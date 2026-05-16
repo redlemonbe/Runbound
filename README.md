@@ -180,4 +180,16 @@ Copyright (c) 2026 RedlemonBe
 
 ---
 
+## Development methodology
+
+Runbound's security posture is reinforced using AI-assisted tooling at every release:
+
+- **Security audit** — white-box code review covering SSRF, injection, timing attacks, DoS vectors, and RFC compliance (see [`docs/security-audit.md`](docs/security-audit.md))
+- **Pentest** — black-box API and DNS protocol testing (input validation, amplification, information disclosure, authentication bypass)
+- **Performance analysis** — hot-path profiling and allocation review
+
+AI tools are used exclusively as an adversarial review layer. All findings are triaged and patched by the maintainer.
+
+---
+
 *Runbound is not affiliated with the NLnet Labs Unbound project.*
