@@ -218,8 +218,10 @@ async fn security_middleware(
             if failures % 10 == 0 {
                 warn!(failures, %path, "Repeated API authentication failures — check RUNBOUND_API_KEY");
             }
-            if failures >= 100 {
-                // Brief lockout: force a short delay to slow automated guessing.
+            // Threshold 50 is reachable within one rate-limiter burst window (burst=60).
+            // At 100 the rate limiter would pre-empt most rapid attacks before the
+            // counter could accumulate, making the lockout unobservable.
+            if failures >= 50 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             return (StatusCode::UNAUTHORIZED,
@@ -296,6 +298,7 @@ pub fn router(state: AppState) -> Router {
 async fn help_handler() -> impl IntoResponse {
     JsonExtract(serde_json::json!({
         "service": "Runbound DNS",
+        "version": env!("CARGO_PKG_VERSION"),
         "protocols": ["DNS/UDP:53","DNS/TCP:53","DoT:853","DoH:443","DoQ:853/UDP"],
         "rfcs": ["RFC1034","RFC1035","RFC2782","RFC4033","RFC4034","RFC4035","RFC6698","RFC6891","RFC7858","RFC8484","RFC9250"],
         "endpoints": [
@@ -351,6 +354,10 @@ async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
     let cfg = s.cfg.as_ref();
+    // Live counts include both config-file entries and API-managed entries.
+    let api_dns   = store::load().map(|st| st.entries.len()).unwrap_or(0);
+    let api_bl    = store::load_blacklist().map(|bl| bl.entries.len()).unwrap_or(0);
+    let api_feeds = crate::feeds::load_feeds().map(|f| f.feeds.len()).unwrap_or(0);
     JsonExtract(serde_json::json!({
         "port":              cfg.port,
         "interfaces":        cfg.interfaces,
@@ -359,12 +366,17 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
             "addrs": fz.addrs,
             "tls":   fz.tls,
         })).collect::<Vec<_>>(),
-        "local_zones":       cfg.local_zones.len(),
-        "local_data":        cfg.local_data.len(),
+        // file_* = entries from runbound.conf; api_* = entries added via REST API
+        "file_local_zones":  cfg.local_zones.len(),
+        "file_local_data":   cfg.local_data.len(),
+        "api_dns_entries":   api_dns,
+        "api_blacklist":     api_bl,
+        "api_feeds":         api_feeds,
         "access_control":    cfg.access_control,
         "private_addresses": cfg.private_addresses,
         "rate_limit":        cfg.rate_limit,
         "cache_max_ttl":     cfg.cache_max_ttl,
+        "dnssec_validation": cfg.dnssec_validation,
         "api_port":          cfg.api_port,
         // api_key intentionally omitted — secret
         "logfile":           cfg.logfile,
