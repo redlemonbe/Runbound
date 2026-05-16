@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hickory_proto::op::{Header, ResponseCode};
-use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::rr::{Name, RData, RecordType};
 use hickory_resolver::{
     config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     error::ResolveErrorKind,
@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::parser::TlsConfig;
 
 use crate::config::parser::UnboundConfig;
-use super::acl::{Acl, AclAction};
+use super::acl::{Acl, AclAction, PrivateAddressSet};
 use super::local::{LocalZoneSet, ZoneAction};
 use super::ratelimit::RateLimiter;
 
@@ -46,29 +46,34 @@ const MAX_INFLIGHT_REQUESTS: usize = 4_096;
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 
-// Maximum TTL cap (seconds) — prevents upstream poisoning with huge TTLs
-const MAX_TTL_CAP: u32 = 86400; // 24 hours
-
 // ============================================================
 // Handler
 // ============================================================
 
 pub struct RunboundHandler {
-    pub zones:    Arc<ArcSwap<LocalZoneSet>>,
-    resolver:     Arc<ArcSwap<TokioAsyncResolver>>,
-    rate_limiter: Arc<RateLimiter>,
-    inflight:     Arc<Semaphore>,
-    acl:          Arc<Acl>,
+    pub zones:     Arc<ArcSwap<LocalZoneSet>>,
+    resolver:      Arc<ArcSwap<TokioAsyncResolver>>,
+    rate_limiter:  Arc<RateLimiter>,
+    inflight:      Arc<Semaphore>,
+    acl:           Arc<Acl>,
+    private_addrs: Arc<PrivateAddressSet>,
+    cache_max_ttl: u32,
 }
 
 impl RunboundHandler {
     fn new(
-        zones:        Arc<ArcSwap<LocalZoneSet>>,
-        resolver:     Arc<ArcSwap<TokioAsyncResolver>>,
-        rate_limiter: Arc<RateLimiter>,
-        acl:          Arc<Acl>,
+        zones:         Arc<ArcSwap<LocalZoneSet>>,
+        resolver:      Arc<ArcSwap<TokioAsyncResolver>>,
+        rate_limiter:  Arc<RateLimiter>,
+        acl:           Arc<Acl>,
+        private_addrs: Arc<PrivateAddressSet>,
+        cache_max_ttl: u32,
     ) -> Self {
-        Self { zones, resolver, rate_limiter, inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)), acl }
+        Self {
+            zones, resolver, rate_limiter,
+            inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
+            acl, private_addrs, cache_max_ttl,
+        }
     }
 }
 
@@ -192,13 +197,32 @@ impl RequestHandler for RunboundHandler {
         // ── 5. Recursive resolution ─────────────────────────────────────
         match self.resolver.load_full().lookup(Name::from(qname), qtype).await {
             Ok(lookup) => {
+                // DNS rebinding protection: SERVFAIL if any A/AAAA record falls
+                // within a configured private-address range (Unbound compatible).
+                if !self.private_addrs.is_empty() {
+                    for rec in lookup.records() {
+                        let private_ip = match rec.data() {
+                            Some(RData::A(a))    => Some(IpAddr::V4((*a).into())),
+                            Some(RData::AAAA(a)) => Some(IpAddr::V6((*a).into())),
+                            _ => None,
+                        };
+                        if let Some(ip) = private_ip {
+                            if self.private_addrs.contains(ip) {
+                                warn!(%qname, %ip, "private-address block → SERVFAIL");
+                                log_query(client_ip, qname, qtype, ResponseCode::ServFail, "private-addr", start);
+                                return send_error(request, response_handle, ResponseCode::ServFail).await;
+                            }
+                        }
+                    }
+                }
                 debug!(%qname, %qtype, count = lookup.records().len(), "resolved");
                 let mut header = Header::response_from_request(request.header());
                 header.set_recursion_available(true);
                 let builder = MessageResponseBuilder::from_message_request(request);
+                let ttl_cap = self.cache_max_ttl;
                 let records: Vec<_> = lookup.records().iter().map(|r| {
                     let mut r = r.clone();
-                    if r.ttl() > MAX_TTL_CAP { r.set_ttl(MAX_TTL_CAP); }
+                    if r.ttl() > ttl_cap { r.set_ttl(ttl_cap); }
                     r
                 }).collect();
                 let response = builder.build(
@@ -289,15 +313,26 @@ fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioAsyncResolver> {
 
     for fwd in &cfg.forward_zones {
         for addr_str in &fwd.addrs {
-            let addr_str = addr_str.split('@').next().unwrap_or(addr_str);
-            if let Ok(ip) = addr_str.parse() {
-                let addr = std::net::SocketAddr::new(ip, 53);
-                // UDP for normal queries (fast path)
-                resolver_cfg.add_name_server(NameServerConfig::new(addr, Protocol::Udp));
-                // TCP mandatory for DNSSEC: DNSKEY RRsets exceed UDP MTU and
-                // arrive truncated (TC=1). Without TCP, the DNSSEC chain cannot
-                // be completed and every signed domain returns SERVFAIL.
-                resolver_cfg.add_name_server(NameServerConfig::new(addr, Protocol::Tcp));
+            // Supports Unbound addr@port syntax: "1.1.1.1@853"
+            let (ip_str, port) = if let Some(at) = addr_str.find('@') {
+                let p: u16 = addr_str[at + 1..].parse().unwrap_or(if fwd.tls { 853 } else { 53 });
+                (&addr_str[..at], p)
+            } else {
+                (addr_str.as_str(), if fwd.tls { 853 } else { 53 })
+            };
+            if let Ok(ip) = ip_str.parse() {
+                let addr = std::net::SocketAddr::new(ip, port);
+                if fwd.tls {
+                    // DNS-over-TLS: encrypted channel, single TCP connection per server.
+                    resolver_cfg.add_name_server(NameServerConfig::new(addr, Protocol::Tls));
+                } else {
+                    // UDP for normal queries (fast path)
+                    resolver_cfg.add_name_server(NameServerConfig::new(addr, Protocol::Udp));
+                    // TCP mandatory for DNSSEC: DNSKEY RRsets exceed UDP MTU and
+                    // arrive truncated (TC=1). Without TCP, the DNSSEC chain cannot
+                    // be completed and every signed domain returns SERVFAIL.
+                    resolver_cfg.add_name_server(NameServerConfig::new(addr, Protocol::Tcp));
+                }
             }
         }
     }
@@ -488,7 +523,18 @@ pub async fn run_dns_server(
     } else {
         info!(rules = acl.len(), "access-control: ACL loaded");
     }
-    let handler = RunboundHandler::new(Arc::clone(&zones), resolver, rate_limiter, acl);
+
+    let cache_max_ttl = cfg.cache_max_ttl.unwrap_or(86400);
+    info!(cache_max_ttl, "TTL cap configured");
+
+    let private_addrs = Arc::new(PrivateAddressSet::from_config(&cfg.private_addresses));
+    if !private_addrs.is_empty() {
+        info!(count = cfg.private_addresses.len(), "private-address: DNS rebinding protection active");
+    }
+
+    let handler = RunboundHandler::new(
+        Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl,
+    );
     let mut server = ServerFuture::new(handler);
 
     let ncpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);

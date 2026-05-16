@@ -117,17 +117,45 @@ verbosity: 1
 
 Set `logfile: ""` or omit it to log to stdout (recommended with systemd).
 
-### API key
+### API key and port
 
 ```
 # In config (not recommended for production):
 api-key: "change-me"
+api-port: 9090       # optional — default 8081
 
 # Preferred — environment variable (never stored in config file):
 # export RUNBOUND_API_KEY="$(openssl rand -hex 32)"
 ```
 
-The environment variable takes priority over the config file value.
+The environment variable takes priority over the config file value.  
+The API always binds to `127.0.0.1` (localhost only) regardless of `api-port`.
+
+### Cache TTL cap
+
+```
+cache-max-ttl: 3600   # cap all TTLs at 1 hour (default: 86400)
+```
+
+Upstream resolvers sometimes return TTLs of 24–48 hours. Capping the TTL limits
+how long a stale or poisoned record lingers in clients' caches.
+
+### Private-address (DNS rebinding protection)
+
+```
+private-address: 10.0.0.0/8
+private-address: 172.16.0.0/12
+private-address: 192.168.0.0/16
+private-address: 127.0.0.0/8
+private-address: fd00::/8
+```
+
+If an upstream resolver returns an A or AAAA record that falls within a
+`private-address` range, the query is answered with SERVFAIL instead of
+forwarding the private IP to the client. This prevents DNS rebinding attacks
+where a public domain is made to resolve to an internal IP.
+
+Mirrors Unbound's `private-address` directive.
 
 ---
 
@@ -144,6 +172,20 @@ forward-zone:
 |---|---|
 | `name` | Zone to forward. `"."` forwards everything not answered locally. |
 | `forward-addr` | Upstream resolver. `ip@port` syntax. Repeat for redundancy. |
+| `forward-tls-upstream` | `yes` → send queries over DNS-over-TLS (port 853). |
+
+**DNS-over-TLS to upstream:**
+
+```
+forward-zone:
+    name:                 "."
+    forward-addr:         1.1.1.1@853
+    forward-addr:         1.0.0.1@853
+    forward-tls-upstream: yes
+```
+
+The `@port` syntax works for both plain and TLS upstreams. When `forward-tls-upstream: yes`
+and no explicit port is given, port 853 is used automatically.
 
 **Split-horizon DNS example:**
 
@@ -177,7 +219,13 @@ server:
     access-control: 192.168.0.0/16   allow
     access-control: 0.0.0.0/0        refuse
 
-    rate-limit: 500
+    rate-limit:    500
+    cache-max-ttl: 3600
+
+    private-address: 10.0.0.0/8
+    private-address: 172.16.0.0/12
+    private-address: 192.168.0.0/16
+    private-address: 127.0.0.0/8
 
     local-zone: "home." static
     local-data: "nas.home.     300 IN A 192.168.1.10"
@@ -186,13 +234,15 @@ server:
     tls-service-pem: /etc/runbound/cert.pem
     tls-service-key: /etc/runbound/key.pem
 
-    logfile: ""
+    api-port:  8081
+    logfile:   ""
     verbosity: 1
 
 forward-zone:
-    name:         "."
-    forward-addr: 1.1.1.1@53
-    forward-addr: 9.9.9.9@53
+    name:                 "."
+    forward-addr:         1.1.1.1@853
+    forward-addr:         9.9.9.9@853
+    forward-tls-upstream: yes
 ```
 
 ---

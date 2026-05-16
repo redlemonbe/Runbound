@@ -18,7 +18,6 @@ use dns::local::LocalZoneSet;
 use dns::{Acl, RateLimiter};
 use api::{AppState, init_api_key};
 
-const API_PORT: u16 = 8081;  // 8080 used by GuestDNS in dev; production uses 8080
 const API_BIND: &str = "127.0.0.1"; // API must not be exposed externally
 
 #[tokio::main]
@@ -113,10 +112,11 @@ async fn main() -> Result<()> {
         feeds::feed_update_loop(86400).await;
     });
 
-    // ── REST API on port 8081 (localhost only) ────────────────────────────
+    // ── REST API (localhost only, port from api-port directive, default 8081) ──
+    let api_port = unbound_cfg.api_port.unwrap_or(8081);
     let api_key = init_api_key(unbound_cfg.api_key.clone());
     info!(
-        addr = %format!("{API_BIND}:{API_PORT}"),
+        addr = %format!("{API_BIND}:{api_port}"),
         "REST API key: {}...{}",
         &api_key[..8], &api_key[api_key.len()-4..]
     );
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
         zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
     };
     let app = api::router(state);
-    let api_addr = format!("{API_BIND}:{API_PORT}");
+    let api_addr = format!("{API_BIND}:{api_port}");
     let listener = tokio::net::TcpListener::bind(&api_addr).await
         .map_err(|e| anyhow::anyhow!("API bind {api_addr}: {e}"))?;
     info!(addr=%api_addr, "REST API listening (localhost only)");
