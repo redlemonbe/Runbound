@@ -394,8 +394,17 @@ fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioAsyncResolver> {
         }
     }
 
-    // If no forward zones, use public resolvers (Cloudflare + Google)
+    // No forward-zone configured — fall back to Cloudflare.
+    // WARNING: This sends all DNS queries to a third-party cloud resolver.
+    // For sensitive or nation-state deployments, configure explicit forward-zone
+    // blocks with trusted upstream resolvers. This fallback should never trigger
+    // in production; it exists only to make Runbound usable out of the box.
     if resolver_cfg.name_servers().is_empty() {
+        warn!(
+            "No forward-zone configured — falling back to Cloudflare (1.1.1.1). \
+             All DNS queries will be sent to a third-party resolver. \
+             Add forward-zone blocks to runbound.conf to suppress this warning."
+        );
         resolver_cfg = ResolverConfig::cloudflare();
     }
 

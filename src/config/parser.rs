@@ -184,7 +184,15 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "tls-cert-hostname" | "server-hostname" => cfg.tls.hostname = Some(val.trim_matches('"').to_string()),
         // Runbound-specific extensions (not in stock Unbound)
         "rate-limit"    => cfg.rate_limit    = val.parse().ok(),
-        "api-key"       => cfg.api_key       = Some(val.trim_matches('"').to_string()),
+        "api-key"       => {
+            warn!(
+                "api-key is set in the config file (plaintext). \
+                 Prefer the RUNBOUND_API_KEY environment variable — \
+                 set it in /etc/runbound/env (chmod 640) to keep the key \
+                 out of config files and version control."
+            );
+            cfg.api_key = Some(val.trim_matches('"').to_string());
+        }
         "api-port"      => cfg.api_port      = val.parse().ok(),
         "cache-max-ttl" => cfg.cache_max_ttl = val.parse().ok(),
         "private-address" => {

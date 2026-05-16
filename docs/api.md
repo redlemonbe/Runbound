@@ -1,35 +1,30 @@
 # REST API Reference
 
 Runbound exposes a REST API on **localhost only** (HTTP). The port defaults to
-**8081** and is configurable with `api-port` in `unbound.conf`. All write
-endpoints require a Bearer token set via `RUNBOUND_API_KEY`.
+**8081** and is configurable with `api-port` in `runbound.conf`. All endpoints
+except `GET /help` require a Bearer token.
 
 ---
 
 ## Authentication
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/stats
+export RUNBOUND_API_KEY="$(cat /etc/runbound/env | cut -d= -f2)"
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/dns
 ```
 
-Timing-safe comparison is used server-side — not vulnerable to timing attacks.
+Timing-safe comparison is used server-side (constant-time, immune to timing attacks).
 
 ---
 
 ## Endpoints
 
-### Health
+### `GET /help`
 
-#### `GET /health`
-
-Liveness probe. Requires the same Bearer token as all other endpoints.
+API documentation. **No authentication required.**
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/health
-```
-
-```json
-{"status": "ok"}
+curl http://localhost:8081/help
 ```
 
 ---
@@ -44,14 +39,16 @@ Changes take effect immediately. No restart required.
 List all local DNS entries.
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/dns
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/dns
 ```
 
 ```json
-[
-  {"name": "nas.home.", "type": "A", "value": "192.168.1.10", "ttl": 300},
-  {"name": "printer.home.", "type": "A", "value": "192.168.1.20", "ttl": 300}
-]
+{
+  "entries": [
+    {"id": "550e8400-...", "name": "nas.home.", "type": "A", "value": "192.168.1.10", "ttl": 300}
+  ],
+  "total": 1
+}
 ```
 
 #### `POST /dns`
@@ -60,37 +57,35 @@ Add a local DNS entry.
 
 ```bash
 curl -X POST http://localhost:8081/dns \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name":"nas.home.","type":"A","value":"192.168.1.10","ttl":300}'
 ```
 
 ```json
-{"status": "added", "name": "nas.home."}
+{"status": "ok", "entry": {"id": "550e8400-...", ...}, "rr": "nas.home. 300 A 192.168.1.10"}
 ```
 
-**Fields:**
+**Supported types:** `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `CAA`, `PTR`,
+`NAPTR`, `SSHFP`, `TLSA`, `NS`
 
-| Field | Required | Description |
-|---|---|---|
-| `name` | ✅ | FQDN (trailing dot required). |
-| `type` | ✅ | `A`, `AAAA`, `PTR`, `CNAME`, `MX`, `TXT` |
-| `value` | ✅ | Record value. |
-| `ttl` | ❌ | TTL in seconds. Default: 300. |
+**Limit:** Maximum 10,000 entries. Returns `422` when exceeded.
 
-**Limits:** Maximum 10,000 entries. Returns `422` when exceeded.
+#### `DELETE /dns/:id`
 
-#### `DELETE /dns/{name}`
-
-Remove a local DNS entry by name.
+Remove an entry by its UUID (from the `id` field of `GET /dns`).
 
 ```bash
-curl -X DELETE http://localhost:8081/dns/nas.home. \
-  -H "Authorization: Bearer $TOKEN"
+# First get the UUID:
+ID=$(curl -s -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/dns \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['entries'][0]['id'])")
+
+curl -X DELETE "http://localhost:8081/dns/$ID" \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
 ```json
-{"status": "deleted", "name": "nas.home."}
+{"status": "ok", "deleted_id": "550e8400-..."}
 ```
 
 ---
@@ -102,160 +97,123 @@ Block domains — equivalent to `local-zone: "domain." always_nxdomain`, but liv
 #### `GET /blacklist`
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/blacklist
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/blacklist
 ```
 
 ```json
-["ads.example.com", "tracker.evil.com"]
+{"blacklist": [{"id": "...", "domain": "ads.example.com", "action": "nxdomain"}], "total": 1}
 ```
 
 #### `POST /blacklist`
 
 ```bash
 curl -X POST http://localhost:8081/blacklist \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"domain":"ads.example.com"}'
+  -d '{"domain":"ads.example.com","action":"nxdomain"}'
 ```
 
-```json
-{"status": "blocked", "domain": "ads.example.com"}
-```
+**Actions:** `refuse` (REFUSED response), `nxdomain` (NXDOMAIN response)
 
 **Limit:** Maximum 100,000 entries. Returns `422` when exceeded.
 
-#### `DELETE /blacklist/{domain}`
+#### `DELETE /blacklist/:id`
+
+Remove by UUID.
 
 ```bash
-curl -X DELETE http://localhost:8081/blacklist/ads.example.com \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-```json
-{"status": "unblocked", "domain": "ads.example.com"}
+curl -X DELETE "http://localhost:8081/blacklist/$ID" \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
 ---
 
 ### Feeds
 
-Subscribe to remote block-list feeds (URLhaus, StevenBlack, etc.). Feeds are
-fetched periodically and their domains added to the blacklist automatically.
+Subscribe to remote block-list feeds. Feeds auto-refresh every 24 hours.
 
 #### `GET /feeds`
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/feeds
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/feeds
 ```
 
 ```json
-[
-  {
-    "name": "urlhaus",
-    "url": "https://urlhaus.abuse.ch/downloads/hostfile/",
-    "last_updated": "2026-05-16T10:00:00Z",
-    "domain_count": 8432
-  }
-]
+{"feeds": [{"id": "...", "name": "urlhaus", "url": "https://...", "entry_count": 8432, "last_updated": "2026-05-16T10:00:00Z"}], "total": 1}
 ```
 
 #### `POST /feeds`
 
-Subscribe to a new feed.
+Subscribe to a new feed. **Limit: 100 feeds maximum.**
 
 ```bash
 curl -X POST http://localhost:8081/feeds \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name":"urlhaus","url":"https://urlhaus.abuse.ch/downloads/hostfile/"}'
+  -d '{"name":"urlhaus","url":"https://urlhaus.abuse.ch/downloads/hostfile/","format":"hosts","action":"nxdomain"}'
+```
+
+**formats:** `hosts` (default), `domains`, `adblock`  
+**Security:** Only HTTPS is accepted. HTTP triggers a server-side warning. Redirects to private IPs or internal hostnames are blocked.
+
+#### `GET /feeds/presets`
+
+List built-in feed presets (OISD, StevenBlack, Hagezi, URLhaus, AdGuard...).
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/feeds/presets
+```
+
+#### `DELETE /feeds/:id`
+
+Remove a feed subscription by UUID.
+
+```bash
+curl -X DELETE "http://localhost:8081/feeds/$ID" \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
+```
+
+#### `POST /feeds/update`
+
+Refresh all enabled feeds immediately.
+
+```bash
+curl -X POST http://localhost:8081/feeds/update \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
 ```json
-{"status": "subscribed", "name": "urlhaus"}
+{"status": "ok", "results": [...], "summary": {"updated": 2, "errors": 0}}
 ```
 
-**Security:** HTTPS is strongly recommended. HTTP feeds trigger a warning in logs.
-Redirects to private IPs are blocked server-side (SSRF protection).
+#### `POST /feeds/:id/update`
 
-#### `DELETE /feeds/{name}`
+Refresh a single feed by UUID.
 
 ```bash
-curl -X DELETE http://localhost:8081/feeds/urlhaus \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-#### `POST /feeds/{name}/refresh`
-
-Force an immediate refresh without waiting for the scheduled interval.
-
-```bash
-curl -X POST http://localhost:8081/feeds/urlhaus/refresh \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-```json
-{"status": "refreshed", "name": "urlhaus", "domain_count": 8441}
+curl -X POST "http://localhost:8081/feeds/$ID/update" \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
 ---
 
-### Statistics
+### TLS status
 
-#### `GET /stats`
+#### `GET /tls`
 
-Live query counters since last start.
+DoT/DoH/DoQ protocol status.
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/stats
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/tls
 ```
 
 ```json
 {
-  "total": 142857,
-  "answered_local": 98432,
-  "blocked": 12000,
-  "forwarded": 32425,
-  "nxdomain": 8432,
-  "refused": 21,
-  "uptime_seconds": 86400
+  "dot": {"enabled": true, "port": 853, "rfc": "RFC 7858"},
+  "doh": {"enabled": true, "port": 443, "rfc": "RFC 8484"},
+  "doq": {"enabled": true, "port": 853, "rfc": "RFC 9250"},
+  "cert": "/etc/runbound/cert.pem"
 }
-```
-
----
-
-### Configuration
-
-#### `GET /config`
-
-Dump the active configuration. Secrets (API key, TLS key path) are redacted.
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/config
-```
-
-```json
-{
-  "interface": "0.0.0.0",
-  "port": 53,
-  "rate_limit": 500,
-  "access_control": ["127.0.0.0/8 allow", "0.0.0.0/0 refuse"],
-  "tls_enabled": true,
-  "api_key": "[redacted]"
-}
-```
-
-#### `POST /reload`
-
-Hot-reload the configuration file without restarting the process. DNS service
-stays up during reload — zero downtime.
-
-```bash
-curl -X POST http://localhost:8081/reload \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-```json
-{"status": "reloaded"}
 ```
 
 ---
@@ -266,16 +224,25 @@ curl -X POST http://localhost:8081/reload \
 |---|---|
 | `200` | Success |
 | `201` | Created |
-| `400` | Bad request — malformed JSON or missing field |
+| `400` | Bad request — malformed JSON or invalid field value |
 | `401` | Unauthorized — missing or invalid Bearer token |
-| `404` | Not found — entry or feed does not exist |
-| `409` | Conflict — entry already exists |
+| `404` | Not found — UUID does not exist |
 | `422` | Unprocessable — entry limit reached |
+| `429` | Too many requests — rate limit exceeded |
 | `500` | Internal server error |
 
 ---
 
-## Rate limiting the API
+## Endpoints missing from this version
 
-The REST API shares the same rate limiter as DNS. If your management host
-is constrained by `rate-limit`, add it to an `allow` subnet or increase the limit.
+The following endpoints were described in early changelog entries but are **not
+implemented** in v0.2.3:
+
+| Endpoint | Status |
+|---|---|
+| `GET /health` | Not implemented — use `systemctl is-active runbound` |
+| `GET /stats` | Not implemented — query statistics not collected |
+| `GET /config` | Not implemented |
+| `POST /reload` | Not implemented — use `systemctl reload runbound` (SIGHUP) |
+
+These are tracked as high-priority items in the security audit (AUDIT-CRIT-01).

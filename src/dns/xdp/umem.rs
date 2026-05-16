@@ -332,11 +332,22 @@ impl Umem {
     /// `offset` must be a valid UMEM frame offset (multiple of FRAME_SIZE),
     /// and `len` must not exceed FRAME_SIZE.
     pub unsafe fn frame_mut(&mut self, offset: u64, len: usize) -> &mut [u8] {
+        // Bounds assertion: catches ring corruption or kernel bugs in debug builds.
+        debug_assert!(
+            (offset as usize).saturating_add(len) <= self.area_len,
+            "XDP frame_mut: offset {offset} + len {len} exceeds UMEM size {}",
+            self.area_len
+        );
         slice::from_raw_parts_mut(self.area.add(offset as usize), len)
     }
 
     /// Get an immutable slice for the frame at the given UMEM offset.
     pub unsafe fn frame(&self, offset: u64, len: usize) -> &[u8] {
+        debug_assert!(
+            (offset as usize).saturating_add(len) <= self.area_len,
+            "XDP frame: offset {offset} + len {len} exceeds UMEM size {}",
+            self.area_len
+        );
         slice::from_raw_parts(self.area.add(offset as usize), len)
     }
 

@@ -346,15 +346,29 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
-            // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16
+            // RFC1918: 10/8, 172.16/12, 192.168/16
+            // Loopback: 127/8, Link-local: 169.254/16, This-network: 0/8
             o[0] == 10
             || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
             || (o[0] == 192 && o[1] == 168)
             || o[0] == 127
             || (o[0] == 169 && o[1] == 254)
-            || (o[0] == 0)
+            || o[0] == 0
         }
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // Loopback (::1) and unspecified (::)
+            v6.is_loopback() || v6.is_unspecified()
+            // ULA: fc00::/7 — covers fd00::/8 used in enterprise/gov networks
+            || (s[0] & 0xfe00) == 0xfc00
+            // Link-local: fe80::/10
+            || (s[0] & 0xffc0) == 0xfe80
+            // IPv4-mapped: ::ffff:0:0/96
+            || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0
+                && s[4] == 0 && s[5] == 0xffff)
+            // Discard/NAT64 well-known: 100::/64
+            || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+        }
     }
 }
 
@@ -583,18 +597,35 @@ fn ssrf_safe_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let url = attempt.url();
-            // Block HTTPS → non-HTTPS downgrade
+            // Block HTTPS → non-HTTPS downgrade (MITM injection vector)
             let was_https = attempt.previous().last()
                 .map(|u| u.scheme() == "https")
                 .unwrap_or(false);
             if was_https && url.scheme() != "https" {
                 return attempt.error("redirect from HTTPS to non-HTTPS blocked");
             }
-            // Block redirect to private/loopback IP
             if let Some(host) = url.host_str() {
+                // Block redirect to private/loopback literal IP
                 if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                     if is_private_ip(&ip) {
                         return attempt.error("redirect to private IP blocked");
+                    }
+                } else {
+                    // Hostname destination — block well-known internal names.
+                    // Full async DNS resolution is not possible inside a sync
+                    // redirect policy; block the most common internal hostnames
+                    // and rely on validate_feed_url() re-validation (TOCTOU
+                    // mitigation) for the resolution-time check.
+                    let h = host.to_lowercase();
+                    if h == "localhost"
+                        || h.ends_with(".local")
+                        || h.ends_with(".internal")
+                        || h.ends_with(".corp")
+                        || h.ends_with(".lan")
+                        || h == "metadata.google.internal"
+                        || h == "169.254.169.254"
+                    {
+                        return attempt.error("redirect to internal hostname blocked");
                     }
                 }
             }
