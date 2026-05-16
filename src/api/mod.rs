@@ -45,6 +45,9 @@ const API_RATE_BURST: u64 = 60;
 const MAX_DNS_ENTRIES: usize = 10_000;
 /// Hard cap on blacklist entries (feeds can add millions; the API is manual).
 const MAX_BLACKLIST_ENTRIES: usize = 100_000;
+/// Hard cap on feed subscriptions. Each feed can download up to 100 MiB;
+/// without this limit an authenticated client could trigger unbounded I/O.
+const MAX_FEEDS: usize = 100;
 
 /// Priority: RUNBOUND_API_KEY env var > api-key in unbound.conf > auto-generate.
 /// Auto-generated keys are 256-bit CSPRNG (2× UUID v4, backed by getrandom).
@@ -557,6 +560,14 @@ async fn add_feed_handler(
     State(_s): State<AppState>,
     JsonExtract(p): JsonExtract<AddFeedRequest>,
 ) -> impl IntoResponse {
+    // Enforce subscription cap before attempting download/validation.
+    let current = feeds::load_feeds().unwrap_or_default();
+    if current.feeds.len() >= MAX_FEEDS {
+        return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
+            "error": "LIMIT_EXCEEDED",
+            "details": format!("Maximum {} feed subscriptions reached", MAX_FEEDS)
+        })));
+    }
     match add_feed(p.name, p.url, p.format, p.action, p.description).await {
         Ok(feed) => {
             info!("Feed added: {} ({})", feed.name, feed.url);

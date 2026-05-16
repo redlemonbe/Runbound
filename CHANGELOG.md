@@ -5,6 +5,62 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.2.4] — 2026-05-16
+
+### Security
+
+- **SEC-CRIT-03 — IPv6 ULA / link-local addresses bypassed SSRF guard** (`src/feeds/mod.rs`)  
+  `is_private_ip()` only covered `::1` and `::`. ULA (`fc00::/7`), link-local (`fe80::/10`),
+  IPv4-mapped (`::ffff:0:0/96`), and NAT64 well-known (`100::/64`) ranges were not blocked.
+  A feed hostname resolving to `fd00::1` or `fe80::1` bypassed the SSRF check entirely.
+  All IPv6 private/internal ranges are now covered.
+
+- **SEC-CRIT-04 — SSRF redirect policy only inspected literal IP destinations** (`src/feeds/mod.rs`)  
+  A feed server could redirect to `http://internal.corp/data` and the redirect would be
+  followed without any hostname validation. The redirect policy now blocks redirects to
+  well-known internal hostnames (`.local`, `.internal`, `.corp`, `.lan`, `localhost`,
+  `169.254.169.254`, `metadata.google.internal`).
+
+- **SEC-HIGH-01 — No feed subscription count limit** (`src/api/mod.rs`)  
+  An authenticated client could add unlimited feeds. Since each feed can download up to
+  100 MiB, this enabled an authenticated DoS via memory/disk exhaustion.
+  Hard cap `MAX_FEEDS = 100` is now enforced on `POST /feeds`.
+
+- **SEC-HIGH-03 — Silent fallback to Cloudflare when no forward-zone configured** (`src/dns/server.rs`)  
+  Misconfigured or stripped config files caused all queries to be silently routed to
+  Cloudflare. A `WARN`-level log is now emitted to alert operators.
+
+- **SEC-MED-04 — XDP frame_mut() had no bounds assertion** (`src/dns/xdp/umem.rs`)  
+  A malformed XDP ring descriptor could produce an out-of-bounds write in the XDP fast path.
+  `debug_assert!` bounds checks added to `frame_mut()` and `frame()`.
+
+- **SEC-MED-07 — api-key in config file accepted silently** (`src/config/parser.rs`)  
+  Using `api-key:` in `runbound.conf` stores the token in cleartext. A `WARN`-level log
+  is now emitted directing operators to use `RUNBOUND_API_KEY` in the env file instead.
+
+### Fixed
+
+- **API docs: ghost endpoints removed** (`docs/api.md`)  
+  `GET /health`, `GET /stats`, `GET /config`, and `POST /reload` were documented as
+  implemented but returned HTTP 404. The docs now accurately reflect the implemented
+  endpoints and note the missing ones as open work items.
+
+- **API docs: path parameters corrected** (`docs/api.md`)  
+  `DELETE /dns/{name}` and `DELETE /feeds/{name}` used name-based paths in the docs
+  but the actual implementation uses UUID (`DELETE /dns/:id`, `DELETE /feeds/:id`).
+  `POST /feeds/{name}/refresh` → `POST /feeds/:id/update`. All corrected.
+
+- **systemd.md: SIGHUP table: ACL is NOT reloaded** (`docs/systemd.md`)  
+  The hot-reload table incorrectly stated that `access-control` rules are reloaded on
+  SIGHUP. The `Arc<Acl>` is built once at startup; only local zones, DNS entries,
+  blacklist, and feed entries are reloaded. ACL changes require a full restart.
+
+### Added
+
+- **`docs/security-audit.md`** — Full white-box security audit (23 findings, CRIT→LOW).
+
+---
+
 ## [0.2.3] — 2026-05-16
 
 ### Fixed

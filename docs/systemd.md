@@ -109,7 +109,7 @@ curl -X POST http://localhost:8081/reload \
 | Persisted DNS entries (`POST /dns`) | ✅ | Read from `dns_entries.json` |
 | Blacklist entries (`POST /blacklist`) | ✅ | Read from `blacklist.json` |
 | Feed block-list entries | ✅ | Last cached version — fetch is not triggered |
-| `access-control` ACL rules | ✅ | Effective immediately |
+| `access-control` ACL rules | ❌ | Restart required — ACL is built once at startup |
 | `forward-zone` upstream resolvers | ❌ | Restart required |
 | `interface` / `port` | ❌ | Socket rebind requires restart |
 | `rate-limit` | ❌ | Restart required |
