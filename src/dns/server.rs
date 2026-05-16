@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hickory_proto::op::{Header, ResponseCode};
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_resolver::{
     config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     error::ResolveErrorKind,
@@ -169,6 +169,30 @@ impl RequestHandler for RunboundHandler {
                         .unwrap_or_else(|e| { error!("send: {e}"); header.into() });
                 }
 
+                // CNAME chain following (RFC 1034 §3.6.2):
+                // If the name exists but has no records of the requested type,
+                // check for a CNAME and follow the chain within local zones.
+                // A query for alias.local A → CNAME tardis.local → A 192.168.1.1
+                // should return both the CNAME and the A record in one answer.
+                if qtype != RecordType::CNAME {
+                    let chain = follow_local_cname(&zones_snap, qname, qtype);
+                    if !chain.is_empty() {
+                        let mut header = Header::response_from_request(request.header());
+                        header.set_authoritative(true);
+                        let builder = MessageResponseBuilder::from_message_request(request);
+                        let response = builder.build(
+                            header,
+                            chain.iter(),
+                            std::iter::empty(),
+                            std::iter::empty(),
+                            std::iter::empty(),
+                        );
+                        log_query(client_ip, qname, qtype, ResponseCode::NoError, "local-cname", start);
+                        return response_handle.send_response(response).await
+                            .unwrap_or_else(|e| { error!("send: {e}"); header.into() });
+                    }
+                }
+
                 // RFC 1035 §3.7 / RFC 2308: NODATA vs NXDOMAIN
                 if zones_snap.name_has_records(qname) {
                     debug!(%qname, %qtype, "local-zone NODATA");
@@ -257,6 +281,39 @@ impl RequestHandler for RunboundHandler {
 // ============================================================
 // Helpers
 // ============================================================
+
+/// Follow CNAME records within local zones, up to 8 hops (prevents loops).
+/// Returns a Vec<Record> containing the CNAME chain + final target records,
+/// or an empty Vec if there is no CNAME or the chain leads outside local zones.
+fn follow_local_cname(
+    zones: &super::local::LocalZoneSet,
+    start: &LowerName,
+    qtype: RecordType,
+) -> Vec<Record> {
+    let mut chain: Vec<Record> = Vec::new();
+    let mut current = start.clone();
+
+    for _ in 0..8 {
+        let cnames = zones.local_records(&current, RecordType::CNAME);
+        if cnames.is_empty() { break; }
+        let cname_rec = (*cnames[0]).clone();
+        let next = match cname_rec.data() {
+            Some(RData::CNAME(c)) => LowerName::from(c.0.clone()),
+            _ => break,
+        };
+        chain.push(cname_rec);
+        let resolved: Vec<Record> = zones.local_records(&next, qtype)
+            .into_iter().map(|r| (*r).clone()).collect();
+        if !resolved.is_empty() {
+            chain.extend(resolved);
+            return chain;
+        }
+        current = next;
+    }
+    // Chain incomplete (target not in local zones) — return nothing;
+    // the caller will fall through to NODATA / NXDOMAIN as appropriate.
+    Vec::new()
+}
 
 /// Structured query log line emitted for every DNS query (info level).
 /// Fields: client IP, query name, type, response code, source path, latency ms.

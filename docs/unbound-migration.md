@@ -55,9 +55,11 @@ existing `unbound.conf` is all you need.
 ### 1. Install Runbound
 
 ```bash
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-x86_64-linux-musl
-chmod +x runbound-x86_64-linux-musl
-sudo mv runbound-x86_64-linux-musl /usr/local/bin/runbound
+# Find the latest version at: https://github.com/redlemonbe/Runbound/releases
+# Replace v0.2.3 with the actual latest tag
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.2.3-x86_64-linux-musl
+chmod +x runbound-v0.2.3-x86_64-linux-musl
+sudo mv runbound-v0.2.3-x86_64-linux-musl /usr/local/bin/runbound
 ```
 
 ### 2. Test against your existing config

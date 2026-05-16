@@ -22,10 +22,10 @@ Timing-safe comparison is used server-side — not vulnerable to timing attacks.
 
 #### `GET /health`
 
-Liveness probe. No authentication required.
+Liveness probe. Requires the same Bearer token as all other endpoints.
 
 ```bash
-curl http://localhost:8081/health
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/health
 ```
 
 ```json
