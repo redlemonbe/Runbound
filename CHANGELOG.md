@@ -5,6 +5,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.2.2] — 2026-05-16
+
+### Added
+
+- **`api-port` directive** (`src/config/parser.rs`, `src/main.rs`)  
+  The REST API port is now configurable via the config file (`api-port: 9090`).
+  Defaults to `8081` when absent. Removes the hardcoded `API_PORT` constant.
+
+- **`cache-max-ttl` directive** (`src/config/parser.rs`, `src/dns/server.rs`)  
+  Maximum TTL cap for cached records is now configurable (`cache-max-ttl: 3600`).
+  Defaults to `86400` (24 h) when absent. Removes the hardcoded `MAX_TTL_CAP` constant.
+  Mirrors Unbound's `cache-max-ttl` directive.
+
+- **`private-address` directive — DNS rebinding protection** (`src/config/parser.rs`, `src/dns/acl.rs`, `src/dns/server.rs`)  
+  CIDR ranges configured with `private-address` are now enforced: if any A or AAAA record
+  returned by an upstream resolver falls within a configured private range, the query is
+  answered with SERVFAIL instead of forwarding the private IP to the client.
+  Mirrors Unbound's `private-address` directive. A new `PrivateAddressSet` type in
+  `acl.rs` provides zero-extra-crate CIDR matching using the same bit-shift/mask logic
+  as the ACL engine. `CidrBlock` is factored out to avoid code duplication.
+
+- **`forward-tls-upstream` directive — DNS-over-TLS to upstream** (`src/config/parser.rs`, `src/dns/server.rs`)  
+  Adding `forward-tls-upstream: yes` to a `forward-zone:` block now sends queries to
+  upstream resolvers over an encrypted TLS connection (port 853 by default, overridable
+  with `addr@port` syntax). Without the directive, plain UDP+TCP is used (existing behaviour).
+  Mirrors Unbound's `forward-tls-upstream` directive.
+
+---
+
 ## [0.2.1] — 2026-05-16
 
 ### Performance
@@ -106,5 +135,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-[0.2.0]: https://github.com/jfbaudson/runbound/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/jfbaudson/runbound/releases/tag/v0.1.0
+[0.2.2]: https://github.com/redlemonbe/Runbound/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/redlemonbe/Runbound/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/redlemonbe/Runbound/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/redlemonbe/Runbound/releases/tag/v0.1.0

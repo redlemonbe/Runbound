@@ -16,6 +16,8 @@ pub struct LocalData {
 pub struct ForwardZone {
     pub name: String,
     pub addrs: Vec<String>,
+    /// Send queries over DNS-over-TLS (port 853) instead of plain UDP/TCP.
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +55,12 @@ pub struct UnboundConfig {
     pub rate_limit: Option<u64>,
     /// REST API key. Overridden by RUNBOUND_API_KEY env var if both are set.
     pub api_key: Option<String>,
+    /// REST API port. Default: 8081.
+    pub api_port: Option<u16>,
+    /// Maximum TTL cap for cached records (seconds). Default: 86400 (24 h).
+    pub cache_max_ttl: Option<u32>,
+    /// CIDR ranges that must never appear in resolver responses (DNS rebinding guard).
+    pub private_addresses: Vec<String>,
 }
 
 impl UnboundConfig {
@@ -110,11 +118,12 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                 let fwd = current_forward.get_or_insert_with(|| ForwardZone {
                     name: String::new(),
                     addrs: Vec::new(),
+                    tls: false,
                 });
                 match key {
                     "name"           => fwd.name = val.trim_matches('"').to_string(),
                     "forward-addr"   => fwd.addrs.push(val.trim_matches('"').to_string()),
-                    "forward-tls-upstream" => {} // silently accepted
+                    "forward-tls-upstream" => fwd.tls = val.trim() == "yes",
                     other => warn!("Line {}: unknown forward-zone directive '{}' — ignored", lineno + 1, other),
                 }
             }
@@ -174,8 +183,14 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "quic-port"  => cfg.tls.doq_port  = val.parse().ok(),
         "tls-cert-hostname" | "server-hostname" => cfg.tls.hostname = Some(val.trim_matches('"').to_string()),
         // Runbound-specific extensions (not in stock Unbound)
-        "rate-limit" => cfg.rate_limit = val.parse().ok(),
-        "api-key"    => cfg.api_key    = Some(val.trim_matches('"').to_string()),
+        "rate-limit"    => cfg.rate_limit    = val.parse().ok(),
+        "api-key"       => cfg.api_key       = Some(val.trim_matches('"').to_string()),
+        "api-port"      => cfg.api_port      = val.parse().ok(),
+        "cache-max-ttl" => cfg.cache_max_ttl = val.parse().ok(),
+        "private-address" => {
+            let cidr = val.trim_matches('"').trim().to_string();
+            if !cidr.is_empty() { cfg.private_addresses.push(cidr); }
+        }
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"
@@ -186,7 +201,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         | "username" | "chroot" | "directory"
         | "auto-trust-anchor-file" | "val-log-level"
         | "harden-glue" | "harden-dnssec-stripped"
-        | "unwanted-reply-threshold" | "private-address" | "private-domain"
+        | "unwanted-reply-threshold" | "private-domain"
         => {} // silently accepted
         other => warn!("Line {}: unknown server directive '{}' — ignored", lineno, other),
     }
