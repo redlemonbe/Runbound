@@ -1,0 +1,33 @@
+# Build output
+/target/
+
+# PGO profiling data
+/tmp/runbound-pgo/
+
+# Editor temp files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets — never commit
+/etc/runbound/api.key
+/etc/runbound/key.pem
+*.key
+*.pem
+.env
+
+# Internal reports (French work notes — not for public repo)
+AUDIT_SECURITE.txt
+RAPPORT_PERFORMANCE.txt
+RAPPORT_TEST_COMPLET.txt
+
+# Test artifacts
+/tmp/dnsperf-*.out
+/tmp/runbound-*.conf
+/tmp/queries-*.txt
