@@ -5,6 +5,72 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.2.5] — 2026-05-17
+
+### Security
+
+- **SEC-HIGH-02 — `/help` endpoint now requires Bearer authentication** (`src/api/mod.rs`)  
+  `/help` was previously public, exposing the endpoint list and RFCs to unauthenticated callers.
+  Fingerprinting a running Runbound instance and cross-referencing with known CVEs is now blocked.
+  All endpoints — including `/help` — now require a valid Bearer token.
+
+- **SEC-MED-05 — Global auth-failure counter with automated lockout** (`src/api/mod.rs`)  
+  Repeated authentication failures now increment a global `AUTH_FAILURES` AtomicU64 counter.
+  Every 10th failure emits a `WARN`-level log. After 100 consecutive failures a 500 ms delay is
+  injected before the 401 response, slowing automated guessing without blocking legitimate retries.
+  The counter resets on every successful authentication.
+
+- **SEC-HIGH-05 — Rate limiter bucket exhaustion mitigation** (`src/dns/ratelimit.rs`)  
+  When the bucket table reaches `MAX_RATE_LIMIT_BUCKETS = 65,536`, the old code silently refused
+  all new source IPs — enabling a targeted DoS by flooding from 65 k distinct IPs to fill the table.
+  On exhaustion, buckets idle for more than 10 s are now aggressively evicted before dropping the
+  new IP. Under a real flood (all buckets active) the drop still fires; under a spoofed exhaustion
+  attack with stale buckets, legitimate IPs are admitted after eviction.
+
+### Fixed
+
+- **TCP / DoT / DoH / DoQ idle timeout 5 s → 30 s** (`src/dns/server.rs`)  
+  The 5-second TCP idle timeout was too aggressive for DNSSEC responses (large RRSIG/DNSKEY
+  payloads can take several round-trips). All TCP listeners now use a 30-second timeout.
+
+- **Hand-rolled UTC timestamp replaced with humantime** (`src/feeds/mod.rs`)  
+  `utc_now_rfc3339()` implemented a custom date/time calculation (including leap-year arithmetic)
+  that had no fuzz coverage and could have edge-case bugs around year boundaries.
+  Replaced with `humantime::format_rfc3339(SystemTime::now())` — a well-tested library already
+  in the dependency graph.
+
+### Added
+
+- **`GET /health` endpoint** (`src/api/mod.rs`)  
+  Liveness probe — returns `{"status":"ok","uptime_secs":…,"queries":…}`.
+  Useful for load balancers and monitoring systems. Previously returned HTTP 404.
+
+- **`GET /stats` endpoint** (`src/api/mod.rs`)  
+  Query statistics: total, blocked, forwarded, NXDOMAIN, REFUSED, SERVFAIL,
+  `blocked_percent`, and `uptime_secs`. Counters are maintained as `AtomicU64` in the
+  DNS handler hot path; reads from `/stats` never contend with query processing.
+  Previously returned HTTP 404.
+
+- **`GET /config` endpoint** (`src/api/mod.rs`)  
+  Dumps the active configuration (sanitised — `api-key` is intentionally omitted).
+  Previously returned HTTP 404.
+
+- **`POST /reload` endpoint** (`src/api/mod.rs`)  
+  Hot-reload equivalent: re-parses `runbound.conf` and rebuilds all in-memory DNS data
+  atomically via ArcSwap. Equivalent to `systemctl reload runbound` (SIGHUP).
+  Previously returned HTTP 404.
+
+- **`dnssec-validation` config directive** (`src/config/parser.rs`, `src/dns/server.rs`)  
+  Mirrors Unbound's `dnssec-validation` directive. When set to `yes`, hickory-resolver
+  performs local DNSSEC re-validation. Default remains `no` (forwarder mode — trust upstream
+  AD bit) because forwarders strip RRSIGs and local re-validation would SERVFAIL every
+  signed domain. Enable only for full recursive deployments with complete RRSIG chains.
+
+- **`src/stats.rs`** — `Stats` / `StatsSnapshot` types with per-outcome AtomicU64 counters,
+  shared between `RunboundHandler` and `AppState` via `Arc<Stats>`.
+
+---
+
 ## [0.2.4] — 2026-05-16
 
 ### Security
@@ -238,6 +304,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+[0.2.5]: https://github.com/redlemonbe/Runbound/compare/v0.2.4...v0.2.5
+[0.2.4]: https://github.com/redlemonbe/Runbound/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/redlemonbe/Runbound/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/redlemonbe/Runbound/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/redlemonbe/Runbound/compare/v0.2.0...v0.2.1

@@ -4,6 +4,7 @@ mod api;
 mod feeds;
 mod error;
 mod store;
+mod stats;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -18,6 +19,7 @@ use config::parser::UnboundConfig;
 use dns::local::LocalZoneSet;
 use dns::{Acl, RateLimiter};
 use api::{AppState, init_api_key};
+use stats::Stats;
 
 const API_BIND: &str = "127.0.0.1"; // API must not be exposed externally
 
@@ -128,11 +130,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    let global_stats = Stats::new();
+
+    let cfg_arc = Arc::new(unbound_cfg.clone());
     let state = AppState {
         zones:       Arc::clone(&zones),
         tls_cfg:     Arc::clone(&tls_cfg),
         rate_limiter: api::ApiRateLimiter::new_public(),
         zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
+        stats:       Arc::clone(&global_stats),
+        cfg:         Arc::clone(&cfg_arc),
+        cfg_path:    cfg_path.clone(),
     };
     let app = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
@@ -189,7 +197,7 @@ async fn main() -> Result<()> {
     };
 
     // ── DNS server (blocks until shutdown) ────────────────────────────────
-    dns::run_dns_server(&unbound_cfg, zones, rate_limiter, acl).await
+    dns::run_dns_server(&unbound_cfg, zones, rate_limiter, acl, global_stats).await
 }
 
 fn print_help() {
@@ -333,8 +341,8 @@ fn gen_self_signed_cert(hostname: &str) -> anyhow::Result<()> {
 }
 
 /// Build the in-memory zone set from config + persisted store + blacklist + feeds.
-/// Called at startup and on SIGHUP hot-reload.
-fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
+/// Called at startup, on SIGHUP hot-reload, and by POST /reload.
+pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
     let mut zone_set = LocalZoneSet::from_config(&cfg.local_zones, &cfg.local_data);
 
     // Persisted DNS entries (from REST API POST /dns)

@@ -21,10 +21,10 @@ Timing-safe comparison is used server-side (constant-time, immune to timing atta
 
 ### `GET /help`
 
-API documentation. **No authentication required.**
+API documentation. **Requires authentication** (Bearer token).
 
 ```bash
-curl http://localhost:8081/help
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/help
 ```
 
 ---
@@ -199,7 +199,72 @@ curl -X POST "http://localhost:8081/feeds/$ID/update" \
 
 ### TLS status
 
-#### `GET /tls`
+#### `GET /health`
+
+Liveness probe. Returns uptime and total query count.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/health
+```
+
+```json
+{"status": "ok", "uptime_secs": 3600, "queries": 125432}
+```
+
+---
+
+### `GET /stats`
+
+Query statistics: total, blocked, forwarded, NXDOMAIN, REFUSED, SERVFAIL, block percentage, uptime.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/stats
+```
+
+```json
+{
+  "total": 125432,
+  "blocked": 8921,
+  "forwarded": 112000,
+  "nxdomain": 4500,
+  "refused": 8921,
+  "servfail": 11,
+  "blocked_percent": 7,
+  "uptime_secs": 3600
+}
+```
+
+---
+
+### `GET /config`
+
+Dump active configuration (sanitised — API key is omitted).
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/config
+```
+
+---
+
+### `POST /reload`
+
+Hot-reload: re-parse `runbound.conf` and rebuild all in-memory DNS data without dropping connections.
+Equivalent to `systemctl reload runbound` (SIGHUP).
+
+```bash
+curl -X POST http://localhost:8081/reload \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
+```
+
+```json
+{"status": "ok", "cfg_path": "/etc/runbound/runbound.conf", "local_zones": 5, "local_data": 12}
+```
+
+**Note:** ACL rules and forward-zone upstreams require a full restart.
+
+---
+
+### `GET /tls`
 
 DoT/DoH/DoQ protocol status.
 
@@ -231,18 +296,3 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/tls
 | `429` | Too many requests — rate limit exceeded |
 | `500` | Internal server error |
 
----
-
-## Endpoints missing from this version
-
-The following endpoints were described in early changelog entries but are **not
-implemented** in v0.2.3:
-
-| Endpoint | Status |
-|---|---|
-| `GET /health` | Not implemented — use `systemctl is-active runbound` |
-| `GET /stats` | Not implemented — query statistics not collected |
-| `GET /config` | Not implemented |
-| `POST /reload` | Not implemented — use `systemctl reload runbound` (SIGHUP) |
-
-These are tracked as high-priority items in the security audit (AUDIT-CRIT-01).
