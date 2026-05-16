@@ -88,16 +88,21 @@ journalctl -u runbound -f
 
 ## Hot reload
 
-Runbound supports configuration reload without dropping any DNS connections:
+Runbound supports zone reload without dropping any DNS connections.
+Both methods re-read the config file and rebuild all local zones,
+persisted entries, blacklist, and feed entries in-memory atomically.
 
 ```bash
-# Via API (preferred)
+# Via systemd signal (SIGHUP)
+systemctl reload runbound
+
+# Via REST API
 curl -X POST http://localhost:8081/reload \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
-
-# Via signal
-systemctl reload runbound
 ```
+
+**Note:** Only local zones and DNS entries are reloaded. Changes to
+`port`, `interface`, `rate-limit`, or TLS settings require a full restart.
 
 ---
 

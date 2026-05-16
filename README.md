@@ -37,19 +37,23 @@ Your existing `unbound.conf` works as-is. Zero migration.
 
 ```bash
 # 1 — Download the static binary (no dependencies)
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-x86_64-linux-musl
-chmod +x runbound-x86_64-linux-musl
+#     Replace v0.2.3 with the latest version tag from the releases page
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.2.3-x86_64-linux-musl
+chmod +x runbound-v0.2.3-x86_64-linux-musl
 
-# 2 — Point it at your existing Unbound config (or use an example)
-sudo ./runbound-x86_64-linux-musl --config /etc/unbound/unbound.conf
+# 2 — One-liner install (downloads automatically, sets up systemd):
+#     sudo bash <(curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh)
 
-# 3 — Test it
+# 3 — Or point it at your existing Unbound config
+sudo ./runbound-v0.2.3-x86_64-linux-musl /etc/unbound/unbound.conf
+
+# 4 — Test it
 dig @127.0.0.1 google.com
 ```
 
-DNS live on **port 53**. REST API live on **port 8081**. No config change needed.
+DNS live on **port 53**. REST API live on **port 8081** (requires Bearer token). No config change needed.
 
-> Raspberry Pi or ARM server? Grab `runbound-aarch64-linux-musl` instead.
+> Raspberry Pi or ARM server? Grab `runbound-v0.2.3-aarch64-linux-musl` instead.
 
 ---
 
@@ -100,12 +104,14 @@ Measured on a 4-core VPS (KVM, 8 GB RAM) with [dnsperf](https://www.dns-oarc.net
 
 ## Downloads
 
-| Platform | Build | Download |
+| Platform | Build | Asset name |
 |---|---|---|
-| Linux x86_64 | static (musl) — no deps | [runbound-x86_64-linux-musl](https://github.com/redlemonbe/Runbound/releases/latest) |
-| Linux x86_64 | dynamic (glibc) | [runbound-x86_64-linux-gnu](https://github.com/redlemonbe/Runbound/releases/latest) |
-| Linux ARM64 | static (musl) — Raspberry Pi, servers | [runbound-aarch64-linux-musl](https://github.com/redlemonbe/Runbound/releases/latest) |
-| Linux ARM64 | dynamic (glibc) | [runbound-aarch64-linux-gnu](https://github.com/redlemonbe/Runbound/releases/latest) |
+| Linux x86_64 | static (musl) — no deps | `runbound-vX.Y.Z-x86_64-linux-musl` |
+| Linux x86_64 | dynamic (glibc) | `runbound-vX.Y.Z-x86_64-linux-gnu` |
+| Linux ARM64 | static (musl) — Raspberry Pi, servers | `runbound-vX.Y.Z-aarch64-linux-musl` |
+| Linux ARM64 | dynamic (glibc) | `runbound-vX.Y.Z-aarch64-linux-gnu` |
+
+All releases: [github.com/redlemonbe/Runbound/releases](https://github.com/redlemonbe/Runbound/releases)
 
 Or build from source: `cargo build --release`  
 With AF/XDP fast path: `cargo build --release --features xdp`

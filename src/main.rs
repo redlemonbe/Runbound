@@ -14,6 +14,7 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use tracing::info;
 
+use config::parser::UnboundConfig;
 use dns::local::LocalZoneSet;
 use dns::{Acl, RateLimiter};
 use api::{AppState, init_api_key};
@@ -65,47 +66,42 @@ async fn main() -> Result<()> {
     );
 
     // ── Build in-memory zone set ───────────────────────────────────────────
-    let mut zone_set = LocalZoneSet::from_config(
-        &unbound_cfg.local_zones,
-        &unbound_cfg.local_data,
-    );
-
-    // Load persisted DNS entries from store
-    if let Ok(st) = store::load() {
-        for entry in &st.entries {
-            if let Some(rr) = entry.to_rr_string() {
-                if let Some(record) = dns::local::parse_local_data(&rr) {
-                    let name = record.name().clone();
-                    zone_set.zones.entry(name.clone()).or_insert(dns::ZoneAction::Static);
-                    zone_set.records.entry(name).or_default().push(record);
-                }
-            }
-        }
-        info!(count = st.entries.len(), "Loaded persisted DNS entries");
-    }
-
-    // Load persisted blacklist entries
-    // VUL-09: override_zone so blacklist always shadows any static zone with
-    // the same name defined in unbound.conf (add_zone's or_insert would silently
-    // keep the static zone, letting blocked domains resolve normally).
-    if let Ok(bl) = store::load_blacklist() {
-        for entry in &bl.entries {
-            zone_set.override_zone(&entry.domain, dns::ZoneAction::from(&entry.action));
-        }
-        if !bl.entries.is_empty() {
-            info!(count = bl.entries.len(), "Loaded persisted blacklist entries");
-        }
-    }
-
-    // Inject feed/blocklist entries (feeds also override static zones)
-    for (domain, action) in feeds::collect_feed_entries() {
-        zone_set.override_zone(&domain, dns::ZoneAction::from(&action));
-    }
+    let zone_set = build_zone_set(&unbound_cfg);
 
     // ArcSwap: reads are a single atomic pointer load — zero lock contention
     // on the hot DNS query path regardless of core count.
     let zones   = Arc::new(ArcSwap::new(Arc::new(zone_set)));
     let tls_cfg = Arc::new(unbound_cfg.tls.clone());
+
+    // ── SIGHUP: hot-reload zones from config without dropping connections ──
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let zones_hup    = Arc::clone(&zones);
+        let cfg_path_hup = cfg_path.clone();
+        tokio::spawn(async move {
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => { tracing::warn!("Cannot install SIGHUP handler: {e}"); return; }
+            };
+            loop {
+                hup.recv().await;
+                info!("SIGHUP — reloading zones from config");
+                match config::load(&cfg_path_hup) {
+                    Ok(new_cfg) => {
+                        let new_zones = build_zone_set(&new_cfg);
+                        zones_hup.store(Arc::new(new_zones));
+                        info!(
+                            local_zones = new_cfg.local_zones.len(),
+                            local_data  = new_cfg.local_data.len(),
+                            "Hot-reload complete"
+                        );
+                    }
+                    Err(e) => tracing::warn!("SIGHUP reload failed (keeping current zones): {e}"),
+                }
+            }
+        });
+    }
 
     // ── Background: feed auto-update ───────────────────────────────────────
     tokio::spawn(async move {
@@ -266,7 +262,7 @@ fn print_help() {
         "    /etc/runbound/key.pem            TLS private key (chmod 600)\n",
         "    /etc/runbound/dns_entries.json   Persisted DNS entries\n",
         "    /etc/runbound/blacklist.json     Persisted blacklist\n",
-        "    /etc/guestdns/feeds.json         Feed subscriptions\n",
+        "    /etc/runbound/feeds.json          Feed subscriptions\n",
         "\n",
         "MEMORY SAFETY:\n",
         "    System memory is checked every 30 s. If usage exceeds 80 %, the DNS\n",
@@ -334,5 +330,44 @@ fn gen_self_signed_cert(hostname: &str) -> anyhow::Result<()> {
     println!("    tls-service-key: /etc/letsencrypt/live/{hostname}/privkey.pem");
 
     Ok(())
+}
+
+/// Build the in-memory zone set from config + persisted store + blacklist + feeds.
+/// Called at startup and on SIGHUP hot-reload.
+fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
+    let mut zone_set = LocalZoneSet::from_config(&cfg.local_zones, &cfg.local_data);
+
+    // Persisted DNS entries (from REST API POST /dns)
+    if let Ok(st) = store::load() {
+        for entry in &st.entries {
+            if let Some(rr) = entry.to_rr_string() {
+                if let Some(record) = dns::local::parse_local_data(&rr) {
+                    let name = record.name().clone();
+                    zone_set.zones.entry(name.clone()).or_insert(dns::ZoneAction::Static);
+                    zone_set.records.entry(name).or_default().push(record);
+                }
+            }
+        }
+        if !st.entries.is_empty() {
+            tracing::info!(count = st.entries.len(), "Loaded persisted DNS entries");
+        }
+    }
+
+    // Persisted blacklist (override_zone so blacklist always shadows static zones)
+    if let Ok(bl) = store::load_blacklist() {
+        for entry in &bl.entries {
+            zone_set.override_zone(&entry.domain, dns::ZoneAction::from(&entry.action));
+        }
+        if !bl.entries.is_empty() {
+            tracing::info!(count = bl.entries.len(), "Loaded persisted blacklist entries");
+        }
+    }
+
+    // Feed block-list entries (also override static zones)
+    for (domain, action) in feeds::collect_feed_entries() {
+        zone_set.override_zone(&domain, dns::ZoneAction::from(&action));
+    }
+
+    zone_set
 }
 
