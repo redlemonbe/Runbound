@@ -93,12 +93,13 @@ Both methods re-read the config file and rebuild all in-memory DNS data atomical
 In-flight queries are not interrupted — they finish against the old snapshot.
 
 ```bash
-# Via systemd (SIGHUP)
+# Via systemd (SIGHUP) — preferred for scripted use
 systemctl reload runbound
 
-# Via REST API
+# Via REST API — same effect as SIGHUP
 curl -X POST http://localhost:8081/reload \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
+# → {"status":"ok","cfg_path":"/etc/runbound/runbound.conf","local_zones":5,"local_data":12}
 ```
 
 ### What gets reloaded

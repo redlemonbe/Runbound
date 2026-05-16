@@ -61,6 +61,9 @@ pub struct UnboundConfig {
     pub cache_max_ttl: Option<u32>,
     /// CIDR ranges that must never appear in resolver responses (DNS rebinding guard).
     pub private_addresses: Vec<String>,
+    /// Enable DNSSEC validation. Default: false (forwarder mode — trust upstream AD bit).
+    /// Set to `yes` for recursive/authoritative deployments with full RRSIG chains.
+    pub dnssec_validation: bool,
 }
 
 impl UnboundConfig {
@@ -199,6 +202,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
             let cidr = val.trim_matches('"').trim().to_string();
             if !cidr.is_empty() { cfg.private_addresses.push(cidr); }
         }
+        "dnssec-validation" => cfg.dnssec_validation = val.trim_matches('"') == "yes",
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"
