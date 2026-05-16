@@ -89,11 +89,11 @@ journalctl -u runbound -f
 ## Hot reload
 
 Runbound supports zone reload without dropping any DNS connections.
-Both methods re-read the config file and rebuild all local zones,
-persisted entries, blacklist, and feed entries in-memory atomically.
+Both methods re-read the config file and rebuild all in-memory DNS data atomically.
+In-flight queries are not interrupted — they finish against the old snapshot.
 
 ```bash
-# Via systemd signal (SIGHUP)
+# Via systemd (SIGHUP)
 systemctl reload runbound
 
 # Via REST API
@@ -101,8 +101,37 @@ curl -X POST http://localhost:8081/reload \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
-**Note:** Only local zones and DNS entries are reloaded. Changes to
-`port`, `interface`, `rate-limit`, or TLS settings require a full restart.
+### What gets reloaded
+
+| Component | Reloaded? | Notes |
+|---|:---:|---|
+| `local-zone` / `local-data` from config | ✅ | Re-parsed from disk |
+| Persisted DNS entries (`POST /dns`) | ✅ | Read from `dns_entries.json` |
+| Blacklist entries (`POST /blacklist`) | ✅ | Read from `blacklist.json` |
+| Feed block-list entries | ✅ | Last cached version — fetch is not triggered |
+| `access-control` ACL rules | ✅ | Effective immediately |
+| `forward-zone` upstream resolvers | ❌ | Restart required |
+| `interface` / `port` | ❌ | Socket rebind requires restart |
+| `rate-limit` | ❌ | Restart required |
+| `tls-service-pem` / `tls-service-key` | ❌ | Restart required |
+| `api-port` / `api-key` | ❌ | Restart required |
+
+**Tip:** To force a feed refresh AND reload in one shot:
+
+```bash
+# Refresh all feeds first, then reload zones
+curl -X POST http://localhost:8081/feeds/update \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
+systemctl reload runbound
+```
+
+### Confirming reload succeeded
+
+```bash
+# Look for this log line after reload:
+journalctl -u runbound -n 20 | grep "Hot-reload complete"
+# → INFO Hot-reload complete local_zones=5 local_data=12
+```
 
 ---
 

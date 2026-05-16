@@ -51,7 +51,9 @@ sudo ./runbound-v0.2.3-x86_64-linux-musl /etc/unbound/unbound.conf
 dig @127.0.0.1 google.com
 ```
 
-DNS live on **port 53**. REST API live on **port 8081** (requires Bearer token). No config change needed.
+DNS live on **port 53**. REST API live on **port 8081** (localhost only, requires Bearer token). No config change needed.
+
+The REST API port is configurable with `api-port: 9090` in `runbound.conf`. See the [Configuration Reference](docs/configuration.md#api-key-and-port).
 
 > Raspberry Pi or ARM server? Grab `runbound-v0.2.3-aarch64-linux-musl` instead.
 
@@ -135,13 +137,14 @@ Ready-to-use configs for common scenarios:
 
 | | |
 |---|---|
+| [Home Lab Guide](docs/homelab.md) | Raspberry Pi / home server setup — local names, ad blocking, router config |
 | [Quick Start](docs/quick-start.md) | Install, configure, run in 5 minutes |
 | [Configuration Reference](docs/configuration.md) | Every directive explained, Unbound compatibility table |
 | [REST API Reference](docs/api.md) | All 14 endpoints with curl examples and JSON responses |
 | [Performance Guide](docs/performance.md) | Benchmarks, methodology, how to reproduce |
 | [TLS Setup](docs/tls.md) | DoT on port 853 — Let's Encrypt or internal CA |
 | [AF/XDP Fast Path](docs/xdp.md) | Kernel-bypass networking — 500k+ q/s |
-| [Systemd Setup](docs/systemd.md) | Production service, hardened unit file |
+| [Systemd Setup](docs/systemd.md) | Production service, hardened unit file, hot reload |
 | [Unbound Migration](docs/unbound-migration.md) | Config compatibility, feature mapping, gotchas |
 | [Security Architecture](docs/security.md) | ACL, rate limiting, API auth, audit findings |
 
