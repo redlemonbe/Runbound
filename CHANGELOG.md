@@ -5,6 +5,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.2.3] — 2026-05-16
+
+### Fixed
+
+- **`/etc/guestdns/` → `/etc/runbound/`** (`src/feeds/mod.rs`, `src/main.rs`)  
+  Feed subscriptions and cache were stored in `/etc/guestdns/feeds.json` and
+  `/etc/guestdns/feed_cache/` — a leftover path from the project's internal predecessor.
+  All paths are now under `/etc/runbound/`, consistent with every other Runbound data file.
+  The `--help` text is also corrected.
+
+- **SIGHUP now hot-reloads zones instead of killing the process** (`src/main.rs`)  
+  `systemctl reload runbound` previously terminated the DNS server because SIGHUP had no
+  handler and the OS default action (terminate) fired. A `tokio::signal::unix` handler is
+  now installed at startup: on SIGHUP, the config file is re-parsed and all local zones,
+  persisted DNS entries, blacklist, and feed entries are rebuilt atomically via ArcSwap.
+  In-flight DNS queries are not interrupted. `ExecReload=/bin/kill -HUP $MAINPID` in the
+  systemd unit file now works correctly.
+
+- **OISD Full preset URL returned HTTP 410 Gone** (`src/feeds/mod.rs`)  
+  `https://dbl.oisd.nl/` was deprecated upstream. Updated to `https://big.oisd.nl/`
+  (domains format). OISD Basic updated from `https://dbl.oisd.nl/basic/` to
+  `https://small.oisd.nl/` (domains format).
+
+- **Local CNAME chain not followed** (`src/dns/server.rs`)  
+  A query for `alias.local A` where `alias.local CNAME tardis.local` and
+  `tardis.local A 192.168.1.1` were both local-data entries returned an empty answer.
+  RFC 1034 §3.6.2 requires the resolver to follow the chain and include all records.
+  `follow_local_cname()` now walks up to 8 hops within local zones and returns the
+  full CNAME chain + final A/AAAA records in one response.
+
+- **Download URLs in docs were unversioned** (`README.md`, `docs/unbound-migration.md`)  
+  Links pointed to `runbound-x86_64-linux-musl` but release assets are named
+  `runbound-vX.Y.Z-x86_64-linux-musl`. Following the doc URL caused a 404.
+  All references now include the version prefix and note to check the releases page.
+
+- **`/health` documented as public — actually requires Bearer token** (`docs/api.md`)  
+  The API reference incorrectly stated "No authentication required" for `GET /health`.
+  The endpoint enforces the same auth as all others. Doc corrected.
+
+- **`install.sh` required a local Rust build** (`install.sh`)  
+  The installer checked for `./target/release/runbound` and failed for users without
+  a Rust toolchain. Rewritten to auto-detect architecture, fetch the versioned binary
+  from the GitHub release, verify it with `--version`, and write the systemd unit inline.
+  Supports `--version <tag>` for pinned installs. `--uninstall` still works.
+
+---
+
 ## [0.2.2] — 2026-05-16
 
 ### Added
@@ -135,6 +182,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+[0.2.3]: https://github.com/redlemonbe/Runbound/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/redlemonbe/Runbound/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/redlemonbe/Runbound/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/redlemonbe/Runbound/compare/v0.1.0...v0.2.0

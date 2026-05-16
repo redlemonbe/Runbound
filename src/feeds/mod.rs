@@ -19,8 +19,8 @@ use crate::error::AppError;
 // Constants
 // ============================================================
 
-pub const FEEDS_CONFIG_PATH: &str = "/etc/guestdns/feeds.json";
-pub const FEED_CACHE_DIR: &str = "/etc/guestdns/feed_cache";
+pub const FEEDS_CONFIG_PATH: &str = "/etc/runbound/feeds.json";
+pub const FEED_CACHE_DIR: &str = "/etc/runbound/feed_cache";
 
 /// VUL-03: Maximum feed body size (100 MiB).
 /// Without a cap, a malicious feed server can exhaust process memory.
@@ -102,15 +102,15 @@ pub fn builtin_presets() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "OISD — Basic",
-            "url": "https://dbl.oisd.nl/basic/",
-            "format": "adblock",
+            "url": "https://small.oisd.nl/",
+            "format": "domains",
             "action": "refuse",
             "description": "~100k domains. Carefully curated, low false-positive rate. Good for home networks."
         }),
         serde_json::json!({
-            "name": "OISD — Full",
-            "url": "https://dbl.oisd.nl/",
-            "format": "adblock",
+            "name": "OISD — Big (full list)",
+            "url": "https://big.oisd.nl/",
+            "format": "domains",
             "action": "refuse",
             "description": "~600k domains. Extended OISD list. Recommended for Pi-hole / Unbound setups."
         }),
