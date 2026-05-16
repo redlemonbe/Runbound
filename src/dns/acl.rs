@@ -1,0 +1,122 @@
+// Access-control list — shared between the normal DNS path (server.rs)
+// and the XDP fast-path (xdp/worker.rs).
+//
+// Mirrors Unbound's access-control directive:
+//   access-control: <network/prefix> allow|deny|refuse
+//
+// Evaluation rules:
+//   - First matching rule wins (same as Unbound).
+//   - IPv4-mapped IPv6 (::ffff:a.b.c.d) is normalised to plain IPv4 before
+//     matching so that IPv4 rules apply correctly on dual-stack sockets.
+//     Without this, a client connecting on [::ffff:127.0.0.1] would not match
+//     the rule `127.0.0.0/8 allow`, silently falling through to the
+//     secure-default Refuse.
+//   - If no rules are configured, all clients are allowed (backward compat
+//     with stock Unbound which defaults to allow-all when unconfigured).
+//   - If rules exist but the client IP matches none, the default is Refuse
+//     (fail-secure — unrecognised clients cannot use the resolver).
+
+use std::net::IpAddr;
+use tracing::warn;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AclAction {
+    Allow,
+    /// Silently drop the packet — no DNS response sent.
+    Deny,
+    /// Send a REFUSED response (RFC 2182 §2.1).
+    Refuse,
+}
+
+struct AclEntry {
+    prefix:     IpAddr,
+    prefix_len: u8,
+    action:     AclAction,
+}
+
+impl AclEntry {
+    fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.split_whitespace();
+        let net_str    = parts.next()?;
+        let action_str = parts.next()?;
+        let action = match action_str {
+            "allow" | "allow_snoop" | "allow_setrd" => AclAction::Allow,
+            "deny"  | "deny_non_local"              => AclAction::Deny,
+            "refuse"| "refuse_non_local"             => AclAction::Refuse,
+            _                                        => return None,
+        };
+        let (ip_str, prefix_len) = if let Some(pos) = net_str.find('/') {
+            let len: u8 = net_str[pos + 1..].parse().ok()?;
+            (&net_str[..pos], len)
+        } else {
+            let ip: IpAddr = net_str.parse().ok()?;
+            let len = match ip { IpAddr::V4(_) => 32, IpAddr::V6(_) => 128 };
+            (net_str, len)
+        };
+        let prefix: IpAddr = ip_str.parse().ok()?;
+        Some(AclEntry { prefix, prefix_len, action })
+    }
+
+    #[inline]
+    fn matches(&self, ip: IpAddr) -> bool {
+        match (self.prefix, ip) {
+            (IpAddr::V4(net), IpAddr::V4(addr)) => {
+                if self.prefix_len == 0 { return true; }
+                let shift = 32u8.saturating_sub(self.prefix_len);
+                let mask  = !0u32 << shift;
+                u32::from(net) & mask == u32::from(addr) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(addr)) => {
+                if self.prefix_len == 0 { return true; }
+                let shift = 128u8.saturating_sub(self.prefix_len);
+                let mask  = !0u128 << shift;
+                u128::from(net) & mask == u128::from(addr) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Compiled access-control list.  Build once from config, share via `Arc`.
+pub struct Acl(Vec<AclEntry>);
+
+impl Acl {
+    pub fn from_config(entries: &[String]) -> Self {
+        let parsed = entries.iter()
+            .filter_map(|s| {
+                AclEntry::parse(s).or_else(|| {
+                    warn!(entry=%s, "access-control: parse error — ignored");
+                    None
+                })
+            })
+            .collect();
+        Self(parsed)
+    }
+
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn len(&self)      -> usize { self.0.len() }
+
+    /// Evaluate the ACL for `ip`.
+    ///
+    /// IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are normalised to their
+    /// plain IPv4 equivalent before matching, ensuring that rules configured
+    /// as IPv4 CIDRs match correctly even when the OS delivers the connection
+    /// as an IPv6 address on a dual-stack socket.
+    #[inline]
+    pub fn check(&self, ip: IpAddr) -> AclAction {
+        if self.0.is_empty() { return AclAction::Allow; }
+        // Normalise IPv4-mapped IPv6 → plain IPv4 before rule evaluation.
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
+            _ => ip,
+        };
+        for entry in &self.0 {
+            if entry.matches(ip) {
+                return entry.action.clone();
+            }
+        }
+        AclAction::Refuse  // no rule matched → fail-secure
+    }
+}
