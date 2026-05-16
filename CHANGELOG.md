@@ -5,6 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.2.1] — 2026-05-16
+
+### Performance
+
+- **OPT-01 — Eliminate `Name::from(qname.clone())` on every DNS query** (`src/dns/local.rs`, `src/dns/server.rs`)
+  `LocalZoneSet::find()`, `local_records()`, and `name_has_records()` now accept `&LowerName`
+  directly instead of `&Name`. Previously, every incoming query paid two heap allocations
+  (clone `LowerName` + `Name::from`) before the first zone lookup. The hot path now uses
+  `LowerName: Borrow<Name>` to perform the `HashMap` lookup with zero allocation.
+  The walk-up hierarchy path (`find()` parent-zone traversal) uses `LowerName::base_name()`
+  end-to-end, avoiding an additional `Name` clone per label trimmed.
+  The XDP fast path benefits from the same change with no callsite modification.
+
+### Fixed
+
+- **`*response_code` in resolver error path** (`src/dns/server.rs`)
+  `ResolveErrorKind::NoRecordsFound::response_code` binds as `&ResponseCode` under match
+  ergonomics. The dereference was correct but the compiler's error reporting was misleading
+  when other errors were present in the same compilation unit. Confirmed and preserved as-is.
+
+---
+
 ## [0.2.0] — 2026-05-16
 
 ### Security

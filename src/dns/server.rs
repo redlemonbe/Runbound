@@ -131,8 +131,7 @@ impl RequestHandler for RunboundHandler {
 
         // ── 4. Local zones ──────────────────────────────────────────────
         let zones_snap = self.zones.load();
-        let qname_name = Name::from(qname.clone());
-        let zone_action = zones_snap.find(&qname_name);
+        let zone_action = zones_snap.find(qname);
 
         match zone_action {
             Some(ZoneAction::Refuse) => {
@@ -146,8 +145,7 @@ impl RequestHandler for RunboundHandler {
                 return send_error(request, response_handle, ResponseCode::NXDomain).await;
             }
             Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
-                let records: Vec<_> = zones_snap.local_records(&qname_name, qtype)
-                    .into_iter().cloned().collect();
+                let records = zones_snap.local_records(qname, qtype);
 
                 if !records.is_empty() {
                     debug!(%qname, count = records.len(), "local-data answer");
@@ -156,7 +154,7 @@ impl RequestHandler for RunboundHandler {
                     let builder = MessageResponseBuilder::from_message_request(request);
                     let response = builder.build(
                         header,
-                        records.iter(),
+                        records.into_iter(),
                         std::iter::empty(),
                         std::iter::empty(),
                         std::iter::empty(),
@@ -167,7 +165,7 @@ impl RequestHandler for RunboundHandler {
                 }
 
                 // RFC 1035 §3.7 / RFC 2308: NODATA vs NXDOMAIN
-                if zones_snap.name_has_records(&qname_name) {
+                if zones_snap.name_has_records(qname) {
                     debug!(%qname, %qtype, "local-zone NODATA");
                     let mut header = Header::response_from_request(request.header());
                     header.set_authoritative(true);
@@ -192,7 +190,7 @@ impl RequestHandler for RunboundHandler {
         drop(zones_snap);
 
         // ── 5. Recursive resolution ─────────────────────────────────────
-        match self.resolver.load_full().lookup(qname_name, qtype).await {
+        match self.resolver.load_full().lookup(Name::from(qname), qtype).await {
             Ok(lookup) => {
                 debug!(%qname, %qtype, count = lookup.records().len(), "resolved");
                 let mut header = Header::response_from_request(request.header());
