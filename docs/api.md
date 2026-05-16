@@ -9,7 +9,7 @@ except `GET /help` require a Bearer token.
 ## Authentication
 
 ```bash
-export RUNBOUND_API_KEY="$(cat /etc/runbound/env | cut -d= -f2)"
+export RUNBOUND_API_KEY="$(cat /etc/runbound/api.key)"
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/dns
 ```
 
@@ -21,9 +21,10 @@ Timing-safe comparison is used server-side (constant-time, immune to timing atta
 
 ### `GET /help`
 
-API documentation. **Requires authentication** (Bearer token).
+API documentation and endpoint list. **Requires Bearer authentication.**
 
 ```bash
+export RUNBOUND_API_KEY="$(cat /etc/runbound/api.key)"
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/help
 ```
 
@@ -68,6 +69,8 @@ curl -X POST http://localhost:8081/dns \
 
 **Supported types:** `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `CAA`, `PTR`,
 `NAPTR`, `SSHFP`, `TLSA`, `NS`
+
+**TTL:** Must be ≤ 2,147,483,647 (RFC 2181 §8 maximum). Capped at 86,400 s (24 h) server-side.
 
 **Limit:** Maximum 10,000 entries. Returns `422` when exceeded.
 
@@ -154,7 +157,7 @@ curl -X POST http://localhost:8081/feeds \
 ```
 
 **formats:** `hosts` (default), `domains`, `adblock`  
-**Security:** Only HTTPS is accepted. HTTP triggers a server-side warning. Redirects to private IPs or internal hostnames are blocked.
+**Security:** Only HTTPS is accepted. HTTP URLs are **rejected** (HTTP 400). Redirects to private IPs or internal hostnames are blocked.
 
 #### `GET /feeds/presets`
 
@@ -243,6 +246,11 @@ Dump active configuration (sanitised — API key is omitted).
 ```bash
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/config
 ```
+
+**Note on entry counts:** `file_local_data` and `file_local_zones` reflect only what is
+in `runbound.conf`. Entries added via REST API (`POST /dns`, `POST /blacklist`, feeds)
+appear in `api_dns_entries`, `api_blacklist`, and `api_feeds`. Use `GET /dns` and `GET /blacklist`
+for the full live lists.
 
 ---
 

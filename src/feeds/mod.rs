@@ -268,20 +268,19 @@ async fn validate_feed_url(url: &str) -> Result<(), AppError> {
     }
 
     let lower = url.to_lowercase();
-    if !lower.starts_with("https://") && !lower.starts_with("http://") {
+    // HTTP is explicitly blocked — not just warned about.
+    // A MITM can inject arbitrary domains into a plaintext feed, instantly
+    // poisoning the entire blocklist. HTTPS is mandatory.
+    if lower.starts_with("http://") {
+        return Err(AppError::BadRequest(
+            "HTTP feed URLs are not allowed — use HTTPS to prevent MITM blocklist injection".into()
+        ));
+    }
+    if !lower.starts_with("https://") {
         return Err(AppError::BadRequest(
             "Only https:// URLs are allowed (no http://, file://, ftp://, etc.)".into()
         ));
     }
-    // Warn loudly when http:// is used — MITM injection is possible.
-    if lower.starts_with("http://") {
-        warn!(
-            url = %url,
-            "Feed URL uses plaintext HTTP — a man-in-the-middle can inject \
-             arbitrary domains into the blocklist; use HTTPS instead"
-        );
-    }
-
     // Extract host+port portion
     let host_and_port = url
         .split("://").nth(1).unwrap_or("")
