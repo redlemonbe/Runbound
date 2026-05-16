@@ -1,11 +1,12 @@
 // Local zone authority — in-memory, instant updates, O(1) lookup.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::str::FromStr;
 
 use hickory_proto::rr::{
     rdata::{self, CNAME},
-    Name, RData, Record, RecordType,
+    LowerName, Name, RData, Record, RecordType,
 };
 
 use crate::config::parser::{LocalData, LocalZone};
@@ -98,17 +99,30 @@ impl LocalZoneSet {
     /// Find matching zone for a query name.
     /// Walks up the name hierarchy: "www.evil.com." → "evil.com." → "com." → "."
     /// Returns the most-specific match (exact domain wins over parent zone).
+    ///
+    /// Accepts `&LowerName` directly — avoids the `Name::from(lower.clone())`
+    /// allocation that callers previously had to perform before each lookup.
+    /// `LowerName: Deref<Target=Name>`, so `&**query` gives a `&Name` for the
+    /// HashMap without any heap allocation on the exact-match fast path.
     #[inline]
-    pub fn find(&self, query: &Name) -> Option<ZoneAction> {
-        let mut name = query.clone();
+    pub fn find(&self, query: &LowerName) -> Option<ZoneAction> {
+        // Fast path: exact match — LowerName: Borrow<Name>, zero allocation.
+        if let Some(action) = self.zones.get(query.borrow() as &Name) {
+            return Some(action.clone());
+        }
+        if query.is_root() {
+            return None;
+        }
+        // Slow path: walk up the label hierarchy via LowerName::base_name().
+        // One LowerName allocation per label trimmed — same cost as before.
+        let mut name = query.base_name();
         loop {
-            if let Some(action) = self.zones.get(&name) {
+            if let Some(action) = self.zones.get(name.borrow() as &Name) {
                 return Some(action.clone());
             }
             if name.is_root() {
                 break;
             }
-            // Walk up: trim the leftmost label
             name = name.base_name();
         }
         None
@@ -117,8 +131,8 @@ impl LocalZoneSet {
     /// Exact local-data records for a query. O(1) name lookup + O(m) type filter
     /// where m is the number of records for that name (typically 1–5).
     #[inline(always)]
-    pub fn local_records(&self, query_name: &Name, rtype: RecordType) -> Vec<&Record> {
-        self.records.get(query_name)
+    pub fn local_records(&self, query_name: &LowerName, rtype: RecordType) -> Vec<&Record> {
+        self.records.get(query_name.borrow() as &Name)
             .map(|recs| recs.iter().filter(|r| r.record_type() == rtype).collect())
             .unwrap_or_default()
     }
@@ -127,8 +141,8 @@ impl LocalZoneSet {
     /// Used to distinguish NODATA (name exists, wrong type → NOERROR empty)
     /// from NXDOMAIN (name itself does not exist) — RFC 1035 §3.7.
     #[inline(always)]
-    pub fn name_has_records(&self, name: &Name) -> bool {
-        self.records.contains_key(name)
+    pub fn name_has_records(&self, name: &LowerName) -> bool {
+        self.records.contains_key(name.borrow() as &Name)
     }
 }
 
