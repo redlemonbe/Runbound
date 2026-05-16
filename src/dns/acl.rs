@@ -28,37 +28,27 @@ pub enum AclAction {
     Refuse,
 }
 
-struct AclEntry {
+struct CidrBlock {
     prefix:     IpAddr,
     prefix_len: u8,
-    action:     AclAction,
 }
 
-impl AclEntry {
+impl CidrBlock {
     fn parse(s: &str) -> Option<Self> {
-        let mut parts = s.split_whitespace();
-        let net_str    = parts.next()?;
-        let action_str = parts.next()?;
-        let action = match action_str {
-            "allow" | "allow_snoop" | "allow_setrd" => AclAction::Allow,
-            "deny"  | "deny_non_local"              => AclAction::Deny,
-            "refuse"| "refuse_non_local"             => AclAction::Refuse,
-            _                                        => return None,
-        };
-        let (ip_str, prefix_len) = if let Some(pos) = net_str.find('/') {
-            let len: u8 = net_str[pos + 1..].parse().ok()?;
-            (&net_str[..pos], len)
+        let (ip_str, prefix_len) = if let Some(pos) = s.find('/') {
+            let len: u8 = s[pos + 1..].parse().ok()?;
+            (&s[..pos], len)
         } else {
-            let ip: IpAddr = net_str.parse().ok()?;
+            let ip: IpAddr = s.parse().ok()?;
             let len = match ip { IpAddr::V4(_) => 32, IpAddr::V6(_) => 128 };
-            (net_str, len)
+            (s, len)
         };
         let prefix: IpAddr = ip_str.parse().ok()?;
-        Some(AclEntry { prefix, prefix_len, action })
+        Some(CidrBlock { prefix, prefix_len })
     }
 
     #[inline]
-    fn matches(&self, ip: IpAddr) -> bool {
+    fn contains(&self, ip: IpAddr) -> bool {
         match (self.prefix, ip) {
             (IpAddr::V4(net), IpAddr::V4(addr)) => {
                 if self.prefix_len == 0 { return true; }
@@ -75,6 +65,56 @@ impl AclEntry {
             _ => false,
         }
     }
+}
+
+/// Set of CIDR ranges that must never appear in resolver responses.
+/// Mirrors Unbound's `private-address` directive — blocks DNS rebinding attacks
+/// where a malicious domain resolves to a private/loopback IP.
+pub struct PrivateAddressSet(Vec<CidrBlock>);
+
+impl PrivateAddressSet {
+    pub fn from_config(cidrs: &[String]) -> Self {
+        let parsed = cidrs.iter()
+            .filter_map(|s| {
+                CidrBlock::parse(s.trim()).or_else(|| {
+                    warn!(cidr=%s, "private-address: parse error — ignored");
+                    None
+                })
+            })
+            .collect();
+        Self(parsed)
+    }
+
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+
+    #[inline]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.0.iter().any(|b| b.contains(ip))
+    }
+}
+
+struct AclEntry {
+    cidr:   CidrBlock,
+    action: AclAction,
+}
+
+impl AclEntry {
+    fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.split_whitespace();
+        let net_str    = parts.next()?;
+        let action_str = parts.next()?;
+        let action = match action_str {
+            "allow" | "allow_snoop" | "allow_setrd" => AclAction::Allow,
+            "deny"  | "deny_non_local"              => AclAction::Deny,
+            "refuse"| "refuse_non_local"             => AclAction::Refuse,
+            _                                        => return None,
+        };
+        let cidr = CidrBlock::parse(net_str)?;
+        Some(AclEntry { cidr, action })
+    }
+
+    #[inline]
+    fn matches(&self, ip: IpAddr) -> bool { self.cidr.contains(ip) }
 }
 
 /// Compiled access-control list.  Build once from config, share via `Arc`.

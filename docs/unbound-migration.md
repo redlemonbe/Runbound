@@ -26,8 +26,8 @@ existing `unbound.conf` is all you need.
 | `logfile` | ✅ | ✅ | `""` = stdout |
 | `verbosity` | ✅ | ✅ | 0–5 |
 | `num-threads` | ✅ | ⚠️ | Ignored — Runbound uses Tokio async |
-| `cache-max-ttl` | ✅ | 🔜 | Planned |
-| `private-address` | ✅ | 🔜 | Planned |
+| `cache-max-ttl` | ✅ | ✅ | Since v0.2.2 |
+| `private-address` | ✅ | ✅ | Since v0.2.2 — DNS rebinding protection |
 | `module-config` | ✅ | ❌ | Unbound modules not supported |
 | `python-script` | ✅ | ❌ | No Python scripting |
 | `dnstap` | ✅ | ❌ | Not planned |
@@ -38,7 +38,7 @@ existing `unbound.conf` is all you need.
 |---|:---:|:---:|---|
 | `name` | ✅ | ✅ | |
 | `forward-addr` | ✅ | ✅ | `ip@port` syntax supported |
-| `forward-tls-upstream` | ✅ | 🔜 | Planned |
+| `forward-tls-upstream` | ✅ | ✅ | Since v0.2.2 — DNS-over-TLS to upstream |
 | `forward-first` | ✅ | ❌ | |
 
 ### Runbound-only directives
@@ -46,6 +46,7 @@ existing `unbound.conf` is all you need.
 | Directive | Description |
 |---|---|
 | `api-key` | REST API Bearer token (prefer `RUNBOUND_API_KEY` env var) |
+| `api-port` | REST API port (default: 8081) |
 
 ---
 
