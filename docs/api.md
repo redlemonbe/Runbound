@@ -1,7 +1,8 @@
 # REST API Reference
 
-Runbound exposes a REST API on port **8081** (HTTP). All write endpoints require
-a Bearer token set via `RUNBOUND_API_KEY`.
+Runbound exposes a REST API on **localhost only** (HTTP). The port defaults to
+**8081** and is configurable with `api-port` in `unbound.conf`. All write
+endpoints require a Bearer token set via `RUNBOUND_API_KEY`.
 
 ---
 
