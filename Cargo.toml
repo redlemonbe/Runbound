@@ -1,0 +1,115 @@
+[package]
+name = "runbound"
+version = "0.2.0"
+edition = "2021"
+authors = ["redlemonbe <https://github.com/redlemonbe>"]
+license = "PolyForm-Noncommercial-1.0.0"
+description = "RFC-compliant DNS recursive resolver — drop-in replacement for Unbound, with integrated REST API"
+repository = "https://github.com/redlemonbe/Runbound"
+homepage = "https://github.com/redlemonbe/Runbound"
+keywords = ["dns", "unbound", "resolver", "dnssec", "axum"]
+categories = ["network-programming", "command-line-utilities"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# DNS engine — DoT / DoH / DoQ / DNSSEC
+hickory-server   = { version = "0.24", features = [
+    "dnssec-ring",
+    "dns-over-rustls",
+    "dns-over-https-rustls",
+    "dns-over-quic",
+] }
+hickory-resolver = { version = "0.24", features = [
+    "dnssec-ring",
+    "tokio-runtime",
+    "dns-over-rustls",
+    "dns-over-https-rustls",
+] }
+hickory-proto    = { version = "0.24", features = [
+    "dnssec-ring",
+    "dns-over-rustls",
+    "dns-over-https-rustls",
+    "dns-over-quic",
+] }
+
+# TLS certificate loading — must match hickory-server 0.24's rustls 0.21
+rustls           = { version = "0.21" }
+rustls-pemfile   = "1"
+
+# REST API
+axum       = { version = "0.7", features = ["json"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower      = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+
+# Serialization
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+serde_with  = "3"
+
+# Error handling
+thiserror = "2"
+anyhow    = "1"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender   = "0.2"
+
+# Utils
+uuid            = { version = "1", features = ["v4", "serde"] }
+sha2            = "0.10"
+hex             = "0.4"
+subtle          = "2"
+tempfile        = "3"
+regex           = "1"
+humantime       = "2"
+humantime-serde = "1"
+
+# HTTP client (feeds fetch)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Async trait (required by RequestHandler impl)
+async-trait = "0.1"
+
+# Jemalloc (Linux only)
+tikv-jemallocator = "0.6"
+
+# Concurrent HashMap — replaces Mutex<HashMap> in rate limiter (lock-free reads)
+dashmap = "6"
+
+# Fast non-cryptographic hasher — RandomState seeded by OS CSPRNG at startup,
+# HashDoS resistant (v0.8+). Used for rate-limiter DashMaps (IpAddr keys).
+# Zone-lookup HashMaps keep SipHash: DNS name keys come from untrusted network.
+ahash = "0.8"
+
+# Raw socket control — SO_REUSEPORT per-CPU UDP socket binding
+socket2 = { version = "0.6", features = ["all"] }
+
+# Low-level OS syscalls used by AF_XDP implementation
+libc = "0.2"
+
+# Lock-free atomic Arc swap — read path for LocalZoneSet with zero contention
+arc-swap = "1"
+
+# Self-signed TLS certificate generation (--gen-cert)
+rcgen = "0.13"
+
+[features]
+# Kernel-bypass DNS fast path via AF_XDP / eBPF.
+# Requires: clang + libbpf-dev at build time (apt install clang libbpf-dev).
+# No runtime C libraries needed — aya is pure Rust.
+xdp = ["dep:aya"]
+
+[dependencies.aya]
+version  = "0.13"
+optional = true
+
+[profile.release]
+opt-level     = 3
+lto           = true
+strip         = true
+codegen-units = 1
