@@ -24,7 +24,7 @@ Internet / LAN
       │
       ▼
 ┌─────────────────────────────────────┐
-│  REST API (port 8081)               │
+│  REST API (port 8081, configurable)  │
 │  Bearer token (timing-safe cmp)     │  ← subtle::ConstantTimeEq
 │  Entry limits (10k DNS, 100k BL)    │
 │  zones_mutex (atomic write+swap)    │
