@@ -757,38 +757,9 @@ pub fn collect_feed_entries() -> Vec<(String, BlacklistAction)> {
 // ============================================================
 
 fn utc_now_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let sec = secs % 60;
-    let mins = secs / 60;
-    let min = mins % 60;
-    let hours = mins / 60;
-    let hour = hours % 24;
-    let total_days = hours / 24;
-
-    let mut y = 1970u64;
-    let mut days = total_days;
-    loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-        let diy = if leap { 366 } else { 365 };
-        if days < diy { break; }
-        days -= diy;
-        y += 1;
-    }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let month_days = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut mo = 1u64;
-    for &md in &month_days {
-        if days < md { break; }
-        days -= md;
-        mo += 1;
-    }
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, days + 1, hour, min, sec)
+    humantime::format_rfc3339(std::time::SystemTime::now()).to_string()
 }
+
 
 // ============================================================
 // Background auto-update loop

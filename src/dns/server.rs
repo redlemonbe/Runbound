@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::parser::TlsConfig;
 
 use crate::config::parser::UnboundConfig;
+use crate::stats::Stats;
 use super::acl::{Acl, AclAction, PrivateAddressSet};
 use super::local::{LocalZoneSet, ZoneAction};
 use super::ratelimit::RateLimiter;
@@ -58,6 +59,7 @@ pub struct RunboundHandler {
     acl:           Arc<Acl>,
     private_addrs: Arc<PrivateAddressSet>,
     cache_max_ttl: u32,
+    pub stats:     Arc<Stats>,
 }
 
 impl RunboundHandler {
@@ -68,11 +70,12 @@ impl RunboundHandler {
         acl:           Arc<Acl>,
         private_addrs: Arc<PrivateAddressSet>,
         cache_max_ttl: u32,
+        stats:         Arc<Stats>,
     ) -> Self {
         Self {
             zones, resolver, rate_limiter,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
-            acl, private_addrs, cache_max_ttl,
+            acl, private_addrs, cache_max_ttl, stats,
         }
     }
 }
@@ -88,6 +91,8 @@ impl RequestHandler for RunboundHandler {
         let qname     = request.query().name();
         let qtype     = request.query().query_type();
         let client_ip = request.src().ip();
+
+        self.stats.inc_total();
 
         // ── 0. Access-control list ──────────────────────────────────────
         match self.acl.check(client_ip) {
@@ -141,11 +146,13 @@ impl RequestHandler for RunboundHandler {
         match zone_action {
             Some(ZoneAction::Refuse) => {
                 debug!(%qname, "local-zone REFUSED");
+                self.stats.inc_blocked(); self.stats.inc_refused();
                 log_query(client_ip, qname, qtype, ResponseCode::Refused, "local-refuse", start);
                 return send_error(request, response_handle, ResponseCode::Refused).await;
             }
             Some(ZoneAction::NxDomain) => {
                 debug!(%qname, "local-zone NXDOMAIN");
+                self.stats.inc_blocked(); self.stats.inc_nxdomain();
                 log_query(client_ip, qname, qtype, ResponseCode::NXDomain, "local-nxdomain", start);
                 return send_error(request, response_handle, ResponseCode::NXDomain).await;
             }
@@ -256,6 +263,7 @@ impl RequestHandler for RunboundHandler {
                     std::iter::empty(),
                     std::iter::empty(),
                 );
+                self.stats.inc_forwarded();
                 log_query(client_ip, qname, qtype, ResponseCode::NoError, "forward", start);
                 response_handle.send_response(response).await
                     .unwrap_or_else(|e| { error!("send: {e}"); header.into() })
@@ -271,6 +279,12 @@ impl RequestHandler for RunboundHandler {
                         ResponseCode::ServFail
                     }
                 };
+                match rcode {
+                    ResponseCode::NXDomain => self.stats.inc_nxdomain(),
+                    ResponseCode::ServFail => self.stats.inc_servfail(),
+                    ResponseCode::Refused  => self.stats.inc_refused(),
+                    _ => {}
+                }
                 log_query(client_ip, qname, qtype, rcode, "forward-err", start);
                 send_error(request, response_handle, rcode).await
             }
@@ -413,14 +427,11 @@ fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioAsyncResolver> {
     opts.cache_size = 8192; // doubled from 4096 — better hit rate under load
     opts.timeout = Duration::from_secs(3);      // hard timeout per upstream query
     opts.attempts = 2;                           // retry once before SERVFAIL
-    // DNSSEC: disable local re-validation when operating as a forwarder.
-    // Upstream resolvers (1.1.1.1, 8.8.8.8) perform full DNSSEC validation
-    // and signal it via the AD bit. Re-validating locally requires complete
-    // RRSIG/DNSKEY chains in every response — forwarders strip them — causing
-    // spurious SERVFAIL for all unsigned or partially-signed zones (gmail.com
-    // MX, google.com AAAA, etc.). The AD flag from upstream is preserved and
-    // passed to the client, which is the correct forwarder behaviour.
-    opts.validate = false;
+    // DNSSEC: controlled by `dnssec-validation` directive (default: off for forwarders).
+    // Enable only when operating as a full recursive resolver with complete RRSIG chains.
+    // Forwarders must leave this off: upstreams strip RRSIGs before forwarding,
+    // causing spurious SERVFAIL for every signed domain (gmail.com, google.com…).
+    opts.validate = cfg.dnssec_validation;
     opts.use_hosts_file = false;                 // don't leak host file data
 
     Ok(TokioAsyncResolver::tokio(resolver_cfg, opts))
@@ -568,6 +579,7 @@ pub async fn run_dns_server(
     zones:        Arc<ArcSwap<LocalZoneSet>>,
     rate_limiter: Arc<RateLimiter>,
     acl:          Arc<Acl>,
+    stats:        Arc<Stats>,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -599,7 +611,7 @@ pub async fn run_dns_server(
     }
 
     let handler = RunboundHandler::new(
-        Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl,
+        Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl, stats,
     );
     let mut server = ServerFuture::new(handler);
 
@@ -636,8 +648,8 @@ pub async fn run_dns_server(
         let tcp = TcpListener::bind(&tcp_addr).await
             .map_err(|e| anyhow::anyhow!("TCP bind {tcp_addr}: {e}"))?;
         info!(addr=%tcp_addr, "DNS TCP listening");
-        // 5s idle timeout prevents slow-connection FD exhaustion
-        server.register_listener(tcp, Duration::from_secs(5));
+        // 30s idle timeout — enough for slow DNSSEC responses while limiting FD exhaustion
+        server.register_listener(tcp, Duration::from_secs(30));
     }
 
     // ── DoT / DoH / DoQ (RFC 7858 / 8484 / 9250) ───────────────────────────
@@ -654,7 +666,7 @@ pub async fn run_dns_server(
             match TcpListener::bind(&dot_addr).await {
                 Ok(tcp) => {
                     info!(addr=%dot_addr, "DoT (DNS-over-TLS) listening — RFC 7858");
-                    server.register_tls_listener(tcp, Duration::from_secs(5), tls.clone())
+                    server.register_tls_listener(tcp, Duration::from_secs(30), tls.clone())
                         .map_err(|e| anyhow::anyhow!("DoT register: {e}"))?;
                 }
                 Err(e) => warn!(addr=%dot_addr, err=%e, "DoT bind failed — skipping"),
@@ -665,7 +677,7 @@ pub async fn run_dns_server(
             match TcpListener::bind(&doh_addr).await {
                 Ok(tcp) => {
                     info!(addr=%doh_addr, "DoH (DNS-over-HTTPS) listening — RFC 8484");
-                    server.register_https_listener(tcp, Duration::from_secs(5), tls.clone(), Some(hostname.clone()))
+                    server.register_https_listener(tcp, Duration::from_secs(30), tls.clone(), Some(hostname.clone()))
                         .map_err(|e| anyhow::anyhow!("DoH register: {e}"))?;
                 }
                 Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
@@ -676,7 +688,7 @@ pub async fn run_dns_server(
             match UdpSocket::bind(&doq_addr).await {
                 Ok(udp) => {
                     info!(addr=%doq_addr, "DoQ (DNS-over-QUIC) listening — RFC 9250");
-                    server.register_quic_listener(udp, Duration::from_secs(5), tls.clone(), Some(hostname.clone()))
+                    server.register_quic_listener(udp, Duration::from_secs(30), tls.clone(), Some(hostname.clone()))
                         .map_err(|e| anyhow::anyhow!("DoQ register: {e}"))?;
                 }
                 Err(e) => warn!(addr=%doq_addr, err=%e, "DoQ bind failed — skipping"),

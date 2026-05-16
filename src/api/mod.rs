@@ -23,7 +23,8 @@ use tracing::{info, warn};
 use crate::dns::{BlacklistAction, ZoneAction, local::{LocalZoneSet, parse_local_data}};
 use crate::feeds::{self, FeedFormat, add_feed, builtin_presets, remove_feed, update_all_feeds, update_one_feed};
 use crate::store::{self, DnsEntry, DnsType, BlacklistEntry};
-use crate::config::parser::TlsConfig;
+use crate::config::parser::{TlsConfig, UnboundConfig};
+use crate::stats::Stats;
 
 /// Max TTL for API-created DNS entries (86400 s = 24 h).
 /// Prevents TTL-based cache persistence attacks and operator mistakes.
@@ -33,6 +34,10 @@ const MAX_API_TTL: u32 = 86_400;
 
 /// API key — read from RUNBOUND_API_KEY env at startup, or generated if absent.
 static API_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Global authentication failure counter (reset on every successful auth).
+/// Used to detect and slow brute-force attempts without per-IP state.
+static AUTH_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Max JSON body size (64 KiB) — prevents OOM via huge payloads.
 const MAX_BODY_BYTES: usize = 65_536;
@@ -111,6 +116,9 @@ pub struct AppState {
     pub zones_mutex:  Arc<Mutex<()>>,
     pub tls_cfg:      Arc<TlsConfig>,
     pub rate_limiter: ApiRateLimiter,
+    pub stats:        Arc<Stats>,
+    pub cfg:          Arc<UnboundConfig>,
+    pub cfg_path:     String,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -193,21 +201,33 @@ async fn security_middleware(
     }
 
     // ── 2. API key authentication (Bearer token) ──────────────────────
-    // /help is public; all other endpoints require authentication
+    // ALL endpoints require authentication — including /help.
+    // Exposing version, endpoint list, or RFCs without auth enables
+    // fingerprinting and targeted exploitation (AUDIT-HIGH-02).
     let path = req.uri().path();
-    if path != "/help" {
+    {
         let auth = req.headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let expected = format!("Bearer {}", get_api_key());
-        // Constant-time comparison to prevent timing attacks
         if !constant_time_eq(auth.as_bytes(), expected.as_bytes()) {
-            warn!(%client_ip, %path, "API auth failed");
+            // Increment global auth-failure counter (localhost-only API,
+            // so per-IP tracking adds nothing; we track globally).
+            let failures = AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if failures % 10 == 0 {
+                warn!(failures, %path, "Repeated API authentication failures — check RUNBOUND_API_KEY");
+            }
+            if failures >= 100 {
+                // Brief lockout: force a short delay to slow automated guessing.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
             return (StatusCode::UNAUTHORIZED,
                 [(axum::http::header::WWW_AUTHENTICATE, "Bearer realm=\"runbound\"")],
                 "Unauthorized").into_response();
         }
+        // Successful auth resets the failure counter.
+        AUTH_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ── 3. Security response headers ──────────────────────────────────
@@ -245,8 +265,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        // Info (public)
+        // Info
         .route("/help",              get(help_handler))
+        // Operations
+        .route("/health",            get(health_handler))
+        .route("/stats",             get(stats_handler))
+        .route("/config",            get(config_handler))
+        .route("/reload",            post(reload_handler))
         // DNS CRUD
         .route("/dns",               get(list_dns_handler).post(add_dns_handler))
         .route("/dns/:id",           delete(delete_dns_handler))
@@ -270,10 +295,7 @@ pub fn router(state: AppState) -> Router {
 
 async fn help_handler() -> impl IntoResponse {
     JsonExtract(serde_json::json!({
-        "name": env!("CARGO_PKG_NAME"),
-        "version": env!("CARGO_PKG_VERSION"),
-        "author": env!("CARGO_PKG_AUTHORS"),
-        "repository": env!("CARGO_PKG_REPOSITORY"),
+        "service": "Runbound DNS",
         "protocols": ["DNS/UDP:53","DNS/TCP:53","DoT:853","DoH:443","DoQ:853/UDP"],
         "rfcs": ["RFC1034","RFC1035","RFC2782","RFC4033","RFC4034","RFC4035","RFC6698","RFC6891","RFC7858","RFC8484","RFC9250"],
         "endpoints": [
@@ -293,6 +315,85 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/tls",              "description":"DoT/DoH/DoQ TLS status"},
         ]
     }))
+}
+
+// ── GET /health ────────────────────────────────────────────────────────────
+
+async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let snap = s.stats.snapshot();
+    JsonExtract(serde_json::json!({
+        "status":      "ok",
+        "uptime_secs": snap.uptime_secs,
+        "queries":     snap.total,
+    }))
+}
+
+// ── GET /stats ─────────────────────────────────────────────────────────────
+
+async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let snap = s.stats.snapshot();
+    let pct_blocked = if snap.total > 0 {
+        (snap.blocked as f64 / snap.total as f64 * 100.0).round() as u64
+    } else { 0 };
+    JsonExtract(serde_json::json!({
+        "total":           snap.total,
+        "blocked":         snap.blocked,
+        "forwarded":       snap.forwarded,
+        "nxdomain":        snap.nxdomain,
+        "refused":         snap.refused,
+        "servfail":        snap.servfail,
+        "blocked_percent": pct_blocked,
+        "uptime_secs":     snap.uptime_secs,
+    }))
+}
+
+// ── GET /config ────────────────────────────────────────────────────────────
+
+async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let cfg = s.cfg.as_ref();
+    JsonExtract(serde_json::json!({
+        "port":              cfg.port,
+        "interfaces":        cfg.interfaces,
+        "forward_zones":     cfg.forward_zones.iter().map(|fz| serde_json::json!({
+            "name":  fz.name,
+            "addrs": fz.addrs,
+            "tls":   fz.tls,
+        })).collect::<Vec<_>>(),
+        "local_zones":       cfg.local_zones.len(),
+        "local_data":        cfg.local_data.len(),
+        "access_control":    cfg.access_control,
+        "private_addresses": cfg.private_addresses,
+        "rate_limit":        cfg.rate_limit,
+        "cache_max_ttl":     cfg.cache_max_ttl,
+        "api_port":          cfg.api_port,
+        // api_key intentionally omitted — secret
+        "logfile":           cfg.logfile,
+    }))
+}
+
+// ── POST /reload ────────────────────────────────────────────────────────────
+
+async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
+    match crate::config::load(&s.cfg_path) {
+        Ok(new_cfg) => {
+            let new_zones = crate::build_zone_set(&new_cfg);
+            s.zones.store(std::sync::Arc::new(new_zones));
+            info!(cfg_path = %s.cfg_path, "API hot-reload complete");
+            (StatusCode::OK, JsonExtract(serde_json::json!({
+                "status":      "ok",
+                "cfg_path":    s.cfg_path,
+                "local_zones": new_cfg.local_zones.len(),
+                "local_data":  new_cfg.local_data.len(),
+            })))
+        }
+        Err(e) => {
+            warn!(err = %e, "API reload failed — keeping current zones");
+            (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+                "error":   "RELOAD_FAILED",
+                "details": e.to_string(),
+            })))
+        }
+    }
 }
 
 // ── DNS CRUD ───────────────────────────────────────────────────────────────

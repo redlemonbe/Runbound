@@ -43,7 +43,15 @@ impl RateLimiter {
         }
 
         if !self.buckets.contains_key(&ip) && self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
-            return false;
+            // Bucket table full — aggressively evict idle entries (>10 s) before
+            // silently dropping the new IP. This prevents a bucket-exhaustion attack
+            // where an attacker floods from N distinct IPs to fill the table and
+            // cause all subsequent IPs (including legitimate clients) to be refused.
+            self.buckets.retain(|_, b| now.duration_since(b.last_refill).as_secs() < 10);
+            if self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+                // Still full after eviction — table is under active flood; drop.
+                return false;
+            }
         }
 
         let mut bucket = self.buckets.entry(ip).or_insert(IpBucket {

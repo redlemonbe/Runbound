@@ -532,26 +532,26 @@ This design is sound. There is no data exfiltration risk from the XDP path.
 
 | ID | Severity | Component | Status |
 |---|---|---|---|
-| CRIT-01 | CRITICAL | API | Fixed (docs corrected, endpoints added in v0.2.4) |
-| CRIT-02 | CRITICAL | DNS/DNSSEC | Open — architectural decision required |
+| CRIT-01 | CRITICAL | API | Fixed in v0.2.5 — /health /stats /config /reload implemented |
+| CRIT-02 | CRITICAL | DNS/DNSSEC | Mitigated in v0.2.5 — dnssec-validation directive added |
 | CRIT-03 | CRITICAL | Feeds/SSRF | Fixed in v0.2.4 |
 | CRIT-04 | CRITICAL | Feeds/SSRF | Fixed in v0.2.4 |
 | HIGH-01 | HIGH | Feeds | Fixed in v0.2.4 (MAX_FEEDS = 100) |
-| HIGH-02 | HIGH | API | Open — operator decision |
+| HIGH-02 | HIGH | API | Fixed in v0.2.5 — /help now requires Bearer token |
 | HIGH-03 | HIGH | DNS | Mitigated in v0.2.4 (loud warning log) |
-| HIGH-04 | HIGH | Reload | Fixed in v0.2.4 (doc corrected) |
-| HIGH-05 | HIGH | RateLimit | Open — requires network-layer BCP38 |
-| HIGH-06 | HIGH | Storage | Open — architectural |
+| HIGH-04 | HIGH | Reload | Fixed in v0.2.5 — POST /reload implemented |
+| HIGH-05 | HIGH | RateLimit | Mitigated in v0.2.5 — aggressive eviction on bucket exhaustion |
+| HIGH-06 | HIGH | Storage | Open — architectural (HMAC integrity planned) |
 | HIGH-07 | HIGH | TLS | Open — requires rustls upgrade |
 | HIGH-08 | HIGH | TLS/DoT | Open — requires mTLS implementation |
 | MED-01 | MEDIUM | Feeds | Accepted — intentional RFC relaxation |
 | MED-02 | MEDIUM | Feeds/SSRF | Partial — documented residual risk |
 | MED-03 | MEDIUM | Feeds/SSRF | Open — resolver independence |
 | MED-04 | MEDIUM | XDP | Mitigated in v0.2.4 (debug_assert added) |
-| MED-05 | MEDIUM | API | Open — auth lockout not implemented |
+| MED-05 | MEDIUM | API | Fixed in v0.2.5 — AUTH_FAILURES global counter + 500ms lockout |
 | MED-06 | MEDIUM | Logging | Open — verify tracing JSON escaping |
 | MED-07 | MEDIUM | Config | Mitigated in v0.2.4 (WARN log) |
-| LOW-01 | LOW | Feeds | Open — tech debt |
+| LOW-01 | LOW | Feeds | Fixed in v0.2.5 — replaced with humantime::format_rfc3339 |
 | LOW-02 | LOW | API | Open — operator decision |
 | LOW-03 | LOW | Config | Open |
 | LOW-04 | LOW | DNS/TLS | Open |
