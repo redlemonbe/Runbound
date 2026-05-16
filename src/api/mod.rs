@@ -432,6 +432,33 @@ async fn add_dns_handler(
             "error": "INVALID_NAME", "details": e
         })));
     }
+    // Reject control characters in free-text fields (CRLF injection prevention).
+    for (field, val) in [
+        ("value",       req.value.as_deref().unwrap_or("")),
+        ("tag",         req.tag.as_deref().unwrap_or("")),
+        ("description", req.description.as_deref().unwrap_or("")),
+        ("fingerprint", req.fingerprint.as_deref().unwrap_or("")),
+        ("cert_data",   req.cert_data.as_deref().unwrap_or("")),
+        ("services",    req.services.as_deref().unwrap_or("")),
+        ("regexp",      req.regexp.as_deref().unwrap_or("")),
+        ("replacement", req.replacement.as_deref().unwrap_or("")),
+        ("flags_naptr", req.flags_naptr.as_deref().unwrap_or("")),
+    ] {
+        if let Err(e) = validate_no_control_chars(val, field) {
+            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                "error": "INVALID_FIELD", "details": e
+            })));
+        }
+    }
+    // RFC 2181 §8: TTL is a signed 32-bit integer; values >= 2^31 are treated
+    // as 0 by compliant resolvers — reject them to prevent silent data loss.
+    const RFC2181_MAX_TTL: u32 = 2_147_483_647;
+    if req.ttl > RFC2181_MAX_TTL {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_TTL",
+            "details": format!("TTL {} exceeds RFC 2181 maximum of 2147483647", req.ttl)
+        })));
+    }
     let entry = DnsEntry {
         id:               DnsEntry::new_id(),
         name:             ensure_dot(&req.name),
@@ -593,6 +620,13 @@ async fn add_blacklist_handler(
             "error": "INVALID_NAME", "details": e
         })));
     }
+    if let Some(ref desc) = req.description {
+        if let Err(e) = validate_no_control_chars(desc, "description") {
+            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                "error": "INVALID_FIELD", "details": e
+            })));
+        }
+    }
     // Persist + inject atomically under zones_mutex (same race-fix as add_dns).
     let entry = {
         let _guard = s.zones_mutex.lock().await;
@@ -709,11 +743,15 @@ async fn delete_feed_handler(
     }
 }
 
-async fn update_feeds_handler(State(_s): State<AppState>) -> impl IntoResponse {
+async fn update_feeds_handler(State(s): State<AppState>) -> impl IntoResponse {
     match update_all_feeds().await {
         Ok(results) => {
             let updated = results.iter().filter(|r| r.status == "updated").count();
             let errors  = results.iter().filter(|r| r.status == "error").count();
+            // Rebuild zone set so newly downloaded feed domains are immediately active.
+            let new_zones = crate::build_zone_set(&s.cfg);
+            s.zones.store(std::sync::Arc::new(new_zones));
+            info!(updated, errors, "Feed update complete — zones rebuilt");
             (StatusCode::OK, JsonExtract(serde_json::json!({
                 "status": "ok", "results": results,
                 "summary": {"updated": updated, "errors": errors}
@@ -724,11 +762,14 @@ async fn update_feeds_handler(State(_s): State<AppState>) -> impl IntoResponse {
 }
 
 async fn update_one_feed_handler(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match update_one_feed(&id).await {
         Ok(result) => {
+            // Rebuild zone set immediately so the refreshed feed is active without a reload.
+            let new_zones = crate::build_zone_set(&s.cfg);
+            s.zones.store(std::sync::Arc::new(new_zones));
             let code = if result.error.is_some() { StatusCode::INTERNAL_SERVER_ERROR } else { StatusCode::OK };
             (code, JsonExtract(serde_json::json!({"result": result})))
         }
@@ -771,6 +812,16 @@ async fn tls_status_handler(State(s): State<AppState>) -> impl IntoResponse {
 
 fn ensure_dot(name: &str) -> String {
     if name.ends_with('.') { name.to_string() } else { format!("{}.", name) }
+}
+
+/// Reject any string that contains ASCII control characters (0x00–0x1f, 0x7f).
+/// Applied to all user-supplied text fields (value, description) to prevent
+/// CRLF injection into logs, stored JSON, or HTTP response bodies.
+fn validate_no_control_chars(s: &str, field: &'static str) -> Result<(), String> {
+    if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(format!("Field '{}' must not contain control characters (\\r, \\n, etc.)", field));
+    }
+    Ok(())
 }
 
 /// VUL-05: Validate a DNS name before accepting it from the API.

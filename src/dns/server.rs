@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hickory_proto::op::{Header, ResponseCode};
-use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use hickory_resolver::{
     config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     error::ResolveErrorKind,
@@ -130,7 +130,17 @@ impl RequestHandler for RunboundHandler {
             }
         };
 
-        // ── 3. Block ANY queries (RFC 8482 — amplification vector) ─────
+        // ── 3a. Block CHAOS class queries (version.bind, hostname.bind) ───
+        // CHAOS class exposes DNS server identity even when hide-identity/
+        // hide-version are set in unbound.conf. Return REFUSED for all CH queries.
+        if request.query().query_class() == DNSClass::CH {
+            debug!(%client_ip, %qname, "CHAOS class query blocked");
+            self.stats.inc_refused();
+            log_query(client_ip, qname, qtype, ResponseCode::Refused, "chaos-block", start);
+            return send_error(request, response_handle, ResponseCode::Refused).await;
+        }
+
+        // ── 3b. Block ANY queries (RFC 8482 — amplification vector) ────
         if qtype == RecordType::ANY {
             debug!(%client_ip, "ANY query blocked (RFC 8482)");
             log_query(client_ip, qname, qtype, ResponseCode::NotImp, "rfc8482-any", start);
