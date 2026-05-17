@@ -134,6 +134,8 @@ Ready-to-use configs for common scenarios:
 | [examples/office.conf](examples/office.conf) | SMB office — split-horizon DNS, VPN, corporate zone |
 | [examples/server.conf](examples/server.conf) | Public recursive resolver — VPS / datacenter |
 | [examples/secure.conf](examples/secure.conf) | Air-gapped / military-grade — strict ACL, no public forwarding |
+| [examples/master.conf](examples/master.conf) | Master node — writes + replication to slaves |
+| [examples/slave.conf](examples/slave.conf) | Slave replica — read-only, TOFU TLS, auto delta sync |
 
 ---
 

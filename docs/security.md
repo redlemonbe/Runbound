@@ -65,11 +65,42 @@ rate-limit: 500    # max queries per second per IP
 
 ---
 
-## Inflight semaphore
+## Anti-OOM memory protection
+
+Runbound has two independent, always-active defences against memory exhaustion:
+
+### 1. Inflight concurrency semaphore
 
 Hard cap of **4,096 concurrent in-flight requests**. When the semaphore is exhausted,
-new requests receive REFUSED immediately without allocating any memory. This prevents
-OOM under DNS flood conditions.
+new requests receive REFUSED immediately without allocating any additional memory.
+This provides a hard backstop even at line rate and is immune to amplification —
+no bytes are allocated for the rejected request.
+
+### 2. Memory pressure guard
+
+A background task reads `/proc/meminfo` every **30 seconds**. When system RAM usage
+reaches **80 %**, two caches are purged atomically:
+
+- **Rate-limiter DashMap** — all token buckets cleared. Each IP rebuilds its bucket
+  on the next query; no query is lost, only the accumulation of per-IP state.
+- **hickory-resolver cache** — the resolver is rebuilt from config and atomically
+  swapped via ArcSwap. In-flight queries hold their Arc reference and complete
+  normally; new queries use the fresh resolver with an empty cache.
+
+After the purge, the new usage level is logged. If usage is still above 50 %, a
+second warning is emitted so the operator knows a permanent fix (more RAM, reduced
+rate limit, fewer feed subscriptions) may be needed.
+
+On non-Linux systems or containers without `/proc/meminfo`, the guard silently
+skips its check — DNS service continues normally.
+
+```
+WARN Memory pressure — purging DNS caches  used_pct=82.3%  avail_mb=312  total_mb=1753
+WARN DNS resolver cache flushed and rate limiter cleared  freed_buckets=8241
+WARN Memory after purge  used_pct=44.1%  status="below 50% target"
+```
+
+**The memory guard is always active — no configuration required.**
 
 ---
 

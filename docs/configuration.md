@@ -146,6 +146,52 @@ complete RRSIG/DNSKEY chains. In forwarder mode (the typical setup with Cloudfla
 Quad9), enabling this causes SERVFAIL on every signed domain because forwarders strip
 DNSSEC records. Default is `no` — trust the upstream AD bit.
 
+### Anti-OOM memory guard
+
+Runbound runs two automatic memory-pressure defences — both are always active, no
+configuration required.
+
+**1 — Inflight concurrency cap (hard limit)**
+
+```
+# Not configurable — hardcoded at 4,096 concurrent requests.
+# Excess requests receive REFUSED immediately, zero allocation.
+```
+
+`hickory-server` spawns one tokio task per incoming DNS request with no backpressure.
+Under a flood (DDoS or benchmark), this exhausts RAM and triggers the Linux OOM killer.
+Runbound imposes a semaphore of **4,096 concurrent in-flight requests**. When the limit
+is reached, new requests receive `REFUSED` instantly without allocating any memory.
+This bound is hard even at line rate.
+
+**2 — Memory pressure guard (background, /proc/meminfo)**
+
+```
+# Not configurable — polls /proc/meminfo every 30 s.
+# Threshold: purge when system RAM usage ≥ 80 %
+# Target:    log status at 50 % after purge
+```
+
+A background task reads `/proc/meminfo` every 30 seconds. If system memory usage
+reaches **80 %**, two caches are flushed atomically:
+
+| Cache | Action | Recovery |
+|---|---|---|
+| Rate-limiter DashMap | All token buckets cleared | Rebuilds naturally on next query per IP |
+| hickory-resolver cache | Resolver rebuilt, ArcSwap pointer swapped | In-flight queries keep old resolver; new queries use fresh empty cache |
+
+After purging, usage and whether the 50 % target was reached are logged at `WARN` level.
+On non-Linux systems or containers without `/proc/meminfo`, the guard silently skips
+its check and DNS service continues normally.
+
+**Log output example:**
+
+```
+WARN Memory pressure — purging DNS caches  used_pct=82.3%  avail_mb=312  total_mb=1753
+WARN DNS resolver cache flushed and rate limiter cleared  freed_buckets=8241
+WARN Memory after purge  used_pct=44.1%  status="below 50% target"
+```
+
 ### Cache TTL cap
 
 ```
