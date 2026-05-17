@@ -124,8 +124,29 @@ journalctl -u runbound | grep -i "sha256\|fingerprint\|sync"
 # [INFO] Sync HTTPS server starting  port=8082  sha256=AA:BB:CC:…
 ```
 
-The master auto-generates `/etc/runbound/sync-cert.pem` on first start.
-Copy the SHA-256 fingerprint shown in the log — you will verify it on the slave.
+The master auto-generates `sync-cert.pem` and `sync-key.pem` on first start in the
+**same directory as `runbound.conf`** (the runtime base directory). With the default
+config path `/etc/runbound/runbound.conf`, the files land at:
+
+| File | Path | Purpose |
+|---|---|---|
+| `sync-cert.pem` | `/etc/runbound/sync-cert.pem` | Master's self-signed TLS cert for the sync endpoint |
+| `sync-key.pem` | `/etc/runbound/sync-key.pem` | Corresponding private key (chmod 600) |
+
+On the slave side, after TOFU:
+
+| File | Path | Purpose |
+|---|---|---|
+| `sync-master.fingerprint` | `/etc/runbound/sync-master.fingerprint` | Pinned SHA-256 of the master's cert |
+
+If your config file is at a non-standard path, these files follow. For example, with
+`/opt/runbound/runbound.conf` they would be at `/opt/runbound/sync-cert.pem` etc.
+
+To force a re-TOFU (master cert regeneration or suspected compromise): delete
+`sync-cert.pem` and `sync-key.pem` on the master, then `sync-master.fingerprint` on
+the slave, and restart both.
+
+Copy the SHA-256 fingerprint shown in the master log — you will verify it on the slave.
 
 ---
 

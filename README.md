@@ -32,6 +32,8 @@ Your existing `unbound.conf` works as-is. Zero migration.
 | Master/slave replication | ✅ AXFR/IXFR | ❌ | ✅ built-in |
 | Automatic TLS (Let's Encrypt) | ❌ external | ❌ external | ✅ built-in ACME |
 | Tamper-evident audit log | ❌ | ❌ | ✅ HMAC-SHA256 chain |
+| Prometheus metrics | ⚠️ XML/JSON channel | ❌ | ✅ `/metrics` OpenMetrics |
+| API key rotation (no restart) | ❌ | ❌ | ✅ `POST /rotate-key` |
 | Hot config reload | ✅ rndc reload | ❌ | ✅ API |
 | AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ optional |
 | Static binary (no dependencies) | ❌ | ❌ | ✅ musl builds |
@@ -44,14 +46,14 @@ Your existing `unbound.conf` works as-is. Zero migration.
 ```bash
 # 1 — Download the static binary (no dependencies)
 #     Replace vX.Y.Z with the latest version tag from the releases page
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.1-x86_64-linux-musl
-chmod +x runbound-v0.3.1-x86_64-linux-musl
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.2-x86_64-linux-musl
+chmod +x runbound-v0.3.2-x86_64-linux-musl
 
 # 2 — One-liner install (downloads automatically, sets up systemd):
 #     sudo bash <(curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh)
 
 # 3 — Or point it at your existing Unbound config
-sudo ./runbound-v0.3.1-x86_64-linux-musl /etc/unbound/unbound.conf
+sudo ./runbound-v0.3.2-x86_64-linux-musl /etc/unbound/unbound.conf
 
 # 4 — Test it
 dig @127.0.0.1 google.com
@@ -61,7 +63,7 @@ DNS live on **port 53**. REST API live on **port 8081** (localhost only, require
 
 The REST API port is configurable with `api-port: 9090` in `runbound.conf`. See the [Configuration Reference](docs/configuration.md#api-key-and-port).
 
-> Raspberry Pi or ARM server? Grab `runbound-v0.3.1-aarch64-linux-musl` instead.
+> Raspberry Pi or ARM server? Grab `runbound-v0.3.2-aarch64-linux-musl` instead.
 
 ---
 

@@ -46,10 +46,11 @@ access-control: 0.0.0.0/0      refuse
 |---|---|
 | `allow` | Accept the query and answer it. |
 | `deny` | Drop the packet silently. |
-| `refuse` | Reply with DNS REFUSED. Recommended default — client knows it was blocked. |
+| `refuse` | Reply with DNS REFUSED. Recommended — client knows it was blocked. |
+| *(no match)* | **`refuse`** — fail-secure default. If no rule matches the client IP, Runbound replies with REFUSED. |
 
-Rules are evaluated in order. The first match wins. If no rule matches, the default
-is `refuse` (fail-secure).
+Rules are evaluated in order. The first match wins. The implicit default when no rule
+matches is `refuse` — this means an empty `access-control` block blocks all clients.
 
 **IPv4-mapped IPv6:** A client connecting as `::ffff:192.168.1.1` is automatically
 normalised to `192.168.1.1` before matching — your IPv4 ACL rules apply correctly.
@@ -179,14 +180,19 @@ server:
 
 **How it works:**
 
-1. On startup Runbound checks whether the certificate is missing or older than 60 days.
+1. On startup Runbound checks whether the certificate is missing or was last modified
+   more than **60 days ago**. Let's Encrypt issues 90-day certificates, so a 60-day
+   mtime threshold means renewal triggers with **at least 30 days of validity remaining**.
 2. If renewal is needed, a temporary HTTP server binds on `acme-challenge-port` to answer
    Let's Encrypt's HTTP-01 challenge.
 3. The issued certificate is written atomically to `acme-cache-dir/cert.pem` and
    `acme-cache-dir/key.pem` — then used as `tls-service-pem` / `tls-service-key`.
-4. A background task checks every 6 hours and renews at least 30 days before expiry.
+4. A background task **checks every 6 hours** and triggers renewal if the 60-day mtime
+   threshold is met (i.e., ≤ 30 days before expiry).
 5. After renewal, restart Runbound to load the new certificate (or configure your process
    supervisor to watch the cert file and SIGHUP on change).
+
+**Timer summary:** check interval = 6 h · renewal threshold = cert age > 60 days · minimum validity at renewal = 30 days.
 
 **Quick setup:**
 
@@ -517,3 +523,22 @@ The sync port number is configurable. The REST API stays on localhost on all nod
 | `RUNBOUND_API_KEY` | REST API Bearer token. Overrides `api-key` in config. |
 | `RUNBOUND_AUDIT_HMAC_KEY` | HMAC key for the audit log. Overrides `audit-log-hmac-key` in config. |
 | `RUST_LOG` | Log filter (e.g. `runbound=debug,info`). |
+
+### API key rotation without restart
+
+The Bearer token can be rotated live without restarting Runbound or interrupting DNS service:
+
+```bash
+# 1. Generate a new key and update the environment:
+NEW_KEY=$(openssl rand -hex 32)
+export RUNBOUND_API_KEY="$NEW_KEY"   # or update your systemd EnvironmentFile
+
+# 2. Rotate — call with the CURRENT key, the new key is read from env:
+curl -X POST http://localhost:8081/rotate-key \
+  -H "Authorization: Bearer $OLD_KEY"
+
+# 3. From this point on, $NEW_KEY is required for all API calls.
+```
+
+The old token is invalidated atomically. The rotation is recorded in the audit log.
+See [api.md](api.md#post-rotate-key) for full details.

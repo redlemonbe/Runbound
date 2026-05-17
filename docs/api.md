@@ -21,7 +21,9 @@ Timing-safe comparison is used server-side (constant-time, immune to timing atta
 
 ### `GET /help`
 
-API documentation and endpoint list. **Requires Bearer authentication.**
+API documentation and endpoint list. **Requires Bearer authentication** (same as all
+other endpoints — exposing version and endpoint list without auth enables fingerprinting,
+see security rationale in [`docs/security.md`](security.md)).
 
 ```bash
 export RUNBOUND_API_KEY="$(cat /etc/runbound/api.key)"
@@ -491,6 +493,94 @@ curl -X POST http://localhost:8081/reload \
 ```
 
 **Note:** ACL rules and forward-zone upstreams require a full restart.
+
+---
+
+### `GET /metrics`
+
+Prometheus/OpenMetrics exposition. Returns all counters and gauges from `GET /stats` in
+Prometheus text format (`text/plain; version=0.0.4`). Compatible with any Prometheus
+scraper, Grafana Agent, VictoriaMetrics, and OTEL Collector.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/metrics
+```
+
+```
+# HELP runbound_queries_total Total DNS queries received
+# TYPE runbound_queries_total counter
+runbound_queries_total 125432
+# HELP runbound_blocked_total Queries answered with REFUSED (blacklist/feeds)
+# TYPE runbound_blocked_total counter
+runbound_blocked_total 8921
+# HELP runbound_qps Queries per second
+# TYPE runbound_qps gauge
+runbound_qps{window="1m"} 34.7
+runbound_qps{window="5m"} 31.2
+runbound_qps{window="peak"} 410
+# HELP runbound_latency_ms DNS query latency percentiles in milliseconds
+# TYPE runbound_latency_ms gauge
+runbound_latency_ms{quantile="0.5"} 0.3
+runbound_latency_ms{quantile="0.95"} 4.2
+runbound_latency_ms{quantile="0.99"} 22.5
+# HELP runbound_dnssec_total DNSSEC validation results
+# TYPE runbound_dnssec_total counter
+runbound_dnssec_total{status="secure"} 1000
+runbound_dnssec_total{status="bogus"} 5
+runbound_dnssec_total{status="insecure"} 100
+...
+```
+
+**Prometheus scrape config:**
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: runbound
+    static_configs:
+      - targets: ["localhost:8081"]
+    authorization:
+      type: Bearer
+      credentials: <your-api-key>
+    metrics_path: /metrics
+```
+
+---
+
+### `POST /rotate-key`
+
+Atomically replace the active Bearer token **without restarting Runbound**. The old token
+is invalidated the instant this endpoint returns. Designed for PCI-DSS / NIS2 key
+rotation requirements.
+
+**Procedure:**
+
+```bash
+# 1. Set the new key in the environment (before calling rotate-key):
+export RUNBOUND_API_KEY="$(openssl rand -hex 32)"
+
+# 2. Call rotate-key with the CURRENT (old) key:
+curl -X POST http://localhost:8081/rotate-key \
+  -H "Authorization: Bearer $OLD_KEY"
+
+# 3. All subsequent calls must use the new key.
+```
+
+```json
+{"status": "ok", "message": "API key rotated — old token is immediately invalid"}
+```
+
+**How it works:** `POST /rotate-key` reads `RUNBOUND_API_KEY` from the process
+environment (already updated by the admin in step 1) and atomically swaps the in-memory
+key. No restart, no DNS service interruption. The rotation is recorded in the audit log
+as a `ConfigReload` event.
+
+**Errors:**
+
+| Code | Meaning |
+|---|---|
+| `400` | `RUNBOUND_API_KEY` env var not set or empty — set it first |
+| `401` | Old key incorrect — rotation rejected |
 
 ---
 
