@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.3.5] — 2026-05-17
+
+### Fixed
+
+- **`GET /config` missing `log_retention` / `log_client_ip`** — the two GDPR privacy
+  directives added in v0.3.4 were not exposed in the config snapshot endpoint.
+  Both fields now appear in the response alongside all other runtime parameters.
+- **CHAOS class returning NOERROR** — confirmed that `version.bind CH TXT` and
+  `hostname.bind CH TXT` correctly return `NOTIMP` (SEC-10). The finding was caused by
+  the pentest tooling hitting the system Unbound on port 53 rather than Runbound.
+  No code change required; this entry documents the root-cause analysis.
+
+---
+
 ## [0.3.4] — 2026-05-17
 
 ### Added
