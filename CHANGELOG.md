@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.5] — 2026-05-17
+
+### Security — pentest v0.4.4 follow-up
+
+- **NEW-HIGH — Timing oracle on Bearer token eliminated** (`src/api/mod.rs`)  
+  The brute-force brake (`tokio::time::sleep(500 ms)` at ≥ 50 auth failures) was on the
+  critical path *after* `constant_time_eq`, creating a measurable timing signal for keys
+  that shared a long prefix with the valid key (observed: +183 ms vs. random key).  
+  Fix: the sleep is now applied **before** `constant_time_eq`, uniformly to all requests
+  when the failure counter is high, so it cannot reveal key content. Post-comparison side
+  effects (audit event, periodic `warn!`) are moved to `tokio::spawn` — the 401 is
+  returned immediately with no timing leakage.
+
+- **SEC-02 MEDIUM — Domain length validation confirmed + HTTP integration tests** (`src/api/mod.rs`)  
+  Pentest claimed "254-char name → HTTP 201". Investigation confirms this is the same false
+  positive as the military audit: the test used a 253-char name + trailing FQDN dot (= 254
+  bytes submitted), which is correctly accepted (trailing dot stripped before the 253-char
+  check per RFC 1035 §2.3.4). Added three HTTP-level integration tests
+  (`dns_name_254_chars_is_rejected`, `blacklist_name_254_chars_is_rejected`,
+  `dns_name_253_chars_no_trailing_dot_passes_validation`) that prove the boundary
+  end-to-end and will catch any regression.
+
+- **SEC-04 LOW — JSON POST without `Content-Length` now returns 411** (`src/api/mod.rs`)  
+  Chunked JSON bodies (no `Content-Length` header) bypassed the early 413 check in the
+  security middleware and caused `DefaultBodyLimit` to drop the TCP connection for large
+  bodies (observed for 512 KB and 5 MB payloads) instead of returning 413. Fix: JSON
+  requests without `Content-Length` now receive **411 Length Required** before reaching
+  rate limiting or auth. Non-JSON POST endpoints (`/reload`, `/feeds/update`, etc.)
+  are unaffected. New integration tests confirm 411 behaviour.
+
+- **NEW-LOW — UUID null byte TCP drop** (`docs/security-audit.md`)  
+  A raw `\x00` in an HTTP path is rejected by hyper at the HTTP/1.1 parse layer before
+  any application code runs. Documented as a known hyper limitation; not addressable at
+  the application level.
+
+---
+
 ## [0.4.4] — 2026-05-17
 
 ### Added — supply-chain security & HSM key storage

@@ -258,11 +258,24 @@ async fn security_middleware(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    // ── 0. Body size pre-check (S-11) ────────────────────────────────
+    // ── 0. Body size pre-check ───────────────────────────────────────
     // DefaultBodyLimit fires at extraction time inside the handler, not here.
     // A large body would therefore hit the rate limiter first and return 429
     // instead of 413. Checking Content-Length early produces the correct 413
     // for over-sized requests before the rate limit token is consumed.
+    //
+    // SEC-04: clients sending chunked bodies (no Content-Length) bypass this
+    // check and hit DefaultBodyLimit directly. For very large chunked bodies
+    // (> ~512 KB) hyper cannot drain the remaining data before the RST, so
+    // the client receives a connection drop instead of 413.
+    // Fix: require Content-Length on JSON-body requests. Non-JSON POST
+    // endpoints (/reload, /feeds/update, etc.) are unaffected.
+    let has_content_type_json = req.headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("application/json"))
+        .unwrap_or(false);
+
     if let Some(cl) = req.headers().get(axum::http::header::CONTENT_LENGTH) {
         let len: usize = cl.to_str().unwrap_or("0").parse().unwrap_or(0);
         if len > MAX_BODY_BYTES {
@@ -271,6 +284,13 @@ async fn security_middleware(
                 "details": format!("Body exceeds {} bytes", MAX_BODY_BYTES)
             }))).into_response();
         }
+    } else if has_content_type_json {
+        // JSON body without Content-Length → 411 Length Required.
+        // Eliminates the chunked-body drop-without-413 behaviour (SEC-04).
+        return (StatusCode::LENGTH_REQUIRED, axum::Json(serde_json::json!({
+            "error": "LENGTH_REQUIRED",
+            "details": "Content-Length header is required for JSON requests"
+        }))).into_response();
     }
 
     // ── 1. Rate limiting ──────────────────────────────────────────────
@@ -292,6 +312,15 @@ async fn security_middleware(
     // fingerprinting and targeted exploitation (AUDIT-HIGH-02).
     let path = req.uri().path();
     {
+        // NEW-HIGH (pentest v0.4.4): timing oracle — pre-auth brute-force brake.
+        // The sleep is applied BEFORE constant_time_eq so it cannot be used as
+        // a timing signal to distinguish key content. All requests (correct key,
+        // wrong key, or partial key) are equally delayed when failures are high.
+        let current_failures = AUTH_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+        if current_failures >= 50 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
         let auth = req.headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -299,19 +328,18 @@ async fn security_middleware(
         let key = get_api_key();
         let expected = format!("Bearer {}", key.as_str());
         if !constant_time_eq(auth.as_bytes(), expected.as_bytes()) {
-            // Increment global auth-failure counter (localhost-only API,
-            // so per-IP tracking adds nothing; we track globally).
             let failures = AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            state.audit.send(AuditEvent::AuthFailure { path: path.to_string() });
-            if failures.is_multiple_of(10) {
-                warn!(failures, %path, "Repeated API authentication failures — check RUNBOUND_API_KEY");
-            }
-            // Threshold 50 is reachable within one rate-limiter burst window (burst=60).
-            // At 100 the rate limiter would pre-empt most rapid attacks before the
-            // counter could accumulate, making the lockout unobservable.
-            if failures >= 50 {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
+            // All post-comparison side effects (audit event, periodic warning) run in a
+            // background task so the 401 is returned immediately with no timing signal.
+            // Combined with the pre-auth sleep above, this eliminates the timing oracle.
+            let audit = state.audit.clone();
+            let path_owned = path.to_string();
+            tokio::spawn(async move {
+                audit.send(AuditEvent::AuthFailure { path: path_owned });
+                if failures.is_multiple_of(10) {
+                    warn!(failures, "Repeated API authentication failures — check RUNBOUND_API_KEY");
+                }
+            });
             return (StatusCode::UNAUTHORIZED,
                 [(axum::http::header::WWW_AUTHENTICATE, "Bearer realm=\"runbound\"")],
                 "Unauthorized").into_response();
@@ -1650,5 +1678,116 @@ mod tests {
     fn test_validate_dns_name_label_63_chars_accepted() {
         let name = "a".repeat(63);
         assert!(validate_dns_name(&name).is_ok());
+    }
+
+    // ── SEC-02 HTTP endpoint integration tests ────────────────────────────────
+    // Verify that the /dns and /blacklist endpoints reject 254-char domain names
+    // at the HTTP level. Pentest v0.4.4 claimed "254 chars → HTTP 201"; these
+    // tests prove the rejection works end-to-end and that the pentest was using
+    // a 253-char name + trailing dot (= 254 bytes submitted, 253-char domain
+    // after trailing-dot strip — correctly accepted).
+
+    #[tokio::test]
+    async fn dns_name_254_chars_is_rejected() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        // 254-char name (no trailing dot): 63+1+63+1+63+1+62 = 254.
+        // validate_dns_name must reject this → 400.
+        let name: String = format!("{}.{}.{}.{}",
+            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(62));
+        assert_eq!(name.len(), 254);
+        let body = serde_json::json!({
+            "name": name, "type": "A", "value": "1.2.3.4"
+        }).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/dns")
+                .header(k, v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "254-char domain name must be rejected with 400");
+    }
+
+    #[tokio::test]
+    async fn dns_name_253_chars_no_trailing_dot_passes_validation() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        // 253-char name (no trailing dot) — valid per RFC 1035 §2.3.4.
+        // validate_dns_name must accept this. The handler may fail at store
+        // level (test dir), but must NOT return 400 for the name itself.
+        let name: String = format!("{}.{}.{}.{}",
+            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        assert_eq!(name.len(), 253);
+        let body = serde_json::json!({
+            "name": name, "type": "A", "value": "1.2.3.4"
+        }).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/dns")
+                .header(k, v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::BAD_REQUEST,
+            "253-char domain name must not be rejected by name validation");
+    }
+
+    #[tokio::test]
+    async fn blacklist_name_254_chars_is_rejected() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let name: String = format!("{}.{}.{}.{}",
+            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(62));
+        assert_eq!(name.len(), 254);
+        let body = serde_json::json!({"domain": name}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/blacklist")
+                .header(k, v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "254-char blacklist domain must be rejected with 400");
+    }
+
+    // ── SEC-04 body limit integration tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn post_json_without_content_length_gets_411() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        // JSON Content-Type but no Content-Length → 411 (SEC-04 fix).
+        let body = serde_json::json!({"name": "example.com", "type": "A", "value": "1.2.3.4"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/dns")
+                .header(k, v)
+                .header("Content-Type", "application/json")
+                // Deliberately omit Content-Length
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::LENGTH_REQUIRED,
+            "JSON POST without Content-Length must return 411");
+    }
+
+    #[tokio::test]
+    async fn post_without_body_no_content_type_passes() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        // Bodyless POST (/reload) has no Content-Type → must not get 411.
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/reload")
+                .header(k, v)
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::LENGTH_REQUIRED,
+            "Bodyless POST must not get 411");
     }
 }
