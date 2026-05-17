@@ -5,6 +5,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.6] — 2026-05-18
+
+### Changed — code quality & performance (senior Rust audit follow-up)
+
+- **QUAL-05** (`src/main.rs`) — Decomposed 344-line `main()` into three private helpers:
+  `handle_cli_flags()`, `init_runtime()`, `build_and_launch()`. `main()` is now a
+  40-line dispatcher with clear separation of concerns.
+
+- **QUAL-06** (`src/dns/server.rs`) — Extracted `handle_local_zone()` and
+  `resolve_upstream()` from the 298-line `handle_request()`. Uses `Result<ResponseInfo, R>`
+  to safely transfer `ResponseHandler` ownership without cloning. `handle_request()` is
+  now a 40-line dispatcher; zero behavior change.
+
+- **QUAL-07** (`src/api/mod.rs`) — Extracted `validate_dns_entry()` (all validation,
+  RR construction, parse) and `persist_and_swap()` (mutex, store, ArcSwap) from
+  `add_dns_handler()`. Handler body reduced to 3 lines.
+
+- **QUAL-08** (`src/api/mod.rs`) — Extracted `fmt_counter()`, `fmt_gauge()`, and
+  `render_prometheus_metrics()` from `metrics_handler()`. Handler body reduced to 2 lines.
+
+- **PERF-02** (`src/dns/server.rs`) — Zero-alloc identity-probe check: static
+  `OnceLock<[LowerName; 4]>` initialised once, compared by reference per query.
+  Eliminates a `String` allocation on every DNS request.
+
+- **PERF-03/QUAL-03** (`src/upstreams.rs`) — `BIND_V4` / `BIND_V6` are now `const
+  SocketAddr` (Rust 1.82+), removing two `.parse().unwrap()` calls in the hot probe path.
+
+- **QUAL-01** (`src/sync.rs`) — `.unwrap()` → `.expect("…")` on all Mutex locks for
+  clearer panic diagnostics.
+
+- **QUAL-02** (`src/upstreams.rs`) — `.unwrap()` → `.expect("…")` on all RwLock
+  accesses in the health-loop task.
+
+- **QUAL-04** (`src/api/mod.rs`) — Removed duplicate section comment before
+  `POST /rotate-key`.
+
+- **QUAL-09** (`src/config/parser.rs`) — Added intent comment above the
+  `match key {}` block in `parse_server_directive`.
+
+- **PERF-01 doc** (`docs/api.md`) — Added copy-on-write write-performance note
+  under the DNS entries section explaining the `ArcSwap` clone-on-write zone store
+  and its lock-free read behaviour.
+
+- **docs** (`docs/code-audit.md`, `docs/security.md`) — Added full 23-finding senior
+  Rust audit report (QUAL, PERF, BUILD, ARCH categories); linked from security.md.
+
+---
+
 ## [0.4.5] — 2026-05-17
 
 ### Security — pentest v0.4.4 follow-up
