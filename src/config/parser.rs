@@ -64,20 +64,37 @@ pub struct UnboundConfig {
     /// Enable DNSSEC validation. Default: false (forwarder mode — trust upstream AD bit).
     /// Set to `yes` for recursive/authoritative deployments with full RRSIG chains.
     pub dnssec_validation: bool,
+
+    // ── Slave/master sync (Runbound extensions) ────────────────────────────
+    /// Node role: "master" (default) or "slave".
+    pub mode: String,
+    /// Master only: port for the HTTPS sync server (e.g. 8082). Disabled if absent.
+    pub sync_port: Option<u16>,
+    /// Slave only: master IP:port (e.g. "192.168.1.10:8082").
+    pub sync_master: Option<String>,
+    /// Slave only: Bearer token for authenticating to the master sync API.
+    pub sync_key: Option<String>,
+    /// Slave only: sync interval in seconds. Default: 30.
+    pub sync_interval: u64,
 }
 
 impl UnboundConfig {
     fn defaults() -> Self {
         Self {
-            interfaces: vec![],   // empty = bind 0.0.0.0 in server.rs
-            port: 53,
-            do_ipv4: true,
-            do_ipv6: true,
-            do_udp: true,
-            do_tcp: true,
+            interfaces:    vec![],   // empty = bind 0.0.0.0 in server.rs
+            port:          53,
+            do_ipv4:       true,
+            do_ipv6:       true,
+            do_udp:        true,
+            do_tcp:        true,
+            mode:          "master".to_string(),
+            sync_interval: 30,
             ..Default::default()
         }
     }
+
+    pub fn is_slave(&self) -> bool { self.mode == "slave" }
+    pub fn is_master(&self) -> bool { !self.is_slave() }
 }
 
 pub fn parse_file(path: &str) -> Result<UnboundConfig> {
@@ -203,6 +220,12 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
             if !cidr.is_empty() { cfg.private_addresses.push(cidr); }
         }
         "dnssec-validation" => cfg.dnssec_validation = val.trim_matches('"') == "yes",
+        // Slave/master sync directives
+        "mode"          => cfg.mode          = val.trim_matches('"').to_string(),
+        "sync-port"     => cfg.sync_port     = val.parse().ok(),
+        "sync-master"   => cfg.sync_master   = Some(val.trim_matches('"').to_string()),
+        "sync-key"      => cfg.sync_key      = Some(val.trim_matches('"').to_string()),
+        "sync-interval" => cfg.sync_interval = val.parse().unwrap_or(30),
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"

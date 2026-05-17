@@ -26,6 +26,10 @@ Your existing `unbound.conf` works as-is. Zero migration.
 | Block a domain live | ❌ restart | ✅ API |
 | Subscribe to block-list feeds | ❌ manual | ✅ API |
 | Real-time query statistics | ❌ | ✅ API |
+| Live query log | ❌ | ✅ API |
+| SSE live stats stream | ❌ | ✅ API |
+| Upstream health monitoring | ❌ | ✅ API |
+| Master/slave replication | ❌ | ✅ built-in |
 | Hot config reload | ❌ | ✅ API |
 | AF/XDP kernel-bypass fast path | ❌ | ✅ optional |
 | Static binary (no dependencies) | ❌ | ✅ musl builds |
@@ -37,15 +41,15 @@ Your existing `unbound.conf` works as-is. Zero migration.
 
 ```bash
 # 1 — Download the static binary (no dependencies)
-#     Replace v0.2.3 with the latest version tag from the releases page
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.2.5-x86_64-linux-musl
-chmod +x runbound-v0.2.5-x86_64-linux-musl
+#     Replace vX.Y.Z with the latest version tag from the releases page
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.0-x86_64-linux-musl
+chmod +x runbound-v0.3.0-x86_64-linux-musl
 
 # 2 — One-liner install (downloads automatically, sets up systemd):
 #     sudo bash <(curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh)
 
 # 3 — Or point it at your existing Unbound config
-sudo ./runbound-v0.2.5-x86_64-linux-musl /etc/unbound/unbound.conf
+sudo ./runbound-v0.3.0-x86_64-linux-musl /etc/unbound/unbound.conf
 
 # 4 — Test it
 dig @127.0.0.1 google.com
@@ -55,7 +59,7 @@ DNS live on **port 53**. REST API live on **port 8081** (localhost only, require
 
 The REST API port is configurable with `api-port: 9090` in `runbound.conf`. See the [Configuration Reference](docs/configuration.md#api-key-and-port).
 
-> Raspberry Pi or ARM server? Grab `runbound-v0.2.5-aarch64-linux-musl` instead.
+> Raspberry Pi or ARM server? Grab `runbound-v0.3.0-aarch64-linux-musl` instead.
 
 ---
 
@@ -139,8 +143,8 @@ Ready-to-use configs for common scenarios:
 |---|---|
 | [Home Lab Guide](docs/homelab.md) | Raspberry Pi / home server setup — local names, ad blocking, router config |
 | [Quick Start](docs/quick-start.md) | Install, configure, run in 5 minutes |
-| [Configuration Reference](docs/configuration.md) | Every directive explained, Unbound compatibility table |
-| [REST API Reference](docs/api.md) | All 14 endpoints with curl examples and JSON responses |
+| [Configuration Reference](docs/configuration.md) | Every directive explained, slave/master sync, Unbound compatibility table |
+| [REST API Reference](docs/api.md) | All endpoints with curl examples and JSON responses |
 | [Performance Guide](docs/performance.md) | Benchmarks, methodology, how to reproduce |
 | [TLS Setup](docs/tls.md) | DoT on port 853 — Let's Encrypt or internal CA |
 | [AF/XDP Fast Path](docs/xdp.md) | Kernel-bypass networking — 500k+ q/s |

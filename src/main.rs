@@ -3,8 +3,11 @@ mod dns;
 mod api;
 mod feeds;
 mod error;
+mod logbuffer;
 mod store;
 mod stats;
+mod sync;
+mod upstreams;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -13,7 +16,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::sync::Arc;
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use tracing::info;
+use tracing::{error, info};
 
 use config::parser::UnboundConfig;
 use dns::local::LocalZoneSet;
@@ -132,15 +135,81 @@ async fn main() -> Result<()> {
 
     let global_stats = Stats::new();
 
+    // ── QPS ring buffer background task ───────────────────────────────────
+    tokio::spawn(stats::qps_update_loop(Arc::clone(&global_stats)));
+
+    // ── Log ring buffer (pre-allocated, zero alloc after startup) ─────────
+    let log_buffer = logbuffer::new_shared();
+
+    // ── Upstream health monitor ────────────────────────────────────────────
+    let upstreams = upstreams::init_upstreams(&unbound_cfg);
+    {
+        let ups = Arc::clone(&upstreams);
+        tokio::spawn(async move { upstreams::upstream_health_loop(ups).await });
+    }
+
     let cfg_arc = Arc::new(unbound_cfg.clone());
+
+    // ── Slave/master sync ──────────────────────────────────────────────────
+    let sync_journal = if unbound_cfg.is_master() && unbound_cfg.sync_port.is_some() {
+        let journal = sync::SyncJournal::new();
+        let port = unbound_cfg.sync_port.unwrap();
+
+        match sync::ensure_sync_cert() {
+            Ok((cert_pem, key_pem)) => {
+                match sync::cert_sha256_hex(&cert_pem) {
+                    Ok(fingerprint) => {
+                        info!(port, sha256 = %fingerprint, "Sync HTTPS server starting");
+                        let j        = Arc::clone(&journal);
+                        let cert_fp  = fingerprint.clone();
+                        let sync_key = unbound_cfg.sync_key.clone()
+                            .unwrap_or_else(|| {
+                                let k = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+                                info!("No sync-key in config — generated: {}...{}", &k[..8], &k[k.len()-4..]);
+                                info!("Add  sync-key: {k}  to both master and slave configs.");
+                                k
+                            });
+                        tokio::spawn(async move {
+                            if let Err(e) = sync::start_master_sync_server(
+                                port, j, sync_key, cert_fp, cert_pem, key_pem,
+                            ).await {
+                                error!("Sync server exited: {e}");
+                            }
+                        });
+                        Some(journal)
+                    }
+                    Err(e) => { tracing::warn!("Sync cert fingerprint error: {e}"); None }
+                }
+            }
+            Err(e) => { tracing::warn!("Sync cert error: {e}"); None }
+        }
+    } else {
+        None
+    };
+
+    if unbound_cfg.is_slave() {
+        match (&unbound_cfg.sync_master, &unbound_cfg.sync_key) {
+            (Some(master), Some(key)) => {
+                let client = sync::SlaveClient::new(master, key, unbound_cfg.sync_interval);
+                tokio::spawn(async move { client.run().await });
+                info!("Slave sync started → master {master}");
+            }
+            _ => tracing::warn!("Slave mode enabled but sync-master or sync-key not set — sync disabled"),
+        }
+    }
+
     let state = AppState {
-        zones:       Arc::clone(&zones),
-        tls_cfg:     Arc::clone(&tls_cfg),
+        zones:        Arc::clone(&zones),
+        tls_cfg:      Arc::clone(&tls_cfg),
         rate_limiter: api::ApiRateLimiter::new_public(),
-        zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
-        stats:       Arc::clone(&global_stats),
-        cfg:         Arc::clone(&cfg_arc),
-        cfg_path:    cfg_path.clone(),
+        zones_mutex:  Arc::new(tokio::sync::Mutex::new(())),
+        stats:        Arc::clone(&global_stats),
+        cfg:          Arc::clone(&cfg_arc),
+        cfg_path:     cfg_path.clone(),
+        log_buffer:   Arc::clone(&log_buffer),
+        upstreams:    Arc::clone(&upstreams),
+        sync_journal,
+        slave_mode:   unbound_cfg.is_slave(),
     };
     let app = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
@@ -197,7 +266,7 @@ async fn main() -> Result<()> {
     };
 
     // ── DNS server (blocks until shutdown) ────────────────────────────────
-    dns::run_dns_server(&unbound_cfg, zones, rate_limiter, acl, global_stats).await
+    dns::run_dns_server(&unbound_cfg, zones, rate_limiter, acl, global_stats, log_buffer).await
 }
 
 fn print_help() {

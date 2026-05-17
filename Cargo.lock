@@ -516,6 +516,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -534,6 +545,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
  "futures-core",
+ "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -601,6 +613,25 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "http 0.2.12",
+ "indexmap 2.14.0",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "h2"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http 1.4.0",
  "indexmap 2.14.0",
  "slab",
  "tokio",
@@ -687,7 +718,7 @@ dependencies = [
  "futures-channel",
  "futures-io",
  "futures-util",
- "h2",
+ "h2 0.3.27",
  "http 0.2.12",
  "idna",
  "ipnet",
@@ -741,7 +772,7 @@ dependencies = [
  "cfg-if",
  "enum-as-inner",
  "futures-util",
- "h2",
+ "h2 0.3.27",
  "hickory-proto",
  "hickory-resolver",
  "http 0.2.12",
@@ -837,6 +868,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2 0.4.14",
  "http 1.4.0",
  "http-body",
  "httparse",
@@ -1665,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "runbound"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1675,12 +1707,16 @@ dependencies = [
  "axum-extra",
  "aya",
  "dashmap",
+ "futures-util",
  "hex",
  "hickory-proto",
  "hickory-resolver",
  "hickory-server",
+ "http-body-util",
  "humantime",
  "humantime-serde",
+ "hyper",
+ "hyper-util",
  "libc",
  "rcgen",
  "regex",
@@ -1697,6 +1733,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokio",
+ "tokio-rustls 0.24.1",
  "toml",
  "tower",
  "tower-http",

@@ -5,6 +5,89 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.3.0] — 2026-05-17
+
+### Added
+
+- **`GET /stats` — 9 new fields** (`src/stats.rs`, `src/api/mod.rs`)  
+  The stats endpoint now reports QPS sliding window (`qps_1m`, `qps_5m`, all-time `qps_peak`),
+  latency percentiles (`latency_p50_ms`, `latency_p95_ms`, `latency_p99_ms`), cache metrics
+  (`cache_hit_rate`, `cache_entries`), and local zone resolution count (`local_hits`).  
+  Implementation: fixed 10-bucket latency histogram (zero allocation per query via `partition_point`);
+  300-slot QPS ring buffer (`AtomicU64` × 300, updated by a 1-second background task);
+  cache hit detection via timing heuristic (< 2 ms = hickory in-process cache hit).
+  All hot-path counters are `AtomicU64` — no mutex, no allocation on the DNS query path.
+
+- **`GET /stats/stream` — Server-Sent Events live stats** (`src/api/mod.rs`)  
+  Streams a JSON stats snapshot every second using SSE (`text/event-stream`).
+  Implementation uses `futures_util::stream::unfold` — no background task or channel leak.
+  When the client disconnects, axum drops the SSE stream and cancels the in-flight sleep.
+  `X-Accel-Buffering: no` header ensures nginx proxies events immediately.
+
+- **`GET /upstreams` — upstream DNS health check** (`src/upstreams.rs`, `src/api/mod.rs`)  
+  Reports reachability and latency for each configured `forward-addr`.
+  Probed every 30 seconds via a minimal RFC 1035 UDP DNS query (17-byte hardcoded packet for `. IN A`).
+  2-second per-probe timeout. WARN log on failure. Response includes `healthy` / `total` counts.
+
+- **`GET /logs` — ring buffer query log** (`src/logbuffer.rs`, `src/dns/server.rs`, `src/api/mod.rs`)  
+  Captures up to 10,000 recent DNS queries in a fixed-size pre-allocated ring buffer.
+  Each `LogEntry` is a fixed-size struct (no heap pointers) — zero allocation after startup.
+  Fields: timestamp (RFC 3339 UTC), DNS name, client IP, qtype, action, elapsed ms.  
+  Actions: `forwarded`, `cached`, `local`, `blocked`, `nxdomain`, `refused`, `servfail`.  
+  Query params: `limit` (default 100, max 1,000), `page` (0-based), `action`, `client` (IP), `since` (Unix timestamp).
+  Invalid params return `400 Bad Request`; `limit > 1000` returns `422 Unprocessable Entity`.
+
+- **Slave/master replication** (`src/sync.rs`, `src/config/parser.rs`, `src/api/mod.rs`, `src/main.rs`)  
+  Runbound now supports a master/slave topology for high-availability DNS. A master node
+  records every write operation (DNS entries, blacklist, feeds) in a delta journal and serves
+  it over a dedicated HTTPS sync port. Slave nodes poll the master, apply deltas, and
+  rebuild their local zone set on change — with zero API downtime.
+
+  **Architecture:**
+  - `SyncJournal` — ring buffer of 1,000 `SyncEvent`s (`VecDeque<SyncEvent>`, monotonic `AtomicU64` seq).
+    When a slave falls more than 1,000 events behind, it performs a full config snapshot instead.
+  - **Sync endpoints** (master, HTTPS on `sync-port`, separate from REST API):
+    - `GET /sync/cert` — returns the master's SHA-256 cert fingerprint (public, no auth required, for TOFU bootstrap).
+    - `GET /sync/state` — current journal sequence number.
+    - `GET /sync/config` — full state snapshot (DNS + blacklist + feeds + seq). Used on first sync or after 410.
+    - `GET /sync/delta?since=N` — events with seq ≥ N. Returns 410 Gone when N is too old.
+  - **TOFU TLS** — master auto-generates a self-signed certificate via rcgen (`/etc/runbound/sync-cert.pem`).
+    On first slave connect, the cert fingerprint is downloaded from `/sync/cert` and cross-verified
+    against the TLS handshake, then saved to `/etc/runbound/sync-master.fingerprint` with a WARN log.
+    All subsequent connections use rustls pinned cert verification (SHA-256 of DER). No CA or PKI needed.
+  - **Slave read-only** — when `mode: slave`, all non-GET API requests return `503 READ_ONLY`.
+    The slave applies changes exclusively via the replication protocol.
+  - **Slave feed updates** — on `UpdateFeed` events, the slave re-downloads the same URL stored
+    in its local feeds config, without requiring the master to forward feed content.
+  - **Exponential backoff** — on network errors, retry delay doubles (5 s → 10 → 20 → … cap 300 s).
+    On 410 Gone, a full sync is triggered immediately without waiting for the backoff interval.
+
+  **Configuration (master):**
+  ```
+  server:
+      mode:      master        # default — may be omitted
+      sync-port: 8082          # enables HTTPS sync server on 0.0.0.0:8082
+      sync-key:  <shared-secret>
+  ```
+
+  **Configuration (slave):**
+  ```
+  server:
+      mode:          slave
+      sync-master:   192.168.1.10:8082    # master ip:port
+      sync-key:      <same-shared-secret>
+      sync-interval: 30                   # poll interval in seconds (default: 30)
+  ```
+
+### Changed
+
+- **`blocked_percent` — now a float** (`src/api/mod.rs`)  
+  Previously rounded to `u64`, now `f64` with one decimal place (e.g. `4.7` instead of `5`).
+
+- **`GET /help` — updated endpoint list** to include `/stats/stream`, `/upstreams`, `/logs`.
+
+---
+
 ## [0.2.5] — 2026-05-17
 
 ### Security

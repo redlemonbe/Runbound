@@ -32,7 +32,8 @@ use tracing::{debug, error, info, warn};
 use crate::config::parser::TlsConfig;
 
 use crate::config::parser::UnboundConfig;
-use crate::stats::Stats;
+use crate::logbuffer::{LogAction, LogEntry, SharedLogBuffer};
+use crate::stats::{Stats, CACHE_HIT_THRESHOLD_US};
 use super::acl::{Acl, AclAction, PrivateAddressSet};
 use super::local::{LocalZoneSet, ZoneAction};
 use super::ratelimit::RateLimiter;
@@ -52,17 +53,19 @@ const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 // ============================================================
 
 pub struct RunboundHandler {
-    pub zones:     Arc<ArcSwap<LocalZoneSet>>,
-    resolver:      Arc<ArcSwap<TokioAsyncResolver>>,
-    rate_limiter:  Arc<RateLimiter>,
-    inflight:      Arc<Semaphore>,
-    acl:           Arc<Acl>,
-    private_addrs: Arc<PrivateAddressSet>,
-    cache_max_ttl: u32,
-    pub stats:     Arc<Stats>,
+    pub zones:      Arc<ArcSwap<LocalZoneSet>>,
+    resolver:       Arc<ArcSwap<TokioAsyncResolver>>,
+    rate_limiter:   Arc<RateLimiter>,
+    inflight:       Arc<Semaphore>,
+    acl:            Arc<Acl>,
+    private_addrs:  Arc<PrivateAddressSet>,
+    cache_max_ttl:  u32,
+    pub stats:      Arc<Stats>,
+    pub log_buffer: SharedLogBuffer,
 }
 
 impl RunboundHandler {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         zones:         Arc<ArcSwap<LocalZoneSet>>,
         resolver:      Arc<ArcSwap<TokioAsyncResolver>>,
@@ -71,12 +74,51 @@ impl RunboundHandler {
         private_addrs: Arc<PrivateAddressSet>,
         cache_max_ttl: u32,
         stats:         Arc<Stats>,
+        log_buffer:    SharedLogBuffer,
     ) -> Self {
         Self {
             zones, resolver, rate_limiter,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
-            acl, private_addrs, cache_max_ttl, stats,
+            acl, private_addrs, cache_max_ttl, stats, log_buffer,
         }
+    }
+
+    /// Record a completed query: latency histogram, log buffer push, tracing log.
+    /// Cache metrics (record_forward) and domain counters are updated at call sites.
+    #[inline]
+    fn record_query(
+        &self,
+        client: IpAddr,
+        qname:  &hickory_proto::rr::LowerName,
+        qtype:  RecordType,
+        rcode:  ResponseCode,
+        action: LogAction,
+        start:  Instant,
+    ) {
+        let elapsed    = start.elapsed();
+        let elapsed_us = elapsed.as_micros() as u64;
+        let elapsed_ms = elapsed.as_millis() as u32;
+
+        self.stats.record_latency_us(elapsed_us);
+        if action == LogAction::Local {
+            self.stats.inc_local_hits();
+        }
+
+        if let Ok(mut buf) = self.log_buffer.lock() {
+            buf.push(LogEntry::new(
+                &qname.to_string(), &client, u16::from(qtype), action, elapsed_ms,
+            ));
+        }
+
+        info!(
+            client = %client,
+            name   = %qname,
+            qtype  = %qtype,
+            rcode  = %rcode,
+            action = action.as_str(),
+            ms     = elapsed_ms,
+            "query"
+        );
     }
 }
 
@@ -103,12 +145,12 @@ impl RequestHandler for RunboundHandler {
                 let mut h = Header::response_from_request(request.header());
                 h.set_response_code(ResponseCode::Refused);
                 let info: ResponseInfo = h.into();
-                log_query(client_ip, qname, qtype, ResponseCode::Refused, "acl-deny", start);
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
                 return info;
             }
             AclAction::Refuse => {
                 debug!(%client_ip, %qname, "ACL refuse");
-                log_query(client_ip, qname, qtype, ResponseCode::Refused, "acl-refuse", start);
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
                 return send_error(request, response_handle, ResponseCode::Refused).await;
             }
         }
@@ -116,7 +158,7 @@ impl RequestHandler for RunboundHandler {
         // ── 1. Rate limiting (per source IP) ───────────────────────────
         if !self.rate_limiter.check(client_ip) {
             warn!(%client_ip, "rate limited");
-            log_query(client_ip, qname, qtype, ResponseCode::Refused, "rate-limited", start);
+            self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
             return send_error(request, response_handle, ResponseCode::Refused).await;
         }
 
@@ -125,7 +167,7 @@ impl RequestHandler for RunboundHandler {
             Ok(p) => p,
             Err(_) => {
                 warn!(%client_ip, inflight = MAX_INFLIGHT_REQUESTS, "inflight cap reached — REFUSED");
-                log_query(client_ip, qname, qtype, ResponseCode::Refused, "inflight-cap", start);
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
                 return send_error(request, response_handle, ResponseCode::Refused).await;
             }
         };
@@ -136,14 +178,14 @@ impl RequestHandler for RunboundHandler {
         if request.query().query_class() == DNSClass::CH {
             debug!(%client_ip, %qname, "CHAOS class query blocked");
             self.stats.inc_refused();
-            log_query(client_ip, qname, qtype, ResponseCode::Refused, "chaos-block", start);
+            self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
             return send_error(request, response_handle, ResponseCode::Refused).await;
         }
 
         // ── 3b. Block ANY queries (RFC 8482 — amplification vector) ────
         if qtype == RecordType::ANY {
             debug!(%client_ip, "ANY query blocked (RFC 8482)");
-            log_query(client_ip, qname, qtype, ResponseCode::NotImp, "rfc8482-any", start);
+            self.record_query(client_ip, qname, qtype, ResponseCode::NotImp, LogAction::Refused, start);
             return send_error(request, response_handle, ResponseCode::NotImp).await;
         }
 
@@ -157,13 +199,13 @@ impl RequestHandler for RunboundHandler {
             Some(ZoneAction::Refuse) => {
                 debug!(%qname, "local-zone REFUSED");
                 self.stats.inc_blocked(); self.stats.inc_refused();
-                log_query(client_ip, qname, qtype, ResponseCode::Refused, "local-refuse", start);
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Blocked, start);
                 return send_error(request, response_handle, ResponseCode::Refused).await;
             }
             Some(ZoneAction::NxDomain) => {
                 debug!(%qname, "local-zone NXDOMAIN");
                 self.stats.inc_blocked(); self.stats.inc_nxdomain();
-                log_query(client_ip, qname, qtype, ResponseCode::NXDomain, "local-nxdomain", start);
+                self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Blocked, start);
                 return send_error(request, response_handle, ResponseCode::NXDomain).await;
             }
             Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
@@ -181,7 +223,7 @@ impl RequestHandler for RunboundHandler {
                         std::iter::empty(),
                         std::iter::empty(),
                     );
-                    log_query(client_ip, qname, qtype, ResponseCode::NoError, "local-data", start);
+                    self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
                     return response_handle.send_response(response).await
                         .unwrap_or_else(|e| { error!("send: {e}"); header.into() });
                 }
@@ -204,7 +246,7 @@ impl RequestHandler for RunboundHandler {
                             std::iter::empty(),
                             std::iter::empty(),
                         );
-                        log_query(client_ip, qname, qtype, ResponseCode::NoError, "local-cname", start);
+                        self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
                         return response_handle.send_response(response).await
                             .unwrap_or_else(|e| { error!("send: {e}"); header.into() });
                     }
@@ -223,12 +265,12 @@ impl RequestHandler for RunboundHandler {
                         std::iter::empty(),
                         std::iter::empty(),
                     );
-                    log_query(client_ip, qname, qtype, ResponseCode::NoError, "local-nodata", start);
+                    self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
                     return response_handle.send_response(response).await
                         .unwrap_or_else(|e| { error!("send: {e}"); header.into() });
                 }
                 debug!(%qname, "local-zone NXDOMAIN (name not found)");
-                log_query(client_ip, qname, qtype, ResponseCode::NXDomain, "local-nxdomain", start);
+                self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Nxdomain, start);
                 return send_error(request, response_handle, ResponseCode::NXDomain).await;
             }
             None => {}
@@ -250,7 +292,7 @@ impl RequestHandler for RunboundHandler {
                         if let Some(ip) = private_ip {
                             if self.private_addrs.contains(ip) {
                                 warn!(%qname, %ip, "private-address block → SERVFAIL");
-                                log_query(client_ip, qname, qtype, ResponseCode::ServFail, "private-addr", start);
+                                self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
                                 return send_error(request, response_handle, ResponseCode::ServFail).await;
                             }
                         }
@@ -274,7 +316,14 @@ impl RequestHandler for RunboundHandler {
                     std::iter::empty(),
                 );
                 self.stats.inc_forwarded();
-                log_query(client_ip, qname, qtype, ResponseCode::NoError, "forward", start);
+                let fwd_us = start.elapsed().as_micros() as u64;
+                self.stats.record_forward(fwd_us);
+                let fwd_action = if fwd_us < CACHE_HIT_THRESHOLD_US {
+                    LogAction::Cached
+                } else {
+                    LogAction::Forwarded
+                };
+                self.record_query(client_ip, qname, qtype, ResponseCode::NoError, fwd_action, start);
                 response_handle.send_response(response).await
                     .unwrap_or_else(|e| { error!("send: {e}"); header.into() })
             }
@@ -289,13 +338,13 @@ impl RequestHandler for RunboundHandler {
                         ResponseCode::ServFail
                     }
                 };
-                match rcode {
-                    ResponseCode::NXDomain => self.stats.inc_nxdomain(),
-                    ResponseCode::ServFail => self.stats.inc_servfail(),
-                    ResponseCode::Refused  => self.stats.inc_refused(),
-                    _ => {}
-                }
-                log_query(client_ip, qname, qtype, rcode, "forward-err", start);
+                let err_action = match rcode {
+                    ResponseCode::NXDomain => { self.stats.inc_nxdomain(); LogAction::Nxdomain }
+                    ResponseCode::ServFail => { self.stats.inc_servfail(); LogAction::Servfail }
+                    ResponseCode::Refused  => { self.stats.inc_refused();  LogAction::Refused  }
+                    _                      => LogAction::Servfail,
+                };
+                self.record_query(client_ip, qname, qtype, rcode, err_action, start);
                 send_error(request, response_handle, rcode).await
             }
         }
@@ -337,28 +386,6 @@ fn follow_local_cname(
     // Chain incomplete (target not in local zones) — return nothing;
     // the caller will fall through to NODATA / NXDOMAIN as appropriate.
     Vec::new()
-}
-
-/// Structured query log line emitted for every DNS query (info level).
-/// Fields: client IP, query name, type, response code, source path, latency ms.
-#[inline]
-fn log_query(
-    client: IpAddr,
-    qname:  &hickory_proto::rr::LowerName,
-    qtype:  RecordType,
-    rcode:  ResponseCode,
-    source: &'static str,
-    start:  Instant,
-) {
-    info!(
-        client = %client,
-        name   = %qname,
-        qtype  = %qtype,
-        rcode  = %rcode,
-        source,
-        ms     = start.elapsed().as_millis(),
-        "query"
-    );
 }
 
 /// Send an error response, mirroring the request's EDNS0 OPT record if present.
@@ -486,6 +513,7 @@ pub async fn memory_guard_loop(
     rate_limiter: Arc<RateLimiter>,
     resolver:     Arc<ArcSwap<TokioAsyncResolver>>,
     cfg:          Arc<UnboundConfig>,
+    stats:        Arc<Stats>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(MEM_CHECK_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -514,6 +542,7 @@ pub async fn memory_guard_loop(
         match build_resolver(&cfg) {
             Ok(new_res) => {
                 resolver.store(Arc::new(new_res));
+                stats.reset_cache();
                 warn!(freed_buckets, "DNS resolver cache flushed and rate limiter cleared");
             }
             Err(e) => {
@@ -590,6 +619,7 @@ pub async fn run_dns_server(
     rate_limiter: Arc<RateLimiter>,
     acl:          Arc<Acl>,
     stats:        Arc<Stats>,
+    log_buffer:   SharedLogBuffer,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -600,10 +630,11 @@ pub async fn run_dns_server(
     // Spawn memory pressure guard — monitors /proc/meminfo every 30 s and
     // flushes DNS caches (rate limiter + resolver) when usage exceeds 80 %.
     {
-        let rl  = Arc::clone(&rate_limiter);
-        let res = Arc::clone(&resolver);
-        let cfg_arc = Arc::new(cfg.clone());
-        tokio::spawn(async move { memory_guard_loop(rl, res, cfg_arc).await });
+        let rl       = Arc::clone(&rate_limiter);
+        let res      = Arc::clone(&resolver);
+        let cfg_arc  = Arc::new(cfg.clone());
+        let stats_mg = Arc::clone(&stats);
+        tokio::spawn(async move { memory_guard_loop(rl, res, cfg_arc, stats_mg).await });
     }
 
     if acl.is_empty() {
@@ -621,7 +652,7 @@ pub async fn run_dns_server(
     }
 
     let handler = RunboundHandler::new(
-        Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl, stats,
+        Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl, stats, log_buffer,
     );
     let mut server = ServerFuture::new(handler);
 
