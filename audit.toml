@@ -1,47 +1,5 @@
 # cargo-audit configuration
-# Advisories acknowledged below are tracked for v0.4.0 (hickory 0.26 migration).
-# Each entry documents the actual exposure in this specific deployment context.
+# v0.4.0 — all previously ignored CVEs resolved by the hickory 0.26 / rustls 0.23 upgrade.
+# No active ignores.
 
 [advisories]
-
-# RUSTSEC-2026-0119 — hickory-proto: O(n²) name compression (CPU exhaustion)
-# Exposure: a malicious upstream DNS server could craft responses with
-# pathological label overlaps. Runbound forwards to trusted resolvers
-# (Cloudflare, Quad9, user-configured). Low practical risk in typical
-# deployments; HIGH if pointed at untrusted upstreams.
-# Fix target: hickory 0.26.x — planned for v0.4.0 (full API migration).
-ignore = ["RUSTSEC-2026-0119"]
-
-# RUSTSEC-2026-0037 — quinn-proto: DoS in QUIC endpoints
-# Exposure: only reachable via DNS-over-QUIC (port 853/UDP). Most
-# deployments run DoQ on an internal interface or behind a firewall.
-# Firewall rule: block port 853/UDP from untrusted sources until patched.
-# Fix target: hickory 0.26.x — planned for v0.4.0.
-ignore = ["RUSTSEC-2026-0037"]
-
-# RUSTSEC-2025-0009 — ring 0.16: AES panic with overflow-checks=true
-# Exposure: only triggered when compiled with overflow checks enabled.
-# Release builds use opt-level=3 with overflow checks off (Rust default).
-# Debug builds may panic — do not expose debug builds to the internet.
-# Fix target: hickory 0.26.x (pulls ring 0.17) — planned for v0.4.0.
-ignore = ["RUSTSEC-2025-0009"]
-
-# RUSTSEC-2026-0104 — rustls-webpki: panic in CRL parsing
-# Exposure: only triggered when parsing Certificate Revocation Lists.
-# Runbound does not request or process CRLs. The sync server uses TOFU
-# (fingerprint pinning), not CRL validation. The ACME client uses reqwest
-# with its own rustls instance (not this one). No exploitable path.
-# Fix target: hickory 0.26.x — planned for v0.4.0.
-ignore = ["RUSTSEC-2026-0104"]
-
-# RUSTSEC-2026-0098 — rustls-webpki: URI name constraints incorrectly accepted
-# Exposure: only affects TLS certificate validation for URI SANs.
-# Runbound does not validate certificates with URI SANs. Sync server
-# uses fingerprint pinning, not chain validation.
-# Fix target: hickory 0.26.x — planned for v0.4.0.
-ignore = ["RUSTSEC-2026-0098"]
-
-# RUSTSEC-2026-0099 — rustls-webpki: wildcard name constraint bypass
-# Same exposure analysis as RUSTSEC-2026-0098 above.
-# Fix target: hickory 0.26.x — planned for v0.4.0.
-ignore = ["RUSTSEC-2026-0099"]

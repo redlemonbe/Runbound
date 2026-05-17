@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::dns::BlacklistAction;
 use crate::error::AppError;
+use crate::integrity::{store_key, verify_mac, write_mac};
 
 
 // ============================================================
@@ -166,6 +168,9 @@ pub fn load_feeds() -> Result<FeedsConfig, AppError> {
     let content = fs::read_to_string(&path).map_err(|e| {
         AppError::Internal(format!("Failed to read feeds config: {}", e))
     })?;
+    // HIGH-06: verify HMAC integrity before deserializing
+    verify_mac(&path, content.as_bytes(), store_key().as_deref())
+        .map_err(AppError::Internal)?;
     serde_json::from_str(&content).map_err(|e| {
         AppError::Internal(format!("Failed to parse feeds config JSON: {}", e))
     })
@@ -198,6 +203,9 @@ pub fn save_feeds(config: &FeedsConfig) -> Result<(), AppError> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o640));
     }
+    // HIGH-06: write HMAC sidecar after atomic rename.
+    write_mac(&path, content.as_bytes(), store_key().as_deref())
+        .map_err(|e| AppError::Internal(format!("write feeds .mac: {e}")))?;
     Ok(())
 }
 
@@ -215,10 +223,16 @@ pub fn load_feed_domains(feed_id: &str) -> Vec<String> {
     if !path.exists() {
         return Vec::new();
     }
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-        .unwrap_or_default()
+    let content = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    // HIGH-06: domain caches are regeneratable; HMAC mismatch → WARN + empty result.
+    if let Err(e) = verify_mac(&path, content.as_bytes(), store_key().as_deref()) {
+        warn!("Feed domain cache {} HMAC mismatch ({e}) — cache discarded.", path.display());
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<String>>(&content).unwrap_or_default()
 }
 
 fn save_feed_domains(feed_id: &str, domains: &[String]) -> Result<(), AppError> {
@@ -249,6 +263,9 @@ fn save_feed_domains(feed_id: &str, domains: &[String]) -> Result<(), AppError> 
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o640));
     }
+    // HIGH-06: write HMAC sidecar.
+    write_mac(&path, content.as_bytes(), store_key().as_deref())
+        .map_err(|e| AppError::Internal(format!("write domain cache .mac: {e}")))?;
     Ok(())
 }
 
@@ -597,16 +614,46 @@ pub async fn update_feed(feed: &mut Feed, client: &reqwest::Client) -> Result<us
     Ok(count)
 }
 
-/// Build a reqwest client with a SSRF-safe redirect policy.
-///
-/// Two redirect attacks are blocked:
-///   1. HTTPS → HTTP downgrade: allows a MITM to inject domains once the
-///      feed server redirects a validated HTTPS request to plaintext HTTP.
-///   2. Redirect to private/loopback IP: a feed server that initially has a
-///      public IP can redirect to an internal host (10.x, 172.16.x, etc.),
-///      bypassing the SSRF check that was performed on the original URL.
+// ── MED-03: SSRF-safe DNS resolver ───────────────────────────────────────────
+//
+// Defense-in-depth below validate_feed_url(): filters private IPs at the TCP
+// connection layer so that even a DNS rebinding attack that slips past the
+// async lookup in validate_feed_url() cannot reach internal services.
+// Every hostname-to-address resolution made by reqwest passes through here.
+
+struct SsrfSafeDnsResolver;
+
+impl reqwest::dns::Resolve for SsrfSafeDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            type DynErr = Box<dyn std::error::Error + Send + Sync>;
+
+            let addrs = tokio::net::lookup_host(format!("{host}:0"))
+                .await
+                .map_err(|e| Box::new(e) as DynErr)?;
+
+            let safe: Vec<std::net::SocketAddr> = addrs
+                .filter(|a| !is_private_ip(&a.ip()))
+                .collect();
+
+            if safe.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("all IPs for '{host}' are private/internal — SSRF blocked"),
+                )) as DynErr);
+            }
+            Ok(Box::new(safe.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Build a reqwest client with layered SSRF protection:
+///   1. Custom DNS resolver (MED-03): private IPs filtered at connection time.
+///   2. Redirect policy: blocks HTTPS→HTTP downgrade and redirect-to-private-IP.
 fn ssrf_safe_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .dns_resolver(Arc::new(SsrfSafeDnsResolver))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let url = attempt.url();
             // Block HTTPS → non-HTTPS downgrade (MITM injection vector)
@@ -624,10 +671,9 @@ fn ssrf_safe_client() -> reqwest::Client {
                     }
                 } else {
                     // Hostname destination — block well-known internal names.
-                    // Full async DNS resolution is not possible inside a sync
-                    // redirect policy; block the most common internal hostnames
-                    // and rely on validate_feed_url() re-validation (TOCTOU
-                    // mitigation) for the resolution-time check.
+                    // Full async DNS resolution is not possible in a sync redirect
+                    // policy; block common names and rely on SsrfSafeDnsResolver
+                    // (which runs on every connect) for the resolution-time check.
                     let h = host.to_lowercase();
                     if h == "localhost"
                         || h.ends_with(".local")

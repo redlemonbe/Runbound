@@ -7,6 +7,7 @@ mod dns;
 mod api;
 mod feeds;
 mod error;
+mod integrity;
 mod logbuffer;
 mod runtime;
 mod store;
@@ -582,7 +583,7 @@ pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
         for entry in &st.entries {
             if let Some(rr) = entry.to_rr_string() {
                 if let Some(record) = dns::local::parse_local_data(&rr) {
-                    let name = record.name().clone();
+                    let name = record.name.clone();
                     zone_set.zones.entry(name.clone()).or_insert(dns::ZoneAction::Static);
                     zone_set.records.entry(name).or_default().push(record);
                 }

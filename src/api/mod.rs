@@ -641,7 +641,7 @@ async fn add_dns_handler(
 
         let current = s.zones.load_full();
         let mut new_zones = (*current).clone();
-        let name = record.name().clone();
+        let name = record.name.clone();
         new_zones.zones.entry(name.clone()).or_insert(ZoneAction::Static);
         new_zones.records.entry(name).or_default().push(record);
         s.zones.store(Arc::new(new_zones));
@@ -689,7 +689,7 @@ async fn delete_dns_handler(
         if let Some(record) = parse_local_data(&rr) {
             let current = s.zones.load_full();
             let mut new_zones = (*current).clone();
-            let name = record.name().clone();
+            let name = record.name.clone();
             if let Some(recs) = new_zones.records.get_mut(&name) {
                 // VUL-08: match on the full Record (name + type + rdata + TTL),
                 // not just the type. The old code removed ALL records of the

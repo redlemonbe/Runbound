@@ -15,25 +15,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use hickory_proto::op::{Header, ResponseCode};
+use hickory_proto::op::{Metadata, ResponseCode};
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
-use hickory_proto::error::ProtoErrorKind;
 use hickory_resolver::{
-    config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
-    error::ResolveErrorKind,
-    TokioAsyncResolver,
+    TokioResolver,
+    config::{ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts},
+    net::runtime::TokioRuntimeProvider,
+    net::{DnsError, NetError, NoRecords},
 };
 use hickory_server::{
-    authority::MessageResponseBuilder,
-    server::{Request, RequestHandler, ResponseHandler, ResponseInfo, ServerFuture},
+    Server,
+    zone_handler::MessageResponseBuilder,
+    server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
+    net::runtime::Time,
 };
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::config::parser::TlsConfig;
-
 use crate::config::parser::UnboundConfig;
 use crate::logbuffer::{LogAction, SharedLogBuffer};
 use crate::stats::{Stats, CACHE_HIT_THRESHOLD_US};
@@ -57,7 +59,7 @@ const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 
 pub struct RunboundHandler {
     pub zones:        Arc<ArcSwap<LocalZoneSet>>,
-    resolver:         Arc<ArcSwap<TokioAsyncResolver>>,
+    resolver:         Arc<ArcSwap<TokioResolver>>,
     rate_limiter:     Arc<RateLimiter>,
     inflight:         Arc<Semaphore>,
     acl:              Arc<Acl>,
@@ -74,7 +76,7 @@ impl RunboundHandler {
     #[allow(clippy::too_many_arguments)]
     fn new(
         zones:            Arc<ArcSwap<LocalZoneSet>>,
-        resolver:         Arc<ArcSwap<TokioAsyncResolver>>,
+        resolver:         Arc<ArcSwap<TokioResolver>>,
         rate_limiter:     Arc<RateLimiter>,
         acl:              Arc<Acl>,
         private_addrs:    Arc<PrivateAddressSet>,
@@ -97,12 +99,12 @@ impl RunboundHandler {
     #[inline]
     fn record_query(
         &self,
-        client: IpAddr,
-        qname:  &hickory_proto::rr::LowerName,
-        qtype:  RecordType,
-        rcode:  ResponseCode,
-        action: LogAction,
-        start:  Instant,
+        client:    IpAddr,
+        qname:     &hickory_proto::rr::LowerName,
+        qtype:     RecordType,
+        rcode:     ResponseCode,
+        action:    LogAction,
+        start:     Instant,
     ) {
         let elapsed    = start.elapsed();
         let elapsed_us = elapsed.as_micros() as u64;
@@ -113,15 +115,19 @@ impl RunboundHandler {
             self.stats.inc_local_hits();
         }
 
+        // MED-06: sanitize the DNS name before structured log emission to prevent
+        // log injection via control characters embedded in query names.
+        let safe_name = sanitize_dns_name(qname);
+
         let client_log = if let Ok(mut buf) = self.log_buffer.lock() {
-            buf.push_query(&qname.to_string(), &client, u16::from(qtype), action, elapsed_ms)
+            buf.push_query(&safe_name, &client, u16::from(qtype), action, elapsed_ms)
         } else {
             client.to_string()
         };
 
         info!(
             client = %client_log,
-            name   = %qname,
+            name   = %safe_name,
             qtype  = %qtype,
             rcode  = %rcode,
             action = action.as_str(),
@@ -133,15 +139,21 @@ impl RunboundHandler {
 
 #[async_trait]
 impl RequestHandler for RunboundHandler {
-    async fn handle_request<R: ResponseHandler>(
+    async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
         mut response_handle: R,
     ) -> ResponseInfo {
-        let start     = Instant::now();
-        let qname     = request.query().name();
-        let qtype     = request.query().query_type();
-        let client_ip = request.src().ip();
+        let start = Instant::now();
+
+        // Require exactly one query — RFC 1035 §4.1.2.
+        let Ok(info) = request.request_info() else {
+            self.stats.inc_total();
+            return servfail_info(request);
+        };
+        let qname     = info.query.name();
+        let qtype     = info.query.query_type();
+        let client_ip = info.src.ip();
 
         self.stats.inc_total();
 
@@ -149,16 +161,18 @@ impl RequestHandler for RunboundHandler {
         match self.acl.check(client_ip) {
             AclAction::Allow  => {}
             AclAction::Deny   => {
-                // Silently drop — no response sent
-                debug!(%client_ip, %qname, "ACL deny (silent drop)");
-                let mut h = Header::response_from_request(request.header());
-                h.set_response_code(ResponseCode::Refused);
-                let info: ResponseInfo = h.into();
+                // Silently drop — no response sent, just track the event.
+                debug!(%client_ip, name=%sanitize_dns_name(qname), "ACL deny (silent drop)");
                 self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
-                return info;
+                let mut meta = Metadata::response_from_request(&request.metadata);
+                meta.response_code = ResponseCode::Refused;
+                return ResponseInfo::from(hickory_proto::op::Header {
+                    metadata: meta,
+                    counts:   hickory_proto::op::HeaderCounts::default(),
+                });
             }
             AclAction::Refuse => {
-                debug!(%client_ip, %qname, "ACL refuse");
+                debug!(%client_ip, name=%sanitize_dns_name(qname), "ACL refuse");
                 self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
                 return send_error(request, response_handle, ResponseCode::Refused).await;
             }
@@ -185,8 +199,8 @@ impl RequestHandler for RunboundHandler {
         // CHAOS class (numeric 3) exposes server identity. Compare by wire value
         // to avoid any hickory Unknown(3) vs CH variant mismatch.
         // RFC 5358 §4: responders that do not implement CHAOS SHOULD return NOTIMP.
-        if u16::from(request.query().query_class()) == 3 {
-            debug!(%client_ip, %qname, "CHAOS class query → NOTIMP");
+        if u16::from(info.query.query_class()) == 3 {
+            debug!(%client_ip, name=%sanitize_dns_name(qname), "CHAOS class query → NOTIMP");
             self.stats.inc_refused();
             self.record_query(client_ip, qname, qtype, ResponseCode::NotImp, LogAction::Refused, start);
             return send_error(request, response_handle, ResponseCode::NotImp).await;
@@ -199,7 +213,7 @@ impl RequestHandler for RunboundHandler {
             return send_error(request, response_handle, ResponseCode::NotImp).await;
         }
 
-        debug!(%client_ip, name=%qname, type=%qtype, "DNS query");
+        debug!(%client_ip, name=%sanitize_dns_name(qname), type=%qtype, "DNS query");
 
         // ── 4. Local zones ──────────────────────────────────────────────
         let zones_snap = self.zones.load();
@@ -207,13 +221,13 @@ impl RequestHandler for RunboundHandler {
 
         match zone_action {
             Some(ZoneAction::Refuse) => {
-                debug!(%qname, "local-zone REFUSED");
+                debug!(name=%sanitize_dns_name(qname), "local-zone REFUSED");
                 self.stats.inc_blocked(); self.stats.inc_refused();
                 self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Blocked, start);
                 return send_error(request, response_handle, ResponseCode::Refused).await;
             }
             Some(ZoneAction::NxDomain) => {
-                debug!(%qname, "local-zone NXDOMAIN");
+                debug!(name=%sanitize_dns_name(qname), "local-zone NXDOMAIN");
                 self.stats.inc_blocked(); self.stats.inc_nxdomain();
                 self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Blocked, start);
                 return send_error(request, response_handle, ResponseCode::NXDomain).await;
@@ -222,12 +236,12 @@ impl RequestHandler for RunboundHandler {
                 let records = zones_snap.local_records(qname, qtype);
 
                 if !records.is_empty() {
-                    debug!(%qname, count = records.len(), "local-data answer");
-                    let mut header = Header::response_from_request(request.header());
-                    header.set_authoritative(true);
+                    debug!(name=%sanitize_dns_name(qname), count = records.len(), "local-data answer");
+                    let mut metadata = Metadata::response_from_request(&request.metadata);
+                    metadata.authoritative = true;
                     let builder = MessageResponseBuilder::from_message_request(request);
                     let response = builder.build(
-                        header,
+                        metadata,
                         records,
                         std::iter::empty(),
                         std::iter::empty(),
@@ -235,7 +249,7 @@ impl RequestHandler for RunboundHandler {
                     );
                     self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
                     return response_handle.send_response(response).await
-                        .unwrap_or_else(|e| { error!("send: {e}"); header.into() });
+                        .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
                 }
 
                 // CNAME chain following (RFC 1034 §3.6.2):
@@ -246,11 +260,11 @@ impl RequestHandler for RunboundHandler {
                 if qtype != RecordType::CNAME {
                     let chain = follow_local_cname(&zones_snap, qname, qtype);
                     if !chain.is_empty() {
-                        let mut header = Header::response_from_request(request.header());
-                        header.set_authoritative(true);
+                        let mut metadata = Metadata::response_from_request(&request.metadata);
+                        metadata.authoritative = true;
                         let builder = MessageResponseBuilder::from_message_request(request);
                         let response = builder.build(
-                            header,
+                            metadata,
                             chain.iter(),
                             std::iter::empty(),
                             std::iter::empty(),
@@ -258,28 +272,28 @@ impl RequestHandler for RunboundHandler {
                         );
                         self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
                         return response_handle.send_response(response).await
-                            .unwrap_or_else(|e| { error!("send: {e}"); header.into() });
+                            .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
                     }
                 }
 
                 // RFC 1035 §3.7 / RFC 2308: NODATA vs NXDOMAIN
                 if zones_snap.name_has_records(qname) {
-                    debug!(%qname, %qtype, "local-zone NODATA");
-                    let mut header = Header::response_from_request(request.header());
-                    header.set_authoritative(true);
+                    debug!(name=%sanitize_dns_name(qname), %qtype, "local-zone NODATA");
+                    let mut metadata = Metadata::response_from_request(&request.metadata);
+                    metadata.authoritative = true;
                     let builder = MessageResponseBuilder::from_message_request(request);
                     let response = builder.build(
-                        header,
-                        std::iter::empty(),
+                        metadata,
+                        std::iter::empty::<&Record>(),
                         std::iter::empty(),
                         std::iter::empty(),
                         std::iter::empty(),
                     );
                     self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
                     return response_handle.send_response(response).await
-                        .unwrap_or_else(|e| { error!("send: {e}"); header.into() });
+                        .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
                 }
-                debug!(%qname, "local-zone NXDOMAIN (name not found)");
+                debug!(name=%sanitize_dns_name(qname), "local-zone NXDOMAIN (name not found)");
                 self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Nxdomain, start);
                 return send_error(request, response_handle, ResponseCode::NXDomain).await;
             }
@@ -293,33 +307,57 @@ impl RequestHandler for RunboundHandler {
                 // DNS rebinding protection: SERVFAIL if any A/AAAA record falls
                 // within a configured private-address range (Unbound compatible).
                 if !self.private_addrs.is_empty() {
-                    for rec in lookup.records() {
-                        let private_ip = match rec.data() {
-                            Some(RData::A(a))    => Some(IpAddr::V4((*a).into())),
-                            Some(RData::AAAA(a)) => Some(IpAddr::V6((*a).into())),
+                    for rec in lookup.answers() {
+                        let private_ip = match &rec.data {
+                            RData::A(a)    => Some(IpAddr::V4(a.0)),
+                            RData::AAAA(a) => Some(IpAddr::V6(a.0)),
                             _ => None,
                         };
                         if let Some(ip) = private_ip {
                             if self.private_addrs.contains(ip) {
-                                warn!(%qname, %ip, "private-address block → SERVFAIL");
+                                warn!(name=%sanitize_dns_name(qname), %ip, "private-address block → SERVFAIL");
                                 self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
                                 return send_error(request, response_handle, ResponseCode::ServFail).await;
                             }
                         }
                     }
                 }
-                debug!(%qname, %qtype, count = lookup.records().len(), "resolved");
-                let mut header = Header::response_from_request(request.header());
-                header.set_recursion_available(true);
-                let builder = MessageResponseBuilder::from_message_request(request);
+
                 let ttl_cap = self.cache_max_ttl;
-                let records: Vec<_> = lookup.records().iter().map(|r| {
+                let records: Vec<Record> = lookup.answers().iter().map(|r| {
                     let mut r = r.clone();
-                    if r.ttl() > ttl_cap { r.set_ttl(ttl_cap); }
+                    if r.ttl > ttl_cap { r.ttl = ttl_cap; }
                     r
                 }).collect();
+
+                // DNSSEC: check for bogus proof on individual records in success path.
+                // Bogus = RRSIG chain failed validation → SERVFAIL.
+                // Secure = at least one RRSIG present and valid.
+                // Insecure = no RRSIG (delegation proved unsigned by NSEC/NSEC3).
+                if self.dnssec_enabled {
+                    let has_bogus = records.iter().any(|r| r.proof.is_bogus());
+                    if has_bogus {
+                        self.stats.inc_dnssec_bogus();
+                        if self.dnssec_log_bogus {
+                            warn!(name=%sanitize_dns_name(qname), "DNSSEC bogus — SERVFAIL");
+                        }
+                        self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
+                        return send_error(request, response_handle, ResponseCode::ServFail).await;
+                    }
+                    let has_rrsig = records.iter().any(|r| r.record_type() == RecordType::RRSIG);
+                    if has_rrsig {
+                        self.stats.inc_dnssec_secure();
+                    } else {
+                        self.stats.inc_dnssec_insecure();
+                    }
+                }
+
+                debug!(name=%sanitize_dns_name(qname), %qtype, count = records.len(), "resolved");
+                let mut metadata = Metadata::response_from_request(&request.metadata);
+                metadata.recursion_available = true;
+                let builder = MessageResponseBuilder::from_message_request(request);
                 let response = builder.build(
-                    header,
+                    metadata,
                     records.iter(),
                     std::iter::empty(),
                     std::iter::empty(),
@@ -328,18 +366,6 @@ impl RequestHandler for RunboundHandler {
                 self.stats.inc_forwarded();
                 let fwd_us = start.elapsed().as_micros() as u64;
                 self.stats.record_forward(fwd_us);
-                // DNSSEC: classify Secure vs Insecure when validation is enabled.
-                // RRSIG records in the answer indicate the response is signed (Secure).
-                // No RRSIG = delegation proved unsigned by parent NSEC/NSEC3 (Insecure).
-                if self.dnssec_enabled {
-                    let has_rrsig = records.iter()
-                        .any(|r| r.record_type() == RecordType::RRSIG);
-                    if has_rrsig {
-                        self.stats.inc_dnssec_secure();
-                    } else {
-                        self.stats.inc_dnssec_insecure();
-                    }
-                }
                 let fwd_action = if fwd_us < CACHE_HIT_THRESHOLD_US {
                     LogAction::Cached
                 } else {
@@ -347,30 +373,29 @@ impl RequestHandler for RunboundHandler {
                 };
                 self.record_query(client_ip, qname, qtype, ResponseCode::NoError, fwd_action, start);
                 response_handle.send_response(response).await
-                    .unwrap_or_else(|e| { error!("send: {e}"); header.into() })
+                    .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) })
             }
             Err(e) => {
-                // Detect DNSSEC bogus: ProtoErrorKind::RrsigsNotPresent means hickory
-                // found no RRSIG for a domain it expected to be signed → bogus signature chain.
+                // DNSSEC bogus via NSEC denial: the resolver returned a validated
+                // NSEC/NSEC3 proof that the record does not exist → SERVFAIL.
                 let is_dnssec_bogus = self.dnssec_enabled
-                    && matches!(e.kind(), ResolveErrorKind::Proto(pe)
-                        if matches!(pe.kind(), ProtoErrorKind::RrsigsNotPresent { .. }));
+                    && matches!(&e, NetError::Dns(DnsError::Nsec { proof, .. }) if proof.is_bogus());
 
                 if is_dnssec_bogus {
                     self.stats.inc_dnssec_bogus();
                     if self.dnssec_log_bogus {
-                        warn!(%qname, "DNSSEC bogus — SERVFAIL (missing/invalid RRSIG)");
+                        warn!(name=%sanitize_dns_name(qname), "DNSSEC bogus — SERVFAIL (NSEC denial)");
                     }
                 }
 
-                let rcode = match e.kind() {
-                    ResolveErrorKind::NoRecordsFound { response_code, .. } => {
-                        debug!(%qname, ?response_code, "no records from resolver");
+                let rcode = match &e {
+                    NetError::Dns(DnsError::NoRecordsFound(NoRecords { response_code, .. })) => {
+                        debug!(name=%sanitize_dns_name(qname), ?response_code, "no records from resolver");
                         *response_code
                     }
                     _ => {
                         if !is_dnssec_bogus {
-                            warn!(%qname, err=%e, "resolver error → SERVFAIL");
+                            warn!(name=%sanitize_dns_name(qname), err=%e, "resolver error → SERVFAIL");
                         }
                         ResponseCode::ServFail
                     }
@@ -392,6 +417,15 @@ impl RequestHandler for RunboundHandler {
 // Helpers
 // ============================================================
 
+/// MED-06: Strip control characters from DNS names before structured log emission.
+/// Prevents log injection via carefully crafted query names containing \n, \r, etc.
+fn sanitize_dns_name(name: &LowerName) -> String {
+    name.to_string()
+        .chars()
+        .map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '?' })
+        .collect()
+}
+
 /// Follow CNAME records within local zones, up to 8 hops (prevents loops).
 /// Returns a Vec<Record> containing the CNAME chain + final target records,
 /// or an empty Vec if there is no CNAME or the chain leads outside local zones.
@@ -407,8 +441,8 @@ fn follow_local_cname(
         let cnames = zones.local_records(&current, RecordType::CNAME);
         if cnames.is_empty() { break; }
         let cname_rec = (*cnames[0]).clone();
-        let next = match cname_rec.data() {
-            Some(RData::CNAME(c)) => LowerName::from(c.0.clone()),
+        let next = match &cname_rec.data {
+            RData::CNAME(c) => LowerName::from(c.0.clone()),
             _ => break,
         };
         chain.push(cname_rec);
@@ -425,6 +459,18 @@ fn follow_local_cname(
     Vec::new()
 }
 
+/// Construct a ResponseInfo carrying a SERVFAIL code without sending.
+/// Used as the send-failure fallback when the socket is already broken.
+#[inline]
+fn servfail_info(request: &Request) -> ResponseInfo {
+    let mut meta = Metadata::response_from_request(&request.metadata);
+    meta.response_code = ResponseCode::ServFail;
+    ResponseInfo::from(hickory_proto::op::Header {
+        metadata: meta,
+        counts:   hickory_proto::op::HeaderCounts::default(),
+    })
+}
+
 /// Send an error response, mirroring the request's EDNS0 OPT record if present.
 /// RFC 6891 §7: "If a query included an OPT record, the response MUST include one."
 #[inline(always)]
@@ -433,50 +479,46 @@ async fn send_error<R: ResponseHandler>(
     mut response_handle: R,
     rcode: ResponseCode,
 ) -> ResponseInfo {
-    let mut header = Header::response_from_request(request.header());
-    header.set_response_code(rcode);
+    // `error_msg` mirrors the request's EDNS0 OPT record, satisfying RFC 6891 §7.
     let builder  = MessageResponseBuilder::from_message_request(request);
-    // `build()` mirrors the request's EDNS0 OPT record into the response,
-    // satisfying RFC 6891 §7.  `error_msg()` does NOT include the OPT record.
-    let response = builder.build(
-        header,
-        std::iter::empty::<&hickory_proto::rr::Record>(),
-        std::iter::empty(),
-        std::iter::empty(),
-        std::iter::empty(),
-    );
+    let response = builder.error_msg(&request.metadata, rcode);
     response_handle.send_response(response).await
         .unwrap_or_else(|e| {
             error!("send: {e}");
-            header.into()
+            servfail_info(request)
         })
 }
 
 /// Build resolver from forward-zones in unbound.conf, fallback to system resolvers.
-fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioAsyncResolver> {
-    let mut resolver_cfg = ResolverConfig::new();
+fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioResolver> {
+    let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
 
     for fwd in &cfg.forward_zones {
         for addr_str in &fwd.addrs {
             // Supports Unbound addr@port syntax: "1.1.1.1@853"
+            let default_port = if fwd.tls { 853u16 } else { 53u16 };
             let (ip_str, port) = if let Some(at) = addr_str.find('@') {
-                let p: u16 = addr_str[at + 1..].parse().unwrap_or(if fwd.tls { 853 } else { 53 });
+                let p: u16 = addr_str[at + 1..].parse().unwrap_or(default_port);
                 (&addr_str[..at], p)
             } else {
-                (addr_str.as_str(), if fwd.tls { 853 } else { 53 })
+                (addr_str.as_str(), default_port)
             };
-            if let Ok(ip) = ip_str.parse() {
-                let addr = std::net::SocketAddr::new(ip, port);
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
                 if fwd.tls {
                     // DNS-over-TLS: encrypted channel, single TCP connection per server.
-                    resolver_cfg.add_name_server(NameServerConfig::new(addr, Protocol::Tls));
+                    let mut cc = ConnectionConfig::tls(Arc::from(ip.to_string()));
+                    cc.port = port;
+                    resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc]));
                 } else {
                     // UDP for normal queries (fast path)
-                    resolver_cfg.add_name_server(NameServerConfig::new(addr, Protocol::Udp));
+                    let mut cc_udp = ConnectionConfig::udp();
+                    cc_udp.port = port;
                     // TCP mandatory for DNSSEC: DNSKEY RRsets exceed UDP MTU and
                     // arrive truncated (TC=1). Without TCP, the DNSSEC chain cannot
                     // be completed and every signed domain returns SERVFAIL.
-                    resolver_cfg.add_name_server(NameServerConfig::new(addr, Protocol::Tcp));
+                    let mut cc_tcp = ConnectionConfig::tcp();
+                    cc_tcp.port = port;
+                    resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc_udp, cc_tcp]));
                 }
             }
         }
@@ -493,22 +535,31 @@ fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioAsyncResolver> {
              All DNS queries will be sent to a third-party resolver. \
              Add forward-zone blocks to runbound.conf to suppress this warning."
         );
-        resolver_cfg = ResolverConfig::cloudflare();
+        for ip_str in ["1.1.1.1", "1.0.0.1"] {
+            let ip: IpAddr = ip_str.parse().expect("valid Cloudflare IP");
+            resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![
+                ConnectionConfig::udp(),
+                ConnectionConfig::tcp(),
+            ]));
+        }
     }
 
     let mut opts = ResolverOpts::default();
     opts.recursion_desired = true;
     opts.cache_size = 8192; // doubled from 4096 — better hit rate under load
-    opts.timeout = Duration::from_secs(3);      // hard timeout per upstream query
-    opts.attempts = 2;                           // retry once before SERVFAIL
+    opts.timeout = Duration::from_secs(3);            // hard timeout per upstream query
+    opts.attempts = 2;                                // retry once before SERVFAIL
     // DNSSEC: controlled by `dnssec-validation` directive (default: off for forwarders).
     // Enable only when operating as a full recursive resolver with complete RRSIG chains.
     // Forwarders must leave this off: upstreams strip RRSIGs before forwarding,
     // causing spurious SERVFAIL for every signed domain (gmail.com, google.com…).
     opts.validate = cfg.dnssec_validation;
-    opts.use_hosts_file = false;                 // don't leak host file data
+    opts.use_hosts_file = ResolveHosts::Never;        // don't leak host file data
 
-    Ok(TokioAsyncResolver::tokio(resolver_cfg, opts))
+    TokioResolver::builder_with_config(resolver_cfg, TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+        .map_err(|e| anyhow::anyhow!("resolver build: {e}"))
 }
 
 // ============================================================
@@ -548,7 +599,7 @@ fn read_meminfo() -> Option<(u64, u64)> {
 ///      until they finish; new queries use the fresh resolver with empty cache.
 pub async fn memory_guard_loop(
     rate_limiter: Arc<RateLimiter>,
-    resolver:     Arc<ArcSwap<TokioAsyncResolver>>,
+    resolver:     Arc<ArcSwap<TokioResolver>>,
     cfg:          Arc<UnboundConfig>,
     stats:        Arc<Stats>,
 ) {
@@ -574,7 +625,7 @@ pub async fn memory_guard_loop(
         let freed_buckets = rate_limiter.clear();
 
         // 2. Rebuild resolver — this discards hickory's entire in-memory DNS cache.
-        //    Queries in flight hold their own Arc<TokioAsyncResolver> and finish
+        //    Queries in flight hold their own Arc<TokioResolver> and finish
         //    normally; new queries get the fresh empty-cache resolver.
         match build_resolver(&cfg) {
             Ok(new_res) => {
@@ -596,35 +647,67 @@ pub async fn memory_guard_loop(
 }
 
 // ============================================================
-// Server entry point
+// TLS helpers
 // ============================================================
 
-/// Load TLS cert+key from PEM files. Returns None if not configured.
-fn load_tls(tls: &TlsConfig) -> Option<(Vec<rustls::Certificate>, rustls::PrivateKey)> {
+/// Load TLS cert+key materials from PEM files. Returns None if not configured.
+fn load_tls_materials(tls: &TlsConfig) -> Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let cert_path = tls.cert_path.as_deref()?;
     let key_path  = tls.key_path.as_deref()?;
-
-    let cert_pem = std::fs::read(cert_path).ok()?;
-    let key_pem  = std::fs::read(key_path).ok()?;
-
-    let certs: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut cert_pem.as_slice())
-        .ok()?
-        .into_iter()
-        .map(rustls::Certificate)
+    let cert_pem  = std::fs::read(cert_path).ok()?;
+    let key_pem   = std::fs::read(key_path).ok()?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .flatten()
         .collect();
-
-    // Try PKCS8 first, then RSA
-    let key = rustls_pemfile::pkcs8_private_keys(&mut key_pem.as_slice())
-        .ok()
-        .and_then(|k| k.into_iter().next().map(rustls::PrivateKey))
-        .or_else(|| {
-            rustls_pemfile::rsa_private_keys(&mut key_pem.as_slice())
-                .ok()
-                .and_then(|k| k.into_iter().next().map(rustls::PrivateKey))
-        })?;
-
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice()).ok()??.clone_key();
     if certs.is_empty() { return None; }
     Some((certs, key))
+}
+
+/// Build a rustls ServerConfig for a specific DNS-over-TLS protocol.
+///
+/// * `alpn`      — ALPN token: `b"dot"`, `b"h2"`, or `b"doq"`.
+/// * `tls13_only`— true for DoQ (Quinn requires TLS 1.3 exclusively).
+/// * `client_ca` — optional path to CA PEM for mTLS (HIGH-08, DoT only).
+fn build_tls_config(
+    certs:     Vec<CertificateDer<'static>>,
+    key:       PrivateKeyDer<'static>,
+    alpn:      &[u8],
+    tls13_only: bool,
+    client_ca: Option<&str>,
+) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    let builder = if tls13_only {
+        // DoQ requires TLS 1.3 — Quinn rejects configs that allow TLS 1.2.
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+    } else {
+        rustls::ServerConfig::builder()
+    };
+
+    let mut config = if let Some(ca_path) = client_ca {
+        // HIGH-08: mutual TLS for DoT — require a client certificate signed by ca_path.
+        let ca_pem = std::fs::read(ca_path)
+            .map_err(|e| anyhow::anyhow!("read CA cert {ca_path}: {e}"))?;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_pem.as_slice()).flatten() {
+            roots.add(cert)
+                .map_err(|e| anyhow::anyhow!("load CA cert: {e}"))?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| anyhow::anyhow!("mTLS verifier: {e}"))?;
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("TLS config: {e}"))?
+    };
+
+    config.alpn_protocols = vec![alpn.to_vec()];
+    Ok(Arc::new(config))
 }
 
 // SO_REUSEPORT UDP socket: the kernel distributes incoming packets across
@@ -692,7 +775,7 @@ pub async fn run_dns_server(
         Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl, stats, log_buffer,
         cfg.dnssec_validation, cfg.dnssec_log_bogus,
     );
-    let mut server = ServerFuture::new(handler);
+    let mut server = Server::new(handler);
 
     let ncpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
 
@@ -727,25 +810,46 @@ pub async fn run_dns_server(
         let tcp = TcpListener::bind(&tcp_addr).await
             .map_err(|e| anyhow::anyhow!("TCP bind {tcp_addr}: {e}"))?;
         info!(addr=%tcp_addr, "DNS TCP listening");
-        // 30s idle timeout — enough for slow DNSSEC responses while limiting FD exhaustion
-        server.register_listener(tcp, Duration::from_secs(30));
+        // 30s idle timeout — enough for slow DNSSEC responses while limiting FD exhaustion.
+        // 4096-byte response buffer fits any DNS response (max UDP payload is 65535 bytes but
+        // typical responses are well under 4 KiB; EDNS0 handles larger).
+        server.register_listener(tcp, Duration::from_secs(30), 4096);
     }
 
     // ── DoT / DoH / DoQ (RFC 7858 / 8484 / 9250) ───────────────────────────
-    if let Some(tls) = load_tls(tls_cfg) {
+    if let Some((certs, key)) = load_tls_materials(tls_cfg) {
         let dot_port = tls_cfg.dot_port.unwrap_or(853);
         let doh_port = tls_cfg.doh_port.unwrap_or(443);
         let doq_port = tls_cfg.doq_port.unwrap_or(853);
         let hostname = tls_cfg.hostname.clone()
             .unwrap_or_else(|| "runbound.local".to_string());
 
+        // Build one ServerConfig per protocol (each needs its own ALPN token).
+        // PrivateKeyDer does not implement Clone; use clone_key() for each copy.
+        let dot_config = build_tls_config(
+            certs.clone(), key.clone_key(),
+            b"dot", false,
+            tls_cfg.dot_client_auth_ca.as_deref(),
+        ).map_err(|e| anyhow::anyhow!("DoT TLS config: {e}"))?;
+
+        let doh_config = build_tls_config(
+            certs.clone(), key.clone_key(),
+            b"h2", false, None,
+        ).map_err(|e| anyhow::anyhow!("DoH TLS config: {e}"))?;
+
+        // DoQ requires TLS 1.3 exclusively (Quinn constraint).
+        let doq_config = build_tls_config(
+            certs, key,
+            b"doq", true, None,
+        ).map_err(|e| anyhow::anyhow!("DoQ TLS config: {e}"))?;
+
         for iface in &interfaces {
             // DNS-over-TLS (port 853 TCP)
             let dot_addr = format!("{}:{}", iface, dot_port);
             match TcpListener::bind(&dot_addr).await {
                 Ok(tcp) => {
-                    info!(addr=%dot_addr, "DoT (DNS-over-TLS) listening — RFC 7858");
-                    server.register_tls_listener(tcp, Duration::from_secs(30), tls.clone())
+                    info!(addr=%dot_addr, mtls=tls_cfg.dot_client_auth_ca.is_some(), "DoT (DNS-over-TLS) listening — RFC 7858");
+                    server.register_tls_listener_with_tls_config(tcp, Duration::from_secs(30), Arc::clone(&dot_config))
                         .map_err(|e| anyhow::anyhow!("DoT register: {e}"))?;
                 }
                 Err(e) => warn!(addr=%dot_addr, err=%e, "DoT bind failed — skipping"),
@@ -756,8 +860,12 @@ pub async fn run_dns_server(
             match TcpListener::bind(&doh_addr).await {
                 Ok(tcp) => {
                     info!(addr=%doh_addr, "DoH (DNS-over-HTTPS) listening — RFC 8484");
-                    server.register_https_listener(tcp, Duration::from_secs(30), tls.clone(), Some(hostname.clone()))
-                        .map_err(|e| anyhow::anyhow!("DoH register: {e}"))?;
+                    server.register_https_listener_with_tls_config(
+                        tcp, Duration::from_secs(30),
+                        Arc::clone(&doh_config),
+                        Some(hostname.clone()),
+                        "/dns-query".to_string(),
+                    ).map_err(|e| anyhow::anyhow!("DoH register: {e}"))?;
                 }
                 Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
             }
@@ -767,7 +875,7 @@ pub async fn run_dns_server(
             match UdpSocket::bind(&doq_addr).await {
                 Ok(udp) => {
                     info!(addr=%doq_addr, "DoQ (DNS-over-QUIC) listening — RFC 9250");
-                    server.register_quic_listener(udp, Duration::from_secs(30), tls.clone(), Some(hostname.clone()))
+                    server.register_quic_listener_and_tls_config(udp, Duration::from_secs(30), Arc::clone(&doq_config))
                         .map_err(|e| anyhow::anyhow!("DoQ register: {e}"))?;
                 }
                 Err(e) => warn!(addr=%doq_addr, err=%e, "DoQ bind failed — skipping"),

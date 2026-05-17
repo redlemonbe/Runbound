@@ -1,6 +1,6 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.3.5  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.0  
 **Last updated:** 2026-05-17  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser  
 **Methodology:** Manual white-box source code review of all Rust modules
@@ -20,13 +20,14 @@ findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0
 A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
 through SEC-16), all fixed in v0.3.3.
 
-**Three open architectural findings remain** before nation-state production deployment:
+**All HIGH and MEDIUM open findings are closed as of v0.4.0:**
 
-1. JSON data stores (`dns_entries.json`, `blacklist.json`, `feeds.json`) have no
-   HMAC integrity protection — filesystem write access bypasses all API controls.
-2. TLS cipher suites inherit rustls 0.21 defaults, which include suites below
-   BSI TR-02102 / NIST SP 800-52 Rev 2 requirements.
-3. DoT has no mutual TLS support — no client certificate authentication.
+- JSON store HMAC-SHA256 integrity (HIGH-06) — `RUNBOUND_STORE_KEY` env var, sidecar `.mac` files.
+- TLS cipher suite hardening (HIGH-07) — hickory 0.26 + rustls 0.23, TLS 1.3 default.
+- DoT mutual TLS (HIGH-08) — `dot-client-auth-ca` directive + `WebPkiClientVerifier`.
+- SSRF at connection layer (MED-03) — custom `reqwest::dns::Resolve` filtering private IPs.
+- qname log injection (MED-06) — `sanitize_dns_name()` strips control chars before structured logging.
+- Config entry cap (LOW-03) — 1,000,000 limit on `local-zone` / `local-data`.
 
 ---
 
@@ -184,44 +185,59 @@ defence.
 
 #### AUDIT-HIGH-06 — JSON data stores have no integrity protection
 
-**File:** `src/store.rs`, `src/feeds/mod.rs`  
-**Status:** ⚠️ Open — HMAC integrity planned (v0.4.x)
+**File:** `src/store.rs`, `src/feeds/mod.rs`, `src/integrity.rs`  
+**Status:** ✅ Fixed in v0.4.0 — HMAC-SHA256 sidecar `.mac` files
 
 `dns_entries.json`, `blacklist.json`, and `feeds.json` are stored as cleartext JSON
 (mode 0640). An attacker with filesystem write access can inject arbitrary DNS
 records without touching the API, bypassing authentication, rate limiting, and entry
-count limits. HMAC-SHA256 integrity over store files is planned.
+count limits.
 
-**Mitigation for production:** Mount the data directory on an integrity-protected
-filesystem (dm-verity, ZFS with checksums). Apply IMA/EVM on the data files.
+**Fix:** Set `RUNBOUND_STORE_KEY` (hex-encoded 32+ bytes or any UTF-8 string). On every
+write, `src/integrity.rs` computes `HMAC-SHA256(content, key)` and writes it to a
+sidecar `.mac` file (e.g. `dns_entries.mac`). On every load, the HMAC is verified
+before deserialization:
+- `.mac` missing, key set → WARN, load proceeds (backwards compatibility).
+- `.mac` present, mismatch → ERROR, load refused, server exits.
+- `.mac` present, key unset → WARN, load proceeds (cannot verify).
+
+Domain cache files (per-feed `.json`) are regeneratable from the internet; HMAC mismatch
+discards the cache (WARN) and triggers a re-fetch on next update cycle.
 
 ---
 
 #### AUDIT-HIGH-07 — TLS cipher suites inherit rustls 0.21 defaults
 
 **File:** `Cargo.toml`, `src/dns/server.rs`  
-**Status:** ⚠️ Open — requires hickory 0.26 upgrade (v0.4.0)
+**Status:** ✅ Fixed in v0.4.0 — hickory 0.26 + rustls 0.23, TLS 1.3 default
 
-`rustls 0.21` (pulled by hickory-server 0.24) enables TLS 1.2 + cipher suites
-below BSI TR-02102 / NIST SP 800-52 Rev 2. Upgrading to hickory-server 0.26 pulls
-rustls 0.23 which defaults to TLS 1.3 only. Six hickory-proto CVEs (RUSTSEC-2026-0119,
+`rustls 0.21` (pulled by hickory-server 0.24) enabled TLS 1.2 + cipher suites
+below BSI TR-02102 / NIST SP 800-52 Rev 2. Upgraded to hickory-server 0.26 + rustls 0.23.
+DoQ uses `ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])` —
+Quinn rejects configs that permit TLS 1.2. DoT and DoH use the rustls 0.23 default
+which offers TLS 1.3 by preference. Six hickory-proto CVEs (RUSTSEC-2026-0119,
 RUSTSEC-2026-0037, RUSTSEC-2025-0009, RUSTSEC-2026-0104, RUSTSEC-2026-0098,
-RUSTSEC-2026-0099) are also resolved in hickory 0.26. Migration is tracked in `audit.toml`.
-
-**Mitigation for nation-state:** Configure a TLS terminating proxy (nginx, haproxy)
-in front of Runbound's DoT port with explicit TLS 1.3 + approved cipher list.
+RUSTSEC-2026-0099) resolved. All ignores removed from `audit.toml`.
 
 ---
 
 #### AUDIT-HIGH-08 — No mTLS for DoT client authentication
 
-**File:** `src/dns/server.rs`  
-**Status:** ⚠️ Open — architectural
+**File:** `src/dns/server.rs`, `src/config/parser.rs`  
+**Status:** ✅ Fixed in v0.4.0 — `dot-client-auth-ca` + `WebPkiClientVerifier`
 
-DoT uses server-only TLS. There is no support for mutual TLS (client certificates).
-For a classified DNS resolver, mTLS restricts service to authorised endpoints.
-Requires a custom `ServerConfig` with `client_cert_verifier` set in rustls. Blocked
-on the hickory 0.26 upgrade (HIGH-07).
+DoT uses server-only TLS by default. Mutual TLS is now enabled with:
+
+```
+server:
+    dot-client-auth-ca: "/etc/runbound/client-ca.pem"
+```
+
+`build_tls_config()` detects the CA path and builds a `WebPkiClientVerifier` via
+`rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?`.
+The DoT `ServerConfig` is then constructed with `with_client_cert_verifier(verifier)`.
+DoH and DoQ are unaffected (they authenticate via application-layer tokens).
+When `dot-client-auth-ca` is absent, DoT falls back to server-only authentication.
 
 ---
 
@@ -255,13 +271,19 @@ control of both the feed's DNS zone and precise millisecond timing.
 #### AUDIT-MED-03 — SSRF hostname resolution uses system resolver
 
 **File:** `src/feeds/mod.rs`  
-**Status:** ⚠️ Open
+**Status:** ✅ Fixed in v0.4.0 — `SsrfSafeDnsResolver` implements `reqwest::dns::Resolve`
 
 `validate_feed_url()` uses `tokio::net::lookup_host()` which resolves via
 `/etc/resolv.conf`. On a Runbound host that is its own resolver, this creates a
 loop, and the system resolver is not guaranteed to give accurate SSRF-blocking
-results. The correct fix is to validate at TCP connection time in a custom reqwest
-connector that checks `is_private_ip()` after each resolution.
+results.
+
+**Fix:** `SsrfSafeDnsResolver` implements `reqwest::dns::Resolve` and is installed
+via `Client::builder().dns_resolver(Arc::new(SsrfSafeDnsResolver))`. On every TCP
+connection, the resolver calls `tokio::net::lookup_host`, filters all returned
+`SocketAddr`s through `is_private_ip()`, and returns an error if no public address
+remains. This operates at the network layer — independent of `validate_feed_url()`
+and active on every redirect followed by the client.
 
 ---
 
@@ -295,15 +317,16 @@ authentication.
 #### AUDIT-MED-06 — Log injection via structured DNS query names
 
 **File:** `src/dns/server.rs`  
-**Status:** ⚠️ Open — verify tracing JSON escaping
+**Status:** ✅ Fixed in v0.4.0 — `sanitize_dns_name()` strips control characters
 
 DNS query names are emitted verbatim as structured log fields. With JSON output
 (`RUST_LOG=json`), a crafted name containing `"` or `}` could break downstream
-log consumers (Elasticsearch, Splunk). The `tracing-subscriber` JSON formatter
-escapes most special characters; full verification against RFC 1035 character
-constraints and JSON-breaking sequences is pending.
+log consumers (Elasticsearch, Splunk).
 
-**Mitigation:** Apply explicit JSON escaping to `qname` before logging.
+**Fix:** `sanitize_dns_name(name: &LowerName) -> String` replaces any ASCII control
+character (0x00–0x1F, 0x7F) with `?` before the name is used in any `tracing` macro.
+Non-ASCII bytes are also replaced with `?`. The function is called on every query before
+the structured log event is emitted, ensuring the logged field is always printable ASCII.
 
 ---
 
@@ -342,12 +365,13 @@ See AUDIT-HIGH-02.
 #### AUDIT-LOW-03 — No cap on `local-zone` / `local-data` entries in config
 
 **File:** `src/config/parser.rs`  
-**Status:** ⚠️ Open
+**Status:** ✅ Fixed in v0.4.0 — `MAX_LOCAL_ZONES = MAX_LOCAL_DATA = 1_000_000`
 
-The config parser accumulates entries without limit. A malformed config with millions
-of `local-data:` lines consumes unbounded memory at startup. Risk is low (operator-
-controlled config) but a sanity cap (e.g. 1,000,000) with a startup error would
-prevent accidental misconfiguration.
+The config parser now enforces a 1,000,000 entry limit for both `local-zone:` and
+`local-data:` directives. When the limit is reached, subsequent entries are silently
+dropped and a WARN is emitted: `local-zone limit (1000000) reached — entry ignored`.
+This prevents accidental OOM from pathological configs while supporting any realistic
+deployment size (1M entries ≈ 200 MiB of zone data at 200 bytes average).
 
 ---
 
@@ -548,7 +572,7 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 
 ## Finding Summary
 
-### Initial Audit (v0.2.3) — status as of v0.3.5
+### Initial Audit (v0.2.3) — status as of v0.4.0
 
 | ID | Severity | Component | Status |
 |---|---|---|---|
@@ -561,19 +585,19 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 | HIGH-03 | HIGH | DNS | ✅ Mitigated v0.2.4 — startup WARN |
 | HIGH-04 | HIGH | Reload | ✅ Fixed v0.2.5 — docs corrected |
 | HIGH-05 | HIGH | RateLimit | ✅ Mitigated — aggressive eviction on flood |
-| HIGH-06 | HIGH | Storage | ⚠️ Open — HMAC integrity planned v0.4.x |
-| HIGH-07 | HIGH | TLS | ⚠️ Open — rustls 0.23 via hickory 0.26 (v0.4.0) |
-| HIGH-08 | HIGH | TLS/DoT | ⚠️ Open — mTLS, blocked on hickory 0.26 |
+| HIGH-06 | HIGH | Storage | ✅ Fixed v0.4.0 — HMAC-SHA256 sidecar `.mac` files |
+| HIGH-07 | HIGH | TLS | ✅ Fixed v0.4.0 — hickory 0.26 + rustls 0.23, TLS 1.3 |
+| HIGH-08 | HIGH | TLS/DoT | ✅ Fixed v0.4.0 — `dot-client-auth-ca` mTLS |
 | MED-01 | MEDIUM | Feeds | ✅ Accepted — intentional RFC relaxation |
 | MED-02 | MEDIUM | SSRF/TOCTOU | ✅ Mitigated — re-validation on every fetch |
-| MED-03 | MEDIUM | SSRF | ⚠️ Open — resolver independence |
+| MED-03 | MEDIUM | SSRF | ✅ Fixed v0.4.0 — `SsrfSafeDnsResolver` at connect time |
 | MED-04 | MEDIUM | XDP | ✅ Fixed v0.2.4 — debug_assert bounds |
 | MED-05 | MEDIUM | API auth | ✅ Fixed v0.2.5 — 500 ms lockout per failure |
-| MED-06 | MEDIUM | Logging | ⚠️ Open — JSON escaping of qname |
+| MED-06 | MEDIUM | Logging | ✅ Fixed v0.4.0 — `sanitize_dns_name()` |
 | MED-07 | MEDIUM | Config | ✅ Mitigated v0.2.4 — WARN on api-key in config |
 | LOW-01 | LOW | Feeds | ✅ Fixed v0.2.5 — humantime::format_rfc3339 |
 | LOW-02 | LOW | API | ✅ Fixed v0.2.5 — /help requires Bearer |
-| LOW-03 | LOW | Config | ⚠️ Open — no cap on local-zone entries |
+| LOW-03 | LOW | Config | ✅ Fixed v0.4.0 — 1,000,000 entry cap |
 | LOW-04 | LOW | DNS/TLS | ✅ Fixed v0.2.5 — TCP timeout 30 s |
 
 ### Second Audit Cycle (v0.3.x) — status as of v0.3.5
@@ -597,39 +621,21 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 
 ---
 
-## Open Findings (action required)
+## Open Findings
 
-| ID | Severity | Remediation |
-|---|---|---|
-| HIGH-06 | HIGH | Implement HMAC-SHA256 over JSON data stores — planned v0.4.x |
-| HIGH-07 | HIGH | Upgrade hickory 0.24 → 0.26 (rustls 0.21 → 0.23, TLS 1.3 only) — v0.4.0 |
-| HIGH-08 | HIGH | Implement mTLS for DoT — blocked on HIGH-07 |
-| MED-03 | MEDIUM | Validate SSRF at TCP connection time, independent of system resolver |
-| MED-06 | MEDIUM | Explicit JSON escaping for `qname` in structured logs |
-| LOW-03 | LOW | Startup cap on `local-zone` / `local-data` entries from config |
+All findings from the initial audit cycle and second audit cycle are resolved as of v0.4.0.
+No open findings remain.
 
 ---
 
-## Remediation Priority (nation-state deployment)
+## Hardening Checklist (nation-state deployment)
 
-### Before first production use
-
-1. **Configure explicit `forward-zone:` blocks** — never rely on the Cloudflare fallback.
-2. **Enable `forward-tls-upstream: yes`** — plain UDP to upstream is observable.
-3. **Mount data directory on integrity-protected storage** — dm-verity or ZFS (HIGH-06 workaround).
-4. **Route Runbound through a DNSSEC-validating upstream** and set `dnssec-validation: yes`.
-5. **Place a TLS 1.3-only proxy** (nginx, haproxy) in front of the DoT port (HIGH-07 workaround).
-
-### v0.4.0 (planned)
-
-6. Upgrade hickory 0.24 → 0.26 — closes HIGH-07, HIGH-08, and six CVEs in `audit.toml`.
-7. Implement HMAC-SHA256 integrity over JSON data stores — closes HIGH-06.
-8. Implement mTLS for DoT — closes HIGH-08 (depends on #6).
-
-### Medium-term
-
-9. Custom reqwest connector for SSRF validation at TCP connection layer — closes MED-03.
-10. JSON escaping on `qname` in structured logging — closes MED-06.
+1. **Set `RUNBOUND_STORE_KEY`** — enables HMAC-SHA256 integrity on all JSON stores.
+2. **Configure explicit `forward-zone:` blocks** — never rely on the Cloudflare fallback.
+3. **Enable `forward-tls-upstream: yes`** — plain UDP to upstream is observable.
+4. **Set `dot-client-auth-ca:` if DoT is enabled** — restricts service to authorised endpoints.
+5. **Route Runbound through a DNSSEC-validating upstream** and set `dnssec-validation: yes`.
+6. **Set `RUNBOUND_API_KEY` in `/etc/runbound/env` (chmod 640)** — never use `api-key:` in config.
 
 ---
 
@@ -637,4 +643,7 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 `src/main.rs`, `src/api/mod.rs`, `src/config/parser.rs`, `src/dns/server.rs`,
 `src/dns/local.rs`, `src/dns/acl.rs`, `src/dns/ratelimit.rs`, `src/dns/xdp/worker.rs`,
 `src/dns/xdp/umem.rs`, `src/feeds/mod.rs`, `src/store.rs`.
-Second audit cycle targeting v0.3.3. Tracking updated through v0.3.5.*
+Second audit cycle targeting v0.3.3. Tracking updated through v0.4.0.
+v0.4.0 adds: `src/integrity.rs` (HIGH-06), hickory 0.26 + rustls 0.23 migration (HIGH-07),
+`dot-client-auth-ca` mTLS (HIGH-08), `SsrfSafeDnsResolver` (MED-03),
+`sanitize_dns_name()` (MED-06), local-zone cap (LOW-03).*

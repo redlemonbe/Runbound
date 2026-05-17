@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::integrity::{store_key, verify_mac, write_mac};
 
 fn store_path() -> std::path::PathBuf { crate::runtime::base_dir().join("dns_entries.json") }
 fn blacklist_path() -> std::path::PathBuf { crate::runtime::base_dir().join("blacklist.json") }
@@ -133,6 +134,8 @@ pub fn load() -> Result<DnsStore, AppError> {
     }
     let content = fs::read_to_string(&path)
         .map_err(|e| AppError::Internal(format!("read store: {e}")))?;
+    verify_mac(&path, content.as_bytes(), store_key().as_deref())
+        .map_err(AppError::Internal)?;
     serde_json::from_str(&content)
         .map_err(|e| AppError::Internal(format!("parse store: {e}")))
 }
@@ -166,6 +169,9 @@ pub fn save(store: &DnsStore) -> Result<(), AppError> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o640));
     }
+    // HIGH-06: write HMAC sidecar after atomic rename.
+    write_mac(&path, content.as_bytes(), store_key().as_deref())
+        .map_err(|e| AppError::Internal(format!("write store .mac: {e}")))?;
     Ok(())
 }
 
@@ -192,6 +198,8 @@ pub fn load_blacklist() -> Result<BlacklistStore, AppError> {
     }
     let content = fs::read_to_string(&path)
         .map_err(|e| AppError::Internal(format!("read blacklist: {e}")))?;
+    verify_mac(&path, content.as_bytes(), store_key().as_deref())
+        .map_err(AppError::Internal)?;
     serde_json::from_str(&content)
         .map_err(|e| AppError::Internal(format!("parse blacklist: {e}")))
 }
@@ -221,5 +229,8 @@ pub fn save_blacklist(store: &BlacklistStore) -> Result<(), AppError> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o640));
     }
+    // HIGH-06: write HMAC sidecar after atomic rename.
+    write_mac(&path, content.as_bytes(), store_key().as_deref())
+        .map_err(|e| AppError::Internal(format!("write blacklist .mac: {e}")))?;
     Ok(())
 }

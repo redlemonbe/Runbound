@@ -91,15 +91,41 @@ local-zone: "1.168.192.in-addr.arpa." static
 local-data: "10.1.168.192.in-addr.arpa. 300 IN PTR nas.home."
 ```
 
-### TLS (DNS-over-TLS)
+### TLS (DNS-over-TLS / DoH / DoQ)
 
 ```
 tls-service-pem: /etc/runbound/cert.pem
 tls-service-key: /etc/runbound/key.pem
+tls-port:        853       # DoT port (default: 853)
+https-port:      443       # DoH port (default: 443)
+quic-port:       853       # DoQ port (default: 853 UDP)
 ```
 
-When both are set, Runbound listens on port **853** for DoT connections in addition
-to port 53. See [tls.md](tls.md) for certificate setup.
+When both `tls-service-pem` and `tls-service-key` are set, Runbound listens on the
+configured TLS ports in addition to port 53. See [tls.md](tls.md) for certificate setup.
+
+#### DoT mutual TLS (client authentication)
+
+```
+dot-client-auth-ca: /etc/runbound/client-ca.pem
+```
+
+When set, DoT clients must present a certificate signed by the specified CA.
+Connections without a valid client certificate are rejected at the TLS handshake.
+DoH and DoQ are unaffected (they authenticate via the REST API Bearer token).
+
+Generate a client CA and client certificate:
+
+```bash
+# CA
+openssl req -x509 -newkey ed25519 -keyout ca-key.pem -out ca-cert.pem -days 3650 -nodes -subj "/CN=RunboundClientCA"
+# Client key + CSR + cert
+openssl req -newkey ed25519 -keyout client-key.pem -out client-csr.pem -nodes -subj "/CN=dot-client"
+openssl x509 -req -in client-csr.pem -CA ca-cert.pem -CAkey ca-key.pem -out client-cert.pem -days 365
+```
+
+Point `dot-client-auth-ca:` at `ca-cert.pem`. Distribute `client-cert.pem` + `client-key.pem`
+to authorised DNS clients.
 
 ### Logging
 
@@ -426,8 +452,9 @@ server:
     local-data: "nas.home.     300 IN A 192.168.1.10"
     local-data: "router.home.  300 IN A 192.168.1.1"
 
-    tls-service-pem: /etc/runbound/cert.pem
-    tls-service-key: /etc/runbound/key.pem
+    tls-service-pem:    /etc/runbound/cert.pem
+    tls-service-key:    /etc/runbound/key.pem
+    dot-client-auth-ca: /etc/runbound/client-ca.pem   # optional — mTLS for DoT
 
     api-port:  8081
     logfile:   ""
@@ -540,7 +567,40 @@ The sync port number is configurable. The REST API stays on localhost on all nod
 |---|---|
 | `RUNBOUND_API_KEY` | REST API Bearer token. Overrides `api-key` in config. |
 | `RUNBOUND_AUDIT_HMAC_KEY` | HMAC key for the audit log. Overrides `audit-log-hmac-key` in config. |
+| `RUNBOUND_STORE_KEY` | HMAC-SHA256 key for JSON store integrity (HIGH-06). See below. |
 | `RUST_LOG` | Log filter (e.g. `runbound=debug,info`). |
+
+### `RUNBOUND_STORE_KEY` — JSON store integrity (HIGH-06)
+
+When set, Runbound computes `HMAC-SHA256(json_content, key)` on every write and saves
+it to a sidecar `.mac` file (e.g. `dns_entries.mac`). On load, the MAC is verified before
+deserialization. A mismatch (tampered file) causes an ERROR and load is refused.
+
+```bash
+# Generate a 256-bit key (recommended):
+export RUNBOUND_STORE_KEY="$(openssl rand -hex 32)"
+# Add to /etc/runbound/env (chmod 640)
+```
+
+**Accepted key formats:**
+
+| Format | Example |
+|---|---|
+| 64+ hex chars (decoded to bytes) | `a3f1...` (64 hex chars) |
+| Raw UTF-8 string (any length) | `my-store-passphrase` |
+
+**Behaviour by case:**
+
+| Key set | `.mac` present | Result |
+|---|---|---|
+| No | No | OK — integrity not configured |
+| No | Yes | WARN — cannot verify without key |
+| Yes | No | WARN — saved without protection (backwards compat) |
+| Yes | Yes, match | OK |
+| Yes | Yes, mismatch | **ERROR — load refused** |
+
+Domain cache files (per-feed JSON under `feed_cache/`) are regeneratable: a HMAC
+mismatch discards the cache with WARN and triggers a re-fetch on the next update cycle.
 
 ### API key rotation without restart
 

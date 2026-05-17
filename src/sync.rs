@@ -140,37 +140,28 @@ pub fn cert_sha256_hex(cert_pem: &str) -> anyhow::Result<String> {
 }
 
 fn pem_cert_to_der(pem: &str) -> anyhow::Result<Vec<u8>> {
-    use rustls_pemfile::certs;
-    let mut r = std::io::BufReader::new(pem.as_bytes());
-    certs(&mut r)
-        .map_err(|e| anyhow::anyhow!("PEM parse: {e}"))?
-        .into_iter()
+    rustls_pemfile::certs(&mut std::io::BufReader::new(pem.as_bytes()))
+        .flatten()
         .next()
+        .map(|c| c.to_vec())
         .ok_or_else(|| anyhow::anyhow!("no certificate in PEM"))
 }
 
-/// Build a rustls 0.21 ServerConfig from cert+key PEM.
+/// Build a rustls 0.23 ServerConfig from cert+key PEM.
 pub fn server_tls_config(cert_pem: &str, key_pem: &str) -> anyhow::Result<rustls::ServerConfig> {
-    use rustls::{Certificate, PrivateKey, ServerConfig};
-    use rustls_pemfile::{certs, pkcs8_private_keys};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    let certs: Vec<Certificate> = certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
-        .map_err(|e| anyhow::anyhow!("parse cert PEM: {e}"))?
-        .into_iter()
-        .map(Certificate)
-        .collect();
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
+            .flatten()
+            .collect();
 
-    let keys: Vec<PrivateKey> = pkcs8_private_keys(&mut std::io::BufReader::new(key_pem.as_bytes()))
-        .map_err(|e| anyhow::anyhow!("parse key PEM: {e}"))?
-        .into_iter()
-        .map(PrivateKey)
-        .collect();
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem.as_bytes()))
+            .map_err(|e| anyhow::anyhow!("parse key PEM: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("no private key in PEM"))?;
 
-    let key = keys.into_iter().next()
-        .ok_or_else(|| anyhow::anyhow!("no private key in PEM"))?;
-
-    ServerConfig::builder()
-        .with_safe_defaults()
+    rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| anyhow::anyhow!("TLS server config: {e}"))
@@ -178,32 +169,72 @@ pub fn server_tls_config(cert_pem: &str, key_pem: &str) -> anyhow::Result<rustls
 
 // ── Pinned cert verifier (slave → master) ─────────────────────────────────────
 
+// ── Custom rustls verifiers (shared helpers) ───────────────────────────────
+
+/// Delegate TLS signature verification to the ring crypto provider.
+macro_rules! impl_tls_signature_verification {
+    ($t:ty) => {
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message, cert, dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message, cert, dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    };
+}
+
+#[derive(Debug)]
 struct PinnedCertVerifier {
     fingerprint: String,
 }
 
-impl rustls::client::ServerCertVerifier for PinnedCertVerifier {
+impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     fn verify_server_cert(
         &self,
-        end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        let got = hex::encode(Sha256::digest(&end_entity.0));
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let got = hex::encode(Sha256::digest(end_entity));
         if got == self.fingerprint {
-            Ok(rustls::client::ServerCertVerified::assertion())
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(format!(
                 "cert fingerprint mismatch: got {got}, expected {}", self.fingerprint
             )))
         }
     }
+
+    impl_tls_signature_verification!(PinnedCertVerifier);
 }
 
 /// Capture-on-first-use verifier for TOFU handshake.
+#[derive(Debug)]
 struct TofuVerifier {
     captured: Mutex<Option<String>>,
 }
@@ -217,25 +248,26 @@ impl TofuVerifier {
     }
 }
 
-impl rustls::client::ServerCertVerifier for TofuVerifier {
+impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
     fn verify_server_cert(
         &self,
-        end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        let fp = hex::encode(Sha256::digest(&end_entity.0));
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let fp = hex::encode(Sha256::digest(end_entity));
         *self.captured.lock().unwrap() = Some(fp);
-        Ok(rustls::client::ServerCertVerified::assertion())
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
+
+    impl_tls_signature_verification!(TofuVerifier);
 }
 
 fn pinned_client_config(fingerprint: &str) -> rustls::ClientConfig {
     rustls::ClientConfig::builder()
-        .with_safe_defaults()
+        .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
             fingerprint: fingerprint.to_string(),
         }))
@@ -254,7 +286,7 @@ async fn sync_get(
     let tcp = tokio::net::TcpStream::connect(host_port).await
         .map_err(|e| anyhow::anyhow!("TCP connect {host_port}: {e}"))?;
 
-    let server_name = rustls::ServerName::try_from("runbound-sync")
+    let server_name = rustls::pki_types::ServerName::try_from("runbound-sync")
         .map_err(|e| anyhow::anyhow!("invalid SNI: {e}"))?;
     let connector = tokio_rustls::TlsConnector::from(tls_config);
     let tls = connector.connect(server_name, tcp).await
@@ -481,10 +513,10 @@ impl SlaveClient {
 
         // Connect with capture verifier to record the cert fingerprint.
         let verifier = TofuVerifier::new();
-        let verifier_dyn: Arc<dyn rustls::client::ServerCertVerifier> = verifier.clone();
+        let verifier_dyn: Arc<dyn rustls::client::danger::ServerCertVerifier> = verifier.clone();
         let tls_config = Arc::new(
             rustls::ClientConfig::builder()
-                .with_safe_defaults()
+                .dangerous()
                 .with_custom_certificate_verifier(verifier_dyn)
                 .with_no_client_auth()
         );
