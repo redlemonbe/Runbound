@@ -42,8 +42,8 @@ const MAX_API_TTL: u32 = 86_400;
 
 // ── API security constants ─────────────────────────────────────────────────
 
-/// API key — read from RUNBOUND_API_KEY env at startup, or generated if absent.
-static API_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// API key — stored in an ArcSwap so it can be rotated live via POST /rotate-key.
+static API_KEY: std::sync::OnceLock<ArcSwap<String>> = std::sync::OnceLock::new();
 
 /// Global authentication failure counter (reset on every successful auth).
 /// Used to detect and slow brute-force attempts without per-IP state.
@@ -77,12 +77,22 @@ pub fn init_api_key(config_key: Option<String>) -> String {
                 uuid::Uuid::new_v4().simple(),
                 uuid::Uuid::new_v4().simple())
         });
-    API_KEY.get_or_init(|| key.clone());
+    API_KEY.get_or_init(|| ArcSwap::from(Arc::new(key.clone())));
     key
 }
 
-pub fn get_api_key() -> &'static str {
-    API_KEY.get().map(|s| s.as_str()).unwrap_or("")
+/// Returns the current API key as an owned Arc — zero-copy for the common read path.
+pub fn get_api_key() -> Arc<String> {
+    API_KEY.get()
+        .map(|s| s.load_full())
+        .unwrap_or_else(|| Arc::new(String::new()))
+}
+
+/// Atomically replaces the active API key. The old key is invalidated immediately.
+pub fn rotate_api_key(new_key: String) {
+    if let Some(swap) = API_KEY.get() {
+        swap.store(Arc::new(new_key));
+    }
 }
 
 // ── API rate limiter ───────────────────────────────────────────────────────
@@ -231,7 +241,8 @@ async fn security_middleware(
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let expected = format!("Bearer {}", get_api_key());
+        let key = get_api_key();
+        let expected = format!("Bearer {}", key.as_str());
         if !constant_time_eq(auth.as_bytes(), expected.as_bytes()) {
             // Increment global auth-failure counter (localhost-only API,
             // so per-IP tracking adds nothing; we track globally).
@@ -333,6 +344,9 @@ pub fn router(state: AppState) -> Router {
         .route("/upstreams",         get(upstreams_handler))
         .route("/logs",              get(logs_handler))
         .route("/audit/tail",        get(audit_tail_handler))
+        .route("/metrics",           get(metrics_handler))
+        // Administration
+        .route("/rotate-key",        post(rotate_key_handler))
         .layer(middleware::from_fn_with_state(state.clone(), slave_guard_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), security_middleware))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_BYTES))
@@ -369,6 +383,9 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/tls",              "description":"DoT/DoH/DoQ TLS status"},
             {"method":"GET",    "path":"/upstreams",        "description":"Upstream DNS resolver health"},
             {"method":"GET",    "path":"/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
+            {"method":"GET",    "path":"/audit/tail",       "description":"Last N audit log entries — ?n=100"},
+            {"method":"GET",    "path":"/metrics",          "description":"Prometheus/OpenMetrics exposition (text/plain; version=0.0.4)"},
+            {"method":"POST",   "path":"/rotate-key",       "description":"Atomically rotate API key — reads new key from RUNBOUND_API_KEY env var"},
         ]
     }))
 }
@@ -1040,6 +1057,101 @@ async fn audit_tail_handler(
             "details": e,
         }))),
     }
+}
+
+// ── GET /metrics ───────────────────────────────────────────────────────────
+
+async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let snap = s.stats.snapshot();
+    let body = format!(
+        "# HELP runbound_queries_total Total DNS queries received\n\
+         # TYPE runbound_queries_total counter\n\
+         runbound_queries_total {total}\n\
+         # HELP runbound_blocked_total Queries answered with REFUSED (blacklist/feeds)\n\
+         # TYPE runbound_blocked_total counter\n\
+         runbound_blocked_total {blocked}\n\
+         # HELP runbound_nxdomain_total Queries answered with NXDOMAIN\n\
+         # TYPE runbound_nxdomain_total counter\n\
+         runbound_nxdomain_total {nxdomain}\n\
+         # HELP runbound_refused_total Queries answered with REFUSED (ACL/rate limit)\n\
+         # TYPE runbound_refused_total counter\n\
+         runbound_refused_total {refused}\n\
+         # HELP runbound_servfail_total Queries answered with SERVFAIL\n\
+         # TYPE runbound_servfail_total counter\n\
+         runbound_servfail_total {servfail}\n\
+         # HELP runbound_forwarded_total Queries forwarded to upstream resolvers\n\
+         # TYPE runbound_forwarded_total counter\n\
+         runbound_forwarded_total {forwarded}\n\
+         # HELP runbound_local_hits_total Queries answered from local zone data\n\
+         # TYPE runbound_local_hits_total counter\n\
+         runbound_local_hits_total {local_hits}\n\
+         # HELP runbound_uptime_seconds Process uptime in seconds\n\
+         # TYPE runbound_uptime_seconds gauge\n\
+         runbound_uptime_seconds {uptime}\n\
+         # HELP runbound_qps Queries per second\n\
+         # TYPE runbound_qps gauge\n\
+         runbound_qps{{window=\"1m\"}} {qps_1m}\n\
+         runbound_qps{{window=\"5m\"}} {qps_5m}\n\
+         runbound_qps{{window=\"peak\"}} {qps_peak}\n\
+         # HELP runbound_latency_ms DNS query latency percentiles in milliseconds\n\
+         # TYPE runbound_latency_ms gauge\n\
+         runbound_latency_ms{{quantile=\"0.5\"}} {p50}\n\
+         runbound_latency_ms{{quantile=\"0.95\"}} {p95}\n\
+         runbound_latency_ms{{quantile=\"0.99\"}} {p99}\n\
+         # HELP runbound_cache_hit_rate Cache hit rate percentage (0–100)\n\
+         # TYPE runbound_cache_hit_rate gauge\n\
+         runbound_cache_hit_rate {cache_hit_rate}\n\
+         # HELP runbound_cache_entries Approximate cached DNS entries\n\
+         # TYPE runbound_cache_entries gauge\n\
+         runbound_cache_entries {cache_entries}\n\
+         # HELP runbound_dnssec_total DNSSEC validation results\n\
+         # TYPE runbound_dnssec_total counter\n\
+         runbound_dnssec_total{{status=\"secure\"}} {dnssec_secure}\n\
+         runbound_dnssec_total{{status=\"bogus\"}} {dnssec_bogus}\n\
+         runbound_dnssec_total{{status=\"insecure\"}} {dnssec_insecure}\n",
+        total        = snap.total,
+        blocked      = snap.blocked,
+        nxdomain     = snap.nxdomain,
+        refused      = snap.refused,
+        servfail     = snap.servfail,
+        forwarded    = snap.forwarded,
+        local_hits   = snap.local_hits,
+        uptime       = snap.uptime_secs,
+        qps_1m       = snap.qps_1m,
+        qps_5m       = snap.qps_5m,
+        qps_peak     = snap.qps_peak,
+        p50          = snap.latency_p50_ms,
+        p95          = snap.latency_p95_ms,
+        p99          = snap.latency_p99_ms,
+        cache_hit_rate  = snap.cache_hit_rate,
+        cache_entries   = snap.cache_entries,
+        dnssec_secure   = snap.dnssec_secure,
+        dnssec_bogus    = snap.dnssec_bogus,
+        dnssec_insecure = snap.dnssec_insecure,
+    );
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
+
+// ── POST /rotate-key ───────────────────────────────────────────────────────
+
+async fn rotate_key_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let new_key = match std::env::var("RUNBOUND_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "RUNBOUND_API_KEY env var is not set or empty — set it to the new key before calling this endpoint",
+        }))).into_response(),
+    };
+    rotate_api_key(new_key);
+    s.audit.send(AuditEvent::ConfigReload);
+    info!("API key rotated via POST /rotate-key");
+    (StatusCode::OK, JsonExtract(serde_json::json!({
+        "status": "ok",
+        "message": "API key rotated — old token is immediately invalid",
+    }))).into_response()
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

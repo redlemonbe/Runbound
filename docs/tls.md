@@ -1,8 +1,39 @@
-# TLS Setup (DNS-over-TLS)
+# TLS Setup (DoT / DoH / DoQ)
 
-Runbound supports **DNS-over-TLS (DoT)** on port **853** when a certificate and
-private key are provided. Clients that support DoT (Android 9+, systemd-resolved,
-Unbound, Pi-hole, etc.) will encrypt all DNS traffic.
+Runbound supports three encrypted DNS protocols when a certificate and private key
+are configured:
+
+| Protocol | RFC | Default port | Path |
+|---|---|---|---|
+| **DNS-over-TLS (DoT)** | RFC 7858 | 853 (TCP) | — |
+| **DNS-over-HTTPS (DoH)** | RFC 8484 | 443 (HTTPS) | `/dns-query` |
+| **DNS-over-QUIC (DoQ)** | RFC 9250 | 853 (UDP) | — |
+
+All three activate automatically when `tls-service-pem` and `tls-service-key` are set.
+No additional directives are needed to enable DoH or DoQ.
+
+### DoH quick test
+
+```bash
+# POST method (wire format)
+curl -s --doh-url https://dns.example.com/dns-query https://example.com
+
+# GET method (base64url-encoded DNS message)
+kdig @dns.example.com +https google.com
+
+# Using doggo
+doggo --nameserver https://dns.example.com/dns-query google.com
+```
+
+### DoH client configuration
+
+**Firefox:** Settings → Network Settings → Enable DNS over HTTPS → Custom → `https://dns.example.com/dns-query`
+
+**Chrome/Edge:** Settings → Privacy → Use secure DNS → Custom → `https://dns.example.com/dns-query`
+
+**Android 9+ (Private DNS):** Supports DoT only — enter `dns.example.com` (no path).
+
+**Windows 11:** Settings → Network → DNS over HTTPS → `https://dns.example.com/dns-query`
 
 ---
 

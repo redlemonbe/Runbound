@@ -5,6 +5,60 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.3.2] — 2026-05-17
+
+### Added
+
+- **`GET /metrics` — Prometheus/OpenMetrics exposition** (`src/api/mod.rs`)  
+  All stats counters and gauges are now available in Prometheus text format
+  (`text/plain; version=0.0.4`). Compatible with Prometheus, Grafana Agent,
+  VictoriaMetrics, and OTEL Collector. Requires Bearer authentication.
+
+  Exposed metrics: `runbound_queries_total`, `runbound_blocked_total`,
+  `runbound_nxdomain_total`, `runbound_refused_total`, `runbound_servfail_total`,
+  `runbound_forwarded_total`, `runbound_local_hits_total`, `runbound_uptime_seconds`,
+  `runbound_qps{window}`, `runbound_latency_ms{quantile}`,
+  `runbound_cache_hit_rate`, `runbound_cache_entries`,
+  `runbound_dnssec_total{status}`.
+
+- **`POST /rotate-key` — live API key rotation without restart** (`src/api/mod.rs`)  
+  Atomically replaces the active Bearer token from the `RUNBOUND_API_KEY` environment
+  variable. The old key is invalidated immediately. DNS service is uninterrupted.
+  Designed for PCI-DSS and NIS2 periodic key rotation requirements. The rotation is
+  recorded in the audit log as a `ConfigReload` event.
+
+  The API key is now stored in an `ArcSwap<String>` (previously `OnceLock<String>`)
+  to allow lock-free atomic swaps on every auth check with zero overhead.
+
+### Fixed (documentation)
+
+- **DoH not documented in `docs/tls.md`** — Added full DoH section: port 443,
+  path `/dns-query`, `curl`/`kdig`/`doggo` test examples, browser and OS client
+  configuration (Firefox, Chrome, Windows 11, Android). All three encrypted protocols
+  (DoT, DoH, DoQ) now documented with a comparison table.
+
+- **ACME timer ambiguity in `docs/configuration.md`** — Clarified that the "60 days"
+  value is the cert file mtime threshold (not a configurable TTL). Let's Encrypt issues
+  90-day certs; a 60-day mtime check triggers renewal with ≥ 30 days of validity
+  remaining. Added a summary line: check interval = 6 h · threshold = 60 days ·
+  minimum remaining validity = 30 days.
+
+- **`/help` auth ambiguity** — `GET /help` requires Bearer authentication on all nodes.
+  Documentation harmonised across `docs/api.md` with a security rationale note
+  (fingerprinting prevention, consistent with AUDIT-HIGH-02).
+
+- **`access-control` default not explicit** — The implicit `refuse` catch-all when no
+  rule matches is now shown as a row in the action table with a bold label and a note
+  that an empty `access-control` block blocks all clients.
+
+- **`sync-cert.pem` path undocumented in `docs/ha.md`** — Added a file reference table
+  documenting the exact paths for `sync-cert.pem`, `sync-key.pem`, and
+  `sync-master.fingerprint`. Noted that all runtime files follow the config file
+  directory (`base_dir`), with guidance for non-standard install paths and re-TOFU
+  procedure.
+
+---
+
 ## [0.3.1] — 2026-05-17
 
 ### Added
