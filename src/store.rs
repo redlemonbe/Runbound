@@ -137,7 +137,8 @@ pub fn load() -> Result<DnsStore, AppError> {
 
 pub fn save(store: &DnsStore) -> Result<(), AppError> {
     let path = store_path();
-    fs::create_dir_all(path.parent().unwrap())
+    let dir  = path.parent().ok_or_else(|| AppError::Internal("store path has no parent".into()))?;
+    fs::create_dir_all(dir)
         .map_err(|e| AppError::Internal(format!("create store dir: {e}")))?;
 
     let content = serde_json::to_string_pretty(store)
@@ -195,7 +196,8 @@ pub fn load_blacklist() -> Result<BlacklistStore, AppError> {
 
 pub fn save_blacklist(store: &BlacklistStore) -> Result<(), AppError> {
     let path = blacklist_path();
-    fs::create_dir_all(path.parent().unwrap())
+    let dir  = path.parent().ok_or_else(|| AppError::Internal("blacklist path has no parent".into()))?;
+    fs::create_dir_all(dir)
         .map_err(|e| AppError::Internal(format!("create blacklist dir: {e}")))?;
 
     let content = serde_json::to_string_pretty(store)
