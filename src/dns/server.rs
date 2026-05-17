@@ -180,13 +180,14 @@ impl RequestHandler for RunboundHandler {
         };
 
         // ── 3a. Block CHAOS class queries (version.bind, hostname.bind) ───
-        // CHAOS class exposes DNS server identity even when hide-identity/
-        // hide-version are set in unbound.conf. Return REFUSED for all CH queries.
-        if request.query().query_class() == DNSClass::CH {
-            debug!(%client_ip, %qname, "CHAOS class query blocked");
+        // CHAOS class (numeric 3) exposes server identity. Compare by wire value
+        // to avoid any hickory Unknown(3) vs CH variant mismatch.
+        // RFC 5358 §4: responders that do not implement CHAOS SHOULD return NOTIMP.
+        if u16::from(request.query().query_class()) == 3 {
+            debug!(%client_ip, %qname, "CHAOS class query → NOTIMP");
             self.stats.inc_refused();
-            self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
-            return send_error(request, response_handle, ResponseCode::Refused).await;
+            self.record_query(client_ip, qname, qtype, ResponseCode::NotImp, LogAction::Refused, start);
+            return send_error(request, response_handle, ResponseCode::NotImp).await;
         }
 
         // ── 3b. Block ANY queries (RFC 8482 — amplification vector) ────
