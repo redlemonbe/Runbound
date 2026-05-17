@@ -1138,14 +1138,47 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
 
 // ── POST /rotate-key ───────────────────────────────────────────────────────
 
-async fn rotate_key_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let new_key = match std::env::var("RUNBOUND_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "RUNBOUND_API_KEY env var is not set or empty — set it to the new key before calling this endpoint",
-        }))).into_response(),
-    };
-    rotate_api_key(new_key);
+// ── POST /rotate-key ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RotateKeyRequest {
+    new_key: String,
+}
+
+async fn rotate_key_handler(
+    State(s): State<AppState>,
+    JsonExtract(req): JsonExtract<RotateKeyRequest>,
+) -> impl IntoResponse {
+    // Require at least 32 bytes of entropy (64 hex chars) — shorter keys are
+    // statistically weak and likely copy-paste mistakes.
+    if req.new_key.len() < 32 {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "WEAK_KEY",
+            "details": "new_key must be at least 32 characters",
+        }))).into_response();
+    }
+    // Reject control characters (CRLF injection, log injection).
+    if req.new_key.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_KEY",
+            "details": "new_key must not contain control characters",
+        }))).into_response();
+    }
+    rotate_api_key(req.new_key.clone());
+    // Persist to base_dir/api.key so the key survives a restart.
+    let key_path = s.base_dir.join("api.key");
+    let persist_result = std::fs::write(&key_path, req.new_key.as_bytes()).and_then(|_| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    });
+    if let Err(e) = persist_result {
+        // Non-fatal: key is already active in memory; log the write failure.
+        warn!(path = %key_path.display(), err = %e, "Failed to persist rotated API key to disk");
+    }
     s.audit.send(AuditEvent::ConfigReload);
     info!("API key rotated via POST /rotate-key");
     (StatusCode::OK, JsonExtract(serde_json::json!({
