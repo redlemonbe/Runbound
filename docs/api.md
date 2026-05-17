@@ -395,6 +395,32 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 
 **Note:** the `name` field is truncated to 253 characters (RFC 1035 max); `qtype` is the raw DNS RR type number (1 = A, 28 = AAAA, 15 = MX, etc.).
 
+The ring buffer capacity is controlled by `log-retention` in `runbound.conf` (default: 1000). Set to `0` to disable it entirely. When `log-client-ip: no` is set, the `client` field contains `[redacted]` instead of the real IP.
+
+---
+
+### `DELETE /logs`
+
+Clear the in-memory query log ring buffer immediately. Useful for responding to a
+GDPR right-to-erasure request.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     http://localhost:8081/logs
+```
+
+```json
+{
+  "message":         "log buffer cleared",
+  "entries_deleted": 47
+}
+```
+
+**Notes:**
+- Does **not** affect the logfile on disk (if `logfile:` is configured) — manage disk logs with `logrotate`.
+- Does **not** affect the audit log.
+- The action is recorded in the audit log as `event: "logs_clear"` with `entries_deleted`.
+
 ---
 
 ### `GET /audit/tail`

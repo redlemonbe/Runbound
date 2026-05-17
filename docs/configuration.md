@@ -155,6 +155,24 @@ When enabled, every DNSSEC validation failure emits a `WARN` log line with the q
 name, record type, and reason (`bogus`). Useful for diagnosing misconfigured zones
 without enabling full `verbosity: 2` noise.
 
+### Privacy controls (RGPD / GDPR)
+
+```
+server:
+    log-retention: 1000   # max entries in the /logs ring buffer (0 = disabled)
+    log-client-ip: yes    # include client IPs in /logs (no = replace with "[redacted]")
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `log-retention` | integer | `1000` | 🔒 RGPD — Maximum number of entries kept in the in-memory query log ring buffer. Set to `0` to disable the ring buffer entirely and return an empty array from `GET /logs`. No client IPs are held in RAM when set to `0`. |
+| `log-client-ip` | bool | `yes` | 🔒 RGPD — Whether to record the client IP in `/logs` and the logfile. Set to `no` to replace every IP with `[redacted]` before storing. Does **not** affect the audit log (IPs are required there for PCI-DSS / NIS2 traceability). |
+
+Both directives take effect at startup and on `SIGHUP` (hot-reload). Reducing
+`log-retention` on reload truncates the buffer to the new capacity immediately.
+
+See [docs/gdpr.md](gdpr.md) for the full GDPR compliance guide.
+
 ### ACME / Let's Encrypt (automatic TLS)
 
 Runbound can provision and renew a TLS certificate automatically from Let's Encrypt

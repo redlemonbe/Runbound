@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 mod acme;
 mod audit;
 mod config;
@@ -216,7 +218,7 @@ async fn main() -> Result<()> {
     tokio::spawn(stats::qps_update_loop(Arc::clone(&global_stats)));
 
     // ── Log ring buffer (pre-allocated, zero alloc after startup) ─────────
-    let log_buffer = logbuffer::new_shared();
+    let log_buffer = logbuffer::new_shared(unbound_cfg.log_retention, unbound_cfg.log_client_ip);
 
     // ── Upstream health monitor ────────────────────────────────────────────
     let upstreams = upstreams::init_upstreams(&unbound_cfg);
@@ -351,87 +353,168 @@ async fn main() -> Result<()> {
 
 fn print_help() {
     println!(concat!(
-        "runbound ", env!("CARGO_PKG_VERSION"), " — high-performance DNS server (Unbound drop-in)\n",
-        "\n",
-        "USAGE:\n",
-        "    runbound [OPTIONS] [CONFIG]\n",
-        "\n",
-        "ARGUMENTS:\n",
-        "    CONFIG    Path to unbound.conf  [default: /etc/unbound/unbound.conf]\n",
-        "\n",
-        "OPTIONS:\n",
-        "    -h, --help             Print this help message and exit\n",
-        "    -V, --version          Print version and exit\n",
-        "        --gen-cert [HOST]  Generate a self-signed TLS certificate for DoT/DoH/DoQ\n",
-        "                           Writes /etc/runbound/cert.pem and key.pem\n",
-        "                           HOST defaults to 'runbound.local'\n",
-        "\n",
-        "ENVIRONMENT:\n",
-        "    RUNBOUND_API_KEY    REST API key. Priority: env var > api-key in unbound.conf\n",
-        "                        > auto-generated (256-bit CSPRNG, saved to api.key)\n",
-        "    RUST_LOG            Log level filter  [default: info]\n",
-        "                        Examples: RUST_LOG=debug  RUST_LOG=runbound=trace\n",
-        "\n",
-        "CONFIG FILE EXTENSIONS (Runbound-specific, ignored by stock Unbound):\n",
-        "    rate-limit: 200     DNS queries/second per source IP\n",
-        "                        Default: 200 (residential). Use 5000+ for shared resolvers.\n",
-        "    api-key: <secret>   REST API key (overridden by RUNBOUND_API_KEY env var)\n",
-        "    tls-service-pem: /etc/runbound/cert.pem   TLS certificate for DoT/DoH/DoQ\n",
-        "    tls-service-key: /etc/runbound/key.pem    TLS private key\n",
-        "\n",
-        "TLS QUICK START (DoT / DoH / DoQ):\n",
-        "    # 1. Generate self-signed certificate\n",
-        "    runbound --gen-cert dns.example.com\n",
-        "    # 2. Add to unbound.conf:\n",
-        "    #    tls-service-pem: /etc/runbound/cert.pem\n",
-        "    #    tls-service-key: /etc/runbound/key.pem\n",
-        "    # 3. For production: replace with a Let's Encrypt certificate\n",
-        "    #    certbot certonly --standalone -d dns.example.com\n",
-        "    #    tls-service-pem: /etc/letsencrypt/live/dns.example.com/fullchain.pem\n",
-        "    #    tls-service-key: /etc/letsencrypt/live/dns.example.com/privkey.pem\n",
-        "\n",
-        "PORTS:\n",
-        "    53    DNS/UDP + DNS/TCP      (configured via unbound.conf)\n",
-        "    853   DoT (RFC 7858)         (requires tls-service-pem + tls-service-key)\n",
-        "    443   DoH (RFC 8484)         (requires tls-service-pem + tls-service-key)\n",
-        "    8081  REST API (localhost)   Authorization: Bearer <key>\n",
-        "\n",
-        "REST API ENDPOINTS (all require Authorization: Bearer <key>):\n",
-        "    GET    /help               API documentation (public)\n",
-        "    GET    /dns                List local DNS entries\n",
-        "    POST   /dns                Add a DNS entry (A/AAAA/CNAME/TXT/MX/SRV/…)\n",
-        "    DELETE /dns/:id            Remove a DNS entry\n",
-        "    GET    /blacklist          List blacklist entries\n",
-        "    POST   /blacklist          Block a domain (refuse/nxdomain)\n",
-        "    DELETE /blacklist/:id      Remove a blacklist entry\n",
-        "    GET    /feeds              List feed subscriptions\n",
-        "    POST   /feeds              Subscribe to a remote blocklist\n",
-        "    DELETE /feeds/:id          Remove a feed subscription\n",
-        "    POST   /feeds/update       Refresh all feeds\n",
-        "    POST   /feeds/:id/update   Refresh one feed\n",
-        "    GET    /feeds/presets       List pre-configured blocklists\n",
-        "    GET    /tls                DoT/DoH/DoQ TLS status\n",
-        "\n",
-        "FILES:\n",
-        "    /etc/unbound/unbound.conf        Default config (Unbound-compatible)\n",
-        "    /etc/runbound/api.key            REST API key (chmod 600)\n",
-        "    /etc/runbound/cert.pem           TLS certificate (--gen-cert or Let's Encrypt)\n",
-        "    /etc/runbound/key.pem            TLS private key (chmod 600)\n",
-        "    /etc/runbound/dns_entries.json   Persisted DNS entries\n",
-        "    /etc/runbound/blacklist.json     Persisted blacklist\n",
-        "    /etc/runbound/feeds.json          Feed subscriptions\n",
-        "\n",
-        "MEMORY SAFETY:\n",
-        "    System memory is checked every 30 s. If usage exceeds 80 %, the DNS\n",
-        "    resolver cache and rate-limiter buckets are purged automatically to\n",
-        "    bring usage below 50 %. The server keeps running throughout.\n",
-        "\n",
-        "EXAMPLES:\n",
-        "    runbound                                      # use default config\n",
-        "    runbound /etc/runbound/unbound.conf           # custom config\n",
-        "    runbound --gen-cert dns.myserver.com          # generate TLS cert\n",
-        "    RUST_LOG=debug runbound                       # verbose logging\n",
-        "    RUNBOUND_API_KEY=mysecret runbound            # fixed API key via env\n",
+        "runbound ", env!("CARGO_PKG_VERSION"), " — high-performance DNS server (Unbound drop-in)
+",
+        "
+",
+        "USAGE:
+",
+        "    runbound [OPTIONS] [CONFIG]
+",
+        "
+",
+        "ARGUMENTS:
+",
+        "    CONFIG    Path to unbound.conf  [default: /etc/unbound/unbound.conf]
+",
+        "
+",
+        "OPTIONS:
+",
+        "    -h, --help             Print this help message and exit
+",
+        "    -V, --version          Print version and exit
+",
+        "        --gen-cert [HOST]  Generate a self-signed TLS certificate for DoT/DoH/DoQ
+",
+        "                           Writes /etc/runbound/cert.pem and key.pem
+",
+        "                           HOST defaults to 'runbound.local'
+",
+        "
+",
+        "ENVIRONMENT:
+",
+        "    RUNBOUND_API_KEY    REST API key. Priority: env var > api-key in unbound.conf
+",
+        "                        > auto-generated (256-bit CSPRNG, saved to api.key)
+",
+        "    RUST_LOG            Log level filter  [default: info]
+",
+        "                        Examples: RUST_LOG=debug  RUST_LOG=runbound=trace
+",
+        "
+",
+        "CONFIG FILE EXTENSIONS (Runbound-specific, ignored by stock Unbound):
+",
+        "    rate-limit: 200     DNS queries/second per source IP
+",
+        "                        Default: 200 (residential). Use 5000+ for shared resolvers.
+",
+        "    api-key: <secret>   REST API key (overridden by RUNBOUND_API_KEY env var)
+",
+        "    tls-service-pem: /etc/runbound/cert.pem   TLS certificate for DoT/DoH/DoQ
+",
+        "    tls-service-key: /etc/runbound/key.pem    TLS private key
+",
+        "
+",
+        "TLS QUICK START (DoT / DoH / DoQ):
+",
+        "    # 1. Generate self-signed certificate
+",
+        "    runbound --gen-cert dns.example.com
+",
+        "    # 2. Add to unbound.conf:
+",
+        "    #    tls-service-pem: /etc/runbound/cert.pem
+",
+        "    #    tls-service-key: /etc/runbound/key.pem
+",
+        "    # 3. For production: replace with a Let's Encrypt certificate
+",
+        "    #    certbot certonly --standalone -d dns.example.com
+",
+        "    #    tls-service-pem: /etc/letsencrypt/live/dns.example.com/fullchain.pem
+",
+        "    #    tls-service-key: /etc/letsencrypt/live/dns.example.com/privkey.pem
+",
+        "
+",
+        "PORTS:
+",
+        "    53    DNS/UDP + DNS/TCP      (configured via unbound.conf)
+",
+        "    853   DoT (RFC 7858)         (requires tls-service-pem + tls-service-key)
+",
+        "    443   DoH (RFC 8484)         (requires tls-service-pem + tls-service-key)
+",
+        "    8081  REST API (localhost)   Authorization: Bearer <key>
+",
+        "
+",
+        "REST API ENDPOINTS (all require Authorization: Bearer <key>):
+",
+        "    GET    /help               API documentation (public)
+",
+        "    GET    /dns                List local DNS entries
+",
+        "    POST   /dns                Add a DNS entry (A/AAAA/CNAME/TXT/MX/SRV/…)
+",
+        "    DELETE /dns/:id            Remove a DNS entry
+",
+        "    GET    /blacklist          List blacklist entries
+",
+        "    POST   /blacklist          Block a domain (refuse/nxdomain)
+",
+        "    DELETE /blacklist/:id      Remove a blacklist entry
+",
+        "    GET    /feeds              List feed subscriptions
+",
+        "    POST   /feeds              Subscribe to a remote blocklist
+",
+        "    DELETE /feeds/:id          Remove a feed subscription
+",
+        "    POST   /feeds/update       Refresh all feeds
+",
+        "    POST   /feeds/:id/update   Refresh one feed
+",
+        "    GET    /feeds/presets       List pre-configured blocklists
+",
+        "    GET    /tls                DoT/DoH/DoQ TLS status
+",
+        "
+",
+        "FILES:
+",
+        "    /etc/unbound/unbound.conf        Default config (Unbound-compatible)
+",
+        "    /etc/runbound/api.key            REST API key (chmod 600)
+",
+        "    /etc/runbound/cert.pem           TLS certificate (--gen-cert or Let's Encrypt)
+",
+        "    /etc/runbound/key.pem            TLS private key (chmod 600)
+",
+        "    /etc/runbound/dns_entries.json   Persisted DNS entries
+",
+        "    /etc/runbound/blacklist.json     Persisted blacklist
+",
+        "    /etc/runbound/feeds.json          Feed subscriptions
+",
+        "
+",
+        "MEMORY SAFETY:
+",
+        "    System memory is checked every 30 s. If usage exceeds 80 %, the DNS
+",
+        "    resolver cache and rate-limiter buckets are purged automatically to
+",
+        "    bring usage below 50 %. The server keeps running throughout.
+",
+        "
+",
+        "EXAMPLES:
+",
+        "    runbound                                      # use default config
+",
+        "    runbound /etc/runbound/unbound.conf           # custom config
+",
+        "    runbound --gen-cert dns.myserver.com          # generate TLS cert
+",
+        "    RUST_LOG=debug runbound                       # verbose logging
+",
+        "    RUNBOUND_API_KEY=mysecret runbound            # fixed API key via env
+",
     ));
 }
 
@@ -527,4 +610,3 @@ pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
 
     zone_set
 }
-

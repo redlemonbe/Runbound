@@ -5,6 +5,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.3.4] — 2026-05-17
+
+### Added
+
+- **AGPL-3.0 dual license** — Runbound switches from PolyForm Noncommercial to AGPL-3.0
+  for open-source use. A commercial license remains available for organizations that
+  cannot comply with the AGPL (see `COMMERCIAL_LICENSE.md`).
+- **SPDX headers** — every `.rs` source file now carries `SPDX-License-Identifier: AGPL-3.0-or-later`.
+- **`log-retention` config directive** — controls the size of the in-RAM query log ring
+  buffer (default: 1000). Set to `0` to disable `/logs` entirely and hold no client IPs
+  in memory (GDPR data minimisation).
+- **`log-client-ip` config directive** — when set to `no`, client IPs are replaced with
+  `[redacted]` before being stored in the ring buffer and the logfile. The audit log is
+  unaffected (IPs are required for PCI-DSS / NIS2 traceability).
+- **`DELETE /logs`** — authenticated endpoint that clears the in-memory query log ring
+  buffer and records the action in the audit log (`event: "logs_clear"`). Allows operators
+  to respond to GDPR right-to-erasure requests without restarting the server.
+- **`docs/gdpr.md`** — GDPR compliance guide covering data inventory, operator
+  responsibilities, and concrete configuration recipes.
+- **`CLA.md` rewrite** — plain-language one-page CLA; grants the maintainer the right
+  to redistribute contributions under any license (AGPL or commercial) with mandatory
+  changelog attribution.
+
+---
+
 ## [0.3.3] — 2026-05-17
 
 ### Fixed

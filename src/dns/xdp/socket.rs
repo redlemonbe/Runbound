@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // AF_XDP socket creation, ring setup, and NIC binding.
 //
 // One XskSocket per NIC queue. Each socket has its own UMEM (simplest model;

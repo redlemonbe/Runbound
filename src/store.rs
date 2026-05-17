@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Persistent DNS entry store.
 // Survives restarts — JSON file under base_dir (derived from config path at startup).
 // The in-memory LocalZoneSet is always the source of truth for queries;

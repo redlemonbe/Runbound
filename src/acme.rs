@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Runbound — Automatic TLS certificate provisioning via ACME (RFC 8555)
 //
 // HTTP-01 challenge only — port 80 must be reachable from the internet.
