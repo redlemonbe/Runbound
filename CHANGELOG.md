@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.2] — 2026-05-17
+
+### Fixed
+
+- **MEDIUM — Replicated entries not served by DNS on slave nodes** (`src/sync.rs`, `src/main.rs`)  
+  `SlaveClient::apply_event` was writing deltas to the on-disk store but never updating
+  the in-memory `ArcSwap<LocalZoneSet>` that hickory uses to answer queries. The slave's
+  `/dns` API showed the entry; DNS returned NXDOMAIN.  
+  `POST /reload` was correctly blocked (`READ_ONLY`) on slaves, leaving no path to apply
+  changes without a restart.
+
+  Fix — `SlaveClient` now holds `Arc<ArcSwap<LocalZoneSet>>`, the shared `zones_mutex`,
+  and the `UnboundConfig`. For each delta operation:
+  - `AddDns` — injects the new record directly into the zone trie (same path as the API
+    handler), under `zones_mutex` to prevent concurrent write races.
+  - `DeleteDns` — saves the store then calls `build_zone_set()` for a full rebuild
+    (deletion requires removing from the trie; incremental removal is not worth the complexity).
+  - `AddBlacklist` — calls `override_zone()` on the current zone set (same as the API).
+  - `DeleteBlacklist` — full rebuild via `build_zone_set()`.
+  - `full_sync` — saves all three stores then rebuilds zones atomically under `zones_mutex`.
+
+  `zones_mutex` is now hoisted before slave/AppState construction in `main.rs` so both
+  share the same `Arc<Mutex<()>>` instance — zone mutations from the API and from sync
+  are mutually exclusive.
+
+---
+
 ## [0.4.1] — 2026-05-17
 
 ### Fixed — v0.4.0 audit follow-up (all findings closed)
