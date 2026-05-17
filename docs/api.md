@@ -15,6 +15,10 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/dns
 
 Timing-safe comparison is used server-side (constant-time, immune to timing attacks).
 
+**Rate limiting:** The API is rate-limited to **30 requests/second per IP** with a burst allowance of 60.
+
+**Request body size:** All `POST` requests must be ≤ **64 KiB**. Larger payloads return HTTP `413 Content Too Large`.
+
 ---
 
 ## Endpoints
@@ -72,7 +76,7 @@ curl -X POST http://localhost:8081/dns \
 **Supported types:** `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `CAA`, `PTR`,
 `NAPTR`, `SSHFP`, `TLSA`, `NS`
 
-**TTL:** Must be ≤ 2,147,483,647 (RFC 2181 §8 maximum). Capped at 86,400 s (24 h) server-side.
+**TTL:** Optional. Default: 3,600 s (1 hour). Must be in range 0–2,147,483,647 (RFC 2181 §8). Capped at 86,400 s (24 h) server-side. Returns `422 INVALID_TTL` if out of range.
 
 **Limit:** Maximum 10,000 entries. Returns `422` when exceeded.
 
@@ -244,7 +248,12 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/stats
   "latency_p95_ms":  4.2,
   "latency_p99_ms":  22.5,
   "cache_hit_rate":  68.4,
-  "cache_entries":   2941
+  "cache_entries":   2941,
+  "dnssec": {
+    "secure":   1042,
+    "bogus":    3,
+    "insecure": 897
+  }
 }
 ```
 
@@ -263,8 +272,13 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/stats
 | `latency_p50/95/99_ms` | Latency percentiles from a fixed 10-bucket histogram (zero-alloc) |
 | `cache_hit_rate` | Percentage of forwarded lookups served from hickory's in-process cache (< 2 ms) |
 | `cache_entries` | Approximate distinct domains cached (saturates at resolver `cache_size = 8192`) |
+| `dnssec.secure` | Queries validated with a full RRSIG chain (requires `dnssec-validation: yes`) |
+| `dnssec.bogus` | Queries where DNSSEC validation failed — potential tampering or misconfiguration |
+| `dnssec.insecure` | Queries for zones with no DNSSEC signatures (unsigned delegations) |
 
 **Total blocked = `blocked` + `nxdomain`.** The split exists because `refuse` and `nxdomain` are distinct DNS responses. Use `blocked_percent` or sum both fields for an aggregate blocking rate.
+
+**DNSSEC counters** are always present in the response but are meaningful only when `dnssec-validation: yes` is configured.
 
 ---
 
@@ -326,7 +340,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/upstream
 
 ### `GET /logs`
 
-Recent DNS query log, newest first. Up to 10,000 entries are kept in a fixed-size ring buffer (pre-allocated at startup, zero allocation per query).
+Recent DNS query log, newest first. Entries are kept in a fixed-size ring buffer pre-allocated at startup (zero allocation per query). The buffer size is controlled by `log-retention` in `runbound.conf` (default: **1,000**, compile-time max: 10,000). Set to `0` to disable the buffer entirely.
 
 ```bash
 # Last 100 queries (default)
@@ -417,9 +431,8 @@ curl -X DELETE -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 ```
 
 **Notes:**
-- Does **not** affect the logfile on disk (if `logfile:` is configured) — manage disk logs with `logrotate`.
-- Does **not** affect the audit log.
-- The action is recorded in the audit log as `event: "logs_clear"` with `entries_deleted`.
+- Clears only the **in-memory ring buffer** — does not truncate the logfile on disk (manage those with `logrotate`).
+- Does **not** clear the audit log. The deletion is recorded in the audit log as `event: "logs_clear"` with `entries_deleted`, providing a tamper-evident trace.
 
 ---
 
@@ -435,22 +448,25 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 ```
 
 ```json
-[
-  {
-    "seq":    42,
-    "ts":     1715000123,
-    "event":  "DnsAdd",
-    "fields": {"name": "nas.home.", "rtype": "A", "value": "192.168.1.10", "ttl": 300},
-    "mac":    "a3f1c2d8e5..."
-  },
-  {
-    "seq":    41,
-    "ts":     1715000100,
-    "event":  "AuthFailure",
-    "fields": {"client": "203.0.113.5"},
-    "mac":    "9e2b47f1a8..."
-  }
-]
+{
+  "lines": [
+    {
+      "seq":    42,
+      "ts":     1715000123,
+      "event":  "dns_add",
+      "fields": {"name": "nas.home.", "type": "A", "value": "192.168.1.10"},
+      "mac":    "a3f1c2d8e5..."
+    },
+    {
+      "seq":    41,
+      "ts":     1715000100,
+      "event":  "auth_failure",
+      "fields": {"path": "/dns"},
+      "mac":    "9e2b47f1a8..."
+    }
+  ],
+  "count": 2
+}
 ```
 
 **Query parameters:**
@@ -459,20 +475,23 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 |---|---|---|
 | `n` | `100` | Number of entries to return (1–1000). |
 
-**Event types:**
+**Event names** (snake_case in the `event` field):
 
-| Event | Trigger |
-|---|---|
-| `Startup` | Runbound process started |
-| `Shutdown` | Clean shutdown initiated |
-| `DnsAdd` | `POST /dns` — local DNS record added |
-| `DnsDelete` | `DELETE /dns/:id` — local DNS record removed |
-| `FeedAdd` | `POST /feeds` — feed subscription added |
-| `FeedDelete` | `DELETE /feeds/:id` — feed removed |
-| `BlacklistAdd` | `POST /blacklist` — entry added |
-| `BlacklistDelete` | `DELETE /blacklist/:id` — entry removed |
-| `AuthFailure` | Request with missing or invalid Bearer token |
-| `ConfigReload` | `POST /reload` or SIGHUP |
+| Event | Trigger | Fields |
+|---|---|---|
+| `startup` | Runbound process started | — |
+| `shutdown` | Clean shutdown initiated | — |
+| `dns_add` | `POST /dns` — local DNS record added | `name`, `type`, `value` |
+| `dns_delete` | `DELETE /dns/:id` — local DNS record removed | `id` |
+| `feed_add` | `POST /feeds` — feed subscription added | `id`, `name`, `url` |
+| `feed_delete` | `DELETE /feeds/:id` — feed removed | `id` |
+| `blacklist_add` | `POST /blacklist` — entry added | `domain` |
+| `blacklist_delete` | `DELETE /blacklist/:id` — entry removed | `id` |
+| `auth_failure` | Request with missing or invalid Bearer token | `path` |
+| `config_reload` | `POST /reload` or SIGHUP | — |
+| `logs_clear` | `DELETE /logs` — ring buffer cleared (GDPR erasure) | `entries_deleted` |
+
+**Returns `404`** (with `error: "AUDIT_LOG_UNAVAILABLE"`) when `audit-log: yes` is not configured or the log file doesn't exist yet.
 
 **MAC verification:**
 
@@ -497,6 +516,28 @@ Dump active configuration (sanitised — API key is omitted).
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/config
 ```
 
+```json
+{
+  "port": 53,
+  "interfaces": ["0.0.0.0"],
+  "forward_zones": [{"name": ".", "addrs": ["1.1.1.1@853"], "tls": true}],
+  "file_local_zones": 2,
+  "file_local_data": 4,
+  "api_dns_entries": 3,
+  "api_blacklist": 12,
+  "api_feeds": 2,
+  "access_control": ["192.168.1.0/24 allow"],
+  "private_addresses": ["10.0.0.0/8"],
+  "rate_limit": 200,
+  "cache_max_ttl": 86400,
+  "dnssec_validation": false,
+  "log_retention": 1000,
+  "log_client_ip": true,
+  "api_port": null,
+  "logfile": null
+}
+```
+
 **Note on entry counts:** `file_local_data` and `file_local_zones` reflect only what is
 in `runbound.conf`. Entries added via REST API (`POST /dns`, `POST /blacklist`, feeds)
 appear in `api_dns_entries`, `api_blacklist`, and `api_feeds`. Use `GET /dns` and `GET /blacklist`
@@ -518,7 +559,7 @@ curl -X POST http://localhost:8081/reload \
 {"status": "ok", "cfg_path": "/etc/runbound/runbound.conf", "local_zones": 5, "local_data": 12}
 ```
 
-**Note:** ACL rules and forward-zone upstreams require a full restart.
+**Note:** ACL rules, forward-zone upstreams, and privacy settings (`log-retention`, `log-client-ip`) require a full restart.
 
 ---
 
@@ -579,34 +620,42 @@ Atomically replace the active Bearer token **without restarting Runbound**. The 
 is invalidated the instant this endpoint returns. Designed for PCI-DSS / NIS2 key
 rotation requirements.
 
+**Request body (JSON):**
+
+```json
+{"new_key": "your-new-key-minimum-32-characters"}
+```
+
 **Procedure:**
 
 ```bash
-# 1. Set the new key in the environment (before calling rotate-key):
-export RUNBOUND_API_KEY="$(openssl rand -hex 32)"
+NEW_KEY="$(openssl rand -hex 32)"
 
-# 2. Call rotate-key with the CURRENT (old) key:
+# Call with the CURRENT (old) key in Authorization, new key in the body:
 curl -X POST http://localhost:8081/rotate-key \
-  -H "Authorization: Bearer $OLD_KEY"
+  -H "Authorization: Bearer $OLD_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"new_key\": \"$NEW_KEY\"}"
 
-# 3. All subsequent calls must use the new key.
+# All subsequent calls must use NEW_KEY.
 ```
 
 ```json
 {"status": "ok", "message": "API key rotated — old token is immediately invalid"}
 ```
 
-**How it works:** `POST /rotate-key` reads `RUNBOUND_API_KEY` from the process
-environment (already updated by the admin in step 1) and atomically swaps the in-memory
-key. No restart, no DNS service interruption. The rotation is recorded in the audit log
-as a `ConfigReload` event.
+**How it works:** The new key is read from the JSON body, validated, and atomically
+swapped into memory. No restart, no DNS service interruption. The change is persisted to
+the `api.key` file in the runtime directory (mode `0600`). The rotation is recorded in the
+audit log as a `config_reload` event.
 
 **Errors:**
 
-| Code | Meaning |
-|---|---|
-| `400` | `RUNBOUND_API_KEY` env var not set or empty — set it first |
-| `401` | Old key incorrect — rotation rejected |
+| Code | Body | Meaning |
+|---|---|---|
+| `400 WEAK_KEY` | `{"error":"WEAK_KEY"}` | `new_key` is shorter than 32 characters |
+| `400 INVALID_KEY` | `{"error":"INVALID_KEY"}` | `new_key` contains non-printable or DEL characters |
+| `401` | — | `Authorization` header missing or wrong |
 
 ---
 

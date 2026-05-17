@@ -16,9 +16,9 @@ No dependencies required for the `musl` builds.
 
 ```bash
 # Replace vX.Y.Z with the latest tag from https://github.com/redlemonbe/Runbound/releases
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.0-x86_64-linux-musl
-chmod +x runbound-v0.3.0-x86_64-linux-musl
-sudo mv runbound-v0.3.0-x86_64-linux-musl /usr/local/bin/runbound
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.4-x86_64-linux-musl
+chmod +x runbound-v0.3.4-x86_64-linux-musl
+sudo mv runbound-v0.3.4-x86_64-linux-musl /usr/local/bin/runbound
 ```
 
 ---
@@ -105,3 +105,17 @@ curl -s "$API/stats" -H "Authorization: Bearer $TOKEN"
 ```
 
 That's all. For the full API reference see [api.md](api.md).
+
+---
+
+## Privacy defaults
+
+By default Runbound keeps the last 1,000 queries (with client IPs) in a RAM ring buffer accessible via `GET /logs`. If this doesn't fit your retention policy:
+
+```
+server:
+    log-retention: 0     # disable the ring buffer entirely
+    log-client-ip: no    # or: keep the buffer but redact IPs
+```
+
+See [gdpr.md](gdpr.md) for the full GDPR compliance guide.

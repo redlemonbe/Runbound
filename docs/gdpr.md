@@ -35,6 +35,10 @@ log-retention: 0
 log-client-ip: no
 ```
 
+> Ces deux directives nécessitent un **redémarrage** pour prendre effet
+> (le SIGHUP ne recharge que les zones DNS, pas le ring buffer).
+
+
 **Droit à l'oubli :** vider le ring buffer à la demande :
 
 ```

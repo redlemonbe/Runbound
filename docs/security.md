@@ -136,9 +136,12 @@ overwrite each other.
 just at subscription time. A compromised feed record cannot redirect to a private
 address after being subscribed.
 
-**HTTPS enforcement (v0.2.5):** HTTP feed URLs are **rejected with 400 Bad Request** —
+**HTTPS enforcement:** HTTP feed URLs are **rejected with 400 Bad Request** —
 only `https://` URLs are accepted. This prevents man-in-the-middle injection of malicious
 block-list data at the API layer before any network connection is made.
+
+**Credential stripping (v0.3.3):** Feed URLs containing embedded credentials
+(`user:pass@host`) are rejected before any network request to prevent credential leakage.
 
 **File permissions (SEC-07):** Serialised feed files are written with `chmod 640` —
 owner and group readable only.
@@ -180,18 +183,30 @@ See [systemd.md](systemd.md) for the full unit file.
 
 ---
 
-## Audit findings (v0.2.0)
+## Audit findings
 
-| ID | Severity | Title | Status |
+### v0.2.0 — v0.3.x
+
+| ID | Severity | Title | Fixed in |
 |---|---|---|---|
-| SEC-01 | High | Race condition on concurrent API writes | ✅ Fixed |
-| SEC-02 | High | XDP fast path bypassed ACL entirely | ✅ Fixed |
-| SEC-03 | Medium | IPv4-mapped IPv6 skipped ACL rules | ✅ Fixed |
-| SEC-04 | Medium | SSRF via HTTP redirect in feed fetcher | ✅ Fixed |
-| SEC-05 | Medium | TOCTOU on feed URL validation | ✅ Fixed |
-| SEC-06 | Medium | Unbounded data-store growth | ✅ Fixed |
-| SEC-07 | Low | Feed data files world-readable | ✅ Fixed |
-| SEC-08 | Low | Plaintext HTTP feeds accepted silently | ✅ Fixed |
+| SEC-01 | High | Race condition on concurrent API writes | v0.2.0 |
+| SEC-02 | High | XDP fast path bypassed ACL entirely | v0.2.0 |
+| SEC-03 | Medium | IPv4-mapped IPv6 skipped ACL rules | v0.2.0 |
+| SEC-04 | Medium | SSRF via HTTP redirect in feed fetcher | v0.2.0 |
+| SEC-05 | Medium | TOCTOU on feed URL validation | v0.2.0 |
+| SEC-06 | Medium | Unbounded data-store growth | v0.2.0 |
+| SEC-07 | Low | Feed data files world-readable | v0.2.0 |
+| SEC-08 | Low | Plaintext HTTP feeds accepted silently | v0.2.0 |
+| SEC-09 | High | `POST /rotate-key` was a silent no-op (read frozen env var) | v0.3.3 |
+| SEC-10 | Medium | CHAOS class queries returned NOERROR instead of NOTIMP | v0.3.3 |
+| SEC-11 | Medium | Body limit dropped TCP instead of returning HTTP 413 | v0.3.3 |
+| SEC-12 | Medium | Negative TTL caused panic instead of HTTP 422 | v0.3.3 |
+| SEC-13 | Medium | Production `unwrap()` / `expect()` could crash the process | v0.3.3 |
+| SEC-14 | Medium | Sync Bearer comparison was timing-vulnerable | v0.3.3 |
+| SEC-15 | Low | Feed URLs with embedded credentials were not rejected | v0.3.3 |
+| SEC-16 | Low | `rate-limit: u64::MAX` silently disabled rate limiting | v0.3.3 |
+
+See [security-audit.md](security-audit.md) for the full white-box audit report.
 
 ---
 

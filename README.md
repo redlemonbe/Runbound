@@ -46,14 +46,14 @@ Your existing `unbound.conf` works as-is. Zero migration.
 ```bash
 # 1 — Download the static binary (no dependencies)
 #     Replace vX.Y.Z with the latest version tag from the releases page
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.2-x86_64-linux-musl
-chmod +x runbound-v0.3.2-x86_64-linux-musl
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.4-x86_64-linux-musl
+chmod +x runbound-v0.3.4-x86_64-linux-musl
 
 # 2 — One-liner install (downloads automatically, sets up systemd):
 #     sudo bash <(curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh)
 
 # 3 — Or point it at your existing Unbound config
-sudo ./runbound-v0.3.2-x86_64-linux-musl /etc/unbound/unbound.conf
+sudo ./runbound-v0.3.4-x86_64-linux-musl /etc/unbound/unbound.conf
 
 # 4 — Test it
 dig @127.0.0.1 google.com
@@ -63,7 +63,7 @@ DNS live on **port 53**. REST API live on **port 8081** (localhost only, require
 
 The REST API port is configurable with `api-port: 9090` in `runbound.conf`. See the [Configuration Reference](docs/configuration.md#api-key-and-port).
 
-> Raspberry Pi or ARM server? Grab `runbound-v0.3.2-aarch64-linux-musl` instead.
+> Raspberry Pi or ARM server? Grab `runbound-v0.3.4-aarch64-linux-musl` instead.
 
 ---
 
@@ -158,6 +158,8 @@ Ready-to-use configs for common scenarios:
 | [Systemd Setup](docs/systemd.md) | Production service, hardened unit file, hot reload |
 | [Unbound Migration](docs/unbound-migration.md) | Config compatibility, feature mapping, gotchas |
 | [Security Architecture](docs/security.md) | ACL, rate limiting, API auth, audit findings |
+| [Security Audit](docs/security-audit.md) | White-box audit findings and remediation log |
+| [GDPR / Privacy](docs/gdpr.md) | Data inventory, log retention, IP redaction, right-to-erasure |
 
 ---
 

@@ -116,6 +116,7 @@ curl -X POST http://localhost:8081/reload \
 | `rate-limit` | ❌ | Restart required |
 | `tls-service-pem` / `tls-service-key` | ❌ | Restart required |
 | `api-port` / `api-key` | ❌ | Restart required |
+| `log-retention` / `log-client-ip` | ❌ | Restart required — ring buffer is allocated once at startup |
 
 **Tip:** To force an immediate feed refresh:
 

@@ -48,6 +48,32 @@ existing `unbound.conf` is all you need.
 |---|---|
 | `api-key` | REST API Bearer token (prefer `RUNBOUND_API_KEY` env var) |
 | `api-port` | REST API port (default: 8081) |
+| `rate-limit` | Per-IP DNS rate limit in q/s (default: 200, max: 1,000,000) |
+| `cache-max-ttl` | TTL cap for cached records in seconds (default: 86400) |
+| `dnssec-validation` | Enable local DNSSEC re-validation (default: no) |
+| `dnssec-log-bogus` | Log WARN on DNSSEC failures (default: no) |
+| `log-retention` | In-RAM query log ring buffer size (default: 1000, 0 = disabled) |
+| `log-client-ip` | Include client IPs in `/logs` (default: yes — set `no` for GDPR) |
+| `audit-log` | Enable HMAC-SHA256 chained audit log (default: no) |
+| `audit-log-path` | Path for the audit log file |
+| `audit-log-hmac-key` | HMAC key (hex). Auto-generated if omitted |
+| `mode` | `master` (default) or `slave` — HA replication role |
+| `sync-port` | Master: HTTPS sync server port |
+| `sync-master` | Slave: `ip:port` of master |
+| `sync-key` | Slave: Bearer token for master auth |
+| `sync-interval` | Slave: sync interval in seconds (default: 30) |
+| `acme-email` | ACME contact email for Let's Encrypt |
+| `acme-domain` | Domain(s) for the certificate (repeat for SANs) |
+| `acme-cache-dir` | Directory for ACME credentials and temp files |
+| `acme-staging` | Use Let's Encrypt Staging (default: no) |
+| `acme-challenge-port` | HTTP-01 challenge port (default: 80) |
+| `tls-service-pem` | TLS certificate path for DoT/DoH/DoQ |
+| `tls-service-key` | TLS private key path |
+| `tls-port` | DNS-over-TLS port (default: 853) |
+| `https-port` | DNS-over-HTTPS port (default: 443) |
+| `quic-port` | DNS-over-QUIC port (default: 853/UDP) |
+| `tls-cert-hostname` | Hostname for TLS SNI and DoH path |
+| `private-address` | CIDR ranges to block in resolver responses (rebinding guard) |
 
 ---
 
@@ -56,11 +82,9 @@ existing `unbound.conf` is all you need.
 ### 1. Install Runbound
 
 ```bash
-# Find the latest version at: https://github.com/redlemonbe/Runbound/releases
-# Replace v0.2.5 with the latest tag from https://github.com/redlemonbe/Runbound/releases
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.2.5-x86_64-linux-musl
-chmod +x runbound-v0.2.5-x86_64-linux-musl
-sudo mv runbound-v0.2.5-x86_64-linux-musl /usr/local/bin/runbound
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.4-x86_64-linux-musl
+chmod +x runbound-v0.3.4-x86_64-linux-musl
+sudo mv runbound-v0.3.4-x86_64-linux-musl /usr/local/bin/runbound
 ```
 
 ### 2. Test against your existing config
