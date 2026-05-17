@@ -1592,4 +1592,53 @@ mod tests {
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    // ── validate_dns_name unit tests (SEC-02) ─────────────────────────────
+
+    #[test]
+    fn test_validate_dns_name_253_chars_accepted() {
+        // 63+1+63+1+63+1+61 = 253 chars — exactly at RFC 1035 §2.3.4 limit
+        let name = format!("{}.{}.{}.{}",
+            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        assert_eq!(name.len(), 253);
+        assert!(validate_dns_name(&name).is_ok());
+    }
+
+    #[test]
+    fn test_validate_dns_name_254_chars_rejected() {
+        // 63+1+63+1+63+1+62 = 254 chars — one over the RFC limit
+        let name = format!("{}.{}.{}.{}",
+            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(62));
+        assert_eq!(name.len(), 254);
+        assert!(validate_dns_name(&name).is_err());
+    }
+
+    #[test]
+    fn test_validate_dns_name_253_with_trailing_dot_accepted() {
+        // trailing dot is stripped before length check
+        let name = format!("{}.{}.{}.{}.",
+            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        assert_eq!(name.trim_end_matches('.').len(), 253);
+        assert!(validate_dns_name(&name).is_ok());
+    }
+
+    #[test]
+    fn test_validate_dns_name_254_with_trailing_dot_rejected() {
+        let name = format!("{}.{}.{}.{}.",
+            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(62));
+        assert_eq!(name.trim_end_matches('.').len(), 254);
+        assert!(validate_dns_name(&name).is_err());
+    }
+
+    #[test]
+    fn test_validate_dns_name_label_64_chars_rejected() {
+        let name = "a".repeat(64);
+        assert!(validate_dns_name(&name).is_err());
+    }
+
+    #[test]
+    fn test_validate_dns_name_label_63_chars_accepted() {
+        let name = "a".repeat(63);
+        assert!(validate_dns_name(&name).is_ok());
+    }
 }

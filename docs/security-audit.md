@@ -1,6 +1,6 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.1  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.3  
 **Last updated:** 2026-05-17  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser  
 **Methodology:** Manual white-box source code review of all Rust modules
@@ -636,9 +636,22 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 
 ---
 
+### v0.4.3 Audit Findings (military audit on v0.4.1)
+
+| ID | Severity | Component | Status |
+|---|---|---|---|
+| SEC-02 | MEDIUM | API/DNS | ✅ Fixed v0.4.3 — false positive; added unit tests confirming 253/254-char boundary |
+| SEC-03 | LOW | DNS | ✅ Fixed v0.4.3 — name-based identity probe block (defense-in-depth vs CHAOS class) |
+| SEC-04 | LOW | API | ✅ Mitigated v0.4.1/v0.4.3 — Content-Length pre-check (413 for well-behaved clients); TCP RST for chunked >64 KB bodies is an inherent HTTP/1.1 limitation on localhost-only API |
+| DOC-01 | INFO | Docs | ✅ Fixed v0.4.3 — README updated to current binary names |
+| DOC-02 | INFO | Docs | ✅ Fixed v0.4.3 — Fixed runtime limits section added to configuration.md |
+| DOC-03 | INFO | Docs | ✅ Fixed v0.4.3 — Slave DNS behaviour section added to ha.md |
+
+---
+
 ## Open Findings
 
-All findings from all audit cycles are resolved as of v0.4.1.
+All findings from all audit cycles are resolved as of v0.4.3.
 No open findings remain.
 
 ---

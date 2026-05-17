@@ -281,6 +281,46 @@ Use `GET /health` on both nodes for load balancer health probes.
 
 ---
 
+## Slave DNS behaviour
+
+Replicated entries are **immediately served by the slave's DNS engine** after each
+sync cycle — no restart required. The slave maintains the same in-memory zone
+structures as the master.
+
+**What the slave serves via DNS:**
+
+| Data | Served by slave DNS? | Notes |
+|---|:---:|---|
+| Replicated `POST /dns` entries | ✅ Yes | Loaded into DNS engine on each delta apply |
+| Replicated blacklist / feeds | ✅ Yes | Zone entries updated in memory immediately |
+| Forwarding zone resolution | ✅ Yes | Same upstream forwarders as configured |
+| DNSSEC validation | ✅ Yes | Same validation rules as master |
+
+**On slave restart:**
+
+The slave reads its persisted store from disk (DNS entries, blacklist, feeds) and
+rebuilds the in-memory zone structures before accepting DNS queries. This ensures
+that all previously replicated entries are available immediately on startup, without
+waiting for the next sync poll.
+
+**During a sync cycle:**
+
+1. Slave polls master for delta events.
+2. For each event (add/delete DNS entry, add/delete blacklist entry, feed update),
+   the slave applies the change atomically to the in-memory zone trie under a mutex.
+3. Deletes and feed changes trigger a full zone rebuild from the persisted store.
+4. DNS queries are served from the snapshot that was active at the time of the query
+   — zone updates are applied atomically and become visible to the next query
+   immediately.
+
+**If the master is unreachable:**
+
+The slave continues serving DNS from its last known good state — reads from disk
+at startup, in-memory after that. No queries are dropped; replication lag accumulates
+until the master comes back online.
+
+---
+
 ## Delta sync and full sync
 
 The master keeps a **ring buffer of the last 1,000 events**. Each slave tracks the
