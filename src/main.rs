@@ -1,3 +1,4 @@
+mod acme;
 mod audit;
 mod config;
 mod dns;
@@ -107,6 +108,45 @@ async fn main() -> Result<()> {
         base_dir.clone(),
     );
     audit.send(audit::AuditEvent::Startup);
+
+    // ── ACME: auto-provision TLS cert if needed ────────────────────────────
+    if let Some(ref email) = unbound_cfg.acme_email {
+        if unbound_cfg.acme_domains.is_empty() {
+            tracing::warn!("acme-email set but no acme-domain directives — ACME disabled");
+        } else {
+            let cert_path = unbound_cfg.tls.cert_path.as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| base_dir.join("cert.pem"));
+            let key_path = unbound_cfg.tls.key_path.as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| base_dir.join("key.pem"));
+            let cache_dir = unbound_cfg.acme_cache_dir.as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| base_dir.join("acme"));
+
+            let acme_cfg = acme::AcmeConfig {
+                email:          email.clone(),
+                domains:        unbound_cfg.acme_domains.clone(),
+                cert_path:      cert_path.clone(),
+                key_path:       key_path.clone(),
+                cache_dir,
+                staging:        unbound_cfg.acme_staging,
+                challenge_port: unbound_cfg.acme_challenge_port.unwrap_or(80),
+            };
+
+            if acme::needs_renewal(&cert_path) {
+                info!("ACME: cert missing or due for renewal — contacting Let's Encrypt");
+                if let Err(e) = acme::ensure_certificate(&acme_cfg).await {
+                    // Non-fatal: existing cert (if any) will still be used for DoT/DoH.
+                    tracing::warn!(err = %e, "ACME cert provisioning failed — continuing");
+                }
+            } else {
+                info!("ACME: cert is current (>30 days remaining)");
+            }
+
+            tokio::spawn(acme::renewal_loop(acme_cfg));
+        }
+    }
 
     // ── Build in-memory zone set ───────────────────────────────────────────
     let zone_set = build_zone_set(&unbound_cfg);

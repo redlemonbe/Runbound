@@ -86,6 +86,18 @@ pub struct UnboundConfig {
     pub sync_key: Option<String>,
     /// Slave only: sync interval in seconds. Default: 30.
     pub sync_interval: u64,
+
+    // ── ACME (Let's Encrypt) ───────────────────────────────────────────────
+    /// Contact email for Let's Encrypt account.
+    pub acme_email: Option<String>,
+    /// Domain names to include in the cert (can appear multiple times).
+    pub acme_domains: Vec<String>,
+    /// Directory to store ACME account credentials and temp files.
+    pub acme_cache_dir: Option<String>,
+    /// Use Let's Encrypt Staging API (for testing). Default: false.
+    pub acme_staging: bool,
+    /// Port for the HTTP-01 challenge server. Default: 80.
+    pub acme_challenge_port: Option<u16>,
 }
 
 impl UnboundConfig {
@@ -240,6 +252,12 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "sync-master"   => cfg.sync_master   = Some(val.trim_matches('"').to_string()),
         "sync-key"      => cfg.sync_key      = Some(val.trim_matches('"').to_string()),
         "sync-interval" => cfg.sync_interval = val.parse().unwrap_or(30),
+        // ACME / Let's Encrypt
+        "acme-email"          => cfg.acme_email          = Some(val.trim_matches('"').to_string()),
+        "acme-domain"         => cfg.acme_domains.push(val.trim_matches('"').to_string()),
+        "acme-cache-dir"      => cfg.acme_cache_dir      = Some(val.trim_matches('"').to_string()),
+        "acme-staging"        => cfg.acme_staging        = val.trim_matches('"') == "yes",
+        "acme-challenge-port" => cfg.acme_challenge_port = val.parse().ok(),
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"

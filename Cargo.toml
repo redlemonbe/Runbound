@@ -62,6 +62,8 @@ tracing-appender   = "0.2"
 # Utils
 uuid            = { version = "1", features = ["v4", "serde"] }
 sha2            = "0.10"
+hmac            = "0.12"
+getrandom       = "0.3"
 hex             = "0.4"
 subtle          = "2"
 tempfile        = "3"
@@ -69,8 +71,17 @@ regex           = "1"
 humantime       = "2"
 humantime-serde = "1"
 
-# HTTP client (feeds fetch)
+# HTTP client (feeds fetch + ACME HTTP-01 bridge)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# ACME (Let's Encrypt) — ring backend only; HTTP done via reqwest bridge
+instant-acme = { version = "0.8", default-features = false, features = ["ring"] }
+
+# Zero-copy byte buffers — used in ACME HttpClient bridge
+bytes = "1"
+
+# HTTP types shared across hyper / axum / instant-acme
+http = "1"
 
 # Stream utilities — SSE streaming for /stats/stream endpoint
 futures-util = "0.3"
