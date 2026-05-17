@@ -102,11 +102,11 @@ const MAX_BLACKLIST_ENTRIES: usize = 100_000;
 /// without this limit an authenticated client could trigger unbounded I/O.
 const MAX_FEEDS: usize = 100;
 
-/// Priority: RUNBOUND_API_KEY env var > api-key in unbound.conf > auto-generate.
+/// Priority: HSM > RUNBOUND_API_KEY env var > api-key in unbound.conf > auto-generate.
 /// Auto-generated keys are 256-bit CSPRNG (2× UUID v4, backed by getrandom).
 pub fn init_api_key(config_key: Option<String>) -> String {
-    let key = std::env::var("RUNBOUND_API_KEY")
-        .ok()
+    let key = crate::hsm::api_key().map(|k| k.to_string())
+        .or_else(|| std::env::var("RUNBOUND_API_KEY").ok())
         .or(config_key)
         .unwrap_or_else(|| {
             // 256 bits from OS CSPRNG — two UUID v4s = 64 hex chars.
@@ -457,6 +457,7 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
         "status":      "ok",
         "uptime_secs": snap.uptime_secs,
         "queries":     snap.total,
+        "hsm":         crate::hsm::is_active(),
     }))
 }
 
@@ -542,6 +543,15 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
         "api_port":          cfg.api_port,
         // api_key intentionally omitted — secret
         "logfile":           cfg.logfile,
+        // HSM config — pin masked
+        "hsm": serde_json::json!({
+            "active":            crate::hsm::is_active(),
+            "pkcs11_lib":        cfg.hsm_pkcs11_lib,
+            "slot":              cfg.hsm_slot,
+            "pin":               cfg.hsm_pin.as_ref().map(|_| "***"),
+            "api_key_label":     cfg.hsm_api_key_label,
+            "store_key_label":   cfg.hsm_store_key_label,
+        }),
     }))
 }
 

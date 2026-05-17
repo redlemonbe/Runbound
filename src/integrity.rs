@@ -18,10 +18,15 @@ use tracing::{error, warn};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Return the HMAC key from `RUNBOUND_STORE_KEY`.
-/// Accepts: 64+ lowercase hex chars (decoded to bytes), or raw UTF-8.
-/// Returns `None` if the variable is unset or empty.
+/// Return the store HMAC key.
+/// Priority: HSM (crate::hsm) > RUNBOUND_STORE_KEY env var.
+/// Env var accepts 64+ hex chars (decoded) or raw UTF-8.
+/// Returns `None` when no key is configured.
 pub fn store_key() -> Option<Vec<u8>> {
+    // HSM has highest priority — when active, never fall through to env var.
+    if let Some(k) = crate::hsm::store_key() {
+        return Some(k.to_vec());
+    }
     let raw = std::env::var("RUNBOUND_STORE_KEY").ok()?;
     let raw = raw.trim();
     if raw.is_empty() { return None; }

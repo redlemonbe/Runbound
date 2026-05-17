@@ -158,6 +158,44 @@ api-port: 9090       # optional — default 8081
 The environment variable takes priority over the config file value.  
 The API always binds to `127.0.0.1` (localhost only) regardless of `api-port`.
 
+### HSM key storage (PKCS#11)
+
+Store the API key and store HMAC key in a Hardware Security Module instead of
+environment variables. Requires a PKCS#11-compatible device (YubiHSM 2, Nitrokey
+HSM 2, AWS CloudHSM, etc.) or SoftHSM2 for development.
+
+```
+server:
+    # Path to the PKCS#11 shared library (.so) — HSM disabled when absent
+    hsm-pkcs11-lib:  /usr/lib/softhsm/libsofthsm2.so
+
+    # PKCS#11 slot index (0-based, default: 0)
+    hsm-slot:        0
+
+    # PIN — strongly prefer the HSM_PIN environment variable
+    # hsm-pin:       1234       ← emits WARN if set here (plaintext in config)
+
+    # Label of the CKO_SECRET_KEY object used as the REST API Bearer token
+    hsm-api-key-label:   runbound-api-key
+
+    # Label of the CKO_SECRET_KEY object used as the JSON store HMAC key
+    hsm-store-key-label: runbound-store-key
+```
+
+Store the PIN in an env file:
+
+```bash
+echo "HSM_PIN=1234" >> /etc/runbound/env
+chmod 640 /etc/runbound/env
+```
+
+**Key priority** (highest first): HSM → env var → config file → auto-generated.
+
+When `hsm-pkcs11-lib` is set and any key fails to load, Runbound exits immediately
+with an error. There is no silent fallback.
+
+→ Full setup guide including SoftHSM2, YubiHSM 2, and production recommendations: [docs/hsm.md](hsm.md)
+
 ### DNSSEC validation
 
 ```

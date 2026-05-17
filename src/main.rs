@@ -7,6 +7,7 @@ mod dns;
 mod api;
 mod feeds;
 mod error;
+mod hsm;
 mod integrity;
 mod logbuffer;
 mod runtime;
@@ -97,6 +98,18 @@ async fn main() -> Result<()> {
 
     info!(path = %cfg_path, "Loading config");
     let unbound_cfg = config::load(&cfg_path)?;
+
+    // ── HSM: load key material from PKCS#11 device (if configured) ───────────
+    // Must run before init_api_key() and integrity::store_key() so the HSM
+    // keys are in the OnceLocks before any code reads them.
+    // On failure: log + exit(1). Never silently fall back to env vars —
+    // the operator explicitly opted into HSM protection.
+    if let Some(hsm_cfg) = hsm::HsmConfig::from_config(&unbound_cfg) {
+        if let Err(e) = hsm::load_and_store(&hsm_cfg) {
+            error!(err = %e, "HSM key loading failed — exiting");
+            std::process::exit(1);
+        }
+    }
 
     info!(
         port = unbound_cfg.port,
