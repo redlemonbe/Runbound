@@ -4,6 +4,7 @@ mod api;
 mod feeds;
 mod error;
 mod logbuffer;
+mod runtime;
 mod store;
 mod stats;
 mod sync;
@@ -57,6 +58,31 @@ async fn main() -> Result<()> {
     let cfg_path = args.get(1)
         .cloned()
         .unwrap_or_else(|| "/etc/unbound/unbound.conf".to_string());
+
+    // Derive runtime base_dir from config file's parent directory.
+    // All runtime files (api.key, dns_entries.json, …) are stored there.
+    let cfg_canonical = std::fs::canonicalize(&cfg_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&cfg_path));
+    let base_dir = cfg_canonical
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Reject / and /tmp — running from there would scatter files in unexpected places.
+    match base_dir.to_str() {
+        Some("/") | Some("/tmp") => {
+            anyhow::bail!(
+                "Config base directory '{}' is not allowed. \
+                 Move your config file to a dedicated directory (e.g. /etc/runbound/).",
+                base_dir.display()
+            );
+        }
+        _ => {}
+    }
+
+    runtime::BASE_DIR.set(base_dir.clone())
+        .expect("BASE_DIR set twice — this is a bug");
+    info!(base_dir = %base_dir.display(), "Runtime base_dir");
 
     info!(path = %cfg_path, "Loading config");
     let unbound_cfg = config::load(&cfg_path)?;
@@ -121,15 +147,14 @@ async fn main() -> Result<()> {
         "REST API key: {}...{}",
         &api_key[..8], &api_key[api_key.len()-4..]
     );
-    info!("Full API key stored in /etc/runbound/api.key (chmod 600)");
-    // Write key to file for operators
-    let key_path = "/etc/runbound/api.key";
-    if let Ok(()) = std::fs::create_dir_all("/etc/runbound") {
-        let _ = std::fs::write(key_path, &api_key);
+    let key_path = runtime::base_dir().join("api.key");
+    info!(path = %key_path.display(), "Full API key stored (chmod 600)");
+    if let Ok(()) = std::fs::create_dir_all(runtime::base_dir()) {
+        let _ = std::fs::write(&key_path, &api_key);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
         }
     }
 
@@ -151,9 +176,8 @@ async fn main() -> Result<()> {
     let cfg_arc = Arc::new(unbound_cfg.clone());
 
     // ── Slave/master sync ──────────────────────────────────────────────────
-    let sync_journal = if unbound_cfg.is_master() && unbound_cfg.sync_port.is_some() {
+    let sync_journal = if let (true, Some(port)) = (unbound_cfg.is_master(), unbound_cfg.sync_port) {
         let journal = sync::SyncJournal::new();
-        let port = unbound_cfg.sync_port.unwrap();
 
         match sync::ensure_sync_cert() {
             Ok((cert_pem, key_pem)) => {
@@ -210,6 +234,7 @@ async fn main() -> Result<()> {
         upstreams:    Arc::clone(&upstreams),
         sync_journal,
         slave_mode:   unbound_cfg.is_slave(),
+        base_dir:     Arc::new(base_dir),
     };
     let app = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
