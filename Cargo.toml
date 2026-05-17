@@ -4,10 +4,11 @@ version = "0.3.1"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "PolyForm-Noncommercial-1.0.0"
-description = "RFC-compliant DNS recursive resolver — drop-in replacement for Unbound, with integrated REST API"
+description = "RFC-compliant DNS resolver — drop-in Unbound with REST API, ACME auto-TLS, HMAC audit log, and master/slave HA"
+readme = "README.md"
 repository = "https://github.com/redlemonbe/Runbound"
 homepage = "https://github.com/redlemonbe/Runbound"
-keywords = ["dns", "unbound", "resolver", "dnssec", "axum"]
+keywords = ["dns", "unbound", "resolver", "dnssec", "acme"]
 categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
