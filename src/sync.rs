@@ -343,12 +343,18 @@ async fn handle_sync_request(
         return Ok(json_ok(serde_json::json!({ "fingerprint": cert_fingerprint })));
     }
 
-    // All other endpoints require Bearer auth
-    let auth = req.headers()
+    // All other endpoints require Bearer auth — constant-time to prevent
+    // timing oracles on the sync key length and content.
+    let auth     = req.headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if auth != format!("Bearer {sync_key}") {
+    let expected = format!("Bearer {sync_key}");
+    let authed: bool = {
+        use subtle::ConstantTimeEq as _;
+        auth.as_bytes().ct_eq(expected.as_bytes()).into()
+    };
+    if !authed {
         return Ok(json_resp(401, serde_json::json!({ "error": "UNAUTHORIZED" })));
     }
 
