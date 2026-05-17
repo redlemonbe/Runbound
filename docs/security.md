@@ -1,7 +1,7 @@
 # Security Architecture
 
-This document covers the security model, defensive layers, and the audit findings
-fixed in version 0.2.0.
+This document covers the security model, defensive layers, and all audit findings
+fixed across Runbound releases through v0.4.1.
 
 ---
 
@@ -11,24 +11,29 @@ fixed in version 0.2.0.
 Internet / LAN
       │
       ▼
-┌─────────────────────────────────────┐
-│  ACL check (allow / deny / refuse)  │  ← per-subnet rules, IPv4+IPv6
-│  Rate limiter (token bucket)        │  ← per-source-IP, DashMap+ahash
-│  Inflight semaphore (max 4096)      │  ← hard OOM backstop
-├─────────────────────────────────────┤
-│  XDP fast path (optional)           │  ← same ACL + rate limit enforced
-├─────────────────────────────────────┤
-│  DNS engine (hickory-server)        │
-│  Zone lookup / forwarding           │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  DoT / DoH / DoQ (TLS 1.2+, TLS 1.3 for DoQ)       │  ← rustls 0.23 + ring backend
+│  Optional mTLS client auth (dot-client-auth-ca)     │  ← mutual TLS for DoT
+├─────────────────────────────────────────────────────┤
+│  ACL check (allow / deny / refuse)                  │  ← per-subnet rules, IPv4+IPv6
+│  Rate limiter (token bucket)                        │  ← per-source-IP, DashMap+ahash
+│  Inflight semaphore (max 4096)                      │  ← hard OOM backstop
+├─────────────────────────────────────────────────────┤
+│  XDP fast path (optional)                           │  ← same ACL + rate limit enforced
+├─────────────────────────────────────────────────────┤
+│  DNS engine (hickory-server 0.26)                   │
+│  Zone lookup / forwarding                           │
+└─────────────────────────────────────────────────────┘
       │
       ▼
-┌─────────────────────────────────────┐
-│  REST API (port 8081, configurable)  │
-│  Bearer token (timing-safe cmp)     │  ← subtle::ConstantTimeEq
-│  Entry limits (10k DNS, 100k BL)    │
-│  zones_mutex (atomic write+swap)    │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  REST API (port 8081, localhost only)               │
+│  Body size check before rate limit (Content-Length) │  ← 413 before 429
+│  Bearer token (timing-safe cmp)                     │  ← subtle::ConstantTimeEq
+│  Entry limits (10k DNS, 100k BL)                   │
+│  zones_mutex (atomic write+swap)                    │
+│  HMAC-SHA256 store integrity (.mac sidecars)        │  ← RUNBOUND_STORE_KEY
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -73,26 +78,20 @@ Runbound has two independent, always-active defences against memory exhaustion:
 
 Hard cap of **4,096 concurrent in-flight requests**. When the semaphore is exhausted,
 new requests receive REFUSED immediately without allocating any additional memory.
-This provides a hard backstop even at line rate and is immune to amplification —
-no bytes are allocated for the rejected request.
 
 ### 2. Memory pressure guard
 
 A background task reads `/proc/meminfo` every **30 seconds**. When system RAM usage
 reaches **80 %**, two caches are purged atomically:
 
-- **Rate-limiter DashMap** — all token buckets cleared. Each IP rebuilds its bucket
-  on the next query; no query is lost, only the accumulation of per-IP state.
-- **hickory-resolver cache** — the resolver is rebuilt from config and atomically
-  swapped via ArcSwap. In-flight queries hold their Arc reference and complete
-  normally; new queries use the fresh resolver with an empty cache.
+- **Rate-limiter DashMap** — all token buckets cleared.
+- **hickory-resolver cache** — rebuilt and atomically swapped via ArcSwap.
 
 After the purge, the new usage level is logged. If usage is still above 50 %, a
-second warning is emitted so the operator knows a permanent fix (more RAM, reduced
-rate limit, fewer feed subscriptions) may be needed.
+second warning is emitted.
 
 On non-Linux systems or containers without `/proc/meminfo`, the guard silently
-skips its check — DNS service continues normally.
+skips its check.
 
 ```
 WARN Memory pressure — purging DNS caches  used_pct=82.3%  avail_mb=312  total_mb=1753
@@ -101,6 +100,48 @@ WARN Memory after purge  used_pct=44.1%  status="below 50% target"
 ```
 
 **The memory guard is always active — no configuration required.**
+
+---
+
+## TLS (DoT / DoH / DoQ)
+
+Runbound supports three encrypted DNS transports:
+
+| Transport | Port | Standard |
+|---|---|---|
+| DNS-over-TLS (DoT) | 853 | RFC 7858 |
+| DNS-over-HTTPS (DoH) | 443 | RFC 8484 |
+| DNS-over-QUIC (DoQ) | 853/UDP | RFC 9250 |
+
+TLS is provided by **rustls 0.23** with the **ring** cryptographic backend. DoQ
+requires TLS 1.3 (`ServerConfig::builder_with_protocol_versions(&[&TLS13])`).
+
+### Mutual TLS for DoT (mTLS)
+
+Optionally require clients to present a certificate signed by a trusted CA:
+
+```
+dot-client-auth-ca: /etc/runbound/client-ca.pem
+```
+
+When set, unauthenticated DoT connections are rejected at the TLS handshake
+before any DNS message is parsed. See [configuration.md](configuration.md) for
+the full setup guide including client certificate generation.
+
+### Certificate management
+
+Runbound supports automatic certificate provisioning via **Let's Encrypt ACME**
+(HTTP-01 challenge) and includes a `--gen-cert` utility for development
+self-signed certificates.
+
+```bash
+# Generate self-signed certificate for testing
+runbound --gen-cert dns.example.com
+
+# Use Let's Encrypt in production (add to unbound.conf)
+acme-email: ops@example.com
+acme-domain: dns.example.com
+```
 
 ---
 
@@ -115,57 +156,120 @@ WARN Memory after purge  used_pct=44.1%  status="below 50% target"
 export RUNBOUND_API_KEY="$(openssl rand -hex 32)"
 ```
 
+**Body size enforcement:** `Content-Length` is checked before the rate limiter
+so oversized requests return HTTP 413 (not 429). The `DefaultBodyLimit` at
+64 KiB prevents OOM via large payloads.
+
 **Entry limits:** Enforced server-side to prevent authenticated DoS:
 - DNS entries: max 10,000
 - Blacklist entries: max 100,000
+- Feed subscriptions: max 100
 
-**Concurrent write safety (SEC-01):** The entire load → validate → write → ArcSwap
+**Concurrent write safety:** The entire load → validate → write → ArcSwap
 sequence is performed inside `zones_mutex`. Two concurrent API writes cannot
 overwrite each other.
+
+**Input validation:**
+- DNS `name` and domain-type `value` fields (CNAME, MX, NS, PTR, SRV targets)
+  are validated against RFC 1035 rules: max 253 chars, labels max 63 chars,
+  valid label characters only, no control characters.
+- TTL must be in [0, 2147483647] (RFC 2181 §8).
+- All JSON deserialization failures return structured JSON error bodies with
+  `{"error": "INVALID_REQUEST", "details": "..."}`.
+
+---
+
+## Store integrity (HMAC)
+
+Runbound optionally protects its JSON data stores against offline tampering using
+HMAC-SHA256 sidecar files.
+
+```bash
+# 64-byte hex key (minimum)
+export RUNBOUND_STORE_KEY="$(openssl rand -hex 32)"
+```
+
+Protected files:
+- `dns_entries.json` → `dns_entries.json.mac`
+- `blacklist.json` → `blacklist.json.mac`
+- `feeds.json` → `feeds.json.mac`
+- `feed_domains_<id>.txt` → `feed_domains_<id>.txt.mac`
+
+| Key set | MAC file exists | Behaviour |
+|---|---|---|
+| No | No | OK — HMAC disabled |
+| No | Yes | WARN — orphaned sidecar, load continues |
+| Yes | No | WARN — file was written without MAC, load continues |
+| Yes | Yes | Verify — mismatch → ERROR, load aborted |
+
+A HMAC mismatch on startup returns an error and refuses to load the tampered file.
+Startup continues with an empty store rather than serving poisoned data.
+
+See [configuration.md](configuration.md) for the full 4-case behaviour table.
 
 ---
 
 ## Feed security
 
-**SSRF protection (SEC-04):** A custom `reqwest` redirect policy blocks:
-- HTTPS → HTTP downgrades
-- Redirects to private or loopback IP addresses (`10.x`, `172.16.x`, `192.168.x`,
-  `127.x`, `169.254.x`, `::1`, etc.)
+**SSRF protection — two independent layers:**
 
-**TOCTOU re-validation (SEC-05):** Feed URLs are re-validated on every fetch, not
-just at subscription time. A compromised feed record cannot redirect to a private
-address after being subscribed.
+1. **Redirect policy:** HTTP→HTTPS downgrades and redirects to private/loopback
+   addresses are blocked at the reqwest level before any HTTP request is issued.
 
-**HTTPS enforcement:** HTTP feed URLs are **rejected with 400 Bad Request** —
-only `https://` URLs are accepted. This prevents man-in-the-middle injection of malicious
-block-list data at the API layer before any network connection is made.
+2. **Connection-layer resolver (MED-03, v0.4.0):** A custom `reqwest` DNS
+   resolver (`SsrfSafeDnsResolver`) filters private, loopback, and link-local
+   addresses from DNS responses *before* a TCP connection is opened. This closes
+   the gap where a feed URL resolves to a public IP at subscription time but a
+   later DNS update returns a private IP (DNS rebinding).
 
-**Credential stripping (v0.3.3):** Feed URLs containing embedded credentials
-(`user:pass@host`) are rejected before any network request to prevent credential leakage.
+**TOCTOU re-validation:** Feed URLs are re-validated on every fetch, not just
+at subscription time.
 
-**File permissions (SEC-07):** Serialised feed files are written with `chmod 640` —
-owner and group readable only.
+**HTTPS enforcement:** HTTP feed URLs are rejected with 400 Bad Request —
+only `https://` URLs are accepted.
+
+**Credential stripping (v0.3.3):** Feed URLs with embedded credentials
+(`user:pass@host`) are rejected before any network request.
+
+**File permissions:** Serialised feed files are written with `chmod 640` —
+owner and group readable only, with HMAC sidecar integrity verification.
 
 ---
 
 ## XDP path security
 
-**ACL enforcement in XDP (SEC-02):** The AF/XDP fast path applies the full ACL before
-answering any query. There is no bypass. `Deny` → silent drop; `Refuse` → REFUSED
-frame crafted directly in the XDP worker.
+**ACL enforcement in XDP (SEC-02):** The AF/XDP fast path applies the full ACL
+before answering any query. `Deny` → silent drop; `Refuse` → REFUSED frame
+crafted directly in the XDP worker.
+
+---
+
+## HA master/slave sync
+
+The sync HTTPS server (port 8082) uses **rustls 0.23** with a TOFU
+(Trust-On-First-Use) certificate pinning strategy:
+
+- Master generates a self-signed sync certificate on first start and pins its
+  SHA-256 fingerprint.
+- Slave connects only to a master whose certificate matches the configured
+  fingerprint.
+- Sync bearer token compared with `subtle::ConstantTimeEq`.
+- All write operations are blocked on slave nodes (HTTP 503 `READ_ONLY`).
 
 ---
 
 ## File permissions reference
 
-| File | Recommended permissions | Owner |
+| File | Permissions | Notes |
 |---|---|---|
-| `/etc/runbound/runbound.conf` | `640` | `runbound:runbound` |
-| `/etc/runbound/env` (API key) | `640` | `runbound:runbound` |
-| `/etc/runbound/key.pem` (TLS key) | `640` | `runbound:runbound` |
-| `/etc/runbound/cert.pem` | `644` | `runbound:runbound` |
-| `/var/lib/runbound/*.json` (store) | `640` | `runbound:runbound` |
-| `/var/log/runbound/` | `750` | `runbound:runbound` |
+| `/etc/runbound/runbound.conf` | `640` | Contains no secrets when using env vars |
+| `/etc/runbound/api.key` | `600` | Auto-generated API key backup |
+| `/etc/runbound/key.pem` | `600` | TLS private key — never world-readable |
+| `/etc/runbound/cert.pem` | `644` | TLS certificate |
+| `<base_dir>/dns_entries.json` | `640` | DNS store (auto-set by Runbound) |
+| `<base_dir>/blacklist.json` | `640` | Blacklist store (auto-set by Runbound) |
+| `<base_dir>/feeds.json` | `640` | Feed subscriptions |
+| `<base_dir>/*.mac` | `640` | HMAC sidecar files |
 
 ---
 
@@ -185,7 +289,7 @@ See [systemd.md](systemd.md) for the full unit file.
 
 ## Audit findings
 
-### v0.2.0 — v0.3.x
+### v0.2.0 – v0.3.x
 
 | ID | Severity | Title | Fixed in |
 |---|---|---|---|
@@ -197,7 +301,7 @@ See [systemd.md](systemd.md) for the full unit file.
 | SEC-06 | Medium | Unbounded data-store growth | v0.2.0 |
 | SEC-07 | Low | Feed data files world-readable | v0.2.0 |
 | SEC-08 | Low | Plaintext HTTP feeds accepted silently | v0.2.0 |
-| SEC-09 | High | `POST /rotate-key` was a silent no-op (read frozen env var) | v0.3.3 |
+| SEC-09 | High | `POST /rotate-key` was a silent no-op | v0.3.3 |
 | SEC-10 | Medium | CHAOS class queries returned NOERROR instead of NOTIMP | v0.3.3 |
 | SEC-11 | Medium | Body limit dropped TCP instead of returning HTTP 413 | v0.3.3 |
 | SEC-12 | Medium | Negative TTL caused panic instead of HTTP 422 | v0.3.3 |
@@ -205,6 +309,39 @@ See [systemd.md](systemd.md) for the full unit file.
 | SEC-14 | Medium | Sync Bearer comparison was timing-vulnerable | v0.3.3 |
 | SEC-15 | Low | Feed URLs with embedded credentials were not rejected | v0.3.3 |
 | SEC-16 | Low | `rate-limit: u64::MAX` silently disabled rate limiting | v0.3.3 |
+
+### v0.4.0
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| HIGH-01 | High | Auth bypass — 7 attack vectors accepted unauthenticated | v0.4.0 |
+| HIGH-02 | High | Timing oracle on API key comparison | v0.4.0 |
+| HIGH-03 | High | DNS injection via unvalidated name/value fields | v0.4.0 |
+| HIGH-04 | High | ANY amplification not blocked | v0.4.0 |
+| HIGH-05 | High | AXFR zone transfer not refused | v0.4.0 |
+| HIGH-06 | High | No integrity protection on data stores | v0.4.0 |
+| MED-01 | Medium | Per-IP rate limit on API missing | v0.4.0 |
+| MED-02 | Medium | `local-zone` / `local-data` count unbounded in config | v0.4.0 |
+| MED-03 | Medium | SSRF via DNS rebinding not blocked at connection layer | v0.4.0 |
+| MED-04 | Medium | Audit log HMAC not enforced | v0.4.0 |
+| MED-05 | Medium | DoT/DoH TLS upgrade to rustls 0.23 (CVE exposure) | v0.4.0 |
+| LOW-01 | Low | Client IP logged for all queries (privacy) | v0.4.0 |
+| LOW-02 | Low | Log buffer unbounded growth | v0.4.0 |
+| LOW-03 | Low | Config cap on local-zone / local-data directives missing | v0.4.0 |
+| LOW-04 | Low | Sync certificate not pinned (TOFU gap) | v0.4.0 |
+| LOW-05 | Low | Control characters in log fields not sanitised | v0.4.0 |
+
+### v0.4.1
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| BUG-01 | Blocking | Sync HTTPS server panic (CryptoProvider not installed) | v0.4.1 |
+| S-10 | Medium | CNAME/MX/NS/PTR/SRV target values accepted beyond 253 chars | v0.4.1 |
+| S-11 | Low | 1 MB body returned 429 instead of 413 (rate limit fired first) | v0.4.1 |
+| Q-01 | Low | POST /dns invalid type → HTTP 422 non-JSON body | v0.4.1 |
+| Q-02 | Low | POST /blacklist invalid action → HTTP 422 non-JSON body | v0.4.1 |
+| Q-03 | Low | POST /rotate-key non-string type → HTTP 422 non-JSON body | v0.4.1 |
+| Q-04 | Low | GET /logs?page=-1 → HTTP 400 non-JSON body | v0.4.1 |
 
 See [security-audit.md](security-audit.md) for the full white-box audit report.
 

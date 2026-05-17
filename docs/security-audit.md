@@ -1,6 +1,6 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.0  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.1  
 **Last updated:** 2026-05-17  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser  
 **Methodology:** Manual white-box source code review of all Rust modules
@@ -621,9 +621,24 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 
 ---
 
+### v0.4.1 Audit Findings (military audit on v0.4.0)
+
+| ID | Severity | Component | Status |
+|---|---|---|---|
+| BUG-01 | BLOCKING | Sync/TLS | ✅ Fixed v0.4.1 — CryptoProvider install in main() |
+| S-10 | MEDIUM | API/DNS | ✅ Fixed v0.4.1 — validate_dns_name on CNAME/MX/NS/PTR/SRV values |
+| S-11 | LOW | API | ✅ Fixed v0.4.1 — Content-Length check before rate limit (413 not 429) |
+| Q-01 | LOW | API | ✅ Fixed v0.4.1 — ApiJson extractor: JSON body on POST /dns rejection |
+| Q-02 | LOW | API | ✅ Fixed v0.4.1 — ApiJson extractor: JSON body on POST /blacklist rejection |
+| Q-03 | LOW | API | ✅ Fixed v0.4.1 — ApiJson extractor: JSON body on POST /rotate-key rejection |
+| Q-04 | LOW | API | ✅ Fixed v0.4.1 — QueryRejection: JSON body on GET /logs?page=-1 |
+| S-12 | INFO | DNS | ℹ️ False positive — version.bind CHAOS → NOTIMP confirmed in code |
+
+---
+
 ## Open Findings
 
-All findings from the initial audit cycle and second audit cycle are resolved as of v0.4.0.
+All findings from all audit cycles are resolved as of v0.4.1.
 No open findings remain.
 
 ---
@@ -643,7 +658,9 @@ No open findings remain.
 `src/main.rs`, `src/api/mod.rs`, `src/config/parser.rs`, `src/dns/server.rs`,
 `src/dns/local.rs`, `src/dns/acl.rs`, `src/dns/ratelimit.rs`, `src/dns/xdp/worker.rs`,
 `src/dns/xdp/umem.rs`, `src/feeds/mod.rs`, `src/store.rs`.
-Second audit cycle targeting v0.3.3. Tracking updated through v0.4.0.
+Second audit cycle targeting v0.3.3. Third audit cycle targeting v0.4.0.
 v0.4.0 adds: `src/integrity.rs` (HIGH-06), hickory 0.26 + rustls 0.23 migration (HIGH-07),
 `dot-client-auth-ca` mTLS (HIGH-08), `SsrfSafeDnsResolver` (MED-03),
-`sanitize_dns_name()` (MED-06), local-zone cap (LOW-03).*
+`sanitize_dns_name()` (MED-06), local-zone cap (LOW-03).
+v0.4.1 adds: CryptoProvider install (BUG-01), CNAME/MX/NS/PTR/SRV value validation (S-10),
+Content-Length pre-check (S-11), ApiJson extractor (Q-01–Q-03), QueryRejection handling (Q-04).*

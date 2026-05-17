@@ -53,6 +53,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // rustls 0.23: when multiple crypto backends are compiled in (ring + aws-lc-rs),
+    // ServerConfig::builder() panics unless a default provider is installed first.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok(); // ok() = no-op if already installed
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
