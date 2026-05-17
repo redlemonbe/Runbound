@@ -16,7 +16,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 - **SEC-MED-05 — Global auth-failure counter with automated lockout** (`src/api/mod.rs`)  
   Repeated authentication failures now increment a global `AUTH_FAILURES` AtomicU64 counter.
-  Every 10th failure emits a `WARN`-level log. After 100 consecutive failures a 500 ms delay is
+  Every 10th failure emits a `WARN`-level log. After 50 consecutive failures a 500 ms delay is
   injected before the 401 response, slowing automated guessing without blocking legitimate retries.
   The counter resets on every successful authentication.
 
@@ -26,6 +26,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   On exhaustion, buckets idle for more than 10 s are now aggressively evicted before dropping the
   new IP. Under a real flood (all buckets active) the drop still fires; under a spoofed exhaustion
   attack with stale buckets, legitimate IPs are admitted after eviction.
+
+- **PENTEST-01 — HTTP feed URLs upgraded from warn to hard reject** (`src/feeds/mod.rs`)  
+  SEC-08 (v0.2.0) added a `WARN`-level log for `http://` feed subscriptions but still accepted
+  and fetched them. A pentest confirmed that a man-in-the-middle between Runbound and the feed
+  server could inject arbitrary block-list entries with no cryptographic protection.
+  `validate_feed_url()` now returns `400 Bad Request` for any non-HTTPS URL. HTTP feeds are
+  completely blocked at the API layer; the downstream `reqwest` call is never reached.
+
+- **PENTEST-02 — Feed update did not rebuild zone set; blocked stats undercounted** (`src/api/mod.rs`)  
+  `POST /feeds/update` and `POST /feeds/:id/update` fetched and cached feed data but never
+  called `build_zone_set()`. Feed domains were never added to the active `ArcSwap<LocalZoneSet>`,
+  so they were not resolved as blocked and the `/stats` blocked counter was understated.
+  Both handlers now call `build_zone_set()` and atomically swap the zone pointer after a
+  successful fetch. Feed blocks are effective immediately without a manual `/reload`.
+
+- **PENTEST-03 — CRLF injection in DNS entry text fields** (`src/api/mod.rs`)  
+  DNS record fields that are embedded verbatim into zone-file-style RR strings (`value`,
+  `tag`, `description`, `fingerprint`, `cert_data`, `services`, `regexp`, `replacement`,
+  `flags_naptr`) and the blacklist `description` field accepted arbitrary bytes, including
+  `\r` and `\n`. A crafted entry could inject additional resource records into the in-memory
+  zone when the RR string was parsed downstream.
+  A new `validate_no_control_chars()` helper rejects any byte below `0x20` or equal to
+  `0x7f` (DEL) across all affected fields, returning `400 Bad Request`.
+
+- **PENTEST-04 — TTL exceeding RFC 2181 §8 maximum accepted silently** (`src/api/mod.rs`)  
+  RFC 2181 §8 defines the maximum DNS TTL as 2,147,483,647 (signed 32-bit maximum).
+  `POST /dns` accepted any `u32` TTL (up to ~4.29 billion) and silently capped it at 86,400 s.
+  An out-of-range TTL now returns `400 Bad Request` with `INVALID_TTL` before the entry is
+  validated further, matching RFC-compliant resolver behaviour.
+
+- **PENTEST-05 — version.bind CHAOS query disclosed server identity** (`src/dns/server.rs`)  
+  `dig CHAOS TXT version.bind @<host>` returned identifying information from the underlying
+  hickory-server resolver. CHAOS class (`DNSClass::CH`) is now intercepted at the start of
+  `handle_request()`, before any zone lookup, and answered with REFUSED.
+  The check precedes the existing ANY-query block so it cannot be bypassed by query type.
 
 ### Fixed
 
