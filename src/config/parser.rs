@@ -64,6 +64,8 @@ pub struct UnboundConfig {
     /// Enable DNSSEC validation. Default: false (forwarder mode — trust upstream AD bit).
     /// Set to `yes` for recursive/authoritative deployments with full RRSIG chains.
     pub dnssec_validation: bool,
+    /// Log WARN for every DNSSEC-bogus query when dnssec-validation is enabled.
+    pub dnssec_log_bogus: bool,
 
     // ── Slave/master sync (Runbound extensions) ────────────────────────────
     /// Node role: "master" (default) or "slave".
@@ -220,6 +222,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
             if !cidr.is_empty() { cfg.private_addresses.push(cidr); }
         }
         "dnssec-validation" => cfg.dnssec_validation = val.trim_matches('"') == "yes",
+        "dnssec-log-bogus"  => cfg.dnssec_log_bogus  = val.trim_matches('"') == "yes",
         // Slave/master sync directives
         "mode"          => cfg.mode          = val.trim_matches('"').to_string(),
         "sync-port"     => cfg.sync_port     = val.parse().ok(),

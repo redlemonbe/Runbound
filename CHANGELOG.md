@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
+- **DNSSEC full local validation stats** (`src/stats.rs`, `src/dns/server.rs`, `src/config/parser.rs`, `src/api/mod.rs`)  
+  New config directive `dnssec-log-bogus: yes` (default: no) triggers WARN logs for every bogus query.  
+  The IANA root trust anchor (key tag 20326, algorithm 8, SHA-256) is used by hickory-resolver's
+  built-in chain-of-trust validator when `dnssec-validation: yes`.  
+  Bogus queries (`ProtoErrorKind::RrsigsNotPresent`) return SERVFAIL and increment `dnssec_bogus`.  
+  Secure responses (RRSIG records present) increment `dnssec_secure`; unsigned increments `dnssec_insecure`.  
+  All three counters are `AtomicU64` — zero overhead when DNSSEC validation is disabled.  
+  Exposed in `GET /stats` as `"dnssec": {"secure": N, "bogus": N, "insecure": N}`.
+
 - **Runtime files relative to config directory** (`src/runtime.rs`, `src/main.rs`, `src/store.rs`, `src/feeds/mod.rs`, `src/sync.rs`)  
   All runtime files (`api.key`, `dns_entries.json`, `blacklist.json`, `feeds.json`, `feed_cache/`,
   `sync-cert.pem`, `sync-master.fingerprint`) are now stored in the **same directory as the config file**

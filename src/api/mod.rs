@@ -409,6 +409,11 @@ fn stats_json(snap: &crate::stats::StatsSnapshot) -> serde_json::Value {
         "latency_p99_ms":   snap.latency_p99_ms,
         "cache_hit_rate":   snap.cache_hit_rate,
         "cache_entries":    snap.cache_entries,
+        "dnssec": {
+            "secure":   snap.dnssec_secure,
+            "bogus":    snap.dnssec_bogus,
+            "insecure": snap.dnssec_insecure,
+        },
     })
 }
 
