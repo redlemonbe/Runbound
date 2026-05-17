@@ -9,31 +9,77 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
-- **DNSSEC full local validation stats** (`src/stats.rs`, `src/dns/server.rs`, `src/config/parser.rs`, `src/api/mod.rs`)  
-  New config directive `dnssec-log-bogus: yes` (default: no) triggers WARN logs for every bogus query.  
-  The IANA root trust anchor (key tag 20326, algorithm 8, SHA-256) is used by hickory-resolver's
-  built-in chain-of-trust validator when `dnssec-validation: yes`.  
-  Bogus queries (`ProtoErrorKind::RrsigsNotPresent`) return SERVFAIL and increment `dnssec_bogus`.  
-  Secure responses (RRSIG records present) increment `dnssec_secure`; unsigned increments `dnssec_insecure`.  
-  All three counters are `AtomicU64` — zero overhead when DNSSEC validation is disabled.  
-  Exposed in `GET /stats` as `"dnssec": {"secure": N, "bogus": N, "insecure": N}`.
+- **Immutable HMAC-SHA256 audit log** (`src/audit.rs`, `src/config/parser.rs`, `src/api/mod.rs`, `src/main.rs`)  
+  Every security-relevant API operation is written to an append-only structured log
+  (`audit.log` in the config directory) with a monotonic sequence number and an
+  HMAC-SHA256 chain. Tampering with any line — or deleting lines — breaks the chain
+  and is detectable by replaying `mac = HMAC-SHA256(key, seq || ts || event || fields)`.
 
-- **Runtime files relative to config directory** (`src/runtime.rs`, `src/main.rs`, `src/store.rs`, `src/feeds/mod.rs`, `src/sync.rs`)  
-  All runtime files (`api.key`, `dns_entries.json`, `blacklist.json`, `feeds.json`, `feed_cache/`,
-  `sync-cert.pem`, `sync-master.fingerprint`) are now stored in the **same directory as the config file**
-  rather than hardcoded under `/etc/runbound/`.  
-  Running `runbound /etc/runbound-slave/unbound.conf` writes all slave runtime files to
-  `/etc/runbound-slave/`, enabling master + slave on the same machine without path collisions.  
-  The base directory is derived from `config_path.parent()` at startup, validated (rejects `/` and
-  `/tmp`), logged at INFO (`[INFO] runtime base_dir: /etc/runbound`), and stored in `AppState.base_dir`
-  as well as a process-global `runtime::BASE_DIR` (`OnceLock<PathBuf>`).
+  The log is driven by a dedicated tokio task over an unbounded channel — callers
+  (API handlers) never block on the hot path. The HMAC key is auto-generated on first
+  run (256-bit, chmod 600, `audit-hmac.key`). The monotonic sequence is persisted in
+  `audit-seq.dat` (flushed every 100 events and on clean shutdown) so it survives restarts.
+
+  **Events logged:** `startup`, `shutdown`, `dns_add`, `dns_delete`, `blacklist_add`,
+  `blacklist_delete`, `feed_add`, `feed_delete`, `config_reload`, `auth_failure`.
+
+  **New endpoint:** `GET /audit/tail?n=100` — returns the last N lines (max 1,000) as a
+  JSON array. Useful for SIEM integration.
+
+  **Config directives:**
+  ```
+  audit-log:          yes                      # default: no
+  audit-log-path:     /var/log/runbound/audit.log  # default: <config_dir>/audit.log
+  audit-log-hmac-key: "hex-or-raw-key"         # default: auto-generated
+  ```
+
+- **Automatic Let's Encrypt certificate provisioning via ACME** (`src/acme.rs`, `src/config/parser.rs`, `src/main.rs`)  
+  Runbound can now request, obtain, and renew TLS certificates from Let's Encrypt
+  automatically — no certbot, no manual renewal scripts.
+
+  Uses ACME HTTP-01 challenge: a temporary HTTP listener on port 80 is started only
+  during the challenge phase, then shut down. The cert is written atomically via
+  temp-file → rename. A background task checks every 6 hours and renews when
+  ≤ 30 days remain (Let's Encrypt certs are valid 90 days).
+
+  Transport: `instant-acme 0.8.5` (ring backend) with a custom `reqwest`-based HTTP
+  client, avoiding the `rustls 0.21 / 0.23` version conflict with hickory-server.
+
+  **Config directives:**
+  ```
+  acme-email:          admin@example.com    # Let's Encrypt account contact
+  acme-domain:         dns.example.com      # SANs (repeat for multiple)
+  acme-cache-dir:      /etc/runbound/acme   # account credentials + temp files
+  acme-staging:        no                   # yes = use LE Staging API (testing)
+  acme-challenge-port: 80                   # HTTP-01 challenge port (default: 80)
+  ```
+
+  The cert and key paths come from `tls-service-pem` / `tls-service-key` (or fall back
+  to `cert.pem` / `key.pem` in the config directory). Once obtained, DoT/DoH/DoQ are
+  active with a publicly trusted certificate.
+
+- **DNSSEC full local validation stats** (`src/stats.rs`, `src/dns/server.rs`, `src/api/mod.rs`)  
+  New config directive `dnssec-log-bogus: yes` (default: no) triggers WARN logs for
+  every DNSSEC-bogus query. Bogus queries (`RrsigsNotPresent`) return SERVFAIL and
+  increment `dnssec.bogus`. Secure responses (RRSIG present) increment `dnssec.secure`;
+  unsigned queries increment `dnssec.insecure`. All counters are `AtomicU64`.  
+  Exposed in `GET /stats` as:
+  ```json
+  "dnssec": {"secure": 1204, "bogus": 3, "insecure": 8821}
+  ```
+
+- **Runtime files relative to config directory** (`src/runtime.rs`)  
+  All runtime files (`api.key`, `dns_entries.json`, `blacklist.json`, `feeds.json`,
+  `sync-cert.pem`, `audit.log`, …) are now stored in the **same directory as the config
+  file** — not hardcoded under `/etc/runbound/`. This allows a master and slave to run
+  on the same machine using separate config directories without any path collisions.
 
 ### Fixed
 
 - All pre-existing `cargo clippy -- -D warnings` failures resolved:
   `clippy::upper_case_acronyms` on `DnsType` variants; `trim_split_whitespace`;
-  `is_multiple_of`; redundant `into_iter()` on `IntoIterator` args; `map_err` → `inspect_err`
-  in XDP socket; `last()` on `DoubleEndedIterator`; manual prefix stripping; double-`Ok` + `?`;
+  `is_multiple_of`; redundant `into_iter()`; `map_err` → `inspect_err` in XDP socket;
+  `last()` on `DoubleEndedIterator`; manual prefix stripping; double-`Ok` + `?`;
   `unwrap()` after `is_some()`.
 
 ---
@@ -455,6 +501,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+[0.3.1]: https://github.com/redlemonbe/Runbound/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/redlemonbe/Runbound/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/redlemonbe/Runbound/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/redlemonbe/Runbound/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/redlemonbe/Runbound/compare/v0.2.2...v0.2.3

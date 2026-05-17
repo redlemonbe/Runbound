@@ -395,6 +395,72 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 
 ---
 
+### `GET /audit/tail`
+
+Return the last N entries from the immutable audit log. Requires `audit-log: yes` in
+`runbound.conf`.
+
+```bash
+# Last 50 audit entries (default: 100)
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     "http://localhost:8081/audit/tail?n=50"
+```
+
+```json
+[
+  {
+    "seq":    42,
+    "ts":     1715000123,
+    "event":  "DnsAdd",
+    "fields": {"name": "nas.home.", "rtype": "A", "value": "192.168.1.10", "ttl": 300},
+    "mac":    "a3f1c2d8e5..."
+  },
+  {
+    "seq":    41,
+    "ts":     1715000100,
+    "event":  "AuthFailure",
+    "fields": {"client": "203.0.113.5"},
+    "mac":    "9e2b47f1a8..."
+  }
+]
+```
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `n` | `100` | Number of entries to return (1–1000). |
+
+**Event types:**
+
+| Event | Trigger |
+|---|---|
+| `Startup` | Runbound process started |
+| `Shutdown` | Clean shutdown initiated |
+| `DnsAdd` | `POST /dns` — local DNS record added |
+| `DnsDelete` | `DELETE /dns/:id` — local DNS record removed |
+| `FeedAdd` | `POST /feeds` — feed subscription added |
+| `FeedDelete` | `DELETE /feeds/:id` — feed removed |
+| `BlacklistAdd` | `POST /blacklist` — entry added |
+| `BlacklistDelete` | `DELETE /blacklist/:id` — entry removed |
+| `AuthFailure` | Request with missing or invalid Bearer token |
+| `ConfigReload` | `POST /reload` or SIGHUP |
+
+**MAC verification:**
+
+The `mac` field is HMAC-SHA256 over `seq(8 LE) ‖ ts(8 LE) ‖ event ‖ fields_json`.
+Verify it with the same key used in `audit-log-hmac-key` (or `RUNBOUND_AUDIT_HMAC_KEY`).
+Any gap in `seq` or MAC mismatch indicates a tampered or missing entry.
+
+**Errors:**
+
+| Code | Meaning |
+|---|---|
+| `404` | Audit log not enabled or log file not found |
+| `500` | Log file could not be read |
+
+---
+
 ### `GET /config`
 
 Dump active configuration (sanitised — API key is omitted).

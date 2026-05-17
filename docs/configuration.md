@@ -146,6 +146,116 @@ complete RRSIG/DNSKEY chains. In forwarder mode (the typical setup with Cloudfla
 Quad9), enabling this causes SERVFAIL on every signed domain because forwarders strip
 DNSSEC records. Default is `no` — trust the upstream AD bit.
 
+```
+dnssec-log-bogus: yes   # log DNSSEC validation failures (default: no)
+```
+
+When enabled, every DNSSEC validation failure emits a `WARN` log line with the query
+name, record type, and reason (`bogus`). Useful for diagnosing misconfigured zones
+without enabling full `verbosity: 2` noise.
+
+### ACME / Let's Encrypt (automatic TLS)
+
+Runbound can provision and renew a TLS certificate automatically from Let's Encrypt
+using the ACME HTTP-01 challenge. Port 80 must be reachable from the internet.
+
+```
+server:
+    acme-email:          admin@example.com    # required — contact email for Let's Encrypt
+    acme-domain:         dns.example.com      # domain to certify (repeat for SANs)
+    acme-domain:         alt.example.com
+    acme-cache-dir:      /etc/runbound/acme   # stores account.json + cert files
+    acme-staging:        no                   # yes → use Let's Encrypt staging CA (testing)
+    acme-challenge-port: 80                   # port for HTTP-01 validation (default: 80)
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `acme-email` | string | — | ACME contact email. Required to enable auto-TLS. |
+| `acme-domain` | string | — | Domain name to include in the certificate. Repeat for multiple SANs. |
+| `acme-cache-dir` | path | `/etc/runbound/acme` | Directory for ACME account credentials and certificate files. |
+| `acme-staging` | bool | `no` | Use Let's Encrypt staging CA. Enable for testing — staging certs are not trusted by browsers. |
+| `acme-challenge-port` | int | `80` | Port that the built-in HTTP-01 challenge server binds to. Port 80 must be publicly accessible. |
+
+**How it works:**
+
+1. On startup Runbound checks whether the certificate is missing or older than 60 days.
+2. If renewal is needed, a temporary HTTP server binds on `acme-challenge-port` to answer
+   Let's Encrypt's HTTP-01 challenge.
+3. The issued certificate is written atomically to `acme-cache-dir/cert.pem` and
+   `acme-cache-dir/key.pem` — then used as `tls-service-pem` / `tls-service-key`.
+4. A background task checks every 6 hours and renews at least 30 days before expiry.
+5. After renewal, restart Runbound to load the new certificate (or configure your process
+   supervisor to watch the cert file and SIGHUP on change).
+
+**Quick setup:**
+
+```
+server:
+    acme-email:  admin@example.com
+    acme-domain: dns.example.com
+
+    # These are auto-populated from acme-cache-dir after first issuance:
+    tls-service-pem: /etc/runbound/acme/cert.pem
+    tls-service-key: /etc/runbound/acme/key.pem
+```
+
+See [tls.md](tls.md) for the full TLS setup options including self-signed and
+bring-your-own certificate.
+
+### Audit log
+
+Runbound can write a tamper-evident audit log recording all zone changes, feed
+operations, authentication failures, and configuration reloads.
+
+```
+server:
+    audit-log:          yes
+    audit-log-path:     /var/log/runbound/audit.log
+    audit-log-hmac-key: "your-hex-encoded-key"   # see note below
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `audit-log` | bool | `no` | Enable the audit log. |
+| `audit-log-path` | path | `/var/log/runbound/audit.log` | Where to write audit events. Parent directory must exist. |
+| `audit-log-hmac-key` | string | auto-generated | HMAC-SHA256 key (hex). If omitted, a random key is generated at startup and printed to the log. |
+
+**Log format** — one JSON object per line:
+
+```json
+{"seq":1,"ts":1715000000,"event":"DnsAdd","fields":{"name":"nas.home.","rtype":"A","value":"192.168.1.10"},"mac":"a3f1..."}
+```
+
+| Field | Description |
+|---|---|
+| `seq` | Monotonic sequence number. Gaps indicate tampered or missing entries. |
+| `ts` | Unix timestamp (seconds). |
+| `event` | Event type: `Startup`, `Shutdown`, `DnsAdd`, `DnsDelete`, `FeedAdd`, `FeedDelete`, `BlacklistAdd`, `BlacklistDelete`, `AuthFailure`, `ConfigReload`. |
+| `fields` | Event-specific payload. |
+| `mac` | HMAC-SHA256 over `seq ‖ ts ‖ event ‖ fields_json`. |
+
+**Key management:**
+
+```bash
+# Generate a key:
+openssl rand -hex 32
+
+# Preferred — pass via environment variable to avoid storing in config:
+export RUNBOUND_AUDIT_HMAC_KEY="$(openssl rand -hex 32)"
+```
+
+Setting `audit-log-hmac-key` in plain text emits a `WARN` at startup reminding you
+to prefer the environment variable. When the env var is set it overrides the config value.
+
+**Read the last N entries via the API:**
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" http://localhost:8081/audit/tail?n=50
+```
+
+See [api.md](api.md) for the full `/audit/tail` endpoint documentation.
+
 ### Anti-OOM memory guard
 
 Runbound runs two automatic memory-pressure defences — both are always active, no
@@ -299,6 +409,14 @@ server:
     logfile:   ""
     verbosity: 1
 
+    dnssec-log-bogus: yes
+
+    audit-log:      yes
+    audit-log-path: /var/log/runbound/audit.log
+
+    acme-email:  admin@example.com
+    acme-domain: dns.example.com
+
 forward-zone:
     name:                 "."
     forward-addr:         1.1.1.1@853
@@ -397,4 +515,5 @@ The sync port number is configurable. The REST API stays on localhost on all nod
 | Variable | Description |
 |---|---|
 | `RUNBOUND_API_KEY` | REST API Bearer token. Overrides `api-key` in config. |
+| `RUNBOUND_AUDIT_HMAC_KEY` | HMAC key for the audit log. Overrides `audit-log-hmac-key` in config. |
 | `RUST_LOG` | Log filter (e.g. `runbound=debug,info`). |

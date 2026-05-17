@@ -99,6 +99,47 @@ openssl x509 -req -in /etc/runbound/server.csr \
 
 ---
 
+## Option D — Built-in ACME (automatic, zero-maintenance)
+
+Runbound can provision and renew its own Let's Encrypt certificate with no external
+tools. Port 80 must be publicly reachable and the domain must point to this server.
+
+```
+server:
+    acme-email:  admin@example.com
+    acme-domain: dns.example.com
+
+    # Point TLS to the auto-managed files:
+    tls-service-pem: /etc/runbound/acme/cert.pem
+    tls-service-key: /etc/runbound/acme/key.pem
+```
+
+Runbound handles the full ACME HTTP-01 flow at startup and checks for renewal every
+6 hours (renews when ≤ 30 days remain). After renewal, restart Runbound to load the
+new certificate.
+
+**Automatic restart on renewal** (systemd):
+
+```ini
+# /etc/systemd/system/runbound.service
+[Service]
+...
+ExecStartPost=/bin/sh -c 'while inotifywait -e close_write /etc/runbound/acme/cert.pem 2>/dev/null; do systemctl reload-or-restart runbound; done &'
+```
+
+Or use a dedicated deploy hook:
+
+```bash
+# /etc/runbound/renew-hook.sh — called by Runbound after each renewal
+#!/bin/sh
+systemctl restart runbound
+```
+
+See [configuration.md](configuration.md#acme--lets-encrypt-automatic-tls) for the full
+list of `acme-*` directives.
+
+---
+
 ## Verify DoT is working
 
 ```bash
