@@ -1,0 +1,112 @@
+# cargo-deny configuration for Runbound
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Run:  cargo deny check
+# CI:   make deny
+
+# ── Vulnerability advisories ──────────────────────────────────────────────────
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# Scope of each check: "all" = workspace + transitive deps.
+# Vulnerabilities (RUSTSEC CVEs) are always denied — no toggle needed.
+unmaintained = "all"   # check all deps for unmaintained status
+unsound      = "all"   # deny soundness issues (unsafe misuse, UB)
+yanked       = "deny"  # deny yanked crate versions
+
+# Acknowledged advisories — add with a mandatory justification comment.
+ignore = [
+    # rustls-pemfile 2.x is a thin wrapper around rustls-pki-types (same code).
+    # No vulnerability — purely a maintenance notice. Planned migration in the
+    # next Cargo update cycle once rustls-pki-types ≥ 1.9 is the stable API.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.x is a thin wrapper around rustls-pki-types; no vulnerability, migration planned at next rustls update" },
+]
+
+# ── Licence policy ────────────────────────────────────────────────────────────
+
+[licenses]
+version = 2
+
+# Permissive FOSS licences accepted by Runbound's AGPL-3.0 dual-licence model.
+# Any crate with a licence NOT in this list will cause `cargo deny check` to fail.
+#
+# Blocked by omission (not listed = denied):
+#   GPL-2.0, LGPL-2.x/3.x without linking exception — incompatible with static
+#   linking and with Runbound's AGPL-3.0 / commercial dual-licence.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",   # Cranelift / wasm toolchain deps
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",                       # icu4x crates (IDNA/Unicode via hickory)
+    "CDLA-Permissive-2.0",               # webpki-roots (CA certificate bundle data)
+]
+
+# Confidence threshold: below this SPDX-match confidence level, cargo-deny
+# flags the crate for manual review rather than auto-approving.
+confidence-threshold = 0.8
+
+# Per-crate exceptions for packages whose licence is correct but outside the
+# standard allow list above.
+[[licenses.exceptions]]
+# Runbound itself is AGPL-3.0-or-later. cargo-deny checks the workspace root
+# crate against its own policy; this exception acknowledges it explicitly.
+name    = "runbound"
+version = "*"
+allow   = ["AGPL-3.0-or-later"]
+
+# ── Crate bans ────────────────────────────────────────────────────────────────
+
+[bans]
+# Warn when the same crate appears in multiple major versions. This inflates
+# the binary and can hide version-skew bugs in security-sensitive crates.
+# Set to "deny" once the hickory/axum/hyper ecosystem fully converges.
+multiple-versions = "warn"
+
+# Wildcard version requirements (e.g. "*") are banned — they break
+# reproducible builds and bypass security-patch pinning.
+wildcards = "deny"
+
+# Crates that must never appear anywhere in the dependency tree.
+deny = []
+
+# Known unavoidable version duplicates (transitive from hickory/quinn/rand).
+# Each skip entry silences the multiple-versions warning for that crate.
+skip = [
+    # Transitive duplicates from the hickory 0.26 / quinn 0.11 / rand 0.10 ecosystem.
+    # These will resolve once upstream crates converge on the same rand/crypto versions.
+    { name = "getrandom" },         # rand 0.9 + rand 0.10 pull different minor versions
+    { name = "rand" },              # quinn 0.11 (rand 0.9) vs hickory (rand 0.10)
+    { name = "rand_core" },         # follows rand duplication
+    { name = "r-efi" },             # platform dep pulled by two getrandom versions
+    { name = "rcgen" },             # instant-acme uses rcgen 0.14, runbound uses 0.13
+    { name = "cpufeatures" },       # sha2 (0.2.x) vs chacha20 via rand (0.3.x)
+    { name = "hashbrown" },         # dashmap 6 (0.14) vs indexmap 2 (0.17)
+    { name = "windows-sys" },       # windows platform crates span multiple majors
+    { name = "windows-targets" },
+    { name = "windows_aarch64_gnullvm" },
+    { name = "windows_aarch64_msvc" },
+    { name = "windows_i686_gnu" },
+    { name = "windows_i686_gnullvm" },
+    { name = "windows_i686_msvc" },
+    { name = "windows_x86_64_gnu" },
+    { name = "windows_x86_64_gnullvm" },
+    { name = "windows_x86_64_msvc" },
+    { name = "wit-bindgen" },       # wasmtime pulls two majors transitively
+    { name = "yasna" },             # rcgen 0.13 vs 0.14 pull different yasna versions
+]
+
+# ── Source policy ─────────────────────────────────────────────────────────────
+
+[sources]
+# Only allow crates published to crates.io. Git sources and local path
+# dependencies bypass the public audit trail and reproducibility guarantees.
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

@@ -347,6 +347,38 @@ See [security-audit.md](security-audit.md) for the full white-box audit report.
 
 ---
 
+## Supply chain & audit
+
+Runbound enforces supply-chain security at three levels:
+
+**1. CVE scanning (`cargo audit`)**  
+Every dependency is checked against the [RustSec advisory database](https://rustsec.org/)
+at each release. The gate is `--deny warnings`: any known vulnerability blocks the
+release, with no exceptions.
+
+**2. Licence and ban policy (`cargo deny`)**  
+`deny.toml` enforces the licence whitelist (MIT / Apache-2.0 / BSD / ISC / Zlib)
+and blocks GPL-2.0 and LGPL-without-exception, which are incompatible with
+Runbound's AGPL-3.0 / commercial dual-licence model and with Rust static linking.
+Wildcard version requirements are banned; only crates.io sources are allowed.
+
+**3. SBOM (Software Bill of Materials)**  
+A `sbom.cdx.json` file (CycloneDX 1.4 format) listing all transitive dependencies
+with version, hash, and licence is attached to every GitHub release. Enterprise
+customers and security auditors can use it to verify the full dependency tree
+without rebuilding.
+
+```bash
+make audit       # cargo audit --deny warnings
+make deny        # cargo deny check (licence + advisory + ban policy)
+make sbom        # generate sbom.cdx.json
+make audit-full  # all three + cargo outdated
+```
+
+→ Full audit process, release procedure, and manual review areas: [docs/audit.md](audit.md)
+
+---
+
 ## Reporting a vulnerability
 
 Send a report to **redlemonbe@codix.be** with subject line `[SECURITY] Runbound`.
