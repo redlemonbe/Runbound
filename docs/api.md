@@ -237,6 +237,18 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/stats
 }
 ```
 
+**Counter semantics:**
+
+| Field | What it counts |
+|---|---|
+| `blocked` | Queries answered with **REFUSED** — domains blocked via blacklist or feeds with `action: refuse` |
+| `nxdomain` | Queries answered with **NXDOMAIN** — domains blocked with `action: nxdomain` |
+| `forwarded` | Queries forwarded to an upstream resolver (recursive lookup) |
+| `servfail` | Upstream returned SERVFAIL, or DNSSEC validation failed |
+| `blocked_percent` | `(blocked + nxdomain) / total × 100` — total blocking rate regardless of action |
+
+**Total blocked = `blocked` + `nxdomain`.** The split exists because `refuse` and `nxdomain` are distinct DNS responses: `REFUSED` tells the client the server declines to answer; `NXDOMAIN` tells the client the domain does not exist. Some clients and resolvers handle these differently. Use `blocked_percent` or sum both fields for an aggregate blocking rate.
+
 ---
 
 ### `GET /config`
