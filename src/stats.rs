@@ -60,6 +60,14 @@ pub struct Stats {
     pub cache_entries: AtomicU64,
     // local_hits: queries answered from local zone data (config + API dns_entries)
     pub local_hits:    AtomicU64,
+
+    // DNSSEC counters — only incremented when dnssec-validation is enabled.
+    // secure:   resolved with valid DNSSEC signature chain (RRSIG present)
+    // bogus:    DNSSEC validation failed (ProtoErrorKind::RrsigsNotPresent)
+    // insecure: resolved OK but unsigned (no RRSIG — delegation proven unsigned by parent)
+    pub dnssec_secure:   AtomicU64,
+    pub dnssec_bogus:    AtomicU64,
+    pub dnssec_insecure: AtomicU64,
 }
 
 impl Stats {
@@ -80,16 +88,22 @@ impl Stats {
             cache_misses:  AtomicU64::new(0),
             cache_entries: AtomicU64::new(0),
             local_hits:    AtomicU64::new(0),
+            dnssec_secure:   AtomicU64::new(0),
+            dnssec_bogus:    AtomicU64::new(0),
+            dnssec_insecure: AtomicU64::new(0),
         })
     }
 
-    #[inline] pub fn inc_total(&self)      { self.total.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_blocked(&self)    { self.blocked.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_forwarded(&self)  { self.forwarded.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_nxdomain(&self)   { self.nxdomain.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_refused(&self)    { self.refused.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_servfail(&self)   { self.servfail.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_local_hits(&self) { self.local_hits.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_total(&self)           { self.total.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_blocked(&self)         { self.blocked.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_forwarded(&self)       { self.forwarded.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_nxdomain(&self)        { self.nxdomain.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_refused(&self)         { self.refused.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_servfail(&self)        { self.servfail.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_local_hits(&self)      { self.local_hits.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_dnssec_secure(&self)   { self.dnssec_secure.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_dnssec_bogus(&self)    { self.dnssec_bogus.fetch_add(1, Ordering::Relaxed); }
+    #[inline] pub fn inc_dnssec_insecure(&self) { self.dnssec_insecure.fetch_add(1, Ordering::Relaxed); }
 
     /// Record query latency — zero allocation, single atomic increment.
     /// Finds the histogram bucket via binary search on the 9 thresholds.
@@ -203,6 +217,9 @@ impl Stats {
             cache_hit_rate,
             cache_entries:   self.cache_entries.load(Ordering::Relaxed),
             local_hits:      self.local_hits.load(Ordering::Relaxed),
+            dnssec_secure:   self.dnssec_secure.load(Ordering::Relaxed),
+            dnssec_bogus:    self.dnssec_bogus.load(Ordering::Relaxed),
+            dnssec_insecure: self.dnssec_insecure.load(Ordering::Relaxed),
         }
     }
 }
@@ -224,6 +241,9 @@ pub struct StatsSnapshot {
     pub cache_hit_rate: f64,
     pub cache_entries:  u64,
     pub local_hits:     u64,
+    pub dnssec_secure:   u64,
+    pub dnssec_bogus:    u64,
+    pub dnssec_insecure: u64,
 }
 
 // ── QPS background task ────────────────────────────────────────────────────

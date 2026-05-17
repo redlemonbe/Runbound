@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use hickory_proto::op::{Header, ResponseCode};
 use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
+use hickory_proto::error::ProtoErrorKind;
 use hickory_resolver::{
     config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     error::ResolveErrorKind,
@@ -53,33 +54,39 @@ const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 // ============================================================
 
 pub struct RunboundHandler {
-    pub zones:      Arc<ArcSwap<LocalZoneSet>>,
-    resolver:       Arc<ArcSwap<TokioAsyncResolver>>,
-    rate_limiter:   Arc<RateLimiter>,
-    inflight:       Arc<Semaphore>,
-    acl:            Arc<Acl>,
-    private_addrs:  Arc<PrivateAddressSet>,
-    cache_max_ttl:  u32,
-    pub stats:      Arc<Stats>,
-    pub log_buffer: SharedLogBuffer,
+    pub zones:        Arc<ArcSwap<LocalZoneSet>>,
+    resolver:         Arc<ArcSwap<TokioAsyncResolver>>,
+    rate_limiter:     Arc<RateLimiter>,
+    inflight:         Arc<Semaphore>,
+    acl:              Arc<Acl>,
+    private_addrs:    Arc<PrivateAddressSet>,
+    cache_max_ttl:    u32,
+    pub stats:        Arc<Stats>,
+    pub log_buffer:   SharedLogBuffer,
+    /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
+    dnssec_enabled:   bool,
+    dnssec_log_bogus: bool,
 }
 
 impl RunboundHandler {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        zones:         Arc<ArcSwap<LocalZoneSet>>,
-        resolver:      Arc<ArcSwap<TokioAsyncResolver>>,
-        rate_limiter:  Arc<RateLimiter>,
-        acl:           Arc<Acl>,
-        private_addrs: Arc<PrivateAddressSet>,
-        cache_max_ttl: u32,
-        stats:         Arc<Stats>,
-        log_buffer:    SharedLogBuffer,
+        zones:            Arc<ArcSwap<LocalZoneSet>>,
+        resolver:         Arc<ArcSwap<TokioAsyncResolver>>,
+        rate_limiter:     Arc<RateLimiter>,
+        acl:              Arc<Acl>,
+        private_addrs:    Arc<PrivateAddressSet>,
+        cache_max_ttl:    u32,
+        stats:            Arc<Stats>,
+        log_buffer:       SharedLogBuffer,
+        dnssec_enabled:   bool,
+        dnssec_log_bogus: bool,
     ) -> Self {
         Self {
             zones, resolver, rate_limiter,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             acl, private_addrs, cache_max_ttl, stats, log_buffer,
+            dnssec_enabled, dnssec_log_bogus,
         }
     }
 
@@ -318,6 +325,18 @@ impl RequestHandler for RunboundHandler {
                 self.stats.inc_forwarded();
                 let fwd_us = start.elapsed().as_micros() as u64;
                 self.stats.record_forward(fwd_us);
+                // DNSSEC: classify Secure vs Insecure when validation is enabled.
+                // RRSIG records in the answer indicate the response is signed (Secure).
+                // No RRSIG = delegation proved unsigned by parent NSEC/NSEC3 (Insecure).
+                if self.dnssec_enabled {
+                    let has_rrsig = records.iter()
+                        .any(|r| r.record_type() == RecordType::RRSIG);
+                    if has_rrsig {
+                        self.stats.inc_dnssec_secure();
+                    } else {
+                        self.stats.inc_dnssec_insecure();
+                    }
+                }
                 let fwd_action = if fwd_us < CACHE_HIT_THRESHOLD_US {
                     LogAction::Cached
                 } else {
@@ -328,13 +347,28 @@ impl RequestHandler for RunboundHandler {
                     .unwrap_or_else(|e| { error!("send: {e}"); header.into() })
             }
             Err(e) => {
+                // Detect DNSSEC bogus: ProtoErrorKind::RrsigsNotPresent means hickory
+                // found no RRSIG for a domain it expected to be signed → bogus signature chain.
+                let is_dnssec_bogus = self.dnssec_enabled
+                    && matches!(e.kind(), ResolveErrorKind::Proto(pe)
+                        if matches!(pe.kind(), ProtoErrorKind::RrsigsNotPresent { .. }));
+
+                if is_dnssec_bogus {
+                    self.stats.inc_dnssec_bogus();
+                    if self.dnssec_log_bogus {
+                        warn!(%qname, "DNSSEC bogus — SERVFAIL (missing/invalid RRSIG)");
+                    }
+                }
+
                 let rcode = match e.kind() {
                     ResolveErrorKind::NoRecordsFound { response_code, .. } => {
                         debug!(%qname, ?response_code, "no records from resolver");
                         *response_code
                     }
                     _ => {
-                        warn!(%qname, err=%e, "resolver error → SERVFAIL");
+                        if !is_dnssec_bogus {
+                            warn!(%qname, err=%e, "resolver error → SERVFAIL");
+                        }
                         ResponseCode::ServFail
                     }
                 };
@@ -653,6 +687,7 @@ pub async fn run_dns_server(
 
     let handler = RunboundHandler::new(
         Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl, stats, log_buffer,
+        cfg.dnssec_validation, cfg.dnssec_log_bogus,
     );
     let mut server = ServerFuture::new(handler);
 
