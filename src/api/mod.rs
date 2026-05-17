@@ -32,6 +32,7 @@ use crate::logbuffer::{LogAction, LogQuery, SharedLogBuffer};
 use crate::store::{self, DnsEntry, DnsType, BlacklistEntry};
 use crate::config::parser::{TlsConfig, UnboundConfig};
 use crate::stats::Stats;
+use crate::audit::{AuditEvent, AuditLogger};
 use crate::sync::{SyncJournal, SyncOp};
 use crate::upstreams::SharedUpstreams;
 
@@ -136,9 +137,9 @@ pub struct AppState {
     /// True when running as slave — all write operations are blocked (503).
     pub slave_mode:   bool,
     /// Directory where runtime files (api.key, dns_entries.json, …) are stored.
-    /// Exposed for handlers in future features; suppress dead_code lint.
-    #[allow(dead_code)]
     pub base_dir:     Arc<PathBuf>,
+    /// Immutable audit log sender. No-op when audit is disabled.
+    pub audit:        AuditLogger,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -235,6 +236,7 @@ async fn security_middleware(
             // Increment global auth-failure counter (localhost-only API,
             // so per-IP tracking adds nothing; we track globally).
             let failures = AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            state.audit.send(AuditEvent::AuthFailure { path: path.to_string() });
             if failures.is_multiple_of(10) {
                 warn!(failures, %path, "Repeated API authentication failures — check RUNBOUND_API_KEY");
             }
@@ -330,6 +332,7 @@ pub fn router(state: AppState) -> Router {
         // Monitoring
         .route("/upstreams",         get(upstreams_handler))
         .route("/logs",              get(logs_handler))
+        .route("/audit/tail",        get(audit_tail_handler))
         .layer(middleware::from_fn_with_state(state.clone(), slave_guard_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), security_middleware))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_BYTES))
@@ -472,6 +475,7 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
             let new_zones = crate::build_zone_set(&new_cfg);
             s.zones.store(std::sync::Arc::new(new_zones));
             info!(cfg_path = %s.cfg_path, "API hot-reload complete");
+            s.audit.send(AuditEvent::ConfigReload);
             (StatusCode::OK, JsonExtract(serde_json::json!({
                 "status":      "ok",
                 "cfg_path":    s.cfg_path,
@@ -616,6 +620,11 @@ async fn add_dns_handler(
     }
 
     info!(id=%entry.id, name=%entry.name, r#type=?entry.entry_type, "DNS entry added");
+    s.audit.send(AuditEvent::DnsAdd {
+        name:  entry.name.clone(),
+        rtype: format!("{:?}", entry.entry_type),
+        value: entry.value.clone().unwrap_or_default(),
+    });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::AddDns { entry: entry.clone() });
     }
@@ -677,6 +686,7 @@ async fn delete_dns_handler(
     }
 
     info!(id=%id, "DNS entry deleted");
+    s.audit.send(AuditEvent::DnsDelete { id: id.clone() });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::DeleteDns { id: id.clone() });
     }
@@ -749,6 +759,7 @@ async fn add_blacklist_handler(
     };
 
     info!(domain=%req.domain, action=?req.action, "Blacklist entry added");
+    s.audit.send(AuditEvent::BlacklistAdd { domain: entry.domain.clone() });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::AddBlacklist { entry: entry.clone() });
     }
@@ -783,6 +794,7 @@ async fn delete_blacklist_handler(
     s.zones.store(Arc::new(new_zones));
 
     info!(id=%id, domain=%removed.domain, "Blacklist entry deleted");
+    s.audit.send(AuditEvent::BlacklistDelete { id: id.clone() });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::DeleteBlacklist { id: id.clone() });
     }
@@ -811,6 +823,11 @@ async fn add_feed_handler(
     match add_feed(p.name, p.url, p.format, p.action, p.description).await {
         Ok(feed) => {
             info!("Feed added: {} ({})", feed.name, feed.url);
+            s.audit.send(AuditEvent::FeedAdd {
+                id:   feed.id.clone(),
+                name: feed.name.clone(),
+                url:  feed.url.clone(),
+            });
             if let Some(ref j) = s.sync_journal {
                 j.push(SyncOp::AddFeed { feed: feed.clone() });
             }
@@ -834,6 +851,7 @@ async fn delete_feed_handler(
 ) -> impl IntoResponse {
     match remove_feed(&id) {
         Ok(()) => {
+            s.audit.send(AuditEvent::FeedDelete { id: id.clone() });
             if let Some(ref j) = s.sync_journal {
                 j.push(SyncOp::DeleteFeed { id: id.clone() });
             }
@@ -1001,6 +1019,29 @@ async fn tls_status_handler(State(s): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+// ── GET /audit/tail ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AuditTailQuery { n: Option<usize> }
+
+async fn audit_tail_handler(
+    State(s): State<AppState>,
+    Query(q): Query<AuditTailQuery>,
+) -> impl IntoResponse {
+    let n = q.n.unwrap_or(100).min(1000);
+    let log_path = s.base_dir.join("audit.log");
+    match crate::audit::tail_audit_log(&log_path, n) {
+        Ok(lines) => (StatusCode::OK, JsonExtract(serde_json::json!({
+            "lines": lines,
+            "count": lines.len(),
+        }))),
+        Err(e) => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
+            "error": "AUDIT_LOG_UNAVAILABLE",
+            "details": e,
+        }))),
+    }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn ensure_dot(name: &str) -> String {
@@ -1085,6 +1126,7 @@ mod tests {
             sync_journal: None,
             slave_mode:   false,
             base_dir:     Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
+            audit:        crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
         };
         router(state)
     }
