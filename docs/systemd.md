@@ -117,12 +117,17 @@ curl -X POST http://localhost:8081/reload \
 | `tls-service-pem` / `tls-service-key` | ❌ | Restart required |
 | `api-port` / `api-key` | ❌ | Restart required |
 
-**Tip:** To force a feed refresh AND reload in one shot:
+**Tip:** To force an immediate feed refresh:
 
 ```bash
-# Refresh all feeds first, then reload zones
+# Feed domains are active immediately after this call — no reload needed
 curl -X POST http://localhost:8081/feeds/update \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
+```
+
+If you also edited `runbound.conf` at the same time, follow up with a reload:
+
+```bash
 systemctl reload runbound
 ```
 

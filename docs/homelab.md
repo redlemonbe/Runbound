@@ -299,11 +299,12 @@ sudo iptables -A INPUT -p tcp --dport 53 -s 192.168.1.0/24 -j ACCEPT
 ### A specific domain is blocked unexpectedly
 
 ```bash
-# Check if it's in the blacklist
-curl -s "$API/blacklist" -H "Authorization: Bearer $TOKEN" | grep example.com
+# Check if it's in the blacklist — note the UUID in the "id" field
+curl -s "$API/blacklist" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool | grep -A2 example.com
 
-# Remove it
-curl -s -X DELETE "$API/blacklist/example.com" -H "Authorization: Bearer $TOKEN"
+# Remove it by UUID (the "id" field from GET /blacklist)
+ID="<uuid-from-above>"
+curl -s -X DELETE "$API/blacklist/$ID" -H "Authorization: Bearer $TOKEN"
 ```
 
 ### View live DNS queries

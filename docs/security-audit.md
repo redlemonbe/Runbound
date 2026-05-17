@@ -194,9 +194,9 @@ and storage. The server's OOM guard triggers but may not recover.
 ### AUDIT-HIGH-02 — `/help` endpoint information disclosure (unauthenticated)
 
 **File:** `src/api/mod.rs:268`  
-**Status:** INFO / operator decision
+**Status:** Fixed in v0.2.5 — `/help` now requires Bearer authentication
 
-`GET /help` requires no authentication and returns:
+`GET /help` previously required no authentication and returned:
 - Exact version string (`"version": "0.2.3"`)
 - Complete endpoint list
 - RFC compliance claims
@@ -457,15 +457,16 @@ maintenance risk is elevated. Use `std::time::SystemTime` formatted via
 
 ### AUDIT-LOW-02 — `GET /help` exposes author identity and repository URL
 
-**File:** `src/api/mod.rs:270`
+**File:** `src/api/mod.rs:270`  
+**Status:** Fixed in v0.2.5 — `/help` now requires Bearer authentication
 
 ```rust
 "author": env!("CARGO_PKG_AUTHORS"),
 "repository": env!("CARGO_PKG_REPOSITORY"),
 ```
 
-Reveals personal identity and repository URL from an unauthenticated endpoint.
-For air-gapped or classified deployments, remove or redact.
+Previously revealed personal identity and repository URL from an unauthenticated endpoint.
+The endpoint is now behind auth — unauthenticated callers receive 401.
 
 ---
 
@@ -483,7 +484,8 @@ parse time would prevent accidental misconfiguration.
 
 ### AUDIT-LOW-04 — TCP idle timeout (5 s) is too short for high-latency DoT
 
-**File:** `src/dns/server.rs:631`
+**File:** `src/dns/server.rs:631`  
+**Status:** Fixed in v0.2.5 — timeout raised to 30 s
 
 ```rust
 server.register_listener(tcp, Duration::from_secs(5));
@@ -491,7 +493,7 @@ server.register_listener(tcp, Duration::from_secs(5));
 
 DoT clients on high-latency links (satellite, intercontinental) may exceed 5 seconds
 between queries on the same connection, causing premature disconnection and
-re-handshake overhead. RFC 7858 §3.5 recommends >= 10 s. Consider 30 s.
+re-handshake overhead. RFC 7858 §3.5 recommends >= 10 s. All TCP listeners now use 30 s.
 
 ---
 
@@ -552,9 +554,9 @@ This design is sound. There is no data exfiltration risk from the XDP path.
 | MED-06 | MEDIUM | Logging | Open — verify tracing JSON escaping |
 | MED-07 | MEDIUM | Config | Mitigated in v0.2.4 (WARN log) |
 | LOW-01 | LOW | Feeds | Fixed in v0.2.5 — replaced with humantime::format_rfc3339 |
-| LOW-02 | LOW | API | Open — operator decision |
+| LOW-02 | LOW | API | Fixed in v0.2.5 — /help now requires Bearer token |
 | LOW-03 | LOW | Config | Open |
-| LOW-04 | LOW | DNS/TLS | Open |
+| LOW-04 | LOW | DNS/TLS | Fixed in v0.2.5 — TCP timeout raised to 30 s |
 
 ---
 
@@ -564,23 +566,23 @@ This design is sound. There is no data exfiltration risk from the XDP path.
 
 1. **Configure explicit `forward-zone:` blocks** — never rely on the Cloudflare fallback.
 2. **Enable `forward-tls-upstream: yes`** — plain UDP to upstream is observable.
-3. **Remove or authenticate `/help`** — prevents version fingerprinting.
+3. ✅ **Authenticate `/help`** — done in v0.2.5 (Bearer token required).
 4. **Mount data directory on integrity-protected storage** — dm-verity or ZFS.
 5. **Route Runbound through a DNSSEC-validating resolver** as upstream.
 
 ### Short-term (next release cycle)
 
-6. Implement `GET /health`, `GET /stats`, `POST /reload` (operational necessity).
+6. ✅ `GET /health`, `GET /stats`, `GET /config`, `POST /reload` implemented in v0.2.5.
 7. Upgrade to rustls 0.23; pin TLS 1.3 + approved cipher suites.
 8. Implement mTLS for DoT (client certificate required).
-9. Add per-IP authentication failure counter.
+9. ✅ Auth failure counter + lockout implemented in v0.2.5 (AUTH_FAILURES, 500 ms delay).
 
 ### Medium-term
 
-10. Add `dnssec-validation: yes` config directive.
+10. ✅ `dnssec-validation` config directive added in v0.2.5.
 11. Implement HMAC integrity on JSON data stores.
 12. Add per-operator API keys with audit log.
-13. Replace `utc_now_rfc3339()` with `humantime` formatting.
+13. ✅ `utc_now_rfc3339()` replaced with `humantime::format_rfc3339` in v0.2.5.
 
 ---
 

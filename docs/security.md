@@ -105,8 +105,9 @@ overwrite each other.
 just at subscription time. A compromised feed record cannot redirect to a private
 address after being subscribed.
 
-**HTTP warning (SEC-08):** HTTP feed URLs trigger a `WARN` log entry. Use HTTPS feeds
-to prevent man-in-the-middle injection of malicious block-list data.
+**HTTPS enforcement (v0.2.5):** HTTP feed URLs are **rejected with 400 Bad Request** —
+only `https://` URLs are accepted. This prevents man-in-the-middle injection of malicious
+block-list data at the API layer before any network connection is made.
 
 **File permissions (SEC-07):** Serialised feed files are written with `chmod 640` —
 owner and group readable only.

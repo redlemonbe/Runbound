@@ -19,7 +19,7 @@
 
 | Component | Value |
 |---|---|
-| CPU | 32 vCPUs (KVM), x86_64 |
+| CPU | 4 vCPUs (KVM), x86_64 |
 | RAM | 8 GB |
 | OS | Linux 6.x (Debian 13) |
 | Network | loopback (`127.0.0.x`) |

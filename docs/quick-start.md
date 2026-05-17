@@ -11,13 +11,14 @@ No dependencies required for the `musl` builds.
 
 | Platform | File |
 |---|---|
-| Linux x86_64 (most servers, VMs) | `runbound-x86_64-linux-musl` |
-| Linux ARM64 (Raspberry Pi, ARM servers) | `runbound-aarch64-linux-musl` |
+| Linux x86_64 (most servers, VMs) | `runbound-vX.Y.Z-x86_64-linux-musl` |
+| Linux ARM64 (Raspberry Pi, ARM servers) | `runbound-vX.Y.Z-aarch64-linux-musl` |
 
 ```bash
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-x86_64-linux-musl
-chmod +x runbound-x86_64-linux-musl
-sudo mv runbound-x86_64-linux-musl /usr/local/bin/runbound
+# Replace vX.Y.Z with the latest tag from https://github.com/redlemonbe/Runbound/releases
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.2.5-x86_64-linux-musl
+chmod +x runbound-v0.2.5-x86_64-linux-musl
+sudo mv runbound-v0.2.5-x86_64-linux-musl /usr/local/bin/runbound
 ```
 
 ---
@@ -64,8 +65,8 @@ sudo RUNBOUND_API_KEY="your-key" runbound --config /etc/runbound/runbound.conf
 dig @127.0.0.1 google.com
 
 # Verify the API is reachable:
-curl -s http://localhost:8081/health
-# → {"status":"ok"}
+curl -s http://localhost:8081/health -H "Authorization: Bearer $RUNBOUND_API_KEY"
+# → {"status":"ok","uptime_secs":3,"queries":0}
 ```
 
 ---

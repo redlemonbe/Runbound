@@ -28,6 +28,7 @@ existing `unbound.conf` is all you need.
 | `num-threads` | ✅ | ⚠️ | Ignored — Runbound uses Tokio async |
 | `cache-max-ttl` | ✅ | ✅ | Since v0.2.2 |
 | `private-address` | ✅ | ✅ | Since v0.2.2 — DNS rebinding protection |
+| `dnssec-validation` | ✅ | ✅ | Since v0.2.5 — enable only for recursive mode |
 | `module-config` | ✅ | ❌ | Unbound modules not supported |
 | `python-script` | ✅ | ❌ | No Python scripting |
 | `dnstap` | ✅ | ❌ | Not planned |
@@ -56,10 +57,10 @@ existing `unbound.conf` is all you need.
 
 ```bash
 # Find the latest version at: https://github.com/redlemonbe/Runbound/releases
-# Replace v0.2.3 with the actual latest tag
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.2.3-x86_64-linux-musl
-chmod +x runbound-v0.2.3-x86_64-linux-musl
-sudo mv runbound-v0.2.3-x86_64-linux-musl /usr/local/bin/runbound
+# Replace v0.2.5 with the latest tag from https://github.com/redlemonbe/Runbound/releases
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.2.5-x86_64-linux-musl
+chmod +x runbound-v0.2.5-x86_64-linux-musl
+sudo mv runbound-v0.2.5-x86_64-linux-musl /usr/local/bin/runbound
 ```
 
 ### 2. Test against your existing config
