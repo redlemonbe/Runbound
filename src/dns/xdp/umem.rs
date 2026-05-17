@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // AF_XDP UMEM — shared memory region between kernel and user space.
 //
 // Layout:  FRAME_COUNT contiguous frames of FRAME_SIZE bytes each.

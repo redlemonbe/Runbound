@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Runbound REST API — full DNS management + feeds + DoT/DoH status
 
 use std::path::PathBuf;
@@ -344,7 +346,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tls",               get(tls_status_handler))
         // Monitoring
         .route("/upstreams",         get(upstreams_handler))
-        .route("/logs",              get(logs_handler))
+        .route("/logs",              get(logs_handler).delete(clear_logs_handler))
         .route("/audit/tail",        get(audit_tail_handler))
         .route("/metrics",           get(metrics_handler))
         // Administration
@@ -388,6 +390,7 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/tls",              "description":"DoT/DoH/DoQ TLS status"},
             {"method":"GET",    "path":"/upstreams",        "description":"Upstream DNS resolver health"},
             {"method":"GET",    "path":"/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
+            {"method":"DELETE", "path":"/logs",             "description":"Clear the in-memory query log ring buffer (GDPR right-to-erasure)"},
             {"method":"GET",    "path":"/audit/tail",       "description":"Last N audit log entries — ?n=100"},
             {"method":"GET",    "path":"/metrics",          "description":"Prometheus/OpenMetrics exposition (text/plain; version=0.0.4)"},
             {"method":"POST",   "path":"/rotate-key",       "description":"Atomically rotate API key — reads new key from RUNBOUND_API_KEY env var"},
@@ -1017,7 +1020,7 @@ async fn logs_handler(
     };
 
     let (entries, total) = match s.log_buffer.lock() {
-        Ok(mut buf) => buf.query(&q),
+        Ok(buf) => buf.query(&q),
         Err(e) => {
             error!(err = %e, "log_buffer Mutex poisoned");
             return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
@@ -1030,6 +1033,28 @@ async fn logs_handler(
         "total":   total,
         "page":    params.page,
         "limit":   params.limit,
+    })).into_response()
+}
+
+// ── DELETE /logs ───────────────────────────────────────────────────────────
+
+async fn clear_logs_handler(
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let deleted = match s.log_buffer.lock() {
+        Ok(mut buf) => buf.clear(),
+        Err(e) => {
+            error!(err = %e, "log_buffer Mutex poisoned");
+            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+                "error": "INTERNAL", "details": "log buffer unavailable"
+            }))).into_response();
+        }
+    };
+    s.audit.send(AuditEvent::LogsClear { count: deleted });
+    info!(entries_deleted = deleted, "log buffer cleared via DELETE /logs");
+    JsonExtract(serde_json::json!({
+        "message":         "log buffer cleared",
+        "entries_deleted": deleted,
     })).into_response()
 }
 
@@ -1086,51 +1111,96 @@ async fn audit_tail_handler(
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.stats.snapshot();
     let body = format!(
-        "# HELP runbound_queries_total Total DNS queries received\n\
-         # TYPE runbound_queries_total counter\n\
-         runbound_queries_total {total}\n\
-         # HELP runbound_blocked_total Queries answered with REFUSED (blacklist/feeds)\n\
-         # TYPE runbound_blocked_total counter\n\
-         runbound_blocked_total {blocked}\n\
-         # HELP runbound_nxdomain_total Queries answered with NXDOMAIN\n\
-         # TYPE runbound_nxdomain_total counter\n\
-         runbound_nxdomain_total {nxdomain}\n\
-         # HELP runbound_refused_total Queries answered with REFUSED (ACL/rate limit)\n\
-         # TYPE runbound_refused_total counter\n\
-         runbound_refused_total {refused}\n\
-         # HELP runbound_servfail_total Queries answered with SERVFAIL\n\
-         # TYPE runbound_servfail_total counter\n\
-         runbound_servfail_total {servfail}\n\
-         # HELP runbound_forwarded_total Queries forwarded to upstream resolvers\n\
-         # TYPE runbound_forwarded_total counter\n\
-         runbound_forwarded_total {forwarded}\n\
-         # HELP runbound_local_hits_total Queries answered from local zone data\n\
-         # TYPE runbound_local_hits_total counter\n\
-         runbound_local_hits_total {local_hits}\n\
-         # HELP runbound_uptime_seconds Process uptime in seconds\n\
-         # TYPE runbound_uptime_seconds gauge\n\
-         runbound_uptime_seconds {uptime}\n\
-         # HELP runbound_qps Queries per second\n\
-         # TYPE runbound_qps gauge\n\
-         runbound_qps{{window=\"1m\"}} {qps_1m}\n\
-         runbound_qps{{window=\"5m\"}} {qps_5m}\n\
-         runbound_qps{{window=\"peak\"}} {qps_peak}\n\
-         # HELP runbound_latency_ms DNS query latency percentiles in milliseconds\n\
-         # TYPE runbound_latency_ms gauge\n\
-         runbound_latency_ms{{quantile=\"0.5\"}} {p50}\n\
-         runbound_latency_ms{{quantile=\"0.95\"}} {p95}\n\
-         runbound_latency_ms{{quantile=\"0.99\"}} {p99}\n\
-         # HELP runbound_cache_hit_rate Cache hit rate percentage (0–100)\n\
-         # TYPE runbound_cache_hit_rate gauge\n\
-         runbound_cache_hit_rate {cache_hit_rate}\n\
-         # HELP runbound_cache_entries Approximate cached DNS entries\n\
-         # TYPE runbound_cache_entries gauge\n\
-         runbound_cache_entries {cache_entries}\n\
-         # HELP runbound_dnssec_total DNSSEC validation results\n\
-         # TYPE runbound_dnssec_total counter\n\
-         runbound_dnssec_total{{status=\"secure\"}} {dnssec_secure}\n\
-         runbound_dnssec_total{{status=\"bogus\"}} {dnssec_bogus}\n\
-         runbound_dnssec_total{{status=\"insecure\"}} {dnssec_insecure}\n",
+        "# HELP runbound_queries_total Total DNS queries received
+\
+         # TYPE runbound_queries_total counter
+\
+         runbound_queries_total {total}
+\
+         # HELP runbound_blocked_total Queries answered with REFUSED (blacklist/feeds)
+\
+         # TYPE runbound_blocked_total counter
+\
+         runbound_blocked_total {blocked}
+\
+         # HELP runbound_nxdomain_total Queries answered with NXDOMAIN
+\
+         # TYPE runbound_nxdomain_total counter
+\
+         runbound_nxdomain_total {nxdomain}
+\
+         # HELP runbound_refused_total Queries answered with REFUSED (ACL/rate limit)
+\
+         # TYPE runbound_refused_total counter
+\
+         runbound_refused_total {refused}
+\
+         # HELP runbound_servfail_total Queries answered with SERVFAIL
+\
+         # TYPE runbound_servfail_total counter
+\
+         runbound_servfail_total {servfail}
+\
+         # HELP runbound_forwarded_total Queries forwarded to upstream resolvers
+\
+         # TYPE runbound_forwarded_total counter
+\
+         runbound_forwarded_total {forwarded}
+\
+         # HELP runbound_local_hits_total Queries answered from local zone data
+\
+         # TYPE runbound_local_hits_total counter
+\
+         runbound_local_hits_total {local_hits}
+\
+         # HELP runbound_uptime_seconds Process uptime in seconds
+\
+         # TYPE runbound_uptime_seconds gauge
+\
+         runbound_uptime_seconds {uptime}
+\
+         # HELP runbound_qps Queries per second
+\
+         # TYPE runbound_qps gauge
+\
+         runbound_qps{{window=\"1m\"}} {qps_1m}
+\
+         runbound_qps{{window=\"5m\"}} {qps_5m}
+\
+         runbound_qps{{window=\"peak\"}} {qps_peak}
+\
+         # HELP runbound_latency_ms DNS query latency percentiles in milliseconds
+\
+         # TYPE runbound_latency_ms gauge
+\
+         runbound_latency_ms{{quantile=\"0.5\"}} {p50}
+\
+         runbound_latency_ms{{quantile=\"0.95\"}} {p95}
+\
+         runbound_latency_ms{{quantile=\"0.99\"}} {p99}
+\
+         # HELP runbound_cache_hit_rate Cache hit rate percentage (0–100)
+\
+         # TYPE runbound_cache_hit_rate gauge
+\
+         runbound_cache_hit_rate {cache_hit_rate}
+\
+         # HELP runbound_cache_entries Approximate cached DNS entries
+\
+         # TYPE runbound_cache_entries gauge
+\
+         runbound_cache_entries {cache_entries}
+\
+         # HELP runbound_dnssec_total DNSSEC validation results
+\
+         # TYPE runbound_dnssec_total counter
+\
+         runbound_dnssec_total{{status=\"secure\"}} {dnssec_secure}
+\
+         runbound_dnssec_total{{status=\"bogus\"}} {dnssec_bogus}
+\
+         runbound_dnssec_total{{status=\"insecure\"}} {dnssec_insecure}
+",
         total        = snap.total,
         blocked      = snap.blocked,
         nxdomain     = snap.nxdomain,
@@ -1220,7 +1290,7 @@ fn ensure_dot(name: &str) -> String {
 /// CRLF injection into logs, stored JSON, or HTTP response bodies.
 fn validate_no_control_chars(s: &str, field: &'static str) -> Result<(), String> {
     if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err(format!("Field '{}' must not contain control characters (\\r, \\n, etc.)", field));
+        return Err(format!("Field '{}' must not contain control characters (\r, \n, etc.)", field));
     }
     Ok(())
 }
@@ -1277,7 +1347,7 @@ mod tests {
             crate::dns::local::LocalZoneSet::default()
         )));
         let cfg_arc = Arc::new(crate::config::parser::UnboundConfig::default());
-        let log_buffer = crate::logbuffer::new_shared();
+        let log_buffer = crate::logbuffer::new_shared(1000, true);
         let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
 
         let state = AppState {

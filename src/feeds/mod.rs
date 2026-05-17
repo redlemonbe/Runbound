@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Runbound — Feed subscription management (remote blocklists)
 //
 // Feeds are remote domain blocklists (ads, telemetry, malware...).
@@ -806,4 +808,3 @@ pub async fn feed_update_loop(interval_secs: u64) {
         }
     }
 }
-

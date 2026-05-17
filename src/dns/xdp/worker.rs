@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // XDP worker: poll loop that reads raw Ethernet frames from the AF_XDP RX
 // ring, processes local-zone DNS queries entirely in user space, and writes
 // DNS responses back to the TX ring.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Local zone authority — in-memory, instant updates, O(1) lookup.
 
 use std::borrow::Borrow;

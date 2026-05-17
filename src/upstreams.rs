@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Upstream DNS health monitoring.
 //
 // Probes each configured forward-addr every 30 seconds with a minimal UDP DNS

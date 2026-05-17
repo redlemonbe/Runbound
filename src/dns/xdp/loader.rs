@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Load the compiled XDP eBPF program, attach it to a NIC, and manage the
 // XSKMAP that maps queue_id → AF_XDP socket fd.
 //

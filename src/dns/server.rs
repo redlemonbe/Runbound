@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Runbound DNS server — drop-in for Unbound.
 //
 // Architecture:
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hickory_proto::op::{Header, ResponseCode};
-use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
+use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_proto::error::ProtoErrorKind;
 use hickory_resolver::{
     config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
@@ -33,7 +35,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::parser::TlsConfig;
 
 use crate::config::parser::UnboundConfig;
-use crate::logbuffer::{LogAction, LogEntry, SharedLogBuffer};
+use crate::logbuffer::{LogAction, SharedLogBuffer};
 use crate::stats::{Stats, CACHE_HIT_THRESHOLD_US};
 use super::acl::{Acl, AclAction, PrivateAddressSet};
 use super::local::{LocalZoneSet, ZoneAction};
@@ -111,14 +113,14 @@ impl RunboundHandler {
             self.stats.inc_local_hits();
         }
 
-        if let Ok(mut buf) = self.log_buffer.lock() {
-            buf.push(LogEntry::new(
-                &qname.to_string(), &client, u16::from(qtype), action, elapsed_ms,
-            ));
-        }
+        let client_log = if let Ok(mut buf) = self.log_buffer.lock() {
+            buf.push_query(&qname.to_string(), &client, u16::from(qtype), action, elapsed_ms)
+        } else {
+            client.to_string()
+        };
 
         info!(
-            client = %client,
+            client = %client_log,
             name   = %qname,
             qtype  = %qtype,
             rcode  = %rcode,

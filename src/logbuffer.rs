@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Query log ring buffer — fixed capacity, zero allocation after startup.
 //
 // LogEntry is a fixed-size struct (no heap pointers). The ring buffer
@@ -14,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 // ── Capacity ───────────────────────────────────────────────────────────────
+/// Compile-time upper bound. Runtime capacity is set via `log-retention` config (default 1000).
 pub const LOG_CAP: usize = 10_000;
 
 // DNS name max length per RFC 1035 is 253 characters.
@@ -84,7 +87,7 @@ pub struct LogEntry {
 impl LogEntry {
     pub fn new(
         name:       &str,
-        client:     &IpAddr,
+        client:     &str,
         qtype:      u16,
         action:     LogAction,
         elapsed_ms: u32,
@@ -99,9 +102,8 @@ impl LogEntry {
         let name_len = name_bytes.len().min(NAME_CAP) as u8;
         name_buf[..name_len as usize].copy_from_slice(&name_bytes[..name_len as usize]);
 
-        let client_str = client.to_string();
         let mut client_buf = [0u8; CLIENT_CAP];
-        let client_bytes = client_str.as_bytes();
+        let client_bytes = client.as_bytes();
         let client_len = client_bytes.len().min(CLIENT_CAP) as u8;
         client_buf[..client_len as usize].copy_from_slice(&client_bytes[..client_len as usize]);
 
@@ -139,35 +141,72 @@ pub struct LogQuery {
 
 // ── Ring buffer ───────────────────────────────────────────────────────────
 pub struct LogBuffer {
-    slots: Vec<Option<LogEntry>>,
-    head:  usize,   // next write position
-    count: usize,   // total entries written (saturates at LOG_CAP)
+    slots:      Vec<Option<LogEntry>>,
+    head:       usize,  // next write position
+    count:      usize,  // total entries written (saturates at capacity)
+    /// Runtime capacity (set from log-retention config, default 1000).
+    /// 0 = disabled: push() is a no-op and query() returns empty.
+    capacity:   usize,
+    /// When false, client IPs are stored as "[redacted]" (log-client-ip: no).
+    log_client_ip: bool,
 }
 
 impl LogBuffer {
-    fn new() -> Self {
-        let mut slots = Vec::with_capacity(LOG_CAP);
-        for _ in 0..LOG_CAP { slots.push(None); }
-        Self { slots, head: 0, count: 0 }
+    fn new_with(capacity: usize, log_client_ip: bool) -> Self {
+        let cap = capacity.min(LOG_CAP);
+        let mut slots = Vec::with_capacity(cap);
+        for _ in 0..cap { slots.push(None); }
+        Self { slots, head: 0, count: 0, capacity: cap, log_client_ip }
     }
 
     /// Push a log entry — O(1), overwrites oldest when full.
+    /// No-op when capacity is 0 (log-retention: 0).
     pub fn push(&mut self, entry: LogEntry) {
+        if self.capacity == 0 { return; }
         self.slots[self.head] = Some(entry);
-        self.head = (self.head + 1) % LOG_CAP;
-        if self.count < LOG_CAP { self.count += 1; }
+        self.head = (self.head + 1) % self.capacity;
+        if self.count < self.capacity { self.count += 1; }
+    }
+
+    /// High-level push used by the DNS server: applies IP redaction automatically.
+    /// Returns the client string actually stored (for use in tracing logs).
+    pub fn push_query(
+        &mut self,
+        name:       &str,
+        client_ip:  &std::net::IpAddr,
+        qtype:      u16,
+        action:     LogAction,
+        elapsed_ms: u32,
+    ) -> String {
+        let client_str = if self.log_client_ip {
+            client_ip.to_string()
+        } else {
+            "[redacted]".to_string()
+        };
+        self.push(LogEntry::new(name, &client_str, qtype, action, elapsed_ms));
+        client_str
+    }
+
+
+    /// Clear all entries. Returns the number of entries deleted.
+    pub fn clear(&mut self) -> usize {
+        let deleted = self.count;
+        for slot in &mut self.slots { *slot = None; }
+        self.head  = 0;
+        self.count = 0;
+        deleted
     }
 
     /// Query entries — newest first, with optional filters and pagination.
     /// Allocates only on the read path.
     pub fn query(&self, q: &LogQuery) -> (Vec<LogEntryView>, usize) {
-        let filled = self.count.min(LOG_CAP);
+        let filled = self.count.min(self.capacity);
         if filled == 0 { return (vec![], 0); }
 
         // Collect matching entries newest-first
         let mut matched: Vec<LogEntryView> = Vec::new();
         for i in 0..filled {
-            let idx = (self.head + LOG_CAP - 1 - i) % LOG_CAP;
+            let idx = (self.head + self.capacity - 1 - i) % self.capacity;
             let entry = match &self.slots[idx] {
                 Some(e) => e,
                 None    => continue,
@@ -177,6 +216,7 @@ impl LogBuffer {
                 if entry.action != a { continue; }
             }
             if let Some(ref c) = q.client {
+                // Filter on raw stored value: redacted entries never match an IP filter.
                 if entry.client() != c.to_string() { continue; }
             }
             if let Some(since) = q.since_secs {
@@ -203,8 +243,8 @@ impl LogBuffer {
 // ── Shared handle ─────────────────────────────────────────────────────────
 pub type SharedLogBuffer = Arc<Mutex<LogBuffer>>;
 
-pub fn new_shared() -> SharedLogBuffer {
-    Arc::new(Mutex::new(LogBuffer::new()))
+pub fn new_shared(capacity: usize, log_client_ip: bool) -> SharedLogBuffer {
+    Arc::new(Mutex::new(LogBuffer::new_with(capacity, log_client_ip)))
 }
 
 // ── Timestamp formatter ────────────────────────────────────────────────────

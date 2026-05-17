@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 use anyhow::{Context, Result};
 use tracing::warn;
 
@@ -67,6 +69,14 @@ pub struct UnboundConfig {
     /// Log WARN for every DNSSEC-bogus query when dnssec-validation is enabled.
     pub dnssec_log_bogus: bool,
 
+    // ── GDPR / privacy controls ────────────────────────────────────────────
+    /// Max entries in the in-RAM query log ring buffer. Default: 1000. 0 = disabled.
+    /// Reduce or set to 0 if your data-retention policy requires it.
+    pub log_retention: usize,
+    /// Include client IPs in /logs and logfile. Default: true.
+    /// Set to `no` to replace IPs with "[redacted]" (does not apply to audit log).
+    pub log_client_ip: bool,
+
     // ── Audit log ─────────────────────────────────────────────────────────────
     /// Enable immutable HMAC-chained audit log. Default: false.
     pub audit_log: bool,
@@ -111,6 +121,8 @@ impl UnboundConfig {
             do_tcp:        true,
             mode:          "master".to_string(),
             sync_interval: 30,
+            log_retention: 1000,
+            log_client_ip: true,
             ..Default::default()
         }
     }
@@ -244,6 +256,8 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         }
         "dnssec-validation" => cfg.dnssec_validation = val.trim_matches('"') == "yes",
         "dnssec-log-bogus"  => cfg.dnssec_log_bogus  = val.trim_matches('"') == "yes",
+        "log-retention"     => cfg.log_retention      = val.parse().unwrap_or(1000),
+        "log-client-ip"     => cfg.log_client_ip      = val.trim_matches('"') != "no",
         "audit-log"          => cfg.audit_log          = val.trim_matches('"') == "yes",
         "audit-log-path"     => cfg.audit_log_path     = Some(val.trim_matches('"').to_string()),
         "audit-log-hmac-key" => cfg.audit_log_hmac_key = Some(val.trim_matches('"').to_string()),

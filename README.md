@@ -2,7 +2,7 @@
 
 **Drop-in Unbound replacement — with a REST API and 80,000 q/s.**
 
-[![License: PolyForm NC](https://img.shields.io/badge/License-PolyForm_NC_1.0-blue)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial License](https://img.shields.io/badge/license-commercial-green.svg)](COMMERCIAL_LICENSE.md)
 [![GitHub release](https://img.shields.io/github/v/release/redlemonbe/Runbound)](https://github.com/redlemonbe/Runbound/releases/latest)
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor)](https://github.com/sponsors/redlemonbe)
 
@@ -184,10 +184,16 @@ If Runbound saves you time or infrastructure costs:
 
 ## License
 
-[PolyForm Noncommercial License 1.0.0](LICENSE) for non-commercial use.  
-Commercial use: [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) — contact redlemonbe@codix.be.
+Runbound is open source under the [GNU AGPL v3](LICENSE).
 
-Copyright (c) 2026 RedlemonBe
+**What this means:** if you use Runbound as part of a commercial service,
+you must publish your modifications under the same license.
+
+**Commercial license:** organizations that need to use Runbound without
+AGPL obligations can purchase a commercial license with priority support.
+See [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
+
+Copyright (C) 2024-2026 RedLemonBe
 
 ---
 

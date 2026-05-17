@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Runbound — Immutable audit log
 //
 // Events are written to an append-only file (O_APPEND | O_CREAT | O_WRONLY).
@@ -33,6 +35,7 @@ pub enum AuditEvent {
     BlacklistDelete { id: String },
     AuthFailure { path: String },
     ConfigReload,
+    LogsClear   { count: usize },
 }
 
 impl AuditEvent {
@@ -48,12 +51,14 @@ impl AuditEvent {
             Self::BlacklistDelete { .. } => "blacklist_delete",
             Self::AuthFailure { .. } => "auth_failure",
             Self::ConfigReload       => "config_reload",
+            Self::LogsClear { .. }   => "logs_clear",
         }
     }
 
     fn fields(&self) -> serde_json::Value {
         match self {
             Self::Startup | Self::Shutdown | Self::ConfigReload => serde_json::json!({}),
+            Self::LogsClear { count } => serde_json::json!({ "entries_deleted": count }),
             Self::DnsAdd { name, rtype, value } => serde_json::json!({
                 "name": name, "type": rtype, "value": value,
             }),
