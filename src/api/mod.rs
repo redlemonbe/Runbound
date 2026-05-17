@@ -623,15 +623,16 @@ async fn list_dns_handler(State(_s): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn add_dns_handler(
-    State(s): State<AppState>,
-    ApiJson(req): ApiJson<AddDnsRequest>,
-) -> impl IntoResponse {
+type ApiError = (StatusCode, JsonExtract<serde_json::Value>);
+
+/// Validate all fields of an AddDnsRequest and build the DnsEntry + RR + Record.
+/// Returns the triple on success, or a (StatusCode, JSON error) ready to return.
+fn validate_dns_entry(req: &AddDnsRequest) -> Result<(DnsEntry, String, hickory_proto::rr::Record), ApiError> {
     // VUL-05: Reject malformed or dangerous names before any parsing.
     if let Err(e) = validate_dns_name(&req.name) {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+        return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
             "error": "INVALID_NAME", "details": e
-        })));
+        }))));
     }
     // Reject control characters in free-text fields (CRLF injection prevention).
     for (field, val) in [
@@ -646,9 +647,9 @@ async fn add_dns_handler(
         ("flags_naptr", req.flags_naptr.as_deref().unwrap_or("")),
     ] {
         if let Err(e) = validate_no_control_chars(val, field) {
-            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
                 "error": "INVALID_FIELD", "details": e
-            })));
+            }))));
         }
     }
     // S-10: for record types where value is a domain name, validate it as such.
@@ -657,9 +658,9 @@ async fn add_dns_handler(
         DnsType::CNAME | DnsType::NS | DnsType::PTR | DnsType::MX | DnsType::SRV => {
             if let Some(ref v) = req.value {
                 if let Err(e) = validate_dns_name(v) {
-                    return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                    return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
                         "error": "INVALID_VALUE", "details": e
-                    })));
+                    }))));
                 }
             }
         }
@@ -668,91 +669,93 @@ async fn add_dns_handler(
             if let Some(ref r) = req.replacement {
                 if r != "." {
                     if let Err(e) = validate_dns_name(r) {
-                        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                        return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
                             "error": "INVALID_REPLACEMENT", "details": e
-                        })));
+                        }))));
                     }
                 }
             }
         }
         _ => {}
     }
-
     // RFC 2181 §8: TTL is a non-negative 32-bit integer; values outside
     // [0, 2^31-1] must be rejected with a uniform JSON error.
     const RFC2181_MAX_TTL: i64 = 2_147_483_647;
     if req.ttl < 0 || req.ttl > RFC2181_MAX_TTL {
-        return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
             "error": "INVALID_TTL",
             "details": "TTL must be between 0 and 2147483647"
-        })));
+        }))));
     }
     let ttl = req.ttl as u32;
     let entry = DnsEntry {
         id:               DnsEntry::new_id(),
         name:             ensure_dot(&req.name),
-        entry_type:       req.entry_type,
+        entry_type:       req.entry_type.clone(),
         ttl:              ttl.min(MAX_API_TTL),
-        value:            req.value,
+        value:            req.value.clone(),
         priority:         req.priority,
         weight:           req.weight,
         port:             req.port,
         flags:            req.flags,
-        tag:              req.tag,
+        tag:              req.tag.clone(),
         order:            req.order,
         preference_naptr: req.preference_naptr,
-        flags_naptr:      req.flags_naptr,
-        services:         req.services,
-        regexp:           req.regexp,
-        replacement:      req.replacement,
+        flags_naptr:      req.flags_naptr.clone(),
+        services:         req.services.clone(),
+        regexp:           req.regexp.clone(),
+        replacement:      req.replacement.clone(),
         algorithm:        req.algorithm,
         fp_type:          req.fp_type,
-        fingerprint:      req.fingerprint,
+        fingerprint:      req.fingerprint.clone(),
         cert_usage:       req.cert_usage,
         selector:         req.selector,
         matching_type:    req.matching_type,
-        cert_data:        req.cert_data,
-        description:      req.description,
+        cert_data:        req.cert_data.clone(),
+        description:      req.description.clone(),
     };
-
-    // Validate by converting to RR string and parsing
     let rr = match entry.to_rr_string() {
         Some(r) => r,
-        None => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+        None => return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
             "error": "INVALID_ENTRY",
             "details": "Missing required fields for this record type"
-        }))),
+        })))),
     };
-
     let record = match parse_local_data(&rr) {
         Some(r) => r,
-        None => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+        None => return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
             "error": "PARSE_FAILED",
             "details": format!("Could not parse RR: {rr}")
-        }))),
+        })))),
     };
+    Ok((entry, rr, record))
+}
 
-    // Persist + inject atomically under zones_mutex.
-    // VUL-FIX: store load/save MUST be inside the mutex.  Without this,
-    // two concurrent POST /dns both load the same snapshot, each append
-    // their entry, and the last writer wins — the other entry is silently
-    // lost from the on-disk store (in-memory zones get both, but a restart
-    // would only restore one).
+/// Persist entry to disk and atomically inject into the live zone set.
+/// VUL-FIX: store load/save MUST be inside zones_mutex.  Without this,
+/// two concurrent POST /dns both load the same snapshot, each append
+/// their entry, and the last writer wins — the other entry is silently
+/// lost from the on-disk store.
+async fn persist_and_swap(
+    entry: &DnsEntry,
+    record: hickory_proto::rr::Record,
+    s: &AppState,
+) -> Result<(), ApiError> {
     {
         let _guard = s.zones_mutex.lock().await;
 
         let mut st = store::load().unwrap_or_default();
         if st.entries.len() >= MAX_DNS_ENTRIES {
-            return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
                 "error": "LIMIT_EXCEEDED",
                 "details": format!("Maximum {} DNS entries reached", MAX_DNS_ENTRIES)
-            })));
+            }))));
         }
         st.entries.push(entry.clone());
         if let Err(e) = store::save(&st) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
                 "error": e.to_string()
-            })));
+            }))));
         }
 
         let current = s.zones.load_full();
@@ -762,7 +765,6 @@ async fn add_dns_handler(
         new_zones.records.entry(name).or_default().push(record);
         s.zones.store(Arc::new(new_zones));
     }
-
     info!(id=%entry.id, name=%entry.name, r#type=?entry.entry_type, "DNS entry added");
     s.audit.send(AuditEvent::DnsAdd {
         name:  entry.name.clone(),
@@ -771,6 +773,20 @@ async fn add_dns_handler(
     });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::AddDns { entry: entry.clone() });
+    }
+    Ok(())
+}
+
+async fn add_dns_handler(
+    State(s): State<AppState>,
+    ApiJson(req): ApiJson<AddDnsRequest>,
+) -> impl IntoResponse {
+    let (entry, rr, record) = match validate_dns_entry(&req) {
+        Ok(v)  => v,
+        Err(e) => return e,
+    };
+    if let Err(e) = persist_and_swap(&entry, record, &s).await {
+        return e;
     }
     (StatusCode::CREATED, JsonExtract(serde_json::json!({
         "status": "ok",
@@ -1234,123 +1250,59 @@ async fn audit_tail_handler(
 
 // ── GET /metrics ───────────────────────────────────────────────────────────
 
+fn fmt_counter(name: &str, help: &str, val: u64) -> String {
+    format!("# HELP {name} {help}\n# TYPE {name} counter\n{name} {val}\n")
+}
+
+fn fmt_gauge<V: std::fmt::Display>(name: &str, help: &str, val: V) -> String {
+    format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {val}\n")
+}
+
+fn render_prometheus_metrics(snap: &crate::stats::StatsSnapshot) -> String {
+    let mut out = String::with_capacity(1500);
+    out.push_str(&fmt_counter("runbound_queries_total",   "Total DNS queries received",                           snap.total));
+    out.push_str(&fmt_counter("runbound_blocked_total",   "Queries answered with REFUSED (blacklist/feeds)",      snap.blocked));
+    out.push_str(&fmt_counter("runbound_nxdomain_total",  "Queries answered with NXDOMAIN",                      snap.nxdomain));
+    out.push_str(&fmt_counter("runbound_refused_total",   "Queries answered with REFUSED (ACL/rate limit)",      snap.refused));
+    out.push_str(&fmt_counter("runbound_servfail_total",  "Queries answered with SERVFAIL",                      snap.servfail));
+    out.push_str(&fmt_counter("runbound_forwarded_total", "Queries forwarded to upstream resolvers",             snap.forwarded));
+    out.push_str(&fmt_counter("runbound_local_hits_total","Queries answered from local zone data",               snap.local_hits));
+    out.push_str(&fmt_gauge(  "runbound_uptime_seconds",  "Process uptime in seconds",                           snap.uptime_secs));
+    out.push_str(&format!(
+        "# HELP runbound_qps Queries per second\n\
+         # TYPE runbound_qps gauge\n\
+         runbound_qps{{window=\"1m\"}} {}\n\
+         runbound_qps{{window=\"5m\"}} {}\n\
+         runbound_qps{{window=\"peak\"}} {}\n",
+        snap.qps_1m, snap.qps_5m, snap.qps_peak,
+    ));
+    out.push_str(&format!(
+        "# HELP runbound_latency_ms DNS query latency percentiles in milliseconds\n\
+         # TYPE runbound_latency_ms gauge\n\
+         runbound_latency_ms{{quantile=\"0.5\"}} {}\n\
+         runbound_latency_ms{{quantile=\"0.95\"}} {}\n\
+         runbound_latency_ms{{quantile=\"0.99\"}} {}\n",
+        snap.latency_p50_ms, snap.latency_p95_ms, snap.latency_p99_ms,
+    ));
+    out.push_str(&fmt_gauge("runbound_cache_hit_rate", "Cache hit rate percentage (0\u{2013}100)", snap.cache_hit_rate));
+    out.push_str(&fmt_gauge("runbound_cache_entries",  "Approximate cached DNS entries",           snap.cache_entries));
+    out.push_str(&format!(
+        "# HELP runbound_dnssec_total DNSSEC validation results\n\
+         # TYPE runbound_dnssec_total counter\n\
+         runbound_dnssec_total{{status=\"secure\"}} {}\n\
+         runbound_dnssec_total{{status=\"bogus\"}} {}\n\
+         runbound_dnssec_total{{status=\"insecure\"}} {}\n",
+        snap.dnssec_secure, snap.dnssec_bogus, snap.dnssec_insecure,
+    ));
+    out
+}
+
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.stats.snapshot();
-    let body = format!(
-        "# HELP runbound_queries_total Total DNS queries received
-\
-         # TYPE runbound_queries_total counter
-\
-         runbound_queries_total {total}
-\
-         # HELP runbound_blocked_total Queries answered with REFUSED (blacklist/feeds)
-\
-         # TYPE runbound_blocked_total counter
-\
-         runbound_blocked_total {blocked}
-\
-         # HELP runbound_nxdomain_total Queries answered with NXDOMAIN
-\
-         # TYPE runbound_nxdomain_total counter
-\
-         runbound_nxdomain_total {nxdomain}
-\
-         # HELP runbound_refused_total Queries answered with REFUSED (ACL/rate limit)
-\
-         # TYPE runbound_refused_total counter
-\
-         runbound_refused_total {refused}
-\
-         # HELP runbound_servfail_total Queries answered with SERVFAIL
-\
-         # TYPE runbound_servfail_total counter
-\
-         runbound_servfail_total {servfail}
-\
-         # HELP runbound_forwarded_total Queries forwarded to upstream resolvers
-\
-         # TYPE runbound_forwarded_total counter
-\
-         runbound_forwarded_total {forwarded}
-\
-         # HELP runbound_local_hits_total Queries answered from local zone data
-\
-         # TYPE runbound_local_hits_total counter
-\
-         runbound_local_hits_total {local_hits}
-\
-         # HELP runbound_uptime_seconds Process uptime in seconds
-\
-         # TYPE runbound_uptime_seconds gauge
-\
-         runbound_uptime_seconds {uptime}
-\
-         # HELP runbound_qps Queries per second
-\
-         # TYPE runbound_qps gauge
-\
-         runbound_qps{{window=\"1m\"}} {qps_1m}
-\
-         runbound_qps{{window=\"5m\"}} {qps_5m}
-\
-         runbound_qps{{window=\"peak\"}} {qps_peak}
-\
-         # HELP runbound_latency_ms DNS query latency percentiles in milliseconds
-\
-         # TYPE runbound_latency_ms gauge
-\
-         runbound_latency_ms{{quantile=\"0.5\"}} {p50}
-\
-         runbound_latency_ms{{quantile=\"0.95\"}} {p95}
-\
-         runbound_latency_ms{{quantile=\"0.99\"}} {p99}
-\
-         # HELP runbound_cache_hit_rate Cache hit rate percentage (0–100)
-\
-         # TYPE runbound_cache_hit_rate gauge
-\
-         runbound_cache_hit_rate {cache_hit_rate}
-\
-         # HELP runbound_cache_entries Approximate cached DNS entries
-\
-         # TYPE runbound_cache_entries gauge
-\
-         runbound_cache_entries {cache_entries}
-\
-         # HELP runbound_dnssec_total DNSSEC validation results
-\
-         # TYPE runbound_dnssec_total counter
-\
-         runbound_dnssec_total{{status=\"secure\"}} {dnssec_secure}
-\
-         runbound_dnssec_total{{status=\"bogus\"}} {dnssec_bogus}
-\
-         runbound_dnssec_total{{status=\"insecure\"}} {dnssec_insecure}
-",
-        total        = snap.total,
-        blocked      = snap.blocked,
-        nxdomain     = snap.nxdomain,
-        refused      = snap.refused,
-        servfail     = snap.servfail,
-        forwarded    = snap.forwarded,
-        local_hits   = snap.local_hits,
-        uptime       = snap.uptime_secs,
-        qps_1m       = snap.qps_1m,
-        qps_5m       = snap.qps_5m,
-        qps_peak     = snap.qps_peak,
-        p50          = snap.latency_p50_ms,
-        p95          = snap.latency_p95_ms,
-        p99          = snap.latency_p99_ms,
-        cache_hit_rate  = snap.cache_hit_rate,
-        cache_entries   = snap.cache_entries,
-        dnssec_secure   = snap.dnssec_secure,
-        dnssec_bogus    = snap.dnssec_bogus,
-        dnssec_insecure = snap.dnssec_insecure,
-    );
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        body,
+        render_prometheus_metrics(&snap),
     )
 }
 

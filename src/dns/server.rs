@@ -152,12 +152,213 @@ impl RunboundHandler {
     }
 }
 
+impl RunboundHandler {
+    /// Attempt to answer from local zones (blacklist, static data, CNAME chains).
+    /// Returns `Ok(info)` when a response was sent; `Err(rh)` when no local match
+    /// was found and the query should fall through to recursive resolution.
+    async fn handle_local_zone<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        qname: &LowerName,
+        qtype: RecordType,
+        client_ip: IpAddr,
+        start: Instant,
+    ) -> Result<ResponseInfo, R> {
+        let zones_snap  = self.zones.load();
+        let zone_action = zones_snap.find(qname);
+
+        match zone_action {
+            Some(ZoneAction::Refuse) => {
+                debug!(name=%sanitize_dns_name(qname), "local-zone REFUSED");
+                self.stats.inc_blocked(); self.stats.inc_refused();
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Blocked, start);
+                return Ok(send_error(request, response_handle, ResponseCode::Refused).await);
+            }
+            Some(ZoneAction::NxDomain) => {
+                debug!(name=%sanitize_dns_name(qname), "local-zone NXDOMAIN");
+                self.stats.inc_blocked(); self.stats.inc_nxdomain();
+                self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Blocked, start);
+                return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
+            }
+            Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
+                let records = zones_snap.local_records(qname, qtype);
+
+                if !records.is_empty() {
+                    debug!(name=%sanitize_dns_name(qname), count = records.len(), "local-data answer");
+                    let mut metadata = Metadata::response_from_request(&request.metadata);
+                    metadata.authoritative = true;
+                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let response = builder.build(
+                        metadata, records,
+                        std::iter::empty(), std::iter::empty(), std::iter::empty(),
+                    );
+                    self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
+                    return Ok(response_handle.send_response(response).await
+                        .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) }));
+                }
+
+                // CNAME chain following (RFC 1034 §3.6.2)
+                if qtype != RecordType::CNAME {
+                    let chain = follow_local_cname(&zones_snap, qname, qtype);
+                    if !chain.is_empty() {
+                        let mut metadata = Metadata::response_from_request(&request.metadata);
+                        metadata.authoritative = true;
+                        let builder = MessageResponseBuilder::from_message_request(request);
+                        let response = builder.build(
+                            metadata, chain.iter(),
+                            std::iter::empty(), std::iter::empty(), std::iter::empty(),
+                        );
+                        self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
+                        return Ok(response_handle.send_response(response).await
+                            .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) }));
+                    }
+                }
+
+                // RFC 1035 §3.7 / RFC 2308: NODATA vs NXDOMAIN
+                if zones_snap.name_has_records(qname) {
+                    debug!(name=%sanitize_dns_name(qname), %qtype, "local-zone NODATA");
+                    let mut metadata = Metadata::response_from_request(&request.metadata);
+                    metadata.authoritative = true;
+                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let response = builder.build(
+                        metadata, std::iter::empty::<&Record>(),
+                        std::iter::empty(), std::iter::empty(), std::iter::empty(),
+                    );
+                    self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
+                    return Ok(response_handle.send_response(response).await
+                        .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) }));
+                }
+                debug!(name=%sanitize_dns_name(qname), "local-zone NXDOMAIN (name not found)");
+                self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Nxdomain, start);
+                return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
+            }
+            None => {}
+        }
+        // Reached only via the None arm — response_handle was not consumed.
+        Err(response_handle)
+    }
+
+    /// Recursive upstream resolution with DNSSEC validation and rebinding protection.
+    async fn resolve_upstream<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        qname: &LowerName,
+        qtype: RecordType,
+        client_ip: IpAddr,
+        start: Instant,
+    ) -> ResponseInfo {
+        match self.resolver.load_full().lookup(Name::from(qname), qtype).await {
+            Ok(lookup) => {
+                // DNS rebinding protection: SERVFAIL if any A/AAAA record falls
+                // within a configured private-address range (Unbound compatible).
+                if !self.private_addrs.is_empty() {
+                    for rec in lookup.answers() {
+                        let private_ip = match &rec.data {
+                            RData::A(a)    => Some(IpAddr::V4(a.0)),
+                            RData::AAAA(a) => Some(IpAddr::V6(a.0)),
+                            _ => None,
+                        };
+                        if let Some(ip) = private_ip {
+                            if self.private_addrs.contains(ip) {
+                                warn!(name=%sanitize_dns_name(qname), %ip, "private-address block → SERVFAIL");
+                                self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
+                                return send_error(request, response_handle, ResponseCode::ServFail).await;
+                            }
+                        }
+                    }
+                }
+
+                let ttl_cap = self.cache_max_ttl;
+                let records: Vec<Record> = lookup.answers().iter().map(|r| {
+                    let mut r = r.clone();
+                    if r.ttl > ttl_cap { r.ttl = ttl_cap; }
+                    r
+                }).collect();
+
+                // DNSSEC: check for bogus proof on individual records in success path.
+                if self.dnssec_enabled {
+                    let has_bogus = records.iter().any(|r| r.proof.is_bogus());
+                    if has_bogus {
+                        self.stats.inc_dnssec_bogus();
+                        if self.dnssec_log_bogus {
+                            warn!(name=%sanitize_dns_name(qname), "DNSSEC bogus — SERVFAIL");
+                        }
+                        self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
+                        return send_error(request, response_handle, ResponseCode::ServFail).await;
+                    }
+                    let has_rrsig = records.iter().any(|r| r.record_type() == RecordType::RRSIG);
+                    if has_rrsig {
+                        self.stats.inc_dnssec_secure();
+                    } else {
+                        self.stats.inc_dnssec_insecure();
+                    }
+                }
+
+                debug!(name=%sanitize_dns_name(qname), %qtype, count = records.len(), "resolved");
+                let mut metadata = Metadata::response_from_request(&request.metadata);
+                metadata.recursion_available = true;
+                let builder = MessageResponseBuilder::from_message_request(request);
+                let response = builder.build(
+                    metadata, records.iter(),
+                    std::iter::empty(), std::iter::empty(), std::iter::empty(),
+                );
+                self.stats.inc_forwarded();
+                let fwd_us = start.elapsed().as_micros() as u64;
+                self.stats.record_forward(fwd_us);
+                let fwd_action = if fwd_us < CACHE_HIT_THRESHOLD_US {
+                    LogAction::Cached
+                } else {
+                    LogAction::Forwarded
+                };
+                self.record_query(client_ip, qname, qtype, ResponseCode::NoError, fwd_action, start);
+                response_handle.send_response(response).await
+                    .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) })
+            }
+            Err(e) => {
+                // DNSSEC bogus via NSEC denial: validated proof the record does not exist.
+                let is_dnssec_bogus = self.dnssec_enabled
+                    && matches!(&e, NetError::Dns(DnsError::Nsec { proof, .. }) if proof.is_bogus());
+
+                if is_dnssec_bogus {
+                    self.stats.inc_dnssec_bogus();
+                    if self.dnssec_log_bogus {
+                        warn!(name=%sanitize_dns_name(qname), "DNSSEC bogus — SERVFAIL (NSEC denial)");
+                    }
+                }
+
+                let rcode = match &e {
+                    NetError::Dns(DnsError::NoRecordsFound(NoRecords { response_code, .. })) => {
+                        debug!(name=%sanitize_dns_name(qname), ?response_code, "no records from resolver");
+                        *response_code
+                    }
+                    _ => {
+                        if !is_dnssec_bogus {
+                            warn!(name=%sanitize_dns_name(qname), err=%e, "resolver error → SERVFAIL");
+                        }
+                        ResponseCode::ServFail
+                    }
+                };
+                let err_action = match rcode {
+                    ResponseCode::NXDomain => { self.stats.inc_nxdomain(); LogAction::Nxdomain }
+                    ResponseCode::ServFail => { self.stats.inc_servfail(); LogAction::Servfail }
+                    ResponseCode::Refused  => { self.stats.inc_refused();  LogAction::Refused  }
+                    _                      => LogAction::Servfail,
+                };
+                self.record_query(client_ip, qname, qtype, rcode, err_action, start);
+                send_error(request, response_handle, rcode).await
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl RequestHandler for RunboundHandler {
     async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
-        mut response_handle: R,
+        response_handle: R,
     ) -> ResponseInfo {
         let start = Instant::now();
 
@@ -245,200 +446,15 @@ impl RequestHandler for RunboundHandler {
         debug!(%client_ip, name=%sanitize_dns_name(qname), type=%qtype, "DNS query");
 
         // ── 4. Local zones ──────────────────────────────────────────────
-        let zones_snap = self.zones.load();
-        let zone_action = zones_snap.find(qname);
-
-        match zone_action {
-            Some(ZoneAction::Refuse) => {
-                debug!(name=%sanitize_dns_name(qname), "local-zone REFUSED");
-                self.stats.inc_blocked(); self.stats.inc_refused();
-                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Blocked, start);
-                return send_error(request, response_handle, ResponseCode::Refused).await;
-            }
-            Some(ZoneAction::NxDomain) => {
-                debug!(name=%sanitize_dns_name(qname), "local-zone NXDOMAIN");
-                self.stats.inc_blocked(); self.stats.inc_nxdomain();
-                self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Blocked, start);
-                return send_error(request, response_handle, ResponseCode::NXDomain).await;
-            }
-            Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
-                let records = zones_snap.local_records(qname, qtype);
-
-                if !records.is_empty() {
-                    debug!(name=%sanitize_dns_name(qname), count = records.len(), "local-data answer");
-                    let mut metadata = Metadata::response_from_request(&request.metadata);
-                    metadata.authoritative = true;
-                    let builder = MessageResponseBuilder::from_message_request(request);
-                    let response = builder.build(
-                        metadata,
-                        records,
-                        std::iter::empty(),
-                        std::iter::empty(),
-                        std::iter::empty(),
-                    );
-                    self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
-                    return response_handle.send_response(response).await
-                        .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
-                }
-
-                // CNAME chain following (RFC 1034 §3.6.2):
-                // If the name exists but has no records of the requested type,
-                // check for a CNAME and follow the chain within local zones.
-                // A query for alias.local A → CNAME tardis.local → A 192.168.1.1
-                // should return both the CNAME and the A record in one answer.
-                if qtype != RecordType::CNAME {
-                    let chain = follow_local_cname(&zones_snap, qname, qtype);
-                    if !chain.is_empty() {
-                        let mut metadata = Metadata::response_from_request(&request.metadata);
-                        metadata.authoritative = true;
-                        let builder = MessageResponseBuilder::from_message_request(request);
-                        let response = builder.build(
-                            metadata,
-                            chain.iter(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                        );
-                        self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
-                        return response_handle.send_response(response).await
-                            .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
-                    }
-                }
-
-                // RFC 1035 §3.7 / RFC 2308: NODATA vs NXDOMAIN
-                if zones_snap.name_has_records(qname) {
-                    debug!(name=%sanitize_dns_name(qname), %qtype, "local-zone NODATA");
-                    let mut metadata = Metadata::response_from_request(&request.metadata);
-                    metadata.authoritative = true;
-                    let builder = MessageResponseBuilder::from_message_request(request);
-                    let response = builder.build(
-                        metadata,
-                        std::iter::empty::<&Record>(),
-                        std::iter::empty(),
-                        std::iter::empty(),
-                        std::iter::empty(),
-                    );
-                    self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
-                    return response_handle.send_response(response).await
-                        .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
-                }
-                debug!(name=%sanitize_dns_name(qname), "local-zone NXDOMAIN (name not found)");
-                self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Nxdomain, start);
-                return send_error(request, response_handle, ResponseCode::NXDomain).await;
-            }
-            None => {}
-        }
-        drop(zones_snap);
+        let response_handle = match self.handle_local_zone(
+            request, response_handle, qname, qtype, client_ip, start,
+        ).await {
+            Ok(info) => return info,
+            Err(rh)  => rh,
+        };
 
         // ── 5. Recursive resolution ─────────────────────────────────────
-        match self.resolver.load_full().lookup(Name::from(qname), qtype).await {
-            Ok(lookup) => {
-                // DNS rebinding protection: SERVFAIL if any A/AAAA record falls
-                // within a configured private-address range (Unbound compatible).
-                if !self.private_addrs.is_empty() {
-                    for rec in lookup.answers() {
-                        let private_ip = match &rec.data {
-                            RData::A(a)    => Some(IpAddr::V4(a.0)),
-                            RData::AAAA(a) => Some(IpAddr::V6(a.0)),
-                            _ => None,
-                        };
-                        if let Some(ip) = private_ip {
-                            if self.private_addrs.contains(ip) {
-                                warn!(name=%sanitize_dns_name(qname), %ip, "private-address block → SERVFAIL");
-                                self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
-                                return send_error(request, response_handle, ResponseCode::ServFail).await;
-                            }
-                        }
-                    }
-                }
-
-                let ttl_cap = self.cache_max_ttl;
-                let records: Vec<Record> = lookup.answers().iter().map(|r| {
-                    let mut r = r.clone();
-                    if r.ttl > ttl_cap { r.ttl = ttl_cap; }
-                    r
-                }).collect();
-
-                // DNSSEC: check for bogus proof on individual records in success path.
-                // Bogus = RRSIG chain failed validation → SERVFAIL.
-                // Secure = at least one RRSIG present and valid.
-                // Insecure = no RRSIG (delegation proved unsigned by NSEC/NSEC3).
-                if self.dnssec_enabled {
-                    let has_bogus = records.iter().any(|r| r.proof.is_bogus());
-                    if has_bogus {
-                        self.stats.inc_dnssec_bogus();
-                        if self.dnssec_log_bogus {
-                            warn!(name=%sanitize_dns_name(qname), "DNSSEC bogus — SERVFAIL");
-                        }
-                        self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
-                        return send_error(request, response_handle, ResponseCode::ServFail).await;
-                    }
-                    let has_rrsig = records.iter().any(|r| r.record_type() == RecordType::RRSIG);
-                    if has_rrsig {
-                        self.stats.inc_dnssec_secure();
-                    } else {
-                        self.stats.inc_dnssec_insecure();
-                    }
-                }
-
-                debug!(name=%sanitize_dns_name(qname), %qtype, count = records.len(), "resolved");
-                let mut metadata = Metadata::response_from_request(&request.metadata);
-                metadata.recursion_available = true;
-                let builder = MessageResponseBuilder::from_message_request(request);
-                let response = builder.build(
-                    metadata,
-                    records.iter(),
-                    std::iter::empty(),
-                    std::iter::empty(),
-                    std::iter::empty(),
-                );
-                self.stats.inc_forwarded();
-                let fwd_us = start.elapsed().as_micros() as u64;
-                self.stats.record_forward(fwd_us);
-                let fwd_action = if fwd_us < CACHE_HIT_THRESHOLD_US {
-                    LogAction::Cached
-                } else {
-                    LogAction::Forwarded
-                };
-                self.record_query(client_ip, qname, qtype, ResponseCode::NoError, fwd_action, start);
-                response_handle.send_response(response).await
-                    .unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) })
-            }
-            Err(e) => {
-                // DNSSEC bogus via NSEC denial: the resolver returned a validated
-                // NSEC/NSEC3 proof that the record does not exist → SERVFAIL.
-                let is_dnssec_bogus = self.dnssec_enabled
-                    && matches!(&e, NetError::Dns(DnsError::Nsec { proof, .. }) if proof.is_bogus());
-
-                if is_dnssec_bogus {
-                    self.stats.inc_dnssec_bogus();
-                    if self.dnssec_log_bogus {
-                        warn!(name=%sanitize_dns_name(qname), "DNSSEC bogus — SERVFAIL (NSEC denial)");
-                    }
-                }
-
-                let rcode = match &e {
-                    NetError::Dns(DnsError::NoRecordsFound(NoRecords { response_code, .. })) => {
-                        debug!(name=%sanitize_dns_name(qname), ?response_code, "no records from resolver");
-                        *response_code
-                    }
-                    _ => {
-                        if !is_dnssec_bogus {
-                            warn!(name=%sanitize_dns_name(qname), err=%e, "resolver error → SERVFAIL");
-                        }
-                        ResponseCode::ServFail
-                    }
-                };
-                let err_action = match rcode {
-                    ResponseCode::NXDomain => { self.stats.inc_nxdomain(); LogAction::Nxdomain }
-                    ResponseCode::ServFail => { self.stats.inc_servfail(); LogAction::Servfail }
-                    ResponseCode::Refused  => { self.stats.inc_refused();  LogAction::Refused  }
-                    _                      => LogAction::Servfail,
-                };
-                self.record_query(client_ip, qname, qtype, rcode, err_action, start);
-                send_error(request, response_handle, rcode).await
-            }
-        }
+        self.resolve_upstream(request, response_handle, qname, qtype, client_ip, start).await
     }
 }
 

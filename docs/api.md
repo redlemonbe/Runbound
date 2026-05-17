@@ -41,6 +41,12 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/help
 Local DNS records — equivalent to `local-data` in the config file, but live.
 Changes take effect immediately. No restart required.
 
+> **Write performance:** The zone store uses a copy-on-write design (`ArcSwap`). Each
+> `POST` or `DELETE` clones the full zone map, applies the change, then atomically
+> swaps the pointer. Active DNS queries keep their old snapshot until they finish;
+> new queries immediately see the updated zone. Read throughput is unaffected during
+> writes — there are no locks on the hot query path.
+
 #### `GET /dns`
 
 List all local DNS entries.
