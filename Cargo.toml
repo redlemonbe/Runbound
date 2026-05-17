@@ -1,6 +1,6 @@
 [package]
 name = "runbound"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "PolyForm-Noncommercial-1.0.0"
@@ -16,6 +16,8 @@ categories = ["network-programming", "command-line-utilities"]
 tokio = { version = "1", features = ["full"] }
 
 # DNS engine — DoT / DoH / DoQ / DNSSEC
+# 0.26.1 fixes RUSTSEC-2026-0119 (O(n²) compression), RUSTSEC-2026-0037 (quinn DoS),
+# RUSTSEC-2025-0009 (ring AES panic), RUSTSEC-2026-0104/0098/0099 (rustls-webpki).
 hickory-server   = { version = "0.24", features = [
     "dnssec-ring",
     "dns-over-rustls",

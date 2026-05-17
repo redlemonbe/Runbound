@@ -5,6 +5,69 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.3.3] — 2026-05-17
+
+### Fixed
+
+- **Bug 1 — `POST /rotate-key` silent no-op** (`src/api/mod.rs`)  
+  The handler was reading `RUNBOUND_API_KEY` from the process environment,
+  which is frozen at startup — updating the systemd EnvironmentFile without
+  a restart had no effect. New contract: caller sends `{"new_key":"<32+ chars>"}`
+  in the JSON body. Validates minimum length (32 chars), rejects control characters,
+  atomically swaps the in-memory key, and persists to `base_dir/api.key` (chmod 600).
+
+- **Bug 2 — CHAOS class queries returned NOERROR** (`src/dns/server.rs`)  
+  The `DNSClass::CH` enum comparison could fail when hickory parsed the class
+  as `Unknown(3)` for some query variants, bypassing the filter. Fixed by
+  comparing the numeric wire value directly (`u16::from(class) == 3`).
+  Response changed from REFUSED to NOTIMP per RFC 5358 §4.
+
+- **Bug 3 — Payloads ≥512 KB dropped TCP connection instead of HTTP 413** (`src/api/mod.rs`)  
+  `tower_http::RequestBodyLimitLayer` drops the TCP connection for very large
+  payloads instead of returning 413. Replaced with `axum::extract::DefaultBodyLimit::max()`
+  which enforces the limit at the stream level and always sends a proper 413
+  before reading the body into RAM, regardless of payload size.
+
+- **Bug 4 — Negative TTL returned plain-text 422 instead of JSON** (`src/api/mod.rs`)  
+  TTL field changed from `u32` to `i64` so serde accepts negative values
+  without aborting deserialization. Explicit validation now returns
+  `{"error":"INVALID_TTL","details":"TTL must be between 0 and 2147483647"}` HTTP 422.
+
+### Security (audit)
+
+- **[HIGH] Sync Bearer comparison was not constant-time** (`src/sync.rs`)  
+  `auth != format!(...)` string comparison exits early on the first differing
+  byte — a timing oracle for the sync-key length and content. Replaced with
+  `subtle::ConstantTimeEq`.
+
+- **[MEDIUM] Feed URLs with embedded credentials accepted** (`src/feeds/mod.rs`)  
+  `https://user:pass@host/path` would strip credentials for the SSRF host check
+  but store the URL with credentials in the config. Now explicitly rejected with
+  a clear error message.
+
+- **[MEDIUM] `rate-limit: 18446744073709551615` silently disabled rate limiting** (`src/config/parser.rs`)  
+  Extreme values parsed as `u64::MAX` effectively disable the rate limiter.
+  Capped at 1,000,000 rps.
+
+- **[LOW] `unwrap()` on production RwLock/Mutex** (`src/api/mod.rs`, `src/store.rs`)  
+  `upstreams.read().unwrap()`, `log_buffer.lock().unwrap()`, and two
+  `path.parent().unwrap()` calls replaced with explicit error handling that
+  returns HTTP 500 JSON or propagates `AppError::Internal`.
+
+### Audit findings (acknowledged, not fixed — target v0.4.0)
+
+Six CVEs in `hickory-proto 0.24` transitive dependencies require upgrading
+to `hickory 0.26`. The migration breaks ~50 API sites across the codebase
+(rustls 0.21→0.23, renamed types, restructured modules) and is tracked for
+v0.4.0. See `audit.toml` for per-CVE exposure analysis and mitigations.
+
+- RUSTSEC-2026-0119 — hickory-proto: O(n²) name compression (CPU exhaustion)
+- RUSTSEC-2026-0037 — quinn-proto: DoS (CRITICAL — mitigate: firewall 853/UDP)
+- RUSTSEC-2025-0009 — ring: AES panic with overflow checks (release builds unaffected)
+- RUSTSEC-2026-0104/98/99 — rustls-webpki: CRL/name constraint issues (no exploitable path)
+
+---
+
 ## [0.3.2] — 2026-05-17
 
 ### Added
