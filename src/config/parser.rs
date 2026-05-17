@@ -34,6 +34,10 @@ pub struct TlsConfig {
     pub doq_port: Option<u16>,
     /// Hostname sent in TLS SNI / DoH path
     pub hostname: Option<String>,
+    /// Path to CA cert PEM for DoT mutual TLS client authentication (HIGH-08).
+    /// When set, DoT clients must present a certificate signed by this CA.
+    /// DoH and DoQ are unaffected (they authenticate via the application layer).
+    pub dot_client_auth_ca: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,12 +198,20 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
     Ok(cfg)
 }
 
+/// LOW-03: cap on local-zone / local-data to prevent DoS via pathological configs.
+const MAX_LOCAL_ZONES: usize = 1_000_000;
+const MAX_LOCAL_DATA:  usize = 1_000_000;
+
 fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno: usize) {
     match key {
         "interface"      => cfg.interfaces.push(val.to_string()),
         "port"           => cfg.port = val.parse().unwrap_or(53),
         "access-control" => cfg.access_control.push(val.to_string()),
         "local-zone"     => {
+            if cfg.local_zones.len() >= MAX_LOCAL_ZONES {
+                warn!("Line {}: local-zone limit ({MAX_LOCAL_ZONES}) reached — entry ignored", lineno);
+                return;
+            }
             // Format: "name." type  OR  name. type  (with or without quotes)
             // Strip optional leading quote, then split name from type
             let raw = val.trim_start_matches('"');
@@ -216,6 +228,10 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
             }
         }
         "local-data"     => {
+            if cfg.local_data.len() >= MAX_LOCAL_DATA {
+                warn!("Line {}: local-data limit ({MAX_LOCAL_DATA}) reached — entry ignored", lineno);
+                return;
+            }
             // Format: "name. TYPE value"  (entire RR is quoted)
             let rr = val.trim_matches('"').trim().to_string();
             if !rr.is_empty() {
@@ -236,6 +252,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "https-port" => cfg.tls.doh_port  = val.parse().ok(),
         "quic-port"  => cfg.tls.doq_port  = val.parse().ok(),
         "tls-cert-hostname" | "server-hostname" => cfg.tls.hostname = Some(val.trim_matches('"').to_string()),
+        "dot-client-auth-ca" => cfg.tls.dot_client_auth_ca = Some(val.trim_matches('"').to_string()),
         // Runbound-specific extensions (not in stock Unbound)
         "rate-limit"    => cfg.rate_limit = val.parse::<u64>().ok()
                                .map(|v| v.min(1_000_000)), // cap at 1M rps — u64::MAX silently disables

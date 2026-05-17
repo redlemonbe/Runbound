@@ -62,7 +62,7 @@ impl LocalZoneSet {
         let mut record_map: HashMap<Name, Vec<Record>> = HashMap::new();
         for d in data {
             if let Some(rec) = parse_local_data(&d.rr) {
-                let name = rec.name().clone();
+                let name = rec.name.clone();
                 map.entry(name.clone()).or_insert(ZoneAction::Static);
                 record_map.entry(name).or_default().push(rec);
             }
@@ -272,11 +272,5 @@ pub fn parse_local_data(rr: &str) -> Option<Record> {
         _ => return None,
     };
 
-    let mut record = Record::new();
-    record
-        .set_name(name)
-        .set_rr_type(rdata.record_type())
-        .set_data(Some(rdata))
-        .set_ttl(ttl);
-    Some(record)
+    Some(Record::from_rdata(name, ttl, rdata))
 }

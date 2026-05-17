@@ -5,6 +5,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.0] — 2026-05-17
+
+### Security — all open audit findings closed
+
+- **HIGH-06 — HMAC-SHA256 store integrity** (`src/integrity.rs`, `src/store.rs`, `src/feeds/mod.rs`)  
+  Set `RUNBOUND_STORE_KEY` (env var, hex 32+ bytes or UTF-8) to enable.  
+  Every JSON write produces a sidecar `.mac` file (`HMAC-SHA256(content, key)`, hex).  
+  On load: missing `.mac` with key set → WARN; HMAC mismatch → ERROR, load refused.  
+  Domain caches are regeneratable: mismatch discards cache with WARN and triggers re-fetch.
+
+- **HIGH-07 — hickory 0.24 → 0.26, rustls 0.21 → 0.23** (`Cargo.toml`, `src/dns/server.rs`, `src/sync.rs`)  
+  Resolves six CVEs: RUSTSEC-2026-0119, -0037, -2025-0009, -2026-0104, -0098, -0099.  
+  rustls 0.23 defaults to TLS 1.3 + approved cipher suites (BSI TR-02102 / NIST SP 800-52 Rev 2).  
+  DoQ uses `builder_with_protocol_versions(&[&TLS13])` — Quinn enforces TLS 1.3 only.  
+  All `audit.toml` ignores removed.
+
+- **HIGH-08 — DoT mutual TLS** (`src/dns/server.rs`, `src/config/parser.rs`)  
+  New `dot-client-auth-ca:` directive. When set, `WebPkiClientVerifier` requires clients  
+  to present a certificate signed by the configured CA. DoH and DoQ unaffected.
+
+- **MED-03 — SSRF at TCP connection layer** (`src/feeds/mod.rs`)  
+  `SsrfSafeDnsResolver` implements `reqwest::dns::Resolve`.  
+  Every hostname resolution by the feed HTTP client filters private/loopback addresses  
+  before the TCP connection is established — independent of the system resolver.
+
+- **MED-06 — qname log injection** (`src/dns/server.rs`)  
+  `sanitize_dns_name()` replaces ASCII control chars (0x00–0x1F, 0x7F) and non-ASCII  
+  bytes with `?` before any structured log emission. Prevents log injection via crafted  
+  DNS names in JSON-mode logging (Elasticsearch, Splunk consumers).
+
+- **LOW-03 — Config entry cap** (`src/config/parser.rs`)  
+  `MAX_LOCAL_ZONES = MAX_LOCAL_DATA = 1_000_000`. Entries above the cap are dropped  
+  with a WARN. Prevents startup OOM from pathological configs.
+
+### Changed
+
+- `hickory-server`, `hickory-resolver`, `hickory-proto` bumped to `0.26`.
+- `rustls` bumped to `0.23`, `rustls-pemfile` to `2`, `tokio-rustls` to `0.26`.
+- `TokioAsyncResolver` renamed to `TokioResolver` (hickory 0.26 API).
+- `ServerFuture` renamed to `Server`; `register_listener` gains `response_buffer_size` arg.
+- `MessageResponseBuilder` moved to `hickory_server::zone_handler`.
+- `RequestHandler::handle_request` gains `T: Time` type parameter (hickory 0.26).
+- `ResolverConfig::new()` → `from_parts(None, vec![], vec![])`.
+- `record.name()` → `record.name` field access (hickory 0.26 public fields).
+- `Record::new()` → `Record::from_rdata(name, ttl, rdata)`.
+- rustls `Certificate`/`PrivateKey` → `pki_types::{CertificateDer, PrivateKeyDer}`.
+- `ServerCertVerifier` → `rustls::client::danger::ServerCertVerifier`.
+- `verify_server_cert` no longer takes `_scts`; uses `UnixTime` instead of `SystemTime`.
+
+---
+
 ## [0.3.5] — 2026-05-17
 
 ### Fixed
