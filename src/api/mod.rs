@@ -1356,8 +1356,6 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
 
 // ── POST /rotate-key ───────────────────────────────────────────────────────
 
-// ── POST /rotate-key ───────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 struct RotateKeyRequest {
     new_key: String,

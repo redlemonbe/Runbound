@@ -75,7 +75,7 @@ impl SyncJournal {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut q = self.events.lock().unwrap();
+        let mut q = self.events.lock().expect("sync: events mutex poisoned");
         if q.len() >= JOURNAL_CAPACITY {
             q.pop_front();
         }
@@ -86,7 +86,7 @@ impl SyncJournal {
     /// Returns events with seq >= since.
     /// Returns None when `since` predates the ring buffer — slave must do a full sync.
     pub fn delta(&self, since: u64) -> Option<Vec<SyncEvent>> {
-        let q = self.events.lock().unwrap();
+        let q = self.events.lock().expect("sync: events mutex poisoned");
         if let Some(oldest) = q.front() {
             if since < oldest.seq {
                 return None; // 410 Gone — too far behind
@@ -249,7 +249,7 @@ impl TofuVerifier {
         Arc::new(Self { captured: Mutex::new(None) })
     }
     fn take_fingerprint(&self) -> Option<String> {
-        self.captured.lock().unwrap().clone()
+        self.captured.lock().expect("sync: TOFU captured mutex poisoned").clone()
     }
 }
 
@@ -263,7 +263,7 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let fp = hex::encode(Sha256::digest(end_entity));
-        *self.captured.lock().unwrap() = Some(fp);
+        *self.captured.lock().expect("sync: TOFU captured mutex poisoned") = Some(fp);
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
