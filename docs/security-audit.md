@@ -649,9 +649,68 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 
 ---
 
+### Pentest v0.4.4 Findings (external pentest on v0.4.4)
+
+| ID | Severity | Component | Status |
+|---|---|---|---|
+| NEW-HIGH | 🔴 HIGH | API auth | ✅ Fixed v0.4.5 — timing oracle eliminated (pre-auth sleep + async side effects) |
+| SEC-02 | 🟡 MEDIUM | API/DNS | ✅ Confirmed false positive — integration tests added; see analysis below |
+| SEC-04 | 🟢 LOW | API | ✅ Fixed v0.4.5 — 411 for JSON POST without Content-Length (SEC-04 partial close) |
+| NEW-LOW | 🟢 LOW | HTTP | ℹ️ Acknowledged — hyper-level HTTP parse rejection; not addressable in application code |
+
+#### NEW-HIGH — Timing oracle (+183 ms on "nearly correct" key)
+
+**Root cause:** The brute-force brake (`tokio::time::sleep(500 ms)` at ≥ 50 failures) ran
+*after* `constant_time_eq` on the failure path, i.e. on the critical path before the 401
+response. Two channels of leakage:
+1. The sleep itself — applied only on failure, after the comparison. Pentest measured 184 ms
+   (consistent with a sleep triggered at exactly failure #50, then cancelled by the rate limiter
+   or measured mid-sleep).
+2. The `warn!()` tracing call at multiples of 10 failures — file I/O on the handler task.
+
+**Fix:** Pre-auth brake — `AUTH_FAILURES.load()` is checked *before* `constant_time_eq`; the
+500 ms sleep applies equally to all requests (correct key, wrong key, any key) when failures
+are high. The post-comparison side effects (audit event, warn!) are moved to `tokio::spawn`
+so the 401 is returned immediately with no timing signal.
+
+#### SEC-02 — Domain name > 253 chars (confirmed false positive)
+
+The pentest reported "254 chars → HTTP 201". Investigation + added integration tests
+(`dns_name_254_chars_is_rejected`, `blacklist_name_254_chars_is_rejected`) confirm that:
+
+- A true 254-char name (no trailing dot) → HTTP **400** ✓
+- The pentest used a 253-char name + trailing FQDN dot (= 254 bytes submitted) → HTTP 201,
+  which is **correct**: the trailing dot is stripped before the 253-char check per RFC 1035 §2.3.4.
+
+This is the same false positive identified in the military audit (v0.4.3 SEC-02). The added
+HTTP-level integration tests document and prove the boundary end-to-end.
+
+#### SEC-04 — Chunked body drop without 413 (partial close)
+
+The 412KB/5 MB bodies without `Content-Length` (chunked transfer encoding) caused
+`DefaultBodyLimit` to drop the TCP connection instead of returning 413. The Content-Length
+pre-check in the middleware only applies when the header is present.
+
+**Fix:** JSON POST requests without `Content-Length` now return **411 Length Required**
+before reaching rate limiting or auth. Non-JSON POST endpoints (`/reload`,
+`/feeds/update`, `/feeds/:id/update`) are unaffected (no `Content-Type: application/json`).
+
+#### NEW-LOW — UUID null byte → TCP drop
+
+A null byte (`\x00`) in the HTTP request path causes hyper to reject the request at the
+HTTP/1.1 parsing layer — before any application middleware runs. The connection is dropped
+with no response rather than returning 400. This is **inherent hyper behaviour**: raw null bytes
+are invalid in HTTP request targets per RFC 9110 §4.1. Fixing this would require patching the
+HTTP library or adding a pre-parse TCP stream filter — both out of scope for this API.
+
+**Impact:** LOW — affects only malformed/buggy clients (no well-behaved HTTP client sends raw
+null bytes in a URI). No data is leaked; the client sees a connection reset.
+
+---
+
 ## Open Findings
 
-All findings from all audit cycles are resolved as of v0.4.3.
+All findings from all audit cycles are resolved as of v0.4.5.
 No open findings remain.
 
 ---
