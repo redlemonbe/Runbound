@@ -1,55 +1,54 @@
-# RGPD / GDPR
+# GDPR
 
-## Responsabilités
+## Responsibilities
 
-Runbound est un logiciel. Son auteur est **éditeur** au sens du RGPD —
-il ne traite aucune donnée personnelle de vos utilisateurs.
+Runbound is software. Its author is a **data processor vendor** under the GDPR —
+it does not process any personal data belonging to your users.
 
-L'**opérateur** qui déploie Runbound est le responsable de traitement.
-Il lui appartient de définir la base légale, la durée de conservation,
-et les procédures d'exercice des droits.
+The **operator** who deploys Runbound is the data controller.
+It is the operator's responsibility to define the legal basis, retention periods,
+and procedures for handling data subject requests.
 
-## Données traitées par Runbound
+## Data processed by Runbound
 
-| Donnée | Où | Durée | Configurable |
-|--------|----|-------|--------------|
-| IP source des requêtes DNS | Ring buffer RAM (`/logs`) | Jusqu'au redémarrage ou rotation | `log-retention`, `log-client-ip` |
-| Domaines interrogés | Ring buffer RAM (`/logs`) | Jusqu'au redémarrage ou rotation | `log-retention` |
-| IP source des appels API | Audit log | Jusqu'à rotation manuelle | `audit-log-path` |
-| Clé API (hash) | Mémoire uniquement | Durée du process | — |
+| Data | Where | Duration | Configurable |
+|------|-------|----------|--------------|
+| Source IP of DNS queries | In-memory ring buffer (`/logs`) | Until restart or rotation | `log-retention`, `log-client-ip` |
+| Queried domain names | In-memory ring buffer (`/logs`) | Until restart or rotation | `log-retention` |
+| Source IP of API calls | Audit log | Until manual rotation | `audit-log-path` |
+| API key (hashed) | Memory only | Duration of the process | — |
 
-Runbound **ne stocke pas** de données DNS sur disque par défaut.
-Le `logfile:` est désactivé par défaut.
+Runbound **does not persist** DNS data to disk by default.
+The `logfile:` directive is disabled by default.
 
-## Recommandations pour la conformité
+## Compliance recommendations
 
-**Minimisation :** désactiver `/logs` si vous n'en avez pas l'usage :
+**Data minimisation:** disable `/logs` if not needed:
 
 ```
 log-retention: 0
 ```
 
-**Pseudonymisation :** masquer les IPs clientes :
+**Pseudonymisation:** mask client IPs:
 
 ```
 log-client-ip: no
 ```
 
-> Ces deux directives nécessitent un **redémarrage** pour prendre effet
-> (le SIGHUP ne recharge que les zones DNS, pas le ring buffer).
+> Both directives require a **restart** to take effect
+> (SIGHUP only reloads DNS zones, not the ring buffer).
 
-
-**Droit à l'oubli :** vider le ring buffer à la demande :
+**Right to erasure:** flush the ring buffer on demand:
 
 ```
 curl -X DELETE http://localhost:8081/logs -H "Authorization: Bearer $KEY"
 ```
 
-**Logfile disque :** si vous activez `logfile:`, mettez en place une
-rotation avec `logrotate` et une durée de conservation explicite.
+**Disk logfile:** if you enable `logfile:`, set up rotation with `logrotate`
+and define an explicit retention period.
 
-## Transferts hors UE
+## Transfers outside the EU
 
-Les feeds de blocklists (Hagezi, etc.) sont téléchargés depuis des CDN
-internationaux. Aucune donnée personnelle n'est transmise lors de ces
-téléchargements — seule une requête HTTP GET sans payload est émise.
+Blocklist feeds (Hagezi, etc.) are downloaded from international CDNs.
+No personal data is transmitted during these downloads — only a plain HTTP GET
+request with no payload is issued.
