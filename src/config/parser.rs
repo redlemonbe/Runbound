@@ -67,6 +67,14 @@ pub struct UnboundConfig {
     /// Log WARN for every DNSSEC-bogus query when dnssec-validation is enabled.
     pub dnssec_log_bogus: bool,
 
+    // ── Audit log ─────────────────────────────────────────────────────────────
+    /// Enable immutable HMAC-chained audit log. Default: false.
+    pub audit_log: bool,
+    /// Path to audit log file. Default: base_dir/audit.log.
+    pub audit_log_path: Option<String>,
+    /// HMAC-SHA256 key (hex or raw). Auto-generated if empty.
+    pub audit_log_hmac_key: Option<String>,
+
     // ── Slave/master sync (Runbound extensions) ────────────────────────────
     /// Node role: "master" (default) or "slave".
     pub mode: String,
@@ -223,6 +231,9 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         }
         "dnssec-validation" => cfg.dnssec_validation = val.trim_matches('"') == "yes",
         "dnssec-log-bogus"  => cfg.dnssec_log_bogus  = val.trim_matches('"') == "yes",
+        "audit-log"          => cfg.audit_log          = val.trim_matches('"') == "yes",
+        "audit-log-path"     => cfg.audit_log_path     = Some(val.trim_matches('"').to_string()),
+        "audit-log-hmac-key" => cfg.audit_log_hmac_key = Some(val.trim_matches('"').to_string()),
         // Slave/master sync directives
         "mode"          => cfg.mode          = val.trim_matches('"').to_string(),
         "sync-port"     => cfg.sync_port     = val.parse().ok(),

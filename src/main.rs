@@ -1,3 +1,4 @@
+mod audit;
 mod config;
 mod dns;
 mod api;
@@ -95,6 +96,17 @@ async fn main() -> Result<()> {
         forward_zones = unbound_cfg.forward_zones.len(),
         "Config loaded"
     );
+
+    // ── Audit log ─────────────────────────────────────────────────────────
+    let audit_log_path = unbound_cfg.audit_log_path.as_deref()
+        .map(std::path::PathBuf::from);
+    let audit = audit::init(
+        unbound_cfg.audit_log,
+        audit_log_path,
+        unbound_cfg.audit_log_hmac_key.clone(),
+        base_dir.clone(),
+    );
+    audit.send(audit::AuditEvent::Startup);
 
     // ── Build in-memory zone set ───────────────────────────────────────────
     let zone_set = build_zone_set(&unbound_cfg);
@@ -235,6 +247,7 @@ async fn main() -> Result<()> {
         sync_journal,
         slave_mode:   unbound_cfg.is_slave(),
         base_dir:     Arc::new(base_dir),
+        audit:        audit.clone(),
     };
     let app = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
@@ -291,7 +304,9 @@ async fn main() -> Result<()> {
     };
 
     // ── DNS server (blocks until shutdown) ────────────────────────────────
-    dns::run_dns_server(&unbound_cfg, zones, rate_limiter, acl, global_stats, log_buffer).await
+    let result = dns::run_dns_server(&unbound_cfg, zones, rate_limiter, acl, global_stats, log_buffer).await;
+    audit.send(audit::AuditEvent::Shutdown);
+    result
 }
 
 fn print_help() {
