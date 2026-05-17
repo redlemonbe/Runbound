@@ -131,6 +131,21 @@ api-port: 9090       # optional — default 8081
 The environment variable takes priority over the config file value.  
 The API always binds to `127.0.0.1` (localhost only) regardless of `api-port`.
 
+### DNSSEC validation
+
+```
+dnssec-validation: no    # default — trust upstream AD bit (forwarder mode)
+dnssec-validation: yes   # local re-validation (recursive mode only)
+```
+
+Mirrors Unbound's `dnssec-validation` directive. When set to `yes`, hickory-resolver
+performs local DNSSEC re-validation of every response.
+
+**Warning:** Only enable in full recursive deployments where upstream resolvers return
+complete RRSIG/DNSKEY chains. In forwarder mode (the typical setup with Cloudflare or
+Quad9), enabling this causes SERVFAIL on every signed domain because forwarders strip
+DNSSEC records. Default is `no` — trust the upstream AD bit.
+
 ### Cache TTL cap
 
 ```

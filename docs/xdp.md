@@ -107,13 +107,13 @@ in the XDP worker. There is no security bypass.
 ## Verify XDP is active
 
 ```bash
-# Check the stats endpoint
-curl -s http://localhost:8081/stats -H "Authorization: Bearer $RUNBOUND_API_KEY" \
-  | jq .xdp_active
-
-# Or check logs at startup
+# Check logs at startup — XDP activation is logged there
 journalctl -u runbound | grep -i xdp
 # → XDP fast path active on eth0 (driver mode)
+
+# Throughput verification: XDP will push the /stats total counter much faster
+# than standard sockets under the same load
+curl -s http://localhost:8081/stats -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
 ---
