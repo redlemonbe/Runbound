@@ -13,7 +13,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::QueryRejection},
     http::{HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -41,6 +41,42 @@ use crate::upstreams::SharedUpstreams;
 /// Max TTL for API-created DNS entries (86400 s = 24 h).
 /// Prevents TTL-based cache persistence attacks and operator mistakes.
 const MAX_API_TTL: u32 = 86_400;
+
+// ── Custom JSON body extractor ─────────────────────────────────────────────
+// axum's default Json<T> extractor returns a plain-text 422/400 body on
+// deserialization failure (Q-01, Q-02, Q-03). ApiJson<T> wraps it and always
+// returns a structured JSON error body so clients can parse the failure
+// programmatically.
+
+struct ApiJson<T>(T);
+
+#[axum::async_trait]
+impl<T, S> axum::extract::FromRequest<S> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, axum::Json<serde_json::Value>);
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(val)) => Ok(ApiJson(val)),
+            Err(rejection) => {
+                use axum::extract::rejection::JsonRejection;
+                let (status, msg) = match rejection {
+                    JsonRejection::JsonDataError(e)        => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
+                    JsonRejection::JsonSyntaxError(e)      => (StatusCode::BAD_REQUEST,          e.to_string()),
+                    JsonRejection::MissingJsonContentType(e) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()),
+                    e                                      => (StatusCode::BAD_REQUEST,          e.to_string()),
+                };
+                Err((status, axum::Json(serde_json::json!({
+                    "error":   "INVALID_REQUEST",
+                    "details": msg
+                }))))
+            }
+        }
+    }
+}
 
 // ── API security constants ─────────────────────────────────────────────────
 
@@ -222,6 +258,21 @@ async fn security_middleware(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // ── 0. Body size pre-check (S-11) ────────────────────────────────
+    // DefaultBodyLimit fires at extraction time inside the handler, not here.
+    // A large body would therefore hit the rate limiter first and return 429
+    // instead of 413. Checking Content-Length early produces the correct 413
+    // for over-sized requests before the rate limit token is consumed.
+    if let Some(cl) = req.headers().get(axum::http::header::CONTENT_LENGTH) {
+        let len: usize = cl.to_str().unwrap_or("0").parse().unwrap_or(0);
+        if len > MAX_BODY_BYTES {
+            return (StatusCode::PAYLOAD_TOO_LARGE, axum::Json(serde_json::json!({
+                "error": "REQUEST_TOO_LARGE",
+                "details": format!("Body exceeds {} bytes", MAX_BODY_BYTES)
+            }))).into_response();
+        }
+    }
+
     // ── 1. Rate limiting ──────────────────────────────────────────────
     // VUL-04: Never trust X-Forwarded-For. The API is bound exclusively to
     // 127.0.0.1 so the real peer is always localhost. Accepting XFF would let
@@ -536,7 +587,7 @@ async fn list_dns_handler(State(_s): State<AppState>) -> impl IntoResponse {
 
 async fn add_dns_handler(
     State(s): State<AppState>,
-    JsonExtract(req): JsonExtract<AddDnsRequest>,
+    ApiJson(req): ApiJson<AddDnsRequest>,
 ) -> impl IntoResponse {
     // VUL-05: Reject malformed or dangerous names before any parsing.
     if let Err(e) = validate_dns_name(&req.name) {
@@ -562,6 +613,33 @@ async fn add_dns_handler(
             })));
         }
     }
+    // S-10: for record types where value is a domain name, validate it as such.
+    // validate_no_control_chars is not enough — it would accept a 300-char CNAME target.
+    match req.entry_type {
+        DnsType::CNAME | DnsType::NS | DnsType::PTR | DnsType::MX | DnsType::SRV => {
+            if let Some(ref v) = req.value {
+                if let Err(e) = validate_dns_name(v) {
+                    return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                        "error": "INVALID_VALUE", "details": e
+                    })));
+                }
+            }
+        }
+        DnsType::NAPTR => {
+            // replacement may be "." (no-replacement special case — RFC 2915 §2)
+            if let Some(ref r) = req.replacement {
+                if r != "." {
+                    if let Err(e) = validate_dns_name(r) {
+                        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                            "error": "INVALID_REPLACEMENT", "details": e
+                        })));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
     // RFC 2181 §8: TTL is a non-negative 32-bit integer; values outside
     // [0, 2^31-1] must be rejected with a uniform JSON error.
     const RFC2181_MAX_TTL: i64 = 2_147_483_647;
@@ -737,7 +815,7 @@ async fn list_blacklist_handler(State(_s): State<AppState>) -> impl IntoResponse
 
 async fn add_blacklist_handler(
     State(s): State<AppState>,
-    JsonExtract(req): JsonExtract<AddBlacklistRequest>,
+    ApiJson(req): ApiJson<AddBlacklistRequest>,
 ) -> impl IntoResponse {
     // VUL-05: Reject invalid domain names (empty, root zone, Unicode, etc.)
     if let Err(e) = validate_dns_name(&req.domain) {
@@ -981,9 +1059,17 @@ struct LogsParams {
 fn default_log_limit() -> usize { LOG_LIMIT_DEFAULT }
 
 async fn logs_handler(
-    State(s):          State<AppState>,
-    Query(params):     Query<LogsParams>,
+    State(s):      State<AppState>,
+    params_result: Result<Query<LogsParams>, QueryRejection>,
 ) -> Response {
+    let Query(params) = match params_result {
+        Ok(q) => q,
+        Err(e) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error":   "INVALID_PARAM",
+            "details": e.to_string()
+        }))).into_response(),
+    };
+
     if params.limit > LOG_LIMIT_MAX {
         return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
             "error":   "INVALID_PARAM",
@@ -1241,7 +1327,7 @@ struct RotateKeyRequest {
 
 async fn rotate_key_handler(
     State(s): State<AppState>,
-    JsonExtract(req): JsonExtract<RotateKeyRequest>,
+    ApiJson(req): ApiJson<RotateKeyRequest>,
 ) -> impl IntoResponse {
     // Require at least 32 bytes of entropy (64 hex chars) — shorter keys are
     // statistically weak and likely copy-paste mistakes.

@@ -5,6 +5,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.1] — 2026-05-17
+
+### Fixed — v0.4.0 audit follow-up (all findings closed)
+
+- **BUG-01 BLOCKING — Sync HTTPS server panic** (`src/main.rs`)  
+  rustls 0.23 panics when `ServerConfig::builder()` is called without a default
+  `CryptoProvider` installed. Added `rustls::crypto::ring::default_provider().install_default().ok()`
+  early in `main()`. Port 8082 now opens; HA master/slave sync is functional.
+
+- **S-10 MEDIUM — CNAME/MX/NS/PTR/SRV target values not length-validated** (`src/api/mod.rs`)  
+  `validate_dns_name()` was only applied to the DNS `name` field and blacklist `domain`.
+  Target `value` fields for CNAME, MX, NS, PTR, SRV and the `replacement` field for
+  NAPTR are now validated as domain names (max 253 chars, labels max 63 chars, RFC 1035
+  character set). Rejects RFC-violating records with HTTP 400.
+
+- **S-11 LOW — 1 MB body returned HTTP 429 instead of 413** (`src/api/mod.rs`)  
+  `DefaultBodyLimit` fires at extraction time inside the handler, after the rate limiter.
+  Added `Content-Length` header pre-check at the top of `security_middleware` — oversized
+  requests are rejected with JSON HTTP 413 before the rate-limit token is consumed.
+
+- **Q-01/Q-02/Q-03 LOW — JSON deserialization failures returned plain-text 422** (`src/api/mod.rs`)  
+  axum's default `Json<T>` extractor returns a plain-text body on `JsonRejection`.
+  Replaced with a custom `ApiJson<T>` extractor (`#[axum::async_trait] FromRequest`)
+  that converts all `JsonRejection` variants to structured JSON:
+  `{"error": "INVALID_REQUEST", "details": "..."}`. Applied to `POST /dns`,
+  `POST /blacklist`, `POST /rotate-key`.
+
+- **Q-04 LOW — GET /logs?page=-1 returned plain-text 400** (`src/api/mod.rs`)  
+  `Query<LogsParams>` with `page: usize` would panic the extractor on negative input.
+  Changed to `Result<Query<LogsParams>, QueryRejection>` — parse failure returns
+  `{"error": "INVALID_PARAM", "details": "..."}` with HTTP 400.
+
+### Documentation
+
+- **`docs/security.md`** — Complete rewrite to reflect v0.4.0 architecture:
+  HMAC store integrity, connection-layer SSRF resolver, mutual TLS for DoT,
+  rustls 0.23 TLS stack, updated defensive-layers diagram, full audit table
+  through v0.4.1.
+
+---
+
 ## [0.4.0] — 2026-05-17
 
 ### Security — all open audit findings closed
