@@ -23,7 +23,7 @@
 | RAM | 8 GB |
 | OS | Linux 6.x (Debian 13) |
 | Network | loopback (`127.0.0.x`) |
-| Runbound version | 0.2.0 |
+| Runbound version | 0.3.x |
 | dnsperf version | 2.x |
 | Query type | A record, local zone (no forwarding) |
 

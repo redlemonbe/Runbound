@@ -486,6 +486,8 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
         "rate_limit":        cfg.rate_limit,
         "cache_max_ttl":     cfg.cache_max_ttl,
         "dnssec_validation": cfg.dnssec_validation,
+        "log_retention":     cfg.log_retention,
+        "log_client_ip":     cfg.log_client_ip,
         "api_port":          cfg.api_port,
         // api_key intentionally omitted — secret
         "logfile":           cfg.logfile,

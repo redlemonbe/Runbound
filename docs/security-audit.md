@@ -1,6 +1,6 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.3.4  
 **Date:** 2026-05-16  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser  
 **Methodology:** Manual white-box source code review of all Rust modules

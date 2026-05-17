@@ -168,8 +168,8 @@ server:
 | `log-retention` | integer | `1000` | 🔒 RGPD — Maximum number of entries kept in the in-memory query log ring buffer. Set to `0` to disable the ring buffer entirely and return an empty array from `GET /logs`. No client IPs are held in RAM when set to `0`. |
 | `log-client-ip` | bool | `yes` | 🔒 RGPD — Whether to record the client IP in `/logs` and the logfile. Set to `no` to replace every IP with `[redacted]` before storing. Does **not** affect the audit log (IPs are required there for PCI-DSS / NIS2 traceability). |
 
-Both directives take effect at startup and on `SIGHUP` (hot-reload). Reducing
-`log-retention` on reload truncates the buffer to the new capacity immediately.
+Both directives take effect at **startup only** — a full restart is required to change them
+(SIGHUP hot-reload only reloads DNS zones, not the ring buffer configuration).
 
 See [docs/gdpr.md](gdpr.md) for the full GDPR compliance guide.
 
@@ -255,7 +255,7 @@ server:
 |---|---|
 | `seq` | Monotonic sequence number. Gaps indicate tampered or missing entries. |
 | `ts` | Unix timestamp (seconds). |
-| `event` | Event type: `Startup`, `Shutdown`, `DnsAdd`, `DnsDelete`, `FeedAdd`, `FeedDelete`, `BlacklistAdd`, `BlacklistDelete`, `AuthFailure`, `ConfigReload`. |
+| `event` | Event type (snake_case): `startup`, `shutdown`, `dns_add`, `dns_delete`, `feed_add`, `feed_delete`, `blacklist_add`, `blacklist_delete`, `auth_failure`, `config_reload`, `logs_clear`. |
 | `fields` | Event-specific payload. |
 | `mac` | HMAC-SHA256 over `seq ‖ ts ‖ event ‖ fields_json`. |
 

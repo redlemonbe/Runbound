@@ -122,6 +122,12 @@ server:
     logfile:    ""       # stdout → journald
     verbosity:  1
 
+    # ── Privacy (RGPD) ───────────────────────────────────────────────────────
+    # Keep last 500 queries in memory (or set to 0 to disable entirely)
+    log-retention: 500
+    # Uncomment to replace client IPs with [redacted] in /logs:
+    # log-client-ip: no
+
 # ── Encrypted upstream DNS (Cloudflare + Quad9 over DoT) ─────────────────────
 forward-zone:
     name:                 "."
@@ -325,3 +331,4 @@ journalctl -u runbound -f | grep '"query"'
 | [REST API Reference](api.md) | All endpoints with examples |
 | [Unbound Migration](unbound-migration.md) | Migrating from an existing Unbound config |
 | [Security Architecture](security.md) | ACL, rate limiting, DNS rebinding protection |
+| [GDPR / Privacy](gdpr.md) | Log retention, IP redaction, right-to-erasure |
