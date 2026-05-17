@@ -24,7 +24,7 @@ use arc_swap::ArcSwap;
 use futures_util::stream;
 use serde::Deserialize;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::dns::{BlacklistAction, ZoneAction, local::{LocalZoneSet, parse_local_data}};
 use crate::feeds::{self, FeedFormat, add_feed, builtin_presets, remove_feed, update_all_feeds, update_one_feed};
@@ -939,14 +939,22 @@ async fn feed_presets_handler() -> impl IntoResponse {
 // ── GET /upstreams ─────────────────────────────────────────────────────────
 
 async fn upstreams_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let statuses = s.upstreams.read().unwrap().clone();
-    let total = statuses.len();
+    let statuses = match s.upstreams.read() {
+        Ok(g)  => g.clone(),
+        Err(e) => {
+            error!(err = %e, "upstreams RwLock poisoned");
+            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+                "error": "INTERNAL", "details": "upstream state unavailable"
+            }))).into_response();
+        }
+    };
+    let total   = statuses.len();
     let healthy = statuses.iter().filter(|u| u.healthy).count();
-    JsonExtract(serde_json::json!({
+    (StatusCode::OK, JsonExtract(serde_json::json!({
         "upstreams": statuses,
         "total":     total,
         "healthy":   healthy,
-    }))
+    }))).into_response()
 }
 
 // ── GET /logs ──────────────────────────────────────────────────────────────
@@ -1008,7 +1016,15 @@ async fn logs_handler(
         since_secs: params.since,
     };
 
-    let (entries, total) = s.log_buffer.lock().unwrap().query(&q);
+    let (entries, total) = match s.log_buffer.lock() {
+        Ok(mut buf) => buf.query(&q),
+        Err(e) => {
+            error!(err = %e, "log_buffer Mutex poisoned");
+            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+                "error": "INTERNAL", "details": "log buffer unavailable"
+            }))).into_response();
+        }
+    };
     JsonExtract(serde_json::json!({
         "entries": entries,
         "total":   total,
