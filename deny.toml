@@ -23,6 +23,11 @@ ignore = [
     # No vulnerability — purely a maintenance notice. Planned migration in the
     # next Cargo update cycle once rustls-pki-types ≥ 1.9 is the stable API.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.x is a thin wrapper around rustls-pki-types; no vulnerability, migration planned at next rustls update" },
+    # `paste` is a compile-time proc-macro crate (identifier concatenation).
+    # It is a transitive dependency of cryptoki 0.6 with no safe upgrade available.
+    # It contains no runtime code and has no security impact. Will resolve when
+    # cryptoki migrates away from paste in a future release.
+    { id = "RUSTSEC-2024-0436", reason = "paste is a compile-time proc-macro with no runtime security impact; transitive via cryptoki 0.6, no upstream fix available yet" },
 ]
 
 # ── Licence policy ────────────────────────────────────────────────────────────

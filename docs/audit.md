@@ -1,8 +1,8 @@
-# Audit Process
+# Supply-Chain & Security Audit — Runbound
 
-Runbound applies defence-in-depth to its own supply chain.
-This document describes the tooling, frequency, and procedures used to keep the
-dependency tree clean of known vulnerabilities, licence violations, and stale crates.
+This document describes the tooling, cadence, and procedures used to keep Runbound's
+dependency tree free of known vulnerabilities, licence violations, and stale crates,
+and to guide internal or third-party source-code audits.
 
 ---
 
@@ -10,41 +10,42 @@ dependency tree clean of known vulnerabilities, licence violations, and stale cr
 
 | Tool | Purpose | Install |
 |---|---|---|
-| `cargo audit` | CVE / RUSTSEC advisory scan | `cargo install cargo-audit` |
-| `cargo deny` | Licence policy + advisory gate + ban rules | `cargo install cargo-deny` |
-| `cargo cyclonedx` | SBOM generation (CycloneDX 1.4, JSON) | `cargo install cargo-cyclonedx` |
-| `cargo outdated` | Stale dependency detection | `cargo install cargo-outdated` |
-
----
-
-## Recommended frequency
-
-| Check | When |
-|---|---|
-| `cargo audit` | At every release **and** weekly in CI |
-| `cargo deny` | At every dependency addition or `Cargo.lock` update |
-| SBOM | Generated automatically at every git tag |
-| `cargo outdated` | Monthly, and before each minor/major release |
+| [`cargo audit`](https://github.com/rustsec/rustsec/tree/main/cargo-audit) | CVE / RUSTSEC advisory scan | `cargo install cargo-audit` |
+| [`cargo deny`](https://github.com/EmbarkStudios/cargo-deny) | Licence policy + advisory gate + ban rules | `cargo install cargo-deny` |
+| [`cargo cyclonedx`](https://github.com/CycloneDX/cyclonedx-rust-cargo) | SBOM generation (CycloneDX 1.4, JSON) | `cargo install cargo-cyclonedx` |
+| [`cargo outdated`](https://github.com/kbknapp/cargo-outdated) | Stale dependency detection | `cargo install cargo-outdated` |
 
 ---
 
 ## Makefile targets
 
 ```bash
-make audit       # cargo audit --deny warnings (zero CVE gate)
-make deny        # cargo deny check (licence + advisory + bans)
-make sbom        # cargo cyclonedx → sbom.cdx.json
-make audit-full  # audit + deny + sbom + cargo outdated
+make audit       # cargo audit --deny warnings      — zero-CVE gate
+make deny        # cargo deny check                 — licence + advisory + ban policy
+make sbom        # cargo cyclonedx → sbom.cdx.json  — full dependency inventory
+make audit-full  # runs all three above + cargo outdated
 ```
+
+---
+
+## Recommended cadence
+
+| Check | Trigger |
+|---|---|
+| `make audit` | Every release + every week in CI |
+| `make deny` | Every dependency addition or `Cargo.lock` change |
+| `make sbom` | Every git tag (attach `sbom.cdx.json` as a release asset) |
+| `cargo outdated` | Monthly + before any minor or major release |
 
 ---
 
 ## Reproducibility
 
-**Cargo.lock is committed** — every build resolves to the exact same versions.
-Dependency updates are a conscious, audited step, not a side-effect of `cargo update`.
+**`Cargo.lock` is committed.** Every build resolves to the exact same crate versions.
+Dependency updates are a conscious, audited step — not a side-effect of a stale lockfile.
 
-**Rust toolchain:** pin the compiler version in `rust-toolchain.toml`:
+**Rust toolchain pinning.** Pin the compiler in `rust-toolchain.toml` to prevent silent
+breakage when a new toolchain ships between CI runs:
 
 ```toml
 [toolchain]
@@ -52,100 +53,134 @@ channel = "stable"
 components = ["rustfmt", "clippy"]
 ```
 
-This prevents silent breakage when new toolchains are released between CI runs.
+---
+
+## Licence policy (`deny.toml`)
+
+Runbound is AGPL-3.0-or-later (with a commercial licence option).
+The `deny.toml` licence policy allows:
+
+**Permitted:** MIT · Apache-2.0 · Apache-2.0 WITH LLVM-exception · BSD-2-Clause ·
+BSD-3-Clause · ISC · Zlib · Unicode-3.0 · CDLA-Permissive-2.0
+
+**Blocked by omission (not listed = denied):**
+GPL-2.0, LGPL-2.x/3.x without a linking exception — incompatible with static linking
+and with the commercial dual-licence model.
+
+Any dependency introducing an unlisted licence causes `cargo deny check` to fail,
+blocking the merge.
 
 ---
 
-## Critical third-party dependencies (manual review on each update)
+## Critical third-party dependencies (manual review on every update)
 
-These crates sit on the security-critical path. Every version bump requires a
-manual check of the RUSTSEC advisory database and the upstream changelog before
-merging.
+These crates sit on the security-critical path. Every version bump requires a manual
+check of the RUSTSEC advisory database and the upstream changelog before merging.
 
-| Crate | Why it matters |
-|---|---|
-| `rustls` / `rustls-webpki` | TLS stack — any CVE here breaks DoT/DoH/DoQ security |
-| `tokio` | Async runtime — attack surface for all network I/O |
-| `hickory-server` / `hickory-resolver` | DNS parsing — processes untrusted network input |
-| `axum` / `hyper` | HTTP server — injection, path traversal, request smuggling |
-| `serde_json` | JSON deserialisation — parses external (API) input |
-| `ring` | Cryptographic backend — used by rustls for AEAD/HMAC |
-| `rcgen` / `instant-acme` | Certificate management — ACME key handling |
+| Crate | File(s) | Risk surface |
+|---|---|---|
+| `rustls` / `rustls-webpki` | `src/main.rs`, `src/sync.rs` | TLS stack — CVE here breaks DoT/DoH/DoQ security |
+| `tokio` | everywhere | Async runtime — attack surface for all network I/O |
+| `hickory-server` / `hickory-resolver` | `src/dns/server.rs` | DNS parsing — processes untrusted network input |
+| `axum` / `hyper` | `src/api/mod.rs` | HTTP server — injection, path traversal, request smuggling |
+| `serde_json` | `src/store.rs`, `src/api/mod.rs` | JSON deserialisation — parses external (API) input |
+| `ring` | transitive via `rustls` | Cryptographic backend — AEAD, HMAC, ECDSA |
+| `rcgen` / `instant-acme` | `src/tls.rs` | Certificate management — ACME key handling |
+| `cryptoki` | `src/hsm.rs` | PKCS#11 FFI — HSM key extraction, unsafe at the boundary |
 
 ---
 
 ## Release procedure
 
-Before tagging any release, the following gates must pass with zero errors:
+The following gates must all pass with zero errors before tagging a release:
 
 ```bash
-# 1. Zero known CVEs
-cargo audit --deny warnings
+# 1. Zero known CVEs or unsound/unmaintained advisories
+make audit        # cargo audit --deny warnings
 
-# 2. Zero licence or ban violations
-cargo deny check
+# 2. Zero licence or dependency ban violations
+make deny         # cargo deny check
 
-# 3. Generate SBOM and attach to the GitHub release
-cargo cyclonedx --format json --output sbom.cdx.json
-# → upload sbom.cdx.json as a release asset
+# 3. Generate and attach SBOM
+make sbom         # → sbom.cdx.json
+# Upload sbom.cdx.json as a GitHub release asset.
 
 # 4. Tag with GPG signature
 git tag -s v0.X.Y -m "release v0.X.Y"
 git push origin v0.X.Y
 ```
 
-Failing any of steps 1–2 blocks the release.
+Steps 1 and 2 are blocking — a failed gate prevents the release.
+Step 3 is mandatory for enterprise and government customers.
+Step 4 ensures every release can be traced to a verified committer identity.
 
 ---
 
 ## SBOM (Software Bill of Materials)
 
 The file `sbom.cdx.json` (CycloneDX 1.4 format) lists every transitive dependency
-with its version, source hash, and licence. It is attached to every GitHub release
-as a release asset.
+with its version, source hash, and SPDX licence identifier. It is generated by
+`cargo cyclonedx` and attached to every GitHub release.
 
 **Use cases:**
 
-- Enterprise customers and government agencies can verify the full dependency tree
-  independently.
-- Security auditors (CSPN, Common Criteria EAL) can cross-reference component
-  versions against their own CVE databases.
-- Incident response: if a new advisory is published for a transitive dependency,
-  the SBOM lets operators immediately determine whether they are affected without
-  rebuilding.
+| Audience | How they use the SBOM |
+|---|---|
+| Enterprise customers | Verify full dependency tree matches their approved software inventory |
+| Government / ANSSI | Required artefact for CSPN qualification and supply-chain risk assessment |
+| Security auditors (CC EAL) | Cross-reference component versions against national CVE databases |
+| Incident response | Immediately determine whether a newly published advisory affects a running deployment |
 
-**Download:** available on the [GitHub releases page](https://github.com/redlemonbe/Runbound/releases/latest)
-as `sbom.cdx.json`.
+**Download:** [github.com/redlemonbe/Runbound/releases/latest](https://github.com/redlemonbe/Runbound/releases/latest) → `sbom.cdx.json`
 
 ---
 
-## Licence policy
+## Manual source audit — priority areas
 
-Runbound is dual-licensed under AGPL-3.0 and a commercial licence.
-The dependency licence policy (enforced by `deny.toml`) is:
+For formal security evaluations (CSPN, Common Criteria EAL, enterprise red team,
+government qualification), the following source areas have the largest attack surface
+and should be reviewed first.
 
-**Allowed:** MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, Unicode-DFS-2016, OpenSSL  
-**Blocked:** GPL-2.0, LGPL without linking exception (incompatible with static linking
-and with the commercial dual-licence model)
-
-Any dependency addition that introduces a blocked licence will cause `cargo deny check`
-to fail, preventing the merge.
-
----
-
-## Manual source audit: priority areas
-
-For formal audits (CSPN, Common Criteria EAL, enterprise security review),
-the following source areas have the largest attack surface and should be
-reviewed first:
-
-| Area | File(s) | What to look for |
+| Area | Location | What to verify |
 |---|---|---|
-| Constant-time auth | `src/api/mod.rs` → `constant_time_eq` | Timing side-channels in Bearer token comparison |
-| SSRF prevention | `src/dns/server.rs` → `SsrfSafeDnsResolver` | IP/domain validation completeness |
-| Store integrity | `src/store.rs` | HMAC verification before deserialisation |
-| DNS name parsing | `src/api/mod.rs` → `validate_dns_name` | Label length, charset, RFC 1035 boundaries |
-| DNS query handler | `src/dns/server.rs` | ACL bypass, amplification vectors, identity probes |
-| Sync/replication | `src/sync.rs` | Authentication, cert pinning, race conditions |
+| **Constant-time auth** | `src/api/mod.rs` → `constant_time_eq`, `security_middleware` | Timing side-channels in Bearer token comparison; brute-force brake placement (must be pre-comparison) |
+| **SSRF prevention** | `src/feeds/mod.rs` → `SsrfSafeDnsResolver`, `ssrf_safe_client` | Private IP and RFC-1918 range filtering at DNS-resolution time, not just URL parse time |
+| **HSM key management** | `src/hsm.rs` → `load_and_store`, `extract_key` | Key extraction path, `Zeroizing<T>` usage, session close after extraction, fatal-on-failure guarantee |
+| **Store integrity** | `src/store.rs`, `src/integrity.rs` | HMAC-SHA256 verification before deserialisation; timing-safe MAC comparison |
+| **DNS name parsing** | `src/api/mod.rs` → `validate_dns_name` | RFC 1035 §2.3.4 boundaries (253-char total, 63-char label, ASCII only); applies to `name` field AND CNAME/MX/NS/PTR/SRV targets |
+| **DNS query handler** | `src/dns/server.rs` | ACL bypass vectors, ANY/AXFR blocking, CHAOS-class identity probe suppression |
+| **HA sync** | `src/sync.rs` | mTLS TOFU cert pinning, constant-time sync-token comparison, write-block on slave |
+| **Rate limiting** | `src/api/mod.rs` → `ApiRateLimiter`, `src/dns/ratelimit.rs` | Token-bucket correctness, IPv4-mapped IPv6 normalisation, XFF rejection |
 
-See [security-audit.md](security-audit.md) for the complete white-box audit report.
+### HSM threat model note
+
+When HSM is enabled, keys are **extracted** from the device at startup into
+`Zeroizing<Vec<u8>>` buffers and the PKCS#11 session is closed immediately.
+The HSM is therefore not required during normal operation, but the key material
+exists in process memory until shutdown (where `Zeroizing` scrubs it on drop).
+
+For deployments requiring keys to **never leave the HSM** (banking, government FIPS 140-3 L3),
+a custom integration that performs all HMAC/signing operations inside the device is needed —
+this is beyond the current `src/hsm.rs` scope. See [`docs/hsm.md`](hsm.md) for details.
+
+---
+
+## Acknowledged advisories
+
+| Advisory | Crate | Reason ignored |
+|---|---|---|
+| RUSTSEC-2025-0134 | `rustls-pemfile` | Maintenance notice only, no CVE. `rustls-pemfile 2.x` is a thin wrapper around `rustls-pki-types`. Migration planned at next rustls update cycle. |
+
+New advisories that cannot be ignored must block the release until the affected crate
+is updated or the advisory is explicitly acknowledged in `deny.toml` with a dated justification.
+
+---
+
+## Cargo deny configuration
+
+The full policy is in [`deny.toml`](../deny.toml) at the repository root:
+
+- **`[advisories]`** — blocks CVEs, unsound crates, yanked versions; acknowledges RUSTSEC-2025-0134
+- **`[licenses]`** — enforces the permit list above; exempts `runbound` itself (AGPL-3.0-or-later)
+- **`[bans]`** — warns on multiple major versions of the same crate; bans wildcard version specs; skip-list for known transitive duplicates (rand/getrandom ecosystem, windows-sys, rcgen)
+- **`[sources]`** — restricts to crates.io only; blocks unknown registries and git sources

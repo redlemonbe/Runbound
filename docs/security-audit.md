@@ -1,18 +1,29 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.3  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.5  
 **Last updated:** 2026-05-17  
-**Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser  
-**Methodology:** Manual white-box source code review of all Rust modules
+**Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration  
+**Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4)
 
 ---
 
 ## Executive Summary
 
+**50 findings across 5 audit cycles — 100% resolved as of v0.4.5.**
+
+| Cycle | Target | Findings | Status |
+|---|---|---|---|
+| Initial white-box | v0.2.3 | 20 (4 Critical, 8 High, 5 Medium, 3 Low) | ✅ All fixed v0.2.4–v0.4.0 |
+| Second white-box | v0.3.3 | 9 (1 High, 6 Medium, 2 Low) | ✅ All fixed v0.3.3–v0.3.5 |
+| Third white-box | v0.4.0 | 8 (1 Blocking, 2 Medium, 5 Low) | ✅ All fixed v0.4.1 |
+| Military audit | v0.4.1 | 9 (3 Low, 3 Info, 2 Doc, 1 false positive) | ✅ All closed v0.4.3 |
+| External pentest | v0.4.4 | 4 (1 High, 1 Medium/false positive, 1 Low, 1 Info) | ✅ All closed v0.4.5 |
+
 Runbound's core DNS path is well-engineered: memory-safe Rust, lock-free hot path
 via ArcSwap, per-IP token-bucket rate limiting with aggressive eviction, RFC 8482
 ANY-query blocking, IPv4-mapped IPv6 normalisation in the ACL, HMAC-SHA256 audit
-chain, and constant-time Bearer comparison.
+chain, and constant-time Bearer comparison (timing oracle fixed in v0.4.0 and
+re-hardened in v0.4.5 by moving the brute-force brake to before the comparison).
 
 The four original critical findings (ghost API endpoints, DNSSEC unconditionally
 disabled, IPv6 SSRF bypass, SSRF hostname-redirect bypass) and all high-severity
@@ -726,13 +737,20 @@ No open findings remain.
 
 ---
 
-*Initial audit performed on commit `7dd3a66` (tag v0.2.3). All source files reviewed:
+*Initial white-box audit performed on commit `7dd3a66` (tag v0.2.3). Source files reviewed:
 `src/main.rs`, `src/api/mod.rs`, `src/config/parser.rs`, `src/dns/server.rs`,
 `src/dns/local.rs`, `src/dns/acl.rs`, `src/dns/ratelimit.rs`, `src/dns/xdp/worker.rs`,
 `src/dns/xdp/umem.rs`, `src/feeds/mod.rs`, `src/store.rs`.
 Second audit cycle targeting v0.3.3. Third audit cycle targeting v0.4.0.
 v0.4.0 adds: `src/integrity.rs` (HIGH-06), hickory 0.26 + rustls 0.23 migration (HIGH-07),
-`dot-client-auth-ca` mTLS (HIGH-08), `SsrfSafeDnsResolver` (MED-03),
+`dot-client-auth-ca` mTLS (HIGH-08), `SsrfSafeDnsResolver` in `src/feeds/mod.rs` (MED-03),
 `sanitize_dns_name()` (MED-06), local-zone cap (LOW-03).
 v0.4.1 adds: CryptoProvider install (BUG-01), CNAME/MX/NS/PTR/SRV value validation (S-10),
-Content-Length pre-check (S-11), ApiJson extractor (Q-01–Q-03), QueryRejection handling (Q-04).*
+Content-Length pre-check (S-11), ApiJson extractor (Q-01–Q-03), QueryRejection handling (Q-04).
+v0.4.3 adds: defense-in-depth identity-probe block by name in `src/dns/server.rs` (SEC-03);
+unit tests for 253/254-char boundary in `src/api/mod.rs` (SEC-02 false-positive documentation).
+v0.4.4 adds: `src/hsm.rs` (PKCS#11 HSM key storage, cryptoki 0.6); `deny.toml` (supply-chain
+policy); `docs/audit.md` (audit process and SBOM procedure).
+v0.4.5 adds: pre-auth brute-force brake + async side-effects in `security_middleware`
+(timing oracle elimination, NEW-HIGH pentest); 411 for JSON POST without Content-Length
+(SEC-04 partial close); HTTP integration tests for 253/254-char name boundary (SEC-02).*
