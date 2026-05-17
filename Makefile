@@ -19,7 +19,8 @@ BENCH_DUR := 30
 BENCH_QPS := 150000
 
 .PHONY: all build release pgo pgo-instrument pgo-merge pgo-optimise \
-        bench install clean
+        bench install clean \
+        audit deny sbom audit-full
 
 # ── Default ───────────────────────────────────────────────────────────────────
 all: build
@@ -138,6 +139,38 @@ bench:
 
 install: release
 	sudo ./install.sh
+
+# ── Security audit ────────────────────────────────────────────────────────────
+#
+# Tools required (install once):
+#   cargo install cargo-audit cargo-deny cargo-cyclonedx cargo-outdated
+#
+# See docs/audit.md for the full audit process and release procedure.
+
+audit:
+	@command -v cargo-audit >/dev/null 2>&1 || \
+	    { echo "[ERROR] cargo-audit not installed. Run: cargo install cargo-audit"; exit 1; }
+	cargo audit --deny warnings
+
+deny:
+	@command -v cargo-deny >/dev/null 2>&1 || \
+	    { echo "[ERROR] cargo-deny not installed. Run: cargo install cargo-deny"; exit 1; }
+	cargo deny check
+
+sbom:
+	@command -v cargo-cyclonedx >/dev/null 2>&1 || \
+	    { echo "[ERROR] cargo-cyclonedx not installed. Run: cargo install cargo-cyclonedx"; exit 1; }
+	cargo cyclonedx --format json --output sbom.cdx.json
+	@echo "SBOM written to sbom.cdx.json"
+
+audit-full: audit deny sbom
+	@command -v cargo-outdated >/dev/null 2>&1 || \
+	    { echo "[WARN] cargo-outdated not installed. Run: cargo install cargo-outdated"; }
+	@command -v cargo-outdated >/dev/null 2>&1 && cargo outdated || true
+	@echo ""
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo " Full audit complete. Attach sbom.cdx.json to the GitHub release."
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 
