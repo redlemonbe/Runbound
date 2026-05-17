@@ -31,3 +31,4 @@ RAPPORT_TEST_COMPLET.txt
 /tmp/dnsperf-*.out
 /tmp/runbound-*.conf
 /tmp/queries-*.txt
+runbound-v*
