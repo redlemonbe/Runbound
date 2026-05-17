@@ -77,6 +77,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # ACME (Let's Encrypt) — ring backend only; HTTP done via reqwest bridge
 instant-acme = { version = "0.8", default-features = false, features = ["ring"] }
 
+# HSM (Hardware Security Module) key storage via PKCS#11
+# cryptoki provides the Rust binding; the actual PKCS#11 .so is loaded
+# dynamically at runtime (dlopen) — no compile-time dependency on the HSM.
+cryptoki = "0.6"
+
+# Secure memory zeroing — used for HSM-loaded key material (Zeroizing<T>)
+zeroize = "1"
+
 # Zero-copy byte buffers — used in ACME HttpClient bridge
 bytes = "1"
 

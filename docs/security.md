@@ -347,6 +347,35 @@ See [security-audit.md](security-audit.md) for the full white-box audit report.
 
 ---
 
+## HSM key storage (PKCS#11)
+
+Runbound supports loading the REST API key and the JSON store HMAC key from a
+Hardware Security Module via PKCS#11. When active, keys are physically non-extractable
+from the hardware and never written to disk in plaintext.
+
+**Key priority chain (highest to lowest):**
+
+| Source | API key | Store key |
+|---|:---:|:---:|
+| HSM (`hsm-api-key-label`) | ✅ | ✅ |
+| Env var (`RUNBOUND_API_KEY` / `RUNBOUND_STORE_KEY`) | ✅ | ✅ |
+| Config file (`api-key:`) | ✅ | — |
+| Auto-generated (CSPRNG) | ✅ | — |
+
+When `hsm-pkcs11-lib` is set and key loading fails, Runbound exits immediately —
+no silent fallback to env vars.
+
+The HSM session is opened at startup, keys are extracted into `Zeroizing<T>` buffers
+(memory is scrubbed on drop), and the session is closed. The HSM does not need to
+remain connected during normal operation.
+
+**Tested devices:** SoftHSM2 (dev), YubiHSM 2 (recommended, FIPS 140-2 L3), Nitrokey
+HSM 2, AWS CloudHSM, Thales Luna.
+
+→ Full setup guide: [docs/hsm.md](hsm.md)
+
+---
+
 ## Supply chain & audit
 
 Runbound enforces supply-chain security at three levels:

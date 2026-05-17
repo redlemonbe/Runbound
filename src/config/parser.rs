@@ -112,6 +112,19 @@ pub struct UnboundConfig {
     pub acme_staging: bool,
     /// Port for the HTTP-01 challenge server. Default: 80.
     pub acme_challenge_port: Option<u16>,
+
+    // ── HSM (Hardware Security Module) via PKCS#11 ────────────────────────
+    /// Path to the PKCS#11 shared library (.so). HSM is disabled when absent.
+    /// Example: /usr/lib/softhsm/libsofthsm2.so
+    pub hsm_pkcs11_lib: Option<String>,
+    /// PKCS#11 slot index (0-based). Default: 0.
+    pub hsm_slot: u64,
+    /// PKCS#11 PIN. Prefer the HSM_PIN environment variable (chmod 640).
+    pub hsm_pin: Option<String>,
+    /// Label of the CKO_SECRET_KEY object used as the REST API Bearer token.
+    pub hsm_api_key_label: Option<String>,
+    /// Label of the CKO_SECRET_KEY object used as the JSON store HMAC key.
+    pub hsm_store_key_label: Option<String>,
 }
 
 impl UnboundConfig {
@@ -290,6 +303,20 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "acme-cache-dir"      => cfg.acme_cache_dir      = Some(val.trim_matches('"').to_string()),
         "acme-staging"        => cfg.acme_staging        = val.trim_matches('"') == "yes",
         "acme-challenge-port" => cfg.acme_challenge_port = val.parse().ok(),
+        // HSM / PKCS#11
+        "hsm-pkcs11-lib"      => cfg.hsm_pkcs11_lib  = Some(val.trim_matches('"').to_string()),
+        "hsm-slot"            => cfg.hsm_slot         = val.parse().unwrap_or(0),
+        "hsm-pin"             => {
+            warn!(
+                "hsm-pin is set in the config file (plaintext). \
+                 Prefer the HSM_PIN environment variable — \
+                 set it in /etc/runbound/env (chmod 640) to keep the PIN \
+                 out of config files and version control."
+            );
+            cfg.hsm_pin = Some(val.trim_matches('"').to_string());
+        }
+        "hsm-api-key-label"   => cfg.hsm_api_key_label   = Some(val.trim_matches('"').to_string()),
+        "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"
