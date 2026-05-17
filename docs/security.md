@@ -1,7 +1,7 @@
 # Security Architecture
 
 This document covers the security model, defensive layers, and all audit findings
-fixed across Runbound releases through v0.4.1.
+fixed across Runbound releases through v0.4.5.
 
 ---
 
@@ -173,6 +173,11 @@ overwrite each other.
 - DNS `name` and domain-type `value` fields (CNAME, MX, NS, PTR, SRV targets)
   are validated against RFC 1035 rules: max 253 chars, labels max 63 chars,
   valid label characters only, no control characters.
+  A trailing FQDN dot (`example.com.`) is stripped before the 253-char check —
+  submitting a 253-char domain with a trailing dot (= 254 bytes) is therefore
+  accepted, because the actual domain length is 253 chars. A true 254-char name
+  without a trailing dot is rejected. Integration tests `dns_name_254_chars_is_rejected`
+  and `blacklist_name_254_chars_is_rejected` prove this boundary end-to-end.
 - TTL must be in [0, 2147483647] (RFC 2181 §8).
 - All JSON deserialization failures return structured JSON error bodies with
   `{"error": "INVALID_REQUEST", "details": "..."}`.
@@ -342,6 +347,39 @@ See [systemd.md](systemd.md) for the full unit file.
 | Q-02 | Low | POST /blacklist invalid action → HTTP 422 non-JSON body | v0.4.1 |
 | Q-03 | Low | POST /rotate-key non-string type → HTTP 422 non-JSON body | v0.4.1 |
 | Q-04 | Low | GET /logs?page=-1 → HTTP 400 non-JSON body | v0.4.1 |
+
+### v0.4.2
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| BUG-01b | Blocking | Replicated DNS entries returned NXDOMAIN on slave nodes | v0.4.2 |
+
+### v0.4.3
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| AUDIT-SEC-02 | Info | Domain name 253-char boundary (false positive — confirmed with unit tests) | v0.4.3 |
+| AUDIT-SEC-03 | Low | `version.bind` CHAOS class → NOERROR (hickory class normalisation) | v0.4.3 |
+| AUDIT-SEC-04 | Low | 5 MB payload → connection drop without 413 (Content-Length check added) | v0.4.3 |
+| AUDIT-DOC-01 | Info | README referenced v0.3.4 binary names | v0.4.3 |
+| AUDIT-DOC-02 | Info | 4 runtime constants undocumented (body limit, rate limit, sync ring, purge %) | v0.4.3 |
+| AUDIT-DOC-03 | Info | ha.md missing slave DNS behaviour section | v0.4.3 |
+
+### v0.4.4
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| FEAT-HSM | — | HSM key storage via PKCS#11 (API key + store HMAC key, `cryptoki 0.6`) | v0.4.4 |
+| FEAT-AUDIT | — | Supply-chain audit tooling: `cargo-deny`, SBOM, `audit-full` Makefile target | v0.4.4 |
+
+### v0.4.5
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| PENTEST-HIGH | High | Timing oracle on Bearer token — pre-auth sleep + async side effects | v0.4.5 |
+| PENTEST-SEC02 | Info | Domain 253-char boundary (confirmed false positive + HTTP integration tests) | v0.4.5 |
+| PENTEST-SEC04 | Low | JSON POST without `Content-Length` → 411 (eliminates chunked TCP drop) | v0.4.5 |
+| PENTEST-LOW | Low | Null byte in URL path → TCP drop (hyper parse layer, documented) | v0.4.5 |
 
 See [security-audit.md](security-audit.md) for the full white-box audit report.
 
