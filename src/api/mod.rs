@@ -349,7 +349,10 @@ pub fn router(state: AppState) -> Router {
         .route("/rotate-key",        post(rotate_key_handler))
         .layer(middleware::from_fn_with_state(state.clone(), slave_guard_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), security_middleware))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        // axum DefaultBodyLimit returns HTTP 413 before reading the body into RAM,
+        // regardless of payload size. tower_http::RequestBodyLimitLayer drops the
+        // TCP connection for very large payloads (> ~512 KB) instead of 413.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
