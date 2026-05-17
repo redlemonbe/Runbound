@@ -225,7 +225,8 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "quic-port"  => cfg.tls.doq_port  = val.parse().ok(),
         "tls-cert-hostname" | "server-hostname" => cfg.tls.hostname = Some(val.trim_matches('"').to_string()),
         // Runbound-specific extensions (not in stock Unbound)
-        "rate-limit"    => cfg.rate_limit    = val.parse().ok(),
+        "rate-limit"    => cfg.rate_limit = val.parse::<u64>().ok()
+                               .map(|v| v.min(1_000_000)), // cap at 1M rps — u64::MAX silently disables
         "api-key"       => {
             warn!(
                 "api-key is set in the config file (plaintext). \
