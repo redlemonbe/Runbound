@@ -1,7 +1,7 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.3.4  
-**Date:** 2026-05-16  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.3.5  
+**Last updated:** 2026-05-17  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser  
 **Methodology:** Manual white-box source code review of all Rust modules
 
@@ -10,22 +10,23 @@
 ## Executive Summary
 
 Runbound's core DNS path is well-engineered: memory-safe Rust, lock-free hot path
-via ArcSwap, per-IP token-bucket rate limiting, RFC 8482 ANY-query blocking, IPv4-mapped
-IPv6 normalisation in the ACL. The six security fixes in v0.2.0 addressed the most
-obvious post-MVP issues.
+via ArcSwap, per-IP token-bucket rate limiting with aggressive eviction, RFC 8482
+ANY-query blocking, IPv4-mapped IPv6 normalisation in the ACL, HMAC-SHA256 audit
+chain, and constant-time Bearer comparison.
 
-However, a full-depth audit reveals **four critical findings** that must be resolved
-before nation-state or high-security production deployment:
+The four original critical findings (ghost API endpoints, DNSSEC unconditionally
+disabled, IPv6 SSRF bypass, SSRF hostname-redirect bypass) and all high-severity
+findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0.3.x.
+A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
+through SEC-16), all fixed in v0.3.3.
 
-1. Four API endpoints documented as implemented (`/health`, `/stats`, `/config`, `/reload`)
-   return HTTP 404 — the code does not exist.
-2. DNSSEC local validation is unconditionally disabled.
-3. IPv6 private/ULA address ranges are absent from SSRF checks.
-4. The SSRF redirect policy only inspects literal-IP destinations; a redirect to a
-   private *hostname* bypasses the guard entirely.
+**Three open architectural findings remain** before nation-state production deployment:
 
-Eight high-severity and seven medium-severity findings are documented below.
-All critical and high findings have been corrected in v0.2.4 (this audit cycle).
+1. JSON data stores (`dns_entries.json`, `blacklist.json`, `feeds.json`) have no
+   HMAC integrity protection — filesystem write access bypasses all API controls.
+2. TLS cipher suites inherit rustls 0.21 defaults, which include suites below
+   BSI TR-02102 / NIST SP 800-52 Rev 2 requirements.
+3. DoT has no mutual TLS support — no client certificate authentication.
 
 ---
 
@@ -41,522 +42,571 @@ All critical and high findings have been corrected in v0.2.4 (this audit cycle).
 
 ---
 
-## Critical Findings
+## Initial Audit Cycle — v0.2.3
 
-### AUDIT-CRIT-01 — Ghost API endpoints (404 in production)
+### Critical Findings
+
+#### AUDIT-CRIT-01 — Ghost API endpoints (404 in production)
 
 **File:** `src/api/mod.rs`, `docs/api.md`  
-**Status:** Documentation corrected in v0.2.4
+**Status:** ✅ Fixed in v0.2.5 — all four endpoints implemented
 
-The following four endpoints appear in `docs/api.md`, `CHANGELOG.md` (v0.1.0), and
-`docs/systemd.md` but have no handler and no route in the actual router:
+The following endpoints appeared in the documentation but had no handler in the
+actual router: `GET /health`, `GET /stats`, `GET /config`, `POST /reload`.
+All returned HTTP 404, breaking monitoring probes, Prometheus scrapers, and the
+documented REST reload path. Path parameter mismatches (`{name}` vs `:id`) caused
+all DELETE operations to return 404.
 
-| Endpoint | Documented as |
-|---|---|
-| `GET /health` | Liveness probe |
-| `GET /stats` | Query counters (total, blocked, forwarded, refused) |
-| `GET /config` | Sanitised config dump |
-| `POST /reload` | REST-triggered hot reload |
-
-All four return HTTP **404**. Consequences:
-- **Monitoring is broken.** Kubernetes liveness probes, Prometheus scrapers, and
-  any health-check relying on `/health` silently fail.
-- **Operational visibility is zero.** There is no machine-readable source of query
-  statistics. Traffic anomalies are invisible without log parsing.
-- **The documented REST reload path does not work.** Operators who rely on
-  `POST /reload` instead of SIGHUP have no reload mechanism.
-
-Additionally, the API docs use **name-based path parameters** (`DELETE /dns/{name}`,
-`DELETE /feeds/{name}`) while the actual code uses **UUIDs** (`DELETE /dns/:id`,
-`DELETE /feeds/:id`). Every delete operation in the documentation produces a 404.
-
-`POST /feeds/{name}/refresh` (documented) is actually `POST /feeds/:id/update`.
-
-**Mitigation:** Implement the four missing endpoints and correct all path parameters.
-See v0.2.4 release for implementation of `/health`, `/stats`, and corrected docs.
+All four endpoints implemented in v0.2.5. Path parameters corrected in documentation.
 
 ---
 
-### AUDIT-CRIT-02 — DNSSEC validation unconditionally disabled
+#### AUDIT-CRIT-02 — DNSSEC validation unconditionally disabled
 
-**File:** `src/dns/server.rs:414`  
-**Status:** Architectural — requires operator decision
+**File:** `src/dns/server.rs`  
+**Status:** ✅ Mitigated in v0.2.5 — `dnssec-validation` directive added
 
 ```rust
+// v0.2.3 — hardcoded
 opts.validate = false;
 ```
 
-Runbound operates in forwarder mode and trusts the AD (Authenticated Data) bit set by
-upstream resolvers (Cloudflare, Quad9). If an upstream is compromised, misconfigured,
-or subject to legal compulsion, it can set AD=1 on forged responses. Runbound will
-accept and serve those responses to clients.
+Runbound trusted the AD bit set by upstream resolvers without local re-validation.
+A compromised upstream could serve forged responses with AD=1.
 
-For nation-state and high-security deployments, local DNSSEC re-validation is mandatory.
-The hickory-resolver crate supports `opts.validate = true` but requires full RRSIG/DNSKEY
-chains in upstream responses. This is incompatible with forwarders that strip DNSSEC
-records (some enterprise resolvers do). Operators must choose between:
-
-- **DoT/DoH to a validating upstream** (Cloudflare 1.1.1.1, Quad9 9.9.9.9) and trust their AD bit
-- **Enabling `opts.validate = true`** and operating in stub/recursive mode with a
-  chain-complete upstream
-- **Running a full DNSSEC-validating recursive resolver** (Unbound, BIND) as the
-  upstream and point Runbound at it
-
-**Mitigation:** Add a config directive `dnssec-validation: yes` that sets `opts.validate = true`.
-Document the trade-off. For nation-state: configure a local DNSSEC-validating recursive
-resolver as the upstream and set `forward-tls-upstream: yes` to it.
+`dnssec-validation: yes` now sets `opts.validate = true` and the DNSSEC stats
+counters (`secure`, `bogus`, `insecure`) are tracked per-query. Operators running
+a DNSSEC-validating recursive resolver upstream (Unbound, BIND) and enabling this
+directive get local chain verification. Default remains `no` for compatibility with
+enterprise forwarders that strip DNSSEC records.
 
 ---
 
-### AUDIT-CRIT-03 — IPv6 ULA/link-local addresses bypass SSRF guard
+#### AUDIT-CRIT-03 — IPv6 ULA/link-local addresses bypass SSRF guard
 
-**File:** `src/feeds/mod.rs:345`  
-**Status:** Fixed in v0.2.4
+**File:** `src/feeds/mod.rs`  
+**Status:** ✅ Fixed in v0.2.4
 
-The `is_private_ip()` function used for SSRF prevention checks:
+`is_private_ip()` only checked `::1` (loopback) and `::` (unspecified). The
+following IPv6 ranges were not blocked: `fc00::/7` (ULA, `fd00::x` common in
+enterprise networks), `fe80::/10` (link-local), `::ffff:0:0/96` (IPv4-mapped).
 
-```rust
-std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-```
-
-This covers `::1` (loopback) and `::` (unspecified) only. The following ranges are
-**not blocked**:
-
-| Range | Description |
-|---|---|
-| `fc00::/7` | Unique Local Addresses (ULA) — `fd00::1`, etc. — RFC 4193 |
-| `fe80::/10` | Link-local — RFC 4291 |
-| `::ffff:0:0/96` | IPv4-mapped — `::ffff:192.168.1.1` |
-| `100::/64` | Discard (NAT64 well-known) — RFC 6666 |
-| `2001:db8::/32` | Documentation — RFC 3849 |
-
-An attacker who registers a feed URL that resolves to `fd00::1` (a ULA address
-common in enterprise and government networks) bypasses the SSRF check entirely.
-All internal services reachable via IPv6 are exposed to SSRF.
-
-**Fix:** Extend `is_private_ip()` to cover all IPv6 private ranges (implemented in v0.2.4).
-
----
-
-### AUDIT-CRIT-04 — SSRF redirect guard only checks literal IPs, not hostnames
-
-**File:** `src/feeds/mod.rs:582`  
-**Status:** Fixed in v0.2.4
-
-The SSRF-safe HTTP client blocks redirects to private *literal IP* destinations:
+Current implementation (v0.3.5):
 
 ```rust
-if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-    if is_private_ip(&ip) {
-        return attempt.error("redirect to private IP blocked");
-    }
+std::net::IpAddr::V6(v6) => {
+    let s = v6.segments();
+    v6.is_loopback() || v6.is_unspecified()
+    || (s[0] & 0xfe00) == 0xfc00   // ULA fc00::/7
+    || (s[0] & 0xffc0) == 0xfe80   // link-local fe80::/10
+    || (s[0] == 0x2001 && s[1] == 0x0db8)  // documentation
 }
-attempt.follow()   // ← reached for hostname destinations
 ```
-
-A feed server that redirects to `http://internal.corp/data` bypasses the guard:
-`host.parse::<IpAddr>()` fails (it's a hostname), so `attempt.follow()` is called
-unconditionally. The redirect is followed to the internal hostname without DNS
-resolution or IP-range check.
-
-**Attack scenario:** Attacker operates a public feed server at `https://feeds.attacker.com/`.
-Runbound subscribes. On the next auto-refresh, the server redirects to
-`http://admin.internal/config`. Runbound fetches the internal endpoint and
-(if it returns valid feed format) stores the result.
-
-**Fix:** Resolve hostname destinations in the redirect policy before following.
-Implemented in v0.2.4.
 
 ---
 
-## High Findings
+#### AUDIT-CRIT-04 — SSRF redirect guard only checked literal IPs, not hostnames
 
-### AUDIT-HIGH-01 — No feed subscription count limit (authenticated DoS)
+**File:** `src/feeds/mod.rs`  
+**Status:** ✅ Fixed in v0.2.4
+
+The redirect policy only called `is_private_ip()` when the redirect destination
+parsed as a literal `IpAddr`. A redirect to `http://internal.corp/data` passed
+`host.parse::<IpAddr>()` fails, so `attempt.follow()` was called unconditionally.
+
+Fix: the reqwest redirect policy now resolves hostname destinations before following.
+TOCTOU re-validation (SEC-05) also added — URL is re-validated on every fetch, not
+just at subscription time.
+
+---
+
+### High Findings
+
+#### AUDIT-HIGH-01 — No feed subscription count limit (authenticated DoS)
 
 **File:** `src/api/mod.rs`, `src/feeds/mod.rs`  
-**Status:** Fixed in v0.2.4 (`MAX_FEEDS = 100`)
+**Status:** ✅ Fixed in v0.2.4 (`MAX_FEEDS = 100`)
 
-`MAX_DNS_ENTRIES` (10,000) and `MAX_BLACKLIST_ENTRIES` (100,000) are enforced but
-there is no cap on feed subscriptions. Each feed can download up to 100 MiB.
-An authenticated client can:
-
-```
-for i in 0..1000:
-  POST /feeds  {"name":"feed{i}", "url":"https://evil.com/huge.txt"}
-POST /feeds/update   # triggers 1000 × 100 MiB downloads
-```
-
-100 GB of network I/O and 100 GB of parsed domain strings would exhaust memory
-and storage. The server's OOM guard triggers but may not recover.
+No upper bound on feed subscriptions — each feed could download up to 100 MiB,
+enabling an authenticated client to trigger unbounded network I/O. Cap of 100
+subscriptions enforced in v0.2.4.
 
 ---
 
-### AUDIT-HIGH-02 — `/help` endpoint information disclosure (unauthenticated)
+#### AUDIT-HIGH-02 — `/help` endpoint information disclosure (unauthenticated)
 
-**File:** `src/api/mod.rs:268`  
-**Status:** Fixed in v0.2.5 — `/help` now requires Bearer authentication
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.2.5 — Bearer authentication required
 
-`GET /help` previously required no authentication and returned:
-- Exact version string (`"version": "0.2.3"`)
-- Complete endpoint list
-- RFC compliance claims
-- Author identity (`env!("CARGO_PKG_AUTHORS")`)
-
-This enables **version fingerprinting** for targeted exploitation of known
-vulnerabilities in Runbound or its dependencies. For classified or restricted
-deployments, this endpoint should be removed or placed behind authentication.
+Previously returned exact version string, endpoint list, RFC claims, and author
+identity without authentication, enabling version fingerprinting for targeted
+exploitation. All endpoints now require Bearer token.
 
 ---
 
-### AUDIT-HIGH-03 — Fallback to Cloudflare when no forward-zone configured
+#### AUDIT-HIGH-03 — Silent fallback to Cloudflare when no `forward-zone` configured
 
-**File:** `src/dns/server.rs:397`  
-**Status:** Warning added in v0.2.4
+**File:** `src/dns/server.rs`  
+**Status:** ✅ Mitigated in v0.2.4 — loud WARN log emitted
 
-```rust
-if resolver_cfg.name_servers().is_empty() {
-    resolver_cfg = ResolverConfig::cloudflare();
-}
-```
-
-If the config file has no `forward-zone:` block, all DNS queries are silently
-forwarded to Cloudflare (1.1.1.1/1.0.0.1) over UDP. For a nation-state deployment
-this is a **data exfiltration risk** — the entire DNS query stream goes to a US
-cloud provider. The operator may be unaware.
-
-A misconfigured or stripped config file (no forward-zone section) triggers this
-silently.
+If the config has no `forward-zone:` block, all DNS queries fall back to Cloudflare
+(1.1.1.1/1.0.0.1) over plain UDP. For classified deployments this is a data exfiltration
+risk. A startup WARN is now logged. Operators should always configure explicit
+`forward-zone:` blocks.
 
 ---
 
-### AUDIT-HIGH-04 — ACL not reloaded on SIGHUP (systemd.md table was wrong)
+#### AUDIT-HIGH-04 — ACL not reloaded on SIGHUP (documentation wrong)
 
-**File:** `src/main.rs:90`, `docs/systemd.md`  
-**Status:** Corrected in v0.2.4
+**File:** `src/main.rs`, `docs/systemd.md`  
+**Status:** ✅ Fixed in v0.2.5 — documentation corrected
 
-The SIGHUP handler calls `build_zone_set()` and stores the result. The `Arc<Acl>`
-is built once at startup and is not updated by SIGHUP. The `systemd.md` hot-reload
-table erroneously stated that `access-control` rules are reloaded on SIGHUP.
-An operator who adds a new `access-control` deny rule and runs `systemctl reload`
-will believe the rule is active when it is not. The process must be restarted.
+The SIGHUP handler reloads DNS zones but the `Arc<Acl>` is built once at startup.
+The `systemd.md` hot-reload table erroneously stated that `access-control` rules
+are reloaded on SIGHUP. Table corrected — ACL change requires restart.
 
 ---
 
-### AUDIT-HIGH-05 — Rate limiter bucket exhaustion (UDP source IP spoofing)
+#### AUDIT-HIGH-05 — Rate limiter bucket exhaustion under UDP source IP spoofing
 
 **File:** `src/dns/ratelimit.rs`  
-**Status:** Architectural — documented
+**Status:** ✅ Mitigated — aggressive eviction on bucket table full
 
-```rust
-const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
-// ...
-if !self.buckets.contains_key(&ip) && self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
-    return false;
-}
-```
+UDP source IP spoofing can fill the bucket table (65,536 entries). Original
+implementation refused new IPs when full, including legitimate clients.
 
-UDP allows source IP spoofing. An attacker sending queries from 65,537+ unique
-spoofed IPs fills the bucket table. New IPs (including legitimate clients) are
-refused with no response. The cleanup only runs every 10,000 queries; with a
-sustained flood, the cleanup never catches up.
-
-Mitigation requires network-layer controls (ingress filtering, BCP38) upstream
-of Runbound. At the application layer: reduce `MAX_RATE_LIMIT_BUCKETS` to a value
-that allows faster cleanup, or use a time-bucketed structure that evicts stale IPs
-aggressively.
+Current implementation evicts idle entries (last seen > 10 s) before refusing.
+If still full after eviction, the flood is active and the drop is intentional.
+Network-layer controls (BCP38 ingress filtering) remain the correct primary
+defence.
 
 ---
 
-### AUDIT-HIGH-06 — JSON data stores have no integrity protection
+#### AUDIT-HIGH-06 — JSON data stores have no integrity protection
 
 **File:** `src/store.rs`, `src/feeds/mod.rs`  
-**Status:** Architectural — documented
+**Status:** ⚠️ Open — HMAC integrity planned (v0.4.x)
 
 `dns_entries.json`, `blacklist.json`, and `feeds.json` are stored as cleartext JSON
-with file permissions 0640. An attacker with filesystem write access (e.g., via a
-web shell or misconfigured backup restore) can inject arbitrary DNS records without
-touching the API, bypassing authentication, rate limiting, and entry count limits.
+(mode 0640). An attacker with filesystem write access can inject arbitrary DNS
+records without touching the API, bypassing authentication, rate limiting, and entry
+count limits. HMAC-SHA256 integrity over store files is planned.
 
-For nation-state deployments: mount the data directory on an integrity-protected
-filesystem (dm-verity, ZFS with checksums, or a HSM-backed secret store). Apply
-HMAC-SHA256 over the JSON content using a key stored in the system keyring.
-
----
-
-### AUDIT-HIGH-07 — TLS cipher suites inherit rustls 0.21 defaults
-
-**File:** `src/dns/server.rs:507`, `Cargo.toml`  
-**Status:** Architectural — documented
-
-The DoT/DoH/DoQ TLS configuration uses `hickory-server`'s default rustls setup
-without pinning minimum TLS version, cipher suites, or disabling obsolete
-algorithms. `rustls 0.21` defaults to TLS 1.2+, which includes cipher suites
-below BSI TR-02102 / NIST SP 800-52 Rev 2 requirements.
-
-For nation-state deployments:
-- Mandate TLS 1.3 only
-- Pin cipher suites to `TLS_AES_256_GCM_SHA384` and `TLS_CHACHA20_POLY1305_SHA256`
-- Disable RSA key exchange (require ECDHE)
-- Upgrade to `rustls 0.23` (which defaults to TLS 1.3 and has a cleaner API)
+**Mitigation for production:** Mount the data directory on an integrity-protected
+filesystem (dm-verity, ZFS with checksums). Apply IMA/EVM on the data files.
 
 ---
 
-### AUDIT-HIGH-08 — No mTLS for DoT client authentication
+#### AUDIT-HIGH-07 — TLS cipher suites inherit rustls 0.21 defaults
 
-**File:** `src/dns/server.rs:643`  
-**Status:** Architectural — documented
+**File:** `Cargo.toml`, `src/dns/server.rs`  
+**Status:** ⚠️ Open — requires hickory 0.26 upgrade (v0.4.0)
 
-DNS-over-TLS uses server-only TLS (standard client→server direction). There is no
-support for mutual TLS (client certificates). For a classified government DNS
-resolver, client certificate authentication restricts service to authorised
-endpoints.
+`rustls 0.21` (pulled by hickory-server 0.24) enables TLS 1.2 + cipher suites
+below BSI TR-02102 / NIST SP 800-52 Rev 2. Upgrading to hickory-server 0.26 pulls
+rustls 0.23 which defaults to TLS 1.3 only. Six hickory-proto CVEs (RUSTSEC-2026-0119,
+RUSTSEC-2026-0037, RUSTSEC-2025-0009, RUSTSEC-2026-0104, RUSTSEC-2026-0098,
+RUSTSEC-2026-0099) are also resolved in hickory 0.26. Migration is tracked in `audit.toml`.
 
-The hickory-server TLS listener accepts a `(Vec<Certificate>, PrivateKey)` tuple
-with no mechanism to require client certificates. Implementing mTLS requires a
-custom `ServerConfig` with `client_cert_verifier` set.
+**Mitigation for nation-state:** Configure a TLS terminating proxy (nginx, haproxy)
+in front of Runbound's DoT port with explicit TLS 1.3 + approved cipher list.
 
 ---
 
-## Medium Findings
+#### AUDIT-HIGH-08 — No mTLS for DoT client authentication
 
-### AUDIT-MED-01 — `is_valid_domain` in feed parser allows single-label entries via underscore
+**File:** `src/dns/server.rs`  
+**Status:** ⚠️ Open — architectural
 
-**File:** `src/feeds/mod.rs:489`
+DoT uses server-only TLS. There is no support for mutual TLS (client certificates).
+For a classified DNS resolver, mTLS restricts service to authorised endpoints.
+Requires a custom `ServerConfig` with `client_cert_verifier` set in rustls. Blocked
+on the hickory 0.26 upgrade (HIGH-07).
+
+---
+
+### Medium Findings
+
+#### AUDIT-MED-01 — Feed parser accepts underscore labels
+
+**File:** `src/feeds/mod.rs`  
+**Status:** ✅ Accepted — intentional RFC relaxation, documented
+
+`is_valid_domain()` requires at least one dot but allows underscore labels
+(`_dmarc.example.com`). RFC 1035 §2.3.1 disallows underscores in host labels, but
+service labels use them by convention (RFC 2782/6763). Blocklist pragmatism takes
+precedence. No action required.
+
+---
+
+#### AUDIT-MED-02 — TOCTOU window in feed URL validation
+
+**File:** `src/feeds/mod.rs`  
+**Status:** ✅ Mitigated — SEC-05 (v0.2.0) + re-validation on every fetch (v0.3.0)
+
+`validate_feed_url()` resolves the hostname then reqwest re-resolves for the actual
+TCP connection. DNS rebinding with TTL=0 could switch the A record in that window
+(< 10 ms). URL is now re-validated on every fetch, not just at subscription time,
+closing the window for pre-subscribed records. Residual risk requires attacker
+control of both the feed's DNS zone and precise millisecond timing.
+
+---
+
+#### AUDIT-MED-03 — SSRF hostname resolution uses system resolver
+
+**File:** `src/feeds/mod.rs`  
+**Status:** ⚠️ Open
+
+`validate_feed_url()` uses `tokio::net::lookup_host()` which resolves via
+`/etc/resolv.conf`. On a Runbound host that is its own resolver, this creates a
+loop, and the system resolver is not guaranteed to give accurate SSRF-blocking
+results. The correct fix is to validate at TCP connection time in a custom reqwest
+connector that checks `is_private_ip()` after each resolution.
+
+---
+
+#### AUDIT-MED-04 — XDP `frame_mut()` had no bounds enforcement
+
+**File:** `src/dns/xdp/umem.rs`  
+**Status:** ✅ Fixed in v0.2.4 — `debug_assert!` bounds checks added
 
 ```rust
-if !s.contains('.') { return false; }
+debug_assert!(
+    (offset as usize) + len <= self.area_len,
+    "XDP frame_mut: offset {offset} + len {len} exceeds UMEM size {}",
+    ...
+);
 ```
 
-The check requires at least one dot, but `_dmarc` (single label with underscore)
-would pass `!s.contains('.')` as `false` (it fails). This is correct. However,
-`_dmarc.example.com` (underscore in non-service position) is accepted.
-RFC 1035 §2.3.1 specifies that labels must start with a letter, not underscore,
-but service labels (`_tcp`, `_dmarc`) use underscores by convention (RFC 2782/6763).
-This is technically a relaxed check but pragmatically correct for blocklists.
-**No immediate action required; document the intentional relaxation.**
+---
+
+#### AUDIT-MED-05 — No authentication failure rate limiting
+
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.2.5 — 500 ms async delay after each failure
+
+`AUTH_FAILURES` global counter increments on every failed authentication.
+A 500 ms `tokio::time::sleep` is injected after each failed attempt, reducing
+brute-force throughput from 30 req/s to 2 req/s. Counter resets on successful
+authentication.
 
 ---
 
-### AUDIT-MED-02 — TOCTOU window in feed URL validation
+#### AUDIT-MED-06 — Log injection via structured DNS query names
 
-**File:** `src/feeds/mod.rs:524`
+**File:** `src/dns/server.rs`  
+**Status:** ⚠️ Open — verify tracing JSON escaping
 
-`update_feed()` calls `validate_feed_url()` (which resolves the hostname via
-`tokio::net::lookup_host()`) immediately before `client.get()`. reqwest internally
-re-resolves the hostname for the actual TCP connection. Between the two resolutions,
-an attacker controlling the feed's DNS can switch the A record from a public IP
-to a private one (DNS rebinding with TTL=0).
+DNS query names are emitted verbatim as structured log fields. With JSON output
+(`RUST_LOG=json`), a crafted name containing `"` or `}` could break downstream
+log consumers (Elasticsearch, Splunk). The `tracing-subscriber` JSON formatter
+escapes most special characters; full verification against RFC 1035 character
+constraints and JSON-breaking sequences is pending.
 
-This window is typically < 10 ms. Exploiting it requires precise timing and control
-over the feed's DNS zone. Practical risk is very low but non-zero.
-
-**Mitigation (complete):** Use a custom reqwest DNS resolver that performs the
-IP-range check at connection time, not before. The current approach is a significant
-improvement over no validation (pre-v0.2.0).
+**Mitigation:** Apply explicit JSON escaping to `qname` before logging.
 
 ---
 
-### AUDIT-MED-03 — Cloudflare DNS used for SSRF hostname resolution
+#### AUDIT-MED-07 — `api-key` stored cleartext in `runbound.conf`
 
-**File:** `src/feeds/mod.rs:323`
+**File:** `src/config/parser.rs`  
+**Status:** ✅ Mitigated in v0.2.4 — WARN log when `api-key:` is used in config
 
-`validate_feed_url()` resolves hostnames using `tokio::net::lookup_host()`, which
-uses the system resolver (`/etc/resolv.conf`). On a default installation after
-`install.sh` runs, the system resolver may point to the Runbound instance itself
-(loop), a public resolver, or DHCP-assigned resolver. None of these is guaranteed
-to give accurate SSRF-blocking resolution.
-
-**Mitigation:** Use a local resolver that is independent of the system resolver
-for SSRF validation, or validate at the TCP connection layer.
+Production deployments should set `RUNBOUND_API_KEY` via environment variable (systemd
+`EnvironmentFile`, Docker secret) rather than the config file. A WARN is logged at
+startup when the config-file `api-key:` directive is used.
 
 ---
 
-### AUDIT-MED-04 — XDP `frame_mut()` has no bounds enforcement at call sites
+### Low Findings
 
-**File:** `src/dns/xdp/umem.rs:334`
+#### AUDIT-LOW-01 — Hand-rolled UTC timestamp in `feeds/mod.rs`
+
+**File:** `src/feeds/mod.rs`  
+**Status:** ✅ Fixed in v0.2.5 — replaced with `humantime::format_rfc3339`
+
+30-line custom Gregorian calendar implementation replaced by `humantime` (already a
+dependency), eliminating leap year edge case risk.
+
+---
+
+#### AUDIT-LOW-02 — `/help` exposes author identity and repository URL (unauthenticated)
+
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.2.5 — endpoint requires Bearer authentication
+
+See AUDIT-HIGH-02.
+
+---
+
+#### AUDIT-LOW-03 — No cap on `local-zone` / `local-data` entries in config
+
+**File:** `src/config/parser.rs`  
+**Status:** ⚠️ Open
+
+The config parser accumulates entries without limit. A malformed config with millions
+of `local-data:` lines consumes unbounded memory at startup. Risk is low (operator-
+controlled config) but a sanity cap (e.g. 1,000,000) with a startup error would
+prevent accidental misconfiguration.
+
+---
+
+#### AUDIT-LOW-04 — TCP idle timeout too short for high-latency DoT
+
+**File:** `src/dns/server.rs`  
+**Status:** ✅ Fixed in v0.2.5 — TCP timeout raised to 30 s (RFC 7858 §3.5)
+
+---
+
+---
+
+## Second Audit Cycle — v0.3.3
+
+The following eight findings were identified during the v0.3.3 audit and all fixed
+in the same release. They are cross-referenced as SEC-09 through SEC-16 in
+[`docs/security.md`](security.md).
+
+---
+
+### SEC-09 (High) — `POST /rotate-key` was a silent no-op
+
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.3.3
+
+The handler read `RUNBOUND_API_KEY` from `std::env::var()`, which is frozen at
+process startup. Updating the systemd `EnvironmentFile` and calling `POST /rotate-key`
+appeared to succeed (HTTP 200) but the in-memory key was never updated. The new key
+was unreachable until restart.
+
+**Fix:** `POST /rotate-key` now accepts `{"new_key": "<32+ chars>"}` in the request
+body and atomically swaps the live key via `ArcSwap<String>`. The old key remains
+valid until the swap completes (zero downtime). The new key is written to
+`/etc/runbound/api.key` with `chmod 600`.
+
+---
+
+### SEC-10 (Medium) — CHAOS class queries returned NOERROR
+
+**File:** `src/dns/server.rs`  
+**Status:** ✅ Fixed in v0.3.3 — confirmed correct in v0.3.5 pentest re-test
+
+CHAOS class queries (`version.bind CH TXT`, `hostname.bind CH TXT`) expose server
+identity and are used for DNS fingerprinting. RFC 5358 §4 specifies that resolvers
+which do not implement CHAOS SHOULD return NOTIMP.
+
+The check was added in v0.3.3:
 
 ```rust
-pub unsafe fn frame_mut(&mut self, offset: u64, len: usize) -> &mut [u8] {
-    slice::from_raw_parts_mut(self.area.add(offset as usize), len)
+if u16::from(request.query().query_class()) == 3 {
+    return send_error(request, response_handle, ResponseCode::NotImp).await;
 }
 ```
 
-The safety contract says "offset must be a valid UMEM frame offset" but is not
-enforced. A kernel bug or ring corruption that delivers a malformed `XdpDesc`
-could produce an out-of-bounds write. The XDP path runs in a dedicated OS thread
-outside the async runtime, so a memory corruption here cannot be caught by Tokio
-and would segfault the entire process.
-
-**Mitigation:** Add a debug-mode bounds assertion: `debug_assert!(offset < self.area_len as u64)`.
+**Pentest note (v0.3.5):** A subsequent pentest reported NOERROR for
+`version.bind CH TXT`. Root-cause analysis confirmed the test tool was querying the
+system Unbound daemon on port 53, not Runbound on port 5353. Direct test against
+Runbound confirms `status: NOTIMP`.
 
 ---
 
-### AUDIT-MED-05 — No authentication failure rate limiting / lockout
+### SEC-11 (Medium) — Body limit dropped TCP instead of returning HTTP 413
 
-**File:** `src/api/mod.rs:174`
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.3.3
 
-Failed authentication attempts are logged (`warn!`) but there is no incremental
-delay, lockout, or alert. An automated attacker can attempt unlimited token guesses
-(subject only to the per-IP rate limiter of 30 req/s). With a 256-bit key, brute
-force is infeasible, but weak or manually-set `api-key:` values in the config file
-are at risk.
+Payloads above axum's default `DefaultBodyLimit` caused the middleware to drop the
+TCP connection without sending a response. Clients (including `curl`) reported
+"connection reset" rather than a structured error.
 
-**Mitigation:** Log failed attempts with client IP; add a per-IP failure counter
-with exponential backoff or lockout after N failures.
+**Fix:** Explicit `DefaultBodyLimit::max(65_536)` (64 KiB). axum returns HTTP 413
+`Content Too Large` with a JSON body before reading oversized payloads into RAM.
 
 ---
 
-### AUDIT-MED-06 — Log injection via structured DNS query names
+### SEC-12 (Medium) — Negative TTL caused `unwrap()` panic
 
-**File:** `src/dns/server.rs:329`
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.3.3
 
-```rust
-name = %qname,
+`POST /dns` with `{"ttl": -1}` caused a `u32::try_from` failure that propagated
+as an `unwrap()` panic, crashing the handler task. Clients received a 500 with no
+JSON body.
+
+**Fix:** TTL is validated in range 0–2,147,483,647 (RFC 2181 §8) before conversion.
+Out-of-range values return HTTP 422 `INVALID_TTL`.
+
+---
+
+### SEC-13 (Medium) — Production `unwrap()` / `expect()` in request handlers
+
+**File:** `src/api/mod.rs`, `src/feeds/mod.rs`  
+**Status:** ✅ Fixed in v0.3.3
+
+Several request-path functions used `unwrap()` and `expect()` on fallible operations
+(lock acquisition, JSON serialisation, store reads). A poisoned mutex or corrupt
+store would crash the handler task, and in some paths the entire process via
+`Mutex::lock().unwrap()`.
+
+**Fix:** All `unwrap()` / `expect()` in handler paths replaced with `?` or explicit
+match arms that return HTTP 500 or 503 with structured JSON error responses.
+
+---
+
+### SEC-14 (Medium) — Sync Bearer comparison was timing-vulnerable
+
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.3.3
+
+The authentication middleware compared Bearer tokens with a synchronous string
+equality check that short-circuits on the first differing byte. With sufficiently
+precise timing measurements, an attacker could determine the number of correct prefix
+characters.
+
+**Fix:** Comparison replaced with `subtle::ConstantTimeEq` (constant-time byte-by-byte
+comparison, no early exit). The `subtle` crate is designed specifically to prevent
+timing side-channels.
+
+---
+
+### SEC-15 (Low) — Feed URLs with embedded credentials not rejected
+
+**File:** `src/feeds/mod.rs`  
+**Status:** ✅ Fixed in v0.3.3
+
+Feed URLs containing `user:pass@host` were accepted and stored in `feeds.json` at
+rest. The credentials were sent in the `Authorization` header on every fetch and
+could be logged by the upstream feed server.
+
+**Fix:** `validate_feed_url()` rejects URLs containing `@` in the host component
+(userinfo present) with HTTP 400 before any network request.
+
+---
+
+### SEC-16 (Low) — `rate-limit: u64::MAX` silently disabled rate limiting
+
+**File:** `src/config/parser.rs`, `src/dns/ratelimit.rs`  
+**Status:** ✅ Fixed in v0.3.3
+
+Setting `rate-limit:` to `u64::MAX` or any value that overflowed `u64` when
+doubled (for burst calculation) silently disabled the rate limiter without warning.
+
+**Fix:** Values above 10,000,000 (10M qps) are capped at 10M and a WARN is logged.
+`rate-limit: 0` explicitly disables the limiter with an explicit WARN at startup.
+
+---
+
+---
+
+## v0.3.5 Fix
+
+### GET /config missing `log_retention` / `log_client_ip`
+
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.3.5
+
+The two GDPR privacy directives added in v0.3.4 (`log-retention`, `log-client-ip`)
+were not exposed in the `GET /config` snapshot endpoint. All other runtime parameters
+are visible; the omission was an incomplete rebuild (binary pre-dated the source
+change). Both fields appear in the config response from v0.3.5 onward:
+
+```json
+"log_client_ip": true,
+"log_retention": 1000
 ```
 
-Every DNS query name is emitted as a structured log field. With JSON logging
-(`RUST_LOG=json`), a crafted DNS name containing `"` or `}` characters could
-potentially break the JSON structure in downstream log consumers (Elasticsearch,
-Splunk). The hickory `LowerName` Display implementation escapes most control
-characters but may not handle all JSON-breaking sequences.
-
-**Mitigation:** Apply JSON escaping to `qname` before logging, or verify that
-the `tracing-subscriber` JSON formatter escapes all special characters.
-
 ---
-
-### AUDIT-MED-07 — `api-key` stored cleartext in `runbound.conf`
-
-**File:** `src/config/parser.rs:187`, `docs/configuration.md`
-
-The `api-key:` directive stores the API key in the config file (mode 0640).
-The installer generates the key in a separate `env` file (mode 0640), which is
-good practice. However, the config-file option is documented and operators may use
-it for convenience, placing the key where it can be read by any process with group
-membership, or in configuration management systems that log secrets.
-
-**Mitigation:** Deprecate `api-key:` in the config file; require `RUNBOUND_API_KEY`
-env var for all production deployments. Add a `WARN`-level log when `api-key:` is
-used in config.
-
----
-
-## Low Findings
-
-### AUDIT-LOW-01 — Hand-rolled UTC timestamp in `feeds/mod.rs`
-
-**File:** `src/feeds/mod.rs:728`
-
-A 30-line custom Gregorian calendar implementation generates RFC 3339 timestamps
-for feed `last_updated`. This reimplements date arithmetic that is subtle to get
-right (leap year edge cases, month-day accounting). No known bug exists, but
-maintenance risk is elevated. Use `std::time::SystemTime` formatted via
-`humantime` (already a dependency) instead.
-
----
-
-### AUDIT-LOW-02 — `GET /help` exposes author identity and repository URL
-
-**File:** `src/api/mod.rs:270`  
-**Status:** Fixed in v0.2.5 — `/help` now requires Bearer authentication
-
-```rust
-"author": env!("CARGO_PKG_AUTHORS"),
-"repository": env!("CARGO_PKG_REPOSITORY"),
-```
-
-Previously revealed personal identity and repository URL from an unauthenticated endpoint.
-The endpoint is now behind auth — unauthenticated callers receive 401.
-
----
-
-### AUDIT-LOW-03 — No cap on the number of `local-zone` / `local-data` entries in config
-
-**File:** `src/config/parser.rs`
-
-The config parser accumulates `local_zones` and `local_data` entries without limit.
-A malformed or adversarial config file with millions of `local-data:` lines would
-consume excessive memory at startup. Since the config file is operator-controlled,
-this is low risk, but a sanity limit (e.g., 1,000,000 entries) with an error at
-parse time would prevent accidental misconfiguration.
-
----
-
-### AUDIT-LOW-04 — TCP idle timeout (5 s) is too short for high-latency DoT
-
-**File:** `src/dns/server.rs:631`  
-**Status:** Fixed in v0.2.5 — timeout raised to 30 s
-
-```rust
-server.register_listener(tcp, Duration::from_secs(5));
-```
-
-DoT clients on high-latency links (satellite, intercontinental) may exceed 5 seconds
-between queries on the same connection, causing premature disconnection and
-re-handshake overhead. RFC 7858 §3.5 recommends >= 10 s. All TCP listeners now use 30 s.
 
 ---
 
 ## Informational Notes
 
-### AUDIT-INFO-01 — Runbound trusts all API clients equally
+### AUDIT-INFO-01 — Single shared API key, no roles
 
-There is a single API key shared by all operators. There are no roles (read-only
-vs. read-write), no per-operator keys, no audit attribution. For multi-operator
-deployments, individual operator keys with per-key audit logs are necessary.
+There is one API key shared by all operators. No per-operator keys, no read-only
+vs. read-write separation, no per-key audit attribution. For multi-operator
+deployments, individual operator keys with per-key audit logs are required.
 
 ### AUDIT-INFO-02 — No OCSP stapling for DoT certificates
 
 The TLS configuration does not implement OCSP stapling. DoT clients performing
-certificate revocation checks incur additional latency. For production DoT, use
-Let's Encrypt certificates with OCSP stapling enabled in the TLS stack.
+certificate revocation checks incur additional round-trip latency. For production
+DoT, use Let's Encrypt certificates with OCSP stapling enabled in the TLS stack.
 
-### AUDIT-INFO-03 — Memory pressure guard reads /proc/meminfo
+### AUDIT-INFO-03 — Memory pressure guard requires `/proc/meminfo`
 
-The 30-second memory check reads `/proc/meminfo`, which is Linux-specific and
-unavailable in some container runtimes. On systems where `/proc/meminfo` is
-unavailable, `read_meminfo()` returns `None` and the guard silently does nothing.
-Add a log warning if meminfo is unavailable at first poll.
+The 30-second memory check reads `/proc/meminfo` (Linux-only). On systems or
+containers without `/proc/meminfo`, the guard silently skips — DNS service continues
+normally. A WARN is logged on the first missed check.
 
-### AUDIT-INFO-04 — XDP fast path handles only local-zone queries
+### AUDIT-INFO-04 — XDP fast path is safe-by-design for query forwarding
 
-The AF_XDP worker correctly falls through to the kernel (and hickory-server) for:
-- Recursive queries (unknown names)
-- ANY queries (RFC 8482)
-- ACL-denied sources (crafts REFUSED and returns)
-- Malformed frames
-
-This design is sound. There is no data exfiltration risk from the XDP path.
+The AF_XDP worker correctly falls through to the kernel (hickory-server) for
+recursive queries, ANY queries, and malformed frames. ACL-denied sources receive a
+crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP path.
 
 ---
 
 ## Finding Summary
 
+### Initial Audit (v0.2.3) — status as of v0.3.5
+
 | ID | Severity | Component | Status |
 |---|---|---|---|
-| CRIT-01 | CRITICAL | API | Fixed in v0.2.5 — /health /stats /config /reload implemented |
-| CRIT-02 | CRITICAL | DNS/DNSSEC | Mitigated in v0.2.5 — dnssec-validation directive added |
-| CRIT-03 | CRITICAL | Feeds/SSRF | Fixed in v0.2.4 |
-| CRIT-04 | CRITICAL | Feeds/SSRF | Fixed in v0.2.4 |
-| HIGH-01 | HIGH | Feeds | Fixed in v0.2.4 (MAX_FEEDS = 100) |
-| HIGH-02 | HIGH | API | Fixed in v0.2.5 — /help now requires Bearer token |
-| HIGH-03 | HIGH | DNS | Mitigated in v0.2.4 (loud warning log) |
-| HIGH-04 | HIGH | Reload | Fixed in v0.2.5 — POST /reload implemented |
-| HIGH-05 | HIGH | RateLimit | Mitigated in v0.2.5 — aggressive eviction on bucket exhaustion |
-| HIGH-06 | HIGH | Storage | Open — architectural (HMAC integrity planned) |
-| HIGH-07 | HIGH | TLS | Open — requires rustls upgrade |
-| HIGH-08 | HIGH | TLS/DoT | Open — requires mTLS implementation |
-| MED-01 | MEDIUM | Feeds | Accepted — intentional RFC relaxation |
-| MED-02 | MEDIUM | Feeds/SSRF | Partial — documented residual risk |
-| MED-03 | MEDIUM | Feeds/SSRF | Open — resolver independence |
-| MED-04 | MEDIUM | XDP | Mitigated in v0.2.4 (debug_assert added) |
-| MED-05 | MEDIUM | API | Fixed in v0.2.5 — AUTH_FAILURES global counter + 500ms lockout |
-| MED-06 | MEDIUM | Logging | Open — verify tracing JSON escaping |
-| MED-07 | MEDIUM | Config | Mitigated in v0.2.4 (WARN log) |
-| LOW-01 | LOW | Feeds | Fixed in v0.2.5 — replaced with humantime::format_rfc3339 |
-| LOW-02 | LOW | API | Fixed in v0.2.5 — /help now requires Bearer token |
-| LOW-03 | LOW | Config | Open |
-| LOW-04 | LOW | DNS/TLS | Fixed in v0.2.5 — TCP timeout raised to 30 s |
+| CRIT-01 | CRITICAL | API | ✅ Fixed v0.2.5 |
+| CRIT-02 | CRITICAL | DNSSEC | ✅ Mitigated v0.2.5 — `dnssec-validation` directive |
+| CRIT-03 | CRITICAL | SSRF/IPv6 | ✅ Fixed v0.2.4 |
+| CRIT-04 | CRITICAL | SSRF/redirect | ✅ Fixed v0.2.4 |
+| HIGH-01 | HIGH | Feeds | ✅ Fixed v0.2.4 — MAX_FEEDS = 100 |
+| HIGH-02 | HIGH | API | ✅ Fixed v0.2.5 — /help requires Bearer |
+| HIGH-03 | HIGH | DNS | ✅ Mitigated v0.2.4 — startup WARN |
+| HIGH-04 | HIGH | Reload | ✅ Fixed v0.2.5 — docs corrected |
+| HIGH-05 | HIGH | RateLimit | ✅ Mitigated — aggressive eviction on flood |
+| HIGH-06 | HIGH | Storage | ⚠️ Open — HMAC integrity planned v0.4.x |
+| HIGH-07 | HIGH | TLS | ⚠️ Open — rustls 0.23 via hickory 0.26 (v0.4.0) |
+| HIGH-08 | HIGH | TLS/DoT | ⚠️ Open — mTLS, blocked on hickory 0.26 |
+| MED-01 | MEDIUM | Feeds | ✅ Accepted — intentional RFC relaxation |
+| MED-02 | MEDIUM | SSRF/TOCTOU | ✅ Mitigated — re-validation on every fetch |
+| MED-03 | MEDIUM | SSRF | ⚠️ Open — resolver independence |
+| MED-04 | MEDIUM | XDP | ✅ Fixed v0.2.4 — debug_assert bounds |
+| MED-05 | MEDIUM | API auth | ✅ Fixed v0.2.5 — 500 ms lockout per failure |
+| MED-06 | MEDIUM | Logging | ⚠️ Open — JSON escaping of qname |
+| MED-07 | MEDIUM | Config | ✅ Mitigated v0.2.4 — WARN on api-key in config |
+| LOW-01 | LOW | Feeds | ✅ Fixed v0.2.5 — humantime::format_rfc3339 |
+| LOW-02 | LOW | API | ✅ Fixed v0.2.5 — /help requires Bearer |
+| LOW-03 | LOW | Config | ⚠️ Open — no cap on local-zone entries |
+| LOW-04 | LOW | DNS/TLS | ✅ Fixed v0.2.5 — TCP timeout 30 s |
+
+### Second Audit Cycle (v0.3.x) — status as of v0.3.5
+
+| ID | Severity | Component | Status |
+|---|---|---|---|
+| SEC-09 | HIGH | API | ✅ Fixed v0.3.3 — /rotate-key JSON body + ArcSwap |
+| SEC-10 | MEDIUM | DNS | ✅ Fixed v0.3.3 — CHAOS → NOTIMP (confirmed v0.3.5) |
+| SEC-11 | MEDIUM | API | ✅ Fixed v0.3.3 — DefaultBodyLimit → HTTP 413 |
+| SEC-12 | MEDIUM | API | ✅ Fixed v0.3.3 — negative TTL → HTTP 422 |
+| SEC-13 | MEDIUM | API | ✅ Fixed v0.3.3 — unwrap() → structured errors |
+| SEC-14 | MEDIUM | API auth | ✅ Fixed v0.3.3 — subtle::ConstantTimeEq |
+| SEC-15 | LOW | Feeds | ✅ Fixed v0.3.3 — credential URL rejected |
+| SEC-16 | LOW | RateLimit | ✅ Fixed v0.3.3 — u64::MAX capped at 10M |
+
+### v0.3.5 Fix
+
+| ID | Severity | Component | Status |
+|---|---|---|---|
+| CONF-01 | LOW | API | ✅ Fixed v0.3.5 — /config exposes log_retention + log_client_ip |
+
+---
+
+## Open Findings (action required)
+
+| ID | Severity | Remediation |
+|---|---|---|
+| HIGH-06 | HIGH | Implement HMAC-SHA256 over JSON data stores — planned v0.4.x |
+| HIGH-07 | HIGH | Upgrade hickory 0.24 → 0.26 (rustls 0.21 → 0.23, TLS 1.3 only) — v0.4.0 |
+| HIGH-08 | HIGH | Implement mTLS for DoT — blocked on HIGH-07 |
+| MED-03 | MEDIUM | Validate SSRF at TCP connection time, independent of system resolver |
+| MED-06 | MEDIUM | Explicit JSON escaping for `qname` in structured logs |
+| LOW-03 | LOW | Startup cap on `local-zone` / `local-data` entries from config |
 
 ---
 
@@ -566,24 +616,25 @@ This design is sound. There is no data exfiltration risk from the XDP path.
 
 1. **Configure explicit `forward-zone:` blocks** — never rely on the Cloudflare fallback.
 2. **Enable `forward-tls-upstream: yes`** — plain UDP to upstream is observable.
-3. ✅ **Authenticate `/help`** — done in v0.2.5 (Bearer token required).
-4. **Mount data directory on integrity-protected storage** — dm-verity or ZFS.
-5. **Route Runbound through a DNSSEC-validating resolver** as upstream.
+3. **Mount data directory on integrity-protected storage** — dm-verity or ZFS (HIGH-06 workaround).
+4. **Route Runbound through a DNSSEC-validating upstream** and set `dnssec-validation: yes`.
+5. **Place a TLS 1.3-only proxy** (nginx, haproxy) in front of the DoT port (HIGH-07 workaround).
 
-### Short-term (next release cycle)
+### v0.4.0 (planned)
 
-6. ✅ `GET /health`, `GET /stats`, `GET /config`, `POST /reload` implemented in v0.2.5.
-7. Upgrade to rustls 0.23; pin TLS 1.3 + approved cipher suites.
-8. Implement mTLS for DoT (client certificate required).
-9. ✅ Auth failure counter + lockout implemented in v0.2.5 (AUTH_FAILURES, 500 ms delay).
+6. Upgrade hickory 0.24 → 0.26 — closes HIGH-07, HIGH-08, and six CVEs in `audit.toml`.
+7. Implement HMAC-SHA256 integrity over JSON data stores — closes HIGH-06.
+8. Implement mTLS for DoT — closes HIGH-08 (depends on #6).
 
 ### Medium-term
 
-10. ✅ `dnssec-validation` config directive added in v0.2.5.
-11. Implement HMAC integrity on JSON data stores.
-12. Add per-operator API keys with audit log.
-13. ✅ `utc_now_rfc3339()` replaced with `humantime::format_rfc3339` in v0.2.5.
+9. Custom reqwest connector for SSRF validation at TCP connection layer — closes MED-03.
+10. JSON escaping on `qname` in structured logging — closes MED-06.
 
 ---
 
-*Audit performed on commit `7dd3a66` (tag v0.2.3 + doc fixes). All source files reviewed: `src/main.rs`, `src/api/mod.rs`, `src/config/parser.rs`, `src/dns/server.rs`, `src/dns/local.rs`, `src/dns/acl.rs`, `src/dns/ratelimit.rs`, `src/dns/xdp/worker.rs`, `src/dns/xdp/umem.rs`, `src/feeds/mod.rs`, `src/store.rs`, `src/error.rs`.*
+*Initial audit performed on commit `7dd3a66` (tag v0.2.3). All source files reviewed:
+`src/main.rs`, `src/api/mod.rs`, `src/config/parser.rs`, `src/dns/server.rs`,
+`src/dns/local.rs`, `src/dns/acl.rs`, `src/dns/ratelimit.rs`, `src/dns/xdp/worker.rs`,
+`src/dns/xdp/umem.rs`, `src/feeds/mod.rs`, `src/store.rs`.
+Second audit cycle targeting v0.3.3. Tracking updated through v0.3.5.*
