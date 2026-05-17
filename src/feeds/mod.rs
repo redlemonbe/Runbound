@@ -281,11 +281,23 @@ async fn validate_feed_url(url: &str) -> Result<(), AppError> {
             "Only https:// URLs are allowed (no http://, file://, ftp://, etc.)".into()
         ));
     }
+    // Strip fragment — fragments are client-side and never sent in the HTTP request,
+    // but reject them explicitly to avoid ambiguity in stored URLs and audit logs.
+    let url_no_fragment = url.split('#').next().unwrap_or(url);
+
+    // Strip embedded credentials (user:pass@host) — the reqwest client would
+    // send them, but we reject them to keep the stored URL clean and prevent
+    // credential leakage into logs.
+    let after_scheme = url_no_fragment.split("://").nth(1).unwrap_or("");
+    if after_scheme.contains('@') {
+        return Err(AppError::BadRequest(
+            "Feed URLs must not contain credentials (user:pass@host)".into()
+        ));
+    }
+
     // Extract host+port portion
-    let host_and_port = url
-        .split("://").nth(1).unwrap_or("")
-        .split('/').next().unwrap_or("")
-        .split('@').next_back().unwrap_or(""); // strip user:pass@
+    let host_and_port = after_scheme
+        .split('/').next().unwrap_or("");
 
     // Handle IPv6 bracket notation ([::1]:8080) vs host:port
     let host = if host_and_port.starts_with('[') {
