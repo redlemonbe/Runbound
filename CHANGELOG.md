@@ -5,6 +5,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.3] — 2026-05-17
+
+### Fixed — second military audit follow-up (all findings closed)
+
+- **SEC-02 INFO — Domain name length validation confirmed correct** (`src/api/mod.rs`)  
+  Added six unit tests for `validate_dns_name()` to document and verify RFC 1035 §2.3.4
+  compliance: 253-char names accepted, 254-char names rejected, trailing-dot stripping
+  before length check, per-label 63-char enforcement. Audit finding was a false positive —
+  the auditor counted the trailing dot as part of the name length; the existing `n.len() > 253`
+  check (where `n` is the name with the trailing dot stripped) is correct per RFC.
+
+- **SEC-03 LOW — Identity probes inconsistently blocked** (`src/dns/server.rs`)  
+  The CHAOS class check (`u16::from(query_class()) == 3`) was in place but hickory
+  normalises the CHAOS class to IN before invoking our handler for some query paths,
+  causing `version.bind.` to return NOERROR and `hostname.bind.` to return NXDOMAIN
+  instead of REFUSED/NOTIMP.  
+  Added a defense-in-depth name-based check immediately after the class check: any query
+  for `version.bind.`, `hostname.bind.`, `id.server.`, or `version.server.` — regardless
+  of query class — now returns REFUSED.
+
+- **DOC-01 INFO — README showed v0.3.4 binary names** (`README.md`)  
+  Updated all hardcoded binary filename references from `v0.3.4` to `v0.4.3`.
+
+- **DOC-02 INFO — Non-configurable runtime limits undocumented** (`docs/configuration.md`)  
+  Added "Fixed runtime limits" section documenting all compiled-in constants:
+  API max payload (64 KB), API rate limit (30 req/s, burst 60), sync ring buffer
+  (1,000 events), memory purge thresholds (80 % → 50 %), and hard caps on DNS
+  entries (10,000), blacklist entries (100,000), and feed subscriptions (100).
+
+- **DOC-03 INFO — Slave DNS behaviour not documented** (`docs/ha.md`)  
+  Added "Slave DNS behaviour" section documenting that replicated entries are served
+  by the slave's DNS engine immediately after each sync cycle (fixed in v0.4.2), the
+  behaviour on slave restart (zones rebuilt from disk before accepting queries), and
+  what happens during a sync cycle (atomic zone-trie updates under mutex).
+
+---
+
 ## [0.4.2] — 2026-05-17
 
 ### Fixed

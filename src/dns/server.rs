@@ -206,7 +206,25 @@ impl RequestHandler for RunboundHandler {
             return send_error(request, response_handle, ResponseCode::NotImp).await;
         }
 
-        // ── 3b. Block ANY queries (RFC 8482 — amplification vector) ────
+        // ── 3b. SEC-03: defense-in-depth — block identity-probe names ───────
+        // Block well-known identity-probe names by name regardless of query
+        // class. hickory may normalise the CHAOS class (numeric 3) to IN
+        // before invoking our handler, which bypasses the class check above
+        // (observed: version.bind → NOERROR, hostname.bind → NXDOMAIN).
+        {
+            let name_lower = qname.to_string().to_lowercase();
+            let name_lower = name_lower.trim_end_matches('.');
+            if matches!(name_lower,
+                "version.bind" | "hostname.bind" | "id.server" | "version.server"
+            ) {
+                debug!(%client_ip, name=%sanitize_dns_name(qname), "identity probe → REFUSED");
+                self.stats.inc_refused();
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
+                return send_error(request, response_handle, ResponseCode::Refused).await;
+            }
+        }
+
+        // ── 3c. Block ANY queries (RFC 8482 — amplification vector) ────
         if qtype == RecordType::ANY {
             debug!(%client_ip, "ANY query blocked (RFC 8482)");
             self.record_query(client_ip, qname, qtype, ResponseCode::NotImp, LogAction::Refused, start);

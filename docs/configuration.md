@@ -620,3 +620,20 @@ curl -X POST http://localhost:8081/rotate-key \
 
 The old token is invalidated atomically. The rotation is recorded in the audit log.
 See [api.md](api.md#post-rotate-key) for full details.
+
+---
+
+## Fixed runtime limits
+
+The following limits are compiled in and cannot be changed via configuration.
+They exist to bound memory usage and protect against authenticated DoS.
+
+| Limit | Value | Description |
+|---|---|---|
+| **API max payload** | 64 KB | Maximum size of any single REST API request body. Requests with a `Content-Length` header exceeding this value receive a `413 Payload Too Large` response before the body is read. |
+| **API rate limit** | 30 req/s | Token-bucket rate limiter per source IP on the REST API. Burst capacity: 60 requests. Returns `429 Too Many Requests` when exceeded. |
+| **Sync ring buffer** | 1,000 events | The master keeps the last 1,000 delta events in memory. A slave that falls more than 1,000 events behind receives `410 Gone` and triggers a full re-sync. |
+| **Memory purge threshold** | 80 % → 50 % | When system memory usage reaches 80 %, Runbound purges the DNS resolver cache. Purge stops when usage falls below 50 % (target). |
+| **Max DNS entries (API)** | 10,000 | Maximum number of DNS records that can be added via `POST /dns`. Feed-loaded blocklist entries are not counted here. |
+| **Max blacklist entries (API)** | 100,000 | Maximum number of manual blacklist entries via `POST /blacklist`. |
+| **Max feed subscriptions** | 100 | Maximum number of concurrent feed subscriptions via `POST /feeds`. |
