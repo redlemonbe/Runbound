@@ -18,24 +18,24 @@ Your existing `unbound.conf` works as-is. Zero migration.
 
 ## What you get
 
-| | Unbound | Runbound |
-|---|:---:|:---:|
-| Drop-in config compatibility | ✅ | ✅ |
-| UDP / TCP / DoT / DoH | ✅ | ✅ |
-| Add a DNS entry live | ❌ restart | ✅ API |
-| Block a domain live | ❌ restart | ✅ API |
-| Subscribe to block-list feeds | ❌ manual | ✅ API |
-| Real-time query statistics | ❌ | ✅ API |
-| Live query log | ❌ | ✅ API |
-| SSE live stats stream | ❌ | ✅ API |
-| Upstream health monitoring | ❌ | ✅ API |
-| Master/slave replication | ❌ | ✅ built-in |
-| Automatic TLS (Let's Encrypt) | ❌ external | ✅ built-in ACME |
-| Tamper-evident audit log | ❌ | ✅ HMAC-SHA256 chain |
-| Hot config reload | ❌ | ✅ API |
-| AF/XDP kernel-bypass fast path | ❌ | ✅ optional |
-| Static binary (no dependencies) | ❌ | ✅ musl builds |
-| Throughput (local zone) | ~50k q/s | **~80k q/s** |
+| | BIND9 | Unbound | Runbound |
+|---|:---:|:---:|:---:|
+| Drop-in Unbound config | ❌ | ✅ | ✅ |
+| UDP / TCP / DoT / DoH | ✅ | ✅ | ✅ |
+| Add a DNS entry live | ⚠️ nsupdate | ❌ restart | ✅ API |
+| Block a domain live | ⚠️ RPZ | ❌ restart | ✅ API |
+| Subscribe to block-list feeds | ⚠️ RPZ/manual | ❌ manual | ✅ API |
+| Real-time query statistics | ⚠️ XML/JSON channel | ❌ | ✅ API |
+| Live query log | ⚠️ via rndc | ❌ | ✅ API |
+| SSE live stats stream | ❌ | ❌ | ✅ API |
+| Upstream health monitoring | ❌ | ❌ | ✅ API |
+| Master/slave replication | ✅ AXFR/IXFR | ❌ | ✅ built-in |
+| Automatic TLS (Let's Encrypt) | ❌ external | ❌ external | ✅ built-in ACME |
+| Tamper-evident audit log | ❌ | ❌ | ✅ HMAC-SHA256 chain |
+| Hot config reload | ✅ rndc reload | ❌ | ✅ API |
+| AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ optional |
+| Static binary (no dependencies) | ❌ | ❌ | ✅ musl builds |
+| Throughput (recursive) | ~40k q/s | ~50k q/s | **~80k q/s** |
 
 ---
 
