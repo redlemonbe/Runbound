@@ -11,7 +11,8 @@
 // UDP + TCP on the configured port (default 53).
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -52,6 +53,20 @@ use super::ratelimit::RateLimiter;
 const MAX_INFLIGHT_REQUESTS: usize = 4_096;
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
+
+// ── Identity-probe name set (zero-alloc hot path) ──────────────────────────
+// Initialised once on first DNS query; compared directly as LowerName.
+// Avoids a String allocation per request for the CHAOS identity-probe check.
+static IDENTITY_PROBE_NAMES: OnceLock<[LowerName; 4]> = OnceLock::new();
+
+fn identity_probe_names() -> &'static [LowerName; 4] {
+    IDENTITY_PROBE_NAMES.get_or_init(|| [
+        LowerName::from(Name::from_str("version.bind.").expect("static DNS name")),
+        LowerName::from(Name::from_str("hostname.bind.").expect("static DNS name")),
+        LowerName::from(Name::from_str("id.server.").expect("static DNS name")),
+        LowerName::from(Name::from_str("version.server.").expect("static DNS name")),
+    ])
+}
 
 // ============================================================
 // Handler
@@ -211,17 +226,13 @@ impl RequestHandler for RunboundHandler {
         // class. hickory may normalise the CHAOS class (numeric 3) to IN
         // before invoking our handler, which bypasses the class check above
         // (observed: version.bind → NOERROR, hostname.bind → NXDOMAIN).
-        {
-            let name_lower = qname.to_string().to_lowercase();
-            let name_lower = name_lower.trim_end_matches('.');
-            if matches!(name_lower,
-                "version.bind" | "hostname.bind" | "id.server" | "version.server"
-            ) {
-                debug!(%client_ip, name=%sanitize_dns_name(qname), "identity probe → REFUSED");
-                self.stats.inc_refused();
-                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
-                return send_error(request, response_handle, ResponseCode::Refused).await;
-            }
+        // Zero allocation: qname is already a LowerName; compared against a
+        // static set initialised once on first request.
+        if identity_probe_names().iter().any(|n| n == qname) {
+            debug!(%client_ip, name=%sanitize_dns_name(qname), "identity probe → REFUSED");
+            self.stats.inc_refused();
+            self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
+            return send_error(request, response_handle, ResponseCode::Refused).await;
         }
 
         // ── 3c. Block ANY queries (RFC 8482 — amplification vector) ────

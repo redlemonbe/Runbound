@@ -216,6 +216,10 @@ const MAX_LOCAL_ZONES: usize = 1_000_000;
 const MAX_LOCAL_DATA:  usize = 1_000_000;
 
 fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno: usize) {
+    // Mapping intentionnel 1:1 avec la syntaxe unbound.conf.
+    // Volumineux par design — chaque directive Unbound correspond
+    // à une assignation. Ne pas refactorer en table générique
+    // pour conserver la lisibilité directive par directive.
     match key {
         "interface"      => cfg.interfaces.push(val.to_string()),
         "port"           => cfg.port = val.parse().unwrap_or(53),

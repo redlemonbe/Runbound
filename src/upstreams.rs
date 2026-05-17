@@ -20,6 +20,11 @@ use crate::config::parser::UnboundConfig;
 const PROBE_INTERVAL_SECS: u64 = 30;
 const PROBE_TIMEOUT_MS:    u64 = 2_000;
 
+const BIND_V4: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+const BIND_V6: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0);
+
 // Minimal RFC 1035 DNS query: id=0x0001, RD=1, QDCOUNT=1, `. IN A`
 // 17 bytes total (header 12 + root label 1 + qtype 2 + qclass 2)
 const DNS_PROBE_PACKET: [u8; 17] = [
@@ -75,7 +80,7 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
 
         // Collect addresses to probe (read-only snapshot)
         let addrs: Vec<String> = {
-            upstreams.read().unwrap().iter().map(|s| s.addr.clone()).collect()
+            upstreams.read().expect("upstreams: RwLock poisoned in health task").iter().map(|s| s.addr.clone()).collect()
         };
 
         let mut results: Vec<(bool, Option<u64>)> = Vec::with_capacity(addrs.len());
@@ -84,7 +89,7 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
         }
 
         // Write results back
-        let mut statuses = upstreams.write().unwrap();
+        let mut statuses = upstreams.write().expect("upstreams: RwLock poisoned in health task");
         let now = crate::logbuffer::format_ts(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -128,8 +133,8 @@ fn probe_upstream(addr: &str) -> (bool, Option<u64>) {
     };
 
     let bind: SocketAddr = match target.ip() {
-        IpAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-        IpAddr::V6(_) => "[::]:0".parse().unwrap(),
+        IpAddr::V4(_) => BIND_V4,
+        IpAddr::V6(_) => BIND_V6,
     };
 
     let sock = match UdpSocket::bind(bind) {
