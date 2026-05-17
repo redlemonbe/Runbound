@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.4] — 2026-05-17
+
+### Added — supply-chain security & HSM key storage
+
+- **Supply-chain audit tooling** (`deny.toml`, `Makefile`, `docs/audit.md`)  
+  Added `cargo-deny` configuration (`deny.toml`) with advisory blocking, license whitelist
+  (MIT, Apache-2.0, BSD-2/3, ISC, Zlib, Unicode-3.0, CDLA-Permissive-2.0; AGPL-3.0-or-later
+  for runbound itself), and dependency ban rules. New `Makefile` targets: `audit`
+  (`cargo audit --deny warnings`), `deny` (`cargo deny check`), `sbom`
+  (`cargo cyclonedx --format json`), `audit-full` (all three + `cargo outdated`).
+  Full process documented in `docs/audit.md`.
+
+- **HSM key storage via PKCS#11** (`src/hsm.rs`, `docs/hsm.md`)  
+  Sensitive key material (REST API Bearer token, JSON store HMAC key) can now be loaded
+  from a Hardware Security Module via PKCS#11 (`cryptoki 0.6`). Keys are extracted once at
+  startup into `Zeroizing<T>` buffers (memory scrubbed on drop) and the HSM session is
+  closed immediately after. Priority chain: HSM > `RUNBOUND_API_KEY`/`RUNBOUND_STORE_KEY`
+  env vars > config file > auto-generated. Failure to load keys from a configured HSM is
+  **fatal** — no silent fallback. Supported: SoftHSM2 (dev/CI), YubiHSM 2, Nitrokey HSM 2,
+  AWS CloudHSM, Thales Luna (any PKCS#11-compliant `.so`). New config directives:
+  `hsm-pkcs11-lib`, `hsm-slot`, `hsm-pin` (WARN if in config; prefer `HSM_PIN` env var),
+  `hsm-api-key-label`, `hsm-store-key-label`. `/health` now reports `"hsm": true/false`;
+  `/config` masks the PIN as `"***"`. Full setup guide in `docs/hsm.md`.
+
+---
+
 ## [0.4.3] — 2026-05-17
 
 ### Fixed — second military audit follow-up (all findings closed)
