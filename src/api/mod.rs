@@ -159,8 +159,10 @@ pub struct AddDnsRequest {
     pub name: String,
     #[serde(rename = "type")]
     pub entry_type: DnsType,
-    #[serde(default = "default_ttl")]
-    pub ttl: u32,
+    // i64 so serde accepts negative values and we can return a uniform JSON 422
+    // instead of axum's default plain-text deserialization error.
+    #[serde(default = "default_ttl_i64")]
+    pub ttl: i64,
     // simple types
     pub value: Option<String>,
     // MX / SRV priority
@@ -190,7 +192,7 @@ pub struct AddDnsRequest {
     pub description: Option<String>,
 }
 
-fn default_ttl() -> u32 { 3600 }
+fn default_ttl_i64() -> i64 { 3600 }
 
 #[derive(Debug, Deserialize)]
 pub struct AddFeedRequest {
@@ -555,20 +557,21 @@ async fn add_dns_handler(
             })));
         }
     }
-    // RFC 2181 §8: TTL is a signed 32-bit integer; values >= 2^31 are treated
-    // as 0 by compliant resolvers — reject them to prevent silent data loss.
-    const RFC2181_MAX_TTL: u32 = 2_147_483_647;
-    if req.ttl > RFC2181_MAX_TTL {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+    // RFC 2181 §8: TTL is a non-negative 32-bit integer; values outside
+    // [0, 2^31-1] must be rejected with a uniform JSON error.
+    const RFC2181_MAX_TTL: i64 = 2_147_483_647;
+    if req.ttl < 0 || req.ttl > RFC2181_MAX_TTL {
+        return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
             "error": "INVALID_TTL",
-            "details": format!("TTL {} exceeds RFC 2181 maximum of 2147483647", req.ttl)
+            "details": "TTL must be between 0 and 2147483647"
         })));
     }
+    let ttl = req.ttl as u32;
     let entry = DnsEntry {
         id:               DnsEntry::new_id(),
         name:             ensure_dot(&req.name),
         entry_type:       req.entry_type,
-        ttl:              req.ttl.min(MAX_API_TTL),
+        ttl:              ttl.min(MAX_API_TTL),
         value:            req.value,
         priority:         req.priority,
         weight:           req.weight,
