@@ -1,22 +1,22 @@
 // Persistent DNS entry store.
-// Survives restarts — JSON file at /etc/runbound/dns_entries.json.
+// Survives restarts — JSON file under base_dir (derived from config path at startup).
 // The in-memory LocalZoneSet is always the source of truth for queries;
 // this file is loaded at boot and written on every mutation.
 
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
 
-pub const STORE_PATH: &str = "/etc/runbound/dns_entries.json";
-pub const BLACKLIST_STORE_PATH: &str = "/etc/runbound/blacklist.json";
+fn store_path() -> std::path::PathBuf { crate::runtime::base_dir().join("dns_entries.json") }
+fn blacklist_path() -> std::path::PathBuf { crate::runtime::base_dir().join("blacklist.json") }
 
 // ── Record types supported by the API ──────────────────────────────────────
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum DnsType {
@@ -125,7 +125,7 @@ pub struct DnsStore {
 }
 
 pub fn load() -> Result<DnsStore, AppError> {
-    let path = PathBuf::from(STORE_PATH);
+    let path = store_path();
     if !path.exists() {
         return Ok(DnsStore::default());
     }
@@ -136,14 +136,14 @@ pub fn load() -> Result<DnsStore, AppError> {
 }
 
 pub fn save(store: &DnsStore) -> Result<(), AppError> {
-    let dir = PathBuf::from(STORE_PATH).parent().unwrap().to_path_buf();
-    fs::create_dir_all(&dir)
+    let path = store_path();
+    fs::create_dir_all(path.parent().unwrap())
         .map_err(|e| AppError::Internal(format!("create store dir: {e}")))?;
 
     let content = serde_json::to_string_pretty(store)
         .map_err(|e| AppError::Internal(format!("serialize store: {e}")))?;
 
-    let tmp = format!("{}.tmp", STORE_PATH);
+    let tmp = path.with_extension("json.tmp");
     {
         let mut f = fs::File::create(&tmp)
             .map_err(|e| AppError::Internal(format!("create tmp: {e}")))?;
@@ -155,13 +155,13 @@ pub fn save(store: &DnsStore) -> Result<(), AppError> {
         f.sync_all()
             .map_err(|e| AppError::Internal(format!("fsync tmp: {e}")))?;
     }
-    fs::rename(&tmp, STORE_PATH)
+    fs::rename(&tmp, &path)
         .map_err(|e| AppError::Internal(format!("rename store: {e}")))?;
     // VUL-06: 640 — root:root rw-r----- ; world has no access to DNS entries.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(STORE_PATH, fs::Permissions::from_mode(0o640));
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o640));
     }
     Ok(())
 }
@@ -183,7 +183,7 @@ pub struct BlacklistStore {
 }
 
 pub fn load_blacklist() -> Result<BlacklistStore, AppError> {
-    let path = PathBuf::from(BLACKLIST_STORE_PATH);
+    let path = blacklist_path();
     if !path.exists() {
         return Ok(BlacklistStore::default());
     }
@@ -194,14 +194,14 @@ pub fn load_blacklist() -> Result<BlacklistStore, AppError> {
 }
 
 pub fn save_blacklist(store: &BlacklistStore) -> Result<(), AppError> {
-    let dir = PathBuf::from(BLACKLIST_STORE_PATH).parent().unwrap().to_path_buf();
-    fs::create_dir_all(&dir)
+    let path = blacklist_path();
+    fs::create_dir_all(path.parent().unwrap())
         .map_err(|e| AppError::Internal(format!("create blacklist dir: {e}")))?;
 
     let content = serde_json::to_string_pretty(store)
         .map_err(|e| AppError::Internal(format!("serialize blacklist: {e}")))?;
 
-    let tmp = format!("{}.tmp", BLACKLIST_STORE_PATH);
+    let tmp = path.with_extension("json.tmp");
     {
         let mut f = fs::File::create(&tmp)
             .map_err(|e| AppError::Internal(format!("create blacklist tmp: {e}")))?;
@@ -210,12 +210,12 @@ pub fn save_blacklist(store: &BlacklistStore) -> Result<(), AppError> {
         f.sync_all()
             .map_err(|e| AppError::Internal(format!("fsync blacklist tmp: {e}")))?;
     }
-    fs::rename(&tmp, BLACKLIST_STORE_PATH)
+    fs::rename(&tmp, &path)
         .map_err(|e| AppError::Internal(format!("rename blacklist store: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(BLACKLIST_STORE_PATH, fs::Permissions::from_mode(0o640));
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o640));
     }
     Ok(())
 }

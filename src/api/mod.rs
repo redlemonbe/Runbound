@@ -1,5 +1,6 @@
 // Runbound REST API — full DNS management + feeds + DoT/DoH status
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use std::net::IpAddr;
@@ -134,6 +135,10 @@ pub struct AppState {
     pub sync_journal: Option<Arc<SyncJournal>>,
     /// True when running as slave — all write operations are blocked (503).
     pub slave_mode:   bool,
+    /// Directory where runtime files (api.key, dns_entries.json, …) are stored.
+    /// Exposed for handlers in future features; suppress dead_code lint.
+    #[allow(dead_code)]
+    pub base_dir:     Arc<PathBuf>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -230,7 +235,7 @@ async fn security_middleware(
             // Increment global auth-failure counter (localhost-only API,
             // so per-IP tracking adds nothing; we track globally).
             let failures = AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if failures % 10 == 0 {
+            if failures.is_multiple_of(10) {
                 warn!(failures, %path, "Repeated API authentication failures — check RUNBOUND_API_KEY");
             }
             // Threshold 50 is reachable within one rate-limiter burst window (burst=60).
@@ -868,7 +873,7 @@ async fn update_one_feed_handler(
             let new_zones = crate::build_zone_set(&s.cfg);
             s.zones.store(std::sync::Arc::new(new_zones));
             if result.error.is_none() {
-                if let (Some(ref j), Some(url)) = (s.sync_journal.as_ref(), feed_url) {
+                if let (Some(j), Some(url)) = (s.sync_journal.as_ref(), feed_url) {
                     j.push(SyncOp::UpdateFeed { id: id.clone(), url });
                 }
             }
@@ -1052,6 +1057,8 @@ mod tests {
     fn make_test_app() -> Router {
         // Initialise API key (OnceLock — safe to call multiple times with same value)
         init_api_key(Some(TEST_KEY.to_string()));
+        // Initialise BASE_DIR for store/feeds path resolution (OnceLock — idempotent).
+        let _ = crate::runtime::BASE_DIR.set(std::path::PathBuf::from("/tmp/runbound-test"));
 
         let zones = Arc::new(ArcSwap::new(Arc::new(
             crate::dns::local::LocalZoneSet::default()
@@ -1072,6 +1079,7 @@ mod tests {
             upstreams,
             sync_journal: None,
             slave_mode:   false,
+            base_dir:     Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
         };
         router(state)
     }

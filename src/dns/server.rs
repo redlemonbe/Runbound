@@ -218,7 +218,7 @@ impl RequestHandler for RunboundHandler {
                     let builder = MessageResponseBuilder::from_message_request(request);
                     let response = builder.build(
                         header,
-                        records.into_iter(),
+                        records,
                         std::iter::empty(),
                         std::iter::empty(),
                         std::iter::empty(),

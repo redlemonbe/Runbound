@@ -5,6 +5,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.3.1] — 2026-05-17
+
+### Added
+
+- **Runtime files relative to config directory** (`src/runtime.rs`, `src/main.rs`, `src/store.rs`, `src/feeds/mod.rs`, `src/sync.rs`)  
+  All runtime files (`api.key`, `dns_entries.json`, `blacklist.json`, `feeds.json`, `feed_cache/`,
+  `sync-cert.pem`, `sync-master.fingerprint`) are now stored in the **same directory as the config file**
+  rather than hardcoded under `/etc/runbound/`.  
+  Running `runbound /etc/runbound-slave/unbound.conf` writes all slave runtime files to
+  `/etc/runbound-slave/`, enabling master + slave on the same machine without path collisions.  
+  The base directory is derived from `config_path.parent()` at startup, validated (rejects `/` and
+  `/tmp`), logged at INFO (`[INFO] runtime base_dir: /etc/runbound`), and stored in `AppState.base_dir`
+  as well as a process-global `runtime::BASE_DIR` (`OnceLock<PathBuf>`).
+
+### Fixed
+
+- All pre-existing `cargo clippy -- -D warnings` failures resolved:
+  `clippy::upper_case_acronyms` on `DnsType` variants; `trim_split_whitespace`;
+  `is_multiple_of`; redundant `into_iter()` on `IntoIterator` args; `map_err` → `inspect_err`
+  in XDP socket; `last()` on `DoubleEndedIterator`; manual prefix stripping; double-`Ok` + `?`;
+  `unwrap()` after `is_some()`.
+
+---
+
 ## [0.3.0] — 2026-05-17
 
 ### Added

@@ -150,7 +150,7 @@ impl LocalZoneSet {
 /// Supports: A, AAAA, CNAME, TXT, PTR, NS, MX, SRV, CAA, NAPTR, SSHFP, TLSA
 /// Format:  name [ttl] TYPE rdata...
 pub fn parse_local_data(rr: &str) -> Option<Record> {
-    let parts: Vec<&str> = rr.trim().split_whitespace().collect();
+    let parts: Vec<&str> = rr.split_whitespace().collect();
     if parts.len() < 3 {
         return None;
     }

@@ -23,9 +23,9 @@ use crate::store::{
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const JOURNAL_CAPACITY: usize = 1_000;
-const FINGERPRINT_PATH: &str = "/etc/runbound/sync-master.fingerprint";
-const SYNC_CERT_PATH: &str = "/etc/runbound/sync-cert.pem";
-const SYNC_KEY_PATH: &str = "/etc/runbound/sync-key.pem";
+fn fingerprint_path() -> std::path::PathBuf { crate::runtime::base_dir().join("sync-master.fingerprint") }
+fn sync_cert_path() -> std::path::PathBuf { crate::runtime::base_dir().join("sync-cert.pem") }
+fn sync_key_path() -> std::path::PathBuf { crate::runtime::base_dir().join("sync-key.pem") }
 
 // ── SyncJournal ───────────────────────────────────────────────────────────────
 
@@ -101,9 +101,11 @@ pub fn ensure_sync_cert() -> anyhow::Result<(String, String)> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    let cert_path = sync_cert_path();
+    let key_path  = sync_key_path();
     if let (Ok(cert), Ok(key)) = (
-        fs::read_to_string(SYNC_CERT_PATH),
-        fs::read_to_string(SYNC_KEY_PATH),
+        fs::read_to_string(&cert_path),
+        fs::read_to_string(&key_path),
     ) {
         return Ok((cert, key));
     }
@@ -113,18 +115,18 @@ pub fn ensure_sync_cert() -> anyhow::Result<(String, String)> {
         rcgen::generate_simple_self_signed(vec!["runbound-sync".to_string()])
             .map_err(|e| anyhow::anyhow!("sync cert generation failed: {e}"))?;
 
-    fs::create_dir_all("/etc/runbound")
-        .map_err(|e| anyhow::anyhow!("create /etc/runbound: {e}"))?;
+    fs::create_dir_all(crate::runtime::base_dir())
+        .map_err(|e| anyhow::anyhow!("create base_dir: {e}"))?;
 
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
-    fs::write(SYNC_CERT_PATH, &cert_pem)
-        .map_err(|e| anyhow::anyhow!("write {SYNC_CERT_PATH}: {e}"))?;
-    fs::write(SYNC_KEY_PATH, &key_pem)
-        .map_err(|e| anyhow::anyhow!("write {SYNC_KEY_PATH}: {e}"))?;
+    fs::write(&cert_path, &cert_pem)
+        .map_err(|e| anyhow::anyhow!("write sync-cert.pem: {e}"))?;
+    fs::write(&key_path, &key_pem)
+        .map_err(|e| anyhow::anyhow!("write sync-key.pem: {e}"))?;
     #[cfg(unix)]
-    fs::set_permissions(SYNC_KEY_PATH, fs::Permissions::from_mode(0o600))
-        .map_err(|e| anyhow::anyhow!("chmod {SYNC_KEY_PATH}: {e}"))?;
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow::anyhow!("chmod sync-key.pem: {e}"))?;
 
     Ok((cert_pem, key_pem))
 }
@@ -165,11 +167,11 @@ pub fn server_tls_config(cert_pem: &str, key_pem: &str) -> anyhow::Result<rustls
     let key = keys.into_iter().next()
         .ok_or_else(|| anyhow::anyhow!("no private key in PEM"))?;
 
-    Ok(ServerConfig::builder()
+    ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("TLS server config: {e}"))?)
+        .map_err(|e| anyhow::anyhow!("TLS server config: {e}"))
 }
 
 // ── Pinned cert verifier (slave → master) ─────────────────────────────────────
@@ -456,7 +458,7 @@ impl SlaveClient {
 
     // TOFU: load saved fingerprint or discover it from master on first connect.
     async fn tofu_handshake(&self) -> anyhow::Result<String> {
-        if let Ok(fp) = std::fs::read_to_string(FINGERPRINT_PATH) {
+        if let Ok(fp) = std::fs::read_to_string(fingerprint_path()) {
             let fp = fp.trim().to_string();
             if !fp.is_empty() {
                 return Ok(fp);
@@ -465,7 +467,7 @@ impl SlaveClient {
 
         warn!(
             "Slave sync: no pinned fingerprint — TOFU connect to {}. \
-             Verify /etc/runbound/sync-master.fingerprint manually.",
+             Verify sync-master.fingerprint in config base_dir manually.",
             self.host_port
         );
 
@@ -498,15 +500,16 @@ impl SlaveClient {
             ));
         }
 
-        warn!("Slave sync: pinning master SHA-256={fp} → {FINGERPRINT_PATH}");
-        std::fs::create_dir_all("/etc/runbound")
-            .map_err(|e| anyhow::anyhow!("create /etc/runbound: {e}"))?;
-        std::fs::write(FINGERPRINT_PATH, &fp)
+        let fp_path = fingerprint_path();
+        warn!("Slave sync: pinning master SHA-256={fp} → {}", fp_path.display());
+        std::fs::create_dir_all(crate::runtime::base_dir())
+            .map_err(|e| anyhow::anyhow!("create base_dir: {e}"))?;
+        std::fs::write(&fp_path, &fp)
             .map_err(|e| anyhow::anyhow!("write fingerprint: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(FINGERPRINT_PATH, std::fs::Permissions::from_mode(0o640));
+            let _ = std::fs::set_permissions(&fp_path, std::fs::Permissions::from_mode(0o640));
         }
 
         Ok(fp)

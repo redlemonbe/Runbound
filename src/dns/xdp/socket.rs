@@ -58,7 +58,7 @@ pub unsafe fn create_xsk_socket(
     }
 
     // 2. Allocate and register UMEM (also maps fill + completion rings)
-    let umem = Umem::new(fd).map_err(|e| { libc::close(fd); e })?;
+    let umem = Umem::new(fd).inspect_err(|_| { libc::close(fd); })?;
 
     // 3. Set RX and TX ring sizes
     for (opt, sz) in [(XDP_RX_RING, RING_SIZE), (XDP_TX_RING, RING_SIZE)] {
@@ -79,9 +79,9 @@ pub unsafe fn create_xsk_socket(
     // 4. mmap RX and TX rings (offsets retrieved from the kernel)
     let (rx_off, tx_off) = get_rx_tx_offsets(fd)?;
     let rx = mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, RING_SIZE)
-        .map_err(|e| { libc::close(fd); e })?;
+        .inspect_err(|_| { libc::close(fd); })?;
     let tx = mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, RING_SIZE)
-        .map_err(|e| { libc::close(fd); e })?;
+        .inspect_err(|_| { libc::close(fd); })?;
 
     // 5. Bind to the specific interface queue
     //    XDP_USE_NEED_WAKEUP: when set, we must call poll()/sendto() to kick

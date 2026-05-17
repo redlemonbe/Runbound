@@ -19,8 +19,8 @@ use crate::error::AppError;
 // Constants
 // ============================================================
 
-pub const FEEDS_CONFIG_PATH: &str = "/etc/runbound/feeds.json";
-pub const FEED_CACHE_DIR: &str = "/etc/runbound/feed_cache";
+fn feeds_config_path() -> std::path::PathBuf { crate::runtime::base_dir().join("feeds.json") }
+fn feed_cache_dir() -> std::path::PathBuf { crate::runtime::base_dir().join("feed_cache") }
 
 /// VUL-03: Maximum feed body size (100 MiB).
 /// Without a cap, a malicious feed server can exhaust process memory.
@@ -157,7 +157,7 @@ pub fn builtin_presets() -> Vec<serde_json::Value> {
 // ============================================================
 
 pub fn load_feeds() -> Result<FeedsConfig, AppError> {
-    let path = PathBuf::from(FEEDS_CONFIG_PATH);
+    let path = feeds_config_path();
     if !path.exists() {
         return Ok(FeedsConfig::default());
     }
@@ -170,11 +170,11 @@ pub fn load_feeds() -> Result<FeedsConfig, AppError> {
 }
 
 pub fn save_feeds(config: &FeedsConfig) -> Result<(), AppError> {
-    let path = PathBuf::from(FEEDS_CONFIG_PATH);
+    let path = feeds_config_path();
     let content = serde_json::to_string_pretty(config).map_err(|e| {
         AppError::Internal(format!("Failed to serialize feeds config: {}", e))
     })?;
-    let tmp = PathBuf::from(format!("{}.tmp", FEEDS_CONFIG_PATH));
+    let tmp = path.with_extension("json.tmp");
     {
         let mut f = fs::File::create(&tmp).map_err(|e| {
             AppError::Internal(format!("Failed to create temp feeds file: {}", e))
@@ -205,7 +205,7 @@ fn cache_path(feed_id: &str) -> PathBuf {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .take(64)
         .collect();
-    PathBuf::from(FEED_CACHE_DIR).join(format!("{}.json", safe_id))
+    feed_cache_dir().join(format!("{}.json", safe_id))
 }
 
 pub fn load_feed_domains(feed_id: &str) -> Vec<String> {
@@ -220,7 +220,7 @@ pub fn load_feed_domains(feed_id: &str) -> Vec<String> {
 }
 
 fn save_feed_domains(feed_id: &str, domains: &[String]) -> Result<(), AppError> {
-    fs::create_dir_all(FEED_CACHE_DIR).map_err(|e| {
+    fs::create_dir_all(feed_cache_dir()).map_err(|e| {
         AppError::Internal(format!("Failed to create feed cache dir: {}", e))
     })?;
     let path = cache_path(feed_id);
@@ -285,7 +285,7 @@ async fn validate_feed_url(url: &str) -> Result<(), AppError> {
     let host_and_port = url
         .split("://").nth(1).unwrap_or("")
         .split('/').next().unwrap_or("")
-        .split('@').last().unwrap_or(""); // strip user:pass@
+        .split('@').next_back().unwrap_or(""); // strip user:pass@
 
     // Handle IPv6 bracket notation ([::1]:8080) vs host:port
     let host = if host_and_port.starts_with('[') {
@@ -480,8 +480,7 @@ fn parse_adblock(content: &str) -> Vec<String> {
                 return None;
             }
             // Match `||domain.com^` or `||domain.com^$...`
-            if line.starts_with("||") {
-                let rest = &line[2..];
+            if let Some(rest) = line.strip_prefix("||") {
                 let domain = rest
                     .split('^')
                     .next()

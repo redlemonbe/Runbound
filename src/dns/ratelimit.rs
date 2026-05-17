@@ -38,7 +38,7 @@ impl RateLimiter {
         let now = Instant::now();
 
         let count = self.cleanup_counter.fetch_add(1, Ordering::Relaxed);
-        if count % 10_000 == 0 {
+        if count.is_multiple_of(10_000) {
             self.buckets.retain(|_, b| now.duration_since(b.last_refill).as_secs() < 60);
         }
 
