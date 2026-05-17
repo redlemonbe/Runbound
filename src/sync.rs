@@ -17,6 +17,11 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
+use arc_swap::ArcSwap;
+
+use crate::config::parser::UnboundConfig;
+use crate::dns::local::{LocalZoneSet, parse_local_data};
+use crate::dns::ZoneAction;
 use crate::feeds::{load_feeds, save_feeds, update_one_feed, Feed, FeedsConfig};
 use crate::store::{
     load, load_blacklist, save, save_blacklist, BlacklistEntry, BlacklistStore, DnsEntry, DnsStore,
@@ -437,17 +442,30 @@ fn json_resp(status: u16, body: serde_json::Value) -> hyper::Response<Full<Bytes
 // ── SlaveClient ───────────────────────────────────────────────────────────────
 
 pub struct SlaveClient {
-    host_port: String, // "ip:port" for TCP connections
-    sync_key:  String,
-    interval:  u64,
+    host_port:   String,
+    sync_key:    String,
+    interval:    u64,
+    zones:       Arc<ArcSwap<LocalZoneSet>>,
+    zones_mutex: Arc<tokio::sync::Mutex<()>>,
+    cfg:         Arc<UnboundConfig>,
 }
 
 impl SlaveClient {
-    pub fn new(master: &str, sync_key: &str, interval: u64) -> Self {
+    pub fn new(
+        master:      &str,
+        sync_key:    &str,
+        interval:    u64,
+        zones:       Arc<ArcSwap<LocalZoneSet>>,
+        zones_mutex: Arc<tokio::sync::Mutex<()>>,
+        cfg:         Arc<UnboundConfig>,
+    ) -> Self {
         Self {
             host_port: master.to_string(),
             sync_key:  sync_key.to_string(),
             interval,
+            zones,
+            zones_mutex,
+            cfg,
         }
     }
 
@@ -572,12 +590,18 @@ impl SlaveClient {
         let resp: FullSyncResp = serde_json::from_slice(&body)
             .map_err(|e| anyhow::anyhow!("parse full sync: {e}"))?;
 
-        save(&DnsStore { entries: resp.dns })
-            .map_err(|e| anyhow::anyhow!("save DNS: {e}"))?;
-        save_blacklist(&BlacklistStore { entries: resp.blacklist })
-            .map_err(|e| anyhow::anyhow!("save blacklist: {e}"))?;
-        save_feeds(&FeedsConfig { feeds: resp.feeds })
-            .map_err(|e| anyhow::anyhow!("save feeds: {e}"))?;
+        {
+            let _guard = self.zones_mutex.lock().await;
+            save(&DnsStore { entries: resp.dns })
+                .map_err(|e| anyhow::anyhow!("save DNS: {e}"))?;
+            save_blacklist(&BlacklistStore { entries: resp.blacklist })
+                .map_err(|e| anyhow::anyhow!("save blacklist: {e}"))?;
+            save_feeds(&FeedsConfig { feeds: resp.feeds })
+                .map_err(|e| anyhow::anyhow!("save feeds: {e}"))?;
+            // Rebuild zone handler from the freshly written stores.
+            let new_zones = crate::build_zone_set(&self.cfg);
+            self.zones.store(Arc::new(new_zones));
+        }
 
         Ok(resp.seq)
     }
@@ -631,28 +655,53 @@ impl SlaveClient {
     async fn apply_event(&self, event: SyncEvent) -> anyhow::Result<()> {
         match event.op {
             SyncOp::AddDns { entry } => {
+                let _guard = self.zones_mutex.lock().await;
                 let mut st = load().unwrap_or_default();
                 if !st.entries.iter().any(|e| e.id == entry.id) {
-                    st.entries.push(entry);
+                    st.entries.push(entry.clone());
                     save(&st).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    // Mirror the same zone injection the API handler does.
+                    if let Some(rr) = entry.to_rr_string() {
+                        if let Some(record) = parse_local_data(&rr) {
+                            let current = self.zones.load_full();
+                            let mut new_zones = (*current).clone();
+                            let name = record.name.clone();
+                            new_zones.zones.entry(name.clone()).or_insert(ZoneAction::Static);
+                            new_zones.records.entry(name).or_default().push(record);
+                            self.zones.store(Arc::new(new_zones));
+                        }
+                    }
                 }
             }
             SyncOp::DeleteDns { id } => {
+                let _guard = self.zones_mutex.lock().await;
                 let mut st = load().unwrap_or_default();
                 st.entries.retain(|e| e.id != id);
                 save(&st).map_err(|e| anyhow::anyhow!("{e}"))?;
+                // Deletion requires a full rebuild — no partial removal on the zone trie.
+                let new_zones = crate::build_zone_set(&self.cfg);
+                self.zones.store(Arc::new(new_zones));
             }
             SyncOp::AddBlacklist { entry } => {
+                let _guard = self.zones_mutex.lock().await;
                 let mut bl = load_blacklist().unwrap_or_default();
                 if !bl.entries.iter().any(|e| e.id == entry.id) {
-                    bl.entries.push(entry);
+                    let action = ZoneAction::from(&entry.action);
+                    bl.entries.push(entry.clone());
                     save_blacklist(&bl).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let current = self.zones.load_full();
+                    let mut new_zones = (*current).clone();
+                    new_zones.override_zone(&entry.domain, action);
+                    self.zones.store(Arc::new(new_zones));
                 }
             }
             SyncOp::DeleteBlacklist { id } => {
+                let _guard = self.zones_mutex.lock().await;
                 let mut bl = load_blacklist().unwrap_or_default();
                 bl.entries.retain(|e| e.id != id);
                 save_blacklist(&bl).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let new_zones = crate::build_zone_set(&self.cfg);
+                self.zones.store(Arc::new(new_zones));
             }
             SyncOp::AddFeed { feed } => {
                 let mut cfg = load_feeds().unwrap_or_default();
@@ -667,7 +716,6 @@ impl SlaveClient {
                 save_feeds(&cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             SyncOp::UpdateFeed { id, .. } => {
-                // Re-download from the URL already stored in the local feeds config
                 if let Err(e) = update_one_feed(&id).await {
                     warn!("Slave sync: UpdateFeed {id} failed: {e}");
                 }

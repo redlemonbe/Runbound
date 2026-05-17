@@ -272,10 +272,18 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Hoisted so both SlaveClient and AppState share the same mutex instance.
+    let zones_mutex = Arc::new(tokio::sync::Mutex::new(()));
+
     if unbound_cfg.is_slave() {
         match (&unbound_cfg.sync_master, &unbound_cfg.sync_key) {
             (Some(master), Some(key)) => {
-                let client = sync::SlaveClient::new(master, key, unbound_cfg.sync_interval);
+                let client = sync::SlaveClient::new(
+                    master, key, unbound_cfg.sync_interval,
+                    Arc::clone(&zones),
+                    Arc::clone(&zones_mutex),
+                    Arc::clone(&cfg_arc),
+                );
                 tokio::spawn(async move { client.run().await });
                 info!("Slave sync started → master {master}");
             }
@@ -287,7 +295,7 @@ async fn main() -> Result<()> {
         zones:        Arc::clone(&zones),
         tls_cfg:      Arc::clone(&tls_cfg),
         rate_limiter: api::ApiRateLimiter::new_public(),
-        zones_mutex:  Arc::new(tokio::sync::Mutex::new(())),
+        zones_mutex:  Arc::clone(&zones_mutex),
         stats:        Arc::clone(&global_stats),
         cfg:          Arc::clone(&cfg_arc),
         cfg_path:     cfg_path.clone(),
