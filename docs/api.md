@@ -218,7 +218,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/health
 
 ### `GET /stats`
 
-Query statistics: total, blocked, forwarded, NXDOMAIN, REFUSED, SERVFAIL, block percentage, uptime.
+Query statistics snapshot: counters, QPS, latency percentiles, cache metrics.
 
 ```bash
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/stats
@@ -226,14 +226,23 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/stats
 
 ```json
 {
-  "total": 125432,
-  "blocked": 8921,
-  "forwarded": 112000,
-  "nxdomain": 4500,
-  "refused": 8921,
-  "servfail": 11,
-  "blocked_percent": 7,
-  "uptime_secs": 3600
+  "total":           125432,
+  "blocked":         8921,
+  "forwarded":       112000,
+  "nxdomain":        4500,
+  "refused":         8921,
+  "servfail":        11,
+  "local_hits":      3200,
+  "blocked_percent": 7.1,
+  "uptime_secs":     3600,
+  "qps_1m":          34.7,
+  "qps_5m":          31.2,
+  "qps_peak":        410,
+  "latency_p50_ms":  0.3,
+  "latency_p95_ms":  4.2,
+  "latency_p99_ms":  22.5,
+  "cache_hit_rate":  68.4,
+  "cache_entries":   2941
 }
 ```
 
@@ -241,13 +250,148 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/stats
 
 | Field | What it counts |
 |---|---|
-| `blocked` | Queries answered with **REFUSED** — domains blocked via blacklist or feeds with `action: refuse` |
-| `nxdomain` | Queries answered with **NXDOMAIN** — domains blocked with `action: nxdomain` |
-| `forwarded` | Queries forwarded to an upstream resolver (recursive lookup) |
-| `servfail` | Upstream returned SERVFAIL, or DNSSEC validation failed |
-| `blocked_percent` | `(blocked + nxdomain) / total × 100` — total blocking rate regardless of action |
+| `blocked` | Queries answered with **REFUSED** — blacklist / feeds / local-zone with `action: refuse` |
+| `nxdomain` | Queries answered with **NXDOMAIN** — blacklist / feeds with `action: nxdomain`, or upstream NXDOMAIN |
+| `forwarded` | Queries sent to an upstream resolver (network round-trip) |
+| `local_hits` | Queries answered from local zone data (config + `POST /dns`) without upstream |
+| `servfail` | Upstream returned SERVFAIL or DNSSEC validation failed |
+| `blocked_percent` | `blocked / total × 100` — REFUSED blocking rate (f64, one decimal place) |
+| `qps_1m` / `qps_5m` | Average queries/second over the last 1 and 5 minutes |
+| `qps_peak` | All-time highest queries in any single second |
+| `latency_p50/95/99_ms` | Latency percentiles from a fixed 10-bucket histogram (zero-alloc) |
+| `cache_hit_rate` | Percentage of forwarded lookups served from hickory's in-process cache (< 2 ms) |
+| `cache_entries` | Approximate distinct domains cached (saturates at resolver `cache_size = 8192`) |
 
-**Total blocked = `blocked` + `nxdomain`.** The split exists because `refuse` and `nxdomain` are distinct DNS responses: `REFUSED` tells the client the server declines to answer; `NXDOMAIN` tells the client the domain does not exist. Some clients and resolvers handle these differently. Use `blocked_percent` or sum both fields for an aggregate blocking rate.
+**Total blocked = `blocked` + `nxdomain`.** The split exists because `refuse` and `nxdomain` are distinct DNS responses. Use `blocked_percent` or sum both fields for an aggregate blocking rate.
+
+---
+
+### `GET /stats/stream`
+
+Live stats as Server-Sent Events — one JSON snapshot per second. Ideal for dashboards.
+
+```bash
+curl -N -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     http://localhost:8081/stats/stream
+```
+
+```
+data: {"total":125432,"blocked":8921,...,"qps_1m":34.7,"latency_p50_ms":0.3}
+
+data: {"total":125465,"blocked":8921,...,"qps_1m":34.9,"latency_p50_ms":0.3}
+```
+
+The stream is a standard SSE event stream (`Content-Type: text/event-stream`). Each `data:` line is the same JSON object as `GET /stats`. The connection stays open until the client closes it.
+
+> The `-N` flag disables curl's output buffering — required to see events in real time.
+
+---
+
+### `GET /upstreams`
+
+Health status of each configured `forward-addr` upstream resolver. Probed every 30 seconds with a minimal DNS query (`. IN A`).
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/upstreams
+```
+
+```json
+{
+  "upstreams": [
+    {
+      "addr":       "1.1.1.1",
+      "zone":       ".",
+      "healthy":    true,
+      "latency_ms": 12,
+      "last_check": "2026-05-17T14:23:05Z"
+    },
+    {
+      "addr":       "1.0.0.1",
+      "zone":       ".",
+      "healthy":    true,
+      "latency_ms": 14,
+      "last_check": "2026-05-17T14:23:05Z"
+    }
+  ],
+  "total":   2,
+  "healthy": 2
+}
+```
+
+`healthy: false` means the last probe timed out or received no valid DNS response. Runbound continues resolving — an unhealthy upstream only affects its own weight in hickory's load balancing. A WARN log is emitted on each failure.
+
+---
+
+### `GET /logs`
+
+Recent DNS query log, newest first. Up to 10,000 entries are kept in a fixed-size ring buffer (pre-allocated at startup, zero allocation per query).
+
+```bash
+# Last 100 queries (default)
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/logs
+
+# Blocked queries only
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     "http://localhost:8081/logs?action=blocked&limit=50"
+
+# Filter by client IP
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     "http://localhost:8081/logs?client=192.168.1.10"
+
+# Queries since a Unix timestamp
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     "http://localhost:8081/logs?since=1747483200"
+```
+
+```json
+{
+  "entries": [
+    {
+      "ts":         "2026-05-17T14:23:05Z",
+      "name":       "ads.example.com.",
+      "client":     "192.168.1.42",
+      "qtype":      1,
+      "action":     "blocked",
+      "elapsed_ms": 0
+    },
+    {
+      "ts":         "2026-05-17T14:23:04Z",
+      "name":       "google.com.",
+      "client":     "192.168.1.10",
+      "qtype":      1,
+      "action":     "forwarded",
+      "elapsed_ms": 23
+    }
+  ],
+  "total": 2,
+  "page":  0,
+  "limit": 100
+}
+```
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `limit` | `100` | Max entries per page (1–1000). Returns `422` if > 1000. |
+| `page` | `0` | Zero-based page number. |
+| `action` | — | Filter by action: `forwarded`, `cached`, `local`, `blocked`, `nxdomain`, `refused`, `servfail`. Returns `400` if invalid. |
+| `client` | — | Filter by client IP address. Returns `400` if not a valid IP. |
+| `since` | — | Return only entries with `ts ≥ since` (Unix timestamp in seconds). |
+
+**Action values:**
+
+| Action | Meaning |
+|---|---|
+| `forwarded` | Network round-trip to upstream (cache miss) |
+| `cached` | Served from hickory's in-process DNS cache (< 2 ms) |
+| `local` | Answered from local zone data (config or `POST /dns`) |
+| `blocked` | Domain blocked by blacklist or feeds |
+| `nxdomain` | NXDOMAIN from upstream or local zone |
+| `refused` | REFUSED (ACL, rate limit, CHAOS class, etc.) |
+| `servfail` | SERVFAIL (resolver error or private-address block) |
+
+**Note:** the `name` field is truncated to 253 characters (RFC 1035 max); `qtype` is the raw DNS RR type number (1 = A, 28 = AAAA, 15 = MX, etc.).
 
 ---
 
@@ -303,6 +447,25 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/tls
 
 ---
 
+---
+
+## Slave mode — read-only
+
+When Runbound runs as a slave replica (`mode: slave` in `runbound.conf`), all write
+operations are blocked at the API level. Any non-GET request returns:
+
+```json
+HTTP 503
+{"error": "READ_ONLY", "details": "This node is a slave replica — write operations are disabled"}
+```
+
+Changes must be applied on the master. Slaves receive all updates automatically via the
+replication protocol (delta journal, polled every `sync-interval` seconds). The `GET`
+endpoints (`/dns`, `/blacklist`, `/feeds`, `/stats`, `/logs`, etc.) remain fully available
+on slave nodes.
+
+---
+
 ## HTTP status codes
 
 | Code | Meaning |
@@ -315,4 +478,5 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8081/tls
 | `422` | Unprocessable — entry limit reached |
 | `429` | Too many requests — rate limit exceeded |
 | `500` | Internal server error |
+| `503` | Service unavailable — slave node (read-only), write operation rejected |
 

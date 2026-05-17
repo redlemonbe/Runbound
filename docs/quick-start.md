@@ -16,9 +16,9 @@ No dependencies required for the `musl` builds.
 
 ```bash
 # Replace vX.Y.Z with the latest tag from https://github.com/redlemonbe/Runbound/releases
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.2.5-x86_64-linux-musl
-chmod +x runbound-v0.2.5-x86_64-linux-musl
-sudo mv runbound-v0.2.5-x86_64-linux-musl /usr/local/bin/runbound
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.0-x86_64-linux-musl
+chmod +x runbound-v0.3.0-x86_64-linux-musl
+sudo mv runbound-v0.3.0-x86_64-linux-musl /usr/local/bin/runbound
 ```
 
 ---

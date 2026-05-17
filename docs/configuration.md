@@ -262,6 +262,90 @@ forward-zone:
 
 ---
 
+## Slave/master replication
+
+Runbound supports a master/slave topology for high-availability DNS. The master serves
+write operations and records them in a delta journal; slaves poll the master, apply
+deltas, and rebuild their zone set automatically.
+
+### Master configuration
+
+```
+server:
+    mode:      master      # default — omit if not using replication
+    sync-port: 8082        # opens HTTPS sync server on 0.0.0.0:8082
+    sync-key:  <secret>    # shared Bearer token for slave authentication
+```
+
+On first start, the master auto-generates a self-signed TLS certificate for the sync
+endpoint (`/etc/runbound/sync-cert.pem`). Its SHA-256 fingerprint is logged at startup
+and is also available at `GET https://master:8082/sync/cert` (unauthenticated endpoint
+used for TOFU bootstrap).
+
+If `sync-key` is absent, a 256-bit random key is generated at startup and printed to
+the log. Add it to both master and slave configs.
+
+### Slave configuration
+
+```
+server:
+    mode:          slave
+    sync-master:   192.168.1.10:8082    # master ip:port (same as sync-port above)
+    sync-key:      <same-secret>
+    sync-interval: 30                   # poll interval in seconds (default: 30)
+```
+
+On first start, the slave performs a **TOFU (Trust On First Use)** TLS handshake:
+
+1. Connects to master with no cert validation.
+2. Downloads the cert fingerprint from `GET /sync/cert`.
+3. Cross-checks it against the fingerprint captured during the TLS handshake.
+4. Saves the SHA-256 fingerprint to `/etc/runbound/sync-master.fingerprint` (chmod 640).
+5. Emits a `WARN` log with the fingerprint for manual verification.
+
+All subsequent connections pin the saved fingerprint. A mismatch aborts the connection.
+To re-key, delete `/etc/runbound/sync-master.fingerprint` on the slave and restart.
+
+### Slave read-only mode
+
+When `mode: slave` is set, all non-GET REST API requests return:
+
+```json
+HTTP 503
+{"error": "READ_ONLY", "details": "This node is a slave replica — write operations are disabled"}
+```
+
+Changes must be made on the master and will replicate automatically.
+
+### Delta sync and full sync
+
+The master keeps a ring buffer of the last **1,000 events** (DNS adds/deletes, blacklist
+changes, feed subscriptions, feed refreshes). Slaves request only the events they missed
+since their last sync (`GET /sync/delta?since=N`).
+
+If a slave falls more than 1,000 events behind (e.g., was offline for an extended period),
+the master returns `410 Gone` and the slave automatically performs a full snapshot sync
+(`GET /sync/config`).
+
+### Slave feed updates
+
+When the master refreshes a feed (`POST /feeds/:id/update`), the slave receives a
+`UpdateFeed` event and re-downloads the feed from the **same URL stored in its local
+config** — it does not stream feed content from the master. This keeps the sync protocol
+lightweight regardless of feed size.
+
+### Sync ports reference
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| 53 | UDP + TCP | DNS (all nodes) |
+| 8081 | HTTP | REST API (localhost only, all nodes) |
+| 8082 | HTTPS | Sync server (master only, network-accessible) |
+
+The sync port number is configurable. The REST API stays on localhost on all nodes.
+
+---
+
 ## Environment variables
 
 | Variable | Description |

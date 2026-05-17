@@ -6,25 +6,33 @@ use std::net::IpAddr;
 
 use dashmap::DashMap;
 
+use std::convert::Infallible;
+use std::time::Duration;
+
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    response::sse::{Event, KeepAlive, Sse},
     Json as JsonExtract,
     Router,
     routing::{delete, get, post},
 };
 use arc_swap::ArcSwap;
+use futures_util::stream;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::dns::{BlacklistAction, ZoneAction, local::{LocalZoneSet, parse_local_data}};
 use crate::feeds::{self, FeedFormat, add_feed, builtin_presets, remove_feed, update_all_feeds, update_one_feed};
+use crate::logbuffer::{LogAction, LogQuery, SharedLogBuffer};
 use crate::store::{self, DnsEntry, DnsType, BlacklistEntry};
 use crate::config::parser::{TlsConfig, UnboundConfig};
 use crate::stats::Stats;
+use crate::sync::{SyncJournal, SyncOp};
+use crate::upstreams::SharedUpstreams;
 
 /// Max TTL for API-created DNS entries (86400 s = 24 h).
 /// Prevents TTL-based cache persistence attacks and operator mistakes.
@@ -119,6 +127,13 @@ pub struct AppState {
     pub stats:        Arc<Stats>,
     pub cfg:          Arc<UnboundConfig>,
     pub cfg_path:     String,
+    pub log_buffer:   SharedLogBuffer,
+    pub upstreams:    SharedUpstreams,
+    /// Master: Some(journal) to record write events for slave replication.
+    /// Slave / standalone: None.
+    pub sync_journal: Option<Arc<SyncJournal>>,
+    /// True when running as slave — all write operations are blocked (503).
+    pub slave_mode:   bool,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -241,6 +256,8 @@ async fn security_middleware(
     headers.insert("referrer-policy",           HeaderValue::from_static("no-referrer"));
     headers.insert("content-security-policy",   HeaderValue::from_static("default-src 'none'"));
     headers.insert("cache-control",             HeaderValue::from_static("no-store"));
+    // Disable nginx response buffering so SSE events reach the client immediately.
+    headers.insert("x-accel-buffering",         HeaderValue::from_static("no"));
     response
 }
 
@@ -263,6 +280,22 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff.ct_eq(&0u8).into()
 }
 
+// ── Slave write guard ──────────────────────────────────────────────────────
+
+async fn slave_guard_middleware(
+    State(state): State<AppState>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if state.slave_mode && req.method() != axum::http::Method::GET {
+        return (StatusCode::SERVICE_UNAVAILABLE, JsonExtract(serde_json::json!({
+            "error":   "READ_ONLY",
+            "details": "This node is a slave replica — write operations are disabled",
+        }))).into_response();
+    }
+    next.run(req).await
+}
+
 // ── Router ─────────────────────────────────────────────────────────────────
 
 pub fn router(state: AppState) -> Router {
@@ -272,6 +305,7 @@ pub fn router(state: AppState) -> Router {
         // Operations
         .route("/health",            get(health_handler))
         .route("/stats",             get(stats_handler))
+        .route("/stats/stream",      get(stats_stream_handler))
         .route("/config",            get(config_handler))
         .route("/reload",            post(reload_handler))
         // DNS CRUD
@@ -288,6 +322,10 @@ pub fn router(state: AppState) -> Router {
         .route("/feeds/:id/update",  post(update_one_feed_handler))
         // TLS / Protocol status
         .route("/tls",               get(tls_status_handler))
+        // Monitoring
+        .route("/upstreams",         get(upstreams_handler))
+        .route("/logs",              get(logs_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), slave_guard_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), security_middleware))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .with_state(state)
@@ -303,6 +341,11 @@ async fn help_handler() -> impl IntoResponse {
         "rfcs": ["RFC1034","RFC1035","RFC2782","RFC4033","RFC4034","RFC4035","RFC6698","RFC6891","RFC7858","RFC8484","RFC9250"],
         "endpoints": [
             {"method":"GET",    "path":"/help",             "description":"API documentation"},
+            {"method":"GET",    "path":"/health",           "description":"Liveness check"},
+            {"method":"GET",    "path":"/stats",            "description":"Query statistics snapshot"},
+            {"method":"GET",    "path":"/stats/stream",     "description":"Live stats as Server-Sent Events (1-second interval)"},
+            {"method":"GET",    "path":"/config",           "description":"Running configuration"},
+            {"method":"POST",   "path":"/reload",           "description":"Hot-reload zones and blacklist from disk"},
             {"method":"GET",    "path":"/dns",              "description":"List all local DNS entries"},
             {"method":"POST",   "path":"/dns",              "description":"Add a local DNS entry (A/AAAA/CNAME/TXT/MX/SRV/CAA/PTR/NAPTR/SSHFP/TLSA/NS)"},
             {"method":"DELETE", "path":"/dns/:id",          "description":"Remove a DNS entry by UUID"},
@@ -316,6 +359,8 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"POST",   "path":"/feeds/:id/update", "description":"Refresh one feed"},
             {"method":"GET",    "path":"/feeds/presets",    "description":"List pre-configured blocklists"},
             {"method":"GET",    "path":"/tls",              "description":"DoT/DoH/DoQ TLS status"},
+            {"method":"GET",    "path":"/upstreams",        "description":"Upstream DNS resolver health"},
+            {"method":"GET",    "path":"/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
         ]
     }))
 }
@@ -334,20 +379,46 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
 // ── GET /stats ─────────────────────────────────────────────────────────────
 
 async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let snap = s.stats.snapshot();
+    JsonExtract(stats_json(&s.stats.snapshot()))
+}
+
+fn stats_json(snap: &crate::stats::StatsSnapshot) -> serde_json::Value {
     let pct_blocked = if snap.total > 0 {
-        (snap.blocked as f64 / snap.total as f64 * 100.0).round() as u64
-    } else { 0 };
-    JsonExtract(serde_json::json!({
-        "total":           snap.total,
-        "blocked":         snap.blocked,
-        "forwarded":       snap.forwarded,
-        "nxdomain":        snap.nxdomain,
-        "refused":         snap.refused,
-        "servfail":        snap.servfail,
-        "blocked_percent": pct_blocked,
-        "uptime_secs":     snap.uptime_secs,
-    }))
+        (snap.blocked as f64 / snap.total as f64 * 1000.0).round() / 10.0
+    } else { 0.0 };
+    serde_json::json!({
+        "total":            snap.total,
+        "blocked":          snap.blocked,
+        "forwarded":        snap.forwarded,
+        "nxdomain":         snap.nxdomain,
+        "refused":          snap.refused,
+        "servfail":         snap.servfail,
+        "local_hits":       snap.local_hits,
+        "blocked_percent":  pct_blocked,
+        "uptime_secs":      snap.uptime_secs,
+        "qps_1m":           snap.qps_1m,
+        "qps_5m":           snap.qps_5m,
+        "qps_peak":         snap.qps_peak,
+        "latency_p50_ms":   snap.latency_p50_ms,
+        "latency_p95_ms":   snap.latency_p95_ms,
+        "latency_p99_ms":   snap.latency_p99_ms,
+        "cache_hit_rate":   snap.cache_hit_rate,
+        "cache_entries":    snap.cache_entries,
+    })
+}
+
+// ── GET /stats/stream ──────────────────────────────────────────────────────
+
+async fn stats_stream_handler(
+    State(s): State<AppState>,
+) -> Sse<impl stream::Stream<Item = Result<Event, Infallible>>> {
+    let sse_stream = stream::unfold(s.stats, |stats| async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let data = stats_json(&stats.snapshot()).to_string();
+        let event = Event::default().data(data);
+        Some((Ok::<Event, Infallible>(event), stats))
+    });
+    Sse::new(sse_stream).keep_alive(KeepAlive::default())
 }
 
 // ── GET /config ────────────────────────────────────────────────────────────
@@ -535,6 +606,9 @@ async fn add_dns_handler(
     }
 
     info!(id=%entry.id, name=%entry.name, r#type=?entry.entry_type, "DNS entry added");
+    if let Some(ref j) = s.sync_journal {
+        j.push(SyncOp::AddDns { entry: entry.clone() });
+    }
     (StatusCode::CREATED, JsonExtract(serde_json::json!({
         "status": "ok",
         "entry": entry,
@@ -593,6 +667,9 @@ async fn delete_dns_handler(
     }
 
     info!(id=%id, "DNS entry deleted");
+    if let Some(ref j) = s.sync_journal {
+        j.push(SyncOp::DeleteDns { id: id.clone() });
+    }
     (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id})))
 }
 
@@ -662,6 +739,9 @@ async fn add_blacklist_handler(
     };
 
     info!(domain=%req.domain, action=?req.action, "Blacklist entry added");
+    if let Some(ref j) = s.sync_journal {
+        j.push(SyncOp::AddBlacklist { entry: entry.clone() });
+    }
     (StatusCode::CREATED, JsonExtract(serde_json::json!({
         "status": "ok",
         "entry": entry
@@ -693,6 +773,9 @@ async fn delete_blacklist_handler(
     s.zones.store(Arc::new(new_zones));
 
     info!(id=%id, domain=%removed.domain, "Blacklist entry deleted");
+    if let Some(ref j) = s.sync_journal {
+        j.push(SyncOp::DeleteBlacklist { id: id.clone() });
+    }
     (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id,"domain":removed.domain})))
 }
 
@@ -704,7 +787,7 @@ async fn get_feeds_handler(State(_s): State<AppState>) -> impl IntoResponse {
 }
 
 async fn add_feed_handler(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     JsonExtract(p): JsonExtract<AddFeedRequest>,
 ) -> impl IntoResponse {
     // Enforce subscription cap before attempting download/validation.
@@ -718,6 +801,9 @@ async fn add_feed_handler(
     match add_feed(p.name, p.url, p.format, p.action, p.description).await {
         Ok(feed) => {
             info!("Feed added: {} ({})", feed.name, feed.url);
+            if let Some(ref j) = s.sync_journal {
+                j.push(SyncOp::AddFeed { feed: feed.clone() });
+            }
             (StatusCode::CREATED, JsonExtract(serde_json::json!({
                 "status": "ok", "feed": feed,
                 "message": "Run POST /feeds/:id/update to fetch domains."
@@ -733,11 +819,16 @@ async fn add_feed_handler(
 }
 
 async fn delete_feed_handler(
-    State(_s): State<AppState>,
+    State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match remove_feed(&id) {
-        Ok(()) => (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id}))),
+        Ok(()) => {
+            if let Some(ref j) = s.sync_journal {
+                j.push(SyncOp::DeleteFeed { id: id.clone() });
+            }
+            (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id})))
+        }
         Err(crate::error::AppError::BadRequest(msg)) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"BAD_REQUEST","details":msg}))),
         Err(e) => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"FEED_NOT_FOUND","details":e.to_string()}))),
     }
@@ -765,11 +856,22 @@ async fn update_one_feed_handler(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Look up URL before updating (for journal event)
+    let feed_url = feeds::load_feeds()
+        .ok()
+        .and_then(|cfg| cfg.feeds.into_iter().find(|f| f.id == id))
+        .map(|f| f.url);
+
     match update_one_feed(&id).await {
         Ok(result) => {
             // Rebuild zone set immediately so the refreshed feed is active without a reload.
             let new_zones = crate::build_zone_set(&s.cfg);
             s.zones.store(std::sync::Arc::new(new_zones));
+            if result.error.is_none() {
+                if let (Some(ref j), Some(url)) = (s.sync_journal.as_ref(), feed_url) {
+                    j.push(SyncOp::UpdateFeed { id: id.clone(), url });
+                }
+            }
             let code = if result.error.is_some() { StatusCode::INTERNAL_SERVER_ERROR } else { StatusCode::OK };
             (code, JsonExtract(serde_json::json!({"result": result})))
         }
@@ -781,6 +883,87 @@ async fn update_one_feed_handler(
 async fn feed_presets_handler() -> impl IntoResponse {
     let presets = builtin_presets();
     JsonExtract(serde_json::json!({"presets": presets, "total": presets.len()}))
+}
+
+// ── GET /upstreams ─────────────────────────────────────────────────────────
+
+async fn upstreams_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let statuses = s.upstreams.read().unwrap().clone();
+    let total = statuses.len();
+    let healthy = statuses.iter().filter(|u| u.healthy).count();
+    JsonExtract(serde_json::json!({
+        "upstreams": statuses,
+        "total":     total,
+        "healthy":   healthy,
+    }))
+}
+
+// ── GET /logs ──────────────────────────────────────────────────────────────
+
+const LOG_LIMIT_MAX: usize = 1_000;
+const LOG_LIMIT_DEFAULT: usize = 100;
+
+#[derive(Deserialize)]
+struct LogsParams {
+    #[serde(default = "default_log_limit")]
+    limit:  usize,
+    #[serde(default)]
+    page:   usize,
+    action: Option<String>,
+    client: Option<String>,
+    since:  Option<u64>,
+}
+
+fn default_log_limit() -> usize { LOG_LIMIT_DEFAULT }
+
+async fn logs_handler(
+    State(s):          State<AppState>,
+    Query(params):     Query<LogsParams>,
+) -> Response {
+    if params.limit > LOG_LIMIT_MAX {
+        return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
+            "error":   "INVALID_PARAM",
+            "details": format!("limit must be ≤ {}", LOG_LIMIT_MAX),
+        }))).into_response();
+    }
+
+    let action = match params.action.as_deref() {
+        Some(s) => match LogAction::from_str(s) {
+            Some(a) => Some(a),
+            None => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                "error":   "INVALID_PARAM",
+                "details": format!("action '{}' is not valid — expected one of: forwarded, cached, local, blocked, nxdomain, refused, servfail", s),
+            }))).into_response(),
+        },
+        None => None,
+    };
+
+    let client = match params.client.as_deref() {
+        Some(s) => match s.parse::<std::net::IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                "error":   "INVALID_PARAM",
+                "details": format!("client '{}' is not a valid IP address", s),
+            }))).into_response(),
+        },
+        None => None,
+    };
+
+    let q = LogQuery {
+        limit:      params.limit,
+        page:       params.page,
+        action,
+        client,
+        since_secs: params.since,
+    };
+
+    let (entries, total) = s.log_buffer.lock().unwrap().query(&q);
+    JsonExtract(serde_json::json!({
+        "entries": entries,
+        "total":   total,
+        "page":    params.page,
+        "limit":   params.limit,
+    })).into_response()
 }
 
 // ── TLS status ─────────────────────────────────────────────────────────────
@@ -852,4 +1035,181 @@ fn validate_dns_name(name: &str) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt; // oneshot
+
+    const TEST_KEY: &str = "test-api-key-for-unit-tests";
+
+    fn make_test_app() -> Router {
+        // Initialise API key (OnceLock — safe to call multiple times with same value)
+        init_api_key(Some(TEST_KEY.to_string()));
+
+        let zones = Arc::new(ArcSwap::new(Arc::new(
+            crate::dns::local::LocalZoneSet::default()
+        )));
+        let cfg_arc = Arc::new(crate::config::parser::UnboundConfig::default());
+        let log_buffer = crate::logbuffer::new_shared();
+        let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
+
+        let state = AppState {
+            zones:       Arc::clone(&zones),
+            zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            tls_cfg:     Arc::new(crate::config::parser::TlsConfig::default()),
+            rate_limiter: ApiRateLimiter::new_public(),
+            stats:       crate::stats::Stats::new(),
+            cfg:         Arc::clone(&cfg_arc),
+            cfg_path:    "/dev/null".to_string(),
+            log_buffer,
+            upstreams,
+            sync_journal: None,
+            slave_mode:   false,
+        };
+        router(state)
+    }
+
+    async fn body_json(body: axum::body::Body) -> serde_json::Value {
+        let bytes = body.collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn auth_header() -> (&'static str, String) {
+        ("Authorization", format!("Bearer {}", TEST_KEY))
+    }
+
+    // ── /stats ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stats_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/stats").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stats_schema() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/stats").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        for field in &["total", "blocked", "forwarded", "qps_1m", "qps_5m",
+                       "latency_p50_ms", "cache_hit_rate", "local_hits"] {
+            assert!(json.get(field).is_some(), "missing field: {field}");
+        }
+    }
+
+    // ── /stats/stream ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stats_stream_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/stats/stream").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn stats_stream_content_type() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/stats/stream").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(ct.contains("text/event-stream"), "unexpected Content-Type: {ct}");
+    }
+
+    // ── /upstreams ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upstreams_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/upstreams").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn upstreams_schema() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/upstreams").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert!(json.get("upstreams").is_some());
+        assert!(json.get("total").is_some());
+        assert!(json.get("healthy").is_some());
+    }
+
+    // ── /logs ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn logs_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/logs").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logs_schema() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/logs").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert!(json.get("entries").is_some());
+        assert!(json.get("total").is_some());
+    }
+
+    #[tokio::test]
+    async fn logs_limit_too_large() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/logs?limit=2000").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn logs_invalid_action() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/logs?action=invalid").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn logs_invalid_client_ip() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/logs?client=notanip").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
