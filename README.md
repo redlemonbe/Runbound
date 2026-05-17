@@ -141,6 +141,12 @@ Ready-to-use configs for common scenarios:
 | [examples/master.conf](examples/master.conf) | Master node — writes + replication to slaves |
 | [examples/slave.conf](examples/slave.conf) | Slave replica — read-only, TOFU TLS, auto delta sync |
 
+**Integration example:**
+
+| Script | What it does |
+|---|---|
+| [examples/postgres_collector.py](examples/postgres_collector.py) | Polls `/stats` + `/logs` and inserts into PostgreSQL — reference for "how do I store DNS data in my own DB?" |
+
 ---
 
 ## Documentation
