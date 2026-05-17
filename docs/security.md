@@ -444,6 +444,8 @@ make audit-full  # all three + cargo outdated
 
 → Full audit process, release procedure, and manual review areas: [docs/audit.md](audit.md)
 
+→ Full Rust code audit (quality, performance, architecture): [docs/code-audit.md](code-audit.md)
+
 ---
 
 ## Reporting a vulnerability
