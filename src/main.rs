@@ -37,23 +37,67 @@ const API_BIND: &str = "127.0.0.1"; // API must not be exposed externally
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("runbound {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-    // --gen-cert [hostname] — generate a self-signed TLS certificate for DoT/DoH/DoQ
-    if let Some(pos) = args.iter().position(|a| a == "--gen-cert") {
-        let hostname = args.get(pos + 1)
-            .map(|s| s.as_str())
-            .unwrap_or("runbound.local");
-        gen_self_signed_cert(hostname)?;
+    if handle_cli_flags(&args)? {
         return Ok(());
     }
 
+    let (cfg, base_dir, cfg_path) = init_runtime(&args)?;
+
+    let (zones, rate_limiter, acl, global_stats, log_buffer, audit) =
+        build_and_launch(&cfg, base_dir, cfg_path).await?;
+
+    // ── XDP fast path (optional, feature-gated) ───────────────────────────
+    // The handle must stay alive for the entire process lifetime; dropping it
+    // would detach the XDP program and destroy the XSKMAP.
+    #[cfg(feature = "xdp")]
+    let _xdp_handle = {
+        let iface = cfg.interfaces.first()
+            .and_then(|s| {
+                let s = s.trim();
+                if s == "0.0.0.0" || s == "::" || s.is_empty() { return None; }
+                if s.parse::<std::net::IpAddr>().is_ok() {
+                    return dns::xdp::socket::iface_for_ip(s);
+                }
+                Some(s.to_string())
+            })
+            .or_else(|| dns::xdp::socket::default_interface());
+        match iface {
+            Some(ref iface_name) => {
+                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl)) {
+                    Ok(h)  => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); Some(h) }
+                    Err(e) => { tracing::warn!("XDP not available (continuing without): {e}"); None }
+                }
+            }
+            None => { tracing::warn!("XDP: could not determine network interface; fast path disabled"); None }
+        }
+    };
+
+    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer).await;
+    audit.send(audit::AuditEvent::Shutdown);
+    result
+}
+
+/// Handle `--help`, `--version`, `--gen-cert` flags. Returns `true` if the process should exit.
+fn handle_cli_flags(args: &[String]) -> Result<bool> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(true);
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("runbound {}", env!("CARGO_PKG_VERSION"));
+        return Ok(true);
+    }
+    // --gen-cert [hostname] — generate a self-signed TLS certificate for DoT/DoH/DoQ
+    if let Some(pos) = args.iter().position(|a| a == "--gen-cert") {
+        let hostname = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("runbound.local");
+        gen_self_signed_cert(hostname)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Install rustls crypto provider, init tracing, load and validate config, init HSM.
+fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, String)> {
     // rustls 0.23: when multiple crypto backends are compiled in (ring + aws-lc-rs),
     // ServerConfig::builder() panics unless a default provider is installed first.
     rustls::crypto::ring::default_provider()
@@ -112,71 +156,75 @@ async fn main() -> Result<()> {
     }
 
     info!(
-        port = unbound_cfg.port,
-        interfaces = ?unbound_cfg.interfaces,
-        local_zones = unbound_cfg.local_zones.len(),
-        local_data  = unbound_cfg.local_data.len(),
+        port          = unbound_cfg.port,
+        interfaces    = ?unbound_cfg.interfaces,
+        local_zones   = unbound_cfg.local_zones.len(),
+        local_data    = unbound_cfg.local_data.len(),
         forward_zones = unbound_cfg.forward_zones.len(),
         "Config loaded"
     );
 
+    Ok((unbound_cfg, base_dir, cfg_path))
+}
+
+/// Init audit, ACME, zone set, background tasks, REST API, sync. Returns DNS server inputs.
+async fn build_and_launch(
+    cfg:      &UnboundConfig,
+    base_dir: std::path::PathBuf,
+    cfg_path: String,
+) -> Result<(
+    Arc<ArcSwap<LocalZoneSet>>,
+    Arc<RateLimiter>,
+    Arc<Acl>,
+    Arc<Stats>,
+    logbuffer::SharedLogBuffer,
+    audit::AuditLogger,
+)> {
     // ── Audit log ─────────────────────────────────────────────────────────
-    let audit_log_path = unbound_cfg.audit_log_path.as_deref()
-        .map(std::path::PathBuf::from);
-    let audit = audit::init(
-        unbound_cfg.audit_log,
-        audit_log_path,
-        unbound_cfg.audit_log_hmac_key.clone(),
-        base_dir.clone(),
-    );
+    let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
+    let audit = audit::init(cfg.audit_log, audit_log_path, cfg.audit_log_hmac_key.clone(), base_dir.clone());
     audit.send(audit::AuditEvent::Startup);
 
     // ── ACME: auto-provision TLS cert if needed ────────────────────────────
-    if let Some(ref email) = unbound_cfg.acme_email {
-        if unbound_cfg.acme_domains.is_empty() {
+    if let Some(ref email) = cfg.acme_email {
+        if cfg.acme_domains.is_empty() {
             tracing::warn!("acme-email set but no acme-domain directives — ACME disabled");
         } else {
-            let cert_path = unbound_cfg.tls.cert_path.as_deref()
+            let cert_path = cfg.tls.cert_path.as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| base_dir.join("cert.pem"));
-            let key_path = unbound_cfg.tls.key_path.as_deref()
+            let key_path = cfg.tls.key_path.as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| base_dir.join("key.pem"));
-            let cache_dir = unbound_cfg.acme_cache_dir.as_deref()
+            let cache_dir = cfg.acme_cache_dir.as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| base_dir.join("acme"));
-
             let acme_cfg = acme::AcmeConfig {
                 email:          email.clone(),
-                domains:        unbound_cfg.acme_domains.clone(),
+                domains:        cfg.acme_domains.clone(),
                 cert_path:      cert_path.clone(),
                 key_path:       key_path.clone(),
                 cache_dir,
-                staging:        unbound_cfg.acme_staging,
-                challenge_port: unbound_cfg.acme_challenge_port.unwrap_or(80),
+                staging:        cfg.acme_staging,
+                challenge_port: cfg.acme_challenge_port.unwrap_or(80),
             };
-
             if acme::needs_renewal(&cert_path) {
                 info!("ACME: cert missing or due for renewal — contacting Let's Encrypt");
                 if let Err(e) = acme::ensure_certificate(&acme_cfg).await {
-                    // Non-fatal: existing cert (if any) will still be used for DoT/DoH.
                     tracing::warn!(err = %e, "ACME cert provisioning failed — continuing");
                 }
             } else {
                 info!("ACME: cert is current (>30 days remaining)");
             }
-
             tokio::spawn(acme::renewal_loop(acme_cfg));
         }
     }
 
     // ── Build in-memory zone set ───────────────────────────────────────────
-    let zone_set = build_zone_set(&unbound_cfg);
-
     // ArcSwap: reads are a single atomic pointer load — zero lock contention
     // on the hot DNS query path regardless of core count.
-    let zones   = Arc::new(ArcSwap::new(Arc::new(zone_set)));
-    let tls_cfg = Arc::new(unbound_cfg.tls.clone());
+    let zones   = Arc::new(ArcSwap::new(Arc::new(build_zone_set(cfg))));
+    let tls_cfg = Arc::new(cfg.tls.clone());
 
     // ── SIGHUP: hot-reload zones from config without dropping connections ──
     #[cfg(unix)]
@@ -209,13 +257,11 @@ async fn main() -> Result<()> {
     }
 
     // ── Background: feed auto-update ───────────────────────────────────────
-    tokio::spawn(async move {
-        feeds::feed_update_loop(86400).await;
-    });
+    tokio::spawn(async move { feeds::feed_update_loop(86400).await });
 
     // ── REST API (localhost only, port from api-port directive, default 8081) ──
-    let api_port = unbound_cfg.api_port.unwrap_or(8081);
-    let api_key = init_api_key(unbound_cfg.api_key.clone());
+    let api_port = cfg.api_port.unwrap_or(8081);
+    let api_key  = init_api_key(cfg.api_key.clone());
     info!(
         addr = %format!("{API_BIND}:{api_port}"),
         "REST API key: {}...{}",
@@ -233,26 +279,21 @@ async fn main() -> Result<()> {
     }
 
     let global_stats = Stats::new();
-
-    // ── QPS ring buffer background task ───────────────────────────────────
     tokio::spawn(stats::qps_update_loop(Arc::clone(&global_stats)));
-
-    // ── Log ring buffer (pre-allocated, zero alloc after startup) ─────────
-    let log_buffer = logbuffer::new_shared(unbound_cfg.log_retention, unbound_cfg.log_client_ip);
+    let log_buffer = logbuffer::new_shared(cfg.log_retention, cfg.log_client_ip);
 
     // ── Upstream health monitor ────────────────────────────────────────────
-    let upstreams = upstreams::init_upstreams(&unbound_cfg);
+    let upstreams = upstreams::init_upstreams(cfg);
     {
         let ups = Arc::clone(&upstreams);
         tokio::spawn(async move { upstreams::upstream_health_loop(ups).await });
     }
 
-    let cfg_arc = Arc::new(unbound_cfg.clone());
+    let cfg_arc = Arc::new(cfg.clone());
 
     // ── Slave/master sync ──────────────────────────────────────────────────
-    let sync_journal = if let (true, Some(port)) = (unbound_cfg.is_master(), unbound_cfg.sync_port) {
+    let sync_journal = if let (true, Some(port)) = (cfg.is_master(), cfg.sync_port) {
         let journal = sync::SyncJournal::new();
-
         match sync::ensure_sync_cert() {
             Ok((cert_pem, key_pem)) => {
                 match sync::cert_sha256_hex(&cert_pem) {
@@ -260,7 +301,7 @@ async fn main() -> Result<()> {
                         info!(port, sha256 = %fingerprint, "Sync HTTPS server starting");
                         let j        = Arc::clone(&journal);
                         let cert_fp  = fingerprint.clone();
-                        let sync_key = unbound_cfg.sync_key.clone()
+                        let sync_key = cfg.sync_key.clone()
                             .unwrap_or_else(|| {
                                 let k = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
                                 info!("No sync-key in config — generated: {}...{}", &k[..8], &k[k.len()-4..]);
@@ -288,11 +329,11 @@ async fn main() -> Result<()> {
     // Hoisted so both SlaveClient and AppState share the same mutex instance.
     let zones_mutex = Arc::new(tokio::sync::Mutex::new(()));
 
-    if unbound_cfg.is_slave() {
-        match (&unbound_cfg.sync_master, &unbound_cfg.sync_key) {
+    if cfg.is_slave() {
+        match (&cfg.sync_master, &cfg.sync_key) {
             (Some(master), Some(key)) => {
                 let client = sync::SlaveClient::new(
-                    master, key, unbound_cfg.sync_interval,
+                    master, key, cfg.sync_interval,
                     Arc::clone(&zones),
                     Arc::clone(&zones_mutex),
                     Arc::clone(&cfg_arc),
@@ -311,72 +352,26 @@ async fn main() -> Result<()> {
         zones_mutex:  Arc::clone(&zones_mutex),
         stats:        Arc::clone(&global_stats),
         cfg:          Arc::clone(&cfg_arc),
-        cfg_path:     cfg_path.clone(),
+        cfg_path,
         log_buffer:   Arc::clone(&log_buffer),
         upstreams:    Arc::clone(&upstreams),
         sync_journal,
-        slave_mode:   unbound_cfg.is_slave(),
+        slave_mode:   cfg.is_slave(),
         base_dir:     Arc::new(base_dir),
         audit:        audit.clone(),
     };
-    let app = api::router(state);
+    let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
     let listener = tokio::net::TcpListener::bind(&api_addr).await
         .map_err(|e| anyhow::anyhow!("API bind {api_addr}: {e}"))?;
     info!(addr=%api_addr, "REST API listening (localhost only)");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
-    });
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
 
-    // ── Shared rate limiter (XDP fast-path + normal DNS path share one budget)
-    let rps          = unbound_cfg.rate_limit.unwrap_or(200);
-    let rate_limiter = RateLimiter::new(rps);
+    // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
+    let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200));
+    let acl          = Arc::new(Acl::from_config(&cfg.access_control));
 
-    // ── Shared ACL (XDP fast-path + normal DNS path enforce the same rules)
-    let acl = Arc::new(Acl::from_config(&unbound_cfg.access_control));
-
-    // ── XDP fast path (optional, feature-gated) ───────────────────────────
-    // The handle must stay alive for the entire process lifetime; dropping it
-    // would detach the XDP program and destroy the XSKMAP.
-    #[cfg(feature = "xdp")]
-    let _xdp_handle = {
-        let iface = unbound_cfg.interfaces.first()
-            .and_then(|s| {
-                let s = s.trim();
-                if s == "0.0.0.0" || s == "::" || s.is_empty() {
-                    return None;
-                }
-                if s.parse::<std::net::IpAddr>().is_ok() {
-                    return dns::xdp::socket::iface_for_ip(s);
-                }
-                Some(s.to_string())
-            })
-            .or_else(|| dns::xdp::socket::default_interface());
-
-        match iface {
-            Some(ref iface_name) => {
-                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl)) {
-                    Ok(h) => {
-                        info!(iface = %iface_name, "XDP kernel-bypass fast path active");
-                        Some(h)
-                    }
-                    Err(e) => {
-                        tracing::warn!("XDP not available (continuing without): {e}");
-                        None
-                    }
-                }
-            }
-            None => {
-                tracing::warn!("XDP: could not determine network interface; fast path disabled");
-                None
-            }
-        }
-    };
-
-    // ── DNS server (blocks until shutdown) ────────────────────────────────
-    let result = dns::run_dns_server(&unbound_cfg, zones, rate_limiter, acl, global_stats, log_buffer).await;
-    audit.send(audit::AuditEvent::Shutdown);
-    result
+    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit))
 }
 
 fn print_help() {
