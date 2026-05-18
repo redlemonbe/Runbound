@@ -535,7 +535,7 @@ async fn send_error<R: ResponseHandler>(
 }
 
 /// Build resolver from forward-zones in unbound.conf, fallback to system resolvers.
-fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioResolver> {
+fn build_resolver(cfg: &UnboundConfig, cache_size: usize) -> anyhow::Result<TokioResolver> {
     let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
 
     for fwd in &cfg.forward_zones {
@@ -591,7 +591,7 @@ fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioResolver> {
 
     let mut opts = ResolverOpts::default();
     opts.recursion_desired = true;
-    opts.cache_size = 8192; // doubled from 4096 — better hit rate under load
+    opts.cache_size = cache_size as u64;
     opts.timeout = Duration::from_secs(3);            // hard timeout per upstream query
     opts.attempts = 2;                                // retry once before SERVFAIL
     // DNSSEC: controlled by `dnssec-validation` directive (default: off for forwarders).
@@ -612,12 +612,31 @@ fn build_resolver(cfg: &UnboundConfig) -> anyhow::Result<TokioResolver> {
 // ============================================================
 
 // Check memory every 30 s. On Linux /proc/meminfo is a cheap kernel read.
-const MEM_CHECK_SECS: u64 = 30;
-// Trigger purge when system memory usage ≥ 80 %.
-// Using 80 % rather than 90 % gives a safe margin before the OOM killer fires.
-const MEM_PRESSURE_THRESHOLD: f64 = 0.80;
-// After purge, log whether we landed below 50 % (target) or are still high.
-const MEM_TARGET_THRESHOLD: f64 = 0.50;
+const MEM_CHECK_SECS:       u64 = 30;
+// Scale-up cooldown: do not increase cache more often than every 5 minutes.
+const MEM_SCALEUP_COOLDOWN: u64 = 300;
+// Memory pressure thresholds (used ratio = 1 - MemAvailable/MemTotal):
+const MEM_LOW_WATERMARK:    f64 = 0.60; // below → scale up if cache was reduced
+const MEM_MOD_WATERMARK:    f64 = 0.70; // [0.70, 0.80) → halve cache
+const MEM_HIGH_WATERMARK:   f64 = 0.80; // ≥ 0.80 → recalc + flush rate limiter
+
+/// Compute an appropriate resolver cache size from current available RAM.
+///
+/// 1 hickory cache entry ≈ 512 bytes.
+/// Allocates up to 10 % of MemAvailable, clamped to [512, 65536].
+/// Falls back to 8192 when /proc/meminfo is unavailable.
+fn cache_size_from_meminfo() -> usize {
+    let avail_kb: u64 = std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|t| t.lines()
+            .find(|l| l.starts_with("MemAvailable:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok()))
+        .unwrap_or(0);
+    if avail_kb == 0 {
+        return 8192;
+    }
+    ((avail_kb * 1024 / 10 / 512) as usize).clamp(512, 65536)
+}
 
 /// Read /proc/meminfo and return (available_kb, total_kb).
 /// Returns None on any parse or I/O error (non-Linux, container without /proc, etc.).
@@ -635,21 +654,30 @@ fn read_meminfo() -> Option<(u64, u64)> {
     if total > 0 { Some((available, total)) } else { None }
 }
 
-/// Background task: monitors system memory and purges DNS caches when needed.
+/// Background task: monitors system memory and adjusts the DNS resolver cache size.
 ///
-/// Two caches are flushed:
-///   1. Rate-limiter DashMap — freed O(n_unique_IPs) memory, rebuilds naturally.
-///   2. hickory-resolver internal cache — flushed by rebuilding the resolver and
-///      atomically swapping it via ArcSwap. In-flight queries keep the old Arc
-///      until they finish; new queries use the fresh resolver with empty cache.
+/// Four operating modes based on memory pressure (used = 1 - MemAvailable/MemTotal):
+///   < 60 %  — scale up: restore cache toward optimal size (with cooldown).
+///   60–70 % — stable: no action.
+///   70–80 % — moderate pressure: halve cache size, floor 512.
+///   ≥ 80 %  — high pressure: recalc cache from current RAM + flush rate limiter.
+///
+/// Cache changes take effect by rebuilding the hickory resolver and atomically
+/// swapping it via ArcSwap. In-flight queries keep their Arc until completion.
 pub async fn memory_guard_loop(
-    rate_limiter: Arc<RateLimiter>,
-    resolver:     Arc<ArcSwap<TokioResolver>>,
-    cfg:          Arc<UnboundConfig>,
-    stats:        Arc<Stats>,
+    rate_limiter:         Arc<RateLimiter>,
+    resolver:             Arc<ArcSwap<TokioResolver>>,
+    cfg:                  Arc<UnboundConfig>,
+    stats:                Arc<Stats>,
+    initial_cache_size:   usize,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(MEM_CHECK_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let mut current_cache_size = initial_cache_size;
+    let mut last_scale_up = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(MEM_SCALEUP_COOLDOWN))
+        .unwrap_or_else(std::time::Instant::now);
 
     loop {
         interval.tick().await;
@@ -657,37 +685,69 @@ pub async fn memory_guard_loop(
         let Some((avail_kb, total_kb)) = read_meminfo() else { continue };
         let used_ratio = 1.0 - (avail_kb as f64 / total_kb as f64);
 
-        if used_ratio < MEM_PRESSURE_THRESHOLD { continue; }
-
-        warn!(
-            used_pct  = format!("{:.1}%", used_ratio * 100.0),
-            avail_mb  = avail_kb / 1024,
-            total_mb  = total_kb / 1024,
-            "Memory pressure — purging DNS caches"
-        );
-
-        // 1. Clear rate-limiter (all token buckets — they rebuild on next query)
-        let freed_buckets = rate_limiter.clear();
-
-        // 2. Rebuild resolver — this discards hickory's entire in-memory DNS cache.
-        //    Queries in flight hold their own Arc<TokioResolver> and finish
-        //    normally; new queries get the fresh empty-cache resolver.
-        match build_resolver(&cfg) {
-            Ok(new_res) => {
-                resolver.store(Arc::new(new_res));
-                stats.reset_cache();
-                warn!(freed_buckets, "DNS resolver cache flushed and rate limiter cleared");
+        if used_ratio >= MEM_HIGH_WATERMARK {
+            // High pressure — recalc from current RAM state, flush rate limiter.
+            let new_size = cache_size_from_meminfo();
+            match build_resolver(&cfg, new_size) {
+                Ok(new_res) => {
+                    resolver.store(Arc::new(new_res));
+                    stats.reset_cache();
+                    let freed = rate_limiter.clear();
+                    warn!(
+                        used_pct = format!("{:.1}%", used_ratio * 100.0),
+                        cache_from = current_cache_size,
+                        cache_to   = new_size,
+                        freed_buckets = freed,
+                        "memory pressure high — cache flushed, resized, rate limiter cleared"
+                    );
+                    current_cache_size = new_size;
+                }
+                Err(e) => warn!(%e, "memory guard: resolver rebuild failed (high pressure)"),
             }
-            Err(e) => {
-                warn!(%e, freed_buckets, "Resolver rebuild failed — rate limiter still cleared");
+        } else if used_ratio >= MEM_MOD_WATERMARK {
+            // Moderate pressure — halve cache, floor at 512.
+            if current_cache_size > 512 {
+                let new_size = (current_cache_size / 2).max(512);
+                match build_resolver(&cfg, new_size) {
+                    Ok(new_res) => {
+                        resolver.store(Arc::new(new_res));
+                        stats.reset_cache();
+                        warn!(
+                            used_pct   = format!("{:.1}%", used_ratio * 100.0),
+                            cache_from = current_cache_size,
+                            cache_to   = new_size,
+                            "memory pressure — cache halved"
+                        );
+                        current_cache_size = new_size;
+                    }
+                    Err(e) => warn!(%e, "memory guard: resolver rebuild failed (moderate pressure)"),
+                }
+            }
+        } else if used_ratio < MEM_LOW_WATERMARK {
+            // Memory freed — scale up toward optimal if cooldown elapsed.
+            let optimal = cache_size_from_meminfo();
+            let elapsed = last_scale_up.elapsed();
+            if optimal > current_cache_size
+                && elapsed >= Duration::from_secs(MEM_SCALEUP_COOLDOWN)
+            {
+                match build_resolver(&cfg, optimal) {
+                    Ok(new_res) => {
+                        resolver.store(Arc::new(new_res));
+                        stats.reset_cache();
+                        info!(
+                            used_pct   = format!("{:.1}%", used_ratio * 100.0),
+                            cache_from = current_cache_size,
+                            cache_to   = optimal,
+                            "memory pressure resolved — cache scaled up"
+                        );
+                        current_cache_size = optimal;
+                        last_scale_up = std::time::Instant::now();
+                    }
+                    Err(e) => warn!(%e, "memory guard: resolver rebuild failed (scale up)"),
+                }
             }
         }
-
-        if let Some((new_avail, _)) = read_meminfo() {
-            let new_ratio = 1.0 - (new_avail as f64 / total_kb as f64);
-            let status = if new_ratio < MEM_TARGET_THRESHOLD { "below 50% target" } else { "still elevated" };
-            warn!(used_pct = format!("{:.1}%", new_ratio * 100.0), status, "Memory after purge");
-        }
+        // 60–70 %: stable band — no action.
     }
 }
 
@@ -794,16 +854,20 @@ pub async fn run_dns_server(
         info!(rps, burst = rps * 2, "DNS rate limiter configured");
     }
 
-    let resolver = Arc::new(ArcSwap::new(Arc::new(build_resolver(cfg)?)));
+    let initial_cache_size = cache_size_from_meminfo();
+    info!(cache_size = initial_cache_size, "cache size auto-sized from MemAvailable");
+    let resolver = Arc::new(ArcSwap::new(Arc::new(build_resolver(cfg, initial_cache_size)?)));
 
     // Spawn memory pressure guard — monitors /proc/meminfo every 30 s and
-    // flushes DNS caches (rate limiter + resolver) when usage exceeds 80 %.
+    // adjusts the DNS cache size and flushes the rate limiter under pressure.
     {
         let rl       = Arc::clone(&rate_limiter);
         let res      = Arc::clone(&resolver);
         let cfg_arc  = Arc::new(cfg.clone());
         let stats_mg = Arc::clone(&stats);
-        tokio::spawn(async move { memory_guard_loop(rl, res, cfg_arc, stats_mg).await });
+        tokio::spawn(async move {
+            memory_guard_loop(rl, res, cfg_arc, stats_mg, initial_cache_size).await
+        });
     }
 
     if acl.is_empty() {
@@ -826,7 +890,7 @@ pub async fn run_dns_server(
     );
     let mut server = Server::new(handler);
 
-    let ncpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let ncpus = crate::cpu::physical_cores().len().max(1);
 
     let port = cfg.port;
     let interfaces: Vec<String> = if cfg.interfaces.is_empty() {
