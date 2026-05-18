@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.9] — 2026-05-18
+
+### Changed
+
+- **DNS socket workers use physical core count** (HT excluded) instead of `available_parallelism()`. Consistent with the tokio runtime pinning introduced in v0.4.8.
+
+- **Cache size is now auto-sized from available RAM** and adjusts dynamically under memory pressure.
+  At startup, Runbound allocates up to 10 % of `MemAvailable` (1 entry ≈ 512 B), clamped to [512, 65 536] entries and logged as `cache_size=N entries (auto-sized from MemAvailable)`.
+  The memory guard (every 30 s) now operates in four bands:
+  - **< 60 % used** — scale up: restore cache toward the current optimal size (5-minute cooldown between upscales).
+  - **60–70 %** — stable, no action.
+  - **70–80 %** — halve cache size (floor 512).
+  - **≥ 80 %** — recalculate from current RAM, flush rate limiter.
+
+---
+
 ## [0.4.8] — 2026-05-18
 
 ### Added
