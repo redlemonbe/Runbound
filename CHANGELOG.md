@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.12] — 2026-05-18
+
+### Fixed
+
+- **XDP eBPF verifier rejection — instruction 21** (`r3 += r4`): the BPF verifier
+  prohibits adding a scalar variable to a packet pointer even with `CAP_BPF`.
+  Fixed by assuming a standard IPv4 header (IHL = 20, no options); packets with
+  IP options are passed to the kernel via `XDP_PASS`. The UDP offset is now a
+  compile-time constant (14 + 20 = 34), statically provable by the verifier.
+  Validated with `bpftool prog load` on kernel 6.12.
+
+---
+
 ## [0.4.11] — 2026-05-18
 
 ### Fixed

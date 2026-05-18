@@ -45,11 +45,12 @@ int dns_xdp(struct xdp_md *ctx)
             return XDP_PASS;
         if (ip->protocol != IPPROTO_UDP)
             return XDP_PASS;
-        // Mask to 4-bit field before scaling — constrains range to [0,15]*4=[0,60].
-        // Using ip-relative arithmetic so the verifier can track bounds from a
-        // validated pointer rather than from a variable offset off data.
-        __u32 ihl = (__u32)(ip->ihl & 0xF) * 4;
-        if (ihl < 20)
+        /* Assume standard IPv4 header (no options). Packets with IP options
+         * are extremely rare on DNS traffic — pass them to the kernel.
+         * This avoids adding a scalar variable to a packet pointer, which
+         * the BPF verifier prohibits (r3 += r4 with packet ptr). */
+        __u32 ihl = 20;
+        if ((ip->ihl & 0xF) != 5)
             return XDP_PASS;
         udp = (struct udphdr *)((void *)ip + ihl);
 
