@@ -5,6 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.10] — 2026-05-18
+
+### Changed
+
+- **All release binaries now built with `--features xdp`** — AF/XDP kernel-bypass fast path enabled in every published binary. Previously XDP was opt-in at build time only.
+
+---
+
 ## [0.4.9] — 2026-05-18
 
 ### Changed
