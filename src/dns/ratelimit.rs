@@ -37,6 +37,10 @@ impl RateLimiter {
 
     #[inline]
     pub fn check(&self, ip: IpAddr) -> bool {
+        if self.rps == 0 {
+            return true;
+        }
+
         let now = Instant::now();
 
         let count = self.cleanup_counter.fetch_add(1, Ordering::Relaxed);
