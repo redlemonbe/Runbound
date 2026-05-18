@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.7] — 2026-05-18
+
+### Fixed
+
+- **`rate-limit: 0` now disables rate limiting** (was: refuse every query).
+  When `rate-limit` is set to `0` in `unbound.conf`, the token-bucket `check()`
+  now returns `true` immediately without touching the bucket table. Previously,
+  `rps = 0` produced `burst = 0`, the initial bucket had `tokens = 0`, the
+  refill formula added `(0 × elapsed) / 1000 = 0` tokens, and every query was
+  answered `REFUSED`.  
+  Startup log now prints `rate limiting disabled (rate-limit: 0)` instead of
+  `rps=0 burst=0`.
+
+---
+
 ## [0.4.6] — 2026-05-18
 
 ### Changed — code quality & performance (senior Rust audit follow-up)
