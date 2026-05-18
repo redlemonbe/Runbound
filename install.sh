@@ -92,6 +92,45 @@ chmod 755 "$TMP_BIN"
 "$TMP_BIN" --version >/dev/null 2>&1 || fail "Downloaded binary failed --version test"
 ok "Binary downloaded: runbound $("$TMP_BIN" --version)"
 
+# ── XDP support detection ─────────────────────────────────────────────────────
+XDP_SUPPORTED=false
+XDP_REASON="unknown hardware"
+
+detect_xdp_support() {
+    # Check if running in a VM
+    if systemd-detect-virt --quiet 2>/dev/null; then
+        XDP_REASON="running in a VM ($(systemd-detect-virt 2>/dev/null)) — XDP copy mode only, disabled by default"
+        return
+    fi
+
+    # Check for Intel XDP-native capable drivers on active interfaces
+    for iface in /sys/class/net/*; do
+        local name driver
+        name=$(basename "$iface")
+        [[ "$name" == "lo" ]] && continue
+        driver=$(readlink "$iface/device/driver" 2>/dev/null | xargs basename 2>/dev/null || true)
+        case "$driver" in
+            ixgbe|ixgbevf|i40e|ice|igc|igb)
+                XDP_SUPPORTED=true
+                XDP_REASON="Intel NIC detected ($name, driver: $driver)"
+                return
+                ;;
+        esac
+    done
+
+    XDP_REASON="no Intel XDP-native NIC detected (found: $(ls /sys/class/net/ | grep -v lo | tr '\n' ' '))"
+}
+
+detect_xdp_support
+
+if $XDP_SUPPORTED; then
+    ok "XDP kernel-bypass supported: $XDP_REASON"
+else
+    warn "XDP kernel-bypass disabled: $XDP_REASON"
+    warn "XDP requires an Intel NIC (ixgbe/i40e/ice/igc) on bare metal."
+    warn "Server will run normally without XDP (SO_REUSEPORT fast path still active)."
+fi
+
 # ── Create user / group ───────────────────────────────────────────────────────
 if ! getent group "$RUN_GROUP" > /dev/null 2>&1; then
     groupadd --system "$RUN_GROUP"
@@ -169,6 +208,44 @@ fi
 
 # ── Write systemd unit ────────────────────────────────────────────────────────
 UNIT_FILE="/etc/systemd/system/runbound.service"
+
+if $XDP_SUPPORTED; then
+cat > "$UNIT_FILE" << UNIT
+[Unit]
+Description=Runbound DNS Server ${VER_TAG}
+Documentation=https://github.com/${REPO}
+After=network-online.target
+Wants=network-online.target
+ConditionFileNotEmpty=${CONFIG_DIR}/runbound.conf
+
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_GROUP}
+EnvironmentFile=-${CONFIG_DIR}/env
+ExecStart=${BINARY_DST} ${CONFIG_DIR}/runbound.conf
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5s
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
+MemoryDenyWriteExecute=false
+# ProtectKernelModules intentionally omitted — required for eBPF program loading
+ReadWritePaths=${CONFIG_DIR} ${DATA_DIR}
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+else
 cat > "$UNIT_FILE" << UNIT
 [Unit]
 Description=Runbound DNS Server ${VER_TAG}
@@ -195,12 +272,20 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+# XDP kernel-bypass is compiled in but disabled on this hardware.
+# To enable on Intel bare metal NICs (ixgbe/i40e/ice), see:
+# https://github.com/redlemonbe/Runbound/blob/main/docs/xdp.md
 ReadWritePaths=${CONFIG_DIR} ${DATA_DIR}
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+fi
+
 chmod 644 "$UNIT_FILE"
 ok "Systemd unit installed: $UNIT_FILE"
 
@@ -230,6 +315,11 @@ if systemctl is-active --quiet runbound; then
     echo " Config:   $DEFAULT_CONF"
     echo " Logs:     journalctl -u runbound -f"
     echo " Reload:   systemctl reload runbound"
+    if $XDP_SUPPORTED; then
+    echo " XDP:      kernel-bypass active ($(ip route 2>/dev/null | awk '/default/{print $5; exit}'))"
+    else
+    echo " XDP:      disabled (requires Intel bare metal NIC — see docs/xdp.md)"
+    fi
     echo " Health:   curl -H 'Authorization: Bearer \$RUNBOUND_API_KEY' http://127.0.0.1:8081/health"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 else
