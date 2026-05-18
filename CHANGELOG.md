@@ -7,65 +7,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [0.4.14] — 2026-05-18
 
-### Fixed
+### Added
 
-- **Removed dead `setrlimit(RLIMIT_MEMLOCK)` call in `worker.rs`**: systemd enforces
-  its own limit before process startup and `setrlimit` cannot exceed it without
-  `CAP_SYS_RESOURCE`. The correct fix is `LimitMEMLOCK=infinity` in the service
-  file, which was already present since v0.4.13.
-
----
-
-## [0.4.13] — 2026-05-18
+- **XDP kernel-bypass fast path** — AF_XDP enabled in all published binaries.
+  Local-zone queries answered at NIC driver level, bypassing the kernel network
+  stack entirely. Validated on virtio (Proxmox VM) and designed for Intel bare
+  metal NICs (ixgbe/i40e/ice/igc).
 
 ### Fixed
 
-- **XDP crash on UMEM allocation** (`XDP_UMEM_REG failed: No buffer space available`):
-  the default locked-memory limit (~64 KB) is insufficient for AF_XDP UMEM rings.
-  Runbound now raises `RLIMIT_MEMLOCK` to infinity before allocating UMEM sockets.
-  `LimitMEMLOCK=infinity` added to `runbound.service` and `install.sh` as belt-and-suspenders.
+- `LimitMEMLOCK=infinity` added to `runbound.service` and `install.sh` —
+  required for AF_XDP UMEM allocation under systemd sandboxing.
+- eBPF XDP program rewritten to use constant IHL=20 assumption — eliminates
+  BPF verifier rejection (`r3 += r4` prohibited for non-root packet pointers).
+  Packets with IP options are passed via `XDP_PASS`.
+- XDP errors now produce descriptive `WARN` messages with actionable hints
+  instead of a generic failure. Process no longer panics on XDP init failure —
+  falls back cleanly to SO_REUSEPORT path.
+- `install.sh` now detects Intel XDP-native NICs and configures the service
+  file accordingly (`AF_XDP`, `CAP_NET_RAW/ADMIN/BPF`, `LimitMEMLOCK`).
 
-- **XDP socket creation panic replaced by clean fallback**: the `expect()` at
-  `worker.rs:74` was crashing the entire process instead of falling back to
-  SO_REUSEPORT. Replaced with `map_err(...)` so XDP failure triggers the normal
-  graceful degradation path.
+### Notes
 
----
-
-## [0.4.12] — 2026-05-18
-
-### Fixed
-
-- **XDP eBPF verifier rejection — instruction 21** (`r3 += r4`): the BPF verifier
-  prohibits adding a scalar variable to a packet pointer even with `CAP_BPF`.
-  Fixed by assuming a standard IPv4 header (IHL = 20, no options); packets with
-  IP options are passed to the kernel via `XDP_PASS`. The UDP offset is now a
-  compile-time constant (14 + 20 = 34), statically provable by the verifier.
-  Validated with `bpftool prog load` on kernel 6.12.
-
----
-
-## [0.4.11] — 2026-05-18
-
-### Fixed
-
-- **XDP eBPF verifier rejection on kernel 6.x** — the BPF verifier rejected the previous
-  `dns_xdp` program because of variable-offset pointer arithmetic passed through an
-  inlined function (`data + udp_off`). Rewritten to use struct-relative arithmetic
-  (`(void *)ip + ihl`, `(struct udphdr *)(ip6 + 1)`) which the verifier can track.
-  Validated with `bpftool prog load` on kernel 6.12.
-
-- **XDP error messages now categorized** — on startup failure, Runbound distinguishes
-  between: verifier rejection, missing capabilities, `AF_XDP` not in `RestrictAddressFamilies`,
-  and unsupported NIC/kernel.
-
----
-
-## [0.4.10] — 2026-05-18
-
-### Changed
-
-- **All release binaries now built with `--features xdp`** — AF/XDP kernel-bypass fast path enabled in every published binary. Previously XDP was opt-in at build time only.
+- Versions v0.4.10–v0.4.13 had progressive XDP issues (missing feature flag,
+  BPF verifier rejection, UMEM allocation failure). v0.4.14 is the first
+  stable XDP release.
 
 ---
 

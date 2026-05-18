@@ -153,6 +153,41 @@ Benchmarks run from a dedicated client machine (never from the DNS server):
 
 ---
 
+## XDP Kernel-Bypass Fast Path
+
+Starting with v0.4.14, Runbound includes an AF_XDP fast path enabled in all
+published binaries. Local-zone DNS queries are handled at the NIC driver level,
+bypassing the Linux kernel network stack entirely.
+
+**Measured latency (local zones):**
+| Path | Latency |
+|---|---|
+| XDP fast path (local zone) | **0 ms** |
+| Normal path (forwarded/recursive) | 15–20 ms |
+
+**How it works:**
+- An eBPF XDP program is attached to the NIC at startup
+- UDP/port-53 packets for local zones are answered in user space — zero syscalls on the hot path
+- All other queries (recursive, forwarded, unknown names) pass through to the normal hickory-server path via `XDP_PASS`
+- One worker thread per NIC RX queue, sharing rate-limiter and ACL with the normal path
+
+**Requirements:**
+- Linux kernel 5.10+ (6.x recommended)
+- `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF` (configured automatically by `install.sh`)
+- `LimitMEMLOCK=infinity` in the systemd service (configured automatically by `install.sh`)
+
+**Verify XDP is active:**
+```bash
+journalctl -u runbound | grep XDP
+# INFO runbound: XDP kernel-bypass fast path active iface=eth0
+```
+
+Works on VMs (virtio, copy mode) and bare metal Intel NICs (ixgbe/i40e/ice/igc, native zero-copy).
+
+> Full details: [docs/xdp.md](docs/xdp.md)
+
+---
+
 ## Downloads
 
 | Platform | Build | Asset name |
