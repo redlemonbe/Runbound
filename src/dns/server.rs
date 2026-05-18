@@ -788,7 +788,11 @@ pub async fn run_dns_server(
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
-    info!(rps, burst = rps * 2, "DNS rate limiter configured");
+    if rps == 0 {
+        info!("rate limiting disabled (rate-limit: 0)");
+    } else {
+        info!(rps, burst = rps * 2, "DNS rate limiter configured");
+    }
 
     let resolver = Arc::new(ArcSwap::new(Arc::new(build_resolver(cfg)?)));
 
