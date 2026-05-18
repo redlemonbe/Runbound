@@ -64,15 +64,20 @@ pub fn start_xdp(
 
     let mut handle = XdpHandle::load(iface)?;
 
+    // AF_XDP UMEM requires locked memory — raise the limit before allocating.
+    // Default systemd/kernel limit (~64 KB) is insufficient for UMEM rings.
+    unsafe {
+        let rl = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
+        libc::setrlimit(libc::RLIMIT_MEMLOCK, &rl);
+    }
+
     let queue_count = get_rx_queue_count(iface).max(1);
     tracing::info!(iface = %iface, queues = queue_count, "Starting XDP workers");
 
     for q in 0..queue_count {
         let sock = unsafe { create_xsk_socket(ifidx, q, true) }
-            .unwrap_or_else(|_| unsafe {
-                create_xsk_socket(ifidx, q, false)
-                    .expect("AF_XDP socket creation failed even in copy mode")
-            });
+            .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false) })
+            .map_err(|e| format!("AF_XDP socket creation failed: {e}"))?;
 
         handle.register_socket(q, sock.fd)?;
 

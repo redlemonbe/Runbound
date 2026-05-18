@@ -82,6 +82,8 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
 MemoryMax=512M
 # File descriptors: 32 SO_REUSEPORT UDP sockets + TCP + DoT + feeds HTTP
 LimitNOFILE=65536
+# AF_XDP UMEM requires locked memory — default limit (~64 KB) is insufficient
+LimitMEMLOCK=infinity
 # Tokio thread pool + hickory tasks
 TasksMax=4096
 
