@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.14] — 2026-05-18
+
+### Fixed
+
+- **Removed dead `setrlimit(RLIMIT_MEMLOCK)` call in `worker.rs`**: systemd enforces
+  its own limit before process startup and `setrlimit` cannot exceed it without
+  `CAP_SYS_RESOURCE`. The correct fix is `LimitMEMLOCK=infinity` in the service
+  file, which was already present since v0.4.13.
+
+---
+
 ## [0.4.13] — 2026-05-18
 
 ### Fixed
