@@ -99,7 +99,19 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
             Some(ref iface_name) => {
                 match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl)) {
                     Ok(h)  => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); Some(h) }
-                    Err(e) => { tracing::warn!("XDP not available (continuing without): {e}"); None }
+                    Err(e) => {
+                        let reason = if e.contains("BPF_PROG_LOAD") {
+                            "eBPF program rejected by kernel verifier"
+                        } else if e.contains("Operation not permitted") || e.contains("EPERM") {
+                            "missing CAP_NET_ADMIN/CAP_BPF (add to systemd service)"
+                        } else if e.contains("AF_XDP") {
+                            "AF_XDP not allowed (add AF_XDP to RestrictAddressFamilies in service)"
+                        } else {
+                            "NIC or kernel does not support AF_XDP"
+                        };
+                        tracing::warn!("XDP disabled: {} — error: {}", reason, e);
+                        None
+                    }
                 }
             }
             None => { tracing::warn!("XDP: could not determine network interface; fast path disabled"); None }
