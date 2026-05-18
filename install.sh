@@ -241,6 +241,7 @@ MemoryDenyWriteExecute=false
 # ProtectKernelModules intentionally omitted — required for eBPF program loading
 ReadWritePaths=${CONFIG_DIR} ${DATA_DIR}
 LimitNOFILE=65536
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
@@ -280,6 +281,7 @@ MemoryDenyWriteExecute=true
 # https://github.com/redlemonbe/Runbound/blob/main/docs/xdp.md
 ReadWritePaths=${CONFIG_DIR} ${DATA_DIR}
 LimitNOFILE=65536
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target

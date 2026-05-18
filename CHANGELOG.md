@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.13] — 2026-05-18
+
+### Fixed
+
+- **XDP crash on UMEM allocation** (`XDP_UMEM_REG failed: No buffer space available`):
+  the default locked-memory limit (~64 KB) is insufficient for AF_XDP UMEM rings.
+  Runbound now raises `RLIMIT_MEMLOCK` to infinity before allocating UMEM sockets.
+  `LimitMEMLOCK=infinity` added to `runbound.service` and `install.sh` as belt-and-suspenders.
+
+- **XDP socket creation panic replaced by clean fallback**: the `expect()` at
+  `worker.rs:74` was crashing the entire process instead of falling back to
+  SO_REUSEPORT. Replaced with `map_err(...)` so XDP failure triggers the normal
+  graceful degradation path.
+
+---
+
 ## [0.4.12] — 2026-05-18
 
 ### Fixed
