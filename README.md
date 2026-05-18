@@ -248,6 +248,8 @@ Copyright (C) 2024-2026 RedLemonBe
 
 ## Development methodology
 
+> How this project was built — and why: [METHODOLOGY.md](METHODOLOGY.md)
+
 Runbound's security posture is reinforced using AI-assisted tooling at every release:
 
 - **Security audit** — white-box code review covering SSRF, injection, timing attacks, DoS vectors, and RFC compliance (see [`docs/security-audit.md`](docs/security-audit.md))
