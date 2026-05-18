@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.8] — 2026-05-18
+
+### Added
+
+- **CPU affinity for tokio worker threads** (`cpu-affinity: yes/no`, default `yes`).
+  Each tokio worker is pinned to a distinct physical core, HyperThreading siblings excluded.
+  Reduces cache thrashing and improves tail latency consistency at high QPS.
+  Startup log reports the number of pinned cores.
+  Silent fallback when `/sys` is unavailable (containers, non-Linux).
+
+---
+
 ## [0.4.7] — 2026-05-18
 
 ### Fixed

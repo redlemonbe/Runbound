@@ -125,6 +125,11 @@ pub struct UnboundConfig {
     pub hsm_api_key_label: Option<String>,
     /// Label of the CKO_SECRET_KEY object used as the JSON store HMAC key.
     pub hsm_store_key_label: Option<String>,
+
+    // ── Performance ───────────────────────────────────────────────────────────
+    /// Pin each tokio worker thread to a distinct physical core (HT excluded).
+    /// Default: true. Set to `no` to disable (e.g. in containers without CAP_SYS_NICE).
+    pub cpu_affinity: bool,
 }
 
 impl UnboundConfig {
@@ -140,6 +145,7 @@ impl UnboundConfig {
             sync_interval: 30,
             log_retention: 1000,
             log_client_ip: true,
+            cpu_affinity:  true,
             ..Default::default()
         }
     }
@@ -321,6 +327,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         }
         "hsm-api-key-label"   => cfg.hsm_api_key_label   = Some(val.trim_matches('"').to_string()),
         "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
+        "cpu-affinity"        => cfg.cpu_affinity        = val.trim_matches('"') != "no",
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"

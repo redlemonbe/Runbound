@@ -3,6 +3,7 @@
 mod acme;
 mod audit;
 mod config;
+mod cpu;
 mod dns;
 mod api;
 mod feeds;
@@ -21,6 +22,7 @@ mod upstreams;
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use tracing::{error, info};
@@ -33,8 +35,7 @@ use stats::Stats;
 
 const API_BIND: &str = "127.0.0.1"; // API must not be exposed externally
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if handle_cli_flags(&args)? {
@@ -43,6 +44,39 @@ async fn main() -> Result<()> {
 
     let (cfg, base_dir, cfg_path) = init_runtime(&args)?;
 
+    // ── Tokio runtime with optional CPU affinity ──────────────────────────
+    // init_runtime() has already installed the tracing subscriber, so info!()
+    // works here without a running async runtime.
+    let cores = cpu::physical_cores();
+    let core_count = cores.len();
+
+    let runtime = if cfg.cpu_affinity && !cores.is_empty() {
+        info!(cores = core_count, "CPU affinity enabled — physical cores (HT excluded)");
+        let cores_arc = Arc::new(cores);
+        let thread_index = Arc::new(AtomicUsize::new(0));
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(core_count)
+            .on_thread_start(move || {
+                let idx = thread_index.fetch_add(1, Ordering::Relaxed) % core_count;
+                cpu::pin_to_cpu(cores_arc[idx]);
+            })
+            .enable_all()
+            .build()?
+    } else {
+        if cfg.cpu_affinity {
+            info!("CPU affinity disabled (fallback: /sys unavailable)");
+        } else {
+            info!("CPU affinity disabled (cpu-affinity: no)");
+        }
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+    };
+
+    runtime.block_on(async_main(cfg, base_dir, cfg_path))
+}
+
+async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: String) -> Result<()> {
     let (zones, rate_limiter, acl, global_stats, log_buffer, audit) =
         build_and_launch(&cfg, base_dir, cfg_path).await?;
 
