@@ -1,6 +1,6 @@
 # Runbound
 
-**Drop-in Unbound replacement — with a REST API and 80,000 q/s.**
+**Drop-in Unbound replacement — REST API, linear scaling, and no restart ever.**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial License](https://img.shields.io/badge/license-commercial-green.svg)](COMMERCIAL_LICENSE.md)
 [![GitHub release](https://img.shields.io/github/v/release/redlemonbe/Runbound)](https://github.com/redlemonbe/Runbound/releases/latest)
@@ -37,8 +37,10 @@ Your existing `unbound.conf` works as-is. Zero migration.
 | API key rotation (no restart) | ❌ | ❌ | ✅ `POST /rotate-key` |
 | Hot config reload | ✅ rndc reload | ❌ | ✅ API |
 | AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ optional |
+| Linear scaling (SO_REUSEPORT, no lock contention) | ❌ | ❌ | ✅ built-in |
+| CPU affinity — physical cores only (HT excluded)  | ❌ | ❌ | ✅ automatic |
+| Adaptive DNS cache (auto-sized from available RAM) | ❌ | ❌ | ✅ built-in |
 | Static binary (no dependencies) | ❌ | ❌ | ✅ musl builds |
-| Throughput (recursive) | ~40k q/s | ~50k q/s | **~80k q/s** |
 
 ---
 
@@ -47,14 +49,14 @@ Your existing `unbound.conf` works as-is. Zero migration.
 ```bash
 # 1 — Download the static binary (no dependencies)
 #     Replace vX.Y.Z with the latest version tag from the releases page
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.4.5-x86_64-linux-musl
-chmod +x runbound-v0.4.5-x86_64-linux-musl
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-vX.Y.Z-x86_64-linux-musl
+chmod +x runbound-vX.Y.Z-x86_64-linux-musl
 
 # 2 — One-liner install (downloads automatically, sets up systemd):
 #     sudo bash <(curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh)
 
 # 3 — Or point it at your existing Unbound config
-sudo ./runbound-v0.4.5-x86_64-linux-musl /etc/unbound/unbound.conf
+sudo ./runbound-vX.Y.Z-x86_64-linux-musl /etc/unbound/unbound.conf
 
 # 4 — Test it
 dig @127.0.0.1 google.com
@@ -64,7 +66,7 @@ DNS live on **port 53**. REST API live on **port 8081** (localhost only, require
 
 The REST API port is configurable with `api-port: 9090` in `runbound.conf`. See the [Configuration Reference](docs/configuration.md#api-key-and-port).
 
-> Raspberry Pi or ARM server? Grab `runbound-v0.4.5-aarch64-linux-musl` instead.
+> Raspberry Pi or ARM server? Grab `runbound-vX.Y.Z-aarch64-linux-musl` instead.
 
 ---
 
@@ -100,16 +102,52 @@ curl -s "$API/stats" -H "Authorization: Bearer $TOKEN"
 
 ## Performance
 
-Measured on a 4-core VPS (KVM, 8 GB RAM) with [dnsperf](https://www.dns-oarc.net/tools/dnsperf):
+### Linear scaling — the key architectural difference
 
-| Scenario | Throughput | Avg latency |
-|---|---|---|
-| Local zone — 1 client | **82,000 q/s** | 83 ms |
-| Local zone — 8 clients | **75,000 q/s** | ~1 s (server saturated) |
-| Forwarding (Cloudflare) | network-bound | < 5 ms |
-| AF/XDP (bare metal, DRV mode) | **500k – 1M+ q/s** | < 1 ms |
+BIND9 and Unbound use shared caches protected by locks.
+Beyond 8–16 cores, contention grows and throughput plateaus.
 
-→ Full methodology and raw results: [docs/performance.md](docs/performance.md)
+Runbound is built differently:
+
+- **SO_REUSEPORT** — one UDP socket per physical core, kernel-distributed.
+  Zero userspace lock on the receive path.
+- **ArcSwap zone trie** — readers take a lock-free snapshot.
+  Any number of cores can read simultaneously with no contention.
+- **CPU affinity** — each worker thread is pinned to a physical core,
+  HyperThreading siblings excluded. Enabled automatically at startup:
+  `CPU affinity enabled — physical cores (HT excluded) cores=N`
+- **Adaptive cache** — cache size is computed from `/proc/meminfo` at
+  startup and adjusts automatically under memory pressure.
+  `cache size auto-sized from MemAvailable cache_size=N`
+
+Result: Runbound scales **linearly with core count** where
+BIND9 and Unbound plateau.
+
+```
+QPS
+│                                        Runbound  /
+│                                               /
+│                                            /
+│                          BIND9 / Unbound /
+│                     ................/
+│               _____/                 /
+│          __/                    /
+│___/                      /
+└─────────────────────────────────▶ cores
+  2    8    16   32   64
+```
+
+### Measured throughput
+
+Benchmarks run from a dedicated client machine (never from the DNS server):
+
+| Hardware | Tool | Throughput | Notes |
+|---|---|---|---|
+| 4-core KVM, 8 GB | dnsmark | ~16 000 q/s | 2 vCPU allocated to Runbound |
+| Bare metal 40c, 256 GB | dnsmark | pending | T640 — results coming |
+| AF/XDP bare metal | dnsmark | 500k – 1M+ q/s | kernel-bypass, Intel NICs |
+
+> Full methodology: [docs/performance.md](docs/performance.md)
 
 ---
 
