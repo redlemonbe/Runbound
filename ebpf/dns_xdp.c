@@ -25,27 +25,6 @@ struct {
     __type(value, __u32);
 } XSKS SEC(".maps");
 
-// Inline helper — check UDP dest port and redirect.
-// Offset is the byte offset of the UDP header from the start of the frame.
-static __always_inline int redirect_dns_udp(struct xdp_md *ctx, __u32 udp_off)
-{
-    void *data_end = (void *)(long)ctx->data_end;
-    void *data     = (void *)(long)ctx->data;
-    struct udphdr *udp = data + udp_off;
-
-    // Bounds check required by the BPF verifier
-    if ((void *)(udp + 1) > data_end)
-        return XDP_PASS;
-
-    if (udp->dest != bpf_htons(53))
-        return XDP_PASS;
-
-    // Redirect to the AF_XDP socket registered for this NIC queue.
-    // XDP_PASS fallback: if queue not yet registered (e.g. during startup)
-    // the packet falls to the normal kernel socket.
-    return bpf_redirect_map(&XSKS, ctx->rx_queue_index, XDP_PASS);
-}
-
 SEC("xdp")
 int dns_xdp(struct xdp_md *ctx)
 {
@@ -58,32 +37,46 @@ int dns_xdp(struct xdp_md *ctx)
 
     __u16 eth_proto = bpf_ntohs(eth->h_proto);
 
-    // IPv4 — variable-length IP header (IHL field)
+    struct udphdr *udp;
+
     if (eth_proto == ETH_P_IP) {
         struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
         if (ip->protocol != IPPROTO_UDP)
             return XDP_PASS;
-        __u32 ihl = ip->ihl * 4;
-        // Sanity-check IHL (must be ≥ 20 bytes, ≤ 60 bytes)
-        if (ihl < 20 || ihl > 60)
+        // Mask to 4-bit field before scaling — constrains range to [0,15]*4=[0,60].
+        // Using ip-relative arithmetic so the verifier can track bounds from a
+        // validated pointer rather than from a variable offset off data.
+        __u32 ihl = (__u32)(ip->ihl & 0xF) * 4;
+        if (ihl < 20)
             return XDP_PASS;
-        return redirect_dns_udp(ctx, sizeof(struct ethhdr) + ihl);
-    }
+        udp = (struct udphdr *)((void *)ip + ihl);
 
-    // IPv6 — fixed 40-byte header (no options for UDP; extension headers skipped)
-    if (eth_proto == ETH_P_IPV6) {
+    } else if (eth_proto == ETH_P_IPV6) {
         struct ipv6hdr *ip6 = (void *)(eth + 1);
         if ((void *)(ip6 + 1) > data_end)
             return XDP_PASS;
         if (ip6->nexthdr != IPPROTO_UDP)
             return XDP_PASS;
-        return redirect_dns_udp(ctx,
-            sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
+        // Fixed 40-byte IPv6 header — direct struct pointer arithmetic.
+        udp = (struct udphdr *)(ip6 + 1);
+
+    } else {
+        return XDP_PASS;
     }
 
-    return XDP_PASS;
+    // Bounds check required by the BPF verifier
+    if ((void *)(udp + 1) > data_end)
+        return XDP_PASS;
+
+    if (udp->dest != bpf_htons(53))
+        return XDP_PASS;
+
+    // Redirect to the AF_XDP socket registered for this NIC queue.
+    // XDP_PASS fallback: if queue not yet registered (e.g. during startup)
+    // the packet falls to the normal kernel socket.
+    return bpf_redirect_map(&XSKS, ctx->rx_queue_index, XDP_PASS);
 }
 
 char _license[] SEC("license") = "GPL";

@@ -5,6 +5,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.11] — 2026-05-18
+
+### Fixed
+
+- **XDP eBPF verifier rejection on kernel 6.x** — the BPF verifier rejected the previous
+  `dns_xdp` program because of variable-offset pointer arithmetic passed through an
+  inlined function (`data + udp_off`). Rewritten to use struct-relative arithmetic
+  (`(void *)ip + ihl`, `(struct udphdr *)(ip6 + 1)`) which the verifier can track.
+  Validated with `bpftool prog load` on kernel 6.12.
+
+- **XDP error messages now categorized** — on startup failure, Runbound distinguishes
+  between: verifier rejection, missing capabilities, `AF_XDP` not in `RestrictAddressFamilies`,
+  and unsupported NIC/kernel.
+
+---
+
 ## [0.4.10] — 2026-05-18
 
 ### Changed
