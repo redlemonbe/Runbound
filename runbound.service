@@ -41,7 +41,9 @@ ReadWritePaths=/etc/runbound /var/lib/runbound
 
 # Kernel hardening
 ProtectKernelTunables=true
-ProtectKernelModules=true
+# eBPF program loading requires kernel module access — disabled for XDP.
+# Re-enable (=true) if not using XDP.
+ProtectKernelModules=false
 ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
@@ -52,12 +54,13 @@ RestrictNamespaces=true
 LockPersonality=true
 
 # Syscall filter — DNS server only needs inet sockets and file I/O
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# No memory regions executable + writable simultaneously
-MemoryDenyWriteExecute=true
+# eBPF JIT requires executable memory — disable this guard when XDP is active.
+# Re-enable (=true) if not using XDP.
+MemoryDenyWriteExecute=false
 
 # No realtime scheduling (unnecessary, prevents priority inversion attacks)
 RestrictRealtime=true
@@ -68,8 +71,10 @@ RemoveIPC=true
 
 # ── Capabilities ─────────────────────────────────────────────────────────────
 # CAP_NET_BIND_SERVICE: bind to port 53 (< 1024) as non-root
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CAP_NET_RAW + CAP_NET_ADMIN + CAP_BPF: required for AF_XDP kernel-bypass
+# Remove the XDP caps if not using bare metal Intel NICs (ixgbe/i40e/ice/igc)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
 
 # ── Resource limits ──────────────────────────────────────────────────────────
 # 512 MB hard cap — the memory guard already purges caches at 80 % system RAM,

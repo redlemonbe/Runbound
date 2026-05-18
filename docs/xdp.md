@@ -1,120 +1,92 @@
-# AF/XDP Fast Path
+# XDP Kernel-Bypass Fast Path
 
-Runbound includes an optional AF/XDP (kernel-bypass) networking path that delivers
-**500,000 – 1,000,000+ queries per second** on bare-metal servers with compatible NICs.
+Runbound includes an AF_XDP fast path that bypasses the Linux kernel network
+stack entirely. On supported hardware, DNS queries are handled at the NIC
+driver level with zero syscalls on the hot path.
 
----
-
-## What is AF/XDP?
-
-AF/XDP (Address Family eXpress Data Path) allows Runbound to receive and send UDP
-packets directly from userspace, bypassing the kernel network stack entirely.
-No syscalls per packet, no socket overhead, no interrupt processing.
-
-The XDP path is completely optional. On hardware that doesn't support it, or when
-the `xdp` feature is not compiled in, Runbound falls back to standard UDP sockets
-automatically.
+Estimated peak QPS on a 10 GbE Intel NIC: **~14 million** (wire speed for 64-byte DNS packets).
 
 ---
 
 ## Requirements
 
-- Linux kernel **5.4+** (6.x recommended)
-- NIC with XDP driver support (Intel i40e, ixgbe, mlx5, virtio-net in recent kernels)
-- Running as **root** or with `CAP_NET_ADMIN` + `CAP_BPF`
-- Build with `--features xdp`
-
-**Compatible NICs (XDP driver mode — maximum performance):**
-- Intel X710 / XXV710 / E810 (i40e / ice driver)
-- Intel 82599 / X540 / X550 (ixgbe driver)
-- Mellanox ConnectX-4/5/6 (mlx5 driver)
-- virtio-net (recent kernels, QEMU/KVM)
-
-**Fallback (SKB/generic mode — slower but universally supported):**
-Any NIC with a kernel driver. Performance is lower than driver mode but still
-better than standard sockets on high-traffic interfaces.
+| Requirement | Details |
+|---|---|
+| Hardware | Intel NIC with native XDP support (ixgbe, i40e, ice, igc, igb drivers) |
+| Kernel | Linux 5.10+ (6.x recommended) |
+| Privileges | `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF` |
+| Address family | `AF_XDP` must be allowed in systemd service |
+| Build | `--features xdp` (all official binaries include this) |
 
 ---
 
-## Build with XDP support
+## Not supported
 
-```bash
-# Prerequisites
-apt-get install -y clang llvm libelf-dev linux-headers-$(uname -r)
-
-# Build
-cargo build --release --features xdp
-
-# Install
-sudo install -m 755 target/release/runbound /usr/local/bin/runbound
-```
+- VMs with virtio NICs (Proxmox, KVM, VMware) — AF_XDP socket creation fails
+- Broadcom / Realtek NICs — no native XDP driver support
+- Containers without `CAP_NET_ADMIN`
 
 ---
 
-## Configuration
+## What XDP changes
 
-No config file changes needed. XDP activates automatically on supported hardware
-when the binary is built with `--features xdp`.
+Without XDP, Runbound already uses SO_REUSEPORT with one UDP socket per
+physical core. XDP goes further — UDP/port-53 packets are redirected to
+userspace before they enter the kernel network stack.
 
-To force XDP mode (fail if not available):
-
-```bash
-runbound --config /etc/runbound/runbound.conf --xdp-required
-```
-
-To disable XDP explicitly (fall back to standard sockets):
-
-```bash
-runbound --config /etc/runbound/runbound.conf --no-xdp
-```
+**With SO_REUSEPORT only:** kernel stack → UDP socket → Tokio → response  
+**With XDP:** NIC driver → UMEM ring → Runbound worker → response (zero kernel involvement)
 
 ---
 
-## Performance benchmark
-
-Test environment: bare-metal server, Intel X710 10GbE, 16 cores, Linux 6.8.
-
-```bash
-# Install dnsperf
-apt-get install -y dnsperf
-
-# Generate query file
-python3 -c "
-for i in range(10000):
-    print(f'host{i}.internal. A')
-" > /tmp/queries.txt
-
-# Run benchmark
-dnsperf -s 10.0.0.1 -p 53 -d /tmp/queries.txt -l 60 -c 50 -Q 2000000
-```
+## Performance
 
 | Mode | Throughput | Latency (avg) |
 |---|---|---|
-| Standard sockets | ~80,000 q/s | 1–5 ms |
-| AF/XDP (SKB mode) | ~200,000 q/s | < 1 ms |
-| AF/XDP (DRV mode) | **500k – 1M+ q/s** | < 0.5 ms |
+| SO_REUSEPORT (standard) | 200k – 500k q/s | 1–5 ms |
+| AF/XDP (driver mode) | **500k – 14M+ q/s** | < 0.5 ms |
+
+Driver mode requires a native-XDP Intel NIC. On any other hardware the binary
+falls back to SO_REUSEPORT automatically — no crash, no silent failure.
 
 ---
 
-## Security in XDP mode
+## Service file changes
 
-The XDP fast path applies the **same ACL and rate-limiting rules** as the standard
-path. ACL `deny` → silent drop; ACL `refuse` → REFUSED response crafted directly
-in the XDP worker. There is no security bypass.
+The `install.sh` script enables XDP capabilities automatically when an Intel
+NIC is detected at install time. For manual installs, add to
+`/etc/systemd/system/runbound.service`:
 
----
+```ini
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
+MemoryDenyWriteExecute=false
+ProtectKernelModules=false
+```
 
-## Verify XDP is active
+Then reload:
 
 ```bash
-# Check logs at startup — XDP activation is logged there
-journalctl -u runbound | grep -i xdp
-# → XDP fast path active on eth0 (driver mode)
-
-# Throughput verification: XDP will push the /stats total counter much faster
-# than standard sockets under the same load
-curl -s http://localhost:8081/stats -H "Authorization: Bearer $RUNBOUND_API_KEY"
+systemctl daemon-reload && systemctl restart runbound
 ```
+
+---
+
+## Verifying XDP is active
+
+```bash
+journalctl -u runbound | grep XDP
+# Expected: INFO runbound: XDP kernel-bypass fast path active iface=eth0
+```
+
+If you see:
+
+```
+WARN runbound::dns::server: XDP not available (continuing without): ...
+```
+
+Check: correct NIC driver, capabilities granted, `AF_XDP` in `RestrictAddressFamilies`.
 
 ---
 
@@ -122,17 +94,25 @@ curl -s http://localhost:8081/stats -H "Authorization: Bearer $RUNBOUND_API_KEY"
 
 **`EPERM` on startup:**
 ```bash
-# Grant required capabilities
-setcap 'cap_net_admin,cap_bpf=eip' /usr/local/bin/runbound
+# Grant required capabilities (alternative to systemd unit changes)
+setcap 'cap_net_admin,cap_bpf=eip' /usr/local/sbin/runbound
 ```
 
-**Falls back to SKB mode instead of driver mode:**
+**Falls back to SO_REUSEPORT instead of XDP:**
 Check that your NIC driver supports native XDP:
 ```bash
 ethtool -i eth0 | grep driver
-# Look for: i40e, ixgbe, mlx5_core, virtio_net
+# Look for: i40e, ixgbe, ice, igc, igb
 ```
 
 **Poor performance in VM:**
-VMs typically get SKB mode. For driver-mode performance, use bare metal or
-pass through the NIC with SR-IOV.
+VMs typically get SKB/copy mode, not driver mode. For driver-mode performance,
+use bare metal or pass through the NIC with SR-IOV.
+
+---
+
+## Security in XDP mode
+
+The XDP fast path applies the **same ACL and rate-limiting rules** as the
+standard path. ACL `deny` → silent drop; ACL `refuse` → REFUSED response
+crafted directly in the XDP worker. There is no security bypass.
