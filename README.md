@@ -2,6 +2,8 @@
 
 **Drop-in Unbound replacement — REST API, linear scaling, and no restart ever.**
 
+*Built just for fun — because reconfiguring Unbound by hand every week gets old.*
+
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial License](https://img.shields.io/badge/license-commercial-green.svg)](COMMERCIAL_LICENSE.md)
 [![GitHub release](https://img.shields.io/github/v/release/redlemonbe/Runbound)](https://github.com/redlemonbe/Runbound/releases/latest)
 [![cargo audit](https://img.shields.io/badge/cargo_audit-clean-brightgreen.svg)](docs/audit.md) [![SBOM](https://img.shields.io/badge/SBOM-CycloneDX_1.4-blue.svg)](https://github.com/redlemonbe/Runbound/releases/latest)
