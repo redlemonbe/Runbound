@@ -24,6 +24,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
+    rr::LowerName,
     serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
 };
 
@@ -326,10 +327,10 @@ fn answer_dns(
         Ok(m) => m,
         Err(_) => return false,
     };
-    if msg.message_type() != MessageType::Query { return false; }
-    if msg.op_code() != OpCode::Query { return false; }
+    if msg.message_type != MessageType::Query { return false; }
+    if msg.op_code != OpCode::Query { return false; }
 
-    let q = match msg.queries().first() {
+    let q = match msg.queries.first() {
         Some(q) => q,
         None    => return false,
     };
@@ -343,12 +344,9 @@ fn answer_dns(
             AclAction::Deny   => return false, // silent drop — no response
             AclAction::Refuse => {
                 // Craft a minimal REFUSED response and send it.
-                let mut refused = Message::new();
-                refused.set_id(msg.id());
-                refused.set_message_type(MessageType::Response);
-                refused.set_op_code(OpCode::Query);
-                refused.set_response_code(ResponseCode::Refused);
-                refused.set_recursion_desired(msg.recursion_desired());
+                let mut refused = Message::new(msg.id, MessageType::Response, OpCode::Query);
+                refused.metadata.response_code = ResponseCode::Refused;
+                refused.metadata.recursion_desired = msg.recursion_desired;
                 refused.add_query(q.clone());
                 let mut enc = BinEncoder::new(out);
                 return refused.emit(&mut enc).is_ok();
@@ -356,42 +354,39 @@ fn answer_dns(
         }
     }
 
-    let name  = q.name();
+    let name  = LowerName::from(q.name());
     let rtype = q.query_type();
 
     // ANY queries go to the normal server (which returns NOTIMP per RFC 8482)
     if rtype == hickory_proto::rr::RecordType::ANY { return false; }
 
-    let mut resp = Message::new();
-    resp.set_id(msg.id());
-    resp.set_message_type(MessageType::Response);
-    resp.set_op_code(OpCode::Query);
-    resp.set_recursion_desired(msg.recursion_desired());
-    resp.set_recursion_available(false);
+    let mut resp = Message::new(msg.id, MessageType::Response, OpCode::Query);
+    resp.metadata.recursion_desired = msg.recursion_desired;
+    resp.metadata.recursion_available = false;
     resp.add_query(q.clone());
 
-    match zones.find(name) {
+    match zones.find(&name) {
         Some(ZoneAction::Refuse) => {
-            resp.set_response_code(ResponseCode::Refused);
-            resp.set_authoritative(false);
+            resp.metadata.response_code = ResponseCode::Refused;
+            resp.metadata.authoritative = false;
         }
         Some(ZoneAction::NxDomain) => {
-            resp.set_response_code(ResponseCode::NXDomain);
-            resp.set_authoritative(true);
+            resp.metadata.response_code = ResponseCode::NXDomain;
+            resp.metadata.authoritative = true;
         }
         Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
-            resp.set_authoritative(true);
-            let records = zones.local_records(name, rtype);
+            resp.metadata.authoritative = true;
+            let records = zones.local_records(&name, rtype);
             if !records.is_empty() {
-                resp.set_response_code(ResponseCode::NoError);
+                resp.metadata.response_code = ResponseCode::NoError;
                 for r in records {
                     resp.add_answer(r.clone());
                 }
-            } else if zones.name_has_records(name) {
+            } else if zones.name_has_records(&name) {
                 // NODATA — name exists, wrong type (RFC 2308)
-                resp.set_response_code(ResponseCode::NoError);
+                resp.metadata.response_code = ResponseCode::NoError;
             } else {
-                resp.set_response_code(ResponseCode::NXDomain);
+                resp.metadata.response_code = ResponseCode::NXDomain;
             }
         }
         // Name not in any local zone — forward to kernel / hickory-server
