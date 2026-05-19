@@ -7,6 +7,84 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased] — next: 0.5
 
+### Performance
+
+- **TTL-cap clone eliminated on the common path** (`src/dns/server.rs`) — the upstream
+  resolver response was previously cloned unconditionally into a `Vec<Record>` so that
+  individual TTLs could be capped to `cache-max-ttl`. The path now performs a single
+  `any()` scan first; when no record exceeds the cap (the common case), the original
+  borrowed slice is used directly and no allocation occurs.  A clone is still performed
+  when at least one TTL actually needs rewriting.
+
+- **`sanitize_dns_name` hot-path allocation removed at verbosity 1** (`src/dns/server.rs`,
+  `src/logbuffer.rs`) — the DNS name was sanitized and converted to a `String` on every
+  query to feed both the log-buffer ring and the `info!` tracing macro.  At `verbosity: 1`
+  (warn) the `info!` macro is a no-op, and the ring buffer may also be disabled
+  (`log-retention: 0`).  The sanitise+push block is now guarded by
+  `log_buffer.is_enabled() || tracing::enabled!(INFO)`: when both are false the
+  `name.to_string()` allocation is skipped entirely.  `ShardedLogBuffer` exposes a new
+  `is_enabled() -> bool` method backed by a `total_capacity: usize` field set at
+  construction — zero-cost to read on the hot path.
+
+- **Rate-limiter GC contention eliminated** (`src/dns/ratelimit.rs`) — the periodic
+  `DashMap::retain()` cleanup was triggered by a shared `AtomicU64` counter incremented
+  on every query (`fetch_add(Relaxed)`).  Under high QPS with many threads, all cores
+  write to the same counter, causing cache-line bouncing.  The counter is replaced by a
+  time-based `next_gc_ns: AtomicU64` (nanoseconds since `RateLimiter::start`).  The hot
+  path now performs a single `load(Relaxed)` (read-only, stays in shared cache state
+  across all cores) followed by a branch that is almost always not-taken.  One thread per
+  10-second window wins a CAS and runs `retain()`; all others see the updated timestamp
+  and skip it.
+
+---
+
+## [0.4.5] — 2026-05-20
+
+### Security
+
+- **DoT/DoH TCP cap enforced (VUL-NEW-01)** (`src/dns/server.rs`) — DoT (port 853) and DoH
+  (port 443) TCP listeners previously bypassed `run_tcp_with_limit`, allowing a client to open
+  more than `TCP_CONN_PER_IP_MAX` (20) concurrent TLS connections per source IP. Both listeners
+  now use the same relay pattern as DNS/TCP: a public `TcpListener` feeds `run_tcp_with_limit`,
+  which enforces the 20-connection per-IP cap before relaying accepted connections to a loopback
+  listener owned by hickory-server. The `TcpConnTracker` is shared across DNS/TCP, DoT, and DoH.
+
+- **IPv6 loopback check before `normalize_tcp_ip` (VUL-NEW-03)** (`src/dns/server.rs`) — `::1`
+  was normalized to `::` (all-zeros) before the `is_loopback()` check, causing `::1` connections
+  to be subjected to the TCP cap rather than unconditionally allowed as health checks. The
+  loopback check now runs on `peer.ip()` directly, before normalization.
+
+- **sysfs path sanitization for interface names (VUL-NEW-04)** (`src/dns/xdp/socket.rs`) — four
+  functions that build `/sys/class/net/{iface}/…` paths now call `sanitize_iface_name()` before
+  interpolation. The validator rejects names longer than 15 characters (Linux `IFNAMSIZ`) or
+  containing characters other than ASCII alphanumeric, hyphen, period, and underscore, returning
+  a safe default instead.
+
+- **`CPU_SET` UB guard for `cpu_id >= 1024` (VUL-NEW-05)** (`src/cpu.rs`) — `libc::CPU_SET` is
+  undefined behaviour for `cpu_id >= 1024` because `cpu_set_t` is only 128 bytes (1 024 bits).
+  `pin_to_cpu` now returns early for any `cpu_id >= 1024` before entering the `unsafe` block.
+
+- **`add_feed_handler` uses `ApiJson` extractor (VUL-NEW-06)** (`src/api/mod.rs`) — the handler
+  was using raw `axum::Json`, returning a plain-text 422 on deserialization failure. Changed to
+  `ApiJson<AddFeedRequest>` for consistent structured JSON error responses, matching all other
+  mutation handlers.
+
+- **`validate_dns_entry` PARSE_FAILED detail redacted (VUL-NEW-07)** (`src/api/mod.rs`) — the
+  HTTP 400 error for RR parse failures previously included the full internal RR string in the
+  response body, leaking zone-syntax details. The response now returns the static string
+  `"Record validation failed"`; the RR string is logged server-side at `warn!` level.
+
+### Known limitations
+
+- **TCP rate limiting via loopback relay (VUL-NEW-02)** — the relay architecture causes hickory
+  to see `127.0.0.1` for all TCP clients, so the per-IP DNS rate limiter uses a shared loopback
+  bucket for DNS/TCP, DoT, and DoH. The TCP connection cap (20 per source IP) is the primary
+  DoS protection. See `docs/security.md#known-limitations` for the full analysis.
+
+### Fixed
+
+- Default API port corrected from `8081` to `8080` in `src/main.rs` (`api_port.unwrap_or`).
+
 ---
 
 ## [0.4.2] — 2026-05-19

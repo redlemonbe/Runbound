@@ -773,10 +773,15 @@ fn validate_dns_entry(req: &AddDnsRequest) -> Result<(DnsEntry, String, hickory_
     };
     let record = match parse_local_data(&rr) {
         Some(r) => r,
-        None => return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "PARSE_FAILED",
-            "details": format!("Could not parse RR: {rr}")
-        })))),
+        None => {
+            // FIX 6 (VUL-NEW-07): do not reflect the internal RR string in the HTTP response;
+            // log it server-side so operators can diagnose but clients see no filesystem/config detail.
+            warn!(rr = %rr, "RR parse failed for input");
+            return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                "error": "PARSE_FAILED",
+                "details": "Record validation failed"
+            }))));
+        }
     };
     Ok((entry, rr, record))
 }
@@ -1033,7 +1038,7 @@ async fn get_feeds_handler(State(_s): State<AppState>) -> impl IntoResponse {
 
 async fn add_feed_handler(
     State(s): State<AppState>,
-    JsonExtract(p): JsonExtract<AddFeedRequest>,
+    ApiJson(p): ApiJson<AddFeedRequest>,
 ) -> impl IntoResponse {
     // Enforce subscription cap before attempting download/validation.
     let current = feeds::load_feeds().unwrap_or_default();

@@ -134,19 +134,21 @@ impl RunboundHandler {
 
         // MED-06: sanitize the DNS name before structured log emission to prevent
         // log injection via control characters embedded in query names.
-        let safe_name = sanitize_dns_name(qname);
-
-        let client_log = self.log_buffer.push_query(&safe_name, &client, u16::from(qtype), action, elapsed_ms);
-
-        info!(
-            client = %client_log,
-            name   = %safe_name,
-            qtype  = %qtype,
-            rcode  = %rcode,
-            action = action.as_str(),
-            ms     = elapsed_ms,
-            "query"
-        );
+        // Guard the allocation: skip when log buffer is disabled AND info-level tracing
+        // is off (verbosity < 2). Hot path at verbosity:1 with log-retention:0 → zero alloc.
+        if self.log_buffer.is_enabled() || tracing::enabled!(tracing::Level::INFO) {
+            let safe_name = sanitize_dns_name(qname);
+            let client_log = self.log_buffer.push_query(&safe_name, &client, u16::from(qtype), action, elapsed_ms);
+            info!(
+                client = %client_log,
+                name   = %safe_name,
+                qtype  = %qtype,
+                rcode  = %rcode,
+                action = action.as_str(),
+                ms     = elapsed_ms,
+                "query"
+            );
+        }
     }
 }
 
@@ -269,11 +271,17 @@ impl RunboundHandler {
                 }
 
                 let ttl_cap = self.cache_max_ttl;
-                let records: Vec<Record> = lookup.answers().iter().map(|r| {
-                    let mut r = r.clone();
-                    if r.ttl > ttl_cap { r.ttl = ttl_cap; }
-                    r
-                }).collect();
+                let needs_cap = lookup.answers().iter().any(|r| r.ttl > ttl_cap);
+                let capped: Vec<Record>;
+                let records: &[Record] = if needs_cap {
+                    capped = lookup.answers().iter().map(|r| {
+                        if r.ttl > ttl_cap { let mut rc = r.clone(); rc.ttl = ttl_cap; rc }
+                        else { r.clone() }
+                    }).collect();
+                    &capped
+                } else {
+                    lookup.answers()
+                };
 
                 // DNSSEC: check for bogus proof on individual records in success path.
                 if self.dnssec_enabled {
@@ -934,7 +942,13 @@ async fn run_tcp_with_limit(
             Ok(x)  => x,
             Err(e) => { warn!(err=%e, "TCP accept error"); continue; }
         };
-        let src_ip = normalize_tcp_ip(peer.ip());
+        // FIX 2 (VUL-NEW-03): check loopback BEFORE normalize so that ::1
+        // is not collapsed to :: (an unrelated /48 prefix) by normalize_tcp_ip.
+        let src_ip = if peer.ip().is_loopback() {
+            peer.ip()
+        } else {
+            normalize_tcp_ip(peer.ip())
+        };
         if !tracker.try_acquire(src_ip) {
             // Over limit: drop immediately (TcpStream closed on drop → TCP FIN/RST)
             continue;
@@ -1090,27 +1104,42 @@ pub async fn run_dns_server(
 
         for iface in &interfaces {
             // DNS-over-TLS (port 853 TCP)
+            // FIX 1 (VUL-NEW-01): public listener → run_tcp_with_limit → loopback relay → hickory.
+            // Same TcpConnTracker as DNS/TCP; DoT now shares the per-IP cap of 20 connections.
             let dot_addr = format!("{}:{}", iface, dot_port);
             match TcpListener::bind(&dot_addr).await {
-                Ok(tcp) => {
+                Ok(public_dot) => {
+                    let relay_dot = TcpListener::bind("127.0.0.1:0").await
+                        .map_err(|e| anyhow::anyhow!("DoT relay bind: {e}"))?;
+                    let relay_dot_addr = relay_dot.local_addr()
+                        .map_err(|e| anyhow::anyhow!("DoT relay local_addr: {e}"))?;
                     info!(addr=%dot_addr, mtls=tls_cfg.dot_client_auth_ca.is_some(), "DoT (DNS-over-TLS) listening — RFC 7858");
-                    server.register_tls_listener_with_tls_config(tcp, Duration::from_secs(30), Arc::clone(&dot_config))
+                    server.register_tls_listener_with_tls_config(relay_dot, Duration::from_secs(30), Arc::clone(&dot_config))
                         .map_err(|e| anyhow::anyhow!("DoT register: {e}"))?;
+                    let tracker_dot = Arc::clone(&tcp_tracker);
+                    tokio::spawn(run_tcp_with_limit(public_dot, relay_dot_addr, tracker_dot, TCP_SESSION_TIMEOUT));
                 }
                 Err(e) => warn!(addr=%dot_addr, err=%e, "DoT bind failed — skipping"),
             }
 
             // DNS-over-HTTPS (port 443 TCP)
+            // FIX 1 (VUL-NEW-01): same relay pattern as DoT above.
             let doh_addr = format!("{}:{}", iface, doh_port);
             match TcpListener::bind(&doh_addr).await {
-                Ok(tcp) => {
+                Ok(public_doh) => {
+                    let relay_doh = TcpListener::bind("127.0.0.1:0").await
+                        .map_err(|e| anyhow::anyhow!("DoH relay bind: {e}"))?;
+                    let relay_doh_addr = relay_doh.local_addr()
+                        .map_err(|e| anyhow::anyhow!("DoH relay local_addr: {e}"))?;
                     info!(addr=%doh_addr, "DoH (DNS-over-HTTPS) listening — RFC 8484");
                     server.register_https_listener_with_tls_config(
-                        tcp, Duration::from_secs(30),
+                        relay_doh, Duration::from_secs(30),
                         Arc::clone(&doh_config),
                         Some(hostname.clone()),
                         "/dns-query".to_string(),
                     ).map_err(|e| anyhow::anyhow!("DoH register: {e}"))?;
+                    let tracker_doh = Arc::clone(&tcp_tracker);
+                    tokio::spawn(run_tcp_with_limit(public_doh, relay_doh_addr, tracker_doh, TCP_SESSION_TIMEOUT));
                 }
                 Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
             }

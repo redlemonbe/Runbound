@@ -602,6 +602,32 @@ make audit-full  # all three + cargo outdated
 
 ---
 
+## Known limitations
+
+### TCP rate limiting — loopback proxy (VUL-NEW-02)
+
+**Status:** Accepted design trade-off — not a vulnerability, documented for transparency.
+
+The TCP relay architecture (public TcpListener → loopback relay → hickory-server) causes
+hickory to see `127.0.0.1` as the source for all relayed TCP connections. The per-IP DNS
+rate limiter therefore uses a shared loopback bucket for all TCP clients rather than
+individual per-client buckets.
+
+**Impact:** A client sending many queries over DNS/TCP, DoT, or DoH can consume the shared
+loopback rate-limit bucket, potentially affecting the measured rate for other TCP clients.
+
+**Mitigations in place:**
+- The TCP connection cap (`TCP_CONN_PER_IP_MAX = 20` per source IP) is the primary DoS
+  control and is applied before the relay, so FD exhaustion attacks are blocked at source.
+- TCP is inherently low-volume; most DNS traffic uses UDP.
+- The loopback rate-limit bucket is sized generously (same `rps` × burst as any single IP).
+
+**Resolution path:** Replacing the relay with an in-process per-query source-IP annotation
+inside hickory-server would eliminate the limitation; this requires a non-trivial upstream
+change or a custom hickory fork and is deferred.
+
+---
+
 ## Reporting a vulnerability
 
 Send a report to **redlemonbe@codix.be** with subject line `[SECURITY] Runbound`.
