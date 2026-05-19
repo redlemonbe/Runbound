@@ -111,6 +111,25 @@ at 150% of the detected ceiling. No crashes, no memory leaks observed.
 
 ---
 
+### Context: scale reference
+
+For scale, the same dnsmark protocol run against a consumer router used as a DNS
+resolver (unnamed — any entry-level home/SMB router is representative):
+
+| Metric | Consumer router | Bare metal (best) | Factor |
+|---|---|---|---|
+| QPS ceiling | 1 000 | 128 000 | — |
+| Packet loss at ceiling | 12.02% 🔴 | 0.01% | — |
+| Sustained p99 | 30.495 ms | 0.078 ms | **×390** |
+| Stress p99 | 24.687 ms | 0.170 ms | **×145** |
+| Throughput | ×1 | **×128** | — |
+
+A consumer router used as a DNS resolver saturates and drops packets at 1 000 QPS.
+A single desktop-class PC running Runbound, BIND9, or Unbound handles 128 000 QPS
+with zero packet loss. The hardware matters more than the software at this scale.
+
+---
+
 ### Next benchmark: AF/XDP native (Intel X540 client)
 
 The current client (Emulex be2net) does not support AF/XDP.
