@@ -33,17 +33,19 @@ struct IpBucket {
 }
 
 pub struct RateLimiter {
-    buckets:         DashMap<IpAddr, IpBucket, ahash::RandomState>,
-    cleanup_counter: AtomicU64,
-    rps:             u64,
-    burst:           u64,
+    buckets:    DashMap<IpAddr, IpBucket, ahash::RandomState>,
+    start:      Instant,    // base for nanosecond GC clock
+    next_gc_ns: AtomicU64, // nanos since `start` at which to next run retain()
+    rps:        u64,
+    burst:      u64,
 }
 
 impl RateLimiter {
     pub fn new(rps: u64) -> Arc<Self> {
         Arc::new(Self {
             buckets: DashMap::with_hasher(ahash::RandomState::default()),
-            cleanup_counter: AtomicU64::new(0),
+            start: Instant::now(),
+            next_gc_ns: AtomicU64::new(10_000_000_000), // first GC at 10 s
             rps,
             burst: rps.saturating_mul(2),
         })
@@ -60,8 +62,16 @@ impl RateLimiter {
         let ip = normalize_ip(ip);
         let now = Instant::now();
 
-        let count = self.cleanup_counter.fetch_add(1, Ordering::Relaxed);
-        if count.is_multiple_of(10_000) {
+        // Time-based GC: hot path is a single load (no write, no cache-line contention).
+        // One thread per 10-second window runs retain() via a CAS.
+        let now_ns = now.duration_since(self.start).as_nanos() as u64;
+        let gc_at  = self.next_gc_ns.load(Ordering::Relaxed);
+        if now_ns >= gc_at
+            && self.next_gc_ns
+                .compare_exchange(gc_at, gc_at.saturating_add(10_000_000_000),
+                    Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
             self.buckets.retain(|_, b| now.duration_since(b.last_refill).as_secs() < 60);
         }
 

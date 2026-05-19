@@ -115,9 +115,27 @@ pub unsafe fn create_xsk_socket(
     Ok(XskSocket { fd, umem, rx, tx })
 }
 
+/// Validate a network interface name before using it in sysfs paths.
+/// Linux IFNAMSIZ is 16 (including NUL), so names are at most 15 characters.
+/// Only ASCII alphanumeric, hyphen, period, and underscore are accepted.
+fn sanitize_iface_name(name: &str) -> Option<&str> {
+    if !name.is_empty()
+        && name.len() <= 15
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 /// Returns the number of RX queues on `iface` by counting
 /// /sys/class/net/<iface>/queues/rx-* directories.
 pub fn get_rx_queue_count(iface: &str) -> u32 {
+    let iface = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None    => return 1,
+    };
     let path = format!("/sys/class/net/{iface}/queues");
     std::fs::read_dir(&path)
         .map(|dir| {
@@ -211,6 +229,10 @@ pub fn default_interface() -> Option<String> {
 /// VLAN sub-interfaces (eth0.10, bond0.10) have `DEVTYPE=vlan` in their uevent —
 /// these are XDP-capable and are NOT treated as virtual.
 pub fn is_virtual_interface(iface: &str) -> bool {
+    let iface = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None    => return true,
+    };
     if std::path::Path::new(&format!("/sys/class/net/{iface}/device")).exists() {
         return false;
     }
@@ -228,6 +250,7 @@ pub fn is_virtual_interface(iface: &str) -> bool {
 ///   2. `master` symlink — bond slave or bridge port
 ///   3. `brif/` directory — ports of a bridge interface
 pub fn parent_interface(iface: &str) -> Option<String> {
+    let iface = sanitize_iface_name(iface)?;
     let sysfs = format!("/sys/class/net/{iface}");
     // 1. lower_* entries (ipvlan, macvlan)
     if let Ok(entries) = std::fs::read_dir(&sysfs) {
@@ -261,6 +284,7 @@ pub fn parent_interface(iface: &str) -> Option<String> {
 }
 
 fn first_physical_bridge_port(bridge: &str) -> Option<String> {
+    let bridge = sanitize_iface_name(bridge)?;
     let brif = format!("/sys/class/net/{bridge}/brif");
     let entries = std::fs::read_dir(&brif).ok()?;
     for entry in entries.flatten() {

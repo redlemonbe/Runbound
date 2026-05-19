@@ -58,6 +58,8 @@ pub fn physical_cores() -> Vec<usize> {
 /// Pin the calling thread to `cpu_id` using `sched_setaffinity(2)`.
 /// Silent no-op on failure or on non-Linux targets.
 pub fn pin_to_cpu(cpu_id: usize) {
+    // FIX 4 (VUL-NEW-05): cpu_set_t is 128 bytes = 1024 bits; CPU_SET is UB for cpu_id >= 1024.
+    if cpu_id >= 1024 { return; }
     #[cfg(target_os = "linux")]
     unsafe {
         let mut set = std::mem::zeroed::<libc::cpu_set_t>();

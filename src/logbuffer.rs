@@ -251,8 +251,9 @@ impl LogBuffer {
 const LOG_SHARDS: usize = 16;
 
 pub struct ShardedLogBuffer {
-    shards:  Vec<Mutex<LogBuffer>>,
-    counter: AtomicU64,
+    shards:         Vec<Mutex<LogBuffer>>,
+    counter:        AtomicU64,
+    total_capacity: usize,
 }
 
 impl ShardedLogBuffer {
@@ -261,7 +262,12 @@ impl ShardedLogBuffer {
         let shards = (0..LOG_SHARDS)
             .map(|_| Mutex::new(LogBuffer::new_with(per_shard, log_client_ip)))
             .collect();
-        Self { shards, counter: AtomicU64::new(0) }
+        Self { shards, counter: AtomicU64::new(0), total_capacity: capacity }
+    }
+
+    /// Returns false when log-retention is 0 — used to skip hot-path allocations.
+    pub fn is_enabled(&self) -> bool {
+        self.total_capacity > 0
     }
 
     /// Push a query log entry. Selects a shard via round-robin.

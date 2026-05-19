@@ -351,7 +351,7 @@ async fn build_and_launch(
     tokio::spawn(async move { feeds::feed_update_loop(86400).await });
 
     // ── REST API (localhost only, port from api-port directive, default 8081) ──
-    let api_port = cfg.api_port.unwrap_or(8081);
+    let api_port = cfg.api_port.unwrap_or(8080);
     let api_key  = init_api_key(cfg.api_key.clone());
     info!(
         addr = %format!("{API_BIND}:{api_port}"),
