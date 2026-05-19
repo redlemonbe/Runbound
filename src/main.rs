@@ -24,6 +24,8 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
+#[cfg(target_os = "linux")]
+use libc;
 use arc_swap::ArcSwap;
 use tracing::{error, info};
 
@@ -138,6 +140,13 @@ fn handle_cli_flags(args: &[String]) -> Result<bool> {
         let hostname = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("runbound.local");
         gen_self_signed_cert(hostname)?;
         return Ok(true);
+    }
+    // --check-config [path] — validate config and systemd security parameters, then exit
+    if let Some(pos) = args.iter().position(|a| a == "--check-config") {
+        let path = args.get(pos + 1).map(|s| s.as_str())
+            .unwrap_or("/etc/unbound/unbound.conf");
+        let code = run_check_config(path);
+        std::process::exit(code);
     }
     Ok(false)
 }
@@ -440,15 +449,23 @@ fn print_help() {
 ",
         "OPTIONS:
 ",
-        "    -h, --help             Print this help message and exit
+        "    -h, --help                   Print this help message and exit
 ",
-        "    -V, --version          Print version and exit
+        "    -V, --version                Print version and exit
 ",
-        "        --gen-cert [HOST]  Generate a self-signed TLS certificate for DoT/DoH/DoQ
+        "        --gen-cert [HOST]        Generate a self-signed TLS certificate for DoT/DoH/DoQ
 ",
-        "                           Writes /etc/runbound/cert.pem and key.pem
+        "                                 Writes /etc/runbound/cert.pem and key.pem
 ",
-        "                           HOST defaults to 'runbound.local'
+        "                                 HOST defaults to 'runbound.local'
+",
+        "        --check-config [CONFIG]  Validate config + systemd security parameters
+",
+        "                                 Checks: parse, rate-limit, data dir, port 53,
+",
+        "                                 capabilities (CAP_NET_RAW/ADMIN/BPF), RLIMIT_MEMLOCK
+",
+        "                                 Exit codes: 0=clean  1=error  2=warnings only
 ",
         "
 ",
@@ -574,17 +591,150 @@ fn print_help() {
 ",
         "EXAMPLES:
 ",
-        "    runbound                                      # use default config
+        "    runbound                                           # use default config
 ",
-        "    runbound /etc/runbound/unbound.conf           # custom config
+        "    runbound /etc/runbound/unbound.conf                # custom config
 ",
-        "    runbound --gen-cert dns.myserver.com          # generate TLS cert
+        "    runbound --gen-cert dns.myserver.com               # generate TLS cert
 ",
-        "    RUST_LOG=debug runbound                       # verbose logging
+        "    runbound --check-config /etc/runbound/unbound.conf # validate before start
 ",
-        "    RUNBOUND_API_KEY=mysecret runbound            # fixed API key via env
+        "    RUST_LOG=debug runbound                            # verbose logging
+",
+        "    RUNBOUND_API_KEY=mysecret runbound                 # fixed API key via env
 ",
     ));
+}
+
+// ── --check-config implementation ─────────────────────────────────────────
+
+/// Validate config + systemd security parameters without starting the server.
+/// Returns 0 (clean), 1 (critical error), 2 (warnings only).
+fn run_check_config(path: &str) -> i32 {
+    rustls::crypto::ring::default_provider().install_default().ok();
+
+    let mut warnings = 0u32;
+    let mut errors   = 0u32;
+
+    // ── 1. Config parse ────────────────────────────────────────────────────
+    let cfg = match config::load(path) {
+        Ok(c) => {
+            println!("[OK]   Config parsed: port={} interfaces={:?}", c.port, c.interfaces);
+            c
+        }
+        Err(e) => {
+            println!("[ERR]  Config parse failed: {e}");
+            return 1;
+        }
+    };
+
+    // ── 2. rate-limit ──────────────────────────────────────────────────────
+    match cfg.rate_limit {
+        None | Some(0) => println!("[OK]   Rate limit: disabled (unlimited)"),
+        Some(n)        => println!("[OK]   Rate limit: {n} QPS per source IP"),
+    }
+
+    // ── 3. Data directory writable ─────────────────────────────────────────
+    let base_dir = std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let probe = base_dir.join(".runbound_check_write");
+    match std::fs::write(&probe, b"") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            println!("[OK]   Data directory writable: {}", base_dir.display());
+        }
+        Err(e) => {
+            println!("[ERR]  Data directory not writable: {} — {e}", base_dir.display());
+            errors += 1;
+        }
+    }
+
+    // ── 4. Port availability ───────────────────────────────────────────────
+    check_cfg_port(cfg.port, &mut errors);
+
+    // ── 5. Capabilities (Linux only) ───────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    check_cfg_capabilities(&mut warnings);
+
+    // ── 6. RLIMIT_MEMLOCK (Linux only) ─────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    check_cfg_rlimit_memlock(&mut warnings);
+
+    // ── Summary ────────────────────────────────────────────────────────────
+    if errors > 0 {
+        println!("Config check failed ({errors} error(s), {warnings} warning(s))");
+        1
+    } else if warnings > 0 {
+        println!("Config check passed ({warnings} warning(s))");
+        2
+    } else {
+        println!("Config check passed");
+        0
+    }
+}
+
+fn check_cfg_port(port: u16, errors: &mut u32) {
+    use std::net::UdpSocket;
+    match UdpSocket::bind(format!("0.0.0.0:{port}")) {
+        Ok(_)  => println!("[OK]   Port {port} available"),
+        Err(e) => {
+            println!("[ERR]  Port {port} already in use — {e}");
+            *errors += 1;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_cfg_capabilities(warnings: &mut u32) {
+    // CAP_NET_RAW=13  CAP_NET_ADMIN=12  CAP_BPF=39
+    // Read effective capability mask from /proc/self/status CapEff field.
+    const CAP_NET_ADMIN: u64 = 1 << 12;
+    const CAP_NET_RAW:   u64 = 1 << 13;
+    const CAP_BPF:       u64 = 1 << 39;
+
+    let cap_eff: Option<u64> = std::fs::read_to_string("/proc/self/status").ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("CapEff:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| u64::from_str_radix(v, 16).ok())
+        });
+
+    let Some(cap) = cap_eff else {
+        println!("[WARN] Could not read /proc/self/status — capability check skipped");
+        *warnings += 1;
+        return;
+    };
+
+    for (name, bit) in [
+        ("CAP_NET_ADMIN", CAP_NET_ADMIN),
+        ("CAP_NET_RAW",   CAP_NET_RAW),
+        ("CAP_BPF",       CAP_BPF),
+    ] {
+        if cap & bit == 0 {
+            println!("[WARN] {name} not available — XDP will be disabled");
+            println!("       Fix: sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip $(which runbound)");
+            println!("       Or add AmbientCapabilities={name} to the systemd service");
+            *warnings += 1;
+        } else {
+            println!("[OK]   {name} present");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_cfg_rlimit_memlock(warnings: &mut u32) {
+    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl); }
+    if rl.rlim_cur == libc::RLIM_INFINITY {
+        println!("[OK]   RLIMIT_MEMLOCK: unlimited");
+    } else {
+        println!("[WARN] RLIMIT_MEMLOCK is limited ({} bytes) — XDP UMEM allocation will fail", rl.rlim_cur);
+        println!("       Fix: add LimitMEMLOCK=infinity to the systemd service file");
+        *warnings += 1;
+    }
 }
 
 /// Generate a self-signed TLS certificate for DoT / DoH / DoQ.

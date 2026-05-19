@@ -46,21 +46,43 @@ Your existing `unbound.conf` works as-is. Zero migration.
 
 ---
 
-## Up and running in 60 seconds
+## Installation
+
+### Recommended — automatic script
 
 ```bash
-# 1 — Download the static binary (no dependencies)
-#     Replace vX.Y.Z with the latest version tag from the releases page
+sudo bash <(curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh)
+```
+
+`install.sh` automatically configures all interdependent security parameters:
+capabilities, address families, locked memory, API key, directories and permissions.
+**This is the safest installation method.**
+
+### Manual installation
+
+Manual installation is possible, but Runbound has many interdependent security
+parameters in the systemd service file. A mistake or omission is **silent** —
+the server starts and runs normally even if a security parameter is missing or
+incorrect.
+
+> Before any manual installation, read [docs/hardening.md](docs/hardening.md).
+> Then verify the configuration with:
+> ```bash
+> runbound --check-config /etc/runbound/unbound.conf
+> ```
+> Startup logs explicitly confirm each active parameter — check them
+> systematically after every manual install or update.
+
+```bash
+# Download the static binary (no dependencies)
+# Replace vX.Y.Z with the latest version tag from the releases page
 curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-vX.Y.Z-x86_64-linux-musl
 chmod +x runbound-vX.Y.Z-x86_64-linux-musl
 
-# 2 — One-liner install (downloads automatically, sets up systemd):
-#     sudo bash <(curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh)
-
-# 3 — Or point it at your existing Unbound config
+# Or point it at your existing Unbound config
 sudo ./runbound-vX.Y.Z-x86_64-linux-musl /etc/unbound/unbound.conf
 
-# 4 — Test it
+# Test it
 dig @127.0.0.1 google.com
 ```
 
@@ -240,6 +262,7 @@ Ready-to-use configs for common scenarios:
 | [Systemd Setup](docs/systemd.md) | Production service, hardened unit file, hot reload |
 | [Unbound Migration](docs/unbound-migration.md) | Config compatibility, feature mapping, gotchas |
 | [Security Architecture](docs/security.md) | ACL, rate limiting, API auth, audit findings |
+| [Security Hardening](docs/hardening.md) | Silent failures in systemd params — capabilities, AF_XDP, LimitMEMLOCK |
 | [Security Audit](docs/security-audit.md) | White-box audit findings and remediation log |
 | [GDPR / Privacy](docs/gdpr.md) | Data inventory, log retention, IP redaction, right-to-erasure |
 
