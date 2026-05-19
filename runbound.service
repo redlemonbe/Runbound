@@ -20,8 +20,9 @@ Group=runbound
 
 # API key persistence — set here to survive restarts without regeneration.
 # Leave commented to auto-generate on first start (saved to /etc/runbound/api.key).
-# EnvironmentFile=-/etc/runbound/environment
-Environment="RUST_LOG=runbound=info"
+EnvironmentFile=-/etc/runbound/environment
+# Log level is controlled by verbosity: in unbound.conf (0=error 1=warn 2=info 3=debug).
+# Override at runtime: add RUST_LOG=runbound=debug to /etc/runbound/environment.
 
 WorkingDirectory=/var/lib/runbound
 

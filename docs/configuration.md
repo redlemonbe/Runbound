@@ -134,13 +134,17 @@ logfile: /var/log/runbound/runbound.log
 verbosity: 1
 ```
 
-| `verbosity` | Output |
-|---|---|
-| `0` | Errors only |
-| `1` | Operational (default) |
-| `2` | Detailed — includes query names |
-| `3` | Debug |
-| `4–5` | Trace |
+| `verbosity` | Level | Output |
+|---|---|---|
+| `0` | ERROR | Startup/shutdown errors only |
+| `1` | WARN | Operational events, rate-limit hits **(default)** |
+| `2` | INFO | Every query logged — **avoid above 10k QPS** |
+| `3` | DEBUG | Internal state, XDP decisions, all events |
+
+**Performance impact:** `verbosity: 2` (info) logs every DNS query. On a production server handling 50k QPS, this generates ~50k log lines per second, adding measurable CPU overhead. Use `verbosity: 1` for production. `--check-config` warns if `verbosity: 2` or higher is set on port 53.
+
+**Priority:** `RUST_LOG` environment variable > `verbosity:` directive > default `warn`.  
+Add `RUST_LOG=runbound=debug` to `/etc/runbound/environment` for temporary debug sessions without editing the config file.
 
 Set `logfile: ""` or omit it to log to stdout (recommended with systemd).
 
