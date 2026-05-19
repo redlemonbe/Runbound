@@ -7,7 +7,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+---
+
+## [0.4.17] — 2026-05-19
+
 ### Added
+
+- **`verbosity: <0–3>` directive in `unbound.conf`** — controls the log level without touching
+  the systemd service file. `0` = error, `1` = warn (default), `2` = info (every query),
+  `3` = debug. Priority: `RUST_LOG` env var > `verbosity:` directive > default `warn`.
+  Mirrors the Unbound `verbosity:` directive so existing configs work unchanged.
+
+- **`verbosity:` performance warning in `--check-config`** — if `verbosity: 2` or higher is
+  set on port 53 with rate-limiting active, `--check-config` now emits a `[WARN]` line:
+  *"verbosity: 2 (info) logs every query — expect significant CPU overhead above 10k QPS."*
+
+### Changed
+
+- **Default log level is now `warn` (`verbosity: 1`)** — previously the server defaulted to
+  `info` (every-query logging) via a hardcoded `Environment="RUST_LOG=runbound=info"` in the
+  service file, which silently overrode any `EnvironmentFile`. Production servers no longer
+  log every query by default; set `verbosity: 2` explicitly to restore the previous behaviour.
+
+### Fixed
+
+- **Physical core detection corrected for AMD SMT (Threadripper PRO / EPYC)** — the previous
+  heuristic keyed on `(cpu_id / 64, core_id)`, which misidentified SMT siblings as separate
+  physical cores on AMD CPUs where sibling threads are numbered non-contiguously (e.g. cpu0
+  and cpu64 both have `core_id=0` but `cpu_id/64` puts them in different synthetic sockets).
+  The fix reads `thread_siblings_list` for each online CPU and keeps only the lowest-numbered
+  CPU in each sibling group as the physical-core representative. Behaviour is identical on
+  Intel HT and AMD SMT; a 64-core/128-thread EPYC now reports 64 physical cores, not 128.
+
+- **`EnvironmentFile=-/etc/runbound/environment` no longer overridden by the service file** —
+  the hardcoded `Environment="RUST_LOG=runbound=info"` line in `runbound.service` was shadowing
+  the operator's `EnvironmentFile`. The line is replaced by a comment; `EnvironmentFile` is now
+  active. Operators who relied on `RUST_LOG=info` via that line should add `verbosity: 2` to
+  their `unbound.conf`.
 
 - **`xdp: no` config directive and `--no-xdp` CLI flag** — disable the AF/XDP kernel-bypass
   fast path at runtime without recompiling. Useful for containers, cloud VMs, and environments
@@ -30,9 +66,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   and injects 3 synthetic DNS frames into the TX ring, then polls the RX ring for 200 ms.
   If the fill ring is unseeded or no frames arrive, XDP is disabled with a `WARN` log and
   DNS falls back to the normal path. `--check-config` now also reports whether the
-  configured interface is physical or virtual (step 7 in the check output).
-
-### Fixed
+  configured interface is physical or virtual (step 8 in the check output).
 
 - **XDP interface selected via `getifaddrs()` on configured IP** — `iface_for_ip()` now
   calls `getifaddrs()` directly instead of using the routing table. This eliminates wrong
@@ -50,8 +84,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   limited `RLIMIT_MEMLOCK` is reported as `[INFO]` rather than `[WARN]`, because the
   service file's `LimitMEMLOCK=infinity` will apply at runtime regardless.
 
-- **`/reload` rate limit (2 RPS) now correctly enforced** — regression from v0.4.16 implementation where the dedicated token bucket was not wired into the request path.
-- **TCP per-IP connection cap (20) now enforced for non-loopback sources** — regression from v0.4.16 implementation; loopback exemption (127.0.0.1 / ::1) remains by design.
+- **`/reload` rate limit (2 RPS) now correctly enforced** — regression from v0.4.16 where the
+  dedicated token bucket was not wired into the request path.
+
+- **TCP per-IP connection cap (20) now enforced for non-loopback sources** — regression from
+  v0.4.16; loopback exemption (127.0.0.1 / ::1) remains by design.
 
 ### Documentation
 
@@ -1142,6 +1179,7 @@ v0.4.0. See `audit.toml` for per-CVE exposure analysis and mitigations.
 ---
 
 [Unreleased]: https://github.com/redlemonbe/Runbound/compare/v0.4.16...HEAD
+[0.4.17]: https://github.com/redlemonbe/Runbound/compare/v0.4.16...v0.4.17
 [0.4.16]: https://github.com/redlemonbe/Runbound/compare/v0.4.15...v0.4.16
 [0.4.15]: https://github.com/redlemonbe/Runbound/compare/v0.4.14...v0.4.15
 [0.3.1]: https://github.com/redlemonbe/Runbound/compare/v0.3.0...v0.3.1

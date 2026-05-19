@@ -140,6 +140,7 @@ impl UnboundConfig {
         Self {
             interfaces:    vec![],   // empty = bind 0.0.0.0 in server.rs
             port:          53,
+            verbosity:     1,        // WARN — per-query logs off by default
             do_ipv4:       true,
             do_ipv6:       true,
             do_udp:        true,

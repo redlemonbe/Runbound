@@ -3,29 +3,45 @@
 // CPU topology helpers — physical-core discovery and per-thread affinity pinning.
 // On non-Linux targets all functions compile but pin_to_cpu() is a no-op.
 
-/// Returns one logical CPU ID per physical core, HyperThreading siblings excluded.
+/// Parse a kernel CPU-list string (e.g. "0,4" or "0-3,8-11") into CPU IDs.
+fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in s.trim().split(',') {
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                cpus.extend(lo..=hi);
+            }
+        } else if let Ok(n) = part.trim().parse::<usize>() {
+            cpus.push(n);
+        }
+    }
+    cpus
+}
+
+/// Returns one logical CPU ID per physical core, SMT/HyperThreading siblings excluded.
 ///
-/// Reads `/sys/devices/system/cpu/cpuN/topology/core_id` for each CPU.
-/// The first logical CPU ID seen for each (socket, core_id) pair is kept;
-/// HT siblings sharing the same physical core are dropped.
-/// Falls back to `0..num_cpus::get_physical()` when `/sys` is unavailable
+/// Reads `thread_siblings_list` for each online CPU. A CPU is a physical-core
+/// representative if and only if it is the lowest-numbered CPU in its sibling group.
+/// This works identically on Intel HT and AMD SMT (Threadripper PRO / EPYC).
+///
+/// Example — 4C/8T CPU:
+///   cpu0: siblings = [0,4] → min=0 == cpu_id → keep
+///   cpu4: siblings = [0,4] → min=0 ≠ cpu_id → skip (SMT sibling of cpu0)
+///
+/// Falls back to all available logical CPUs when `/sys` is unavailable
 /// (containers, non-Linux, permission errors).
 pub fn physical_cores() -> Vec<usize> {
-    let mut seen = std::collections::HashSet::new();
     let mut physical = Vec::new();
-    for cpu_id in 0..1024 {
+    for cpu_id in 0..4096 {
         let path = format!(
-            "/sys/devices/system/cpu/cpu{}/topology/core_id",
-            cpu_id
+            "/sys/devices/system/cpu/cpu{cpu_id}/topology/thread_siblings_list"
         );
         match std::fs::read_to_string(&path) {
             Ok(s) => {
-                if let Ok(core_id) = s.trim().parse::<usize>() {
-                    // (cpu_id / 64, core_id) approximates (socket, physical_core).
-                    // Picks the first logical ID per physical core, discarding HT siblings.
-                    if seen.insert((cpu_id / 64, core_id)) {
-                        physical.push(cpu_id);
-                    }
+                let siblings = parse_cpu_list(&s);
+                let min = siblings.iter().copied().min().unwrap_or(cpu_id);
+                if min == cpu_id {
+                    physical.push(cpu_id);
                 }
             }
             Err(_) => break,

@@ -155,20 +155,27 @@ fn handle_cli_flags(args: &[String]) -> Result<bool> {
     Ok(false)
 }
 
-/// Install rustls crypto provider, init tracing, load and validate config, init HSM.
+/// Map `verbosity: N` (0–3) to a tracing Level.
+/// 0 = ERROR, 1 = WARN (production default), 2 = INFO, 3 = DEBUG.
+fn verbosity_to_level(v: u8) -> tracing::Level {
+    match v {
+        0 => tracing::Level::ERROR,
+        1 => tracing::Level::WARN,
+        2 => tracing::Level::INFO,
+        _ => tracing::Level::DEBUG,
+    }
+}
+
+/// Install rustls crypto provider, load config, init tracing, validate config, init HSM.
+///
+/// Tracing is initialized AFTER config load so `verbosity:` takes effect.
+/// Priority: RUST_LOG env var > verbosity: directive > default WARN.
 fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, String)> {
     // rustls 0.23: when multiple crypto backends are compiled in (ring + aws-lc-rs),
     // ServerConfig::builder() panics unless a default provider is installed first.
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok(); // ok() = no-op if already installed
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
 
     let cfg_path = args.iter().skip(1)
         .find(|a| !a.starts_with('-'))
@@ -196,12 +203,32 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         _ => {}
     }
 
+    // Load config before tracing so verbosity: takes effect.
+    // Unknown-directive warnings from the parser are silently dropped here;
+    // they will reappear on reload if the operator adds an unknown key.
+    let mut unbound_cfg = config::load(&cfg_path)?;
+
+    // Init tracing: RUST_LOG env var > verbosity: directive > WARN.
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_env("RUST_LOG"))
+            .init();
+    } else {
+        let level = verbosity_to_level(unbound_cfg.verbosity);
+        tracing_subscriber::fmt()
+            .with_max_level(level)
+            .init();
+    }
+
     runtime::BASE_DIR.set(base_dir.clone())
         .expect("BASE_DIR set twice — this is a bug");
     info!(base_dir = %base_dir.display(), "Runtime base_dir");
 
-    info!(path = %cfg_path, "Loading config");
-    let mut unbound_cfg = config::load(&cfg_path)?;
+    info!(
+        path = %cfg_path,
+        verbosity = unbound_cfg.verbosity,
+        "Config loaded"
+    );
 
     // ── HSM: load key material from PKCS#11 device (if configured) ───────────
     // Must run before init_api_key() and integrity::store_key() so the HSM
@@ -221,7 +248,7 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         local_zones   = unbound_cfg.local_zones.len(),
         local_data    = unbound_cfg.local_data.len(),
         forward_zones = unbound_cfg.forward_zones.len(),
-        "Config loaded"
+        "Server config"
     );
 
     if args.iter().any(|a| a == "--no-xdp") {
@@ -493,7 +520,7 @@ fn print_help() {
 ",
         "                        > auto-generated (256-bit CSPRNG, saved to api.key)
 ",
-        "    RUST_LOG            Log level filter  [default: info]
+        "    RUST_LOG            Log level filter. Overrides verbosity: in unbound.conf.
 ",
         "                        Examples: RUST_LOG=debug  RUST_LOG=runbound=trace
 ",
@@ -654,13 +681,34 @@ fn run_check_config(path: &str) -> i32 {
         }
     };
 
-    // ── 2. rate-limit ──────────────────────────────────────────────────────
+    // ── 2. verbosity ───────────────────────────────────────────────────────
+    {
+        let level_name = match cfg.verbosity {
+            0 => "error",
+            1 => "warn",
+            2 => "info",
+            _ => "debug",
+        };
+        println!("[OK]   verbosity: {} ({})", cfg.verbosity, level_name);
+        if cfg.verbosity > 1 && cfg.port == 53
+            && cfg.rate_limit.map(|r| r > 0).unwrap_or(true)
+        {
+            println!(
+                "[WARN] verbosity: {} ({}) logs every query — expect significant CPU \
+                 overhead above 10k QPS. Use verbosity: 1 for production.",
+                cfg.verbosity, level_name
+            );
+            warnings += 1;
+        }
+    }
+
+    // ── 3. rate-limit ──────────────────────────────────────────────────────
     match cfg.rate_limit {
         None | Some(0) => println!("[OK]   Rate limit: disabled (unlimited)"),
         Some(n)        => println!("[OK]   Rate limit: {n} QPS per source IP"),
     }
 
-    // ── 3. Data directory writable ─────────────────────────────────────────
+    // ── 4. Data directory writable ─────────────────────────────────────────
     let base_dir = std::path::Path::new(path)
         .parent()
         .map(|p| p.to_path_buf())
@@ -677,18 +725,18 @@ fn run_check_config(path: &str) -> i32 {
         }
     }
 
-    // ── 4. Port availability ───────────────────────────────────────────────
+    // ── 5. Port availability ───────────────────────────────────────────────
     check_cfg_port(cfg.port, &mut errors);
 
-    // ── 5. Capabilities (Linux only) ───────────────────────────────────────
+    // ── 6. Capabilities (Linux only) ───────────────────────────────────────
     #[cfg(target_os = "linux")]
     check_cfg_capabilities(&mut warnings);
 
-    // ── 6. RLIMIT_MEMLOCK (Linux only) ─────────────────────────────────────
+    // ── 7. RLIMIT_MEMLOCK (Linux only) ─────────────────────────────────────
     #[cfg(target_os = "linux")]
     check_cfg_rlimit_memlock(&mut warnings);
 
-    // ── 7. XDP interface type (Linux only) ─────────────────────────────────
+    // ── 8. XDP interface type (Linux only) ─────────────────────────────────
     #[cfg(target_os = "linux")]
     check_cfg_xdp_interface(&cfg, &mut warnings);
 
