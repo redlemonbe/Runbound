@@ -4,7 +4,7 @@
 
 ### Test environment
 
-**DNS server — dragonrage (192.168.10.250)**
+**DNS server**
 
 | Component | Value |
 |---|---|
@@ -17,7 +17,7 @@
 | Storage | NVMe (0 ms rotational) |
 | Architecture | bond0.10 → br-rb + veth-rb (.250) — see [docs/proxmox.md](proxmox.md) |
 
-**Client — codix-gaming (192.168.10.200) — Dell PowerEdge T620**
+**Client — Dell PowerEdge T620**
 
 | Component | Value |
 |---|---|
@@ -108,20 +108,6 @@ at 150% of the detected ceiling. No crashes, no memory leaks observed.
 - Blacklist performance at scale (100k+ entries)
 - HA master/slave replication
 - Performance under random/uncached queries (cache-miss rate)
-
----
-
-### Context: consumer router comparison
-
-For reference, the same dnsmark benchmark protocol run against a Unifi aggregation
-router used as a DNS server:
-
-| Metric | Unifi router | Bare metal (all three) |
-|---|---|---|
-| QPS ceiling | 258 QPS | 128 000 QPS |
-| Packet loss at ceiling | 27% | 0.00% |
-| p99 latency | ~200 ms | < 0.3 ms |
-| Factor | ×1 | **×496** |
 
 ---
 
