@@ -1,7 +1,7 @@
 # Security Architecture
 
 This document covers the security model, defensive layers, and all audit findings
-fixed across Runbound releases through v0.4.5.
+fixed across Runbound releases through v0.4.14.
 
 ---
 
@@ -19,10 +19,12 @@ Internet / LAN
 │  Rate limiter (token bucket)                        │  ← per-source-IP, DashMap+ahash
 │  Inflight semaphore (max 4096)                      │  ← hard OOM backstop
 ├─────────────────────────────────────────────────────┤
-│  XDP fast path (optional)                           │  ← same ACL + rate limit enforced
+│  AF/XDP fast path (default on)                      │  ← local-zone answered in user   │
+│    ACL + rate limit enforced before any reply       │    space, XDP_PASS for recursive  │
 ├─────────────────────────────────────────────────────┤
 │  DNS engine (hickory-server 0.26)                   │
 │  Zone lookup / forwarding                           │
+│  CPU-pinned workers (physical cores, HT excluded)   │  ← per-core tokio + DNS workers
 └─────────────────────────────────────────────────────┘
       │
       ▼
@@ -66,7 +68,8 @@ rate-limit: 500    # max queries per second per IP
   concurrent access.
 - Excess queries receive a REFUSED response — no amplification possible.
 - Shared between the standard path and the XDP fast path.
-- Disable with `rate-limit: 0` (not recommended for public-facing resolvers).
+- Setting `rate-limit: 0` **disables** rate limiting entirely — every query is passed without
+  a bucket check. On public-facing resolvers, this is not recommended.
 
 ---
 
@@ -81,22 +84,31 @@ new requests receive REFUSED immediately without allocating any additional memor
 
 ### 2. Memory pressure guard
 
-A background task reads `/proc/meminfo` every **30 seconds**. When system RAM usage
-reaches **80 %**, two caches are purged atomically:
+A background task reads `/proc/meminfo` every **30 seconds** and operates in four
+bands based on `used = 1 − MemAvailable / MemTotal`:
 
-- **Rate-limiter DashMap** — all token buckets cleared.
-- **hickory-resolver cache** — rebuilt and atomically swapped via ArcSwap.
+| Band | Action |
+|---|---|
+| **< 60 %** | Scale up: restore cache toward optimal size (5-minute cooldown between upscales) |
+| **60 – 70 %** | Stable — no action |
+| **70 – 80 %** | Moderate pressure: halve cache size (floor 512 entries) |
+| **≥ 80 %** | High pressure: recalculate cache from current RAM + flush rate-limiter buckets |
 
-After the purge, the new usage level is logged. If usage is still above 50 %, a
-second warning is emitted.
+Cache changes take effect by rebuilding the hickory resolver and atomically swapping
+it via **ArcSwap**. In-flight queries keep their `Arc` reference until completion —
+no query is dropped mid-flight.
+
+**Auto-sized cache at startup:** cache capacity is computed from `MemAvailable`
+at launch (10 % of available RAM ÷ 512 B per entry), clamped to **[512, 65 536]**
+entries. Falls back to 8 192 when `/proc/meminfo` is unavailable.
 
 On non-Linux systems or containers without `/proc/meminfo`, the guard silently
 skips its check.
 
 ```
-WARN Memory pressure — purging DNS caches  used_pct=82.3%  avail_mb=312  total_mb=1753
-WARN DNS resolver cache flushed and rate limiter cleared  freed_buckets=8241
-WARN Memory after purge  used_pct=44.1%  status="below 50% target"
+WARN memory pressure — cache halved  used_pct=74.2%  cache_from=8192  cache_to=4096
+WARN memory pressure high — cache flushed, resized, rate limiter cleared
+     used_pct=82.3%  cache_from=4096  cache_to=2048  freed_buckets=8241
 ```
 
 **The memory guard is always active — no configuration required.**
@@ -241,11 +253,50 @@ owner and group readable only, with HMAC sidecar integrity verification.
 
 ---
 
+## CPU affinity
+
+Runbound pins each worker thread to a distinct **physical CPU core**, with
+HyperThreading siblings excluded. This applies to both:
+
+- **Tokio async workers** — the runtime thread pool is sized to the physical
+  core count and each thread is pinned via `sched_setaffinity(2)`.
+- **DNS socket workers** — one `SO_REUSEPORT` UDP socket per physical core.
+
+Core topology is read from
+`/sys/devices/system/cpu/cpuN/topology/core_id`. When `/sys` is unavailable
+(containers, non-Linux), the affinity step is silently skipped and the process
+continues with OS-scheduled threads.
+
+CPU affinity can be disabled in `unbound.conf`:
+
+```
+cpu-affinity: no   # default: yes
+```
+
+---
+
 ## XDP path security
 
-**ACL enforcement in XDP (SEC-02):** The AF/XDP fast path applies the full ACL
-before answering any query. `Deny` → silent drop; `Refuse` → REFUSED frame
-crafted directly in the XDP worker.
+**Default-on since v0.4.14.** The AF/XDP fast path intercepts UDP port-53 packets
+at the NIC driver level via an eBPF XDP program, answers **local-zone queries
+entirely in user space**, and returns `XDP_PASS` for everything else (recursive
+queries, AAAA on an A-only name, ANY, etc.) so they continue up through the normal
+hickory-server path.
+
+**ACL and rate-limit enforcement in XDP:** Both checks run inside the XDP worker
+before any DNS response is constructed.
+- `Deny` ACL rule → silent drop (`XDP_DROP`).
+- `Refuse` ACL rule → REFUSED frame crafted and sent directly from the worker.
+- Rate-limit exceeded → REFUSED frame, same as the kernel path.
+
+**Systemd requirements:** `LimitMEMLOCK=infinity` is required in the service file
+for AF/XDP UMEM allocation. The provided `runbound.service` sets this automatically.
+`install.sh` detects Intel XDP-native NICs (ixgbe/i40e/ice/igc) and configures
+the appropriate capabilities (`CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF`).
+
+**Fallback:** If XDP initialisation fails (missing capabilities, unsupported NIC,
+kernel < 5.10), Runbound logs a descriptive `WARN` with an actionable hint and
+continues on the `SO_REUSEPORT` kernel path. The process does not panic.
 
 ---
 
@@ -380,6 +431,46 @@ See [systemd.md](systemd.md) for the full unit file.
 | PENTEST-SEC02 | Info | Domain 253-char boundary (confirmed false positive + HTTP integration tests) | v0.4.5 |
 | PENTEST-SEC04 | Low | JSON POST without `Content-Length` → 411 (eliminates chunked TCP drop) | v0.4.5 |
 | PENTEST-LOW | Low | Null byte in URL path → TCP drop (hyper parse layer, documented) | v0.4.5 |
+
+### v0.4.6
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| QUAL-05 | — | `main()` decomposed: 344-line function split into `handle_cli_flags()`, `init_runtime()`, `build_and_launch()` | v0.4.6 |
+| QUAL-06 | — | `handle_request()` split into `handle_local_zone()` + `resolve_upstream()`, Result-based handler ownership | v0.4.6 |
+| QUAL-07 | — | `add_dns_handler()` split: `validate_dns_entry()` + `persist_and_swap()` extracted | v0.4.6 |
+| QUAL-08 | — | `metrics_handler()` split: `fmt_counter()`, `fmt_gauge()`, `render_prometheus_metrics()` extracted | v0.4.6 |
+| PERF-02 | — | Zero-alloc identity-probe: `OnceLock<[LowerName; 4]>` eliminates a `String` allocation per DNS request | v0.4.6 |
+| PERF-03 | — | `BIND_V4`/`BIND_V6` now `const SocketAddr`, removing `.parse().unwrap()` in hot probe path | v0.4.6 |
+
+### v0.4.7
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| BUG-RATELIMIT | Medium | `rate-limit: 0` refused every query instead of disabling rate limiting | v0.4.7 |
+
+### v0.4.8
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| FEAT-AFFINITY | — | CPU affinity for tokio workers and DNS socket workers — physical cores, HT excluded | v0.4.8 |
+
+### v0.4.9
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| FEAT-CACHE-AUTO | — | Cache auto-sized from `MemAvailable` at startup (10 %, clamped [512, 65 536]) | v0.4.9 |
+| FEAT-MEMGUARD | — | Memory guard upgraded to 4-band system (< 60 / 60–70 / 70–80 / ≥ 80 %) | v0.4.9 |
+| FEAT-WORKERS | — | DNS socket workers use physical core count (consistent with tokio affinity) | v0.4.9 |
+
+### v0.4.14
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| FEAT-XDP | — | AF/XDP kernel-bypass fast path — local-zone queries answered in user space at NIC driver level | v0.4.14 |
+| FIX-XDP-VERIFIER | — | eBPF program rewritten with constant IHL=20 — eliminates BPF verifier rejection on variable pointer arithmetic | v0.4.14 |
+| FIX-XDP-UMEM | — | `LimitMEMLOCK=infinity` added to `runbound.service` — fixes UMEM allocation failure under systemd sandboxing | v0.4.14 |
+| FIX-XDP-FALLBACK | — | XDP init failure now logs actionable `WARN` and falls back to SO_REUSEPORT — process no longer panics | v0.4.14 |
 
 See [security-audit.md](security-audit.md) for the full white-box audit report.
 
