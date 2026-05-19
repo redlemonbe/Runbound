@@ -9,7 +9,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [0.4.17] — 2026-05-19
+## [0.4.2] — 2026-05-19
 
 ### Added
 
@@ -1179,7 +1179,7 @@ v0.4.0. See `audit.toml` for per-CVE exposure analysis and mitigations.
 ---
 
 [Unreleased]: https://github.com/redlemonbe/Runbound/compare/v0.4.16...HEAD
-[0.4.17]: https://github.com/redlemonbe/Runbound/compare/v0.4.16...v0.4.17
+[0.4.2]: https://github.com/redlemonbe/Runbound/compare/v0.4.16...v0.4.2
 [0.4.16]: https://github.com/redlemonbe/Runbound/compare/v0.4.15...v0.4.16
 [0.4.15]: https://github.com/redlemonbe/Runbound/compare/v0.4.14...v0.4.15
 [0.3.1]: https://github.com/redlemonbe/Runbound/compare/v0.3.0...v0.3.1
