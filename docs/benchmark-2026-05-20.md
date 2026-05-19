@@ -8,7 +8,7 @@
 
 ## Hardware
 
-### DNS server — dragonrage (192.168.10.250)
+### DNS server
 
 | Component | Value |
 |---|---|
@@ -19,9 +19,9 @@
 | NIC | 2× Intel X540 (ixgbe) 10 GbE fibre — LACP 802.3ad, MTU 9 000 |
 | OS | Debian GNU/Linux 13 (trixie) — kernel 6.17.13-1-pve |
 | Storage | NVMe (0 ms rotational) |
-| Architecture | bond0.10 → br-rb + veth-rb (.250) — see docs/proxmox.md |
+| Architecture | bond0.10 → br-rb + veth-rb — see [docs/proxmox.md](proxmox.md) |
 
-### Client — codix-gaming (192.168.10.200) — Dell PowerEdge T620
+### Client — Dell PowerEdge T620
 
 | Component | Value |
 |---|---|
@@ -105,7 +105,7 @@ Four phases, run sequentially, identical procedure for all three servers:
 #### Phase 2 — Ceiling detection
 
 ```
-dnsmark --ramp --no-xdp -d /tmp/queries.txt -s 192.168.10.250
+dnsmark --ramp --no-xdp -d /tmp/queries.txt -s <SERVER_IP>
 
 Ramp: target QPS ->   2000  (burst: 128000/s)
 Ramp: target QPS ->   4000  (burst: 128000/s)
@@ -180,7 +180,7 @@ Run time: 60.002 s
 #### Phase 2 — Ceiling detection
 
 ```
-dnsmark --ramp --no-xdp -d /tmp/queries.txt -s 192.168.10.250
+dnsmark --ramp --no-xdp -d /tmp/queries.txt -s <SERVER_IP>
 
 Ramp: target QPS ->   2000  (burst: 128000/s)
 Ramp: target QPS ->   4000  (burst: 128000/s)
@@ -251,7 +251,7 @@ Run time: 60.001 s
 #### Phase 2 — Ceiling detection
 
 ```
-dnsmark --ramp --no-xdp -d /tmp/queries.txt -s 192.168.10.250
+dnsmark --ramp --no-xdp -d /tmp/queries.txt -s <SERVER_IP>
 
 Ramp: target QPS ->   2000  (burst: 128000/s)
 Ramp: target QPS ->   4000  (burst: 128000/s)
@@ -341,19 +341,6 @@ Always use `verbosity: 1` for production benchmarks and production deployments.
 
 ---
 
-## Context: consumer router comparison
-
-Same dnsmark protocol run against a Unifi aggregation router used as a DNS server:
-
-| Metric | Unifi router | Bare metal (all three) |
-|---|---|---|
-| QPS ceiling | 258 QPS | 128 000 QPS |
-| Packet loss at ceiling | 27% | 0.00% |
-| p99 latency | ~200 ms | < 0.3 ms |
-| Factor | ×1 | **×496** |
-
----
-
 ## Caveats
 
 1. **Client NIC bottleneck** — the Emulex be2net NIC saturates at ~128 000 QPS. All
@@ -379,7 +366,7 @@ Same dnsmark protocol run against a Unifi aggregation router used as a DNS serve
 
 Expected configuration:
 - Client: Intel X540-T2 (ixgbe, AF/XDP supported)
-- Server: same dragonrage (Intel X540, ixgbe, native XDP zero-copy)
+- Server: Intel X540 (ixgbe, native XDP zero-copy)
 - Expected range: 500 000 – 14 000 000 QPS
 - BIND9 / Unbound: no XDP — comparison becomes one-sided above ~500k QPS
 
