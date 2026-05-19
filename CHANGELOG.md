@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.15] — 2026-05-19
+
+### Added
+
+- **`runbound --check-config [path]`** — validate config and systemd security
+  parameters without starting the server. Checks: config parse, rate-limit,
+  data directory writable, port 53 availability, `CAP_NET_RAW` / `CAP_NET_ADMIN` /
+  `CAP_BPF` (XDP capabilities), `RLIMIT_MEMLOCK` (XDP UMEM). Exit codes:
+  `0` = clean, `1` = critical error, `2` = warnings only.
+- **`docs/hardening.md`** — silent-failure reference for every security-sensitive
+  systemd parameter: capabilities, `AF_XDP`, `LimitMEMLOCK`, `MemoryDenyWriteExecute`,
+  `ProtectKernelModules`, `rate-limit` semantics. Includes a complete hardened
+  service file template.
+
+### Changed
+
+- **README installation section** restructured — recommended automatic script vs
+  manual installation, with explicit warning about silent misconfigurations and
+  pointer to `docs/hardening.md` and `--check-config`.
+- **`docs/security.md`** updated to v0.4.14: memory guard 4-band description,
+  auto-sized cache, XDP default-on section, CPU affinity section, `rate-limit: 0`
+  corrected, audit findings v0.4.6 → v0.4.14 added.
+- All occurrences of "military audit" replaced with "IA audit" across documentation.
+
+---
+
 ## [0.4.14] — 2026-05-18
 
 ### Added
