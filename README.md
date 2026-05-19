@@ -168,7 +168,6 @@ Benchmarks run from a dedicated client machine (never from the DNS server):
 
 | Hardware | Tool | Runbound | BIND9 | Unbound | Notes |
 |---|---|---|---|---|---|
-| 4-core KVM VM | dnsmark | ~16 000 q/s | — | — | 2 vCPU, loopback |
 | AMD TR PRO 5995WX (bare metal) | dnsmark 0.4.5 | 105 846 q/s | 105 919 q/s | 105 781 q/s | NIC-limited (be2net 128k ceiling), verbosity:1 |
 | AF/XDP bare metal Intel ixgbe | dnsmark | 500k – 14M q/s | ❌ | ❌ | kernel-bypass — next benchmark |
 
