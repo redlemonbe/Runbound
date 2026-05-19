@@ -86,7 +86,10 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
     // The handle must stay alive for the entire process lifetime; dropping it
     // would detach the XDP program and destroy the XSKMAP.
     #[cfg(feature = "xdp")]
-    let _xdp_handle = {
+    let _xdp_handle = if !cfg.xdp {
+        info!("XDP fast path disabled (xdp: no / --no-xdp)");
+        None
+    } else {
         let iface = cfg.interfaces.first()
             .and_then(|s| {
                 let s = s.trim();
@@ -100,7 +103,8 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         match iface {
             Some(ref iface_name) => {
                 match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl)) {
-                    Ok(h)  => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); Some(h) }
+                    Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); Some(h) }
+                    Ok(None)    => None, // virtual interface or self-test — already warned
                     Err(e) => {
                         let reason = if e.contains("BPF_PROG_LOAD") {
                             "eBPF program rejected by kernel verifier"
@@ -166,7 +170,8 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         )
         .init();
 
-    let cfg_path = args.get(1)
+    let cfg_path = args.iter().skip(1)
+        .find(|a| !a.starts_with('-'))
         .cloned()
         .unwrap_or_else(|| "/etc/unbound/unbound.conf".to_string());
 
@@ -196,7 +201,7 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
     info!(base_dir = %base_dir.display(), "Runtime base_dir");
 
     info!(path = %cfg_path, "Loading config");
-    let unbound_cfg = config::load(&cfg_path)?;
+    let mut unbound_cfg = config::load(&cfg_path)?;
 
     // ── HSM: load key material from PKCS#11 device (if configured) ───────────
     // Must run before init_api_key() and integrity::store_key() so the HSM
@@ -218,6 +223,10 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         forward_zones = unbound_cfg.forward_zones.len(),
         "Config loaded"
     );
+
+    if args.iter().any(|a| a == "--no-xdp") {
+        unbound_cfg.xdp = false;
+    }
 
     Ok((unbound_cfg, base_dir, cfg_path))
 }
@@ -468,6 +477,14 @@ fn print_help() {
 ",
         "                                 Exit codes: 0=clean  1=error  2=warnings only
 ",
+        "        --no-xdp                 Disable AF/XDP kernel-bypass fast path at runtime
+",
+        "                                 Equivalent to 'xdp: no' in unbound.conf
+",
+        "                                 Useful for troubleshooting or environments without
+",
+        "                                 CAP_NET_ADMIN/CAP_BPF/AF_XDP (containers, VMs)
+",
         "
 ",
         "ENVIRONMENT:
@@ -487,6 +504,14 @@ fn print_help() {
         "    rate-limit: 200     DNS queries/second per source IP
 ",
         "                        Default: 200 (residential). Use 5000+ for shared resolvers.
+",
+        "    xdp: no             Disable AF/XDP kernel-bypass fast path (default: yes)
+",
+        "                        Equivalent to --no-xdp on the command line
+",
+        "    cpu-affinity: no    Disable CPU pinning (default: yes)
+",
+        "                        Use in containers that lack CAP_SYS_NICE
 ",
         "    api-key: <secret>   REST API key (overridden by RUNBOUND_API_KEY env var)
 ",
@@ -663,6 +688,10 @@ fn run_check_config(path: &str) -> i32 {
     #[cfg(target_os = "linux")]
     check_cfg_rlimit_memlock(&mut warnings);
 
+    // ── 7. XDP interface type (Linux only) ─────────────────────────────────
+    #[cfg(target_os = "linux")]
+    check_cfg_xdp_interface(&cfg, &mut warnings);
+
     // ── Summary ────────────────────────────────────────────────────────────
     if errors > 0 {
         println!("Config check failed ({errors} error(s), {warnings} warning(s))");
@@ -731,10 +760,58 @@ fn check_cfg_rlimit_memlock(warnings: &mut u32) {
     unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl); }
     if rl.rlim_cur == libc::RLIM_INFINITY {
         println!("[OK]   RLIMIT_MEMLOCK: unlimited");
-    } else {
-        println!("[WARN] RLIMIT_MEMLOCK is limited ({} bytes) — XDP UMEM allocation will fail", rl.rlim_cur);
+        return;
+    }
+    let under_systemd = std::env::var("INVOCATION_ID").is_ok()
+        || std::fs::read_to_string("/proc/1/comm")
+            .map(|s| s.trim().contains("systemd"))
+            .unwrap_or(false);
+    let mb = rl.rlim_cur / (1024 * 1024);
+    if under_systemd {
+        println!("[WARN] RLIMIT_MEMLOCK is limited ({}MB) — XDP UMEM allocation will fail", mb);
         println!("       Fix: add LimitMEMLOCK=infinity to the systemd service file");
         *warnings += 1;
+    } else {
+        println!("[INFO] RLIMIT_MEMLOCK = {}MB — running outside systemd.", mb);
+        println!("       At runtime LimitMEMLOCK=infinity from the service file will apply.");
+        println!("       Run 'runbound --check-config' via systemd-run to test under real");
+        println!("       runtime conditions.");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_cfg_xdp_interface(cfg: &config::parser::UnboundConfig, warnings: &mut u32) {
+    use dns::xdp::socket::{default_interface, iface_for_ip, is_virtual_interface};
+    if !cfg.xdp {
+        println!("[OK]   XDP disabled in config — interface check skipped");
+        return;
+    }
+    let iface = cfg.interfaces.first()
+        .and_then(|s| {
+            let s = s.trim();
+            if s == "0.0.0.0" || s == "::" || s.is_empty() { return None; }
+            if s.parse::<std::net::IpAddr>().is_ok() { return iface_for_ip(s); }
+            Some(s.to_string())
+        })
+        .or_else(default_interface);
+    let iface_name = match iface {
+        Some(ref i) => i.as_str(),
+        None => {
+            println!("[WARN] Could not determine network interface — XDP interface check skipped");
+            *warnings += 1;
+            return;
+        }
+    };
+    if is_virtual_interface(iface_name) {
+        println!("[WARN] '{}' is a virtual interface (ipvlan / macvlan / bridge / veth) \
+                  — AF/XDP requires a physical NIC or a direct VLAN sub-interface \
+                  (e.g. bond0.10).", iface_name);
+        println!("       XDP will be disabled at runtime; DNS will fall back to UDP.");
+        println!("       Suggestion: bind Runbound directly to the physical interface");
+        println!("       or VLAN sub-interface instead.");
+        *warnings += 1;
+    } else {
+        println!("[OK]   Interface '{}' is physical — XDP compatible", iface_name);
     }
 }
 

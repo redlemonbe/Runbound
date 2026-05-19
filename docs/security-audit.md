@@ -1,6 +1,6 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.16  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.16 live pentest  
 **Last updated:** 2026-05-19  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration  
 **Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4)
@@ -9,16 +9,17 @@
 
 ## Executive Summary
 
-**55 findings across 6 audit cycles — 100% resolved as of v0.4.16.**
+**57 findings across 7 audit cycles — 55 resolved, 2 open (targeted v0.4.17).**
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
+| Live pentest | v0.4.16 | 2 bugs + 13 PASS + 2 observations | ⚠️ 2 bugs open → v0.4.17 |
+| Pre-release white-box | v0.4.16 | 5 (2 Medium, 3 Low) | ✅ All fixed v0.4.16 |
 | Initial white-box | v0.2.3 | 20 (4 Critical, 8 High, 5 Medium, 3 Low) | ✅ All fixed v0.2.4–v0.4.0 |
 | Second white-box | v0.3.3 | 9 (1 High, 6 Medium, 2 Low) | ✅ All fixed v0.3.3–v0.3.5 |
 | Third white-box | v0.4.0 | 8 (1 Blocking, 2 Medium, 5 Low) | ✅ All fixed v0.4.1 |
 | IA audit | v0.4.1 | 9 (3 Low, 3 Info, 2 Doc, 1 false positive) | ✅ All closed v0.4.3 |
 | External pentest | v0.4.4 | 4 (1 High, 1 Medium/false positive, 1 Low, 1 Info) | ✅ All closed v0.4.5 |
-| Pre-release white-box | v0.4.16 | 5 (2 Medium, 3 Low) | ✅ All fixed v0.4.16 |
 
 Runbound's core DNS path is well-engineered: memory-safe Rust, lock-free hot path
 via ArcSwap, per-IP token-bucket rate limiting with aggressive eviction, RFC 8482
@@ -32,7 +33,7 @@ findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0
 A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
 through SEC-16), all fixed in v0.3.3.
 
-**All HIGH and MEDIUM open findings are closed as of v0.4.0. All 5 pre-release findings from the v0.4.16 cycle are also resolved:**
+**All HIGH and MEDIUM findings are closed. 2 LOW bugs from the v0.4.16 live pentest are open and targeted for v0.4.17 (VUL-3.2 rate limit not wired, VUL-6.2 cap not enforced on non-loopback).**
 
 - JSON store HMAC-SHA256 integrity (HIGH-06) — `RUNBOUND_STORE_KEY` env var, sidecar `.mac` files.
 - TLS cipher suite hardening (HIGH-07) — hickory 0.26 + rustls 0.23, TLS 1.3 default.
@@ -722,6 +723,78 @@ null bytes in a URI). No data is leaked; the client sees a connection reset.
 
 ---
 
+## Live Pentest — v0.4.16
+
+**Date:** 2026-05-19  
+**Scope:** `src/api/mod.rs`, `src/dns/server.rs`, DNS protocol handling, REST API  
+**Methodology:** Black-box + white-box, automated + manual  
+**Status:** 13 checks PASS, 2 bugs found (open → v0.4.17), 2 observations
+
+---
+
+### Results — PASS
+
+| Test | Expected | Result |
+|---|---|---|
+| DNS resolution (A, AAAA, TCP) | Correct answers | ✅ PASS |
+| Blacklist enforcement | REFUSED rcode | ✅ PASS |
+| ANY → NOTIMP | NOTIMP rcode | ✅ PASS |
+| Compression pointer loop | FORMERR | ✅ PASS |
+| Label > 63 bytes | FORMERR | ✅ PASS |
+| QNAME > 253 bytes | FORMERR | ✅ PASS |
+| Zero-length UDP packet | Dropped | ✅ PASS |
+| Truncated header (5 bytes) | Dropped | ✅ PASS |
+| RRSIG amplification | 0 bytes (blocked) | ✅ PASS |
+| Log injection (`\r\n` in QNAME) | Escaped as `\012\015` | ✅ PASS |
+| API authentication (no token / wrong token) | HTTP 401 | ✅ PASS |
+| API input validation (path traversal, XSS, buffer overflow) | HTTP 400 / 405 | ✅ PASS |
+| XDP compiled by default, active on ens18 | XDP fast path active | ✅ PASS |
+
+---
+
+### Results — FAIL
+
+#### BUG-1 — `/reload` rate limit (2 RPS) not enforced
+
+**Severity:** Low  
+**File:** `src/api/mod.rs`  
+**Status:** ⚠️ Open — fix targeted for v0.4.17
+
+**Test:** 10 rapid `POST /reload` requests sent within 500 ms.  
+**Actual:** 10 × HTTP 200, zero 429 responses.  
+**Expected:** HTTP 429 after the 2nd request within the 500 ms window.
+
+The dedicated `ReloadLimiter` token bucket was added in v0.4.16 (VUL-3.2) but is not
+correctly wired into the request path — the check does not gate the handler in practice.
+
+---
+
+#### BUG-2 — TCP per-IP connection cap (20) not enforced
+
+**Severity:** Low  
+**File:** `src/dns/server.rs` (`TcpConnTracker`)  
+**Status:** ⚠️ Open — fix targeted for v0.4.17
+
+**Test:** 30 simultaneous TCP connections opened from 127.0.0.1.  
+**Actual:** All 30 accepted.  
+**Expected:** Connections beyond 20 refused.
+
+**Note:** 127.0.0.1 (loopback) is intentionally exempt from the cap by design. The test
+should be re-run from a non-loopback source IP to confirm whether the cap fails for external
+addresses as well. The reported failure may be entirely explained by the loopback exemption,
+but the enforcement path for non-loopback sources has not been independently verified.
+
+---
+
+### Observations
+
+| # | Description | Priority |
+|---|---|---|
+| OBS-1 | Unknown opcode (7) returns NOERROR instead of NOTIMP — inherent hickory-server behaviour | Low |
+| OBS-2 | `api.md` documented port 8081 but default REST API port is 8080 — corrected in this doc update | Fixed |
+
+---
+
 ## Pre-release Audit Cycle — v0.4.16
 
 **Scope:** `src/dns/xdp/umem.rs`, `src/dns/xdp/worker.rs`, `src/dns/ratelimit.rs`,
@@ -857,8 +930,12 @@ rate limiter still applies in addition.
 
 ## Open Findings
 
-All findings from all audit cycles are resolved as of v0.4.16.
-No open findings remain.
+| ID | Severity | Title | Target |
+|---|---|---|---|
+| BUG-1 | Low | `/reload` rate limit (2 RPS) not enforced — `ReloadLimiter` not wired into request path | v0.4.17 |
+| BUG-2 | Low | TCP per-IP connection cap (20) not enforced for non-loopback sources (loopback exempt by design) | v0.4.17 |
+
+All other findings from all prior audit cycles are resolved.
 
 ---
 
@@ -894,4 +971,7 @@ v0.4.16 adds: release-mode UMEM bounds check returning `Option` in `src/dns/xdp/
 `src/dns/xdp/worker.rs` (VUL-2.1); IPv6 /48 normalisation in `src/dns/ratelimit.rs` and
 `src/dns/server.rs` (VUL-6.1); TCP per-IP cap via loopback relay in `src/dns/server.rs`
 (VUL-6.2); `sanitize_error()` at 8 API error sites in `src/api/mod.rs` (VUL-3.4);
-`ReloadLimiter` token bucket (2 RPS) in `src/api/mod.rs` + `src/main.rs` (VUL-3.2).*
+`ReloadLimiter` token bucket (2 RPS) in `src/api/mod.rs` + `src/main.rs` (VUL-3.2).
+v0.4.16 live pentest (2026-05-19): 13 PASS, 2 bugs open (BUG-1: ReloadLimiter not wired;
+BUG-2: TcpConnTracker not enforced for non-loopback) → targeted v0.4.17; `api.md` port
+corrected from 8081 to 8080.*

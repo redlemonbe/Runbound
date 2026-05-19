@@ -127,7 +127,10 @@ On bare metal with a NIC that supports XDP driver mode:
 - Sub-millisecond latency under load
 - ACL and rate-limit enforcement still applied in XDP worker (no bypass)
 
-See [xdp.md](xdp.md) for setup instructions.
+XDP is enabled by default in all published binaries. To disable it at runtime without
+recompiling, add `xdp: no` to `unbound.conf` or pass `--no-xdp` on the command line.
+
+See [xdp.md](xdp.md) for setup instructions and disable options.
 
 ---
 

@@ -149,7 +149,7 @@ Set `logfile: ""` or omit it to log to stdout (recommended with systemd).
 ```
 # In config (not recommended for production):
 api-key: "change-me"
-api-port: 9090       # optional — default 8081
+api-port: 9090       # optional — default 8080
 
 # Preferred — environment variable (never stored in config file):
 # export RUNBOUND_API_KEY="$(openssl rand -hex 32)"
@@ -339,7 +339,7 @@ to prefer the environment variable. When the env var is set it overrides the con
 **Read the last N entries via the API:**
 
 ```bash
-curl -s -H "Authorization: Bearer $KEY" http://localhost:8081/audit/tail?n=50
+curl -s -H "Authorization: Bearer $KEY" http://localhost:8080/audit/tail?n=50
 ```
 
 See [api.md](api.md) for the full `/audit/tail` endpoint documentation.
@@ -389,6 +389,37 @@ WARN Memory pressure — purging DNS caches  used_pct=82.3%  avail_mb=312  total
 WARN DNS resolver cache flushed and rate limiter cleared  freed_buckets=8241
 WARN Memory after purge  used_pct=44.1%  status="below 50% target"
 ```
+
+### XDP kernel-bypass fast path
+
+```
+server:
+    xdp: no    # default: yes
+```
+
+Disables the AF/XDP kernel-bypass fast path at runtime without recompiling. When set
+to `no`, Runbound starts on the standard `SO_REUSEPORT` kernel path. All DNS features
+remain active — only the kernel-bypass acceleration is skipped.
+
+Equivalent to passing `--no-xdp` on the command line.
+
+Use `xdp: no` when:
+- The host lacks `CAP_NET_ADMIN`, `CAP_BPF`, or the `AF_XDP` address family
+  (typical in containers, some cloud VMs, or restricted systemd sandboxing)
+- Troubleshooting NIC compatibility issues
+- The XDP program is rejected by the kernel BPF verifier
+
+See [xdp.md](xdp.md) for full requirements and capability configuration.
+
+### CPU affinity
+
+```
+server:
+    cpu-affinity: no    # default: yes
+```
+
+Disables pinning tokio worker threads and DNS socket workers to physical CPU cores.
+Set to `no` in containers or environments without `CAP_SYS_NICE`.
 
 ### Cache TTL cap
 
@@ -494,7 +525,7 @@ server:
     tls-service-key:    /etc/runbound/key.pem
     dot-client-auth-ca: /etc/runbound/client-ca.pem   # optional — mTLS for DoT
 
-    api-port:  8081
+    api-port:  8080
     logfile:   ""
     verbosity: 1
 
@@ -592,7 +623,7 @@ lightweight regardless of feed size.
 | Port | Protocol | Purpose |
 |---|---|---|
 | 53 | UDP + TCP | DNS (all nodes) |
-| 8081 | HTTP | REST API (localhost only, all nodes) |
+| 8080 | HTTP | REST API (localhost only, all nodes) |
 | 8082 | HTTPS | Sync server (master only, network-accessible) |
 
 The sync port number is configurable. The REST API stays on localhost on all nodes.
@@ -650,7 +681,7 @@ NEW_KEY=$(openssl rand -hex 32)
 export RUNBOUND_API_KEY="$NEW_KEY"   # or update your systemd EnvironmentFile
 
 # 2. Rotate — call with the CURRENT key, the new key is read from env:
-curl -X POST http://localhost:8081/rotate-key \
+curl -X POST http://localhost:8080/rotate-key \
   -H "Authorization: Bearer $OLD_KEY"
 
 # 3. From this point on, $NEW_KEY is required for all API calls.

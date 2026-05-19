@@ -130,6 +130,9 @@ pub struct UnboundConfig {
     /// Pin each tokio worker thread to a distinct physical core (HT excluded).
     /// Default: true. Set to `no` to disable (e.g. in containers without CAP_SYS_NICE).
     pub cpu_affinity: bool,
+    /// Enable AF/XDP kernel-bypass fast path. Default: true (when compiled with xdp feature).
+    /// Set to `no` in unbound.conf, or pass `--no-xdp` on the command line, to disable.
+    pub xdp: bool,
 }
 
 impl UnboundConfig {
@@ -146,6 +149,7 @@ impl UnboundConfig {
             log_retention: 1000,
             log_client_ip: true,
             cpu_affinity:  true,
+            xdp:           true,
             ..Default::default()
         }
     }
@@ -328,6 +332,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "hsm-api-key-label"   => cfg.hsm_api_key_label   = Some(val.trim_matches('"').to_string()),
         "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
         "cpu-affinity"        => cfg.cpu_affinity        = val.trim_matches('"') != "no",
+        "xdp"                 => cfg.xdp                 = val.trim_matches('"') != "no",
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"

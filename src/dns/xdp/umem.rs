@@ -179,6 +179,12 @@ impl AddrRing {
         fence(Ordering::Acquire);
         (unsafe { ptr::read_volatile(self.flags) } & XDP_RING_NEED_WAKEUP) != 0
     }
+
+    /// Read the current producer index (volatile).
+    /// A non-zero value confirms the ring was seeded at startup.
+    pub fn producer_count(&self) -> u32 {
+        unsafe { ptr::read_volatile(self.producer) }
+    }
 }
 
 /// An RX or TX ring (descriptors are XdpDesc).
