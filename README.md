@@ -222,7 +222,7 @@ Works on VMs (virtio, copy mode) and bare metal Intel NICs (ixgbe/i40e/ice/igc, 
 All releases: [github.com/redlemonbe/Runbound/releases](https://github.com/redlemonbe/Runbound/releases)
 
 Or build from source: `cargo build --release`  
-With AF/XDP fast path: `cargo build --release --features xdp`
+XDP is enabled by default. To build without it: `cargo build --release --no-default-features`
 
 ---
 

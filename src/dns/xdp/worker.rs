@@ -67,6 +67,8 @@ pub fn start_xdp(
     let queue_count = get_rx_queue_count(iface).max(1);
     tracing::info!(iface = %iface, queues = queue_count, "Starting XDP workers");
 
+    let cores = crate::cpu::physical_cores();
+
     for q in 0..queue_count {
         let sock = unsafe { create_xsk_socket(ifidx, q, true) }
             .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false) })
@@ -74,12 +76,13 @@ pub fn start_xdp(
 
         handle.register_socket(q, sock.fd)?;
 
-        let z   = Arc::clone(&zones);
-        let rl  = Arc::clone(&rate_limiter);
-        let acl = Arc::clone(&acl);
+        let z       = Arc::clone(&zones);
+        let rl      = Arc::clone(&rate_limiter);
+        let acl     = Arc::clone(&acl);
+        let core_id = cores[(q as usize) % cores.len()];
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
-            .spawn(move || xdp_worker(sock, z, rl, acl))
+            .spawn(move || xdp_worker(sock, z, rl, acl, core_id))
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
@@ -92,8 +95,20 @@ fn xdp_worker(
     zones:        Arc<ArcSwap<LocalZoneSet>>,
     rate_limiter: Arc<RateLimiter>,
     acl:          Arc<Acl>,
+    core_id:      usize,
 ) {
     use libc::{poll, pollfd, POLLIN};
+    use super::umem::RING_SIZE;
+
+    crate::cpu::pin_to_cpu(core_id);
+
+    // Pre-allocate scratch buffers outside the hot loop to avoid per-batch
+    // heap allocations.  Each Vec retains its capacity across iterations;
+    // clear() resets length without releasing memory.
+    let mut rxds:       Vec<XdpDesc> = Vec::with_capacity(RING_SIZE as usize);
+    let mut tx_descs:   Vec<XdpDesc> = Vec::with_capacity(RING_SIZE as usize);
+    let mut rx_addrs:   Vec<u64>     = Vec::with_capacity(RING_SIZE as usize);
+    let mut dns_scratch: Vec<u8>     = Vec::with_capacity(512);
 
     loop {
         sock.umem.reclaim_tx();
@@ -104,19 +119,28 @@ fn xdp_worker(
             break;
         }
 
-        let rxds = sock.rx.consume_rx();
+        rxds.clear();
+        sock.rx.consume_rx_into(&mut rxds);
         if rxds.is_empty() {
             continue;
         }
 
         let snapshot = zones.load();
-        let mut tx_descs: Vec<XdpDesc> = Vec::with_capacity(rxds.len());
-        let mut rx_addrs: Vec<u64>     = Vec::with_capacity(rxds.len());
+        tx_descs.clear();
+        rx_addrs.clear();
 
         for desc in &rxds {
             rx_addrs.push(desc.addr);
 
             if let Some(tx_addr) = sock.umem.tx_free.pop_front() {
+                // FIX 2.1: release-mode bounds check on kernel-provided descriptor.
+                // desc.addr/len come from the XDP RX ring (kernel-controlled); a
+                // corrupted or malicious kernel could supply out-of-bounds values.
+                // Silently skip — never panic, never access memory outside UMEM.
+                if desc.addr as usize + desc.len as usize > sock.umem.area_len {
+                    sock.umem.tx_free.push_back(tx_addr);
+                    continue;
+                }
                 let (rx_frame, tx_frame) = unsafe {
                     let rx = std::slice::from_raw_parts(
                         sock.umem.area.add(desc.addr as usize),
@@ -139,7 +163,8 @@ fn xdp_worker(
                     continue;
                 }
 
-                match process_packet(rx_frame, tx_frame, &snapshot, &acl, src_ip) {
+                dns_scratch.clear();
+                match process_packet(rx_frame, tx_frame, &snapshot, &acl, src_ip, &mut dns_scratch) {
                     Some(tx_len) => tx_descs.push(XdpDesc {
                         addr: tx_addr,
                         len:  tx_len as u32,
@@ -199,12 +224,17 @@ fn extract_src_ip(rx: &[u8]) -> Option<IpAddr> {
 /// Parse a raw Ethernet frame, answer the DNS query from `zones`, and write
 /// the response frame into `tx`.  Returns the number of bytes written on
 /// success, or `None` if this frame should not receive an XDP reply.
+///
+/// `dns_scratch` is a caller-supplied buffer (cleared before each call) used
+/// for DNS response serialisation.  Passing a pre-allocated Vec avoids a heap
+/// allocation on every packet.
 fn process_packet(
-    rx:     &[u8],
-    tx:     &mut [u8],
-    zones:  &LocalZoneSet,
-    acl:    &Acl,
-    src_ip: Option<IpAddr>,
+    rx:          &[u8],
+    tx:          &mut [u8],
+    zones:       &LocalZoneSet,
+    acl:         &Acl,
+    src_ip:      Option<IpAddr>,
+    dns_scratch: &mut Vec<u8>,
 ) -> Option<usize> {
     // ── Ethernet ─────────────────────────────────────────────────────────────
     if rx.len() < ETH_HDR { return None; }
@@ -240,13 +270,12 @@ fn process_packet(
     let dns_in = &rx[dns_off..];
 
     // ── DNS ──────────────────────────────────────────────────────────────────
-    let mut dns_out: Vec<u8> = Vec::with_capacity(512);
-    if !answer_dns(dns_in, zones, acl, src_ip, &mut dns_out) {
+    if !answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
         return None; // not a local query or ACL deny — let it fall through / drop
     }
 
     // ── Build reply frame ────────────────────────────────────────────────────
-    let reply_len = dns_off + dns_out.len();
+    let reply_len = dns_off + dns_scratch.len();
     if reply_len > tx.len() { return None; }
 
     // Ethernet: swap src ↔ dst MAC
@@ -257,7 +286,7 @@ fn process_packet(
     if !is_v6 {
         // IPv4: copy then fix length, swap src/dst, recompute checksum
         tx[ip_off..ip_off + ip_hdr_len].copy_from_slice(&rx[ip_off..ip_off + ip_hdr_len]);
-        let new_tot = (ip_hdr_len + UDP_HDR + dns_out.len()) as u16;
+        let new_tot = (ip_hdr_len + UDP_HDR + dns_scratch.len()) as u16;
         tx[ip_len_off..ip_len_off + 2].copy_from_slice(&new_tot.to_be_bytes());
 
         let src: [u8; 4] = rx[src_ip_off..src_ip_off + 4].try_into().ok()?;
@@ -272,7 +301,7 @@ fn process_packet(
     } else {
         // IPv6: copy, set payload length, swap src/dst
         tx[ip_off..ip_off + IPV6_HDR].copy_from_slice(&rx[ip_off..ip_off + IPV6_HDR]);
-        let payload_len = (UDP_HDR + dns_out.len()) as u16;
+        let payload_len = (UDP_HDR + dns_scratch.len()) as u16;
         tx[ip_len_off..ip_len_off + 2].copy_from_slice(&payload_len.to_be_bytes());
 
         let src: [u8; 16] = rx[src_ip_off..src_ip_off + 16].try_into().ok()?;
@@ -282,7 +311,7 @@ fn process_packet(
     }
 
     // UDP: swap ports, set length
-    let udp_len = (UDP_HDR + dns_out.len()) as u16;
+    let udp_len = (UDP_HDR + dns_scratch.len()) as u16;
     tx[udp_off..udp_off + 2].copy_from_slice(&dst_port.to_be_bytes()); // src = 53
     tx[udp_off + 2..udp_off + 4].copy_from_slice(&src_port.to_be_bytes());
     tx[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
@@ -292,16 +321,16 @@ fn process_packet(
     let cksum = if !is_v6 {
         let si: [u8; 4] = tx[ip_off + 12..ip_off + 16].try_into().ok()?;
         let di: [u8; 4] = tx[ip_off + 16..ip_off + 20].try_into().ok()?;
-        udp_checksum_v4(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_out.len()])
+        udp_checksum_v4(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_scratch.len()])
     } else {
         let si: [u8; 16] = tx[ip_off + 8..ip_off + 24].try_into().ok()?;
         let di: [u8; 16] = tx[ip_off + 24..ip_off + 40].try_into().ok()?;
-        udp_checksum_v6(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_out.len()])
+        udp_checksum_v6(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_scratch.len()])
     };
     tx[udp_off + 6..udp_off + 8].copy_from_slice(&cksum.to_be_bytes());
 
     // DNS payload
-    tx[dns_off..dns_off + dns_out.len()].copy_from_slice(&dns_out);
+    tx[dns_off..dns_off + dns_scratch.len()].copy_from_slice(dns_scratch);
 
     Some(reply_len)
 }

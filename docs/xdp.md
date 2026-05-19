@@ -1,6 +1,14 @@
 # XDP Kernel-Bypass Fast Path
 
-Runbound v0.4.14+ includes an AF_XDP fast path active by default in all binaries.
+Runbound v0.4.14+ includes an AF_XDP fast path, enabled by default (the `xdp`
+feature is part of the default feature set since v0.4.16).
+
+**Build flags:**
+
+| Goal | Command |
+|---|---|
+| Default (XDP enabled) | `cargo build --release` |
+| Disable XDP | `cargo build --release --no-default-features` |
 
 ## What it does
 

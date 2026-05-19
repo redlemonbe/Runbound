@@ -5,6 +5,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.4.16] — 2026-05-19
+
+### Security
+
+- **UMEM descriptor bounds enforced in release builds** — `frame_mut` / `frame` in
+  `src/dns/xdp/umem.rs` replaced `debug_assert!` with hard release-mode checks that
+  return `None` on out-of-bounds access; the XDP worker skips malformed descriptors
+  silently. Hardens against future kernel bugs or UMEM ring corruption without any
+  performance impact on the hot path (VUL-2.1).
+- **IPv6 rate limiting aggregated at /48 prefix** — the DNS rate limiter now truncates
+  IPv6 source addresses to their /48 prefix before bucket lookup.  A flood from a
+  single routed /48 block fills at most one bucket instead of exhausting all 65 536
+  slots with distinct /128 addresses (VUL-6.1).
+- **TCP per-source-IP connection cap (20 connections)** — a pre-accept filter runs
+  ahead of hickory-server's TCP listener.  Connections from a source IP (or /48 for
+  IPv6) that already holds 20 concurrent connections are dropped immediately, bounded
+  the FD exhaustion attack surface.  Loopback addresses are exempt (VUL-6.2).
+- **API error responses no longer expose file-system paths** — `e.to_string()` in HTTP
+  error bodies is replaced with `sanitize_error()`, which returns `"internal error"` if
+  the error string contains `/`.  The full error (with path) is always logged internally
+  at `WARN` level (VUL-3.4).
+- **`/reload` endpoint rate-limited independently (2 RPS)** — a dedicated token bucket
+  separate from the main API limiter prevents an authenticated caller from triggering a
+  burst of zone-set rebuilds even at low overall API rates (VUL-3.2).
+
+### Added
+
+- **XDP default feature** — `xdp` is now in the `default` feature set; `cargo build --release`
+  produces a binary with the AF/XDP fast path without any extra flags.
+  Opt out with `--no-default-features`.
+
+### Changed
+
+- **Sharded log buffer** — the query log ring buffer is now split across 16
+  independent shards (per-shard `Mutex<LogBuffer>`). DNS workers round-robin
+  across shards with an atomic counter, reducing hot-path Mutex contention by
+  up to 16×.  The REST `/logs` read path merges all shards transparently.
+- **Lazy `sanitize_dns_name`** — skips the second `String` allocation on the
+  common path (name contains only printable ASCII). Control characters are
+  still replaced before structured log emission (MED-06).
+- **XDP worker CPU affinity** — each XDP worker thread is now pinned to a
+  physical core at startup via `sched_setaffinity`, matching the Tokio workers.
+  Pinning failure is logged as a warning and never aborts the worker.
+- **XDP scratch buffers** — per-batch `Vec` allocations in the XDP poll loop
+  are replaced with pre-allocated scratch buffers reused across iterations
+  (`rxds`, `tx_descs`, `rx_addrs`, `dns_scratch`).
+- **XDP DNS scratch** — the per-packet `dns_out: Vec<u8>` in `process_packet`
+  is now a caller-supplied scratch buffer, eliminating heap allocation on every
+  local-zone response.
+- **Resolver lease** — upstream lookups now use `resolver.load()` instead of
+  `load_full()`, avoiding one `Arc` reference-count increment (AtomicUsize CAS)
+  per upstream query.
+- **Rate limiter single hash** — the `contains_key` capacity pre-check is now
+  guarded by `len() >= MAX` first; in the common case (table not full) the hash
+  is computed only once by the subsequent `entry(ip)` call.  `or_insert_with`
+  avoids constructing the `IpBucket` when the key already exists.
+- **CNAME chain pre-alloc** — `follow_local_cname` pre-allocates the chain
+  `Vec` to capacity 8 (the maximum chain depth), avoiding up to 3 reallocations.
+
+---
+
 ## [0.4.15] — 2026-05-19
 
 ### Added
@@ -1023,6 +1084,9 @@ v0.4.0. See `audit.toml` for per-CVE exposure analysis and mitigations.
 
 ---
 
+[Unreleased]: https://github.com/redlemonbe/Runbound/compare/v0.4.16...HEAD
+[0.4.16]: https://github.com/redlemonbe/Runbound/compare/v0.4.15...v0.4.16
+[0.4.15]: https://github.com/redlemonbe/Runbound/compare/v0.4.14...v0.4.15
 [0.3.1]: https://github.com/redlemonbe/Runbound/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/redlemonbe/Runbound/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/redlemonbe/Runbound/compare/v0.2.4...v0.2.5

@@ -3,7 +3,7 @@
 // Per-IP token-bucket rate limiter shared between the normal DNS path
 // (server.rs) and the XDP fast-path (xdp/worker.rs).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -12,6 +12,20 @@ use dashmap::DashMap;
 
 const RATE_LIMIT_WINDOW_MS:   u64 = 1_000;
 const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
+
+/// Truncate an IPv6 address to its /48 prefix before rate-limit table lookup.
+/// A /48 flood from a single routed block fills at most one bucket instead of
+/// 65 536 distinct /128 buckets.  IPv4 is unchanged (full /32 per address).
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[6..].fill(0); // zero bytes 7–16, keep the /48 prefix
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
+}
 
 struct IpBucket {
     tokens:      u64,
@@ -41,6 +55,9 @@ impl RateLimiter {
             return true;
         }
 
+        // FIX 6.1: aggregate IPv6 sources at the /48 prefix boundary so that a
+        // flood from one routed block does not exhaust all 65 536 buckets.
+        let ip = normalize_ip(ip);
         let now = Instant::now();
 
         let count = self.cleanup_counter.fetch_add(1, Ordering::Relaxed);
@@ -48,7 +65,7 @@ impl RateLimiter {
             self.buckets.retain(|_, b| now.duration_since(b.last_refill).as_secs() < 60);
         }
 
-        if !self.buckets.contains_key(&ip) && self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+        if self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS && !self.buckets.contains_key(&ip) {
             // Bucket table full — aggressively evict idle entries (>10 s) before
             // silently dropping the new IP. This prevents a bucket-exhaustion attack
             // where an attacker floods from N distinct IPs to fill the table and
@@ -60,7 +77,7 @@ impl RateLimiter {
             }
         }
 
-        let mut bucket = self.buckets.entry(ip).or_insert(IpBucket {
+        let mut bucket = self.buckets.entry(ip).or_insert_with(|| IpBucket {
             tokens:      self.burst,
             last_refill: now,
         });

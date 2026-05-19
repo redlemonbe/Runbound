@@ -401,19 +401,20 @@ async fn build_and_launch(
     }
 
     let state = AppState {
-        zones:        Arc::clone(&zones),
-        tls_cfg:      Arc::clone(&tls_cfg),
-        rate_limiter: api::ApiRateLimiter::new_public(),
-        zones_mutex:  Arc::clone(&zones_mutex),
-        stats:        Arc::clone(&global_stats),
-        cfg:          Arc::clone(&cfg_arc),
+        zones:          Arc::clone(&zones),
+        tls_cfg:        Arc::clone(&tls_cfg),
+        rate_limiter:   api::ApiRateLimiter::new_public(),
+        reload_limiter: api::ReloadLimiter::new(),
+        zones_mutex:    Arc::clone(&zones_mutex),
+        stats:          Arc::clone(&global_stats),
+        cfg:            Arc::clone(&cfg_arc),
         cfg_path,
-        log_buffer:   Arc::clone(&log_buffer),
-        upstreams:    Arc::clone(&upstreams),
+        log_buffer:     Arc::clone(&log_buffer),
+        upstreams:      Arc::clone(&upstreams),
         sync_journal,
-        slave_mode:   cfg.is_slave(),
-        base_dir:     Arc::new(base_dir),
-        audit:        audit.clone(),
+        slave_mode:     cfg.is_slave(),
+        base_dir:       Arc::new(base_dir),
+        audit:          audit.clone(),
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");

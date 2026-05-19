@@ -158,6 +158,22 @@ impl AddrRing {
         out
     }
 
+    /// Like `dequeue_all` but appends into a caller-supplied Vec (avoids heap allocation).
+    /// The caller is responsible for clearing `out` before each call.
+    pub fn dequeue_all_into(&self, out: &mut Vec<u64>) {
+        fence(Ordering::Acquire);
+        let prod = unsafe { ptr::read_volatile(self.producer) };
+        let cons = unsafe { ptr::read_volatile(self.consumer) };
+        let available = prod.wrapping_sub(cons) as usize;
+        for i in 0..available {
+            let idx = (cons.wrapping_add(i as u32)) & self.mask;
+            out.push(unsafe { ptr::read_volatile(self.descs.add(idx as usize)) });
+        }
+        if available > 0 {
+            unsafe { ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32)); }
+        }
+    }
+
     /// True if the kernel has set the NEED_WAKEUP flag on this ring.
     pub fn needs_wakeup(&self) -> bool {
         fence(Ordering::Acquire);
@@ -196,6 +212,25 @@ impl DescRing {
         }
         unsafe { ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32)); }
         out
+    }
+
+    /// Like `consume_rx` but appends into a caller-supplied Vec (avoids heap allocation).
+    /// The caller is responsible for clearing `out` before each call.
+    /// Returns the number of descriptors consumed.
+    pub fn consume_rx_into(&self, out: &mut Vec<XdpDesc>) -> usize {
+        fence(Ordering::Acquire);
+        let prod = unsafe { ptr::read_volatile(self.producer) };
+        let cons = unsafe { ptr::read_volatile(self.consumer) };
+        let available = prod.wrapping_sub(cons) as usize;
+        if available == 0 {
+            return 0;
+        }
+        for i in 0..available {
+            let idx = (cons.wrapping_add(i as u32)) & self.mask;
+            out.push(unsafe { ptr::read_volatile(self.descs.add(idx as usize)) });
+        }
+        unsafe { ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32)); }
+        available
     }
 
     /// Enqueue TX descriptors. Returns the number actually enqueued.
@@ -330,27 +365,24 @@ impl Umem {
     }
 
     /// Get a mutable slice for the frame at the given UMEM offset.
+    /// Returns `None` if the bounds check fails (malformed kernel descriptor).
     /// # Safety
     /// `offset` must be a valid UMEM frame offset (multiple of FRAME_SIZE),
     /// and `len` must not exceed FRAME_SIZE.
-    pub unsafe fn frame_mut(&mut self, offset: u64, len: usize) -> &mut [u8] {
-        // Bounds assertion: catches ring corruption or kernel bugs in debug builds.
-        debug_assert!(
-            (offset as usize).saturating_add(len) <= self.area_len,
-            "XDP frame_mut: offset {offset} + len {len} exceeds UMEM size {}",
-            self.area_len
-        );
-        slice::from_raw_parts_mut(self.area.add(offset as usize), len)
+    pub unsafe fn frame_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
+        if (offset as usize).saturating_add(len) > self.area_len {
+            return None;
+        }
+        Some(slice::from_raw_parts_mut(self.area.add(offset as usize), len))
     }
 
     /// Get an immutable slice for the frame at the given UMEM offset.
-    pub unsafe fn frame(&self, offset: u64, len: usize) -> &[u8] {
-        debug_assert!(
-            (offset as usize).saturating_add(len) <= self.area_len,
-            "XDP frame: offset {offset} + len {len} exceeds UMEM size {}",
-            self.area_len
-        );
-        slice::from_raw_parts(self.area.add(offset as usize), len)
+    /// Returns `None` if the bounds check fails (malformed kernel descriptor).
+    pub unsafe fn frame(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        if (offset as usize).saturating_add(len) > self.area_len {
+            return None;
+        }
+        Some(slice::from_raw_parts(self.area.add(offset as usize), len))
     }
 
     /// Reclaim TX completion frames back into the free pool.

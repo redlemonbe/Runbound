@@ -42,6 +42,44 @@ use crate::upstreams::SharedUpstreams;
 /// Prevents TTL-based cache persistence attacks and operator mistakes.
 const MAX_API_TTL: u32 = 86_400;
 
+// ── /reload rate limiter ───────────────────────────────────────────────────
+
+/// Independent token bucket for POST /reload — max 2 requests per second.
+/// Kept separate from the main API rate limiter so a burst of reloads cannot
+/// consume the shared bucket and throttle other endpoints.
+const RELOAD_RPS:   u64 = 2;
+const RELOAD_BURST: u64 = 2;
+
+pub struct ReloadLimiter {
+    inner: std::sync::Mutex<(u64, Instant)>,
+}
+
+impl ReloadLimiter {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new((RELOAD_BURST, Instant::now())),
+        })
+    }
+
+    fn check(&self) -> bool {
+        let Ok(mut g) = self.inner.lock() else { return true };
+        let (tokens, last) = &mut *g;
+        let now = Instant::now();
+        let elapsed_ms = now.duration_since(*last).as_millis() as u64;
+        if elapsed_ms >= 1_000 {
+            *tokens = RELOAD_BURST;
+            *last = now;
+        } else {
+            let new = (RELOAD_RPS * elapsed_ms) / 1_000;
+            if new > 0 {
+                *tokens = (*tokens + new).min(RELOAD_BURST);
+                *last = now;
+            }
+        }
+        if *tokens > 0 { *tokens -= 1; true } else { false }
+    }
+}
+
 // ── Custom JSON body extractor ─────────────────────────────────────────────
 // axum's default Json<T> extractor returns a plain-text 422/400 body on
 // deserialization failure (Q-01, Q-02, Q-03). ApiJson<T> wraps it and always
@@ -173,8 +211,9 @@ pub struct AppState {
     // DNS reads (every query) never touch this mutex — zero read overhead.
     pub zones_mutex:  Arc<Mutex<()>>,
     pub tls_cfg:      Arc<TlsConfig>,
-    pub rate_limiter: ApiRateLimiter,
-    pub stats:        Arc<Stats>,
+    pub rate_limiter:   ApiRateLimiter,
+    pub reload_limiter: Arc<ReloadLimiter>,
+    pub stats:          Arc<Stats>,
     pub cfg:          Arc<UnboundConfig>,
     pub cfg_path:     String,
     pub log_buffer:   SharedLogBuffer,
@@ -586,6 +625,13 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
 // ── POST /reload ────────────────────────────────────────────────────────────
 
 async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
+    // FIX 3.2: independent 2 RPS cap — prevents authenticated DoS via rapid reloads.
+    if !s.reload_limiter.check() {
+        return (StatusCode::TOO_MANY_REQUESTS, JsonExtract(serde_json::json!({
+            "error":   "RATE_LIMITED",
+            "details": "reload endpoint is limited to 2 requests per second",
+        })));
+    }
     match crate::config::load(&s.cfg_path) {
         Ok(new_cfg) => {
             let new_zones = crate::build_zone_set(&new_cfg);
@@ -600,10 +646,11 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
             })))
         }
         Err(e) => {
+            // FIX 3.4: full error already in the WARN log; sanitize the HTTP body.
             warn!(err = %e, "API reload failed — keeping current zones");
             (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
                 "error":   "RELOAD_FAILED",
-                "details": e.to_string(),
+                "details": sanitize_error(&e),
             })))
         }
     }
@@ -617,9 +664,12 @@ async fn list_dns_handler(State(_s): State<AppState>) -> impl IntoResponse {
             "entries": st.entries,
             "total": st.entries.len()
         }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-            "error": e.to_string()
-        }))),
+        Err(e) => {
+            warn!(err = %e, "store load failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+                "error": sanitize_error(&e)
+            })))
+        }
     }
 }
 
@@ -753,8 +803,9 @@ async fn persist_and_swap(
         }
         st.entries.push(entry.clone());
         if let Err(e) = store::save(&st) {
+            warn!(err = %e, "store save failed");
             return Err((StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": e.to_string()
+                "error": sanitize_error(&e)
             }))));
         }
 
@@ -803,7 +854,10 @@ async fn delete_dns_handler(
 
     let mut st = match store::load() {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => {
+            warn!(err = %e, "store load failed in delete_dns");
+            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": sanitize_error(&e)})));
+        }
     };
 
     let pos = st.entries.iter().position(|e| e.id == id);
@@ -813,7 +867,8 @@ async fn delete_dns_handler(
 
     let entry = st.entries.remove(pos);
     if let Err(e) = store::save(&st) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": e.to_string()})));
+        warn!(err = %e, "store save failed in delete_dns");
+        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": sanitize_error(&e)})));
     }
 
     // Remove from live zone set — ArcSwap write
@@ -861,9 +916,12 @@ async fn list_blacklist_handler(State(_s): State<AppState>) -> impl IntoResponse
             "blacklist": bl.entries,
             "total": bl.entries.len()
         }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-            "error": e.to_string()
-        }))),
+        Err(e) => {
+            warn!(err = %e, "blacklist load failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+                "error": sanitize_error(&e)
+            })))
+        }
     }
 }
 
@@ -903,8 +961,9 @@ async fn add_blacklist_handler(
         };
         bl.entries.push(entry.clone());
         if let Err(e) = store::save_blacklist(&bl) {
+            warn!(err = %e, "blacklist save failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": e.to_string()
+                "error": sanitize_error(&e)
             })));
         }
 
@@ -937,7 +996,10 @@ async fn delete_blacklist_handler(
 
     let mut bl = match store::load_blacklist() {
         Ok(b) => b,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => {
+            warn!(err = %e, "blacklist load failed in delete");
+            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": sanitize_error(&e)})));
+        }
     };
     let pos = bl.entries.iter().position(|e| e.id == id);
     let Some(pos) = pos else {
@@ -945,7 +1007,8 @@ async fn delete_blacklist_handler(
     };
     let removed = bl.entries.remove(pos);
     if let Err(e) = store::save_blacklist(&bl) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": e.to_string()})));
+        warn!(err = %e, "blacklist save failed in delete");
+        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": sanitize_error(&e)})));
     }
 
     let current = s.zones.load_full();
@@ -1161,15 +1224,7 @@ async fn logs_handler(
         since_secs: params.since,
     };
 
-    let (entries, total) = match s.log_buffer.lock() {
-        Ok(buf) => buf.query(&q),
-        Err(e) => {
-            error!(err = %e, "log_buffer Mutex poisoned");
-            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": "INTERNAL", "details": "log buffer unavailable"
-            }))).into_response();
-        }
-    };
+    let (entries, total) = s.log_buffer.query(&q);
     JsonExtract(serde_json::json!({
         "entries": entries,
         "total":   total,
@@ -1183,15 +1238,7 @@ async fn logs_handler(
 async fn clear_logs_handler(
     State(s): State<AppState>,
 ) -> impl IntoResponse {
-    let deleted = match s.log_buffer.lock() {
-        Ok(mut buf) => buf.clear(),
-        Err(e) => {
-            error!(err = %e, "log_buffer Mutex poisoned");
-            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": "INTERNAL", "details": "log buffer unavailable"
-            }))).into_response();
-        }
-    };
+    let deleted = s.log_buffer.clear();
     s.audit.send(AuditEvent::LogsClear { count: deleted });
     info!(entries_deleted = deleted, "log buffer cleared via DELETE /logs");
     JsonExtract(serde_json::json!({
@@ -1357,6 +1404,14 @@ async fn rotate_key_handler(
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// FIX 3.4: Strip file-system paths from error messages before they reach HTTP
+/// response bodies.  The full error (with path) is always logged at WARN level
+/// so operators retain visibility; clients receive only a generic message.
+fn sanitize_error(e: &impl std::fmt::Display) -> String {
+    let s = e.to_string();
+    if s.contains('/') { "internal error".to_string() } else { s }
+}
+
 fn ensure_dot(name: &str) -> String {
     if name.ends_with('.') { name.to_string() } else { format!("{}.", name) }
 }
@@ -1427,19 +1482,20 @@ mod tests {
         let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
 
         let state = AppState {
-            zones:       Arc::clone(&zones),
-            zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
-            tls_cfg:     Arc::new(crate::config::parser::TlsConfig::default()),
-            rate_limiter: ApiRateLimiter::new_public(),
-            stats:       crate::stats::Stats::new(),
-            cfg:         Arc::clone(&cfg_arc),
-            cfg_path:    "/dev/null".to_string(),
+            zones:          Arc::clone(&zones),
+            zones_mutex:    Arc::new(tokio::sync::Mutex::new(())),
+            tls_cfg:        Arc::new(crate::config::parser::TlsConfig::default()),
+            rate_limiter:   ApiRateLimiter::new_public(),
+            reload_limiter: ReloadLimiter::new(),
+            stats:          crate::stats::Stats::new(),
+            cfg:            Arc::clone(&cfg_arc),
+            cfg_path:       "/dev/null".to_string(),
             log_buffer,
             upstreams,
-            sync_journal: None,
-            slave_mode:   false,
-            base_dir:     Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
-            audit:        crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
+            sync_journal:   None,
+            slave_mode:     false,
+            base_dir:       Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
+            audit:          crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
         };
         router(state)
     }
