@@ -21,7 +21,7 @@
 | Storage | NVMe (0 ms rotational) |
 | Architecture | bond0.10 → br-rb + veth-rb (.250) — see docs/proxmox.md |
 
-### Client — codix-gaming (192.168.10.200)
+### Client — codix-gaming (192.168.10.200) — Dell PowerEdge T620
 
 | Component | Value |
 |---|---|
