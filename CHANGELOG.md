@@ -5,6 +5,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`xdp: no` config directive and `--no-xdp` CLI flag** — disable the AF/XDP kernel-bypass
+  fast path at runtime without recompiling. Useful for containers, cloud VMs, and environments
+  without `CAP_NET_ADMIN`/`CAP_BPF`/`AF_XDP`. The server falls back to the standard
+  `SO_REUSEPORT` path; all DNS and security features remain active.
+
+- **XDP virtual interface detection** — `start_xdp()` now detects virtual interfaces (bridge,
+  bond, veth, ipvlan, macvlan) via sysfs before attaching. If a physical parent is found
+  (e.g. the first physical port of a Proxmox `vmbr0` bridge), XDP attaches there with a
+  warning. If no parent is detectable (isolated veth, internal bridge), XDP is cleanly
+  disabled and DNS falls back to `SO_REUSEPORT` — no crash, no silent failure.
+
+- **XDP parent interface resolution** — three-level sysfs search: `lower_*` entries
+  (ipvlan / macvlan), `master` symlink (bond slave / bridge port), `brif/` directory
+  (physical ports of a bridge). VLAN sub-interfaces (`eth0.10`, `bond0.10`) with
+  `DEVTYPE=vlan` in their uevent are treated as physical and accepted directly.
+
+- **XDP fill ring self-test** — before spawning worker threads, `start_xdp_on_iface()`
+  validates the UMEM fill ring producer count (must be > 0 after `Umem::new()` seeds it)
+  and injects 3 synthetic DNS frames into the TX ring, then polls the RX ring for 200 ms.
+  If the fill ring is unseeded or no frames arrive, XDP is disabled with a `WARN` log and
+  DNS falls back to the normal path. `--check-config` now also reports whether the
+  configured interface is physical or virtual (step 7 in the check output).
+
+### Fixed
+
+- **XDP interface selected via `getifaddrs()` on configured IP** — `iface_for_ip()` now
+  calls `getifaddrs()` directly instead of using the routing table. This eliminates wrong
+  interface selection when multiple interfaces (e.g. `br-rb` and `veth-rb`) share the same
+  `/24` subnet. The routing table heuristic is kept as the fallback when no specific IP is
+  configured (`0.0.0.0` or empty).
+
+- **DEBUG log explains interface selection at startup** — when XDP selects an interface,
+  a `DEBUG` log line now records whether the selection came from `getifaddrs()` (specific IP)
+  or the routing table (default route), making it easier to diagnose wrong-interface issues.
+
+- **`--check-config` RLIMIT_MEMLOCK false positive outside systemd** — the RLIMIT_MEMLOCK
+  check now detects whether `--check-config` is running under systemd (via `INVOCATION_ID`
+  env var or `/proc/1/comm`). When run outside systemd (e.g. directly from a shell), a
+  limited `RLIMIT_MEMLOCK` is reported as `[INFO]` rather than `[WARN]`, because the
+  service file's `LimitMEMLOCK=infinity` will apply at runtime regardless.
+
+- **`/reload` rate limit (2 RPS) now correctly enforced** — regression from v0.4.16 implementation where the dedicated token bucket was not wired into the request path.
+- **TCP per-IP connection cap (20) now enforced for non-loopback sources** — regression from v0.4.16 implementation; loopback exemption (127.0.0.1 / ::1) remains by design.
+
+### Documentation
+
+- **New [docs/proxmox.md](docs/proxmox.md)** — Proxmox bare-metal XDP setup guide covering:
+  bridge `rx_handler` conflict and fix, why a dedicated IP is required, working reference
+  architecture (bond → VLAN → bridge → veth pair), AF/XDP generic-mode limitation on
+  VLAN sub-interfaces, `ethtool` flow steering for ixgbe/igc, and `RLIMIT_MEMLOCK` setup.
+
+---
+
 ## [0.4.16] — 2026-05-19
 
 ### Security

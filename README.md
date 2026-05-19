@@ -222,7 +222,11 @@ Works on VMs (virtio, copy mode) and bare metal Intel NICs (ixgbe/i40e/ice/igc, 
 All releases: [github.com/redlemonbe/Runbound/releases](https://github.com/redlemonbe/Runbound/releases)
 
 Or build from source: `cargo build --release`  
-XDP is enabled by default. To build without it: `cargo build --release --no-default-features`
+XDP is enabled by default. To disable at runtime (no recompile needed):
+- Add `xdp: no` to `unbound.conf`, or
+- Pass `--no-xdp` on the command line: `runbound --no-xdp /etc/runbound/unbound.conf`
+
+To remove the code entirely at build time: `cargo build --release --no-default-features`
 
 ---
 
@@ -259,6 +263,7 @@ Ready-to-use configs for common scenarios:
 | [Performance Guide](docs/performance.md) | Benchmarks, methodology, how to reproduce |
 | [TLS Setup](docs/tls.md) | DoT on port 853 — Let's Encrypt, ACME auto-provisioning, internal CA |
 | [AF/XDP Fast Path](docs/xdp.md) | Kernel-bypass networking — 500k+ q/s |
+| [Proxmox / Bare Metal](docs/proxmox.md) | XDP on Proxmox — bridge conflict, veth architecture, ethtool flow steering |
 | [Systemd Setup](docs/systemd.md) | Production service, hardened unit file, hot reload |
 | [Unbound Migration](docs/unbound-migration.md) | Config compatibility, feature mapping, gotchas |
 | [Security Architecture](docs/security.md) | ACL, rate limiting, API auth, audit findings |

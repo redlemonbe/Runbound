@@ -101,6 +101,9 @@ Loopback addresses (`127.x.x.x`, `::1`) are exempt from the cap.
 This prevents FD exhaustion attacks where a single source opens thousands of TCP connections to
 exhaust the process file-descriptor limit and deny service to all clients.
 
+> ⚠️ **Known issue (v0.4.16):** loopback connections (127.0.0.1) are exempt by design.
+> External IP cap enforcement under investigation — fix targeted for v0.4.17.
+
 ---
 
 ## Anti-OOM memory protection
@@ -215,6 +218,8 @@ overwrite each other.
 (2 RPS, burst 2) separate from the general API limiter. This prevents an authenticated caller
 from sustaining a burst of expensive zone-set rebuilds. Callers that exceed the rate receive
 HTTP 429 `{"error": "RATE_LIMITED"}`.
+
+> ⚠️ **Known issue (v0.4.16):** rate limit not enforced in current build — fix targeted for v0.4.17.
 
 **Error body sanitisation (v0.4.16, VUL-3.4):** HTTP 500 error bodies pass through
 `sanitize_error()`, which replaces any error string containing `/` with `"internal error"`.

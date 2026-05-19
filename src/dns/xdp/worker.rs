@@ -34,6 +34,7 @@ use crate::dns::RateLimiter;
 use super::loader::XdpHandle;
 use super::socket::{
     XskSocket, create_xsk_socket, get_rx_queue_count, iface_index,
+    is_virtual_interface, parent_interface,
 };
 use super::umem::{XdpDesc, FRAME_SIZE};
 
@@ -47,18 +48,51 @@ const ETH_P_IPV6: u16 = 0x86DD;
 const PROTO_UDP:   u8 = 17;
 
 /// Load the XDP program onto `iface`, open one AF_XDP socket per RX queue,
-/// and spawn a dedicated OS thread for each.  Returns the `XdpHandle` that
-/// must be kept alive for as long as the fast path should remain active.
+/// and spawn a dedicated OS thread for each.  Returns `Ok(Some(handle))` when
+/// the fast path is active, `Ok(None)` when XDP is cleanly disabled (virtual
+/// interface with no detectable parent, or self-test failure), or `Err` for
+/// unexpected errors.
 ///
-/// The `rate_limiter` is shared with the normal hickory-server path so that
-/// the per-IP budget is consumed identically whether the packet is handled by
-/// the XDP fast path or the kernel / Tokio slow path.
+/// If `iface` is a virtual interface (bridge, veth, ipvlan, macvlan), the
+/// function automatically retries on the physical parent before giving up.
 pub fn start_xdp(
     iface:        &str,
     zones:        Arc<ArcSwap<LocalZoneSet>>,
     rate_limiter: Arc<RateLimiter>,
     acl:          Arc<Acl>,
-) -> Result<XdpHandle, String> {
+) -> Result<Option<XdpHandle>, String> {
+    if is_virtual_interface(iface) {
+        match parent_interface(iface) {
+            Some(ref parent) => {
+                tracing::warn!(
+                    virt = %iface, parent = %parent,
+                    "XDP: virtual interface detected — retrying on parent"
+                );
+                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl);
+                if result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
+                    tracing::info!(parent = %parent, "XDP active on parent interface");
+                }
+                return result;
+            }
+            None => {
+                tracing::warn!(
+                    iface = %iface,
+                    "XDP: virtual interface with no detectable parent — \
+                     disabling XDP, falling back to UDP"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    start_xdp_on_iface(iface, zones, rate_limiter, acl)
+}
+
+fn start_xdp_on_iface(
+    iface:        &str,
+    zones:        Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter: Arc<RateLimiter>,
+    acl:          Arc<Acl>,
+) -> Result<Option<XdpHandle>, String> {
     let ifidx = iface_index(iface)
         .ok_or_else(|| format!("interface {iface} not found"))?;
 
@@ -69,24 +103,156 @@ pub fn start_xdp(
 
     let cores = crate::cpu::physical_cores();
 
+    // Create all sockets before spawning threads so we can run the self-test.
+    let mut sockets: Vec<(u32, XskSocket)> = Vec::with_capacity(queue_count as usize);
     for q in 0..queue_count {
         let sock = unsafe { create_xsk_socket(ifidx, q, true) }
             .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false) })
             .map_err(|e| format!("AF_XDP socket creation failed: {e}"))?;
-
         handle.register_socket(q, sock.fd)?;
+        sockets.push((q, sock));
+    }
 
+    // Self-test on the first socket before committing threads.
+    if let Some((_, first_sock)) = sockets.first_mut() {
+        if let Err(msg) = xdp_fill_ring_self_test(iface, first_sock) {
+            tracing::warn!("{msg}");
+            return Ok(None);
+        }
+    }
+
+    for (q, sock) in sockets {
         let z       = Arc::clone(&zones);
         let rl      = Arc::clone(&rate_limiter);
         let acl     = Arc::clone(&acl);
-        let core_id = cores[(q as usize) % cores.len()];
+        let core_id = if cores.is_empty() { 0 } else { cores[q as usize % cores.len()] };
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
             .spawn(move || xdp_worker(sock, z, rl, acl, core_id))
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
-    Ok(handle)
+    Ok(Some(handle))
+}
+
+/// Verify the UMEM fill ring was seeded, then inject 3 synthetic DNS frames and
+/// poll the RX ring for up to 200 ms.  Returns `Ok(())` if any RX frames arrive
+/// or if the TX pool was empty (can't inject — skip loopback check).
+/// Returns `Err` if the fill ring was never seeded (UMEM misconfiguration) or
+/// if no frames arrive within 200 ms (socket not receiving — possible
+/// misconfiguration or isolated network).
+fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), String> {
+    use libc::{POLLIN, poll, pollfd};
+
+    // Hard check: fill ring must have been seeded by Umem::new().
+    if sock.umem.fill.producer_count() == 0 {
+        return Err(format!(
+            "XDP self-test failed: fill ring empty or UMEM misconfigured on '{iface}' \
+             — disabling XDP, falling back to kernel UDP path"
+        ));
+    }
+
+    // Inject up to 3 synthetic DNS frames into the TX ring.
+    let mut injected = 0u32;
+    for _ in 0..3 {
+        if let Some(tx_addr) = sock.umem.tx_free.pop_front() {
+            if let Some(frame) = unsafe { sock.umem.frame_mut(tx_addr, FRAME_SIZE as usize) } {
+                let len = build_test_frame(frame);
+                if len > 0 {
+                    sock.tx.enqueue_tx(&[XdpDesc { addr: tx_addr, len: len as u32, options: 0 }]);
+                    injected += 1;
+                } else {
+                    sock.umem.tx_free.push_back(tx_addr);
+                }
+            } else {
+                sock.umem.tx_free.push_back(tx_addr);
+            }
+        }
+    }
+    // Kick the driver if needed.
+    if sock.tx.needs_wakeup() {
+        unsafe {
+            libc::sendto(sock.fd, std::ptr::null(), 0, libc::MSG_DONTWAIT,
+                         std::ptr::null(), 0);
+        }
+    }
+    // If TX pool was exhausted we can't inject — skip loopback check.
+    if injected == 0 {
+        return Ok(());
+    }
+
+    // Poll RX ring for up to 200 ms — any incoming frame confirms the socket works.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let mut rx_descs: Vec<XdpDesc> = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { break; }
+        let mut pfd = pollfd { fd: sock.fd, events: POLLIN, revents: 0 };
+        let timeout_ms = (remaining.as_millis() as i32).min(20).max(1);
+        let ret = unsafe { poll(&mut pfd, 1, timeout_ms) };
+        if ret > 0 && (pfd.revents & POLLIN) != 0 {
+            sock.rx.consume_rx_into(&mut rx_descs);
+            if !rx_descs.is_empty() {
+                let addrs: Vec<u64> = rx_descs.iter().map(|d| d.addr).collect();
+                sock.umem.fill.enqueue_batch(&addrs);
+                tracing::info!(iface = %iface, rx_frames = rx_descs.len(), "XDP self-test passed");
+                return Ok(());
+            }
+        }
+        if ret < 0 { break; }
+    }
+    Err(format!(
+        "XDP self-test failed: fill ring empty or UMEM misconfigured on '{iface}' \
+         — disabling XDP, falling back to kernel UDP path"
+    ))
+}
+
+/// Build a minimal Ethernet/IPv4/UDP/DNS query frame for the self-test.
+/// Destination: 192.0.2.2 (TEST-NET-1, RFC 5737 — not routable).
+/// Returns the total frame length, or 0 if `buf` is too small.
+fn build_test_frame(buf: &mut [u8]) -> usize {
+    // DNS query: A record for "xdp.test." (ID=0xDEAD)
+    const DNS: &[u8] = &[
+        0xDE, 0xAD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        3, b'x', b'd', b'p', 4, b't', b'e', b's', b't', 0,
+        0x00, 0x01, 0x00, 0x01,
+    ];
+    const ETH: usize = 14;
+    const IP:  usize = 20;
+    const UDP: usize = 8;
+    let total = ETH + IP + UDP + DNS.len();
+    if buf.len() < total { return 0; }
+
+    // Ethernet: broadcast dst, fake src, EtherType=IPv4
+    buf[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    buf[6..12].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
+    buf[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+
+    // IPv4: src=192.0.2.1, dst=192.0.2.2, proto=UDP
+    let ip_total = (IP + UDP + DNS.len()) as u16;
+    buf[ETH]     = 0x45; // version=4, IHL=5
+    buf[ETH + 1] = 0;
+    buf[ETH + 2..ETH + 4].copy_from_slice(&ip_total.to_be_bytes());
+    buf[ETH + 4..ETH + 6].copy_from_slice(&[0xDE, 0xAD]); // ID
+    buf[ETH + 6..ETH + 8].copy_from_slice(&[0x40, 0x00]); // DF
+    buf[ETH + 8]  = 64; // TTL
+    buf[ETH + 9]  = 17; // UDP
+    buf[ETH + 10..ETH + 12].fill(0); // checksum placeholder
+    buf[ETH + 12..ETH + 16].copy_from_slice(&[192, 0, 2, 1]); // src
+    buf[ETH + 16..ETH + 20].copy_from_slice(&[192, 0, 2, 2]); // dst
+    let cksum = ipv4_checksum(&buf[ETH..ETH + IP]);
+    buf[ETH + 10..ETH + 12].copy_from_slice(&cksum.to_be_bytes());
+
+    // UDP: src_port=12345, dst_port=53
+    let udp_len = (UDP + DNS.len()) as u16;
+    buf[ETH + IP..ETH + IP + 2].copy_from_slice(&12345u16.to_be_bytes());
+    buf[ETH + IP + 2..ETH + IP + 4].copy_from_slice(&53u16.to_be_bytes());
+    buf[ETH + IP + 4..ETH + IP + 6].copy_from_slice(&udp_len.to_be_bytes());
+    buf[ETH + IP + 6..ETH + IP + 8].fill(0); // no UDP checksum
+
+    // DNS payload
+    buf[ETH + IP + UDP..total].copy_from_slice(DNS);
+    total
 }
 
 /// Poll loop for one NIC queue. Runs until the socket fd is closed.

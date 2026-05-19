@@ -3,12 +3,54 @@
 Runbound v0.4.14+ includes an AF_XDP fast path, enabled by default (the `xdp`
 feature is part of the default feature set since v0.4.16).
 
+## Disabling XDP
+
+There are three ways to disable the XDP fast path, depending on the context:
+
+| Method | When to use |
+|---|---|
+| `xdp: no` in `unbound.conf` | Persistent disable — survives restarts |
+| `runbound --no-xdp [config]` | One-shot disable without editing config |
+| `cargo build --release --no-default-features` | Build-time disable — removes the code entirely |
+
+**Config file (`unbound.conf`):**
+
+```
+server:
+    xdp: no
+```
+
+**Command line:**
+
+```bash
+runbound --no-xdp /etc/runbound/unbound.conf
+```
+
+Both produce the same log line at startup:
+
+```
+INFO runbound: XDP fast path disabled (xdp: no / --no-xdp)
+```
+
+The server then runs on the standard `SO_REUSEPORT` kernel path with no capability
+requirements beyond `CAP_NET_BIND_SERVICE`. All security features (ACL, rate limiting,
+blacklist, DNSSEC) remain fully active.
+
+**Typical use cases for runtime disable:**
+
+- Containers or VMs without `CAP_NET_ADMIN` / `CAP_BPF` / `AF_XDP`
+- Troubleshooting suspected XDP issues (compare behaviour with/without)
+- Cloud providers that block AF_XDP (AWS Nitro, GCP, Azure by default)
+- Temporary disable during NIC driver updates
+
+---
+
 **Build flags:**
 
 | Goal | Command |
 |---|---|
 | Default (XDP enabled) | `cargo build --release` |
-| Disable XDP | `cargo build --release --no-default-features` |
+| Disable XDP at build time | `cargo build --release --no-default-features` |
 
 ## What it does
 
@@ -67,6 +109,72 @@ Then: `systemctl daemon-reload && systemctl restart runbound`
 The XDP program assumes a standard IPv4 header (IHL = 20, no options). Packets
 with IP options are passed to the kernel via `XDP_PASS` — correct behavior,
 transparent to clients.
+
+## Virtual interfaces and XDP
+
+AF_XDP binds to a physical NIC queue. It cannot attach to virtual interfaces
+(bridge, bond, veth, ipvlan, macvlan, tun/tap) directly.
+
+| Interface type | XDP support | Notes |
+|---|---|---|
+| Physical NIC (eth0, enp3s0) | ✅ native | Direct attachment |
+| VLAN sub-interface (eth0.10, bond0.10) | ✅ via parent | Treated as physical |
+| Bond slave / active-backup | ✅ via parent | Runbound auto-detects parent |
+| Bridge port (vmbr0 port) | ✅ via port | Runbound resolves a physical bridge port |
+| Bridge interface itself (vmbr0) | ⚠️ auto-retry | Runbound picks a physical port |
+| veth pair | ❌ no parent NIC | Falls back to SO_REUSEPORT UDP |
+| Loopback (lo) | ❌ | XDP not supported on loopback |
+
+**Automatic parent resolution:** if Runbound detects the configured interface is
+virtual, it searches for a physical parent in this order:
+
+1. `lower_*` sysfs entries (ipvlan, macvlan)
+2. `master` symlink (bond slave or bridge port)
+3. `brif/` directory (ports of a bridge)
+
+If a physical parent is found, XDP attaches there with a warning:
+
+```
+WARN runbound::dns::xdp::worker: XDP: virtual interface detected — retrying on parent virt=vmbr0 parent=eth0
+INFO runbound: XDP active on parent interface parent=eth0
+```
+
+If no physical parent is found:
+
+```
+WARN runbound::dns::xdp::worker: XDP: virtual interface with no detectable parent — disabling XDP, falling back to UDP
+```
+
+**Proxmox / vmbr note:** attaching Runbound to a Proxmox bridge interface (`vmbr0`)
+or an ipvlan will not break DNS — Runbound detects the virtual interface, resolves
+a physical bridge port (e.g. `eth0`), and attaches XDP there. If the bridge has no
+physical port (internal-only bridge), XDP is silently disabled and DNS continues on
+the standard UDP path.
+
+**Explicit fix:** to avoid the auto-detection overhead, bind Runbound directly to the
+physical NIC or VLAN sub-interface:
+
+```
+server:
+    interface: eth0          # physical NIC
+    # or:
+    interface: bond0.10      # VLAN sub-interface (XDP-capable)
+```
+
+## Proxmox / bare metal
+
+Running Runbound on a Proxmox host requires extra care when the physical NIC
+is enslaved to a bridge (`vmbr0`). In that configuration the kernel's bridge
+`rx_handler` intercepts all incoming frames before XDP can see them — DNS traffic
+arrives but is never delivered to the AF_XDP socket.
+
+**Quick summary of required steps:**
+
+1. Remove the physical bond from `vmbr0` (`ip link set bond0 nomaster`)
+2. Use a dedicated IP for Runbound on a veth pair (not the Proxmox management IP)
+3. For ixgbe / igc NICs, steer UDP/53 to queue 0 with `ethtool -N`
+
+Full details, reference architecture, and troubleshooting: [docs/proxmox.md](proxmox.md)
 
 ## Expected QPS
 

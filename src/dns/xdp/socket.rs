@@ -140,70 +140,51 @@ pub fn iface_index(name: &str) -> Option<u32> {
     if idx == 0 { None } else { Some(idx) }
 }
 
-/// Find which network interface owns a given IP address by scanning
-/// /proc/net/fib_trie and matching the address against interface names
-/// found in /sys/class/net/. Falls back to `default_interface()` on failure.
+/// Find which network interface carries the given IP address using `getifaddrs()`.
+/// Returns the interface name on success. Covers both IPv4 and IPv6.
 pub fn iface_for_ip(ip: &str) -> Option<String> {
-    // Walk /sys/class/net to get all interface names, then check if the
-    // interface has the given address via /sys/class/net/<iface>/address or
-    // by reading the ifaddr via getifaddrs-equivalent from /proc/net/if_inet6
-    // and /proc/net/fib_trie.
-    //
-    // Simpler: iterate all interfaces and check their assigned addresses.
     let target: std::net::IpAddr = ip.parse().ok()?;
-    let dir = std::fs::read_dir("/sys/class/net").ok()?;
-    for entry in dir.flatten() {
-        let iface = entry.file_name().to_string_lossy().into_owned();
-        // /proc/net/if_inet6 covers IPv6; for IPv4 read /proc/net/fib_trie
-        // Simplest portable approach: read the fib_trie for the address.
-        let addr_file = format!("/sys/class/net/{iface}/address");
-        // That's the MAC. For IP addresses, use /proc/net/fib_trie or ifaddrs.
-        let _ = addr_file; // unused
-        // Use if_nametoindex to validate the name, then check via /proc/net
-        let cname = std::ffi::CString::new(iface.as_str()).ok()?;
-        if unsafe { libc::if_nametoindex(cname.as_ptr()) } == 0 {
-            continue;
-        }
-        // Check IPv4 via /proc/net/fib_trie
-        if let std::net::IpAddr::V4(v4) = target {
-            let octets = v4.octets();
-            let hex = format!("{:02X}{:02X}{:02X}{:02X}",
-                octets[3], octets[2], octets[1], octets[0]);
-            if let Ok(content) = std::fs::read_to_string("/proc/net/fib_trie") {
-                // Simple heuristic: look for the hex address in the trie output
-                // that follows a line mentioning the interface
-                if content.contains(&hex) {
-                    // Verify by checking if this iface owns the IP via ioctl SIOCGIFADDR
-                    if iface_has_ipv4(&iface, v4) {
-                        return Some(iface);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
 
-fn iface_has_ipv4(iface: &str, target: std::net::Ipv4Addr) -> bool {
-    // Use ioctl SIOCGIFADDR to get the interface's IPv4 address.
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 { return false; }
-    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name_bytes = iface.as_bytes();
-    let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            name_bytes.as_ptr() as *const libc::c_char,
-            ifr.ifr_name.as_mut_ptr(),
-            copy_len,
-        );
-        let rc = libc::ioctl(sock, libc::SIOCGIFADDR as _, &ifr as *const _);
-        libc::close(sock);
-        if rc != 0 { return false; }
-        let sa = &*(&ifr.ifr_ifru.ifru_addr as *const libc::sockaddr as *const libc::sockaddr_in);
-        let addr = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
-        addr == target
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return None;
     }
+
+    let mut result: Option<String> = None;
+    let mut cur = ifap;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() { continue; }
+
+        let matched = unsafe {
+            let family = (*ifa.ifa_addr).sa_family as libc::c_int;
+            match (target, family) {
+                (std::net::IpAddr::V4(v4), libc::AF_INET) => {
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)) == v4
+                }
+                (std::net::IpAddr::V6(v6), libc::AF_INET6) => {
+                    let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr) == v6
+                }
+                _ => false,
+            }
+        };
+
+        if matched {
+            if let Ok(name) = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_str() {
+                tracing::debug!(
+                    iface = %name, ip = %target,
+                    "XDP: selected interface because it carries IP (via getifaddrs)"
+                );
+                result = Some(name.to_owned());
+            }
+            break;
+        }
+    }
+    unsafe { libc::freeifaddrs(ifap); }
+    result
 }
 
 /// Detect the default network interface by reading /proc/net/route.
@@ -215,7 +196,77 @@ pub fn default_interface() -> Option<String> {
         let iface = fields.next()?.to_string();
         let dest = fields.next()?;
         if dest == "00000000" {
+            tracing::debug!(
+                iface = %iface,
+                "XDP: selected interface via routing table (no specific IP configured)"
+            );
             return Some(iface);
+        }
+    }
+    None
+}
+
+/// Returns true if `iface` is a virtual interface (bridge, bond, veth, ipvlan, macvlan, tun/tap).
+/// Physical NICs expose a `/sys/class/net/<iface>/device` symlink.
+/// VLAN sub-interfaces (eth0.10, bond0.10) have `DEVTYPE=vlan` in their uevent —
+/// these are XDP-capable and are NOT treated as virtual.
+pub fn is_virtual_interface(iface: &str) -> bool {
+    if std::path::Path::new(&format!("/sys/class/net/{iface}/device")).exists() {
+        return false;
+    }
+    let uevent = std::fs::read_to_string(format!("/sys/class/net/{iface}/uevent"))
+        .unwrap_or_default();
+    if uevent.lines().any(|l| l.trim() == "DEVTYPE=vlan") {
+        return false;
+    }
+    true
+}
+
+/// Try to find a physical parent interface for a virtual interface.
+/// Search order:
+///   1. `lower_*` sysfs entries — ipvlan / macvlan parent
+///   2. `master` symlink — bond slave or bridge port
+///   3. `brif/` directory — ports of a bridge interface
+pub fn parent_interface(iface: &str) -> Option<String> {
+    let sysfs = format!("/sys/class/net/{iface}");
+    // 1. lower_* entries (ipvlan, macvlan)
+    if let Ok(entries) = std::fs::read_dir(&sysfs) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let name  = fname.to_string_lossy();
+            if let Some(lower) = name.strip_prefix("lower_") {
+                if !lower.is_empty() {
+                    return Some(lower.to_string());
+                }
+            }
+        }
+    }
+    // 2. master symlink (bond slave / bridge port)
+    let master_path = format!("{sysfs}/master");
+    if let Ok(target) = std::fs::read_link(&master_path) {
+        if let Some(fname) = target.file_name() {
+            let master = fname.to_string_lossy().into_owned();
+            if !master.is_empty() {
+                if !is_virtual_interface(&master) {
+                    return Some(master);
+                }
+                if let Some(port) = first_physical_bridge_port(&master) {
+                    return Some(port);
+                }
+            }
+        }
+    }
+    // 3. brif/ directory (iface IS the bridge)
+    first_physical_bridge_port(iface)
+}
+
+fn first_physical_bridge_port(bridge: &str) -> Option<String> {
+    let brif = format!("/sys/class/net/{bridge}/brif");
+    let entries = std::fs::read_dir(&brif).ok()?;
+    for entry in entries.flatten() {
+        let port = entry.file_name().to_string_lossy().into_owned();
+        if !is_virtual_interface(&port) {
+            return Some(port);
         }
     }
     None

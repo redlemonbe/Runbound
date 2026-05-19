@@ -127,6 +127,26 @@ INFO runbound::dns::server: rate limiting disabled   ← or: rate limiting enabl
 3. `AF_XDP` in `RestrictAddressFamilies`
 4. `LimitMEMLOCK=infinity` in the service file
 5. `MemoryDenyWriteExecute=false` and `ProtectKernelModules=false`
+6. `xdp: no` not set in `unbound.conf` and `--no-xdp` not passed on the command line
+
+**Virtual interfaces (Proxmox vmbr, ipvlan, veth):** attaching Runbound to a Proxmox
+bridge interface (`vmbr0`) or an ipvlan will not silently break DNS — Runbound detects
+virtual interfaces at startup, resolves a physical parent where possible (e.g. the first
+physical port of `vmbr0`), and attaches XDP there. If no physical parent is found, XDP
+is disabled gracefully and DNS continues on the `SO_REUSEPORT` path. No capability
+changes or config edits are required. See [xdp.md](xdp.md) for details.
+
+**To deliberately disable XDP** (containers, restricted VMs, troubleshooting) without touching
+systemd capabilities, add to `unbound.conf`:
+
+```
+server:
+    xdp: no
+```
+
+Or pass `--no-xdp` on the command line. The server logs
+`INFO runbound: XDP fast path disabled (xdp: no / --no-xdp)` and continues on the
+`SO_REUSEPORT` path. No capability changes needed.
 
 ---
 
@@ -177,3 +197,5 @@ WantedBy=multi-user.target
 ---
 
 See [security.md](security.md) for the full security model and audit findings.
+
+See [proxmox.md](proxmox.md) for Proxmox bare-metal XDP setup, bridge conflict resolution, and ethtool flow steering.
