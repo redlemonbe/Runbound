@@ -1,148 +1,165 @@
 # Performance
 
-## Summary
+## Official benchmark — 2026-05-20
 
-| Scenario | Throughput | Avg latency | Notes |
-|---|---|---|---|
-| Local zone, 1 client | **82,000 q/s** | 83 ms | dnsperf saturated first |
-| Local zone, 8 clients | **75,000 q/s** | ~1,000 ms | server CPU saturated |
-| Forwarding (Cloudflare) | network-bound | < 5 ms | |
-| AF/XDP, bare metal DRV mode | **500k – 1M+ q/s** | < 1 ms | kernel-bypass |
+### Test environment
 
-> **Important:** In the single-client test, dnsperf (single-threaded) reached its own
-> limit before the server did. The true ceiling of Runbound was not reached in these
-> measurements — real throughput is higher.
-
----
-
-## Test environment
+**DNS server — dragonrage (192.168.10.250)**
 
 | Component | Value |
 |---|---|
-| CPU | 4 vCPUs (KVM), x86_64 |
-| RAM | 8 GB |
-| OS | Linux 6.x (Debian 13) |
-| Network | loopback (`127.0.0.x`) |
-| Runbound version | 0.3.x |
-| dnsperf version | 2.x |
-| Query type | A record, local zone (no forwarding) |
+| CPU | AMD Threadripper PRO 5995WX — 64 cores / 128 threads @ up to 4 575 MHz |
+| RAM | 128 GiB DDR5 |
+| NUMA | 8 nodes × 8 cores |
+| L3 cache | 256 MiB (8 × 32 MiB) |
+| NIC | 2× Intel X540 (ixgbe) 10 GbE fibre — LACP 802.3ad, MTU 9 000 |
+| OS | Debian GNU/Linux 13 (trixie) — kernel 6.17.13-1-pve |
+| Storage | NVMe (0 ms rotational) |
+| Architecture | bond0.10 → br-rb + veth-rb (.250) — see [docs/proxmox.md](proxmox.md) |
 
----
+**Client — codix-gaming (192.168.10.200)**
 
-## Methodology
+| Component | Value |
+|---|---|
+| CPU | 2× Intel Xeon E5-2690 v2 — 20 cores / 40 threads @ 3.0 / 3.6 GHz |
+| RAM | 256 GB DDR3 LRDIMM ECC @ 1 866 MT/s |
+| NIC | Emulex OneConnect 10 GbE (be2net) — LACP bond, fibre |
+| OS | Proxmox VE — Linux 6.17.2-2-pve |
+| Tool | dnsmark 0.4.5 |
+| AF_XDP | not available (be2net has no AF_XDP support) |
 
-### Install dnsperf
+**Common configuration (all three servers)**
 
-```bash
-apt-get install -y dnsperf
-# or build from source: https://www.dns-oarc.net/tools/dnsperf
-```
+| Parameter | Value |
+|---|---|
+| Upstream resolvers | 8.8.8.8 / 8.8.4.4 / 1.1.1.1 |
+| DNSSEC | disabled |
+| Query file | 40 real-world domains (pre-cached after warm-up) |
+| Protocol | UDP |
 
-### Generate a query file
+### Servers under test
 
-```bash
-cat > /tmp/queries.txt << 'EOF'
-ns1.internal. A
-ns2.internal. A
-ca.internal. A
-ntp.internal. A
-siem.internal. A
-bastion.internal. A
-EOF
-```
-
-### Single-client test
-
-```bash
-dnsperf -s 127.0.0.1 -p 53 -d /tmp/queries.txt \
-  -l 30 -c 20 -Q 100000
-```
-
-Result:
-
-```
-Queries sent:         2,460,000
-Queries completed:    2,460,000 (100.00%)
-Queries lost:         0 (0.00%)
-
-Response codes:       NOERROR 2,460,000 (100.00%)
-Average packet size:  request 30, response 62
-Run time (s):         30.000
-Queries per second:   82,000.00
-Average latency (s):  0.082511
-```
-
-### 8-client parallel test
-
-To avoid DashMap contention on the rate limiter (all clients from `127.0.0.1`),
-add loopback aliases first:
-
-```bash
-for i in 2 3 4 5 6 7 8 9; do
-  sudo ip addr add 127.0.0.$i/8 dev lo
-done
-```
-
-Then launch 8 instances in parallel:
-
-```bash
-for i in $(seq 1 8); do
-  dnsperf -s 127.0.0.$i -p 53 -d /tmp/queries.txt \
-    -l 30 -c 20 -Q 20000 \
-    > /tmp/perf_$i.txt 2>&1 &
-done
-wait
-
-# Aggregate results
-grep "Queries per second" /tmp/perf_*.txt
-grep "Average latency"    /tmp/perf_*.txt
-```
-
-Result: ~75,000 q/s total across 8 clients — server CPU was the bottleneck,
-not the rate limiter or lock contention.
-
----
-
-## What limits throughput
-
-In standard mode (without XDP), the bottleneck is the **hickory-server async runtime**:
-one Tokio task per DNS request, each performing ACL check → rate limit check →
-zone lookup → response serialisation → UDP send.
-
-On a 4-core VM this caps at ~80k q/s for local-zone queries. Forwarding queries
-are network-latency-bound rather than CPU-bound.
-
-### Scaling vertically
-
-Runbound uses `SO_REUSEPORT` with 32 UDP sockets distributed across CPU cores.
-Adding cores improves throughput linearly up to the point where memory bandwidth
-or kernel UDP overhead becomes the bottleneck (~16 cores on most hardware).
-
-### Breaking the limit: AF/XDP
-
-The `--features xdp` build bypasses the kernel network stack entirely.
-On bare metal with a NIC that supports XDP driver mode:
-
-- **500,000 – 1,000,000+ q/s** for local-zone queries
-- Sub-millisecond latency under load
-- ACL and rate-limit enforcement still applied in XDP worker (no bypass)
-
-XDP is enabled by default in all published binaries. To disable it at runtime without
-recompiling, add `xdp: no` to `unbound.conf` or pass `--no-xdp` on the command line.
-
-See [xdp.md](xdp.md) for setup instructions and disable options.
-
----
-
-## Comparison with Unbound
-
-| | Unbound 1.19 | Runbound 0.2.0 |
+| Server | Version | Threads / workers |
 |---|---|---|
-| Single-core local zone | ~30k q/s | ~82k q/s |
-| Multi-core scaling | Good | Good (SO_REUSEPORT) |
-| Forwarding | Network-bound | Network-bound |
-| Memory per 1M cache entries | ~500 MB | ~400 MB (ArcSwap, no copy) |
-| Config reload | Full restart | Hot reload via API |
+| Runbound | 0.4.16 | 128 OS threads (SO_REUSEPORT) — note ¹ |
+| BIND9 | 9.20.21 | kernel-managed multi-thread |
+| Unbound | 1.22.0 | 64 threads |
 
-> Unbound numbers are indicative; actual results depend on hardware and configuration.
-> Run your own benchmarks on your hardware before making architectural decisions.
+> ¹ Runbound detected 128 "physical cores" on the AMD 5995WX due to a known SMT
+> topology detection bug (fix in v0.4.2). Actual physical cores: 64.
+> Impact: some SMT sibling contention. Results are still competitive; corrected
+> numbers expected to improve slightly once the fix is deployed.
+
+**Runbound log level: verbosity 1 (warn).** At verbosity 2 (info), Runbound logs
+every query — this adds significant CPU overhead at high QPS (confirmed: p99 under
+stress goes from 0.231 ms to 3.011 ms with per-query logging enabled). BIND9 and
+Unbound log nothing by default, making verbosity 1 the fair comparison baseline.
+
+---
+
+### Benchmark methodology
+
+Four phases, ~10 minutes per server, identical for all three:
+
+**Phase 1 — Warm-up** (30 s, 1 000 QPS, 1 client)  
+Fill the DNS cache. Stabilise the process. Discard results.
+
+**Phase 2 — Ceiling detection** (ramp: 1 000 QPS → ×2 every 5 s)  
+Find the maximum sustainable QPS. Stop when the server cannot burst
+to 2× the current level without packet loss > 1%.
+
+**Phase 3 — Sustained load** (60 s, 80% of ceiling, 4 clients)  
+Simulate realistic production load. Measure stable latency.
+
+**Phase 4 — Stress** (60 s, 150% of ceiling, 4 clients)  
+Simulate DDoS conditions. Measure degradation and crash resistance.
+
+---
+
+### Results
+
+| Server | QPS_MAX | Sustained QPS | Sustained p99 | Stress QPS | Stress p99 | Loss |
+|---|---|---|---|---|---|---|
+| **Runbound 0.4.16** | 128 000 | 85 116 | 0.213 ms | 105 846 | **0.231 ms** | **0.00%** |
+| BIND9 9.20.21 | 128 000 | 85 149 | 0.210 ms | 105 919 | 0.225 ms | 0.00% |
+| Unbound 1.22.0 | 128 000 | 85 019 | **0.078 ms** | 105 781 | **0.170 ms** | 0.00% |
+
+All three servers hit the **client NIC ceiling** (Emulex be2net at ~128 000 QPS).
+At that ceiling, sustained QPS and loss rate are statistically identical.
+The latency differences are measurable but sub-millisecond across the board.
+
+---
+
+### Analysis
+
+**Throughput parity:** All three servers saturate the client NIC at 128 000 QPS
+with 0.00% packet loss. The bottleneck is the benchmark client, not the DNS server.
+
+**Latency:** Unbound leads with 0.170 ms p99 under stress — a result of 20+ years
+of cache optimisation in C. Runbound (0.231 ms) and BIND9 (0.225 ms) are within
+60 µs of each other and within 61 µs of Unbound.
+
+**Stability under overload:** All three servers responded correctly after 60 seconds
+at 150% of the detected ceiling. No crashes, no memory leaks observed.
+
+**What this benchmark does NOT measure:**
+- AF/XDP kernel-bypass performance (requires Intel NIC client — coming in next test)
+- REST API throughput
+- Blacklist performance at scale (100k+ entries)
+- HA master/slave replication
+- Performance under random/uncached queries (cache-miss rate)
+
+---
+
+### Context: consumer router comparison
+
+For reference, the same dnsmark benchmark protocol run against a Unifi aggregation
+router used as a DNS server:
+
+| Metric | Unifi router | Bare metal (all three) |
+|---|---|---|
+| QPS ceiling | 258 QPS | 128 000 QPS |
+| Packet loss at ceiling | 27% | 0.00% |
+| p99 latency | ~200 ms | < 0.3 ms |
+| Factor | ×1 | **×496** |
+
+---
+
+### Next benchmark: AF/XDP native (Intel X540 client)
+
+The current client (Emulex be2net) does not support AF/XDP.
+A follow-up benchmark with an Intel X540-T2 client will test:
+
+- Runbound XDP native path on ixgbe (both ends)
+- Expected range: 500 000 – 14 000 000 QPS
+- Both BIND9 and Unbound lack XDP support — comparison becomes one-sided
+
+Results will be published in [docs/benchmark-xdp.md](benchmark-xdp.md) when available.
+
+---
+
+### Reproduce these results
+
+```bash
+# Download dnsmark
+curl -LO https://github.com/redlemonbe/dnsmark/releases/latest/download/dnsmark-linux-x86_64-musl
+chmod +x dnsmark-linux-x86_64-musl
+
+# Create query file
+cat > /tmp/queries.txt << 'EOF'
+google.com A
+cloudflare.com A
+github.com A
+amazon.com A
+youtube.com A
+twitter.com A
+reddit.com A
+facebook.com A
+EOF
+
+# Run benchmark (adjust IP)
+./dnsmark-linux-x86_64-musl -s <SERVER_IP> --ramp -l 60 --no-tui --no-xdp \
+  -d /tmp/queries.txt
+```
+
+Full raw data for all phases and all three servers: [docs/benchmark-2026-05-20.md](benchmark-2026-05-20.md)

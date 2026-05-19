@@ -65,7 +65,7 @@ sudo RUNBOUND_API_KEY="your-key" runbound --config /etc/runbound/runbound.conf
 dig @127.0.0.1 google.com
 
 # Verify the API is reachable:
-curl -s http://localhost:8081/health -H "Authorization: Bearer $RUNBOUND_API_KEY"
+curl -s http://localhost:8080/health -H "Authorization: Bearer $RUNBOUND_API_KEY"
 # → {"status":"ok","uptime_secs":3,"queries":0}
 ```
 
@@ -88,7 +88,7 @@ sudo systemctl enable --now runbound
 ## 5. First API calls
 
 ```bash
-API="http://localhost:8081"
+API="http://localhost:8080"
 TOKEN="your-key"
 
 # Add a local DNS entry

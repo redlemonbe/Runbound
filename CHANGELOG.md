@@ -1179,7 +1179,7 @@ v0.4.0. See `audit.toml` for per-CVE exposure analysis and mitigations.
 ---
 
 [Unreleased]: https://github.com/redlemonbe/Runbound/compare/v0.4.16...HEAD
-[0.4.2]: https://github.com/redlemonbe/Runbound/compare/v0.4.16...v0.4.2
+[0.4.2]: https://github.com/redlemonbe/Runbound/compare/v0.4.1...v0.4.2
 [0.4.16]: https://github.com/redlemonbe/Runbound/compare/v0.4.15...v0.4.16
 [0.4.15]: https://github.com/redlemonbe/Runbound/compare/v0.4.14...v0.4.15
 [0.3.1]: https://github.com/redlemonbe/Runbound/compare/v0.3.0...v0.3.1

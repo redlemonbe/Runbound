@@ -190,7 +190,7 @@ Runbound can subscribe to remote blocklists and auto-refresh them. Start with a 
 well-maintained ones:
 
 ```bash
-API="http://localhost:8081"
+API="http://localhost:8080"
 TOKEN="$RUNBOUND_API_KEY"
 
 # OISD — comprehensive tracker + ad block list

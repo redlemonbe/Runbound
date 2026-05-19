@@ -30,7 +30,7 @@ Internet / LAN
       │
       ▼
 ┌─────────────────────────────────────────────────────┐
-│  REST API (port 8081, localhost only)               │
+│  REST API (port 8080, localhost only)               │
 │  Body size check before rate limit (Content-Length) │  ← 413 before 429
 │  Bearer token (timing-safe cmp)                     │  ← subtle::ConstantTimeEq
 │  /reload independent rate limit (2 RPS)             │  ← dedicated token bucket
