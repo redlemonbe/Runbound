@@ -11,6 +11,7 @@
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -240,11 +241,75 @@ impl LogBuffer {
     }
 }
 
+// ── Sharded log buffer ────────────────────────────────────────────────────
+//
+// Replaces the single Arc<Mutex<LogBuffer>> with N independent shards.
+// DNS workers round-robin across shards (atomic counter), so contention is
+// reduced by a factor of N on the write path.
+// The REST read path merges all shards — allocations there are acceptable.
+
+const LOG_SHARDS: usize = 16;
+
+pub struct ShardedLogBuffer {
+    shards:  Vec<Mutex<LogBuffer>>,
+    counter: AtomicU64,
+}
+
+impl ShardedLogBuffer {
+    fn new(capacity: usize, log_client_ip: bool) -> Self {
+        let per_shard = capacity.div_ceil(LOG_SHARDS).max(1);
+        let shards = (0..LOG_SHARDS)
+            .map(|_| Mutex::new(LogBuffer::new_with(per_shard, log_client_ip)))
+            .collect();
+        Self { shards, counter: AtomicU64::new(0) }
+    }
+
+    /// Push a query log entry. Selects a shard via round-robin.
+    /// Returns the client string actually stored (for tracing).
+    pub fn push_query(
+        &self,
+        name:       &str,
+        client_ip:  &IpAddr,
+        qtype:      u16,
+        action:     LogAction,
+        elapsed_ms: u32,
+    ) -> String {
+        let idx = (self.counter.fetch_add(1, Ordering::Relaxed) % LOG_SHARDS as u64) as usize;
+        if let Ok(mut buf) = self.shards[idx].lock() {
+            buf.push_query(name, client_ip, qtype, action, elapsed_ms)
+        } else {
+            client_ip.to_string()
+        }
+    }
+
+    /// Query log entries across all shards: merge, sort newest-first, filter, paginate.
+    pub fn query(&self, q: &LogQuery) -> (Vec<LogEntryView>, usize) {
+        let fetch_all = LogQuery { limit: LOG_CAP, page: 0, action: q.action, client: q.client, since_secs: q.since_secs };
+        let mut merged: Vec<LogEntryView> = Vec::new();
+        for shard in &self.shards {
+            if let Ok(buf) = shard.lock() {
+                let (entries, _) = buf.query(&fetch_all);
+                merged.extend(entries);
+            }
+        }
+        merged.sort_unstable_by(|a, b| b.ts.cmp(&a.ts));
+        let total = merged.len();
+        let start = (q.page * q.limit).min(total);
+        let end   = (start + q.limit).min(total);
+        (merged.drain(start..end).collect(), total)
+    }
+
+    /// Clear all shards. Returns total entries deleted.
+    pub fn clear(&self) -> usize {
+        self.shards.iter().filter_map(|s| s.lock().ok()).map(|mut b| b.clear()).sum()
+    }
+}
+
 // ── Shared handle ─────────────────────────────────────────────────────────
-pub type SharedLogBuffer = Arc<Mutex<LogBuffer>>;
+pub type SharedLogBuffer = Arc<ShardedLogBuffer>;
 
 pub fn new_shared(capacity: usize, log_client_ip: bool) -> SharedLogBuffer {
-    Arc::new(Mutex::new(LogBuffer::new_with(capacity, log_client_ip)))
+    Arc::new(ShardedLogBuffer::new(capacity, log_client_ip))
 }
 
 // ── Timestamp formatter ────────────────────────────────────────────────────

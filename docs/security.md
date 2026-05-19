@@ -1,7 +1,7 @@
 # Security Architecture
 
 This document covers the security model, defensive layers, and all audit findings
-fixed across Runbound releases through v0.4.14.
+fixed across Runbound releases through v0.4.16.
 
 ---
 
@@ -16,7 +16,8 @@ Internet / LAN
 │  Optional mTLS client auth (dot-client-auth-ca)     │  ← mutual TLS for DoT
 ├─────────────────────────────────────────────────────┤
 │  ACL check (allow / deny / refuse)                  │  ← per-subnet rules, IPv4+IPv6
-│  Rate limiter (token bucket)                        │  ← per-source-IP, DashMap+ahash
+│  Rate limiter (token bucket, /48 for IPv6)          │  ← per-source-IP, DashMap+ahash
+│  TCP per-IP connection cap (20, /48 for IPv6)       │  ← pre-accept filter, loopback relay
 │  Inflight semaphore (max 4096)                      │  ← hard OOM backstop
 ├─────────────────────────────────────────────────────┤
 │  AF/XDP fast path (default on)                      │  ← local-zone answered in user   │
@@ -32,7 +33,9 @@ Internet / LAN
 │  REST API (port 8081, localhost only)               │
 │  Body size check before rate limit (Content-Length) │  ← 413 before 429
 │  Bearer token (timing-safe cmp)                     │  ← subtle::ConstantTimeEq
+│  /reload independent rate limit (2 RPS)             │  ← dedicated token bucket
 │  Entry limits (10k DNS, 100k BL)                   │
+│  Error bodies sanitised (no FS paths)               │  ← sanitize_error()
 │  zones_mutex (atomic write+swap)                    │
 │  HMAC-SHA256 store integrity (.mac sidecars)        │  ← RUNBOUND_STORE_KEY
 └─────────────────────────────────────────────────────┘
@@ -70,6 +73,33 @@ rate-limit: 500    # max queries per second per IP
 - Shared between the standard path and the XDP fast path.
 - Setting `rate-limit: 0` **disables** rate limiting entirely — every query is passed without
   a bucket check. On public-facing resolvers, this is not recommended.
+
+**IPv6 /48 prefix aggregation (v0.4.16, VUL-6.1):** IPv6 source addresses are truncated to
+their /48 prefix before bucket lookup. A flood from a single routed /48 block (up to 65 536
+host addresses) fills at most one bucket instead of exhausting all 65 536 table slots.
+IPv4 addresses use the full /32. This prevents a bucket-exhaustion attack where an attacker
+fills the table from one network block, causing all subsequent IPs to bypass rate limiting.
+
+---
+
+## TCP connection cap (v0.4.16, VUL-6.2)
+
+A pre-accept filter limits the number of concurrent TCP DNS connections per source IP to
+**20 connections** (`TCP_CONN_PER_IP_MAX`). Connections that exceed the cap are dropped
+immediately after a rate-throttled warning log.
+
+**Architecture — loopback relay:** A relay listener sits between the public TCP port and
+hickory-server's internal TCP listener (bound on `127.0.0.1:0`). The relay's accept loop:
+1. Checks the per-IP counter in a `DashMap<IpAddr, Arc<AtomicU16>>` (with `/48` aggregation
+   for IPv6).
+2. If the cap is reached, drops the connection.
+3. Otherwise increments the counter, opens a connection to hickory's loopback listener, proxies
+   the session via `tokio::io::copy_bidirectional`, then decrements the counter on close.
+
+Loopback addresses (`127.x.x.x`, `::1`) are exempt from the cap.
+
+This prevents FD exhaustion attacks where a single source opens thousands of TCP connections to
+exhaust the process file-descriptor limit and deny service to all clients.
 
 ---
 
@@ -181,6 +211,17 @@ so oversized requests return HTTP 413 (not 429). The `DefaultBodyLimit` at
 sequence is performed inside `zones_mutex`. Two concurrent API writes cannot
 overwrite each other.
 
+**`/reload` rate limit (v0.4.16, VUL-3.2):** `POST /reload` has a dedicated token bucket
+(2 RPS, burst 2) separate from the general API limiter. This prevents an authenticated caller
+from sustaining a burst of expensive zone-set rebuilds. Callers that exceed the rate receive
+HTTP 429 `{"error": "RATE_LIMITED"}`.
+
+**Error body sanitisation (v0.4.16, VUL-3.4):** HTTP 500 error bodies pass through
+`sanitize_error()`, which replaces any error string containing `/` with `"internal error"`.
+This prevents file-system paths (e.g.,
+`failed to open file /etc/runbound/dns_entries.json: No such file or directory`) from
+leaking to authenticated API callers. The full error is always logged at `WARN` level.
+
 **Input validation:**
 - DNS `name` and domain-type `value` fields (CNAME, MX, NS, PTR, SRV targets)
   are validated against RFC 1035 rules: max 253 chars, labels max 63 chars,
@@ -288,6 +329,13 @@ before any DNS response is constructed.
 - `Deny` ACL rule → silent drop (`XDP_DROP`).
 - `Refuse` ACL rule → REFUSED frame crafted and sent directly from the worker.
 - Rate-limit exceeded → REFUSED frame, same as the kernel path.
+
+**UMEM descriptor bounds (v0.4.16, VUL-2.1):** `frame_mut()` and `frame()` in
+`src/dns/xdp/umem.rs` now return `Option<&mut [u8]>` / `Option<&[u8]>` with a hard
+release-mode bounds check (`saturating_add`) instead of the previous `debug_assert!` which
+compiled to a no-op in release builds. The XDP worker also adds an explicit bounds check
+before raw-pointer UMEM slice construction. Malformed or kernel-corrupt descriptors are
+silently skipped instead of producing undefined behaviour.
 
 **Systemd requirements:** `LimitMEMLOCK=infinity` is required in the service file
 for AF/XDP UMEM allocation. The provided `runbound.service` sets this automatically.
@@ -471,6 +519,16 @@ See [systemd.md](systemd.md) for the full unit file.
 | FIX-XDP-VERIFIER | — | eBPF program rewritten with constant IHL=20 — eliminates BPF verifier rejection on variable pointer arithmetic | v0.4.14 |
 | FIX-XDP-UMEM | — | `LimitMEMLOCK=infinity` added to `runbound.service` — fixes UMEM allocation failure under systemd sandboxing | v0.4.14 |
 | FIX-XDP-FALLBACK | — | XDP init failure now logs actionable `WARN` and falls back to SO_REUSEPORT — process no longer panics | v0.4.14 |
+
+### v0.4.16
+
+| ID | Severity | Title | Fixed in |
+|---|---|---|---|
+| VUL-2.1 | Medium | UMEM bounds enforced only in debug builds — `debug_assert!` → release-mode `Option` return | v0.4.16 |
+| VUL-6.1 | Medium | IPv6 /128 buckets exhaust rate-limit table — per-/48 normalisation added | v0.4.16 |
+| VUL-6.2 | Low | No per-source-IP TCP connection cap — `TcpConnTracker` added (20 connections, loopback relay) | v0.4.16 |
+| VUL-3.4 | Low | API error bodies exposed file-system paths — `sanitize_error()` added at 8 sites | v0.4.16 |
+| VUL-3.2 | Low | `/reload` endpoint not independently rate-limited — dedicated 2 RPS token bucket added | v0.4.16 |
 
 See [security-audit.md](security-audit.md) for the full white-box audit report.
 

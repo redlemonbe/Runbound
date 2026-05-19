@@ -10,9 +10,10 @@
 //
 // UDP + TCP on the configured port (default 53).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -32,7 +33,8 @@ use hickory_server::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use arc_swap::ArcSwap;
-use tokio::net::{TcpListener, UdpSocket};
+use dashmap::DashMap;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
@@ -134,11 +136,7 @@ impl RunboundHandler {
         // log injection via control characters embedded in query names.
         let safe_name = sanitize_dns_name(qname);
 
-        let client_log = if let Ok(mut buf) = self.log_buffer.lock() {
-            buf.push_query(&safe_name, &client, u16::from(qtype), action, elapsed_ms)
-        } else {
-            client.to_string()
-        };
+        let client_log = self.log_buffer.push_query(&safe_name, &client, u16::from(qtype), action, elapsed_ms);
 
         info!(
             client = %client_log,
@@ -249,7 +247,7 @@ impl RunboundHandler {
         client_ip: IpAddr,
         start: Instant,
     ) -> ResponseInfo {
-        match self.resolver.load_full().lookup(Name::from(qname), qtype).await {
+        match self.resolver.load().lookup(Name::from(qname), qtype).await {
             Ok(lookup) => {
                 // DNS rebinding protection: SERVFAIL if any A/AAAA record falls
                 // within a configured private-address range (Unbound compatible).
@@ -464,11 +462,15 @@ impl RequestHandler for RunboundHandler {
 
 /// MED-06: Strip control characters from DNS names before structured log emission.
 /// Prevents log injection via carefully crafted query names containing \n, \r, etc.
+/// Fast path: if the name contains only printable ASCII (the common case), the
+/// String from to_string() is returned as-is — no second allocation.
 fn sanitize_dns_name(name: &LowerName) -> String {
-    name.to_string()
-        .chars()
-        .map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '?' })
-        .collect()
+    let s = name.to_string();
+    if s.bytes().any(|b| !(0x20..0x7f).contains(&b)) {
+        s.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '?' }).collect()
+    } else {
+        s
+    }
 }
 
 /// Follow CNAME records within local zones, up to 8 hops (prevents loops).
@@ -479,7 +481,7 @@ fn follow_local_cname(
     start: &LowerName,
     qtype: RecordType,
 ) -> Vec<Record> {
-    let mut chain: Vec<Record> = Vec::new();
+    let mut chain: Vec<Record> = Vec::with_capacity(8);
     let mut current = start.clone();
 
     for _ in 0..8 {
@@ -838,6 +840,121 @@ fn bind_reuseport_udp(addr: &str) -> anyhow::Result<UdpSocket> {
         .map_err(|e| anyhow::anyhow!("tokio from_std: {e}"))
 }
 
+// ── FIX 6.2: Per-IP TCP connection cap ────────────────────────────────────────
+
+/// Max concurrent TCP DNS connections from a single source IP (or /48 for IPv6).
+const TCP_CONN_PER_IP_MAX: u16 = 20;
+
+/// Truncate IPv6 to /48 for TCP connection tracking (consistent with rate limiter).
+fn normalize_tcp_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[6..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
+}
+
+struct TcpConnTracker {
+    counts:    DashMap<IpAddr, Arc<AtomicU16>, ahash::RandomState>,
+    last_warn: DashMap<IpAddr, Instant,        ahash::RandomState>,
+}
+
+impl TcpConnTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            counts:    DashMap::with_hasher(ahash::RandomState::default()),
+            last_warn: DashMap::with_hasher(ahash::RandomState::default()),
+        })
+    }
+
+    /// Attempt to claim a connection slot for `ip`.
+    /// Returns `true` if allowed, `false` if the per-IP cap is exceeded.
+    /// Loopback addresses (127.x and ::1) are always allowed (health checks).
+    fn try_acquire(&self, ip: IpAddr) -> bool {
+        if matches!(ip, IpAddr::V4(a) if a.is_loopback())
+            || matches!(ip, IpAddr::V6(a) if a.is_loopback())
+        {
+            return true;
+        }
+        let counter = self.counts
+            .entry(ip)
+            .or_insert_with(|| Arc::new(AtomicU16::new(0)));
+        let prev = counter.fetch_add(1, Ordering::Relaxed);
+        if prev >= TCP_CONN_PER_IP_MAX {
+            counter.fetch_sub(1, Ordering::Relaxed);
+            let mut emit = false;
+            self.last_warn
+                .entry(ip)
+                .and_modify(|t| {
+                    if t.elapsed().as_secs() >= 60 {
+                        *t = Instant::now();
+                        emit = true;
+                    }
+                })
+                .or_insert_with(|| {
+                    emit = true;
+                    Instant::now()
+                });
+            if emit {
+                warn!(%ip, limit = TCP_CONN_PER_IP_MAX, "TCP per-IP connection cap reached — dropping");
+            }
+            false
+        } else {
+            true
+        }
+    }
+
+    fn release(&self, ip: IpAddr) {
+        if let Some(c) = self.counts.get(&ip) {
+            c.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Accept-with-limit loop for a public-facing TCP listener.
+/// Connections within the per-IP cap are relayed to `relay_addr` (a loopback
+/// listener owned by hickory-server) via bidirectional byte copy.
+///
+/// Trade-off: hickory sees 127.0.0.1 as the source for all relayed TCP
+/// connections, so the DNS per-IP rate limiter uses a shared loopback bucket
+/// for TCP clients. Acceptable because TCP DNS traffic is inherently low-volume
+/// (large responses, DNSSEC chains). The TCP connection cap enforced here
+/// prevents the primary DoS vector (FD exhaustion via many idle connections).
+async fn run_tcp_with_limit(
+    public_tcp:   TcpListener,
+    relay_addr:   SocketAddr,
+    tracker:      Arc<TcpConnTracker>,
+    conn_timeout: Duration,
+) {
+    loop {
+        let (mut client, peer) = match public_tcp.accept().await {
+            Ok(x)  => x,
+            Err(e) => { warn!(err=%e, "TCP accept error"); continue; }
+        };
+        let src_ip = normalize_tcp_ip(peer.ip());
+        if !tracker.try_acquire(src_ip) {
+            // Over limit: drop immediately (TcpStream closed on drop → TCP FIN/RST)
+            continue;
+        }
+        let tracker2 = Arc::clone(&tracker);
+        tokio::spawn(async move {
+            let r = tokio::time::timeout(conn_timeout, async {
+                let mut relay = TcpStream::connect(relay_addr).await?;
+                tokio::io::copy_bidirectional(&mut client, &mut relay).await?;
+                Ok::<_, std::io::Error>(())
+            })
+            .await;
+            if let Ok(Err(e)) = r {
+                debug!(err=%e, %src_ip, "TCP relay error");
+            }
+            tracker2.release(src_ip);
+        });
+    }
+}
+
 pub async fn run_dns_server(
     cfg:          &UnboundConfig,
     zones:        Arc<ArcSwap<LocalZoneSet>>,
@@ -899,6 +1016,10 @@ pub async fn run_dns_server(
         cfg.interfaces.clone()
     };
 
+    // FIX 6.2: shared per-IP TCP connection tracker (across all interfaces)
+    let tcp_tracker = TcpConnTracker::new();
+    const TCP_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
     for iface in &interfaces {
         let udp_addr = format!("{}:{}", iface, port);
         let tcp_addr = format!("{}:{}", iface, port);
@@ -920,13 +1041,24 @@ pub async fn run_dns_server(
         }
         info!(addr=%udp_addr, sockets=ncpus, "DNS UDP listening (SO_REUSEPORT)");
 
-        let tcp = TcpListener::bind(&tcp_addr).await
+        // FIX 6.2: public-facing TCP listener feeds our per-IP accept gate.
+        // hickory-server gets a loopback relay listener so its internal accept
+        // loop never sees connections from over-limit source IPs.
+        let public_tcp = TcpListener::bind(&tcp_addr).await
             .map_err(|e| anyhow::anyhow!("TCP bind {tcp_addr}: {e}"))?;
-        info!(addr=%tcp_addr, "DNS TCP listening");
+        // Relay listener: loopback, ephemeral port — hickory owns this listener.
+        let relay_tcp = TcpListener::bind("127.0.0.1:0").await
+            .map_err(|e| anyhow::anyhow!("TCP relay bind: {e}"))?;
+        let relay_addr = relay_tcp.local_addr()
+            .map_err(|e| anyhow::anyhow!("TCP relay local_addr: {e}"))?;
+        info!(addr=%tcp_addr, "DNS TCP listening (per-IP cap: {} conns)", TCP_CONN_PER_IP_MAX);
         // 30s idle timeout — enough for slow DNSSEC responses while limiting FD exhaustion.
         // 4096-byte response buffer fits any DNS response (max UDP payload is 65535 bytes but
         // typical responses are well under 4 KiB; EDNS0 handles larger).
-        server.register_listener(tcp, Duration::from_secs(30), 4096);
+        server.register_listener(relay_tcp, TCP_SESSION_TIMEOUT, 4096);
+
+        let tracker2 = Arc::clone(&tcp_tracker);
+        tokio::spawn(run_tcp_with_limit(public_tcp, relay_addr, tracker2, TCP_SESSION_TIMEOUT));
     }
 
     // ── DoT / DoH / DoQ (RFC 7858 / 8484 / 9250) ───────────────────────────

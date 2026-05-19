@@ -1,6 +1,6 @@
 [package]
 name = "runbound"
-version = "0.4.15"
+version = "0.4.16"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "AGPL-3.0-or-later"
@@ -132,6 +132,8 @@ http-body-util = "0.1"
 # Kernel-bypass DNS fast path via AF_XDP / eBPF.
 # Requires: clang + libbpf-dev at build time (apt install clang libbpf-dev).
 # No runtime C libraries needed — aya is pure Rust.
+# Enabled by default; opt out with --no-default-features.
+default = ["xdp"]
 xdp = ["dep:aya"]
 
 [dependencies.aya]

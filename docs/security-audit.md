@@ -1,7 +1,7 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.5  
-**Last updated:** 2026-05-17  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.16  
+**Last updated:** 2026-05-19  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration  
 **Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4)
 
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-**50 findings across 5 audit cycles — 100% resolved as of v0.4.5.**
+**55 findings across 6 audit cycles — 100% resolved as of v0.4.16.**
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
@@ -18,6 +18,7 @@
 | Third white-box | v0.4.0 | 8 (1 Blocking, 2 Medium, 5 Low) | ✅ All fixed v0.4.1 |
 | IA audit | v0.4.1 | 9 (3 Low, 3 Info, 2 Doc, 1 false positive) | ✅ All closed v0.4.3 |
 | External pentest | v0.4.4 | 4 (1 High, 1 Medium/false positive, 1 Low, 1 Info) | ✅ All closed v0.4.5 |
+| Pre-release white-box | v0.4.16 | 5 (2 Medium, 3 Low) | ✅ All fixed v0.4.16 |
 
 Runbound's core DNS path is well-engineered: memory-safe Rust, lock-free hot path
 via ArcSwap, per-IP token-bucket rate limiting with aggressive eviction, RFC 8482
@@ -31,7 +32,7 @@ findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0
 A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
 through SEC-16), all fixed in v0.3.3.
 
-**All HIGH and MEDIUM open findings are closed as of v0.4.0:**
+**All HIGH and MEDIUM open findings are closed as of v0.4.0. All 5 pre-release findings from the v0.4.16 cycle are also resolved:**
 
 - JSON store HMAC-SHA256 integrity (HIGH-06) — `RUNBOUND_STORE_KEY` env var, sidecar `.mac` files.
 - TLS cipher suite hardening (HIGH-07) — hickory 0.26 + rustls 0.23, TLS 1.3 default.
@@ -719,9 +720,144 @@ null bytes in a URI). No data is leaked; the client sees a connection reset.
 
 ---
 
+---
+
+## Pre-release Audit Cycle — v0.4.16
+
+**Scope:** `src/dns/xdp/umem.rs`, `src/dns/xdp/worker.rs`, `src/dns/ratelimit.rs`,
+`src/dns/server.rs`, `src/api/mod.rs`, `src/main.rs`  
+**Methodology:** Manual white-box source code review focusing on the XDP kernel-bypass path,
+rate limiter, TCP connection handling, and REST API error surface.  
+**Status:** All 5 findings resolved in v0.4.16.
+
+---
+
+### VUL-2.1 — UMEM bounds enforced only in debug builds
+
+**Severity:** MEDIUM  
+**File:** `src/dns/xdp/umem.rs`, `src/dns/xdp/worker.rs`  
+**Status:** ✅ Fixed in v0.4.16
+
+`frame_mut()` and `frame()` used `debug_assert!` to check that the descriptor offset + length
+fit within the UMEM region. In release builds (`--release`) all `debug_assert!` calls compile
+to no-ops, so a kernel-provided descriptor with an out-of-range `addr` would produce a
+dangling pointer slice with undefined behaviour.
+
+Although `addr` comes from the kernel XDP ring and is normally trustworthy, a buggy or
+maliciously patched kernel, or UMEM ring corruption by a future bug, could supply an
+out-of-range value. In that case, the process would access memory outside the UMEM region —
+a safety violation in an otherwise memory-safe codebase.
+
+**Fix:**
+- `frame_mut` and `frame` now return `Option<&mut [u8]>` / `Option<&[u8]>`. A
+  `saturating_add` bounds check runs unconditionally in both debug and release builds;
+  `None` is returned if the bounds are exceeded.
+- The XDP worker (`worker.rs`) adds a matching release-mode check before the raw-pointer
+  slice construction on the direct (non-`frame_mut`) path: if
+  `desc.addr + desc.len > umem.area_len`, the TX frame is returned to the free pool and
+  the descriptor is skipped.
+- No measurable performance impact: the branch is predicted-taken on every iteration.
+
+---
+
+### VUL-6.1 — IPv6 /128 addresses exhaust rate-limit bucket table
+
+**Severity:** MEDIUM  
+**File:** `src/dns/ratelimit.rs`  
+**Status:** ✅ Fixed in v0.4.16
+
+The `DashMap` bucket table has a hard cap of 65 536 slots (`MAX_RATE_LIMIT_BUCKETS`). With
+per-/128 bucketing, an attacker controlling a /48 routed block (65 536 host addresses) could
+fill the entire table from a single network announcement, causing all subsequent source IPs —
+including legitimate clients — to be refused without rate-limit protection until the aggressive
+10-second eviction reacted.
+
+**Fix:** A `normalize_ip()` helper truncates every IPv6 address to its /48 prefix
+(`octets[6..].fill(0)`) before the bucket lookup. The same routed block now occupies exactly
+one bucket instead of up to 65 536. IPv4 addresses are unchanged (full /32 per address). The
+same normalisation is applied in `server.rs` (`normalize_tcp_ip()`) for the TCP connection
+tracker introduced by VUL-6.2.
+
+---
+
+### VUL-6.2 — No per-source-IP TCP connection limit
+
+**Severity:** LOW  
+**File:** `src/dns/server.rs`  
+**Status:** ✅ Fixed in v0.4.16
+
+TCP DNS (RFC 1035 §4.2.2, used by DNSSEC responses and zone transfers) had no per-IP
+concurrency cap. A single source could exhaust the process file-descriptor table by opening
+thousands of TCP connections, causing new UDP and TCP requests from all sources to fail.
+
+**Fix:** A `TcpConnTracker` struct (backed by `DashMap<IpAddr, Arc<AtomicU16>>`) tracks
+concurrent TCP connections per source IP (aggregated at /48 for IPv6). The cap is 20
+connections per IP (`TCP_CONN_PER_IP_MAX`). Loopback addresses (`127.x`, `::1`) are exempt.
+
+Architecture: a **loopback relay** runs between the public TCP listener and hickory-server's
+internal TCP listener bound on `127.0.0.1:0`. The relay's accept loop enforces the per-IP
+cap before proxying allowed connections via `tokio::io::copy_bidirectional`. Connections that
+exceed the cap are dropped immediately after a warning (rate-throttled to one log line per IP
+per 10 seconds).
+
+Trade-off: all TCP sessions proxied through the relay appear as `127.0.0.1` to hickory-server's
+own rate limiter, which is acceptable because the relay already enforces per-IP limits before
+any proxying occurs.
+
+---
+
+### VUL-3.4 — REST API error bodies expose file-system paths
+
+**Severity:** LOW  
+**File:** `src/api/mod.rs`  
+**Status:** ✅ Fixed in v0.4.16
+
+Several API error responses included the raw `e.to_string()` of `std::io::Error` and `anyhow`
+errors, which on Linux often contain absolute file-system paths (e.g.,
+`"failed to open file /etc/runbound/dns_entries.json: No such file or directory"`). These paths
+were returned in the HTTP 500 response body visible to any authenticated API caller, disclosing
+the server's directory layout and potentially aiding privilege escalation planning.
+
+**Affected handlers (8 sites):** `reload_handler`, `list_dns_handler`, `persist_and_swap`,
+`delete_dns_handler` (load + save), `list_blacklist_handler`, `add_blacklist_handler`,
+`delete_blacklist_handler` (load + save).
+
+**Fix:** A `sanitize_error()` helper is called at every error site:
+
+```rust
+fn sanitize_error(e: &impl std::fmt::Display) -> String {
+    let s = e.to_string();
+    if s.contains('/') { "internal error".to_string() } else { s }
+}
+```
+
+The full error string (with path) is always emitted at `WARN` level via `tracing` for
+operator observability. Only the sanitised string appears in the HTTP response body.
+
+---
+
+### VUL-3.2 — `/reload` endpoint not independently rate-limited
+
+**Severity:** LOW  
+**File:** `src/api/mod.rs`, `src/main.rs`  
+**Status:** ✅ Fixed in v0.4.16
+
+`POST /reload` triggers a full zone-set rebuild (config parse + zone trie reconstruction).
+It was only protected by the general API rate limiter (shared across all endpoints), which
+means an authenticated caller could burst-reload the zone set at up to the global API
+query rate — potentially causing sustained elevated CPU consumption on large configs with
+many zones.
+
+**Fix:** A dedicated `ReloadLimiter` token bucket (2 RPS, burst 2) is stored in `AppState`
+and checked at the start of `reload_handler`. Callers that exceed the rate receive HTTP 429
+with `{"error": "RATE_LIMITED", "details": "reload rate limit exceeded"}`. The general API
+rate limiter still applies in addition.
+
+---
+
 ## Open Findings
 
-All findings from all audit cycles are resolved as of v0.4.5.
+All findings from all audit cycles are resolved as of v0.4.16.
 No open findings remain.
 
 ---
@@ -753,4 +889,9 @@ v0.4.4 adds: `src/hsm.rs` (PKCS#11 HSM key storage, cryptoki 0.6); `deny.toml` (
 policy); `docs/audit.md` (audit process and SBOM procedure).
 v0.4.5 adds: pre-auth brute-force brake + async side-effects in `security_middleware`
 (timing oracle elimination, NEW-HIGH pentest); 411 for JSON POST without Content-Length
-(SEC-04 partial close); HTTP integration tests for 253/254-char name boundary (SEC-02).*
+(SEC-04 partial close); HTTP integration tests for 253/254-char name boundary (SEC-02).
+v0.4.16 adds: release-mode UMEM bounds check returning `Option` in `src/dns/xdp/umem.rs` +
+`src/dns/xdp/worker.rs` (VUL-2.1); IPv6 /48 normalisation in `src/dns/ratelimit.rs` and
+`src/dns/server.rs` (VUL-6.1); TCP per-IP cap via loopback relay in `src/dns/server.rs`
+(VUL-6.2); `sanitize_error()` at 8 API error sites in `src/api/mod.rs` (VUL-3.4);
+`ReloadLimiter` token bucket (2 RPS) in `src/api/mod.rs` + `src/main.rs` (VUL-3.2).*
