@@ -47,7 +47,7 @@ existing `unbound.conf` is all you need.
 | Directive | Description |
 |---|---|
 | `api-key` | REST API Bearer token (prefer `RUNBOUND_API_KEY` env var) |
-| `api-port` | REST API port (default: 8081) |
+| `api-port` | REST API port (default: 8080) |
 | `rate-limit` | Per-IP DNS rate limit in q/s (default: 200, max: 1,000,000) |
 | `cache-max-ttl` | TTL cap for cached records in seconds (default: 86400) |
 | `dnssec-validation` | Enable local DNSSEC re-validation (default: no) |

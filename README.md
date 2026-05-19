@@ -38,6 +38,7 @@ Your existing `unbound.conf` works as-is. Zero migration.
 | Prometheus metrics | ⚠️ XML/JSON channel | ❌ | ✅ `/metrics` OpenMetrics |
 | API key rotation (no restart) | ❌ | ❌ | ✅ `POST /rotate-key` |
 | Hot config reload | ✅ rndc reload | ❌ | ✅ API |
+| Bare-metal throughput (UDP, NIC-limited) | ~same | ~same | ~same |
 | AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ optional |
 | Linear scaling (SO_REUSEPORT, no lock contention) | ❌ | ❌ | ✅ built-in |
 | CPU affinity — physical cores only (HT excluded)  | ❌ | ❌ | ✅ automatic |
@@ -86,7 +87,7 @@ sudo ./runbound-vX.Y.Z-x86_64-linux-musl /etc/unbound/unbound.conf
 dig @127.0.0.1 google.com
 ```
 
-DNS live on **port 53**. REST API live on **port 8081** (localhost only, requires Bearer token). No config change needed.
+DNS live on **port 53**. REST API live on **port 8080** (localhost only, requires Bearer token). No config change needed.
 
 The REST API port is configurable with `api-port: 9090` in `runbound.conf`. See the [Configuration Reference](docs/configuration.md#api-key-and-port).
 
@@ -97,7 +98,7 @@ The REST API port is configurable with `api-port: 9090` in `runbound.conf`. See 
 ## Manage DNS without touching a file
 
 ```bash
-API="http://localhost:8081"
+API="http://localhost:8080"
 TOKEN="your-api-key"
 
 # Add a DNS entry — live, no restart
@@ -165,13 +166,19 @@ QPS
 
 Benchmarks run from a dedicated client machine (never from the DNS server):
 
-| Hardware | Tool | Throughput | Notes |
-|---|---|---|---|
-| 4-core KVM, 8 GB | dnsmark | ~16 000 q/s | 2 vCPU allocated to Runbound |
-| Bare metal 40c, 256 GB | dnsmark | pending | T640 — results coming |
-| AF/XDP bare metal | dnsmark | 500k – 1M+ q/s | kernel-bypass, Intel NICs |
+| Hardware | Tool | Runbound | BIND9 | Unbound | Notes |
+|---|---|---|---|---|---|
+| 4-core KVM VM | dnsmark | ~16 000 q/s | — | — | 2 vCPU, loopback |
+| AMD TR PRO 5995WX (bare metal) | dnsmark 0.4.5 | 105 846 q/s | 105 919 q/s | 105 781 q/s | NIC-limited (be2net 128k ceiling), verbosity:1 |
+| AF/XDP bare metal Intel ixgbe | dnsmark | 500k – 14M q/s | ❌ | ❌ | kernel-bypass — next benchmark |
 
-> Full methodology: [docs/performance.md](docs/performance.md)
+> **Production tip:** Set `verbosity: 1` in your `unbound.conf`.
+> `verbosity: 2` (info) logs every DNS query — at high QPS this adds measurable CPU overhead
+> (measured: p99 goes from **0.23 ms** at verbosity 1 to **3 ms** at verbosity 2 under stress).
+> At `verbosity: 1` (warn), per-query logging is disabled and Runbound achieves maximum throughput.
+
+> Bare-metal benchmark methodology and full raw data: [docs/benchmark-2026-05-20.md](docs/benchmark-2026-05-20.md)  
+> Benchmark tool: [dnsmark](https://github.com/redlemonbe/dnsmark)
 
 ---
 

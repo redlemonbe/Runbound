@@ -285,7 +285,7 @@ jobs:
         run: |
           ./target/release/runbound /tmp/runbound-ci.conf &
           sleep 2
-          curl -sf http://localhost:8081/health \
+          curl -sf http://localhost:8080/health \
             -H "Authorization: Bearer $HSM_PIN" | jq .hsm
           # → true
 ```
@@ -360,7 +360,7 @@ the session is closed. The HSM does not need to remain connected after startup.
 
 ```bash
 # Verify HSM is active
-curl -s http://localhost:8081/health -H "Authorization: Bearer $KEY" \
+curl -s http://localhost:8080/health -H "Authorization: Bearer $KEY" \
   | jq .hsm
 # true
 ```
@@ -403,7 +403,7 @@ sed -i 's/hsm-api-key-label:.*/hsm-api-key-label: runbound-api-key-v2/' \
 systemctl restart runbound
 
 # 4. Verify the new key is active
-curl -s http://localhost:8081/health \
+curl -s http://localhost:8080/health \
     -H "Authorization: Bearer $NEW_API_KEY" | jq .hsm
 # true
 
@@ -431,7 +431,7 @@ sed -i 's/hsm-api-key-label:.*/hsm-api-key-label: runbound-api-key-v2/' \
 systemctl restart runbound
 
 # 3. Verify
-curl -s http://localhost:8081/health \
+curl -s http://localhost:8080/health \
     -H "Authorization: Bearer $NEW_API_KEY" | jq .hsm
 # true
 

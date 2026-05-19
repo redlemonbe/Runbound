@@ -20,7 +20,7 @@ file transfers, and no external tooling.
               │  MASTER node   │     │  SLAVE node    │
               │                │     │                │
               │  DNS :53       │     │  DNS :53       │
-              │  REST API :8081│     │  REST API :8081│◄── GET only (read-only)
+              │  REST API :8080│     │  REST API :8080│◄── GET only (read-only)
               │  Sync :8082    │◄────│  Sync client   │
               └────────┬───────┘     └────────────────┘
                        │
@@ -44,7 +44,7 @@ file transfers, and no external tooling.
 |---|:---:|:---:|
 | Runbound binary | ✅ | ✅ |
 | Port 53 open (DNS) | ✅ | ✅ |
-| Port 8081 accessible (API) | localhost only | localhost only |
+| Port 8080 accessible (API) | localhost only | localhost only |
 | Port 8082 accessible (sync) | from slave IPs | — |
 | Dedicated config directory | `/etc/runbound/` | `/etc/runbound/` |
 | Shared secret (`sync-key`) | ✅ | ✅ same value |
@@ -102,7 +102,7 @@ server:
     sync-key:  "PASTE-YOUR-64-CHAR-HEX-HERE"
 
     # ── REST API ───────────────────────────────────────────────────────────
-    api-port: 8081
+    api-port: 8080
     # Set RUNBOUND_API_KEY in /etc/runbound/env  (chmod 640)
 
     verbosity: 1
@@ -184,7 +184,7 @@ server:
     sync-interval: 30                   # poll every 30 s (default)
 
     # ── REST API (read-only on slave) ──────────────────────────────────────
-    api-port: 8081
+    api-port: 8080
 
     verbosity: 1
 
@@ -240,7 +240,7 @@ Add a DNS entry on the master, verify it appears on the slave:
 
 ```bash
 # Master: add an entry via the REST API
-curl -X POST http://localhost:8081/dns \
+curl -X POST http://localhost:8080/dns \
   -H "Authorization: Bearer $(cat /etc/runbound/api.key)" \
   -H "Content-Type: application/json" \
   -d '{"name":"test.home.","type":"A","value":"192.168.1.99","ttl":60}'
@@ -262,7 +262,7 @@ When running as a slave, all write operations are blocked at the API level:
 
 ```bash
 # On slave — write attempt
-curl -X POST http://localhost:8081/dns ...
+curl -X POST http://localhost:8080/dns ...
 # HTTP 503
 # {"error":"READ_ONLY","details":"This node is a slave replica — write operations are disabled"}
 ```
@@ -270,11 +270,11 @@ curl -X POST http://localhost:8081/dns ...
 **Read operations work normally on the slave:**
 
 ```bash
-curl http://localhost:8081/dns       # list DNS entries
-curl http://localhost:8081/blacklist  # list blacklist
-curl http://localhost:8081/stats      # live statistics
-curl http://localhost:8081/logs       # query log
-curl http://localhost:8081/health     # liveness probe (for load balancer checks)
+curl http://localhost:8080/dns       # list DNS entries
+curl http://localhost:8080/blacklist  # list blacklist
+curl http://localhost:8080/stats      # live statistics
+curl http://localhost:8080/logs       # query log
+curl http://localhost:8080/health     # liveness probe (for load balancer checks)
 ```
 
 Use `GET /health` on both nodes for load balancer health probes.
@@ -439,7 +439,7 @@ For testing, or for edge nodes with a single server, you can run master and slav
 on the same machine using different config directories and ports:
 
 ```bash
-# Master — /etc/runbound/runbound.conf (ports 53 + 8081 + 8082)
+# Master — /etc/runbound/runbound.conf (ports 53 + 8080 + 8082)
 # Slave  — /etc/runbound-slave/unbound.conf (ports 5300 + 8083 — different!)
 
 # Because runtime files live next to the config, there are zero path collisions:
@@ -455,7 +455,7 @@ Slave config adjustment for same-machine use:
 ```
 server:
     port:          5300           # different from master's 53
-    api-port:      8083           # different from master's 8081
+    api-port:      8083           # different from master's 8080
     mode:          slave
     sync-master:   127.0.0.1:8082
     sync-key:      "…"
@@ -468,13 +468,13 @@ server:
 
 ### Health check (HTTP)
 
-Both nodes expose `GET /health` on port 8081 (localhost). Expose it via nginx for
+Both nodes expose `GET /health` on port 8080 (localhost). Expose it via nginx for
 external monitoring:
 
 ```nginx
 # nginx — proxy /health to Runbound API (read-only, no sensitive data)
 location /runbound-health {
-    proxy_pass http://127.0.0.1:8081/health;
+    proxy_pass http://127.0.0.1:8080/health;
     proxy_set_header Authorization "Bearer YOUR_KEY";
 }
 ```
