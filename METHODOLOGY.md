@@ -15,7 +15,7 @@ Three specialized AI agents, each with a single role:
 | Agent | Role |
 |---|---|
 | **Coder** | Translates architecture decisions into Rust |
-| **Pentester** | Military-grade testing — API, DNS, memory, privilege escalation |
+| **Pentester** | IA audit testing — API, DNS, memory, privilege escalation |
 | **Code auditor** | Security audit, constant-time checks, no shortcuts |
 
 **External review** — Gemini used as a second opinion on architecture and project direction. No AI is fully neutral, but the disagreements were informative.

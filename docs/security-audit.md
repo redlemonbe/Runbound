@@ -16,7 +16,7 @@
 | Initial white-box | v0.2.3 | 20 (4 Critical, 8 High, 5 Medium, 3 Low) | ✅ All fixed v0.2.4–v0.4.0 |
 | Second white-box | v0.3.3 | 9 (1 High, 6 Medium, 2 Low) | ✅ All fixed v0.3.3–v0.3.5 |
 | Third white-box | v0.4.0 | 8 (1 Blocking, 2 Medium, 5 Low) | ✅ All fixed v0.4.1 |
-| Military audit | v0.4.1 | 9 (3 Low, 3 Info, 2 Doc, 1 false positive) | ✅ All closed v0.4.3 |
+| IA audit | v0.4.1 | 9 (3 Low, 3 Info, 2 Doc, 1 false positive) | ✅ All closed v0.4.3 |
 | External pentest | v0.4.4 | 4 (1 High, 1 Medium/false positive, 1 Low, 1 Info) | ✅ All closed v0.4.5 |
 
 Runbound's core DNS path is well-engineered: memory-safe Rust, lock-free hot path
@@ -632,7 +632,7 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 
 ---
 
-### v0.4.1 Audit Findings (military audit on v0.4.0)
+### v0.4.1 Audit Findings (IA audit on v0.4.0)
 
 | ID | Severity | Component | Status |
 |---|---|---|---|
@@ -647,7 +647,7 @@ crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP
 
 ---
 
-### v0.4.3 Audit Findings (military audit on v0.4.1)
+### v0.4.3 Audit Findings (IA audit on v0.4.1)
 
 | ID | Severity | Component | Status |
 |---|---|---|---|
@@ -693,7 +693,7 @@ The pentest reported "254 chars → HTTP 201". Investigation + added integration
 - The pentest used a 253-char name + trailing FQDN dot (= 254 bytes submitted) → HTTP 201,
   which is **correct**: the trailing dot is stripped before the 253-char check per RFC 1035 §2.3.4.
 
-This is the same false positive identified in the military audit (v0.4.3 SEC-02). The added
+This is the same false positive identified in the IA audit (v0.4.3 SEC-02). The added
 HTTP-level integration tests document and prove the boundary end-to-end.
 
 #### SEC-04 — Chunked body drop without 413 (partial close)

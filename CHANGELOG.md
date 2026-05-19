@@ -141,7 +141,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 - **SEC-02 MEDIUM — Domain length validation confirmed + HTTP integration tests** (`src/api/mod.rs`)  
   Pentest claimed "254-char name → HTTP 201". Investigation confirms this is the same false
-  positive as the military audit: the test used a 253-char name + trailing FQDN dot (= 254
+  positive as the IA audit: the test used a 253-char name + trailing FQDN dot (= 254
   bytes submitted), which is correctly accepted (trailing dot stripped before the 253-char
   check per RFC 1035 §2.3.4). Added three HTTP-level integration tests
   (`dns_name_254_chars_is_rejected`, `blacklist_name_254_chars_is_rejected`,
@@ -191,7 +191,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [0.4.3] — 2026-05-17
 
-### Fixed — second military audit follow-up (all findings closed)
+### Fixed — second IA audit follow-up (all findings closed)
 
 - **SEC-02 INFO — Domain name length validation confirmed correct** (`src/api/mod.rs`)  
   Added six unit tests for `validate_dns_name()` to document and verify RFC 1035 §2.3.4
@@ -957,7 +957,7 @@ v0.4.0. See `audit.toml` for per-CVE exposure analysis and mitigations.
 - `examples/home.conf` — Home / Pi-hole replacement configuration.
 - `examples/office.conf` — SMB office split-horizon DNS configuration.
 - `examples/server.conf` — Public/shared recursive resolver configuration.
-- `examples/secure.conf` — High-security / air-gapped / military-grade configuration.
+- `examples/secure.conf` — High-security / air-gapped / IA audit configuration.
 - `README.md` — Comprehensive GitHub documentation: installation, configuration reference, full REST API reference, performance benchmarks, security architecture, systemd setup, XDP fast-path guide, Unbound compatibility table, and sysadmin-oriented comparison.
 - `.gitignore` — Comprehensive ignore rules covering build artefacts, PGO data, TLS secrets, editor files, and test artefacts.
 
