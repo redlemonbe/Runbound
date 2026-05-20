@@ -134,22 +134,25 @@ logfile: /var/log/runbound/runbound.log
 verbosity: 1
 ```
 
-| `verbosity` | Level | Output |
-|---|---|---|
-| `0` | ERROR | Startup/shutdown errors only — **recommended for production and benchmarks** |
-| `1` | WARN | Operational events, rate-limit hits **(default)** |
-| `2` | INFO | Every query logged — **avoid above 10k QPS** |
-| `3` | DEBUG | Internal state, XDP decisions, all events |
+| `verbosity` | Level | `/logs` | Hot path (NOERROR) | Description |
+|---|---|---|---|---|
+| `0` | ERROR | empty | zero overhead | Startup/shutdown errors only |
+| `1` | WARN | notable events | zero overhead | **Recommended for production** |
+| `2` | INFO | all queries | log + alloc | Full per-query history |
+| `3` | DEBUG | all queries | log + alloc | Development only |
+
+**"Notable events" at `verbosity: 1`:** blocked, NXDOMAIN, SERVFAIL, refused, rate-limited.  
+NOERROR queries (forwarded, cached, local) skip `sanitize_dns_name()`, mutex, and `SystemTime::now()` entirely.
 
 **Performance impact (measured, AMD TR PRO 5995WX, 100k+ QPS):**
 
 | verbosity | Level | p99 under stress |
 |---|---|---|
 | `0` | error | **0.18 ms** — maximum performance |
-| `1` | warn | 0.23 ms |
+| `1` | warn | **0.19 ms** — production standard |
 | `2` | info | 3.01 ms |
 
-> **Production recommendation:** use `verbosity: 0` for maximum performance. At this level the DNS hot path skips all ring-buffer writes and mutex acquisition on every query. The REST API `/logs` endpoint returns empty at `verbosity: 0` — switch to `verbosity: 1` if you need query history via the API.
+> **Production recommendation:** use `verbosity: 1`. The NOERROR hot path has zero overhead; `/logs` captures all actionable events (blocked, errors). Use `verbosity: 0` for benchmark baselines or ultra-high-load deployments where even notable-event logging must be eliminated. Use `verbosity: 2` only when you need full per-query history.
 
 `verbosity: 2` logs every DNS query — at 100k QPS this generates ~100k log lines per second and adds significant CPU overhead. `--check-config` warns if `verbosity: 2` or higher is set on port 53.
 

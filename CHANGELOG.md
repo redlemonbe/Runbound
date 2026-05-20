@@ -9,6 +9,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.5.4] — 2026-05-20
+
+### Performance
+
+- **`record_query()` hot path at `verbosity: 1`** — NOERROR queries (forwarded, cached,
+  local) now bypass `sanitize_dns_name()`, mutex, and `SystemTime::now()` entirely.
+  Only notable events (blocked, NXDOMAIN, SERVFAIL, refused/rate-limited) trigger a
+  log buffer push at `verbosity: 1`. `/logs` remains functional and shows only
+  actionable events. `verbosity: 2` required for full per-query history.
+
+### Notes
+
+- `verbosity: 0` — maximum performance, `/logs` empty.
+- `verbosity: 1` — production standard. `/logs` active for notable events only
+  (blocked, NXDOMAIN, SERVFAIL, rate-limited). NOERROR hot path: zero overhead.
+- `verbosity: 2` — full per-query logging. Degrades p99 under sustained high load.
+
+---
+
 ## [0.5.3] — 2026-05-20
 
 ### Performance
