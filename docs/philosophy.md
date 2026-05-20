@@ -93,7 +93,7 @@ obtain a commercial license.
 
 The AF_XDP fast path is available under the commercial license only.
 
-Contact: [lien contact]
+Contact: [redlemonbe@codix.be]
 
 ---
 
