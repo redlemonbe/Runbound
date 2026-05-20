@@ -41,12 +41,12 @@
 
 | Server | Version | Threads / workers |
 |---|---|---|
-| Runbound | 0.4.16 | 128 OS threads (SO_REUSEPORT) — note ¹ |
+| Runbound | 0.5.4 | 128 OS threads (SO_REUSEPORT) — note ¹ |
 | BIND9 | 9.20.21 | kernel-managed multi-thread |
 | Unbound | 1.22.0 | 64 threads |
 
 > ¹ Runbound detected 128 "physical cores" on the AMD 5995WX due to a known SMT
-> topology detection bug (fix in v0.4.2). Actual physical cores: 64.
+> topology detection bug (fix in v0.5.0). Actual physical cores: 64.
 > Impact: some SMT sibling contention. Results are still competitive; corrected
 > numbers expected to improve slightly once the fix is deployed.
 
@@ -85,7 +85,7 @@ Simulate DDoS conditions. Measure degradation and crash resistance.
 
 | Server | QPS_MAX | Sustained QPS | Sustained p99 | Stress QPS | Stress p99 | Loss |
 |---|---|---|---|---|---|---|
-| **Runbound 0.4.16** | 128 000 | 85 116 | 0.213 ms | 105 846 | **0.231 ms** | **0.00%** |
+| **Runbound 0.5.4** | 128 000 | 84 990 | 0.232 ms | 105 724 | **0.232 ms** | **0.00%** |
 | BIND9 9.20.21 | 128 000 | 85 149 | 0.210 ms | 105 919 | 0.225 ms | 0.00% |
 | Unbound 1.22.0 | 128 000 | 85 019 | **0.078 ms** | 105 781 | **0.170 ms** | 0.00% |
 
@@ -101,8 +101,8 @@ The latency differences are measurable but sub-millisecond across the board.
 with 0.00% packet loss. The bottleneck is the benchmark client, not the DNS server.
 
 **Latency:** Unbound leads with 0.170 ms p99 under stress — a result of 20+ years
-of cache optimisation in C. Runbound (0.231 ms) and BIND9 (0.225 ms) are within
-60 µs of each other and within 61 µs of Unbound.
+of cache optimisation in C. Runbound (0.232 ms) and BIND9 (0.225 ms) are within
+62 µs of each other and within 62 µs of Unbound.
 
 **Stability under overload:** All three servers responded correctly after 60 seconds
 at 150% of the detected ceiling. No crashes, no memory leaks observed.
@@ -173,3 +173,23 @@ EOF
 ```
 
 Full raw data for all phases and all three servers: [docs/benchmark-2026-05-20.md](benchmark-2026-05-20.md)
+
+---
+
+### v0.5.4 hot-path improvements
+
+Since v0.5.4, `verbosity: 1` applies zero overhead on the NOERROR hot path.
+
+| Verbosity | Behavior | Hot-path overhead |
+|---|---|---|
+| 0 | Silent — no logging | baseline |
+| 1 | Notable events only (blocked, NXDOMAIN, SERVFAIL, refused) | ~0% on NOERROR path |
+| 2 | Every query logged | p99 rises from 0.23 ms to 3.01 ms under stress |
+
+Before v0.5.4, `verbosity: 1` acquired the ring-buffer lock on every query — the
+same as `verbosity: 2` for the mutex path. The guard added in v0.5.4 skips the
+buffer entirely for NOERROR non-blocked queries: the lock is never taken, the
+allocation never happens.
+
+`verbosity: 1` is now the recommended production setting — full visibility into
+errors and blocked queries, zero overhead on clean NOERROR traffic.
