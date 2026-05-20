@@ -1,5 +1,18 @@
 # Proxmox / Bare-Metal XDP Setup
 
+## License
+
+The AF/XDP fast path requires the **commercial license**.
+
+Open-source builds (AGPL v3) include the XDP code path but it is disabled at
+runtime — the server self-tests at startup and falls back automatically to the
+standard `SO_REUSEPORT` kernel UDP path if no commercial license is present.
+
+To enable the AF/XDP fast path in production, contact the maintainer for a
+commercial license.
+
+---
+
 This guide covers production deployment of Runbound with AF/XDP on Proxmox hosts
 with LACP bonding (ixgbe / igc NICs). The same principles apply to any bare-metal
 setup with a complex virtual network topology.
