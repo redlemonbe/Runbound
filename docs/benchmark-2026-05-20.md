@@ -1,4 +1,4 @@
-# Benchmark — Runbound v0.4.16 vs BIND9 9.20.21 vs Unbound 1.22.0
+# Benchmark — Runbound v0.4.2 vs BIND9 9.20.21 vs Unbound 1.22.0
 
 **Date:** 2026-05-20  
 **Hardware:** AMD Threadripper PRO 5995WX / Emulex OneConnect be2net client  
@@ -47,7 +47,7 @@
 
 | Server | Version | Threads / workers |
 |---|---|---|
-| Runbound | 0.4.16 | 128 OS threads (SO_REUSEPORT) — note ¹ |
+| Runbound | 0.4.2 | 128 OS threads (SO_REUSEPORT) — note ¹ |
 | BIND9 | 9.20.21 | kernel-managed multi-thread |
 | Unbound | 1.22.0 | 64 threads |
 
@@ -100,7 +100,7 @@ Four phases, run sequentially, identical procedure for all three servers:
 
 ## Raw results
 
-### Runbound 0.4.16
+### Runbound 0.4.2
 
 #### Phase 2 — Ceiling detection
 
@@ -321,7 +321,7 @@ Run time: 60.001 s
 
 | Server | QPS_MAX | Sustained QPS | Sustained p99 | Stress QPS | Stress p99 | Loss |
 |---|---|---|---|---|---|---|
-| **Runbound 0.4.16** | 128 000 | 85 116 | 0.213 ms | 105 846 | **0.231 ms** | **0.00%** |
+| **Runbound 0.4.2** | 128 000 | 85 116 | 0.213 ms | 105 846 | **0.231 ms** | **0.00%** |
 | BIND9 9.20.21 | 128 000 | 85 149 | 0.210 ms | 105 919 | 0.225 ms | 0.00% |
 | Unbound 1.22.0 | 128 000 | 85 019 | **0.078 ms** | 105 781 | **0.170 ms** | 0.00% |
 
@@ -367,7 +367,7 @@ with zero packet loss. The hardware matters more than the software at this scale
    A higher-throughput client (Intel X540) is needed to distinguish the servers above
    this ceiling.
 
-2. **Runbound SMT topology bug** — Runbound 0.4.16 used 128 workers on the 64-core
+2. **Runbound SMT topology bug** — Runbound 0.4.2 used 128 workers on the 64-core
    5995WX due to the `core_id/64` heuristic. The fix (`thread_siblings_list`) is in
    v0.4.2. Impact on these results: marginal (SMT contention at high load).
 
