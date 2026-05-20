@@ -401,6 +401,26 @@ WARN DNS resolver cache flushed and rate limiter cleared  freed_buckets=8241
 WARN Memory after purge  used_pct=44.1%  status="below 50% target"
 ```
 
+**`cache-min-entries`** — floor for memory-pressure halvings (v0.5.1+):
+
+```
+server:
+    cache-min-entries: 2048
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `cache-min-entries` | integer | `2048` | Minimum number of entries the cache will be reduced to during memory pressure events. The cache halving mechanism will not go below this value. |
+
+The halving loop also enforces a 5-minute cooldown between halvings and will disable
+further halvings if they produce no measurable reduction in system memory pressure,
+logging a clear `WARN` that points to the root cause.
+
+Recommended values:
+- `1024` — systems with < 4 GB RAM or high memory contention
+- `2048` — default, suitable for most deployments
+- `4096` — systems with ≥ 4 GB RAM where cache hit rate matters
+
 ### XDP kernel-bypass fast path
 
 ```

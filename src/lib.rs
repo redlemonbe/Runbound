@@ -35,7 +35,7 @@ pub fn parse_dns_bytes(data: &[u8]) -> Option<()> {
 /// Parse a string as an Unbound-format config.
 /// Returns Some(()) on success, None on parse failure.
 /// Used by the fuzz_config target.
-#[cfg(any(test, feature = "fuzz"))]
+#[cfg(feature = "fuzz")]
 pub fn parse_config_str(s: &str) -> Option<()> {
     crate::config::parser::parse_str(s).ok().map(|_| ())
 }
