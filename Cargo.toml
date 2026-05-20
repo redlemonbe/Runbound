@@ -15,6 +15,7 @@ exclude = [
     "*.sha256",
     "sbom.cdx.json",
     "runbound.cdx.json",
+    "runbound.json",
     "fuzz/",
     "docs/",
 ]
