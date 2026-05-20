@@ -9,6 +9,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.5.5] — 2026-05-20
+
+### Tests
+
+- Added `reload_http_concurrent_429`: HTTP-level regression test for `POST /reload`
+  rate limiting. Builds one router, clones it 20 times, sends 20 concurrent requests
+  via tokio + Barrier. Asserts ≤2 get 200 and ≥18 get 429. Catches the class of bug
+  where independent `AppState` instances bypass the shared `Arc<ReloadLimiter>`.
+
+### Documentation
+
+- `docs/benchmark-2026-05-20.md`: updated to v0.5.4 measurements (QPS 105 724,
+  avg 0.128 ms, p99 0.232 ms stress); verbosity baseline changed to 0; added
+  regression caveat for v0.5.0–v0.5.3.
+- `docs/philosophy.md` (new): design philosophy — memory safety, security surface
+  comparison vs BIND9/Unbound, XDP performance tier, commercial licensing.
+- `README.md`: "Why Runbound?" section, updated benchmark figures, verbosity tip.
+
+### Chores
+
+- `Cargo.toml`: exclude `runbound.json` (CycloneDX artifact) from crates.io package.
+
+---
+
 ## [0.5.4] — 2026-05-20
 
 ### Performance
