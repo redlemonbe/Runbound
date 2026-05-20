@@ -50,10 +50,15 @@
 > Impact: some SMT sibling contention. Results are still competitive; corrected
 > numbers expected to improve slightly once the fix is deployed.
 
-**Runbound log level: verbosity 1 (warn).** At verbosity 2 (info), Runbound logs
-every query — this adds significant CPU overhead at high QPS (confirmed: p99 under
-stress goes from 0.231 ms to 3.011 ms with per-query logging enabled). BIND9 and
-Unbound log nothing by default, making verbosity 1 the fair comparison baseline.
+**Runbound log level: verbosity 0 (error/silent).** At this level the DNS hot path
+skips all ring-buffer writes and mutex acquisition on every query, giving maximum
+throughput. At verbosity 2 (info), Runbound logs every query — p99 under stress
+rises from 0.18 ms to 3.01 ms. BIND9 and Unbound log nothing by default, making
+verbosity 0 the correct fair-comparison baseline.
+
+> **v0.5.3 note:** a regression introduced in v0.5.x caused `verbosity: 0` to behave
+> like `verbosity: 1` on the hot path (+43% avg latency under stress). Fixed in
+> v0.5.3 — rerun benchmarks with v0.5.3+ to get accurate numbers at verbosity 0.
 
 ---
 
