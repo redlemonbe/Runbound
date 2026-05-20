@@ -44,39 +44,51 @@ const MAX_API_TTL: u32 = 86_400;
 
 // ── /reload rate limiter ───────────────────────────────────────────────────
 
-/// Independent token bucket for POST /reload — max 2 requests per second.
+/// Independent token bucket for POST /reload — 2 req/s, burst of 2.
 /// Kept separate from the main API rate limiter so a burst of reloads cannot
 /// consume the shared bucket and throttle other endpoints.
-const RELOAD_RPS:   u64 = 2;
-const RELOAD_BURST: u64 = 2;
+///
+/// Uses `std::sync::Mutex` (not tokio) so that `check()` serialises all callers
+/// without any async context. Refill and consumption happen inside a single lock
+/// acquisition — no TOCTOU possible. `last_refill` is always updated on every
+/// call so that elapsed time is never double-counted across concurrent callers.
+struct ReloadLimiterInner {
+    tokens:      f64,
+    last_refill: Instant,
+    rate:        f64,  // tokens per second
+    burst:       f64,  // maximum token capacity
+}
 
 pub struct ReloadLimiter {
-    inner: std::sync::Mutex<(u64, Instant)>,
+    inner: std::sync::Mutex<ReloadLimiterInner>,
 }
 
 impl ReloadLimiter {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: std::sync::Mutex::new((RELOAD_BURST, Instant::now())),
-        })
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(ReloadLimiterInner {
+                tokens:      2.0,
+                last_refill: Instant::now(),
+                rate:        2.0,
+                burst:       2.0,
+            }),
+        }
     }
 
-    fn check(&self) -> bool {
-        let Ok(mut g) = self.inner.lock() else { return true };
-        let (tokens, last) = &mut *g;
-        let now = Instant::now();
-        let elapsed_ms = now.duration_since(*last).as_millis() as u64;
-        if elapsed_ms >= 1_000 {
-            *tokens = RELOAD_BURST;
-            *last = now;
+    pub fn check(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now     = Instant::now();
+        let elapsed = now.duration_since(inner.last_refill).as_secs_f64();
+        // Refill and update timestamp unconditionally — no conditional branch that
+        // could cause elapsed time to accumulate across multiple callers.
+        inner.tokens      = (inner.tokens + elapsed * inner.rate).min(inner.burst);
+        inner.last_refill = now;
+        if inner.tokens >= 1.0 {
+            inner.tokens -= 1.0;
+            true
         } else {
-            let new = (RELOAD_RPS * elapsed_ms) / 1_000;
-            if new > 0 {
-                *tokens = (*tokens + new).min(RELOAD_BURST);
-                *last = now;
-            }
+            false
         }
-        if *tokens > 0 { *tokens -= 1; true } else { false }
     }
 }
 
@@ -1491,7 +1503,7 @@ mod tests {
             zones_mutex:    Arc::new(tokio::sync::Mutex::new(())),
             tls_cfg:        Arc::new(crate::config::parser::TlsConfig::default()),
             rate_limiter:   ApiRateLimiter::new_public(),
-            reload_limiter: ReloadLimiter::new(),
+            reload_limiter: Arc::new(ReloadLimiter::new()),
             stats:          crate::stats::Stats::new(),
             cfg:            Arc::clone(&cfg_arc),
             cfg_path:       "/dev/null".to_string(),
@@ -1800,5 +1812,34 @@ mod tests {
         ).await.unwrap();
         assert_ne!(resp.status(), StatusCode::LENGTH_REQUIRED,
             "Bodyless POST must not get 411");
+    }
+
+    // ── ReloadLimiter correctness under parallel load ─────────────────────────
+    // Regression test for the TOCTOU race in the previous integer-arithmetic
+    // token bucket: 20 threads hit the limiter simultaneously; at most 2 (burst)
+    // must be allowed, at least 18 must be denied.
+    #[test]
+    fn reload_limiter_parallel() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let limiter = Arc::new(ReloadLimiter::new());
+        let barrier = Arc::new(std::sync::Barrier::new(20));
+
+        let handles: Vec<_> = (0..20).map(|_| {
+            let l = Arc::clone(&limiter);
+            let b = Arc::clone(&barrier);
+            thread::spawn(move || {
+                b.wait(); // all threads start at the same instant
+                l.check()
+            })
+        }).collect();
+
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let allowed = results.iter().filter(|&&r|  r).count();
+        let denied  = results.iter().filter(|&&r| !r).count();
+
+        assert!(allowed <= 2, "allowed={allowed} but burst=2");
+        assert!(denied  >= 18, "denied={denied} but expected ≥18");
     }
 }

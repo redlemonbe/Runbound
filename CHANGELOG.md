@@ -9,6 +9,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.5.2] — 2026-05-20
+
+### Fixed
+
+- **ReloadLimiter race condition** (`src/api/mod.rs`) — `POST /reload` did not return
+  429 under parallel load. The token bucket used integer arithmetic with a conditional
+  `last_refill` update (`if new > 0 { *last = now }`): when `elapsed_ms < 1` the
+  timestamp was not advanced, allowing accumulated elapsed time to be double-counted
+  by subsequent callers. Rewritten with `f64` arithmetic and an unconditional
+  `last_refill = now` on every `check()` call — refill and consumption are
+  serialised under a single `std::sync::Mutex` with no TOCTOU possible.
+  Burst capacity: 2 requests, rate: 2 req/s.
+  Verified: 20 simultaneous threads → ≤ 2 allowed, ≥ 18 denied (`reload_limiter_parallel` test).
+
+---
+
 ## [0.5.1] — 2026-05-20
 
 ### Fixed
