@@ -2,9 +2,13 @@
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Upstream DNS health monitoring.
 //
-// Probes each configured forward-addr every 30 seconds with a minimal UDP DNS
-// query (`. IN A`). Reports latency and reachability. Never mutates resolver
-// configuration — read-only diagnostic view.
+// Probes each configured forward-addr with a minimal UDP DNS query (`. IN A`).
+// Reports latency and reachability. Never mutates resolver configuration —
+// read-only diagnostic view.
+//
+// Backoff: a failing upstream is retried with exponential backoff (30s → 60s →
+// 120s → 300s cap) so that a permanently unreachable server does not spam logs.
+// On recovery, the backoff resets and an INFO message is emitted.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, RwLock};
@@ -12,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::time;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::parser::UnboundConfig;
 
@@ -47,9 +51,25 @@ pub struct UpstreamStatus {
     pub latency_ms: Option<u64>,
     pub last_check: String,
     pub zone:       String,
+    // Internal backoff state — not serialised in API responses.
+    #[serde(skip)]
+    pub consecutive_failures: u32,
+    #[serde(skip)]
+    pub next_check_at: Instant,
 }
 
 pub type SharedUpstreams = Arc<RwLock<Vec<UpstreamStatus>>>;
+
+// ── Backoff schedule ───────────────────────────────────────────────────────
+// 1st failure → retry in 30s, 2nd → 60s, 3rd → 120s, 4th+ → 300s cap.
+fn backoff_secs(consecutive_failures: u32) -> u64 {
+    match consecutive_failures {
+        0 | 1 => PROBE_INTERVAL_SECS,
+        2     => 60,
+        3     => 120,
+        _     => 300,
+    }
+}
 
 // ── Initialise from config ─────────────────────────────────────────────────
 pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
@@ -59,11 +79,14 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
             // Strip port if present (e.g. "1.1.1.1@853")
             let clean = addr.split('@').next().unwrap_or(addr).to_string();
             statuses.push(UpstreamStatus {
-                addr:       clean,
-                healthy:    false,
-                latency_ms: None,
-                last_check: String::new(),
-                zone:       fz.name.clone(),
+                addr:                clean,
+                healthy:             false,
+                latency_ms:          None,
+                last_check:          String::new(),
+                zone:                fz.name.clone(),
+                consecutive_failures: 0,
+                // Due immediately so the first tick probes every upstream.
+                next_check_at:       Instant::now(),
             });
         }
     }
@@ -78,33 +101,64 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
     loop {
         interval.tick().await;
 
-        // Collect addresses to probe (read-only snapshot)
-        let addrs: Vec<String> = {
-            upstreams.read().expect("upstreams: RwLock poisoned in health task").iter().map(|s| s.addr.clone()).collect()
+        let now = Instant::now();
+
+        // Collect (index, addr) for upstreams that are due for a probe.
+        let to_probe: Vec<(usize, String)> = {
+            upstreams
+                .read()
+                .expect("upstreams: RwLock poisoned in health task")
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| now >= s.next_check_at)
+                .map(|(i, s)| (i, s.addr.clone()))
+                .collect()
         };
 
-        let mut results: Vec<(bool, Option<u64>)> = Vec::with_capacity(addrs.len());
-        for addr in &addrs {
-            results.push(probe_upstream(addr));
-        }
+        // Probe each due upstream (blocking UDP, no async needed).
+        let results: Vec<(usize, bool, Option<u64>)> = to_probe
+            .iter()
+            .map(|(i, addr)| {
+                let (healthy, latency) = probe_upstream(addr);
+                (*i, healthy, latency)
+            })
+            .collect();
 
-        // Write results back
+        // Write results back, updating backoff state.
         let mut statuses = upstreams.write().expect("upstreams: RwLock poisoned in health task");
-        let now = crate::logbuffer::format_ts(
+        let now_str = crate::logbuffer::format_ts(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
         );
-        for (i, (healthy, latency_ms)) in results.into_iter().enumerate() {
-            if let Some(s) = statuses.get_mut(i) {
-                if !healthy {
-                    warn!(upstream = %s.addr, "Upstream DNS health check failed");
+        for (idx, healthy, latency_ms) in results {
+            let Some(s) = statuses.get_mut(idx) else { continue };
+            if healthy {
+                if s.consecutive_failures > 0 {
+                    info!(
+                        upstream = %s.addr,
+                        failures = s.consecutive_failures,
+                        "upstream recovered after {} failure(s)", s.consecutive_failures,
+                    );
                 }
-                s.healthy    = healthy;
-                s.latency_ms = latency_ms;
-                s.last_check = now.clone();
+                s.consecutive_failures = 0;
+                s.next_check_at = Instant::now() + Duration::from_secs(PROBE_INTERVAL_SECS);
+            } else {
+                s.consecutive_failures += 1;
+                let wait = backoff_secs(s.consecutive_failures);
+                warn!(
+                    upstream        = %s.addr,
+                    attempt         = s.consecutive_failures,
+                    next_check_secs = wait,
+                    "Upstream DNS health check failed (attempt {}) — next check in {}s",
+                    s.consecutive_failures, wait,
+                );
+                s.next_check_at = Instant::now() + Duration::from_secs(wait);
             }
+            s.healthy    = healthy;
+            s.latency_ms = latency_ms;
+            s.last_check = now_str.clone();
         }
     }
 }

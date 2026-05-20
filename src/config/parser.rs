@@ -65,6 +65,9 @@ pub struct UnboundConfig {
     pub api_port: Option<u16>,
     /// Maximum TTL cap for cached records (seconds). Default: 86400 (24 h).
     pub cache_max_ttl: Option<u32>,
+    /// Minimum number of cache entries during memory pressure halvings. Default: 2048.
+    /// The cache halving mechanism will never reduce the cache below this value.
+    pub cache_min_entries: usize,
     /// CIDR ranges that must never appear in resolver responses (DNS rebinding guard).
     pub private_addresses: Vec<String>,
     /// Enable DNSSEC validation. Default: false (forwarder mode — trust upstream AD bit).
@@ -149,8 +152,9 @@ impl UnboundConfig {
             sync_interval: 30,
             log_retention: 1000,
             log_client_ip: true,
-            cpu_affinity:  true,
-            xdp:           true,
+            cpu_affinity:      true,
+            xdp:               true,
+            cache_min_entries: 2048,
             ..Default::default()
         }
     }
@@ -294,7 +298,8 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
             cfg.api_key = Some(val.trim_matches('"').to_string());
         }
         "api-port"      => cfg.api_port      = val.parse().ok(),
-        "cache-max-ttl" => cfg.cache_max_ttl = val.parse().ok(),
+        "cache-max-ttl"      => cfg.cache_max_ttl      = val.parse().ok(),
+        "cache-min-entries"  => cfg.cache_min_entries  = val.parse::<usize>().unwrap_or(2048).max(1),
         "private-address" => {
             let cidr = val.trim_matches('"').trim().to_string();
             if !cidr.is_empty() { cfg.private_addresses.push(cidr); }
