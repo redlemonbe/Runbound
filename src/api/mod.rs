@@ -1842,4 +1842,60 @@ mod tests {
         assert!(allowed <= 2, "allowed={allowed} but burst=2");
         assert!(denied  >= 18, "denied={denied} but expected ≥18");
     }
+
+    // ── HTTP-level concurrent test: 20 concurrent POST /reload sharing ONE AppState ──
+    // This is the correct simulation of the production scenario: one process,
+    // one Arc<ReloadLimiter>, 20 concurrent HTTP requests routed through axum.
+    // (The previous pattern of calling make_test_app() 20 times created 20
+    // independent AppState instances — each with fresh tokens=2.0 — which is
+    // exactly the multi-process bug and produces 200:20, 429:0.)
+    #[tokio::test]
+    async fn reload_http_concurrent_429() {
+        use std::sync::Arc as StdArc;
+        use tokio::sync::Barrier;
+
+        let (k, v) = auth_header();
+        let barrier = StdArc::new(Barrier::new(20));
+
+        // ONE app, cloned 20 times — all clones share the same Arc<ReloadLimiter>.
+        let app = make_test_app();
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let app = app.clone();
+            let k = k;
+            let v = v.clone();
+            let b = StdArc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/reload")
+                        .header(k, v)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }));
+        }
+
+        let statuses: Vec<StatusCode> = futures_util::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let ok   = statuses.iter().filter(|&&s| s == StatusCode::OK).count();
+        let r429 = statuses.iter().filter(|&&s| s == StatusCode::TOO_MANY_REQUESTS).count();
+        let other: Vec<_> = statuses.iter()
+            .filter(|&&s| s != StatusCode::OK && s != StatusCode::TOO_MANY_REQUESTS)
+            .collect();
+
+        eprintln!("[HTTP_TEST] 200={ok} 429={r429} other={other:?}");
+        assert!(ok <= 2,  "burst=2 but {ok} requests got 200");
+        assert!(r429 >= 18, "expected ≥18 requests to get 429, got {r429}");
+    }
 }
