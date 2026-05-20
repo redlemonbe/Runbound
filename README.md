@@ -47,6 +47,16 @@ Your existing `unbound.conf` works as-is. Zero migration.
 
 ---
 
+## Why Runbound?
+
+Runbound approaches DNS server design differently from BIND9 and Unbound — memory
+safety by construction (Rust), built-in authenticated REST API, AF_XDP zero-copy,
+and a security surface that BIND9 and Unbound do not offer without external tooling.
+
+[Read the full comparison →](docs/philosophy.md)
+
+---
+
 ## Installation
 
 ### Recommended — automatic script
@@ -168,13 +178,15 @@ Benchmarks run from a dedicated client machine (never from the DNS server):
 
 | Hardware | Tool | Runbound | BIND9 | Unbound | Notes |
 |---|---|---|---|---|---|
-| AMD TR PRO 5995WX (bare metal) | dnsmark 0.4.5 | 105 846 q/s | 105 919 q/s | 105 781 q/s | NIC-limited (be2net 128k ceiling), verbosity:1 |
+| AMD TR PRO 5995WX (bare metal) | dnsmark 0.4.5 | 105 724 q/s | 105 919 q/s | 105 781 q/s | NIC-limited (be2net 128k ceiling), verbosity:0 |
 | AF/XDP bare metal Intel ixgbe | dnsmark | 500k – 14M q/s | ❌ | ❌ | kernel-bypass — next benchmark |
 
-> **Production tip:** Set `verbosity: 1` in your `unbound.conf`.
-> `verbosity: 2` (info) logs every DNS query — at high QPS this adds measurable CPU overhead
-> (measured: p99 goes from **0.23 ms** at verbosity 1 to **3 ms** at verbosity 2 under stress).
-> At `verbosity: 1` (warn), per-query logging is disabled and Runbound achieves maximum throughput.
+> **Production tip:** Use `verbosity: 1` (recommended) or `verbosity: 0` (maximum throughput).
+> Since v0.5.4, `verbosity: 1` applies zero overhead on the NOERROR hot path — only blocked,
+> NXDOMAIN, SERVFAIL, and rate-limited queries trigger logging. `/logs` remains functional.
+> `verbosity: 2` logs every DNS query — at high QPS this adds measurable CPU overhead
+> (measured: p99 goes from **0.23 ms** to **3 ms** under stress). Use `verbosity: 0` for
+> benchmarks or maximum-throughput deployments where even notable-event logging must be eliminated.
 
 > Bare-metal benchmark methodology and full raw data: [docs/benchmark-2026-05-20.md](docs/benchmark-2026-05-20.md)  
 > Benchmark tool: [dnsmark](https://github.com/redlemonbe/dnsmark)
@@ -267,6 +279,7 @@ Ready-to-use configs for common scenarios:
 | [REST API Reference](docs/api.md) | All endpoints with curl examples and JSON responses |
 | [High Availability](docs/ha.md) | Master/slave replication, VRRP failover, multi-node setup |
 | [Performance Guide](docs/performance.md) | Benchmarks, methodology, how to reproduce |
+| [Design Philosophy](docs/philosophy.md) | Memory safety, security surface, XDP — Runbound vs BIND9 vs Unbound |
 | [TLS Setup](docs/tls.md) | DoT on port 853 — Let's Encrypt, ACME auto-provisioning, internal CA |
 | [AF/XDP Fast Path](docs/xdp.md) | Kernel-bypass networking — 500k+ q/s |
 | [Proxmox / Bare Metal](docs/proxmox.md) | XDP on Proxmox — bridge conflict, veth architecture, ethtool flow steering |
