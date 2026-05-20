@@ -18,6 +18,8 @@
 //   Within the worker, a query whose name isn't found locally returns None
 //   from process_packet(); the frame is recycled without a TX response.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -106,6 +108,9 @@ fn start_xdp_on_iface(
     // Create all sockets before spawning threads so we can run the self-test.
     let mut sockets: Vec<(u32, XskSocket)> = Vec::with_capacity(queue_count as usize);
     for q in 0..queue_count {
+        // SAFETY: `ifidx` is a valid ifindex returned by `iface_index`. `q` is
+        //         in [0, queue_count), which is the valid range of NIC RX queues.
+        //         On zero-copy failure we fall back to copy mode.
         let sock = unsafe { create_xsk_socket(ifidx, q, true) }
             .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false) })
             .map_err(|e| format!("AF_XDP socket creation failed: {e}"))?;
@@ -156,6 +161,10 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
     let mut injected = 0u32;
     for _ in 0..3 {
         if let Some(tx_addr) = sock.umem.tx_free.pop_front() {
+            // SAFETY: `tx_addr` is a frame offset in the TX pool
+            //         (range [RX_FRAME_COUNT*FRAME_SIZE, (RX_FRAME_COUNT+TX_FRAME_COUNT)*FRAME_SIZE)).
+            //         FRAME_SIZE fits within `area_len`; `frame_mut` performs the
+            //         bounds check and returns None on failure.
             if let Some(frame) = unsafe { sock.umem.frame_mut(tx_addr, FRAME_SIZE as usize) } {
                 let len = build_test_frame(frame);
                 if len > 0 {
@@ -171,6 +180,9 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
     }
     // Kick the driver if needed.
     if sock.tx.needs_wakeup() {
+        // SAFETY: `sock.fd` is a valid AF_XDP socket fd owned by `XskSocket`.
+        //         Passing null pointers with length 0 and MSG_DONTWAIT is the
+        //         documented way to kick the TX driver without sending data.
         unsafe {
             libc::sendto(sock.fd, std::ptr::null(), 0, libc::MSG_DONTWAIT,
                          std::ptr::null(), 0);
@@ -189,6 +201,9 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
         if remaining.is_zero() { break; }
         let mut pfd = pollfd { fd: sock.fd, events: POLLIN, revents: 0 };
         let timeout_ms = (remaining.as_millis() as i32).min(20).max(1);
+        // SAFETY: `&mut pfd` is a valid pointer to a single `pollfd` struct.
+        //         nfds=1 matches the array length. `timeout_ms` is a valid
+        //         non-negative timeout in milliseconds.
         let ret = unsafe { poll(&mut pfd, 1, timeout_ms) };
         if ret > 0 && (pfd.revents & POLLIN) != 0 {
             sock.rx.consume_rx_into(&mut rx_descs);
@@ -280,6 +295,9 @@ fn xdp_worker(
         sock.umem.reclaim_tx();
 
         let mut pfd = pollfd { fd: sock.fd, events: POLLIN, revents: 0 };
+        // SAFETY: `&mut pfd` is a valid pointer to a single `pollfd`.
+        //         nfds=1 matches the array length. timeout=1 ms is a valid
+        //         non-negative timeout.
         let ret = unsafe { poll(&mut pfd, 1, 1 /* ms timeout */) };
         if ret < 0 {
             break;
@@ -308,10 +326,20 @@ fn xdp_worker(
                     continue;
                 }
                 let (rx_frame, tx_frame) = unsafe {
+                    // SAFETY: `desc.addr + desc.len <= area_len` is verified by the
+                    //         bounds check above. `sock.umem.area` is the base of the
+                    //         mmap'd UMEM region (PROT_READ|PROT_WRITE, size=area_len).
+                    //         u8 has alignment 1; the resulting slice is valid for the
+                    //         duration of this loop iteration only (no aliasing with tx).
                     let rx = std::slice::from_raw_parts(
                         sock.umem.area.add(desc.addr as usize),
                         desc.len as usize,
                     );
+                    // SAFETY: `tx_addr` is a frame offset from the TX free pool
+                    //         (range [RX_FRAME_COUNT*FRAME_SIZE, …)), disjoint from the
+                    //         RX frame above. FRAME_SIZE fits within `area_len`.
+                    //         u8 has alignment 1; no other reference to this frame exists
+                    //         while `tx_frame` is live.
                     let tx = std::slice::from_raw_parts_mut(
                         sock.umem.area.add(tx_addr as usize),
                         FRAME_SIZE as usize,
@@ -351,6 +379,9 @@ fn xdp_worker(
 
             // Kick the driver if it set the NEED_WAKEUP flag.
             if sock.tx.needs_wakeup() {
+                // SAFETY: `sock.fd` is a valid AF_XDP socket fd owned by `XskSocket`.
+                //         Passing null pointers with length 0 and MSG_DONTWAIT is the
+                //         documented way to kick the TX driver without sending data.
                 unsafe {
                     libc::sendto(
                         sock.fd,

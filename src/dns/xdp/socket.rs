@@ -12,6 +12,7 @@
 //   4. mmap the four ring buffers
 //   5. bind(sockaddr_xdp{ifindex, queue_id, ...})
 
+#![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 
 use std::os::fd::RawFd;
@@ -36,6 +37,10 @@ pub struct XskSocket {
 
 impl Drop for XskSocket {
     fn drop(&mut self) {
+        // SAFETY: `self.fd` is the file descriptor returned by `socket(AF_XDP, …)`
+        //         in `create_xsk_socket`. It has not been closed elsewhere (the
+        //         `XskSocket` owns it exclusively). `Drop` is called exactly once,
+        //         so there is no double-close.
         unsafe { libc::close(self.fd); }
     }
 }
@@ -51,7 +56,9 @@ pub unsafe fn create_xsk_socket(
     use_zerocopy: bool,
 ) -> Result<XskSocket, String> {
     // 1. Create the socket
-    let fd = libc::socket(AF_XDP, libc::SOCK_RAW, 0);
+    // SAFETY: `socket(2)` is safe to call with valid constants. AF_XDP=44,
+    //         SOCK_RAW, protocol=0 is the standard AF_XDP socket creation.
+    let fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW, 0) };
     if fd < 0 {
         return Err(format!(
             "socket(AF_XDP) failed: {}",
@@ -60,17 +67,28 @@ pub unsafe fn create_xsk_socket(
     }
 
     // 2. Allocate and register UMEM (also maps fill + completion rings)
-    let umem = Umem::new(fd).inspect_err(|_| { libc::close(fd); })?;
+    // SAFETY: `fd` is a valid AF_XDP socket fd returned by `socket(2)` above.
+    let umem = unsafe { Umem::new(fd) }.inspect_err(|_| {
+        // SAFETY: `fd` is a valid open file descriptor not yet transferred
+        //         to any owner. We close it here on the error path only.
+        unsafe { libc::close(fd) };
+    })?;
 
     // 3. Set RX and TX ring sizes
     for (opt, sz) in [(XDP_RX_RING, RING_SIZE), (XDP_TX_RING, RING_SIZE)] {
-        let rc = libc::setsockopt(
-            fd, SOL_XDP, opt,
-            &sz as *const _ as *const libc::c_void,
-            std::mem::size_of::<u32>() as libc::socklen_t,
-        );
+        // SAFETY: `fd` is a valid AF_XDP socket fd. `&sz` points to an
+        //         initialised u32 on the stack. The socklen matches sizeof(u32).
+        let rc = unsafe {
+            libc::setsockopt(
+                fd, SOL_XDP, opt,
+                &sz as *const _ as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
         if rc != 0 {
-            libc::close(fd);
+            // SAFETY: `fd` is a valid open file descriptor not yet owned by
+            //         `XskSocket`. We close it here on the error path only.
+            unsafe { libc::close(fd) };
             return Err(format!(
                 "setsockopt ring size ({opt}): {}",
                 std::io::Error::last_os_error()
@@ -79,11 +97,20 @@ pub unsafe fn create_xsk_socket(
     }
 
     // 4. mmap RX and TX rings (offsets retrieved from the kernel)
-    let (rx_off, tx_off) = get_rx_tx_offsets(fd)?;
-    let rx = mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, RING_SIZE)
-        .inspect_err(|_| { libc::close(fd); })?;
-    let tx = mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, RING_SIZE)
-        .inspect_err(|_| { libc::close(fd); })?;
+    // SAFETY: `fd` is a valid AF_XDP socket fd with ring sizes already configured.
+    let (rx_off, tx_off) = unsafe { get_rx_tx_offsets(fd) }?;
+    // SAFETY: `fd` is valid; `rx_off` contains the offsets returned by the kernel.
+    let rx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, RING_SIZE) }
+        .inspect_err(|_| {
+            // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
+            unsafe { libc::close(fd) };
+        })?;
+    // SAFETY: `fd` is valid; `tx_off` contains the offsets returned by the kernel.
+    let tx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, RING_SIZE) }
+        .inspect_err(|_| {
+            // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
+            unsafe { libc::close(fd) };
+        })?;
 
     // 5. Bind to the specific interface queue
     //    XDP_USE_NEED_WAKEUP: when set, we must call poll()/sendto() to kick
@@ -99,13 +126,19 @@ pub unsafe fn create_xsk_socket(
         sxdp_queue_id:       queue_id,
         sxdp_shared_umem_fd: 0,
     };
-    let rc = libc::bind(
-        fd,
-        &sa as *const SockaddrXdp as *const libc::sockaddr,
-        std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
-    );
+    // SAFETY: `fd` is a valid AF_XDP socket fd. `&sa` is a valid pointer to a
+    //         fully-initialised SockaddrXdp cast to `*const sockaddr` as required
+    //         by `bind(2)`. The addrlen matches sizeof(SockaddrXdp).
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sa as *const SockaddrXdp as *const libc::sockaddr,
+            std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
+        )
+    };
     if rc != 0 {
-        libc::close(fd);
+        // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
+        unsafe { libc::close(fd) };
         return Err(format!(
             "bind AF_XDP (ifindex={ifindex}, queue={queue_id}, zerocopy={use_zerocopy}): {}",
             std::io::Error::last_os_error()
@@ -154,6 +187,8 @@ pub fn get_rx_queue_count(iface: &str) -> u32 {
 /// Convert a network interface name to its kernel ifindex.
 pub fn iface_index(name: &str) -> Option<u32> {
     let cname = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `cname.as_ptr()` is a valid NUL-terminated C string whose lifetime
+    //         covers the call. `if_nametoindex(3)` returns 0 on error.
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
     if idx == 0 { None } else { Some(idx) }
 }
@@ -164,6 +199,8 @@ pub fn iface_for_ip(ip: &str) -> Option<String> {
     let target: std::net::IpAddr = ip.parse().ok()?;
 
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `&mut ifap` is a valid out-pointer. `getifaddrs(3)` allocates a
+    //         linked list that must be freed with `freeifaddrs` — done below.
     if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
         return None;
     }
@@ -171,11 +208,17 @@ pub fn iface_for_ip(ip: &str) -> Option<String> {
     let mut result: Option<String> = None;
     let mut cur = ifap;
     while !cur.is_null() {
+        // SAFETY: `cur` is a non-null pointer into the linked list allocated by
+        //         `getifaddrs`. Each node is valid until `freeifaddrs` is called.
         let ifa = unsafe { &*cur };
         cur = ifa.ifa_next;
         if ifa.ifa_addr.is_null() { continue; }
 
         let matched = unsafe {
+            // SAFETY: `ifa.ifa_addr` is non-null (checked above). Reading
+            //         `sa_family` is always safe because `sockaddr` guarantees
+            //         the family field at offset 0. The subsequent casts are
+            //         valid because `sa_family` determines the concrete type.
             let family = (*ifa.ifa_addr).sa_family as libc::c_int;
             match (target, family) {
                 (std::net::IpAddr::V4(v4), libc::AF_INET) => {
@@ -191,6 +234,9 @@ pub fn iface_for_ip(ip: &str) -> Option<String> {
         };
 
         if matched {
+            // SAFETY: `ifa.ifa_name` is a valid NUL-terminated C string owned by
+            //         the `getifaddrs` allocation; it remains valid until
+            //         `freeifaddrs` is called below.
             if let Ok(name) = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_str() {
                 tracing::debug!(
                     iface = %name, ip = %target,
@@ -201,6 +247,8 @@ pub fn iface_for_ip(ip: &str) -> Option<String> {
             break;
         }
     }
+    // SAFETY: `ifap` is the pointer returned by `getifaddrs` above (non-null on
+    //         success). Called exactly once, after we are done traversing the list.
     unsafe { libc::freeifaddrs(ifap); }
     result
 }
