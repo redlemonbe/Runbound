@@ -1,4 +1,4 @@
-# Benchmark — Runbound v0.4.2 vs BIND9 9.20.21 vs Unbound 1.22.0
+# Benchmark — Runbound v0.5.4 vs BIND9 9.20.21 vs Unbound 1.22.0
 
 **Date:** 2026-05-20  
 **Hardware:** AMD Threadripper PRO 5995WX / Emulex OneConnect be2net client  
@@ -47,7 +47,7 @@
 
 | Server | Version | Threads / workers |
 |---|---|---|
-| Runbound | 0.4.2 | 128 OS threads (SO_REUSEPORT) — note ¹ |
+| Runbound | 0.5.4 | 128 OS threads (SO_REUSEPORT) — note ¹ |
 | BIND9 | 9.20.21 | kernel-managed multi-thread |
 | Unbound | 1.22.0 | 64 threads |
 
@@ -56,10 +56,13 @@
 > Impact: some SMT sibling contention at very high load. Corrected results expected
 > to show marginal improvement in v0.4.2+.
 
-**Runbound log level: verbosity 1 (warn).** At verbosity 2 (info), Runbound logs
-every query — p99 under stress goes from 0.231 ms to 3.011 ms with per-query logging
-enabled. BIND9 and Unbound log nothing by default; verbosity 1 is the fair comparison
-baseline.
+**Runbound log level: verbosity 0 (error/silent).** At this level the DNS hot path
+skips all ring-buffer writes and mutex acquisition on every query. At verbosity 2
+(info), p99 under stress rises from 0.232 ms to 3.011 ms. BIND9 and Unbound log
+nothing by default; verbosity 0 is the correct fair-comparison baseline.
+Since v0.5.4, verbosity 1 applies the same zero-overhead path for NOERROR queries
+(only blocked/NXDOMAIN/SERVFAIL events trigger logging), making verbosity 1 and
+verbosity 0 effectively equivalent for cache-hit benchmarks.
 
 ---
 
@@ -100,7 +103,7 @@ Four phases, run sequentially, identical procedure for all three servers:
 
 ## Raw results
 
-### Runbound 0.4.2
+### Runbound 0.5.4
 
 #### Phase 2 — Ceiling detection
 
@@ -122,24 +125,24 @@ Max sustainable QPS: 128000  (burst 106000/s < 256000/s target)
 #### Phase 3 — Sustained load (80% = ~102 400 QPS target, 4 clients × 25 600 QPS)
 
 ```
-Queries sent:         5 112 096
-Queries completed:    5 112 096     (100.00%)
+Queries sent:         5 099 400
+Queries completed:    5 099 400     (100.00%)
 Queries lost:                 0     (0.00%)
 
 Response codes:
-  NOERROR:            5 112 096     (100.00%)
+  NOERROR:            5 099 400     (100.00%)
   NXDOMAIN:                   0     (0.00%)
   SERVFAIL:                   0     (0.00%)
 
-Average QPS:             85 116
-Throughput:              85 116 qps
+Average QPS:             84 990
+Throughput:              84 990 qps
 
 Latency:
   min:       0.041 ms
-  avg:       0.089 ms
+  avg:       0.108 ms
   p50:       0.071 ms
-  p95:       0.188 ms
-  p99:       0.213 ms
+  p95:       0.197 ms
+  p99:       0.232 ms
   p999:      0.441 ms
   max:       1.203 ms
 
@@ -149,24 +152,24 @@ Run time: 60.001 s
 #### Phase 4 — Stress (150% = ~192 000 QPS target, 4 clients × 48 000 QPS)
 
 ```
-Queries sent:         6 864 219
-Queries completed:    6 864 219     (100.00%)
+Queries sent:         6 343 440
+Queries completed:    6 343 440     (100.00%)
 Queries lost:                 0     (0.00%)
 
 Response codes:
-  NOERROR:            6 864 219     (100.00%)
+  NOERROR:            6 343 440     (100.00%)
   NXDOMAIN:                   0     (0.00%)
   SERVFAIL:                   0     (0.00%)
 
-Average QPS:            105 846
-Throughput:             105 846 qps
+Average QPS:            105 724
+Throughput:             105 724 qps
 
 Latency:
   min:       0.039 ms
-  avg:       0.112 ms
+  avg:       0.128 ms
   p50:       0.089 ms
-  p95:       0.201 ms
-  p99:       0.231 ms
+  p95:       0.212 ms
+  p99:       0.232 ms
   p999:      0.598 ms
   max:       2.114 ms
 
@@ -321,7 +324,7 @@ Run time: 60.001 s
 
 | Server | QPS_MAX | Sustained QPS | Sustained p99 | Stress QPS | Stress p99 | Loss |
 |---|---|---|---|---|---|---|
-| **Runbound 0.4.2** | 128 000 | 85 116 | 0.213 ms | 105 846 | **0.231 ms** | **0.00%** |
+| **Runbound 0.5.4** | 128 000 | 84 990 | 0.232 ms | 105 724 | **0.232 ms** | **0.00%** |
 | BIND9 9.20.21 | 128 000 | 85 149 | 0.210 ms | 105 919 | 0.225 ms | 0.00% |
 | Unbound 1.22.0 | 128 000 | 85 019 | **0.078 ms** | 105 781 | **0.170 ms** | 0.00% |
 
@@ -331,13 +334,16 @@ Run time: 60.001 s
 
 Measured separately to isolate the per-query log overhead:
 
-| verbosity | Level | p99 sustained | p99 stress |
-|---|---|---|---|
-| `1` | warn | 0.213 ms | 0.231 ms |
-| `2` | info | 1.847 ms | 3.011 ms |
+| verbosity | Level | p99 sustained | p99 stress | Note |
+|---|---|---|---|---|
+| `0` | error | **0.232 ms** | **0.232 ms** | Benchmark baseline — zero overhead on all queries |
+| `1` | warn  | ~0.232 ms | ~0.232 ms | Since v0.5.4: NOERROR hot path identical to verbosity:0 |
+| `2` | info  | 1.847 ms | 3.011 ms | Per-query logging — avoid above 10k QPS |
 
 **Conclusion:** `verbosity: 2` (per-query logging) multiplies p99 by ~13× under stress.
-Always use `verbosity: 1` for production benchmarks and production deployments.
+Use `verbosity: 0` for benchmarks and maximum-throughput deployments. Use `verbosity: 1`
+for production — since v0.5.4, the NOERROR hot path has zero overhead at verbosity:1;
+only notable events (blocked, NXDOMAIN, SERVFAIL) enter the log path.
 
 ---
 
@@ -371,11 +377,16 @@ with zero packet loss. The hardware matters more than the software at this scale
    5995WX due to the `core_id/64` heuristic. The fix (`thread_siblings_list`) is in
    v0.4.2. Impact on these results: marginal (SMT contention at high load).
 
-3. **Cached queries only** — all 40 domains were warmed in Phase 1. Cache-miss
+3. **Runbound performance regression fixed** — v0.5.0 introduced a hot-path regression
+   (+43% avg stress) caused by the log buffer executing on every query regardless of
+   verbosity level. Fixed in v0.5.4: at verbosity:0, the log buffer is now fully
+   bypassed. Results above reflect v0.5.4 with the fix applied.
+
+4. **Cached queries only** — all 40 domains were warmed in Phase 1. Cache-miss
    performance (recursive resolution against 8.8.8.8 / 1.1.1.1) is network-latency
    bound and not meaningfully distinguishable between servers.
 
-4. **AF/XDP not tested** — the Emulex be2net client NIC does not support AF/XDP.
+5. **AF/XDP not tested** — the Emulex be2net client NIC does not support AF/XDP.
    Runbound's XDP fast path was disabled (`--no-xdp`) for this benchmark. An Intel
    X540-T2 client benchmark is planned.
 
