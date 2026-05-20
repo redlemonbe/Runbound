@@ -9,6 +9,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.5.3] — 2026-05-20
+
+### Performance
+
+- **Hot-path regression fixed** (`src/dns/server.rs`) — `record_query()` was calling
+  `sanitize_dns_name()` + `ShardedLogBuffer::push_query()` on every DNS query even at
+  `verbosity: 0`, because `log_buffer.is_enabled()` returns `true` with the default
+  `log-retention: 1000`. `push_query()` executes an atomic increment, a mutex
+  acquisition, `SystemTime::now()`, a heap allocation (`client_ip.to_string()`),
+  and fixed-size array copies per query. At 105 k QPS under stress load, the queuing
+  amplification turned this ~200 ns constant overhead into a +43 % avg latency
+  regression vs v0.4.2 (which had no log buffer).
+
+  **Fix:** added `tracing::enabled!(WARN)` as the outer guard. At `verbosity: 0`
+  (`Level::ERROR`), WARN events are disabled → the entire block is short-circuited →
+  zero allocation, zero mutex, zero `SystemTime::now()` on the hot path.
+  `verbosity: 0` is the performance-maximum mode; the REST API `/logs` endpoint
+  returns empty in that mode. Use `verbosity: 1` to retain query history.
+
+  Root cause: avg latency 0.160 ms → ≤ 0.120 ms target at `verbosity: 0` (stress benchmark).
+
+---
+
 ## [0.5.2] — 2026-05-20
 
 ### Fixed
