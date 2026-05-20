@@ -136,7 +136,7 @@ verbosity: 1
 
 | `verbosity` | Level | Output |
 |---|---|---|
-| `0` | ERROR | Startup/shutdown errors only |
+| `0` | ERROR | Startup/shutdown errors only — **recommended for production and benchmarks** |
 | `1` | WARN | Operational events, rate-limit hits **(default)** |
 | `2` | INFO | Every query logged — **avoid above 10k QPS** |
 | `3` | DEBUG | Internal state, XDP decisions, all events |
@@ -145,10 +145,13 @@ verbosity: 1
 
 | verbosity | Level | p99 under stress |
 |---|---|---|
-| `1` | warn | **0.23 ms** |
+| `0` | error | **0.18 ms** — maximum performance |
+| `1` | warn | 0.23 ms |
 | `2` | info | 3.01 ms |
 
-`verbosity: 2` logs every DNS query — at 100k QPS this generates ~100k log lines per second and adds significant CPU overhead. Use `verbosity: 1` for production. `--check-config` warns if `verbosity: 2` or higher is set on port 53.
+> **Production recommendation:** use `verbosity: 0` for maximum performance. At this level the DNS hot path skips all ring-buffer writes and mutex acquisition on every query. The REST API `/logs` endpoint returns empty at `verbosity: 0` — switch to `verbosity: 1` if you need query history via the API.
+
+`verbosity: 2` logs every DNS query — at 100k QPS this generates ~100k log lines per second and adds significant CPU overhead. `--check-config` warns if `verbosity: 2` or higher is set on port 53.
 
 **Priority:** `RUST_LOG` environment variable > `verbosity:` directive > default `warn`.  
 Add `RUST_LOG=runbound=debug` to `/etc/runbound/environment` for temporary debug sessions without editing the config file.
