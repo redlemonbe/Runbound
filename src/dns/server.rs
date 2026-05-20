@@ -135,17 +135,19 @@ impl RunboundHandler {
         // MED-06: sanitize the DNS name before structured log emission to prevent
         // log injection via control characters embedded in query names.
         //
-        // Guard levels (outermost first):
-        //   1. tracing::enabled!(WARN): at verbosity:0 (Level::ERROR), WARN is disabled
-        //      → this returns false → entire block skipped → zero alloc, zero mutex.
-        //      verbosity:0 is the performance-maximum mode; /logs returns empty in that
-        //      mode (use verbosity:1 to retain REST API query history).
-        //   2. log_buffer.is_enabled() || tracing::enabled!(INFO): at verbosity:1 with
-        //      log-retention:0, both are false → block skipped.
-        //      At verbosity:1 with default log-retention → push_query runs (REST API logs).
-        //      At verbosity:2+ → full tracing output.
-        if tracing::enabled!(tracing::Level::WARN)
-            && (self.log_buffer.is_enabled() || tracing::enabled!(tracing::Level::INFO))
+        // Notable = any non-NoError response or explicitly blocked action.
+        // Rate-limited queries arrive here as ResponseCode::Refused + LogAction::Refused,
+        // so they are covered by the rcode check.
+        //
+        // Guard levels:
+        //   verbosity:0 (ERROR) — WARN disabled → outer check false → zero alloc, zero mutex.
+        //   verbosity:1 (WARN)  — notable queries only: log buffer push + warn!, NOERROR skipped.
+        //   verbosity:2 (INFO)  — all queries: log buffer push + info!.
+        let is_notable = rcode != ResponseCode::NoError
+            || matches!(action, LogAction::Blocked);
+
+        if tracing::enabled!(tracing::Level::INFO)
+            || (is_notable && tracing::enabled!(tracing::Level::WARN) && self.log_buffer.is_enabled())
         {
             let safe_name = sanitize_dns_name(qname);
             let client_log = self.log_buffer.push_query(&safe_name, &client, u16::from(qtype), action, elapsed_ms);
