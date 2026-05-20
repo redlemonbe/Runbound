@@ -622,9 +622,11 @@ fn build_resolver(cfg: &UnboundConfig, cache_size: usize) -> anyhow::Result<Toki
 // ============================================================
 
 // Check memory every 30 s. On Linux /proc/meminfo is a cheap kernel read.
-const MEM_CHECK_SECS:       u64 = 30;
+const MEM_CHECK_SECS:        u64 = 30;
 // Scale-up cooldown: do not increase cache more often than every 5 minutes.
-const MEM_SCALEUP_COOLDOWN: u64 = 300;
+const MEM_SCALEUP_COOLDOWN:  u64 = 300;
+// Halving cooldown: do not halve more often than once every 5 minutes.
+const CACHE_HALVE_COOLDOWN: Duration = Duration::from_secs(300);
 // Memory pressure thresholds (used ratio = 1 - MemAvailable/MemTotal):
 const MEM_LOW_WATERMARK:    f64 = 0.60; // below → scale up if cache was reduced
 const MEM_MOD_WATERMARK:    f64 = 0.70; // [0.70, 0.80) → halve cache
@@ -669,8 +671,14 @@ fn read_meminfo() -> Option<(u64, u64)> {
 /// Four operating modes based on memory pressure (used = 1 - MemAvailable/MemTotal):
 ///   < 60 %  — scale up: restore cache toward optimal size (with cooldown).
 ///   60–70 % — stable: no action.
-///   70–80 % — moderate pressure: halve cache size, floor 512.
+///   70–80 % — moderate pressure: halve cache size, floor at cache_min_entries.
 ///   ≥ 80 %  — high pressure: recalc cache from current RAM + flush rate limiter.
+///
+/// Three guards prevent infinite cache destruction on memory-constrained systems:
+///   1. Floor: never halve below cfg.cache_min_entries (default 2048).
+///   2. Cooldown: at most one halving per CACHE_HALVE_COOLDOWN (5 min).
+///   3. No-effect detection: if halving does not reduce used_pct by ≥ 5 %,
+///      halvings are disabled for this process lifetime with a clear WARN.
 ///
 /// Cache changes take effect by rebuilding the hickory resolver and atomically
 /// swapping it via ArcSwap. In-flight queries keep their Arc until completion.
@@ -685,15 +693,40 @@ pub async fn memory_guard_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut current_cache_size = initial_cache_size;
-    let mut last_scale_up = std::time::Instant::now()
+    let mut last_scale_up = Instant::now()
         .checked_sub(Duration::from_secs(MEM_SCALEUP_COOLDOWN))
-        .unwrap_or_else(std::time::Instant::now);
+        .unwrap_or_else(Instant::now);
+
+    // Halving guards
+    let mut last_halved: Instant = Instant::now()
+        .checked_sub(CACHE_HALVE_COOLDOWN)
+        .unwrap_or_else(Instant::now);
+    // used_ratio captured just before the last halving; cleared after one check cycle.
+    let mut pct_before_last_halve: Option<f64> = None;
+    // Set permanently when halving is proven to have no measurable effect on RSS.
+    let mut halving_disabled = false;
 
     loop {
         interval.tick().await;
 
         let Some((avail_kb, total_kb)) = read_meminfo() else { continue };
         let used_ratio = 1.0 - (avail_kb as f64 / total_kb as f64);
+
+        // No-effect detection: check whether the previous halving reduced pressure.
+        if let Some(pct_before) = pct_before_last_halve.take() {
+            if used_ratio >= pct_before - 0.05 {
+                halving_disabled = true;
+                warn!(
+                    pct_before = format!("{:.1}%", pct_before * 100.0),
+                    pct_after  = format!("{:.1}%", used_ratio * 100.0),
+                    "cache halving has no effect on memory pressure \
+                     (pct before={:.1}% after={:.1}%) — cache floor reached, \
+                     consider increasing MemoryMax in the service file or reducing other workloads",
+                    pct_before * 100.0,
+                    used_ratio * 100.0,
+                );
+            }
+        }
 
         if used_ratio >= MEM_HIGH_WATERMARK {
             // High pressure — recalc from current RAM state, flush rate limiter.
@@ -715,9 +748,21 @@ pub async fn memory_guard_loop(
                 Err(e) => warn!(%e, "memory guard: resolver rebuild failed (high pressure)"),
             }
         } else if used_ratio >= MEM_MOD_WATERMARK {
-            // Moderate pressure — halve cache, floor at 512.
-            if current_cache_size > 512 {
-                let new_size = (current_cache_size / 2).max(512);
+            // Moderate pressure — halve cache, floor at cache_min_entries.
+            let min = cfg.cache_min_entries;
+            if halving_disabled {
+                // no-op: halving proven ineffective, avoid log spam
+            } else if current_cache_size <= min {
+                warn!(
+                    cache_size = current_cache_size,
+                    cache_min  = min,
+                    used_pct   = format!("{:.1}%", used_ratio * 100.0),
+                    "cache at minimum size ({}) — memory pressure ignored", min,
+                );
+            } else if last_halved.elapsed() < CACHE_HALVE_COOLDOWN {
+                // cooldown active — skip this cycle silently
+            } else {
+                let new_size = (current_cache_size / 2).max(min);
                 match build_resolver(&cfg, new_size) {
                     Ok(new_res) => {
                         resolver.store(Arc::new(new_res));
@@ -729,6 +774,8 @@ pub async fn memory_guard_loop(
                             "memory pressure — cache halved"
                         );
                         current_cache_size = new_size;
+                        last_halved = Instant::now();
+                        pct_before_last_halve = Some(used_ratio);
                     }
                     Err(e) => warn!(%e, "memory guard: resolver rebuild failed (moderate pressure)"),
                 }
@@ -751,7 +798,7 @@ pub async fn memory_guard_loop(
                             "memory pressure resolved — cache scaled up"
                         );
                         current_cache_size = optimal;
-                        last_scale_up = std::time::Instant::now();
+                        last_scale_up = Instant::now();
                     }
                     Err(e) => warn!(%e, "memory guard: resolver rebuild failed (scale up)"),
                 }

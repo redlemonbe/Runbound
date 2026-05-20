@@ -5,7 +5,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [Unreleased] — next: 0.5
+## [Unreleased]
+
+---
+
+## [0.5.1] — 2026-05-20
+
+### Fixed
+
+- **Memory pressure: cache floor** (`src/dns/server.rs`, `src/config/parser.rs`) — the
+  cache halving loop previously had a hard floor of 512 entries. On memory-constrained
+  systems (< 4 GB RAM) where other processes hold significant RSS, the used-memory ratio
+  never dropped below the 70 % threshold after halving, causing the cache to be destroyed
+  to 0. A new `cache-min-entries` config directive (default: 2048) sets the floor. The
+  loop stops halving and logs `WARN cache at minimum size` once the floor is reached.
+
+- **Memory pressure: 5-minute cooldown between halvings** (`src/dns/server.rs`) — a
+  `CACHE_HALVE_COOLDOWN` of 300 s prevents the halving loop from firing on every 30 s
+  check cycle in a tight loop. At most one halving occurs per 5 minutes.
+
+- **Memory pressure: no-effect detection** (`src/dns/server.rs`) — after each halving,
+  the next check cycle compares system memory usage before and after. If used_pct has
+  not decreased by at least 5 percentage points, halvings are permanently disabled for
+  the current process lifetime and a `WARN` message is emitted explaining the cause and
+  pointing to the remediation (increase `MemoryMax` or reduce other workloads).
+
+- **Upstream health checks: exponential backoff** (`src/upstreams.rs`) — a permanently
+  unreachable upstream previously generated a `WARN` log every 30 s indefinitely (120+
+  lines/hour). Failed upstreams now back off exponentially: 30 s → 60 s → 120 s → 300 s
+  cap. The attempt count and next-check interval are included in the `WARN` message.
+  When the upstream recovers, the backoff resets to 30 s and an `INFO` recovery message
+  is logged.
+
+- **`parse_config_str` compile guard** (`src/lib.rs`) — the function was gated with
+  `#[cfg(any(test, feature = "fuzz"))]` but references the `config` module which is only
+  available under `feature = "fuzz"`. Changed to `#[cfg(feature = "fuzz")]`, fixing
+  `cargo test` failures without the fuzz feature.
+
+---
+
+## [0.5.0] — performance improvements (unreleased at tagging)
 
 ### Performance
 
