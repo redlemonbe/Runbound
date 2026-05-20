@@ -134,9 +134,19 @@ impl RunboundHandler {
 
         // MED-06: sanitize the DNS name before structured log emission to prevent
         // log injection via control characters embedded in query names.
-        // Guard the allocation: skip when log buffer is disabled AND info-level tracing
-        // is off (verbosity < 2). Hot path at verbosity:1 with log-retention:0 → zero alloc.
-        if self.log_buffer.is_enabled() || tracing::enabled!(tracing::Level::INFO) {
+        //
+        // Guard levels (outermost first):
+        //   1. tracing::enabled!(WARN): at verbosity:0 (Level::ERROR), WARN is disabled
+        //      → this returns false → entire block skipped → zero alloc, zero mutex.
+        //      verbosity:0 is the performance-maximum mode; /logs returns empty in that
+        //      mode (use verbosity:1 to retain REST API query history).
+        //   2. log_buffer.is_enabled() || tracing::enabled!(INFO): at verbosity:1 with
+        //      log-retention:0, both are false → block skipped.
+        //      At verbosity:1 with default log-retention → push_query runs (REST API logs).
+        //      At verbosity:2+ → full tracing output.
+        if tracing::enabled!(tracing::Level::WARN)
+            && (self.log_buffer.is_enabled() || tracing::enabled!(tracing::Level::INFO))
+        {
             let safe_name = sanitize_dns_name(qname);
             let client_log = self.log_buffer.push_query(&safe_name, &client, u16::from(qtype), action, elapsed_ms);
             info!(
