@@ -38,7 +38,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [0.4.18] — 2026-05-20
+## [0.5.0] — 2026-05-20
 
 ### Security
 
