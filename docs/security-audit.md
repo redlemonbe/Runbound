@@ -13,8 +13,8 @@
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
-| IA audit | v0.4.16 | 7 (5 Low, 2 Info) | ✅ All fixed/accepted v0.4.5 |
-| Live pentest | v0.4.16 | 2 bugs + 13 PASS + 2 observations | ✅ BUG-1/BUG-2 closed v0.4.5 |
+| IA audit | v0.4.16 | 7 (5 Low, 2 Info) | ✅ All fixed/accepted v0.4.6 |
+| Live pentest | v0.4.16 | 2 bugs + 13 PASS + 2 observations | ✅ BUG-1/BUG-2 closed v0.4.6 |
 | Pre-release white-box | v0.4.16 | 5 (2 Medium, 3 Low) | ✅ All fixed v0.4.16 |
 | Initial white-box | v0.2.3 | 20 (4 Critical, 8 High, 5 Medium, 3 Low) | ✅ All fixed v0.2.4–v0.4.0 |
 | Second white-box | v0.3.3 | 9 (1 High, 6 Medium, 2 Low) | ✅ All fixed v0.3.3–v0.3.5 |
@@ -929,11 +929,11 @@ rate limiter still applies in addition.
 
 ---
 
-## Audit v0.4.5 — 2026-05-20
+## Audit v0.4.6 — 2026-05-20
 
 **Scope:** Full source review — all 24 Rust source files  
 **Methodology:** Manual white-box source code review (IA)  
-**Status:** 7 findings — 6 fixed in v0.4.5, 1 accepted (known limitation)
+**Status:** 7 findings — 6 fixed in v0.4.6, 1 accepted (known limitation)
 
 ---
 
@@ -941,13 +941,13 @@ rate limiter still applies in addition.
 
 | ID | Severity | Area | Status |
 |---|---|---|---|
-| VUL-NEW-01 | 🟡 LOW | DoT/DoH TCP cap bypass | ✅ Fixed v0.4.5 |
+| VUL-NEW-01 | 🟡 LOW | DoT/DoH TCP cap bypass | ✅ Fixed v0.4.6 |
 | VUL-NEW-02 | ℹ️ INFO | TCP rate-limit bypass via loopback relay | ✅ Accepted — documented known limitation |
-| VUL-NEW-03 | 🟡 LOW | IPv6 `::1` collapsed by `normalize_tcp_ip` before loopback check | ✅ Fixed v0.4.5 |
-| VUL-NEW-04 | 🟡 LOW | sysfs path injection via unsanitized interface name | ✅ Fixed v0.4.5 |
-| VUL-NEW-05 | 🟡 LOW | `CPU_SET` UB for `cpu_id >= 1024` | ✅ Fixed v0.4.5 |
-| VUL-NEW-06 | 🟡 LOW | `add_feed_handler` uses raw `Json` extractor | ✅ Fixed v0.4.5 |
-| VUL-NEW-07 | 🟡 LOW | `validate_dns_entry` reflects internal RR string in HTTP error | ✅ Fixed v0.4.5 |
+| VUL-NEW-03 | 🟡 LOW | IPv6 `::1` collapsed by `normalize_tcp_ip` before loopback check | ✅ Fixed v0.4.6 |
+| VUL-NEW-04 | 🟡 LOW | sysfs path injection via unsanitized interface name | ✅ Fixed v0.4.6 |
+| VUL-NEW-05 | 🟡 LOW | `CPU_SET` UB for `cpu_id >= 1024` | ✅ Fixed v0.4.6 |
+| VUL-NEW-06 | 🟡 LOW | `add_feed_handler` uses raw `Json` extractor | ✅ Fixed v0.4.6 |
+| VUL-NEW-07 | 🟡 LOW | `validate_dns_entry` reflects internal RR string in HTTP error | ✅ Fixed v0.4.6 |
 
 ---
 
@@ -955,7 +955,7 @@ rate limiter still applies in addition.
 
 **Severity:** LOW  
 **File:** `src/dns/server.rs`  
-**Status:** ✅ Fixed in v0.4.5
+**Status:** ✅ Fixed in v0.4.6
 
 DoT (port 853) and DoH (port 443) TCP listeners were registered directly with hickory-server via `register_tls_listener_with_tls_config` / `register_https_listener_with_tls_config`, bypassing `run_tcp_with_limit`. A client could open more than `TCP_CONN_PER_IP_MAX` (20) concurrent TLS connections per source IP, exhausting file descriptors.
 
@@ -979,7 +979,7 @@ The relay architecture (TCP clients → loopback → hickory) causes hickory to 
 
 **Severity:** LOW  
 **File:** `src/dns/server.rs` (`run_tcp_with_limit`)  
-**Status:** ✅ Fixed in v0.4.5
+**Status:** ✅ Fixed in v0.4.6
 
 `normalize_tcp_ip` truncates IPv6 addresses to their /48 prefix. The loopback check in `run_tcp_with_limit` was applied after normalization, so `::1` was first collapsed to `::` (all-zeros, not loopback) and then tested against `is_loopback()`. `::` is not loopback, so `::1` connections were subjected to the connection cap rather than being unconditionally allowed as health checks.
 
@@ -991,7 +991,7 @@ The relay architecture (TCP clients → loopback → hickory) causes hickory to 
 
 **Severity:** LOW  
 **File:** `src/dns/xdp/socket.rs`  
-**Status:** ✅ Fixed in v0.4.5
+**Status:** ✅ Fixed in v0.4.6
 
 Four functions (`is_virtual_interface`, `parent_interface`, `first_physical_bridge_port`, `get_rx_queue_count`) embedded interface names directly into `/sys/class/net/{iface}/…` path strings via `format!`. Interface names sourced from config or resolved via `/proc/net/route` were not validated, permitting path traversal or directory escape via crafted names.
 
@@ -1003,7 +1003,7 @@ Four functions (`is_virtual_interface`, `parent_interface`, `first_physical_brid
 
 **Severity:** LOW  
 **File:** `src/cpu.rs` (`pin_to_cpu`)  
-**Status:** ✅ Fixed in v0.4.5
+**Status:** ✅ Fixed in v0.4.6
 
 `libc::CPU_SET(cpu_id, &mut set)` writes a bit into a `cpu_set_t` (128 bytes = 1 024 bits). For `cpu_id >= 1024` it writes beyond the struct boundary — undefined behaviour inside an `unsafe` block. The `physical_cores()` scanner iterates up to 4 096 CPUs; a system reporting more than 1 024 logical CPUs could trigger this.
 
@@ -1015,7 +1015,7 @@ Four functions (`is_virtual_interface`, `parent_interface`, `first_physical_brid
 
 **Severity:** LOW  
 **File:** `src/api/mod.rs` (`add_feed_handler`)  
-**Status:** ✅ Fixed in v0.4.5
+**Status:** ✅ Fixed in v0.4.6
 
 `add_feed_handler` extracted the request body with `JsonExtract(p): JsonExtract<AddFeedRequest>` (raw `axum::Json`). On deserialization failure, axum returns a plain-text 422 instead of the structured JSON error produced by the project's `ApiJson<T>` wrapper. All other mutation handlers already used `ApiJson`; this was an oversight.
 
@@ -1027,7 +1027,7 @@ Four functions (`is_virtual_interface`, `parent_interface`, `first_physical_brid
 
 **Severity:** LOW  
 **File:** `src/api/mod.rs` (`validate_dns_entry`)  
-**Status:** ✅ Fixed in v0.4.5
+**Status:** ✅ Fixed in v0.4.6
 
 On `parse_local_data` failure, the HTTP 400 response body included `"details": format!("Could not parse RR: {rr}")`. The RR string is assembled from user-supplied fields and internal config values; including it in the response leaks zone-syntax internals and could aid an attacker in probing record parsing logic.
 
@@ -1037,7 +1037,7 @@ On `parse_local_data` failure, the HTTP 400 response body included `"details": f
 
 ### Pentest BUG-1 and BUG-2 — Status update
 
-| ID | Prior status | v0.4.5 status |
+| ID | Prior status | v0.4.6 status |
 |---|---|---|
 | BUG-1 — `/reload` rate limit not enforced | ⚠️ Open | ✅ Confirmed fixed — `ReloadLimiter` correctly wired; verified functional |
 | BUG-2 — TCP cap not enforced for non-loopback | ⚠️ Open | ✅ Clarified — DNS/TCP cap functional; DoT/DoH gap fixed by VUL-NEW-01 |
@@ -1084,8 +1084,8 @@ v0.4.16 adds: release-mode UMEM bounds check returning `Option` in `src/dns/xdp/
 (VUL-6.2); `sanitize_error()` at 8 API error sites in `src/api/mod.rs` (VUL-3.4);
 `ReloadLimiter` token bucket (2 RPS) in `src/api/mod.rs` + `src/main.rs` (VUL-3.2).
 v0.4.16 live pentest (2026-05-19): 13 PASS, 2 bugs open (BUG-1: ReloadLimiter not wired;
-BUG-2: TcpConnTracker not enforced for non-loopback) → closed v0.4.5.
-v0.4.5 IA audit (2026-05-20): full 24-file review; DoT/DoH TCP cap bypass (VUL-NEW-01),
+BUG-2: TcpConnTracker not enforced for non-loopback) → closed v0.4.6.
+v0.4.6 IA audit (2026-05-20): full 24-file review; DoT/DoH TCP cap bypass (VUL-NEW-01),
 loopback relay rate-limit limitation (VUL-NEW-02, accepted), IPv6 loopback normalisation
 (VUL-NEW-03), sysfs path sanitization (VUL-NEW-04), CPU_SET UB guard (VUL-NEW-05),
 ApiJson on add_feed_handler (VUL-NEW-06), PARSE_FAILED error leakage (VUL-NEW-07);
