@@ -135,6 +135,9 @@ http-body-util = "0.1"
 # Enabled by default; opt out with --no-default-features.
 default = ["xdp"]
 xdp = ["dep:aya"]
+# Expose internal parsing functions for cargo-fuzz targets.
+# Never enabled in the normal release binary.
+fuzz = []
 
 [dependencies.aya]
 version  = "0.13"

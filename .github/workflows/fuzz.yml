@@ -1,0 +1,17 @@
+name: Fuzz
+on:
+  schedule:
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - run: cargo fuzz run fuzz_dns_query -- -max_total_time=300
+      - run: cargo fuzz run fuzz_config -- -max_total_time=300
+      - run: cargo fuzz run fuzz_api_json -- -max_total_time=300
+      - run: cargo fuzz run fuzz_dns_name -- -max_total_time=300
