@@ -3,6 +3,17 @@
 Runbound v0.4.14+ includes an AF_XDP fast path, enabled by default (the `xdp`
 feature is part of the default feature set since v0.4.16).
 
+## License
+
+The AF/XDP fast path requires the **commercial license**.
+
+Open-source builds (AGPL v3) include the XDP code path but it is disabled at
+runtime — the server self-tests at startup and falls back automatically to the
+standard `SO_REUSEPORT` kernel UDP path if no commercial license is present.
+
+To enable the AF/XDP fast path in production, contact the maintainer for a
+commercial license.
+
 ## Disabling XDP
 
 There are three ways to disable the XDP fast path, depending on the context:
