@@ -10,6 +10,14 @@ repository = "https://github.com/redlemonbe/Runbound"
 homepage = "https://github.com/redlemonbe/Runbound"
 keywords = ["dns", "unbound", "resolver", "dnssec", "acme"]
 categories = ["network-programming", "command-line-utilities"]
+exclude = [
+    "runbound-*",
+    "*.sha256",
+    "sbom.cdx.json",
+    "runbound.cdx.json",
+    "fuzz/",
+    "docs/",
+]
 
 [dependencies]
 # Async runtime
