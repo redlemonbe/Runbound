@@ -9,6 +9,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.5.7] — 2026-05-20
+
+### Fixed
+- **verbosity:1 throughput regression** — `with_max_level(Level::WARN)` enabled WARN
+  globally for all dependencies (hickory-resolver, hickory-proto, tokio), preventing
+  their tracing callsites from being cached as "Never". Under load, this added overhead
+  on every DNS resolution even for NOERROR cache hits.
+  Fix: replace `with_max_level` with a scoped `EnvFilter` that restricts WARN to
+  Runbound's own modules only (`error,runbound=warn`). At `verbosity: 1`, dependency
+  crates now run at ERROR level — their callsites are "Never" again.
+  Measured impact: QPS ceiling at verbosity:1 restored from 64k → 128k (client NIC
+  limit). p99 sustained latency unchanged.
+
+---
+
 ## [0.5.5] — 2026-05-20
 
 ### Tests

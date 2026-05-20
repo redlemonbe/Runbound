@@ -155,14 +155,12 @@ fn handle_cli_flags(args: &[String]) -> Result<bool> {
     Ok(false)
 }
 
-/// Map `verbosity: N` (0–3) to a tracing Level.
-/// 0 = ERROR, 1 = WARN (production default), 2 = INFO, 3 = DEBUG.
-fn verbosity_to_level(v: u8) -> tracing::Level {
+fn verbosity_to_filter(v: u8) -> &'static str {
     match v {
-        0 => tracing::Level::ERROR,
-        1 => tracing::Level::WARN,
-        2 => tracing::Level::INFO,
-        _ => tracing::Level::DEBUG,
+        0 => "error",
+        1 => "error,runbound=warn",
+        2 => "warn,runbound=info",
+        _ => "debug",
     }
 }
 
@@ -214,9 +212,10 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
             .with_env_filter(tracing_subscriber::EnvFilter::from_env("RUST_LOG"))
             .init();
     } else {
-        let level = verbosity_to_level(unbound_cfg.verbosity);
         tracing_subscriber::fmt()
-            .with_max_level(level)
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                verbosity_to_filter(unbound_cfg.verbosity)
+            ))
             .init();
     }
 
