@@ -929,6 +929,44 @@ rate limiter still applies in addition.
 
 ---
 
+## Audit v0.5.2 — 2026-05-20
+
+**Scope:** Targeted review — `POST /reload` rate limiter  
+**Methodology:** Production symptom + white-box source review (IA)  
+**Status:** 1 finding — fixed in v0.5.2
+
+---
+
+### Findings
+
+| ID | Severity | Area | Status |
+|---|---|---|---|
+| VUL-052-01 | 🟡 LOW | `POST /reload` rate limit race condition — parallel requests bypassed token bucket | ✅ Fixed v0.5.2 |
+
+---
+
+### VUL-052-01 — POST /reload rate limit TOCTOU
+
+**Severity:** LOW  
+**Component:** `src/api/mod.rs` — `ReloadLimiter::check()`  
+**Symptom:** 20 simultaneous `POST /reload` requests → 0 × 429; all requests bypassed the 2 req/s cap.
+
+**Root cause:** The token bucket used integer arithmetic with a conditional timestamp update:
+`if new > 0 { *last = now }`. When `elapsed_ms < 1` (sub-millisecond arrivals), `new = 0`
+and `last` was NOT updated. On the next call, elapsed time accumulated from the un-advanced
+timestamp, effectively crediting extra tokens to subsequent callers.
+
+**Fix:** Rewritten with `f64` arithmetic. `last_refill` is updated unconditionally on every
+call — no conditional branch. Refill and consumption are serialised under a single
+`std::sync::Mutex` with no TOCTOU possible.
+
+**Verification:** `reload_limiter_parallel` unit test — 20 threads via `std::sync::Barrier`:  
+`assert!(allowed <= 2)` and `assert!(denied >= 18)` — both pass.
+
+**Status:** ✅ Fixed in v0.5.2
+
+---
+
 ## Audit v0.5.0 — 2026-05-20
 
 **Scope:** Full source review — all 24 Rust source files  

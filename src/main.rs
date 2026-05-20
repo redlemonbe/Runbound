@@ -440,7 +440,7 @@ async fn build_and_launch(
         zones:          Arc::clone(&zones),
         tls_cfg:        Arc::clone(&tls_cfg),
         rate_limiter:   api::ApiRateLimiter::new_public(),
-        reload_limiter: api::ReloadLimiter::new(),
+        reload_limiter: Arc::new(api::ReloadLimiter::new()),
         zones_mutex:    Arc::clone(&zones_mutex),
         stats:          Arc::clone(&global_stats),
         cfg:            Arc::clone(&cfg_arc),
