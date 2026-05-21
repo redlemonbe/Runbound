@@ -45,7 +45,6 @@ case "$ARCH" in
 esac
 
 # Prefer musl (static, no dependency on glibc version)
-ASSET="runbound-${VERSION}-${ARCH_TAG}-linux-musl"
 
 # ── Resolve "latest" to an actual version tag ─────────────────────────────────
 if [[ "$VERSION" == "latest" ]]; then
@@ -64,7 +63,7 @@ fi
 # Strip leading 'v' if present to form the asset filename version segment
 VER_TAG="$VERSION"
 VER_BARE="${VERSION#v}"
-ASSET="runbound-${VERSION}-${ARCH_TAG}-linux-musl"
+ASSET="runbound-${VER_BARE}-${ARCH_TAG}-linux-musl"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VER_TAG}/${ASSET}"
 
 echo "Installing Runbound ${VER_TAG} (${ARCH_TAG}, static musl)…"

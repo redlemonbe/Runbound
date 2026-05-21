@@ -119,3 +119,13 @@ server:
 ```
 
 See [gdpr.md](gdpr.md) for the full GDPR compliance guide.
+
+---
+
+## Master / Slave replication
+
+To replicate state (blacklist, zones, feeds) from a master to one or more slaves,
+see [sync.md](sync.md).
+
+> **Quick reminder:** open TCP port 8082 on the master firewall — this is the
+> most common reason slave synchronisation fails.
