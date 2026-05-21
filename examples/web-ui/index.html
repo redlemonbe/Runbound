@@ -127,10 +127,10 @@
     <p class="text-xs text-gray-500 mb-3">Feeds are remote blocklists Runbound downloads and applies automatically every 24 h. Each domain in a feed is blocked with the chosen action.</p>
 
     <!-- Presets -->
-    <div class="mb-4">
-      <div class="text-xs text-gray-500 mb-2 uppercase tracking-wide">Quick-add preset</div>
-      <div id="feed-presets" class="flex flex-wrap gap-2 text-xs text-gray-400">
-        <span class="text-gray-600 italic">Loading presets…</span>
+    <div class="mb-5">
+      <div class="text-xs text-gray-500 mb-2 uppercase tracking-wide">Available presets</div>
+      <div id="feed-presets" class="space-y-1">
+        <span class="text-gray-600 italic text-xs">Loading…</span>
       </div>
     </div>
 
@@ -333,27 +333,44 @@ async function blDelete(id) {
 }
 
 // ── Feeds ────────────────────────────────────────────────────────────
+let presetsCache = [];
+
 async function loadPresets() {
   try {
     const d = await api('GET', '/feeds/presets');
-    const presets = d.presets ?? [];
-    document.getElementById('feed-presets').innerHTML = presets.length === 0
-      ? '<span class="text-gray-600 italic">No presets available.</span>'
-      : presets.map(p => `
-          <button onclick="feedAddPreset(${JSON.stringify(esc(p.name))},${JSON.stringify(esc(p.url))},${JSON.stringify(esc(p.format??'hosts'))},${JSON.stringify(esc(p.action??'nxdomain'))})"
-            class="btn-secondary text-xs flex items-center gap-1.5 py-1" title="${esc(p.url)}">
-            <span>${esc(p.name)}</span>
-            ${p.entry_count_approx ? `<span class="text-gray-600">~${Number(p.entry_count_approx).toLocaleString()}</span>` : ''}
-          </button>`).join('');
+    presetsCache = d.presets ?? [];
+    const activeFeedsResp = await api('GET', '/feeds');
+    const activeUrls = new Set((activeFeedsResp.feeds ?? []).map(f => f.url));
+    document.getElementById('feed-presets').innerHTML = presetsCache.length === 0
+      ? '<span class="text-gray-600 italic text-xs">No presets available.</span>'
+      : presetsCache.map((p, i) => {
+          const already = activeUrls.has(p.url);
+          return `
+          <div class="row items-center gap-3 py-2 ${already ? 'opacity-40' : ''}">
+            <div class="flex-1 min-w-0">
+              <span class="text-gray-200 text-sm font-medium">${esc(p.name)}</span>
+              <span class="text-gray-500 text-xs ml-2">${esc(p.format ?? 'hosts')} · ${esc(p.action ?? 'nxdomain')}</span>
+              <div class="text-gray-500 text-xs mt-0.5">${esc(p.description ?? '')}</div>
+            </div>
+            <button onclick="feedAddPreset(${i})"
+              class="btn-primary text-xs px-3 py-1 shrink-0 ${already ? 'pointer-events-none opacity-50' : ''}"
+              ${already ? 'disabled title="Already added"' : ''}>
+              ${already ? '✓ Added' : '+ Add'}
+            </button>
+          </div>`;
+        }).join('');
   } catch(e) {
-    document.getElementById('feed-presets').innerHTML = '<span class="text-gray-600 italic">Presets unavailable.</span>';
+    document.getElementById('feed-presets').innerHTML = '<span class="text-gray-600 italic text-xs">Presets unavailable.</span>';
   }
 }
 
-async function feedAddPreset(name, url, format, action) {
+async function feedAddPreset(i) {
+  const p = presetsCache[i];
+  if (!p) return;
   try {
-    await api('POST', '/feeds', { name, url, format, action, enabled: true });
-    toast(`Feed "${name}" added`);
+    await api('POST', '/feeds', { name: p.name, url: p.url, format: p.format ?? 'hosts', action: p.action ?? 'nxdomain', enabled: true });
+    toast(`"${p.name}" added`);
+    loadPresets();
     loadFeeds();
   } catch(e) { toast('Add failed: '+e.message, true); }
 }
