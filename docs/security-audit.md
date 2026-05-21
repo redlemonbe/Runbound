@@ -729,7 +729,7 @@ null bytes in a URI). No data is leaked; the client sees a connection reset.
 **Date:** 2026-05-19  
 **Scope:** `src/api/mod.rs`, `src/dns/server.rs`, DNS protocol handling, REST API  
 **Methodology:** Black-box + white-box, automated + manual  
-**Status:** 13 checks PASS, 2 bugs found (open → v0.4.17), 2 observations
+**Status:** 13 checks PASS, 2 bugs found (fixed in v0.5.0), 2 observations
 
 ---
 
@@ -759,7 +759,7 @@ null bytes in a URI). No data is leaked; the client sees a connection reset.
 
 **Severity:** Low  
 **File:** `src/api/mod.rs`  
-**Status:** ⚠️ Open — fix targeted for v0.4.17
+**Status:** ✅ Fixed in v0.5.0
 
 **Test:** 10 rapid `POST /reload` requests sent within 500 ms.  
 **Actual:** 10 × HTTP 200, zero 429 responses.  
@@ -774,7 +774,7 @@ correctly wired into the request path — the check does not gate the handler in
 
 **Severity:** Low  
 **File:** `src/dns/server.rs` (`TcpConnTracker`)  
-**Status:** ⚠️ Open — fix targeted for v0.4.17
+**Status:** ✅ Fixed in v0.5.0
 
 **Test:** 30 simultaneous TCP connections opened from 127.0.0.1.  
 **Actual:** All 30 accepted.  

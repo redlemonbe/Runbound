@@ -315,10 +315,15 @@ curl -s -X DELETE "$API/blacklist/$ID" -H "Authorization: Bearer $TOKEN"
 
 ### View live DNS queries
 
+Set `verbosity: 2` in `unbound.conf` (or `runbound.conf`) then reload:
+
 ```bash
-RUST_LOG=debug systemctl restart runbound
+sudo systemctl reload runbound
 journalctl -u runbound -f | grep '"query"'
 ```
+
+> **Note:** `verbosity: 2` logs every DNS query — revert to `verbosity: 1` after
+> debugging to avoid measurable CPU overhead at high query rates.
 
 ---
 

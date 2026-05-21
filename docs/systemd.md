@@ -21,7 +21,7 @@ Type=simple
 User=runbound
 Group=runbound
 EnvironmentFile=/etc/runbound/env
-ExecStart=/usr/local/bin/runbound --config /etc/runbound/runbound.conf
+ExecStart=/usr/local/sbin/runbound /etc/runbound/unbound.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
@@ -50,6 +50,10 @@ WantedBy=multi-user.target
 
 ## Setup
 
+> **Recommended:** use `install.sh` — it handles all of the steps below automatically
+> (user creation, directories, API key generation, service installation).
+> The manual procedure below is for deployments that cannot use the installer.
+
 ```bash
 # 1. Create the system user
 useradd -r -s /sbin/nologin -d /etc/runbound runbound
@@ -65,12 +69,12 @@ chmod 640 /etc/runbound/env
 chown runbound:runbound /etc/runbound/env
 
 # 4. Install the binary
-install -o root -g root -m 755 runbound /usr/local/bin/runbound
+install -o root -g root -m 755 runbound /usr/local/sbin/runbound
 
-# 5. Install the config
-cp /path/to/runbound.conf /etc/runbound/runbound.conf
-chown runbound:runbound /etc/runbound/runbound.conf
-chmod 640 /etc/runbound/runbound.conf
+# 5. Install the config (the file may be named runbound.conf or unbound.conf)
+cp /path/to/unbound.conf /etc/runbound/unbound.conf
+chown runbound:runbound /etc/runbound/unbound.conf
+chmod 640 /etc/runbound/unbound.conf
 
 # 6. Install the service
 cp runbound.service /etc/systemd/system/

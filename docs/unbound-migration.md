@@ -82,9 +82,10 @@ existing `unbound.conf` is all you need.
 ### 1. Install Runbound
 
 ```bash
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.3.4-x86_64-linux-musl
-chmod +x runbound-v0.3.4-x86_64-linux-musl
-sudo mv runbound-v0.3.4-x86_64-linux-musl /usr/local/bin/runbound
+# Replace vX.Y.Z with the latest version tag from the releases page
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-vX.Y.Z-x86_64-linux-musl
+chmod +x runbound-vX.Y.Z-x86_64-linux-musl
+sudo mv runbound-vX.Y.Z-x86_64-linux-musl /usr/local/sbin/runbound
 ```
 
 ### 2. Test against your existing config
