@@ -61,7 +61,6 @@ server {
         proxy_http_version    1.0;
         proxy_set_header      Host $host;
         proxy_set_header      X-Real-IP $remote_addr;
-        proxy_set_header      Content-Length "";
         proxy_read_timeout    30s;
     }
 }
@@ -138,7 +137,8 @@ testing on the same machine), use `http://localhost:8080` instead.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `411 Length Required` | `Content-Type: application/json` sent on a GET request | Update to the latest `index.html` from the repo (fixed in v0.5.7+) |
+| `411 Length Required` on GET | `Content-Type: application/json` sent on a GET request | Update to the latest `index.html` from the repo (fixed in v0.5.7+) |
+| `411 Length Required` on POST | `proxy_set_header Content-Length ""` in nginx config clears the body length | Remove that line from the nginx `location /api/` block |
 | `Connection failed` | Wrong API URL or Bearer token | Check `/etc/runbound/environment` for the key |
 | Stats show `—` but no error | Auto-refresh polling before connect completes | Click **Connect** manually |
 | nginx `address already in use` on port 80 | Another service owns port 80 | Use a different listen port (8090 is the recommended default) |
