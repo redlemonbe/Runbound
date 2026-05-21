@@ -125,6 +125,16 @@ See [gdpr.md](gdpr.md) for the full GDPR compliance guide.
 
 ---
 
+## Web management console
+
+A browser dashboard is included at `examples/web-ui/index.html` — manage DNS
+entries, the blacklist, feeds, and live query logs without touching the CLI.
+
+It requires a small nginx reverse proxy to bridge the browser to the
+localhost-only API. Full setup in [web-ui.md](web-ui.md) (5 minutes).
+
+---
+
 ## Master / Slave replication
 
 To replicate state (blacklist, zones, feeds) from a master to one or more slaves,

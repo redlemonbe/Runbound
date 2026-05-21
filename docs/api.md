@@ -4,6 +4,9 @@ Runbound exposes a REST API on **localhost only** (HTTP). The port defaults to
 **8080** and is configurable with `api-port` in `runbound.conf`. All endpoints
 except `GET /help` require a Bearer token.
 
+> **Looking for a GUI?** A ready-made browser dashboard is included at
+> `examples/web-ui/index.html`. Setup in [web-ui.md](web-ui.md).
+
 ---
 
 ## Authentication
