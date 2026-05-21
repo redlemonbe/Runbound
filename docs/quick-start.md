@@ -28,32 +28,33 @@ sudo bash install.sh
 
 ## 2. Configure
 
-**Option A — reuse your existing Unbound config:**
+`install.sh` already created `/etc/runbound/runbound.conf` with sensible defaults.
+Edit it to match your network:
 
 ```bash
-sudo mkdir -p /etc/runbound
+sudo nano /etc/runbound/runbound.conf
+```
+
+Key settings to review:
+
+```
+server:
+    interface:  0.0.0.0          # or a specific IP
+    access-control: 192.168.0.0/16  allow   # your LAN subnet
+    rate-limit: 200              # queries/s per client IP (0 = disabled)
+
+forward-zone:
+    name:         "."
+    forward-addr: 1.1.1.1@853   # upstream resolver
+```
+
+**Migrating from Unbound?** Your existing config works as-is — Runbound reads
+the same `server:`, `forward-zone:`, `local-zone:`, and `local-data:` directives.
+See [unbound-migration.md](unbound-migration.md) for the full compatibility table.
+
+```bash
+# To use your existing Unbound config instead of the default:
 sudo cp /etc/unbound/unbound.conf /etc/runbound/runbound.conf
-```
-
-Runbound reads the same `server:`, `forward-zone:`, `local-zone:`, and `local-data:` directives.
-See [unbound-migration.md](unbound-migration.md) for the compatibility table.
-
-**Option B — start from an example:**
-
-```bash
-sudo mkdir -p /etc/runbound
-# Pick the config closest to your use case:
-sudo cp /path/to/Runbound/examples/home.conf    /etc/runbound/runbound.conf  # Pi-hole replacement
-sudo cp /path/to/Runbound/examples/office.conf  /etc/runbound/runbound.conf  # SMB office
-sudo cp /path/to/Runbound/examples/server.conf  /etc/runbound/runbound.conf  # Public resolver
-sudo cp /path/to/Runbound/examples/secure.conf  /etc/runbound/runbound.conf  # Air-gapped
-```
-
-**Set your API key:**
-
-```bash
-export RUNBOUND_API_KEY="$(openssl rand -hex 32)"
-echo "RUNBOUND_API_KEY=$RUNBOUND_API_KEY" | sudo tee /etc/runbound/env
 ```
 
 ---
