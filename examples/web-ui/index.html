@@ -52,9 +52,11 @@
 
   <!-- Overview -->
   <div id="tab-overview" class="fade">
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+
+    <!-- Primary KPIs -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
       <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">Queries / sec</div>
+        <div class="text-xs text-gray-500 mb-1">QPS <span class="text-gray-700">(1 min avg)</span></div>
         <div id="ov-qps" class="text-2xl text-cyan-400">—</div>
       </div>
       <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
@@ -62,12 +64,13 @@
         <div id="ov-total" class="text-2xl text-white">—</div>
       </div>
       <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">Cache hits</div>
+        <div class="text-xs text-gray-500 mb-1">Cache hit rate</div>
         <div id="ov-cache" class="text-2xl text-green-400">—</div>
       </div>
       <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
         <div class="text-xs text-gray-500 mb-1">Blocked</div>
         <div id="ov-blocked" class="text-2xl text-red-400">—</div>
+        <div id="ov-blocked-pct" class="text-xs text-gray-600 mt-0.5">— of total</div>
       </div>
       <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
         <div class="text-xs text-gray-500 mb-1">Forwarded</div>
@@ -78,7 +81,7 @@
         <div id="ov-servfail" class="text-2xl text-yellow-400">—</div>
       </div>
       <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">avg latency</div>
+        <div class="text-xs text-gray-500 mb-1">Latency p50</div>
         <div id="ov-latency" class="text-2xl text-white">—</div>
       </div>
       <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
@@ -86,10 +89,89 @@
         <div id="ov-uptime" class="text-2xl text-white">—</div>
       </div>
     </div>
-    <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
-      <div class="text-xs text-gray-500 mb-3">Server info</div>
-      <pre id="ov-raw" class="text-xs text-gray-400 whitespace-pre-wrap">—</pre>
+
+    <!-- Secondary stats -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+
+      <!-- Latency breakdown -->
+      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Latency</div>
+        <div class="space-y-2">
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">p50</span><span id="ov-p50" class="text-green-400">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">p95</span><span id="ov-p95" class="text-yellow-400">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">p99</span><span id="ov-p99" class="text-red-400">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- QPS breakdown -->
+      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">QPS</div>
+        <div class="space-y-2">
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">1 min avg</span><span id="ov-qps1m" class="text-cyan-400">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">5 min avg</span><span id="ov-qps5m" class="text-cyan-300">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">peak</span><span id="ov-qpspeak" class="text-white">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Blocking detail -->
+      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Blocking</div>
+        <div class="space-y-2">
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">NXDOMAIN</span><span id="ov-nxdomain" class="text-red-400">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">Refused</span><span id="ov-refused" class="text-orange-400">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">Local hits</span><span id="ov-local" class="text-cyan-300">—</span>
+          </div>
+        </div>
+      </div>
     </div>
+
+    <!-- Cache + refresh indicator -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Cache</div>
+        <div class="space-y-2">
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">Entries</span><span id="ov-cache-entries" class="text-green-400">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">Hit rate</span><span id="ov-cache-rate" class="text-green-300">—</span>
+          </div>
+        </div>
+      </div>
+      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">DNSSEC</div>
+        <div class="space-y-2">
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">Secure</span><span id="ov-dnssec-secure" class="text-green-400">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">Bogus</span><span id="ov-dnssec-bogus" class="text-red-400">—</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">Insecure</span><span id="ov-dnssec-insecure" class="text-gray-400">—</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="text-right text-xs text-gray-700 mt-3" id="ov-refreshed">—</div>
   </div>
 
   <!-- DNS Entries -->
@@ -238,26 +320,60 @@ async function refreshStats() {
 }
 
 function updateStats(s) {
-  const fmt = n => n == null ? '—' : n.toLocaleString();
-  const ms  = n => n == null ? '—' : (n / 1000).toFixed(2) + ' ms';
-  const sec = n => {
+  const fmt  = n  => n == null ? '—' : n.toLocaleString();
+  const fmtf = n  => n == null ? '—' : Number(n).toFixed(1);
+  const ms   = n  => n == null ? '—' : n + ' ms';
+  const pct  = n  => n == null ? '—' : fmtf(n) + ' %';
+  const sec  = n  => {
     if (n == null) return '—';
     const d = Math.floor(n/86400), h = Math.floor((n%86400)/3600),
           m = Math.floor((n%3600)/60);
     return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
   };
-  set('ov-qps',      fmt(s.queries_per_second ?? s.qps));
-  set('ov-total',    fmt(s.total_queries ?? s.total));
-  set('ov-cache',    fmt(s.cache_hits));
-  set('ov-blocked',  fmt(s.blocked));
-  set('ov-forwarded',fmt(s.forwarded));
-  set('ov-servfail', fmt(s.servfail));
-  set('ov-latency',  ms(s.avg_latency_us));
-  set('ov-uptime',   sec(s.uptime_secs));
-  set('stat-qps',    (s.queries_per_second ?? s.qps ?? '—') + ' qps');
-  set('stat-total',  fmt(s.total_queries ?? s.total) + ' queries');
+
+  // Primary cards
+  set('ov-qps',         fmtf(s.qps_1m));
+  set('ov-total',       fmt(s.total));
+  set('ov-cache',       pct(s.cache_hit_rate));
+  set('ov-blocked',     fmt(s.blocked));
+  set('ov-blocked-pct', s.blocked_percent != null ? fmtf(s.blocked_percent) + '% of total' : '');
+  set('ov-forwarded',   fmt(s.forwarded));
+  set('ov-servfail',    fmt(s.servfail));
+  set('ov-latency',     ms(s.latency_p50_ms));
+  set('ov-uptime',      sec(s.uptime_secs));
+
+  // Latency breakdown
+  set('ov-p50',  ms(s.latency_p50_ms));
+  set('ov-p95',  ms(s.latency_p95_ms));
+  set('ov-p99',  ms(s.latency_p99_ms));
+
+  // QPS breakdown
+  set('ov-qps1m',    fmtf(s.qps_1m) + ' /s');
+  set('ov-qps5m',    fmtf(s.qps_5m) + ' /s');
+  set('ov-qpspeak',  fmt(s.qps_peak) + ' /s');
+
+  // Blocking detail
+  set('ov-nxdomain', fmt(s.nxdomain));
+  set('ov-refused',  fmt(s.refused));
+  set('ov-local',    fmt(s.local_hits));
+
+  // Cache
+  set('ov-cache-entries', fmt(s.cache_entries));
+  set('ov-cache-rate',    pct(s.cache_hit_rate));
+
+  // DNSSEC
+  const d = s.dnssec ?? {};
+  set('ov-dnssec-secure',   fmt(d.secure));
+  set('ov-dnssec-bogus',    fmt(d.bogus));
+  set('ov-dnssec-insecure', fmt(d.insecure));
+
+  // Header bar
+  set('stat-qps',    fmtf(s.qps_1m) + ' qps');
+  set('stat-total',  fmt(s.total) + ' queries');
   set('stat-uptime', sec(s.uptime_secs));
-  set('ov-raw', JSON.stringify(s, null, 2));
+
+  // Refresh timestamp
+  set('ov-refreshed', 'updated ' + new Date().toLocaleTimeString());
 }
 
 // ── DNS Entries ─────────────────────────────────────────────────────
