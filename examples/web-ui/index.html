@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Runbound — Management Console</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
+    .tab-active { border-bottom: 2px solid #22d3ee; color: #22d3ee; }
+    .fade { animation: fadeIn .15s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #111; }
+    ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-200 min-h-screen">
+
+<!-- ── Connection banner ───────────────────────────────────────────── -->
+<div id="setup-banner" class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex flex-wrap items-center gap-3">
+  <span class="text-cyan-400 font-bold text-sm">RUNBOUND</span>
+  <input id="cfg-url" type="text" value="http://localhost:8080"
+    class="bg-gray-800 border border-gray-700 rounded px-3 py-1 text-sm w-52 focus:outline-none focus:border-cyan-500"
+    placeholder="http://localhost:8080" />
+  <input id="cfg-key" type="password"
+    class="bg-gray-800 border border-gray-700 rounded px-3 py-1 text-sm w-72 focus:outline-none focus:border-cyan-500"
+    placeholder="API key (Bearer token)" />
+  <button onclick="connect()" class="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-1 rounded transition">Connect</button>
+  <span id="conn-status" class="text-xs text-gray-500">— not connected</span>
+  <div class="ml-auto flex items-center gap-4 text-xs text-gray-500">
+    <span id="stat-qps">— qps</span>
+    <span id="stat-total">— queries</span>
+    <span id="stat-uptime">— uptime</span>
+    <button onclick="doReload()" title="Reload config (HUP)"
+      class="border border-gray-600 hover:border-cyan-500 hover:text-cyan-400 text-gray-400 text-xs px-3 py-1 rounded transition">
+      ↺ Reload
+    </button>
+  </div>
+</div>
+
+<!-- ── Tabs ────────────────────────────────────────────────────────── -->
+<div class="border-b border-gray-800 flex gap-6 px-6 text-sm text-gray-500">
+  <button class="py-3 tab-active" onclick="showTab('overview',this)">Overview</button>
+  <button class="py-3 hover:text-gray-300" onclick="showTab('dns',this)">DNS Entries</button>
+  <button class="py-3 hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
+  <button class="py-3 hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
+  <button class="py-3 hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
+</div>
+
+<!-- ── Content ─────────────────────────────────────────────────────── -->
+<div class="p-6 max-w-6xl mx-auto">
+
+  <!-- Overview -->
+  <div id="tab-overview" class="fade">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-1">Queries / sec</div>
+        <div id="ov-qps" class="text-2xl text-cyan-400">—</div>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-1">Total queries</div>
+        <div id="ov-total" class="text-2xl text-white">—</div>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-1">Cache hits</div>
+        <div id="ov-cache" class="text-2xl text-green-400">—</div>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-1">Blocked</div>
+        <div id="ov-blocked" class="text-2xl text-red-400">—</div>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-1">Forwarded</div>
+        <div id="ov-forwarded" class="text-2xl text-white">—</div>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-1">SERVFAIL</div>
+        <div id="ov-servfail" class="text-2xl text-yellow-400">—</div>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-1">avg latency</div>
+        <div id="ov-latency" class="text-2xl text-white">—</div>
+      </div>
+      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
+        <div class="text-xs text-gray-500 mb-1">Uptime</div>
+        <div id="ov-uptime" class="text-2xl text-white">—</div>
+      </div>
+    </div>
+    <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
+      <div class="text-xs text-gray-500 mb-3">Server info</div>
+      <pre id="ov-raw" class="text-xs text-gray-400 whitespace-pre-wrap">—</pre>
+    </div>
+  </div>
+
+  <!-- DNS Entries -->
+  <div id="tab-dns" class="hidden fade">
+    <div class="flex gap-3 mb-4 flex-wrap">
+      <input id="dns-name" type="text" placeholder="name (e.g. myserver.home.)" class="input w-64" />
+      <select id="dns-type" class="input w-24">
+        <option>A</option><option>AAAA</option><option>CNAME</option><option>MX</option><option>TXT</option>
+      </select>
+      <input id="dns-value" type="text" placeholder="value (e.g. 192.168.1.50)" class="input w-48" />
+      <input id="dns-ttl" type="number" placeholder="TTL" value="300" class="input w-24" />
+      <button onclick="dnsAdd()" class="btn-primary">+ Add</button>
+      <button onclick="loadDns()" class="btn-secondary">↻ Refresh</button>
+    </div>
+    <div id="dns-list" class="space-y-2"></div>
+  </div>
+
+  <!-- Blacklist -->
+  <div id="tab-blacklist" class="hidden fade">
+    <div class="flex gap-3 mb-4 flex-wrap">
+      <input id="bl-domain" type="text" placeholder="domain (e.g. ads.example.com)" class="input w-72" />
+      <select id="bl-action" class="input w-32">
+        <option value="nxdomain">nxdomain</option>
+        <option value="refuse">refuse</option>
+      </select>
+      <button onclick="blAdd()" class="btn-primary">+ Add</button>
+      <button onclick="loadBlacklist()" class="btn-secondary">↻ Refresh</button>
+      <span id="bl-count" class="text-xs text-gray-500 self-center"></span>
+    </div>
+    <div id="bl-list" class="space-y-1"></div>
+  </div>
+
+  <!-- Feeds -->
+  <div id="tab-feeds" class="hidden fade">
+    <div class="flex gap-3 mb-4 flex-wrap">
+      <input id="feed-name" type="text" placeholder="name" class="input w-36" />
+      <input id="feed-url" type="text" placeholder="URL (hosts format)" class="input w-96" />
+      <select id="feed-action" class="input w-32">
+        <option value="nxdomain">nxdomain</option>
+        <option value="refuse">refuse</option>
+      </select>
+      <button onclick="feedAdd()" class="btn-primary">+ Add</button>
+      <button onclick="loadFeeds()" class="btn-secondary">↻ Refresh</button>
+    </div>
+    <div id="feed-list" class="space-y-2"></div>
+  </div>
+
+  <!-- Logs -->
+  <div id="tab-logs" class="hidden fade">
+    <div class="flex gap-3 mb-4">
+      <button onclick="loadLogs()" class="btn-secondary">↻ Refresh</button>
+      <label class="flex items-center gap-2 text-sm text-gray-400">
+        <input type="checkbox" id="logs-auto" onchange="toggleAutoLogs(this)" class="accent-cyan-500" />
+        Auto-refresh (3s)
+      </label>
+      <span class="text-xs text-gray-500 self-center">Last 100 queries — requires verbosity ≥ 1</span>
+    </div>
+    <div id="log-list" class="space-y-1 font-mono text-xs"></div>
+  </div>
+
+</div>
+
+<!-- ── Toast ───────────────────────────────────────────────────────── -->
+<div id="toast" class="fixed bottom-6 right-6 hidden bg-gray-800 border border-gray-700 text-sm px-4 py-2 rounded shadow-lg"></div>
+
+<style>
+  .input  { background:#1f2937; border:1px solid #374151; border-radius:6px; padding:6px 12px; font-size:13px; outline:none; color:#e5e7eb; }
+  .input:focus { border-color:#22d3ee; }
+  .btn-primary  { background:#0e7490; color:#fff; border-radius:6px; padding:6px 16px; font-size:13px; cursor:pointer; transition:background .15s; }
+  .btn-primary:hover  { background:#0891b2; }
+  .btn-secondary { background:#1f2937; border:1px solid #374151; color:#d1d5db; border-radius:6px; padding:6px 14px; font-size:13px; cursor:pointer; transition:background .15s; }
+  .btn-secondary:hover { background:#374151; }
+  .row { display:flex; align-items:center; justify-content:space-between; background:#111827; border:1px solid #1f2937; border-radius:6px; padding:8px 14px; font-size:13px; }
+  .del { color:#ef4444; cursor:pointer; font-size:12px; padding:2px 8px; border:1px solid #374151; border-radius:4px; }
+  .del:hover { background:#7f1d1d22; }
+</style>
+
+<script>
+// ── Config ──────────────────────────────────────────────────────────
+let BASE = 'http://localhost:8080';
+let KEY  = '';
+let statsTimer = null;
+let logsTimer  = null;
+
+const h = () => ({ 'Authorization': `Bearer ${KEY}`, 'Content-Type': 'application/json' });
+
+async function api(method, path, body) {
+  const r = await fetch(BASE + path, {
+    method, headers: h(), body: body ? JSON.stringify(body) : undefined
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json().catch(() => ({}));
+}
+
+// ── Connection ──────────────────────────────────────────────────────
+async function connect() {
+  BASE = document.getElementById('cfg-url').value.replace(/\/$/, '');
+  KEY  = document.getElementById('cfg-key').value.trim();
+  localStorage.setItem('rb-url', BASE);
+  localStorage.setItem('rb-key', KEY);
+  try {
+    const s = await api('GET', '/stats');
+    document.getElementById('conn-status').textContent = '● connected';
+    document.getElementById('conn-status').className = 'text-xs text-green-400';
+    updateStats(s);
+    clearInterval(statsTimer);
+    statsTimer = setInterval(refreshStats, 5000);
+    toast('Connected');
+  } catch(e) {
+    document.getElementById('conn-status').textContent = '● ' + e.message;
+    document.getElementById('conn-status').className = 'text-xs text-red-400';
+    toast('Connection failed: ' + e.message, true);
+  }
+}
+
+async function refreshStats() {
+  try { updateStats(await api('GET', '/stats')); } catch(_) {}
+}
+
+function updateStats(s) {
+  const fmt = n => n == null ? '—' : n.toLocaleString();
+  const ms  = n => n == null ? '—' : (n / 1000).toFixed(2) + ' ms';
+  const sec = n => {
+    if (n == null) return '—';
+    const d = Math.floor(n/86400), h = Math.floor((n%86400)/3600),
+          m = Math.floor((n%3600)/60);
+    return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+  };
+  set('ov-qps',      fmt(s.queries_per_second ?? s.qps));
+  set('ov-total',    fmt(s.total_queries ?? s.total));
+  set('ov-cache',    fmt(s.cache_hits));
+  set('ov-blocked',  fmt(s.blocked));
+  set('ov-forwarded',fmt(s.forwarded));
+  set('ov-servfail', fmt(s.servfail));
+  set('ov-latency',  ms(s.avg_latency_us));
+  set('ov-uptime',   sec(s.uptime_secs));
+  set('stat-qps',    (s.queries_per_second ?? s.qps ?? '—') + ' qps');
+  set('stat-total',  fmt(s.total_queries ?? s.total) + ' queries');
+  set('stat-uptime', sec(s.uptime_secs));
+  set('ov-raw', JSON.stringify(s, null, 2));
+}
+
+// ── DNS Entries ─────────────────────────────────────────────────────
+async function loadDns() {
+  try {
+    const d = await api('GET', '/dns');
+    const entries = d.entries ?? d.dns ?? [];
+    document.getElementById('dns-list').innerHTML = entries.length === 0
+      ? '<p class="text-gray-600 text-sm">No entries.</p>'
+      : entries.map(e => `
+        <div class="row">
+          <span class="text-cyan-300 w-48 truncate">${esc(e.name)}</span>
+          <span class="text-gray-500 w-16">${esc(e.type ?? e.qtype)}</span>
+          <span class="text-gray-300 flex-1">${esc(e.value ?? e.rdata)}</span>
+          <span class="text-gray-600 w-16 text-right">${e.ttl}s</span>
+          <button class="del ml-4" onclick="dnsDelete('${e.id}')">✕</button>
+        </div>`).join('');
+  } catch(e) { toast('DNS load failed: '+e.message, true); }
+}
+
+async function dnsAdd() {
+  const name  = document.getElementById('dns-name').value.trim();
+  const type  = document.getElementById('dns-type').value;
+  const value = document.getElementById('dns-value').value.trim();
+  const ttl   = parseInt(document.getElementById('dns-ttl').value) || 300;
+  if (!name || !value) return toast('Name and value are required', true);
+  try {
+    await api('POST', '/dns', { name, type, value, ttl });
+    toast('Entry added');
+    loadDns();
+    document.getElementById('dns-name').value = '';
+    document.getElementById('dns-value').value = '';
+  } catch(e) { toast('Add failed: '+e.message, true); }
+}
+
+async function dnsDelete(id) {
+  try { await api('DELETE', '/dns/'+id); toast('Entry deleted'); loadDns(); }
+  catch(e) { toast('Delete failed: '+e.message, true); }
+}
+
+// ── Blacklist ────────────────────────────────────────────────────────
+async function loadBlacklist() {
+  try {
+    const d = await api('GET', '/blacklist');
+    const entries = d.blacklist ?? d.entries ?? [];
+    document.getElementById('bl-count').textContent = entries.length.toLocaleString() + ' entries';
+    document.getElementById('bl-list').innerHTML = entries.length === 0
+      ? '<p class="text-gray-600 text-sm">No entries.</p>'
+      : entries.map(e => `
+        <div class="row py-1">
+          <span class="text-red-300 flex-1">${esc(e.domain)}</span>
+          <span class="text-gray-600 w-20 text-right text-xs">${e.action}</span>
+          <button class="del ml-4" onclick="blDelete('${e.id}')">✕</button>
+        </div>`).join('');
+  } catch(e) { toast('Blacklist load failed: '+e.message, true); }
+}
+
+async function blAdd() {
+  const domain = document.getElementById('bl-domain').value.trim();
+  const action = document.getElementById('bl-action').value;
+  if (!domain) return toast('Domain is required', true);
+  try {
+    await api('POST', '/blacklist', { domain, action });
+    toast('Domain blocked');
+    loadBlacklist();
+    document.getElementById('bl-domain').value = '';
+  } catch(e) { toast('Add failed: '+e.message, true); }
+}
+
+async function blDelete(id) {
+  try { await api('DELETE', '/blacklist/'+id); toast('Entry removed'); loadBlacklist(); }
+  catch(e) { toast('Delete failed: '+e.message, true); }
+}
+
+// ── Feeds ────────────────────────────────────────────────────────────
+async function loadFeeds() {
+  try {
+    const d = await api('GET', '/feeds');
+    const feeds = d.feeds ?? [];
+    document.getElementById('feed-list').innerHTML = feeds.length === 0
+      ? '<p class="text-gray-600 text-sm">No feeds configured.</p>'
+      : feeds.map(f => `
+        <div class="row">
+          <span class="text-cyan-300 w-32 truncate font-bold">${esc(f.name)}</span>
+          <span class="text-gray-400 flex-1 truncate text-xs">${esc(f.url)}</span>
+          <span class="text-gray-600 w-16 text-right text-xs">${(f.entry_count??0).toLocaleString()}</span>
+          <span class="text-gray-600 w-20 text-right text-xs">${f.action}</span>
+          <span class="ml-4 w-4 h-4 rounded-full ${f.enabled ? 'bg-green-500' : 'bg-gray-600'}" title="${f.enabled ? 'enabled' : 'disabled'}"></span>
+          <button class="del ml-3" onclick="feedDelete('${f.id}')">✕</button>
+        </div>`).join('');
+  } catch(e) { toast('Feeds load failed: '+e.message, true); }
+}
+
+async function feedAdd() {
+  const name   = document.getElementById('feed-name').value.trim();
+  const url    = document.getElementById('feed-url').value.trim();
+  const action = document.getElementById('feed-action').value;
+  if (!name || !url) return toast('Name and URL are required', true);
+  try {
+    await api('POST', '/feeds', { name, url, format: 'hosts', action, enabled: true });
+    toast('Feed added');
+    loadFeeds();
+    document.getElementById('feed-name').value = '';
+    document.getElementById('feed-url').value = '';
+  } catch(e) { toast('Add failed: '+e.message, true); }
+}
+
+async function feedDelete(id) {
+  try { await api('DELETE', '/feeds/'+id); toast('Feed removed'); loadFeeds(); }
+  catch(e) { toast('Delete failed: '+e.message, true); }
+}
+
+// ── Logs ─────────────────────────────────────────────────────────────
+async function loadLogs() {
+  try {
+    const d = await api('GET', '/logs');
+    const logs = d.logs ?? d.entries ?? [];
+    const rcodeColor = r => r === 'NOERROR' ? 'text-green-400' :
+                            r === 'NXDOMAIN' ? 'text-yellow-400' : 'text-red-400';
+    document.getElementById('log-list').innerHTML = logs.length === 0
+      ? '<p class="text-gray-600">No logs yet — requires verbosity: 1 or higher.</p>'
+      : [...logs].reverse().map(l => `
+        <div class="flex gap-3 items-center py-0.5 border-b border-gray-900">
+          <span class="text-gray-600 w-20 shrink-0">${(l.timestamp??'').slice(11,19)}</span>
+          <span class="text-gray-500 w-28 truncate shrink-0">${esc(l.client??'')}</span>
+          <span class="text-cyan-300 flex-1 truncate">${esc(l.name??'')}</span>
+          <span class="text-gray-500 w-12 shrink-0">${esc(l.qtype??'')}</span>
+          <span class="${rcodeColor(l.rcode)} w-20 shrink-0">${esc(l.rcode??'')}</span>
+          <span class="text-gray-600 w-16 text-right shrink-0">${l.ms != null ? l.ms+'ms' : ''}</span>
+        </div>`).join('');
+  } catch(e) { toast('Logs load failed: '+e.message, true); }
+}
+
+function toggleAutoLogs(el) {
+  clearInterval(logsTimer);
+  if (el.checked) { loadLogs(); logsTimer = setInterval(loadLogs, 3000); }
+}
+
+// ── Reload ───────────────────────────────────────────────────────────
+async function doReload() {
+  try {
+    await api('POST', '/reload');
+    toast('Config reloaded');
+  } catch(e) { toast('Reload failed: '+e.message, true); }
+}
+
+// ── Tabs ─────────────────────────────────────────────────────────────
+function showTab(name, btn) {
+  ['overview','dns','blacklist','feeds','logs'].forEach(t => {
+    document.getElementById('tab-'+t).classList.add('hidden');
+  });
+  document.querySelectorAll('.tab-active').forEach(b => {
+    b.classList.remove('tab-active');
+    b.classList.add('text-gray-500');
+  });
+  const el = document.getElementById('tab-'+name);
+  el.classList.remove('hidden');
+  el.classList.add('fade');
+  btn.classList.add('tab-active');
+  btn.classList.remove('text-gray-500');
+  if (name === 'dns')       loadDns();
+  if (name === 'blacklist') loadBlacklist();
+  if (name === 'feeds')     loadFeeds();
+  if (name === 'logs')      loadLogs();
+}
+
+// ── Utils ─────────────────────────────────────────────────────────────
+function set(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+let toastTimer;
+function toast(msg, err=false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `fixed bottom-6 right-6 text-sm px-4 py-2 rounded shadow-lg border
+    ${err ? 'bg-red-950 border-red-800 text-red-300' : 'bg-gray-800 border-gray-700 text-gray-200'}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = el.className + ' hidden', 3000);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────
+window.onload = () => {
+  const url = localStorage.getItem('rb-url');
+  const key = localStorage.getItem('rb-key');
+  if (url) document.getElementById('cfg-url').value = url;
+  if (key) document.getElementById('cfg-key').value = key;
+  if (url && key) connect();
+};
+</script>
+
+</body>
+</html>
