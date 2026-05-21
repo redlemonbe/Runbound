@@ -24,7 +24,7 @@
     placeholder="http://localhost:8080" />
   <input id="cfg-key" type="password"
     class="bg-gray-800 border border-gray-700 rounded px-3 py-1 text-sm w-72 focus:outline-none focus:border-cyan-500"
-    placeholder="API key (Bearer token)" />
+    value="99344aa13a58e77b77f13df9f4da1a12bacf3f83f625545cc08ccb116f2db452" placeholder="API key (Bearer token)" />
   <button onclick="connect()" class="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-1 rounded transition">Connect</button>
   <span id="conn-status" class="text-xs text-gray-500">— not connected</span>
   <div class="ml-auto flex items-center gap-4 text-xs text-gray-500">
@@ -45,6 +45,7 @@
   <button class="py-3 hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
   <button class="py-3 hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
   <button class="py-3 hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
+  <button class="py-3 hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
 </div>
 
 <!-- ── Content ─────────────────────────────────────────────────────── -->
@@ -156,7 +157,9 @@
         </div>
       </div>
       <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">DNSSEC</div>
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">
+          DNSSEC <span id="ov-dnssec-status" class="text-gray-600 normal-case font-normal ml-1"></span>
+        </div>
         <div class="space-y-2">
           <div class="flex justify-between text-sm">
             <span class="text-gray-500">Secure</span><span id="ov-dnssec-secure" class="text-green-400">—</span>
@@ -241,6 +244,72 @@
       </div>
     </div>
     <div id="feed-list" class="space-y-2"></div>
+  </div>
+
+  <!-- About -->
+  <div id="tab-about" class="hidden fade">
+    <div class="max-w-2xl">
+      <div class="flex items-center gap-4 mb-6">
+        <span class="text-cyan-400 font-bold text-3xl tracking-tight">RUNBOUND</span>
+        <span class="bg-gray-800 border border-gray-700 text-cyan-300 text-xs px-2 py-0.5 rounded">v0.5.7</span>
+        <span class="bg-gray-800 border border-gray-700 text-gray-400 text-xs px-2 py-0.5 rounded">AGPL-3.0</span>
+      </div>
+      <p class="text-gray-400 text-sm mb-6">
+        High-performance DNS server written in Rust. Designed as a drop-in replacement for Unbound with a full REST API, built-in blocklist management, and real-time observability.
+      </p>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+          <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Runtime</div>
+          <div class="space-y-2 text-sm">
+            <div class="flex justify-between">
+              <span class="text-gray-500">Uptime</span><span id="about-uptime" class="text-white">—</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-500">Total queries</span><span id="about-total" class="text-white">—</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-500">Cache hit rate</span><span id="about-cache" class="text-green-400">—</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-500">QPS (1m avg)</span><span id="about-qps" class="text-cyan-400">—</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+          <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Features</div>
+          <ul class="text-sm text-gray-400 space-y-1">
+            <li class="flex gap-2"><span class="text-cyan-500">›</span> XDP zero-copy receive path</li>
+            <li class="flex gap-2"><span class="text-cyan-500">›</span> REST API + Prometheus metrics</li>
+            <li class="flex gap-2"><span class="text-cyan-500">›</span> Blocklist feeds (hosts/adblock)</li>
+            <li class="flex gap-2"><span class="text-cyan-500">›</span> DNSSEC validation (optional)</li>
+            <li class="flex gap-2"><span class="text-cyan-500">›</span> Memory pressure management</li>
+            <li class="flex gap-2"><span class="text-cyan-500">›</span> HMAC-chained audit log</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Links</div>
+        <div class="flex flex-wrap gap-3 text-sm">
+          <a href="https://github.com/redlemonbe/Runbound" target="_blank"
+             class="text-cyan-400 hover:text-cyan-300 border border-gray-700 hover:border-cyan-700 rounded px-3 py-1 transition">
+            GitHub ↗
+          </a>
+          <a href="https://github.com/redlemonbe/Runbound/releases" target="_blank"
+             class="text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded px-3 py-1 transition">
+            Releases ↗
+          </a>
+          <a href="https://github.com/redlemonbe/Runbound/issues" target="_blank"
+             class="text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded px-3 py-1 transition">
+            Issues ↗
+          </a>
+        </div>
+      </div>
+
+      <p class="text-xs text-gray-600">redlemonbe · AGPL-3.0 · Built with Rust, Tokio, Hickory DNS</p>
+    </div>
   </div>
 
   <!-- Logs -->
@@ -361,11 +430,14 @@ function updateStats(s) {
   set('ov-cache-entries', fmt(s.cache_entries));
   set('ov-cache-rate',    pct(s.cache_hit_rate));
 
-  // DNSSEC
+  // DNSSEC — if all counters are 0 but queries exist, validation is likely off
   const d = s.dnssec ?? {};
-  set('ov-dnssec-secure',   fmt(d.secure));
-  set('ov-dnssec-bogus',    fmt(d.bogus));
-  set('ov-dnssec-insecure', fmt(d.insecure));
+  const dnssecTotal = (d.secure ?? 0) + (d.bogus ?? 0) + (d.insecure ?? 0);
+  const dnssecOff = dnssecTotal === 0 && (s.total ?? 0) > 0;
+  set('ov-dnssec-secure',   dnssecOff ? '—' : fmt(d.secure));
+  set('ov-dnssec-bogus',    dnssecOff ? '—' : fmt(d.bogus));
+  set('ov-dnssec-insecure', dnssecOff ? '—' : fmt(d.insecure));
+  set('ov-dnssec-status',   dnssecOff ? '· validation off' : '');
 
   // Header bar
   set('stat-qps',    fmtf(s.qps_1m) + ' qps');
@@ -374,6 +446,12 @@ function updateStats(s) {
 
   // Refresh timestamp
   set('ov-refreshed', 'updated ' + new Date().toLocaleTimeString());
+
+  // About tab runtime stats
+  set('about-uptime', sec(s.uptime_secs));
+  set('about-total',  fmt(s.total));
+  set('about-cache',  pct(s.cache_hit_rate));
+  set('about-qps',    fmtf(s.qps_1m) + ' /s');
 }
 
 // ── DNS Entries ─────────────────────────────────────────────────────
@@ -582,7 +660,7 @@ async function doReload() {
 
 // ── Tabs ─────────────────────────────────────────────────────────────
 function showTab(name, btn) {
-  ['overview','dns','blacklist','feeds','logs'].forEach(t => {
+  ['overview','dns','blacklist','feeds','logs','about'].forEach(t => {
     document.getElementById('tab-'+t).classList.add('hidden');
   });
   document.querySelectorAll('.tab-active').forEach(b => {
@@ -621,6 +699,11 @@ window.onload = () => {
   if (url) document.getElementById('cfg-url').value = url;
   if (key) document.getElementById('cfg-key').value = key;
   if (url && key) connect();
+  else {
+    const u = document.getElementById("cfg-url").value;
+    const k = document.getElementById("cfg-key").value;
+    if (u && k) connect();
+  }
 };
 </script>
 
