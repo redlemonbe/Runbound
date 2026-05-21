@@ -77,15 +77,14 @@ curl -s http://localhost:8080/health -H "Authorization: Bearer $RUNBOUND_API_KEY
 
 ## 4. Install as a service (production)
 
-See [systemd.md](systemd.md) for the full hardened unit file.
-
-Quick version:
+If you used `install.sh` (Step 1), the systemd unit is already installed and the
+`runbound` system user already exists. Just enable and start:
 
 ```bash
-sudo useradd -r -s /sbin/nologin runbound
-sudo runbound --config /etc/runbound/runbound.conf --install-service
 sudo systemctl enable --now runbound
 ```
+
+For manual installs or a custom hardened unit file, see [systemd.md](systemd.md).
 
 ---
 
