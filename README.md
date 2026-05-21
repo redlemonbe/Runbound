@@ -335,17 +335,34 @@ Copyright (C) 2024-2026 RedLemonBe
 
 ---
 
+## Security & reliability
+
+### Security audit history
+
+**64 findings across 8 audit cycles — 64 resolved, 0 open.**
+
+Every release goes through a systematic security review cycle:
+
+- **White-box source audit** — full Rust module review covering SSRF, injection, timing oracles, DoS vectors, RFC compliance, ACL bypass, and authentication (see [`docs/security-audit.md`](docs/security-audit.md))
+- **Black-box pentest** — external API and DNS protocol testing: input validation, amplification, information disclosure, authentication bypass, rate-limit evasion
+- **Fuzz testing** — continuous fuzzing with cargo-fuzz on the DNS parser, config parser, and API input layer (`fuzz/` directory)
+- **Supply chain** — `cargo audit` clean on every release, SBOM (CycloneDX 1.4) published with each release artifact
+
+All findings are triaged, fixed, and documented with a `VUL-NN` tag in the changelog. Full audit history: [`docs/security-audit.md`](docs/security-audit.md)
+
+### RFC compliance
+
+DNS protocol correctness (EDNS, DNSSEC, DoT, DoH, NSEC, truncation, TC/retry) is handled by [Hickory DNS](https://github.com/hickory-dns/hickory-dns) — a production-grade Rust DNS library with its own RFC compliance test suite and independent maintenance. Runbound builds on top of Hickory and does not re-implement the DNS wire protocol.
+
+### Commercial support
+
+A commercial licence is available for organisations requiring priority support, SLA guarantees, or private modifications without AGPL obligations. See [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
+
+---
+
 ## Development methodology
 
 > How this project was built — and why: [METHODOLOGY.md](METHODOLOGY.md)
-
-Runbound's security posture is reinforced using AI-assisted tooling at every release:
-
-- **Security audit** — white-box code review covering SSRF, injection, timing attacks, DoS vectors, and RFC compliance (see [`docs/security-audit.md`](docs/security-audit.md))
-- **Pentest** — black-box API and DNS protocol testing (input validation, amplification, information disclosure, authentication bypass)
-- **Performance analysis** — hot-path profiling and allocation review
-
-AI tools are used exclusively as an adversarial review layer. All findings are triaged and patched by the maintainer.
 
 ---
 
