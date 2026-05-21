@@ -85,3 +85,49 @@ INFO upstream recovered after 8 failure(s)  upstream=2a01:cc00:2:24a::b
 **Root cause resolution:** Check network connectivity to the upstream, verify the
 forward-addr is reachable from the Runbound host, and confirm IPv6 is available if
 the address is an IPv6 address.
+
+---
+
+## Firefox ignores Runbound — ads/tracking not blocked
+
+**Symptom:** Runbound blocks ads correctly in Safari, Chrome, and other browsers, but
+Firefox still loads ads on sites that should be blocked. Disabling Runbound has no
+effect on Firefox behaviour.
+
+**Cause:** Firefox has built-in **DNS over HTTPS (DoH)** enabled by default in many
+regions. It sends DNS queries directly to a remote DoH provider (Cloudflare or Mozilla)
+instead of using the system resolver. Runbound — like Unbound, Pi-hole, or any local
+DNS server — is completely bypassed.
+
+This is a Firefox policy decision, not a Runbound issue. Any local DNS resolver is
+affected identically.
+
+**Fix — disable DoH in Firefox:**
+
+1. Open `about:preferences#privacy`
+2. Scroll to **DNS over HTTPS**
+3. Set to **Off**
+
+Or via `about:config`:
+
+```
+network.trr.mode = 5
+```
+
+| `network.trr.mode` value | Behaviour |
+|---|---|
+| `0` | Default (DoH off, uses system DNS) |
+| `2` | DoH preferred, system DNS fallback |
+| `3` | DoH only — system DNS never used |
+| `5` | DoH explicitly disabled |
+
+**Alternative — point Firefox DoH at Runbound:**
+
+If you have TLS configured (see [tls.md](tls.md)), you can keep DoH active in Firefox
+but route it through Runbound instead of Cloudflare:
+
+1. Generate a certificate: `runbound --gen-cert dns.home.arpa`
+2. Add the cert to Firefox's trusted store
+3. In `about:preferences#privacy` → DNS over HTTPS → **Custom** → enter `https://dns.home.arpa/dns-query`
+
+This keeps queries encrypted while still going through your local filter.
