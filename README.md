@@ -174,6 +174,17 @@ QPS
   2    8    16   32   64
 ```
 
+### Restart time
+
+| | Runbound | BIND9 | Unbound |
+|---|---|---|---|
+| **Restart time** | **58 ms** | 10 000 – 30 000 ms | 5 000 – 15 000 ms |
+| **Cache after restart** | ✅ Preserved | ❌ Cold start | ❌ Cold start |
+| **Hardware** | VM 2 vCPU / 4 GB RAM | bare metal | bare metal |
+
+At 58ms restart time, a config update or binary upgrade is imperceptible to clients.
+BIND9 and Unbound start cold — cache warmup takes minutes under production load.
+
 ### Measured throughput
 
 Benchmarks run from a dedicated client machine (never from the DNS server):
