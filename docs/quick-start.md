@@ -4,21 +4,24 @@ Up and running in 5 minutes.
 
 ---
 
-## 1. Download
-
-Grab the static binary for your platform from the [latest release](https://github.com/redlemonbe/Runbound/releases/latest).
-No dependencies required for the `musl` builds.
-
-| Platform | File |
-|---|---|
-| Linux x86_64 (most servers, VMs) | `runbound-vX.Y.Z-x86_64-linux-musl` |
-| Linux ARM64 (Raspberry Pi, ARM servers) | `runbound-vX.Y.Z-aarch64-linux-musl` |
+## 1. Install
 
 ```bash
-# Replace vX.Y.Z with the latest tag from https://github.com/redlemonbe/Runbound/releases
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-v0.5.5-x86_64-linux-musl
-chmod +x runbound-v0.5.5-x86_64-linux-musl
-sudo mv runbound-v0.5.5-x86_64-linux-musl /usr/local/bin/runbound
+curl -sSf https://raw.githubusercontent.com/redlemonbe/Runbound/main/install.sh | sudo bash
+```
+
+That's it — the script detects your architecture (x86_64 / ARM64), downloads the
+correct static musl binary from the latest release, installs it to
+`/usr/local/sbin/runbound`, creates the `runbound` system user, and installs the
+hardened systemd unit file.
+
+**Manual install** (if you prefer not to pipe to bash):
+
+```bash
+# Download and inspect first:
+curl -sSf -o install.sh https://raw.githubusercontent.com/redlemonbe/Runbound/main/install.sh
+less install.sh
+sudo bash install.sh
 ```
 
 ---
