@@ -401,3 +401,20 @@ Expected configuration:
 - BIND9 / Unbound: no XDP — comparison becomes one-sided above ~500k QPS
 
 Results: [docs/benchmark-xdp.md](benchmark-xdp.md) when available.
+
+---
+
+## Restart time
+
+| Server | Restart time | Cache after restart |
+|---|---|---|
+| **Runbound** | **56 ms** | ✅ Preserved (persistent cache) |
+| BIND9 | 10 000 – 30 000 ms | ❌ Cold start |
+| Unbound | 5 000 – 15 000 ms | ❌ Cold start |
+
+Measured on Debian 13, systemd, via `systemctl restart runbound`.
+
+Runbound persists the DNS cache to disk on shutdown and restores it on startup —
+zero cache warmup required after a restart. BIND9 and Unbound start cold every time.
+
+At 56ms restart time, a rolling update or config change is imperceptible to clients.
