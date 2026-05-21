@@ -581,7 +581,7 @@ async function loadFeeds() {
             : 'never';
           return `
           <div class="row gap-2">
-            <span class="w-3 h-3 rounded-full shrink-0 ${f.enabled ? 'bg-green-500' : 'bg-gray-600'}" title="${f.enabled ? 'enabled' : 'disabled'}"></span>
+            <span class="w-3 h-3 rounded-full shrink-0 ${!f.enabled ? 'bg-gray-600' : (f.entry_count ?? 0) === 0 ? 'bg-red-500' : 'bg-green-500'}" title="${!f.enabled ? 'disabled' : (f.entry_count ?? 0) === 0 ? 'enabled — 0 entries (sync error?)' : 'enabled'}"></span>
             <span class="text-cyan-300 w-32 truncate font-bold shrink-0">${esc(f.name)}</span>
             <span class="text-gray-400 flex-1 truncate text-xs">${esc(f.url)}</span>
             <span class="text-gray-500 w-20 text-right text-xs shrink-0">${(f.entry_count??0).toLocaleString()} entries</span>
