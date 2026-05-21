@@ -99,7 +99,7 @@ dig @127.0.0.1 google.com
 
 DNS live on **port 53**. REST API live on **port 8080** (localhost only, requires Bearer token). No config change needed.
 
-The REST API port is configurable with `api-port: 9090` in `runbound.conf`. See the [Configuration Reference](docs/configuration.md#api-key-and-port).
+The REST API port is configurable with `api-port: 9090` in `runbound.conf` (or `unbound.conf` — both names are valid). See the [Configuration Reference](docs/configuration.md#api-key-and-port).
 
 > Raspberry Pi or ARM server? Grab `runbound-vX.Y.Z-aarch64-linux-musl` instead.
 
@@ -195,6 +195,11 @@ Benchmarks run from a dedicated client machine (never from the DNS server):
 
 ## XDP Kernel-Bypass Fast Path
 
+> **Commercial license required.** The AF/XDP fast path is available under the
+> commercial license only. Open-source (AGPL v3) builds include the code but the
+> fast path is disabled at runtime without a commercial license. See
+> [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) or contact redlemonbe@codix.be.
+
 Starting with v0.4.14, Runbound includes an AF_XDP fast path enabled in all
 published binaries. Local-zone DNS queries are handled at the NIC driver level,
 bypassing the Linux kernel network stack entirely.
@@ -240,11 +245,11 @@ Works on VMs (virtio, copy mode) and bare metal Intel NICs (ixgbe/i40e/ice/igc, 
 All releases: [github.com/redlemonbe/Runbound/releases](https://github.com/redlemonbe/Runbound/releases)
 
 Or build from source: `cargo build --release`  
-XDP is enabled by default. To disable at runtime (no recompile needed):
-- Add `xdp: no` to `unbound.conf`, or
+XDP is compiled in by default. The fast path requires a **commercial license** to activate at runtime. To disable it explicitly:
+- Add `xdp: no` to `unbound.conf` (or `runbound.conf`), or
 - Pass `--no-xdp` on the command line: `runbound --no-xdp /etc/runbound/unbound.conf`
 
-To remove the code entirely at build time: `cargo build --release --no-default-features`
+To remove the XDP code entirely at build time: `cargo build --release --no-default-features`
 
 ---
 

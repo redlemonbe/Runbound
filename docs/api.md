@@ -562,7 +562,7 @@ curl -X POST http://localhost:8080/reload \
 ```
 
 ```json
-{"status": "ok", "cfg_path": "/etc/runbound/runbound.conf", "local_zones": 5, "local_data": 12}
+{"status": "ok", "cfg_path": "/etc/runbound/unbound.conf", "local_zones": 5, "local_data": 12}
 ```
 
 **Note:** ACL rules, forward-zone upstreams, and privacy settings (`log-retention`, `log-client-ip`) require a full restart.

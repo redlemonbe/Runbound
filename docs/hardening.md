@@ -160,7 +160,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/runbound /etc/runbound/unbound.conf
+ExecStart=/usr/local/sbin/runbound /etc/runbound/unbound.conf
 Restart=on-failure
 RestartSec=5
 
