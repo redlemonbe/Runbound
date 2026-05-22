@@ -554,11 +554,12 @@ async function loadFeeds() {
     document.getElementById('feed-list').innerHTML = feeds.length===0 ? empty('No feeds. Use a preset or add a custom URL.') :
       feeds.map(f=>{
         const busy=updatingFeeds.has(f.id);
-        const dot=busy?'bg-yellow-400 blink':(!f.enabled?'bg-gray-700':(f.entry_count??0)===0?'bg-red-600':'bg-green-500');
+        const dot=busy?'bg-yellow-400 blink':(!f.enabled?'bg-gray-700':f.last_error?'bg-red-600':(f.entry_count??0)===0?'bg-red-600':'bg-green-500');
         const upd=busy?'<span class="text-yellow-400">updating…</span>':(f.last_updated?new Date(f.last_updated).toLocaleString([],{dateStyle:'short',timeStyle:'short'}):'never');
         const cnt=busy&&(f.entry_count??0)===0?'<span class="text-yellow-400">…</span>':`${(f.entry_count??0).toLocaleString()} entries`;
         const btn=busy?'<span class="text-yellow-400 text-xs w-8 text-center blink shrink-0">↻</span>':`<button onclick="feedUpdate('${f.id}')" class="btn-secondary text-xs px-2 py-0.5 shrink-0">↻</button>`;
-        return `<div class="row gap-2"><span class="w-2.5 h-2.5 rounded-full shrink-0 ${dot}"></span><span class="text-cyan-300 w-28 truncate shrink-0 text-xs font-mono">${esc(f.name)}</span><span class="text-gray-500 flex-1 truncate text-xs">${esc(f.url)}</span><span class="text-gray-600 w-20 text-right text-xs shrink-0">${cnt}</span><span class="text-gray-700 w-16 text-right text-xs shrink-0">${esc(f.action)}</span><span class="text-gray-800 w-24 text-right text-xs shrink-0">↻ ${upd}</span>${btn}<button class="del shrink-0" onclick="feedDelete('${f.id}')">✕</button></div>`;
+        const err=f.last_error?`<span class="text-red-400 text-xs shrink-0 cursor-help" title="${esc(f.last_error)}">⚠</span>`:''; 
+        return `<div class="row gap-2"><span class="w-2.5 h-2.5 rounded-full shrink-0 ${dot}"></span><span class="text-cyan-300 w-28 truncate shrink-0 text-xs font-mono">${esc(f.name)}</span><span class="text-gray-500 flex-1 truncate text-xs">${esc(f.url)}</span><span class="text-gray-600 w-20 text-right text-xs shrink-0">${cnt}</span><span class="text-gray-700 w-16 text-right text-xs shrink-0">${esc(f.action)}</span><span class="text-gray-800 w-24 text-right text-xs shrink-0">↻ ${upd}</span>${err}${btn}<button class="del shrink-0" onclick="feedDelete('${f.id}')">✕</button></div>`;
       }).join('');
   } catch(e) { toast('Feeds: '+e.message, true); }
 }
