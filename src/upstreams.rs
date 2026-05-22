@@ -82,6 +82,11 @@ pub struct UpstreamStatus {
     /// Cleared on successful probe. Not persisted (runtime only).
     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing, default)]
     pub last_error: Option<String>,
+    /// #56: TLS server name used for SNI. Required for DoT — if None,
+    /// derived automatically from well-known IPs.
+    /// Persisted; None for UDP upstreams.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tls_hostname: Option<String>,
     // Internal backoff state — not serialised in API responses.
     #[serde(skip, default)]
     pub consecutive_failures: u32,
@@ -115,12 +120,14 @@ pub type SharedUpstreams = Arc<RwLock<Vec<UpstreamStatus>>>;
 // Only durable fields are saved; runtime health state is not persisted.
 #[derive(Serialize, Deserialize)]
 struct PersistedUpstream {
-    id:       String,
-    addr:     String,
-    port:     u16,
-    protocol: String,
-    name:     Option<String>,
-    zone:     String,
+    id:           String,
+    addr:         String,
+    port:         u16,
+    protocol:     String,
+    name:         Option<String>,
+    zone:         String,
+    #[serde(default)]
+    tls_hostname: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -134,12 +141,13 @@ pub fn save_upstreams(upstreams: &SharedUpstreams, base_dir: &Path) {
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in save_upstreams: {e}"));
     let file = UpstreamsFile {
         upstreams: list.iter().map(|u| PersistedUpstream {
-            id:       u.id.clone(),
-            addr:     u.addr.clone(),
-            port:     u.port,
-            protocol: u.protocol.clone(),
-            name:     u.name.clone(),
-            zone:     u.zone.clone(),
+            id:           u.id.clone(),
+            addr:         u.addr.clone(),
+            port:         u.port,
+            protocol:     u.protocol.clone(),
+            name:         u.name.clone(),
+            zone:         u.zone.clone(),
+            tls_hostname: u.tls_hostname.clone(),
         }).collect(),
     };
     drop(list);
@@ -196,6 +204,7 @@ pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
         name:                 p.name,
         protocol:             p.protocol,
         zone:                 p.zone,
+        tls_hostname:         p.tls_hostname,
         healthy:              false,
         latency_ms:           None,
         last_check:           String::new(),
@@ -242,6 +251,7 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
                 name:                None,
                 protocol:            if fz.tls { "dot".into() } else { "udp".into() },
                 zone:                fz.name.clone(),
+                tls_hostname:        None,
                 healthy:             false,
                 latency_ms:          None,
                 last_check:          String::new(),
@@ -270,11 +280,12 @@ pub fn merge_persisted(shared: &SharedUpstreams, persisted: Vec<UpstreamStatus>)
 
 /// Add a runtime upstream (POST /api/upstreams). Returns the new entry.
 pub fn add_upstream(
-    upstreams: &SharedUpstreams,
-    addr:      String,
-    port:      u16,
-    protocol:  String,
-    name:      Option<String>,
+    upstreams:    &SharedUpstreams,
+    addr:         String,
+    port:         u16,
+    protocol:     String,
+    name:         Option<String>,
+    tls_hostname: Option<String>,
 ) -> UpstreamStatus {
     let entry = UpstreamStatus {
         id:                  uuid::Uuid::new_v4().to_string(),
@@ -282,6 +293,7 @@ pub fn add_upstream(
         port,
         name,
         protocol,
+        tls_hostname,
         healthy:             false,
         latency_ms:          None,
         last_check:          String::new(),
@@ -306,8 +318,9 @@ pub fn remove_upstream(upstreams: &SharedUpstreams, id: &str) -> Option<Upstream
     list.iter().position(|u| u.id == id).map(|pos| list.remove(pos))
 }
 
-/// #50: Rename an upstream in-place (PATCH /api/upstreams/:id).
-/// Returns the updated entry if found, None if the id is unknown.
+/// #50: Rename an upstream in-place. Used in unit tests; production code
+/// patches fields directly in the handler to handle multiple fields atomically.
+#[allow(dead_code)]
 pub fn patch_upstream_name(
     upstreams: &SharedUpstreams,
     id: &str,
@@ -323,12 +336,12 @@ pub fn patch_upstream_name(
     }
 }
 
-/// Snapshot of (addr, port, use_tls) for resolver rebuilds.
-pub fn upstream_addrs(upstreams: &SharedUpstreams) -> Vec<(String, u16, bool)> {
+/// Snapshot of (addr, port, use_tls, tls_hostname) for resolver rebuilds.
+pub fn upstream_addrs(upstreams: &SharedUpstreams) -> Vec<(String, u16, bool, Option<String>)> {
     upstreams.read()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in upstream_addrs: {e}"))
         .iter()
-        .map(|u| (u.addr.clone(), u.port, u.protocol == "dot"))
+        .map(|u| (u.addr.clone(), u.port, u.protocol == "dot", u.tls_hostname.clone()))
         .collect()
 }
 
@@ -692,7 +705,7 @@ mod tests {
     #[test]
     fn parse_last_error_cleared_on_healthy() {
         let upstreams = init_upstreams(&crate::config::parser::UnboundConfig::default());
-        let entry = add_upstream(&upstreams, "1.1.1.1".into(), 53, "udp".into(), None);
+        let entry = add_upstream(&upstreams, "1.1.1.1".into(), 53, "udp".into(), None, None);
         // Simulate a previous failure
         {
             let mut list = upstreams.write().unwrap_or_else(|e| e.into_inner());
@@ -718,7 +731,7 @@ mod tests {
     #[test]
     fn patch_upstream_name_updates_name() {
         let upstreams = init_upstreams(&crate::config::parser::UnboundConfig::default());
-        let entry = add_upstream(&upstreams, "1.1.1.1".into(), 53, "udp".into(), None);
+        let entry = add_upstream(&upstreams, "1.1.1.1".into(), 53, "udp".into(), None, None);
         let updated = patch_upstream_name(&upstreams, &entry.id, Some("Test".into()));
         assert!(updated.is_some());
         assert_eq!(updated.unwrap().name.as_deref(), Some("Test"));
@@ -734,7 +747,7 @@ mod tests {
     #[test]
     fn patch_upstream_name_none_clears_name() {
         let upstreams = init_upstreams(&crate::config::parser::UnboundConfig::default());
-        let entry = add_upstream(&upstreams, "1.1.1.1".into(), 53, "udp".into(), Some("Old".into()));
+        let entry = add_upstream(&upstreams, "1.1.1.1".into(), 53, "udp".into(), Some("Old".into()), None);
         let updated = patch_upstream_name(&upstreams, &entry.id, None);
         assert!(updated.unwrap().name.is_none());
     }
