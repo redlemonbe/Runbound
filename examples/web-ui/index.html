@@ -701,12 +701,12 @@ async function pollUpstreamHealth(id) {
 }
 
 async function upstreamRename(id, current) {
-  const name = prompt('Rename upstream:', current); if (name === null) return;
+  const name = await showInputModal('Rename upstream', null, current); if (name === null) return;
   try { await api('PATCH', '/upstreams/' + id, {name: name.trim() || ''}); toast('Renamed'); loadUpstreams(); }
   catch(e) { toast('Rename: '+e.message, true); }
 }
 async function upstreamEditSni(id, current) {
-  const val=prompt('TLS SNI hostname for this DoT upstream\n(leave empty = auto-detect from well-known IPs):',current); if(val===null) return;
+  const val=await showInputModal('TLS SNI hostname','Leave empty to auto-detect from well-known IPs',current); if(val===null) return;
   try { await api('PATCH','/upstreams/'+id,{tls_hostname:val.trim()}); toast('SNI updated'); loadUpstreams(); }
   catch(e) { toast('SNI update: '+e.message, true); }
 }
@@ -798,6 +798,29 @@ function toast(msg, err=false) {
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.classList.add('hidden'),3500);
 }
 
+
+let _modalResolve = null;
+function showInputModal(title, hint, value) {
+  document.getElementById('modal-title').textContent = title;
+  const h = document.getElementById('modal-hint');
+  h.textContent = hint || '';
+  h.style.display = hint ? '' : 'none';
+  const inp = document.getElementById('modal-input');
+  inp.value = value || '';
+  document.getElementById('modal-overlay').classList.remove('hidden');
+  requestAnimationFrame(() => { inp.focus(); inp.select(); });
+  return new Promise(resolve => { _modalResolve = resolve; });
+}
+function modalConfirm() {
+  const val = document.getElementById('modal-input').value;
+  document.getElementById('modal-overlay').classList.add('hidden');
+  if (_modalResolve) { _modalResolve(val); _modalResolve = null; }
+}
+function modalCancel() {
+  document.getElementById('modal-overlay').classList.add('hidden');
+  if (_modalResolve) { _modalResolve(null); _modalResolve = null; }
+}
+
 window.onload = () => {
   const url=localStorage.getItem('rb-url'), key=localStorage.getItem('rb-key');
   if(url) document.getElementById('cfg-url').value=url;
@@ -820,5 +843,19 @@ window.onload = () => {
   },1500);
 })();
 </script>
+
+<!-- Input modal -->
+<div id="modal-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center" style="background:rgba(0,0,0,.72)" onclick="modalCancel()">
+  <div class="card w-full mx-4" style="max-width:380px" onclick="event.stopPropagation()">
+    <div id="modal-title" class="text-sm text-gray-200 font-medium mb-1"></div>
+    <div id="modal-hint" class="text-xs text-gray-600 mb-3" style="display:none"></div>
+    <input id="modal-input" type="text" class="input w-full mb-4"
+           onkeydown="if(event.key==='Enter'){event.preventDefault();modalConfirm();}else if(event.key==='Escape')modalCancel();" />
+    <div class="flex gap-2 justify-end">
+      <button class="btn-secondary" onclick="modalCancel()">Cancel</button>
+      <button class="btn-primary" onclick="modalConfirm()">OK</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
