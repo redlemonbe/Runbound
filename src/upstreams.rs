@@ -2,15 +2,15 @@
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Upstream DNS health monitoring.
 //
-// Probes each configured forward-addr with a minimal UDP DNS query (`. IN A`).
-// Reports latency and reachability. Never mutates resolver configuration —
-// read-only diagnostic view.
+// UDP upstreams: probed with a minimal UDP DNS query (`. IN A`).
+// DoT upstreams: probed with a TCP+TLS connect+handshake (no DNS query needed).
 //
 // Backoff: a failing upstream is retried with exponential backoff (30s → 60s →
 // 120s → 300s cap) so that a permanently unreachable server does not spam logs.
 // On recovery, the backoff resets and an INFO message is emitted.
 
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::io::Write;
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -271,23 +271,23 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
 
         let now = Instant::now();
 
-        // Collect (index, addr, port) for upstreams that are due for a probe.
-        let to_probe: Vec<(usize, String, u16)> = {
+        // Collect (index, addr, port, protocol) for upstreams that are due for a probe.
+        let to_probe: Vec<(usize, String, u16, String)> = {
             upstreams
                 .read()
                 .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health task: {e}"))
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| now >= s.next_check_at)
-                .map(|(i, s)| (i, s.addr.clone(), s.port))
+                .map(|(i, s)| (i, s.addr.clone(), s.port, s.protocol.clone()))
                 .collect()
         };
 
-        // Probe each due upstream (blocking UDP, no async needed).
+        // Probe each due upstream (blocking I/O — UDP for plain, TCP+TLS for DoT).
         let results: Vec<(usize, bool, Option<u64>)> = to_probe
             .iter()
-            .map(|(i, addr, port)| {
-                let (healthy, latency) = probe_upstream(addr, *port);
+            .map(|(i, addr, port, protocol)| {
+                let (healthy, latency) = probe_upstream(addr, *port, protocol);
                 (*i, healthy, latency)
             })
             .collect();
@@ -332,8 +332,17 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
     }
 }
 
-// ── UDP probe ──────────────────────────────────────────────────────────────
-fn probe_upstream(addr: &str, port: u16) -> (bool, Option<u64>) {
+// ── Probe dispatcher ──────────────────────────────────────────────────────
+fn probe_upstream(addr: &str, port: u16, protocol: &str) -> (bool, Option<u64>) {
+    if protocol == "dot" {
+        probe_dot(addr, port)
+    } else {
+        probe_udp(addr, port)
+    }
+}
+
+// ── UDP probe ─────────────────────────────────────────────────────────────
+fn probe_udp(addr: &str, port: u16) -> (bool, Option<u64>) {
     let ip: IpAddr = match addr.parse() {
         Ok(ip) => ip,
         Err(_) => return (false, None),
@@ -365,5 +374,98 @@ fn probe_upstream(addr: &str, port: u16) -> (bool, Option<u64>) {
             }
         }
         _ => (false, None),
+    }
+}
+
+// ── DoT probe (TCP + TLS handshake) ───────────────────────────────────────
+// A successful TLS handshake is sufficient proof that the server is up and
+// speaking TLS on the expected port. No DNS query is sent.
+fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>) {
+    let ip: IpAddr = match addr.parse() {
+        Ok(ip) => ip,
+        Err(_) => return (false, None),
+    };
+    let target   = SocketAddr::new(ip, port);
+    let timeout  = Duration::from_millis(PROBE_TIMEOUT_MS);
+
+    let t0 = Instant::now();
+
+    // Step 1: TCP connect
+    let tcp = match TcpStream::connect_timeout(&target, timeout) {
+        Ok(s)  => s,
+        Err(_) => return (false, None),
+    };
+    let _ = tcp.set_read_timeout(Some(timeout));
+    let _ = tcp.set_write_timeout(Some(timeout));
+
+    // Step 2: TLS handshake — server name derived from the IP address
+    let server_name = match rustls::pki_types::ServerName::try_from(addr.to_owned()) {
+        Ok(n)  => n,
+        Err(_) => return (false, None),
+    };
+    // Use the ring provider explicitly — avoids relying on a process-level
+    // install_default() that may not have run outside of the main binary.
+    let config = Arc::new(
+        rustls::ClientConfig::builder_with_provider(
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap_or_else(|e| panic!("TLS protocol versions: {e}"))
+        .with_root_certificates(build_tls_roots())
+        .with_no_client_auth(),
+    );
+    let conn = match rustls::ClientConnection::new(config, server_name) {
+        Ok(c)  => c,
+        Err(_) => return (false, None),
+    };
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    // flush() → complete_io() → blocks until TLS handshake is done or fails
+    match tls.flush() {
+        Ok(()) => (true, Some(t0.elapsed().as_millis() as u64)),
+        Err(_) => (false, None),
+    }
+}
+
+// ── TLS root-CA store ─────────────────────────────────────────────────────
+// Attempts to load system native CAs; falls back to bundled WebPKI roots.
+fn build_tls_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    let result = rustls_native_certs::load_native_certs();
+    for cert in result.certs {
+        roots.add(cert).ok();
+    }
+    if roots.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    roots
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires network access to 1.1.1.1:853"]
+    fn probe_dot_cloudflare_healthy() {
+        let (healthy, latency) = probe_upstream("1.1.1.1", 853, "dot");
+        assert!(healthy, "Cloudflare DoT 1.1.1.1:853 should be healthy");
+        assert!(latency.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires network access to 1.1.1.1:53"]
+    fn probe_udp_cloudflare_healthy() {
+        let (healthy, latency) = probe_upstream("1.1.1.1", 53, "udp");
+        assert!(healthy, "Cloudflare UDP 1.1.1.1:53 should be healthy");
+        assert!(latency.is_some());
+    }
+
+    #[test]
+    fn probe_dot_unreachable_returns_false() {
+        // 192.0.2.0/24 is TEST-NET-1 — guaranteed unreachable (RFC 5737)
+        let (healthy, latency) = probe_upstream("192.0.2.1", 853, "dot");
+        assert!(!healthy, "unreachable host must not be reported healthy");
+        assert!(latency.is_none());
     }
 }
