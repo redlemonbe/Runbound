@@ -142,10 +142,15 @@ pub struct UnboundConfig {
     pub prefetch: bool,
     /// Minimum forwarded-query count per window to qualify for prefetch. Default: 5.
     pub prefetch_threshold: u32,
+
+    // ── API safety ────────────────────────────────────────────────────────────
+    /// Minimum seconds between two consecutive POST /api/cache/flush calls.
+    /// 0 disables the cooldown entirely. Default: 60.
+    pub cache_flush_cooldown: u64,
 }
 
 impl UnboundConfig {
-    fn defaults() -> Self {
+    pub fn defaults() -> Self {
         Self {
             interfaces:    vec![],   // empty = bind 0.0.0.0 in server.rs
             port:          53,
@@ -161,8 +166,9 @@ impl UnboundConfig {
             cpu_affinity:       true,
             xdp:                true,
             cache_min_entries:  2048,
-            prefetch:           false,
-            prefetch_threshold: 5,
+            prefetch:             false,
+            prefetch_threshold:   5,
+            cache_flush_cooldown: 60,
             ..Default::default()
         }
     }
@@ -347,8 +353,9 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
         "cpu-affinity"        => cfg.cpu_affinity        = val.trim_matches('"') != "no",
         "xdp"                 => cfg.xdp                 = val.trim_matches('"') != "no",
-        "prefetch"           => cfg.prefetch           = val.trim_matches('"') == "yes",
-        "prefetch-threshold" => cfg.prefetch_threshold = val.parse().unwrap_or(5),
+        "prefetch"              => cfg.prefetch              = val.trim_matches('"') == "yes",
+        "prefetch-threshold"    => cfg.prefetch_threshold    = val.parse().unwrap_or(5),
+        "cache-flush-cooldown"  => cfg.cache_flush_cooldown  = val.parse().unwrap_or(60),
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"

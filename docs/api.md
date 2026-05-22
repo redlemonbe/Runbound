@@ -211,7 +211,7 @@ curl http://localhost:8080/health
 ```
 
 ```json
-{"status": "ok", "version": "0.6.2", "uptime_secs": 3600}
+{"status": "ok", "version": "0.6.4", "uptime_secs": 3600}
 ```
 
 ---
@@ -577,7 +577,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 
 ```json
 {
-  "version": "0.6.2",
+  "version": "0.6.4",
   "uptime_secs": 3600,
   "xdp_active": true,
   "xdp_mode": "drv",
@@ -586,11 +586,20 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
   "mem_total_mb": 65536,
   "mem_avail_mb": 62000,
   "cache_entries": 48231,
-  "workers": 8
+  "workers": 8,
+  "prefetch_enabled": true,
+  "upstreams_healthy": 3,
+  "upstreams_total": 3
 }
 ```
 
 `xdp_mode`: `"drv"` (native zero-copy), `"skb"` (generic fallback), `"disabled"`.
+
+| Field | Type | Description |
+|---|---|---|
+| `prefetch_enabled` | bool | `true` when `prefetch: yes` is set in `runbound.conf` |
+| `upstreams_healthy` | u32 | Count of upstreams with `healthy == true` at last health check |
+| `upstreams_total` | u32 | Total registered upstreams (config + API) |
 
 ---
 
@@ -605,6 +614,20 @@ curl -X POST -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/
 ```json
 {"status": "ok", "flushed_entries": 48231}
 ```
+
+**Cooldown** (`cache-flush-cooldown` in `runbound.conf`, default: 60 s):
+
+If this endpoint is called again before the cooldown expires, it returns:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 58
+```
+```json
+{"error": "FLUSH_COOLDOWN", "retry_after_secs": 58}
+```
+
+Set `cache-flush-cooldown: 0` to disable the cooldown entirely.
 
 ---
 
@@ -733,7 +756,7 @@ on slave nodes.
 | `404` | Not found — UUID does not exist |
 | `409` | Conflict — operation refused by a guard (e.g. `LAST_UPSTREAM`: cannot delete the last upstream) |
 | `422` | Unprocessable — entry limit reached |
-| `429` | Too many requests — rate limit exceeded |
+| `429` | Too many requests — rate limit exceeded, or flush cooldown active (`FLUSH_COOLDOWN`) |
 | `500` | Internal server error |
 | `503` | Service unavailable — slave node (read-only), write operation rejected |
 

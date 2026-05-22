@@ -1,6 +1,6 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.6.3  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.6.4  
 **Last updated:** 2026-05-22  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration, upstream management  
 **Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4) + static Clippy audit (v0.6.2)
@@ -1085,6 +1085,40 @@ On `parse_local_data` failure, the HTTP 400 response body included `"details": f
 
 ---
 
+## v0.6.4 Hardening Pass — 2026-05-22
+
+Replaced UDP-only DoT probe with a proper TCP+TLS handshake (FIX #45).
+Added cache flush cooldown to prevent rapid cache invalidation (FEAT #46).
+Added upstream health and prefetch status to `GET /api/system` (FEAT #47).
+
+**Findings: 1 FIX, 0 open.**
+
+### FIX #45 — DoT upstream health probe used UDP instead of TCP+TLS
+
+**GitHub:** #45  
+**Version fixed:** v0.6.4  
+**Status:** ✅ Fixed  
+**Severity:** LOW
+
+`probe_upstream` used a DNS/UDP probe (send a query, wait for reply) for all
+upstreams regardless of protocol. A DoT upstream (port 853) communicates over
+TCP+TLS — a UDP probe would always fail or produce a false positive via unrelated
+port traffic.
+
+**Fix:** `probe_upstream` dispatches to `probe_dot` for `protocol == "dot"`.
+`probe_dot` opens a `std::net::TcpStream` with a 2-second timeout, wraps it with
+`rustls::StreamOwned`, and calls `flush()` to drive `complete_io()` until the TLS
+handshake completes. A successful handshake → `healthy: true`; any error →
+`healthy: false`. Root CAs are loaded from the system store
+(`rustls-native-certs`) with a fallback to bundled WebPKI roots (`webpki-roots`).
+The ring cryptographic provider is installed explicitly to avoid the
+`no CryptoProvider` panic in non-hickory test contexts.
+
+**Verified:** Cloudflare DoT (1.1.1.1:853) latency 43 ms, Quad9 DoT
+(9.9.9.9:853) latency 38 ms — both `healthy: true` in live test.
+
+---
+
 ## v0.6.3 Hardening Pass — 2026-05-22
 
 Closed the two open findings from the v0.6.2 live pentest (FIX #40 and FIX #41).
@@ -1220,4 +1254,13 @@ confirmed absent (domain names only at DEBUG level); input validation confirmed 
 v0.6.2 endpoints (POST /api/upstreams: protocol enum + IP validation → 400;
 DELETE /api/upstreams/:id: 404 on unknown UUID); no error response leaks internal paths,
 stack traces, or dependency versions. Clippy flags `-D clippy::unwrap_used
--D clippy::expect_used -D warnings` pass clean. 39/39 tests pass.*
+-D clippy::expect_used -D warnings` pass clean. 39/39 tests pass.
+v0.6.3 hardening pass (2026-05-22): loopback/link-local upstream guard (FIX #40);
+last-upstream deletion guard 409 LAST_UPSTREAM (FIX #41); presets DoT port field (FIX #42);
+upstream persistence across restarts HMAC-protected (FIX #43); explicit port field on
+UpstreamStatus (FIX #44); DNS prefetching feature (FEAT #16). 65/65 tests pass.
+v0.6.4 hardening pass (2026-05-22): DoT probe rewritten as TCP+TLS handshake via
+rustls::StreamOwned (FIX #45); cache flush cooldown 429 FLUSH_COOLDOWN + Retry-After header
+(FEAT #46); prefetch_enabled + upstreams_healthy + upstreams_total added to GET /api/system
+(FEAT #47). 65/65 tests pass. Live test: 1.1.1.1:853 healthy=true latency=43ms,
+9.9.9.9:853 healthy=true latency=38ms; flush cooldown 200→429→200 after 6s confirmed.*
