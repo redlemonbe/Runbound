@@ -84,7 +84,7 @@ impl SyncJournal {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut map = self.connected_slaves.lock().expect("sync: slaves mutex poisoned");
+        let mut map = self.connected_slaves.lock().unwrap_or_else(|e| panic!("sync: slaves mutex poisoned: {e}"));
         map.insert(addr.clone(), SlaveInfo { addr, last_seen_secs: now, last_seq: seq });
     }
 
@@ -94,7 +94,7 @@ impl SyncJournal {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let map = self.connected_slaves.lock().expect("sync: slaves mutex poisoned");
+        let map = self.connected_slaves.lock().unwrap_or_else(|e| panic!("sync: slaves mutex poisoned: {e}"));
         map.values()
             .filter(|s| now.saturating_sub(s.last_seen_secs) < 300)
             .cloned()
@@ -108,7 +108,7 @@ impl SyncJournal {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut q = self.events.lock().expect("sync: events mutex poisoned");
+        let mut q = self.events.lock().unwrap_or_else(|e| panic!("sync: events mutex poisoned: {e}"));
         if q.len() >= JOURNAL_CAPACITY {
             q.pop_front();
         }
@@ -119,7 +119,7 @@ impl SyncJournal {
     /// Returns events with seq >= since.
     /// Returns None when `since` predates the ring buffer — slave must do a full sync.
     pub fn delta(&self, since: u64) -> Option<Vec<SyncEvent>> {
-        let q = self.events.lock().expect("sync: events mutex poisoned");
+        let q = self.events.lock().unwrap_or_else(|e| panic!("sync: events mutex poisoned: {e}"));
         if let Some(oldest) = q.front() {
             if since < oldest.seq {
                 return None; // 410 Gone — too far behind
@@ -282,7 +282,7 @@ impl TofuVerifier {
         Arc::new(Self { captured: Mutex::new(None) })
     }
     fn take_fingerprint(&self) -> Option<String> {
-        self.captured.lock().expect("sync: TOFU captured mutex poisoned").clone()
+        self.captured.lock().unwrap_or_else(|e| panic!("sync: TOFU captured mutex poisoned: {e}")).clone()
     }
 }
 
@@ -296,7 +296,7 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let fp = hex::encode(Sha256::digest(end_entity));
-        *self.captured.lock().expect("sync: TOFU captured mutex poisoned") = Some(fp);
+        *self.captured.lock().unwrap_or_else(|e| panic!("sync: TOFU captured mutex poisoned: {e}")) = Some(fp);
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -472,11 +472,12 @@ fn json_ok(body: serde_json::Value) -> hyper::Response<Full<Bytes>> {
 }
 
 fn json_resp(status: u16, body: serde_json::Value) -> hyper::Response<Full<Bytes>> {
+    // Builder with hardcoded valid status + header: infallible.
     hyper::Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap()
+        .unwrap_or_else(|e| panic!("response builder: {e}"))
 }
 
 // ── SlaveClient ───────────────────────────────────────────────────────────────

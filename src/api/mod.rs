@@ -2074,6 +2074,190 @@ mod tests {
             "Bodyless POST must not get 411");
     }
 
+    // ── POST /api/upstreams ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn add_upstream_requires_auth() {
+        let app = make_test_app();
+        let body = serde_json::json!({"addr":"1.1.1.1","protocol":"udp"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_invalid_protocol() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let body = serde_json::json!({"addr":"1.1.1.1","protocol":"tcp"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams")
+                .header(k, v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_invalid_addr() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let body = serde_json::json!({"addr":"not-an-ip","protocol":"udp"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams")
+                .header(k, v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_happy_path() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"udp","name":"Quad9"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams")
+                .header(k, v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["status"], "ok");
+        assert!(json["upstream"]["id"].is_string());
+    }
+
+    // ── DELETE /api/upstreams/:id ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_upstream_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("DELETE").uri("/api/upstreams/some-id")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn delete_upstream_not_found() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("DELETE").uri("/api/upstreams/nonexistent-uuid")
+                .header(k, v)
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── GET /api/upstreams/presets ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upstream_presets_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/upstreams/presets").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn upstream_presets_schema() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/upstreams/presets").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert!(json["presets"].is_array());
+        assert!(json["presets"].as_array().map(|a| a.len() >= 4).unwrap_or(false));
+    }
+
+    // ── POST /api/cache/flush ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cache_flush_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().method("POST").uri("/api/cache/flush").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cache_flush_happy_path() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/cache/flush")
+                .header(k, v)
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["status"], "ok");
+        assert!(json["flushed_entries"].is_number());
+    }
+
+    // ── GET /api/sync/slaves ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sync_slaves_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/sync/slaves").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sync_slaves_standalone_returns_empty() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/sync/slaves").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["total"], 0);
+        assert!(json["slaves"].as_array().map(|a| a.is_empty()).unwrap_or(false));
+    }
+
+    // ── GET /health schema (no auth, version field present) ───────────────────
+
+    #[tokio::test]
+    async fn health_schema() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/health").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["status"], "ok");
+        assert!(json["version"].is_string(), "health must include version field");
+        assert!(json.get("hsm").is_none(), "health must not expose hsm field");
+        assert!(json["uptime_secs"].is_number());
+    }
+
     // ── ReloadLimiter correctness under parallel load ─────────────────────────
     // Regression test for the TOCTOU race in the previous integer-arithmetic
     // token bucket: 20 threads hit the limiter simultaneously; at most 2 (burst)

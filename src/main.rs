@@ -218,7 +218,7 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
     }
 
     runtime::BASE_DIR.set(base_dir.clone())
-        .expect("BASE_DIR set twice — this is a bug");
+        .unwrap_or_else(|_| panic!("BASE_DIR set twice — this is a bug"));
     info!(base_dir = %base_dir.display(), "Runtime base_dir");
 
     info!(
