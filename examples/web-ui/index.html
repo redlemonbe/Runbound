@@ -9,768 +9,734 @@
     body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
     .tab-active { border-bottom: 2px solid #22d3ee; color: #22d3ee; }
     .fade { animation: fadeIn .15s ease; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #111; }
-    ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+    @keyframes fadeIn  { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
+    @keyframes slideUp { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+    @keyframes blink   { 0%,100%{opacity:1;} 50%{opacity:.3;} }
+    .blink { animation: blink 2s ease-in-out infinite; }
+    ::-webkit-scrollbar { width:6px; } ::-webkit-scrollbar-track { background:#0a0a0a; }
+    ::-webkit-scrollbar-thumb { background:#2d3748; border-radius:3px; }
+    .row { display:flex; align-items:center; justify-content:space-between; background:#0f172a; border:1px solid #1e293b; border-radius:6px; padding:8px 14px; font-size:13px; transition:background .1s, border-color .1s; }
+    .row:hover { background:#131f34; border-color:#334155; }
+    .card { background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:16px; }
+    details > summary { list-style:none; cursor:pointer; }
+    details > summary::-webkit-details-marker { display:none; }
+    .sparkbar { display:inline-flex; align-items:flex-end; gap:1px; height:14px; }
+    .sparkbar span { display:inline-block; width:3px; border-radius:1px 1px 0 0; background:#2d4a6e; transition:background .15s; }
+    .sparkbar:hover span { background:#3b82f6; }
+    .badge { display:inline-block; font-size:10px; padding:1px 5px; border-radius:3px; font-weight:600; letter-spacing:.03em; }
+    .badge-udp  { background:#1e3a5f; color:#60a5fa; }
+    .badge-dot  { background:#1a3a2a; color:#34d399; }
+    .badge-dnssec-ok  { background:#14291a; color:#4ade80; border:1px solid #166534; }
+    .badge-dnssec-no  { background:#1a1a1a; color:#4b5563; border:1px solid #374151; }
   </style>
 </head>
-<body class="bg-gray-950 text-gray-200 min-h-screen">
+<body class="bg-gray-950 text-gray-200 min-h-screen pb-8">
 
-<!-- ── Connection banner ───────────────────────────────────────────── -->
-<div id="setup-banner" class="bg-gray-900 border-b border-gray-800 px-6 py-3 flex flex-wrap items-center gap-3">
-  <span class="text-cyan-400 font-bold text-sm">RUNBOUND</span>
+<!-- Banner -->
+<div class="bg-gray-950 border-b border-gray-800/60 px-5 py-2.5 flex flex-wrap items-center gap-3 shadow-lg shadow-black/40">
+  <div class="flex items-center gap-2 shrink-0">
+    <span class="text-cyan-400 font-bold text-sm tracking-widest" style="text-shadow:0 0 18px #22d3ee55">RUNBOUND</span>
+    <span id="conn-dot" class="w-1.5 h-1.5 rounded-full bg-gray-700"></span>
+  </div>
   <input id="cfg-url" type="text" value="/api"
-    class="bg-gray-800 border border-gray-700 rounded px-3 py-1 text-sm w-52 focus:outline-none focus:border-cyan-500"
+    class="bg-gray-900 border border-gray-700 rounded px-3 py-1 text-xs w-44 focus:outline-none focus:border-cyan-600 transition-colors"
     placeholder="http://localhost:8080" />
   <input id="cfg-key" type="password"
-    class="bg-gray-800 border border-gray-700 rounded px-3 py-1 text-sm w-72 focus:outline-none focus:border-cyan-500"
-    value="99344aa13a58e77b77f13df9f4da1a12bacf3f83f625545cc08ccb116f2db452" placeholder="API key (Bearer token)" />
-  <button onclick="connect()" class="bg-cyan-600 hover:bg-cyan-500 text-white text-sm px-4 py-1 rounded transition">Connect</button>
-  <span id="conn-status" class="text-xs text-gray-500">— not connected</span>
+    class="bg-gray-900 border border-gray-700 rounded px-3 py-1 text-xs w-64 focus:outline-none focus:border-cyan-600 transition-colors"
+    value="99344aa13a58e77b77f13df9f4da1a12bacf3f83f625545cc08ccb116f2db452" placeholder="Bearer token" />
+  <button onclick="connect()"
+    class="bg-cyan-700 hover:bg-cyan-600 active:bg-cyan-800 text-white text-xs px-4 py-1.5 rounded transition-colors">
+    Connect
+  </button>
+  <span id="conn-status" class="text-xs text-gray-600">not connected</span>
   <div class="ml-auto flex items-center gap-4 text-xs text-gray-500">
-    <span id="stat-qps">— qps</span>
-    <span id="stat-total">— queries</span>
-    <span id="stat-uptime">— uptime</span>
-    <button onclick="doReload()" title="Reload config (HUP)"
-      class="border border-gray-600 hover:border-cyan-500 hover:text-cyan-400 text-gray-400 text-xs px-3 py-1 rounded transition">
+    <span id="stat-qps" class="tabular-nums">— qps</span>
+    <span id="stat-total" class="tabular-nums">— queries</span>
+    <span id="stat-uptime">—</span>
+    <button onclick="doReload()" title="Reload config (SIGHUP)"
+      class="border border-gray-700 hover:border-cyan-600 hover:text-cyan-400 text-gray-500 text-xs px-2.5 py-1 rounded transition-colors">
       ↺ Reload
     </button>
   </div>
 </div>
 
-<!-- ── Tabs ────────────────────────────────────────────────────────── -->
-<div class="border-b border-gray-800 flex gap-6 px-6 text-sm text-gray-500">
-  <button class="py-3 tab-active" onclick="showTab('overview',this)">Overview</button>
-  <button class="py-3 hover:text-gray-300" onclick="showTab('dns',this)">DNS Entries</button>
-  <button class="py-3 hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
-  <button class="py-3 hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
-  <button class="py-3 hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
-  <button class="py-3 hover:text-gray-300" onclick="showTab('system',this)">System</button>
-  <button class="py-3 hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
+<!-- Tabs -->
+<div class="border-b border-gray-800/60 flex gap-1 px-4 text-xs text-gray-500 bg-gray-950/80 sticky top-0 z-10">
+  <button class="py-3 px-3 tab-active transition-colors hover:text-gray-300" onclick="showTab('overview',this)">Overview</button>
+  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('dns',this)">DNS</button>
+  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
+  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
+  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
+  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
+  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('system',this)">System</button>
+  <button class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
 </div>
 
-<!-- ── Content ─────────────────────────────────────────────────────── -->
-<div class="p-6 max-w-6xl mx-auto">
+<!-- Content -->
+<div class="p-5 max-w-6xl mx-auto">
 
   <!-- Overview -->
   <div id="tab-overview" class="fade">
-
-    <!-- Primary KPIs -->
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">QPS <span class="text-gray-700">(1 min avg)</span></div>
-        <div id="ov-qps" class="text-2xl text-cyan-400">—</div>
-      </div>
-      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">Total queries</div>
-        <div id="ov-total" class="text-2xl text-white">—</div>
-      </div>
-      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">Cache hit rate</div>
-        <div id="ov-cache" class="text-2xl text-green-400">—</div>
-      </div>
-      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">Blocked</div>
-        <div id="ov-blocked" class="text-2xl text-red-400">—</div>
-        <div id="ov-blocked-pct" class="text-xs text-gray-600 mt-0.5">— of total</div>
-      </div>
-      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">Forwarded</div>
-        <div id="ov-forwarded" class="text-2xl text-white">—</div>
-      </div>
-      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">SERVFAIL</div>
-        <div id="ov-servfail" class="text-2xl text-yellow-400">—</div>
-      </div>
-      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">Latency p50</div>
-        <div id="ov-latency" class="text-2xl text-white">—</div>
-      </div>
-      <div class="bg-gray-900 rounded-lg p-4 border border-gray-800">
-        <div class="text-xs text-gray-500 mb-1">Uptime</div>
-        <div id="ov-uptime" class="text-2xl text-white">—</div>
-      </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+      <div class="card"><div class="text-xs text-gray-600 mb-1">QPS <span class="text-gray-700">(1m avg)</span></div><div id="ov-qps" class="text-2xl text-cyan-400 tabular-nums">—</div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">Total queries</div><div id="ov-total" class="text-2xl text-white tabular-nums">—</div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">Cache hit rate</div><div id="ov-cache" class="text-2xl text-green-400 tabular-nums">—</div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">Blocked</div><div id="ov-blocked" class="text-2xl text-red-400 tabular-nums">—</div><div id="ov-blocked-pct" class="text-xs text-gray-700 mt-0.5">—</div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">Forwarded</div><div id="ov-forwarded" class="text-2xl tabular-nums">—</div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">SERVFAIL</div><div id="ov-servfail" class="text-2xl text-yellow-500 tabular-nums">—</div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">Latency p50</div><div id="ov-latency" class="text-2xl tabular-nums">—</div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">Uptime</div><div id="ov-uptime" class="text-2xl">—</div></div>
     </div>
-
-    <!-- Secondary stats -->
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-
-      <!-- Latency breakdown -->
-      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Latency</div>
-        <div class="space-y-2">
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">p50</span><span id="ov-p50" class="text-green-400">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">p95</span><span id="ov-p95" class="text-yellow-400">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">p99</span><span id="ov-p99" class="text-red-400">—</span>
-          </div>
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Latency</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">p50</span><span id="ov-p50" class="text-green-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">p95</span><span id="ov-p95" class="text-yellow-500 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">p99</span><span id="ov-p99" class="text-red-400 tabular-nums">—</span></div>
         </div>
       </div>
-
-      <!-- QPS breakdown -->
-      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">QPS</div>
-        <div class="space-y-2">
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">1 min avg</span><span id="ov-qps1m" class="text-cyan-400">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">5 min avg</span><span id="ov-qps5m" class="text-cyan-300">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">peak</span><span id="ov-qpspeak" class="text-white">—</span>
-          </div>
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">QPS</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">1 min avg</span><span id="ov-qps1m" class="text-cyan-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">5 min avg</span><span id="ov-qps5m" class="text-cyan-300 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">peak</span><span id="ov-qpspeak" class="tabular-nums">—</span></div>
         </div>
       </div>
-
-      <!-- Blocking detail -->
-      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Blocking</div>
-        <div class="space-y-2">
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">NXDOMAIN</span><span id="ov-nxdomain" class="text-red-400">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">Refused</span><span id="ov-refused" class="text-orange-400">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">Local hits</span><span id="ov-local" class="text-cyan-300">—</span>
-          </div>
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Blocking</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">NXDOMAIN</span><span id="ov-nxdomain" class="text-red-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Refused</span><span id="ov-refused" class="text-orange-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Local hits</span><span id="ov-local" class="text-cyan-300 tabular-nums">—</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Upstreams</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Healthy</span><span id="ov-ups-healthy" class="text-green-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Total</span><span id="ov-ups-total" class="tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Prefetch</span><span id="ov-prefetch" class="text-gray-400">—</span></div>
         </div>
       </div>
     </div>
-
-    <!-- Cache + refresh indicator -->
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Cache</div>
-        <div class="space-y-2">
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">Entries</span><span id="ov-cache-entries" class="text-green-400">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">Hit rate</span><span id="ov-cache-rate" class="text-green-300">—</span>
-          </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Cache</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Entries</span><span id="ov-cache-entries" class="text-green-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Hit rate</span><span id="ov-cache-rate" class="text-green-300 tabular-nums">—</span></div>
         </div>
       </div>
-      <div class="bg-gray-900 rounded-lg border border-gray-800 p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">
-          DNSSEC <span id="ov-dnssec-status" class="text-gray-600 normal-case font-normal ml-1"></span>
-        </div>
-        <div class="space-y-2">
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">Secure</span><span id="ov-dnssec-secure" class="text-green-400">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">Bogus</span><span id="ov-dnssec-bogus" class="text-red-400">—</span>
-          </div>
-          <div class="flex justify-between text-sm">
-            <span class="text-gray-500">Insecure</span><span id="ov-dnssec-insecure" class="text-gray-400">—</span>
-          </div>
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DNSSEC <span id="ov-dnssec-status" class="text-gray-700 normal-case font-normal ml-1 text-xs"></span></div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Secure</span><span id="ov-dnssec-secure" class="text-green-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Bogus</span><span id="ov-dnssec-bogus" class="text-red-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Insecure</span><span id="ov-dnssec-insecure" class="text-gray-500 tabular-nums">—</span></div>
         </div>
       </div>
     </div>
-
-    <div class="text-right text-xs text-gray-700 mt-3" id="ov-refreshed">—</div>
+    <div class="text-right text-xs text-gray-800 mt-3" id="ov-refreshed">—</div>
   </div>
 
-  <!-- DNS Entries -->
+  <!-- DNS -->
   <div id="tab-dns" class="hidden fade">
-    <div class="flex gap-3 mb-4 flex-wrap">
-      <input id="dns-name" type="text" placeholder="name (e.g. myserver.home.)" class="input w-64" />
-      <select id="dns-type" class="input w-24">
-        <option>A</option><option>AAAA</option><option>CNAME</option><option>MX</option><option>TXT</option>
-      </select>
-      <input id="dns-value" type="text" placeholder="value (e.g. 192.168.1.50)" class="input w-48" />
-      <input id="dns-ttl" type="number" placeholder="TTL" value="300" class="input w-24" />
-      <button onclick="dnsAdd()" class="btn-primary">+ Add</button>
+    <div class="flex gap-2 mb-4 flex-wrap">
+      <input id="dns-name"  type="text"   placeholder="name  (e.g. myserver.home.)" class="input w-60" />
+      <select id="dns-type" class="input w-24"><option>A</option><option>AAAA</option><option>CNAME</option><option>MX</option><option>TXT</option><option>PTR</option><option>SRV</option></select>
+      <input id="dns-value" type="text"   placeholder="value (e.g. 192.168.1.50)"  class="input w-48" />
+      <input id="dns-ttl"   type="number" placeholder="TTL"  value="300"            class="input w-20" />
+      <button onclick="dnsAdd()"  class="btn-primary">+ Add</button>
       <button onclick="loadDns()" class="btn-secondary">↻ Refresh</button>
     </div>
-    <div id="dns-list" class="space-y-2"></div>
+    <div id="dns-list" class="space-y-1.5"></div>
   </div>
 
   <!-- Blacklist -->
   <div id="tab-blacklist" class="hidden fade">
-    <div class="flex gap-3 mb-4 flex-wrap">
+    <div class="flex gap-2 mb-4 flex-wrap">
       <input id="bl-domain" type="text" placeholder="domain (e.g. ads.example.com)" class="input w-72" />
-      <select id="bl-action" class="input w-32">
-        <option value="nxdomain">nxdomain</option>
-        <option value="refuse">refuse</option>
-      </select>
-      <button onclick="blAdd()" class="btn-primary">+ Add</button>
+      <select id="bl-action" class="input w-32"><option value="nxdomain">nxdomain</option><option value="refuse">refuse</option></select>
+      <button onclick="blAdd()"         class="btn-primary">+ Block</button>
       <button onclick="loadBlacklist()" class="btn-secondary">↻ Refresh</button>
-      <span id="bl-count" class="text-xs text-gray-500 self-center"></span>
+      <span id="bl-count" class="text-xs text-gray-600 self-center"></span>
     </div>
     <div id="bl-list" class="space-y-1"></div>
   </div>
 
   <!-- Feeds -->
   <div id="tab-feeds" class="hidden fade">
-    <p class="text-xs text-gray-500 mb-3">Feeds are remote blocklists Runbound downloads and applies automatically every 24 h. Each domain in a feed is blocked with the chosen action.</p>
-
-    <!-- Presets -->
+    <p class="text-xs text-gray-600 mb-4">Remote blocklists, refreshed every 24 h. Each domain is blocked with the configured action.</p>
     <div class="mb-5">
-      <div class="text-xs text-gray-500 mb-2 uppercase tracking-wide">Available presets</div>
-      <div id="feed-presets" class="space-y-1">
-        <span class="text-gray-600 italic text-xs">Loading…</span>
-      </div>
+      <div class="text-xs text-gray-600 mb-2 uppercase tracking-wide">Presets</div>
+      <div id="feed-presets" class="space-y-1.5"><span class="text-gray-700 italic text-xs">Loading…</span></div>
     </div>
-
-    <!-- Custom feed form -->
-    <div class="flex gap-3 mb-2 flex-wrap">
-      <input id="feed-name" type="text" placeholder="name" class="input w-36" />
-      <input id="feed-url"  type="text" placeholder="URL (hosts or domains format)" class="input flex-1 min-w-64" />
-      <select id="feed-format" class="input w-28">
-        <option value="hosts">hosts</option>
-        <option value="adblock">adblock</option>
-      </select>
-      <select id="feed-action" class="input w-32">
-        <option value="nxdomain">nxdomain</option>
-        <option value="refuse">refuse</option>
-      </select>
+    <div class="flex gap-2 mb-2 flex-wrap">
+      <input id="feed-name"   type="text" placeholder="name"                          class="input w-36" />
+      <input id="feed-url"    type="text" placeholder="URL (hosts or adblock format)" class="input flex-1 min-w-64" />
+      <select id="feed-format" class="input w-28"><option value="hosts">hosts</option><option value="adblock">adblock</option></select>
+      <select id="feed-action" class="input w-32"><option value="nxdomain">nxdomain</option><option value="refuse">refuse</option></select>
       <button onclick="feedAdd()" class="btn-primary">+ Add</button>
     </div>
-
-    <!-- Active feeds -->
     <div class="flex items-center justify-between mt-5 mb-2">
-      <span class="text-xs text-gray-500 uppercase tracking-wide">Active feeds</span>
+      <span class="text-xs text-gray-600 uppercase tracking-wide">Active feeds</span>
       <div class="flex gap-2">
-        <button onclick="feedUpdateAll()" class="btn-secondary text-xs">↻ Update all now</button>
-        <button onclick="loadFeeds()" class="btn-secondary text-xs">↻ Refresh list</button>
+        <button onclick="feedUpdateAll()" class="btn-secondary text-xs">↻ Update all</button>
+        <button onclick="loadFeeds()"     class="btn-secondary text-xs">↻ Refresh</button>
       </div>
     </div>
-    <div id="feed-list" class="space-y-2"></div>
+    <div id="feed-list" class="space-y-1.5"></div>
   </div>
 
-  <!-- System -->
-  <div id="tab-system" class="hidden fade">
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 max-w-2xl">
-      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Runtime</div>
-        <div class="space-y-2 text-sm">
-          <div class="flex justify-between"><span class="text-gray-500">Version</span><span id="sys-version" class="text-cyan-300">—</span></div>
-          <div class="flex justify-between"><span class="text-gray-500">Uptime</span><span id="sys-uptime" class="text-white">—</span></div>
-          <div class="flex justify-between"><span class="text-gray-500">Workers</span><span id="sys-workers" class="text-white">—</span></div>
-        </div>
+  <!-- Upstreams -->
+  <div id="tab-upstreams" class="hidden fade">
+    <div class="mb-6">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">Presets</span>
+        <button onclick="loadUpstreamPresets()" class="btn-secondary text-xs">↻ Refresh</button>
       </div>
-      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">XDP</div>
-        <div class="space-y-2 text-sm">
-          <div class="flex justify-between"><span class="text-gray-500">Active</span><span id="sys-xdp-active" class="text-white">—</span></div>
-          <div class="flex justify-between"><span class="text-gray-500">Mode</span><span id="sys-xdp-mode" class="text-white">—</span></div>
-        </div>
-      </div>
-      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">CPU</div>
-        <div class="space-y-2 text-sm">
-          <div class="flex justify-between"><span class="text-gray-500">Cores</span><span id="sys-cpu-cores" class="text-white">—</span></div>
-          <div class="flex justify-between"><span class="text-gray-500">Usage</span><span id="sys-cpu-pct" class="text-yellow-400">—</span></div>
-        </div>
-      </div>
-      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Memory</div>
-        <div class="space-y-2 text-sm">
-          <div class="flex justify-between"><span class="text-gray-500">Total</span><span id="sys-mem-total" class="text-white">—</span></div>
-          <div class="flex justify-between"><span class="text-gray-500">Available</span><span id="sys-mem-avail" class="text-green-400">—</span></div>
-        </div>
-      </div>
+      <div id="upstream-presets" class="grid grid-cols-1 md:grid-cols-3 gap-2"></div>
     </div>
-    <div class="text-right text-xs text-gray-700 mt-3 max-w-2xl" id="sys-refreshed">—</div>
-  </div>
-
-  <!-- About -->
-  <div id="tab-about" class="hidden fade">
-    <div class="max-w-2xl">
-      <div class="flex items-center gap-4 mb-6">
-        <span class="text-cyan-400 font-bold text-3xl tracking-tight">RUNBOUND</span>
-        <span id="about-version" class="bg-gray-800 border border-gray-700 text-cyan-300 text-xs px-2 py-0.5 rounded">v0.6.0</span>
-        <span class="bg-gray-800 border border-gray-700 text-gray-400 text-xs px-2 py-0.5 rounded">AGPL-3.0</span>
+    <div class="flex items-center justify-between mb-3">
+      <span class="text-xs text-gray-600 uppercase tracking-wide">Active resolvers <span id="upstream-health-badge" class="ml-2 font-mono"></span></span>
+      <button onclick="loadUpstreams()" class="btn-secondary text-xs">↻ Refresh</button>
+    </div>
+    <div id="upstream-list" class="space-y-1.5 mb-6"></div>
+    <div class="card max-w-xl">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Add custom resolver</div>
+      <div class="flex flex-wrap gap-2">
+        <input id="ups-addr"     type="text"   placeholder="IP address" class="input flex-1 min-w-32" />
+        <select id="ups-protocol" class="input w-20" onchange="upsProtocolChange(this)"><option value="udp">UDP</option><option value="dot">DoT</option></select>
+        <input id="ups-port"     type="number" placeholder="Port" value="53" min="1" max="65535" class="input w-20" />
+        <input id="ups-name"     type="text"   placeholder="Name (optional)" class="input w-36" />
+        <button onclick="upstreamAdd()" class="btn-primary">+ Add</button>
       </div>
-      <p class="text-gray-400 text-sm mb-6">
-        High-performance DNS server written in Rust. Designed as a drop-in replacement for Unbound with a full REST API, built-in blocklist management, and real-time observability.
-      </p>
-
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-          <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Runtime</div>
-          <div class="space-y-2 text-sm">
-            <div class="flex justify-between">
-              <span class="text-gray-500">Uptime</span><span id="about-uptime" class="text-white">—</span>
-            </div>
-            <div class="flex justify-between">
-              <span class="text-gray-500">Total queries</span><span id="about-total" class="text-white">—</span>
-            </div>
-            <div class="flex justify-between">
-              <span class="text-gray-500">Cache hit rate</span><span id="about-cache" class="text-green-400">—</span>
-            </div>
-            <div class="flex justify-between">
-              <span class="text-gray-500">QPS (1m avg)</span><span id="about-qps" class="text-cyan-400">—</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
-          <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Features</div>
-          <ul class="text-sm text-gray-400 space-y-1">
-            <li class="flex gap-2"><span class="text-cyan-500">›</span> XDP zero-copy receive path</li>
-            <li class="flex gap-2"><span class="text-cyan-500">›</span> REST API + Prometheus metrics</li>
-            <li class="flex gap-2"><span class="text-cyan-500">›</span> Blocklist feeds (hosts/adblock)</li>
-            <li class="flex gap-2"><span class="text-cyan-500">›</span> DNSSEC validation (optional)</li>
-            <li class="flex gap-2"><span class="text-cyan-500">›</span> Memory pressure management</li>
-            <li class="flex gap-2"><span class="text-cyan-500">›</span> HMAC-chained audit log</li>
-          </ul>
-        </div>
-      </div>
-
-      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Links</div>
-        <div class="flex flex-wrap gap-3 text-sm">
-          <a href="https://github.com/redlemonbe/Runbound" target="_blank"
-             class="text-cyan-400 hover:text-cyan-300 border border-gray-700 hover:border-cyan-700 rounded px-3 py-1 transition">
-            GitHub ↗
-          </a>
-          <a href="https://github.com/redlemonbe/Runbound/releases" target="_blank"
-             class="text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded px-3 py-1 transition">
-            Releases ↗
-          </a>
-          <a href="https://github.com/redlemonbe/Runbound/issues" target="_blank"
-             class="text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded px-3 py-1 transition">
-            Issues ↗
-          </a>
-        </div>
-      </div>
-
-      <p class="text-xs text-gray-600">redlemonbe · AGPL-3.0 · Built with Rust, Tokio, Hickory DNS</p>
     </div>
   </div>
 
   <!-- Logs -->
   <div id="tab-logs" class="hidden fade">
-    <div class="flex gap-3 mb-4">
+    <div class="flex gap-3 mb-4 flex-wrap items-center">
       <button onclick="loadLogs()" class="btn-secondary">↻ Refresh</button>
-      <label class="flex items-center gap-2 text-sm text-gray-400">
-        <input type="checkbox" id="logs-auto" onchange="toggleAutoLogs(this)" class="accent-cyan-500" />
-        Auto-refresh (3s)
+      <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+        <input type="checkbox" id="logs-auto" onchange="toggleAutoLogs(this)" class="accent-cyan-500" /> Auto (3 s)
       </label>
-      <span class="text-xs text-gray-500 self-center">Last 100 queries — requires verbosity ≥ 1</span>
+      <span class="text-xs text-gray-700">Last 100 entries — requires verbosity ≥ 1</span>
     </div>
-    <div id="log-list" class="space-y-1 font-mono text-xs"></div>
+    <div id="log-list" class="space-y-0.5 font-mono text-xs"></div>
+  </div>
+
+  <!-- System -->
+  <div id="tab-system" class="hidden fade">
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 max-w-4xl mb-4">
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Runtime</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Version</span><span id="sys-version" class="text-cyan-300">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Uptime</span><span id="sys-uptime">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Workers</span><span id="sys-workers">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Prefetch</span><span id="sys-prefetch" class="text-gray-400">—</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">XDP</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Active</span><span id="sys-xdp-active">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Mode</span><span id="sys-xdp-mode">—</span></div>
+        </div>
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3 mt-4">Upstreams</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Healthy</span><span id="sys-ups-healthy" class="text-green-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Total</span><span id="sys-ups-total" class="tabular-nums">—</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Hardware</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">CPU cores</span><span id="sys-cpu-cores">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">CPU usage</span><span id="sys-cpu-pct" class="text-yellow-500 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Mem total</span><span id="sys-mem-total" class="tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Mem avail</span><span id="sys-mem-avail" class="text-green-400 tabular-nums">—</span></div>
+        </div>
+      </div>
+    </div>
+    <!-- Cache stats -->
+    <div class="card max-w-4xl mb-3">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-xs text-gray-600 uppercase tracking-wide">Cache</div>
+        <button id="btn-flush" onclick="cacheFlush()"
+          class="border border-gray-700 hover:border-red-700 hover:text-red-400 text-gray-500 text-xs px-3 py-1 rounded transition-colors"
+          title="Flush resolver cache (zero-downtime)">
+          ⊘ Flush
+        </button>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-4 text-sm">
+        <div><div class="text-gray-600 text-xs mb-0.5">Entries</div><div id="sys-cache-entries" class="text-green-400 tabular-nums">—</div></div>
+        <div><div class="text-gray-600 text-xs mb-0.5">Hits</div><div id="sys-cache-hits" class="tabular-nums">—</div></div>
+        <div><div class="text-gray-600 text-xs mb-0.5">Misses</div><div id="sys-cache-misses" class="text-gray-400 tabular-nums">—</div></div>
+        <div><div class="text-gray-600 text-xs mb-0.5">Hit rate</div><div id="sys-cache-rate" class="text-green-300 tabular-nums">—</div></div>
+        <div><div class="text-gray-600 text-xs mb-0.5">Evictions</div><div id="sys-cache-evict" class="text-yellow-600 tabular-nums">—</div></div>
+      </div>
+    </div>
+    <!-- Slaves -->
+    <div class="card max-w-4xl mb-3">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-xs text-gray-600 uppercase tracking-wide">Sync / Slaves</div>
+        <button onclick="loadSlaves()" class="btn-secondary text-xs">↻ Refresh</button>
+      </div>
+      <div id="sys-slaves-list" class="text-sm text-gray-600 italic">—</div>
+    </div>
+    <div class="text-xs text-gray-800" id="sys-refreshed">—</div>
+  </div>
+
+  <!-- About + Docs -->
+  <div id="tab-about" class="hidden fade max-w-3xl">
+    <div class="flex items-center gap-3 mb-5">
+      <span class="text-cyan-400 font-bold text-2xl tracking-widest" style="text-shadow:0 0 18px #22d3ee44">RUNBOUND</span>
+      <span id="about-version" class="badge" style="background:#0e2233;color:#67e8f9;border:1px solid #164e63">v0.6.4</span>
+      <span class="badge" style="background:#1a1a1a;color:#6b7280;border:1px solid #374151">AGPL-3.0</span>
+    </div>
+    <p class="text-gray-400 text-sm mb-5 leading-relaxed">
+      High-performance DNS server written in Rust — drop-in replacement for Unbound with a full REST API,
+      built-in blocklist management, XDP zero-copy fast path, and real-time observability.
+    </p>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Runtime</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Uptime</span><span id="about-uptime">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Total queries</span><span id="about-total" class="tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Cache hit rate</span><span id="about-cache" class="text-green-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">QPS (1m avg)</span><span id="about-qps" class="text-cyan-400 tabular-nums">—</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Features</div>
+        <ul class="text-sm text-gray-400 space-y-1.5">
+          <li class="flex gap-2"><span class="text-cyan-600">›</span>XDP zero-copy receive path (AF_XDP)</li>
+          <li class="flex gap-2"><span class="text-cyan-600">›</span>REST API — Bearer auth, rate-limited</li>
+          <li class="flex gap-2"><span class="text-cyan-600">›</span>Blocklist feeds (hosts / adblock)</li>
+          <li class="flex gap-2"><span class="text-cyan-600">›</span>DoT upstreams with TCP+TLS health probe</li>
+          <li class="flex gap-2"><span class="text-cyan-600">›</span>HMAC-SHA256 audit chain on all stores</li>
+          <li class="flex gap-2"><span class="text-cyan-600">›</span>DNSSEC validation (optional)</li>
+        </ul>
+      </div>
+    </div>
+    <div class="card mb-5">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Links</div>
+      <div class="flex flex-wrap gap-2 text-xs">
+        <a href="https://github.com/redlemonbe/Runbound" target="_blank" class="text-cyan-400 hover:text-cyan-300 border border-gray-700 hover:border-cyan-800 rounded px-3 py-1.5 transition-colors">GitHub ↗</a>
+        <a href="https://github.com/redlemonbe/Runbound/releases" target="_blank" class="text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded px-3 py-1.5 transition-colors">Releases ↗</a>
+        <a href="https://github.com/redlemonbe/Runbound/issues" target="_blank" class="text-gray-400 hover:text-gray-200 border border-gray-700 hover:border-gray-500 rounded px-3 py-1.5 transition-colors">Issues ↗</a>
+      </div>
+    </div>
+
+    <!-- API Reference -->
+    <details class="card mb-3" open>
+      <summary class="flex items-center justify-between text-xs text-gray-500 uppercase tracking-wide select-none">
+        <span>API Reference</span><span class="text-gray-700">▾</span>
+      </summary>
+      <div class="mt-4 mb-3 text-xs text-gray-600 space-y-1">
+        <div>Auth: <code class="bg-gray-900 px-1.5 py-0.5 rounded text-cyan-300">Authorization: Bearer &lt;key&gt;</code> — key in <code class="bg-gray-900 px-1 rounded">/etc/runbound/api.key</code></div>
+        <div>Rate limit: <code class="bg-gray-900 px-1 rounded">30 req/s per IP</code>, burst 60 &nbsp;·&nbsp; Max body: <code class="bg-gray-900 px-1 rounded">64 KiB</code> &nbsp;·&nbsp; Port: <code class="bg-gray-900 px-1 rounded">8080</code></div>
+      </div>
+      <div class="space-y-5 mt-4 text-xs">
+
+        <div>
+          <div class="text-gray-700 uppercase tracking-wide mb-2">Health &amp; Stats</div>
+          <div class="space-y-0.5">
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/health</code><span class="text-gray-700">No auth — liveness probe — <code class="bg-gray-900 px-1 rounded">{status, version, uptime_secs}</code></span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/stats</code><span class="text-gray-700">QPS, latency percentiles (p50/p95/p99), counters, DNSSEC stats</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/system</code><span class="text-gray-700">Version, CPU, memory, XDP mode, upstream health, prefetch flag</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/logs</code><span class="text-gray-700">Last 100 query log entries (requires verbosity ≥ 1)</span></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="text-gray-700 uppercase tracking-wide mb-2">DNS Entries</div>
+          <div class="space-y-0.5">
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/dns</code><span class="text-gray-700">List all local records</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/dns</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{name, type, value, ttl}</code> — A AAAA CNAME TXT MX SRV PTR SSHFP TLSA</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-red-600 w-12 shrink-0 font-bold">DEL</span><code class="text-gray-300 w-52 shrink-0">/api/dns/:id</code><span class="text-gray-700">Remove by UUID</span></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="text-gray-700 uppercase tracking-wide mb-2">Blacklist</div>
+          <div class="space-y-0.5">
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/blacklist</code><span class="text-gray-700">List blocked domains</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/blacklist</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{domain, action: "nxdomain|refuse"}</code></span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-red-600 w-12 shrink-0 font-bold">DEL</span><code class="text-gray-300 w-52 shrink-0">/api/blacklist/:id</code><span class="text-gray-700">Remove by UUID</span></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="text-gray-700 uppercase tracking-wide mb-2">Feeds</div>
+          <div class="space-y-0.5">
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/feeds/presets</code><span class="text-gray-700">Built-in preset blocklists</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/feeds</code><span class="text-gray-700">List active feeds with stats</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/feeds</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{name, url, format: "hosts|adblock", action, enabled}</code></span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/feeds/:id/update</code><span class="text-gray-700">Force fetch for one feed</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/feeds/update</code><span class="text-gray-700">Force update all feeds</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-red-600 w-12 shrink-0 font-bold">DEL</span><code class="text-gray-300 w-52 shrink-0">/api/feeds/:id</code><span class="text-gray-700">Remove feed</span></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="text-gray-700 uppercase tracking-wide mb-2">Upstreams</div>
+          <div class="space-y-0.5">
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/presets</code><span class="text-gray-700">9 built-in presets (Cloudflare, Google, Quad9, OpenDNS)</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams</code><span class="text-gray-700">List with health, latency, DNSSEC flag (v0.6.5+), history (v0.6.5+)</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{addr, protocol: "udp|dot", port, name}</code> — no loopback/link-local</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-yellow-600 w-12 shrink-0 font-bold">PATCH</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id</code><span class="text-gray-700">Rename — <code class="bg-gray-900 px-1 rounded">{name}</code> — v0.6.5+</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-red-600 w-12 shrink-0 font-bold">DEL</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id</code><span class="text-gray-700">Remove — 409 LAST_UPSTREAM if last</span></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="text-gray-700 uppercase tracking-wide mb-2">Cache &amp; Control</div>
+          <div class="space-y-0.5">
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/cache/flush</code><span class="text-gray-700">Flush cache — 429 FLUSH_COOLDOWN within 60 s</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/cache/stats</code><span class="text-gray-700">Hit/miss/eviction counters — v0.6.5+</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/reload</code><span class="text-gray-700">Reload config (equivalent to SIGHUP)</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/sync/slaves</code><span class="text-gray-700">List connected slave nodes with sync status</span></div>
+          </div>
+        </div>
+
+      </div>
+    </details>
+    <p class="text-xs text-gray-800 mt-3">Built with Rust · Tokio · Hickory DNS · axum · rustls</p>
   </div>
 
 </div>
 
-<!-- ── Toast ───────────────────────────────────────────────────────── -->
-<div id="toast" class="fixed bottom-6 right-6 hidden bg-gray-800 border border-gray-700 text-sm px-4 py-2 rounded shadow-lg"></div>
+<!-- Toast -->
+<div id="toast" class="fixed bottom-8 right-6 hidden text-xs px-4 py-2 rounded-lg shadow-xl border"></div>
+
+<!-- Copyright -->
+<div class="fixed bottom-2 right-4 text-xs text-gray-800 pointer-events-none select-none">
+  by redlemonbe 2016
+</div>
 
 <style>
-  .input  { background:#1f2937; border:1px solid #374151; border-radius:6px; padding:6px 12px; font-size:13px; outline:none; color:#e5e7eb; }
-  .input:focus { border-color:#22d3ee; }
-  .btn-primary  { background:#0e7490; color:#fff; border-radius:6px; padding:6px 16px; font-size:13px; cursor:pointer; transition:background .15s; }
-  .btn-primary:hover  { background:#0891b2; }
-  .btn-secondary { background:#1f2937; border:1px solid #374151; color:#d1d5db; border-radius:6px; padding:6px 14px; font-size:13px; cursor:pointer; transition:background .15s; }
-  .btn-secondary:hover { background:#374151; }
-  .row { display:flex; align-items:center; justify-content:space-between; background:#111827; border:1px solid #1f2937; border-radius:6px; padding:8px 14px; font-size:13px; }
-  .del { color:#ef4444; cursor:pointer; font-size:12px; padding:2px 8px; border:1px solid #374151; border-radius:4px; }
-  .del:hover { background:#7f1d1d22; }
+  .input  { background:#0f172a; border:1px solid #1e293b; border-radius:6px; padding:5px 10px; font-size:12px; outline:none; color:#e2e8f0; }
+  .input:focus { border-color:#0e7490; }
+  .btn-primary   { background:#0e4f63; color:#e2e8f0; border-radius:6px; padding:5px 14px; font-size:12px; cursor:pointer; transition:background .15s; border:1px solid #0e6680; }
+  .btn-primary:hover   { background:#0f6b89; }
+  .btn-secondary { background:#0f172a; border:1px solid #1e293b; color:#94a3b8; border-radius:6px; padding:5px 12px; font-size:12px; cursor:pointer; transition:background .15s; }
+  .btn-secondary:hover { background:#1a2a3e; border-color:#334155; }
+  .del { color:#dc2626; cursor:pointer; font-size:11px; padding:2px 7px; border:1px solid #1e293b; border-radius:4px; transition:background .1s; }
+  .del:hover { background:#3b0a0a40; border-color:#7f1d1d; }
+  .edit-btn { color:#374151; cursor:pointer; font-size:11px; padding:2px 6px; border:1px solid #1e293b; border-radius:4px; transition:color .1s; }
+  .edit-btn:hover { color:#94a3b8; border-color:#374151; }
 </style>
 
 <script>
-// ── Config ──────────────────────────────────────────────────────────
-let BASE = 'http://localhost:8080';
-let KEY  = '';
-let statsTimer = null;
-let logsTimer  = null;
+let BASE = '/api', KEY = '', statsTimer = null, logsTimer = null;
 
-const h = (hasBody) => {
-  const hdrs = { 'Authorization': `Bearer ${KEY}` };
-  if (hasBody) hdrs['Content-Type'] = 'application/json';
-  return hdrs;
-};
+const h = b => { const o = {'Authorization': `Bearer ${KEY}`}; if (b) o['Content-Type'] = 'application/json'; return o; };
 
 async function api(method, path, body) {
-  const r = await fetch(BASE + path, {
-    method, headers: h(!!body), body: body ? JSON.stringify(body) : undefined
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const r = await fetch(BASE + path, {method, headers: h(!!body), body: body ? JSON.stringify(body) : undefined});
+  if (!r.ok) {
+    let msg = `HTTP ${r.status}`;
+    try { const j = await r.json(); msg = j.error || j.message || msg; } catch(_) {}
+    throw new Error(msg);
+  }
   return r.json().catch(() => ({}));
 }
 
-// ── Connection ──────────────────────────────────────────────────────
 async function connect() {
   BASE = document.getElementById('cfg-url').value.replace(/\/$/, '');
   KEY  = document.getElementById('cfg-key').value.trim();
-  localStorage.setItem('rb-url', BASE);
-  localStorage.setItem('rb-key', KEY);
+  localStorage.setItem('rb-url', BASE); localStorage.setItem('rb-key', KEY);
   try {
     const s = await api('GET', '/stats');
-    document.getElementById('conn-status').textContent = '● connected';
-    document.getElementById('conn-status').className = 'text-xs text-green-400';
-    updateStats(s);
-    clearInterval(statsTimer);
-    statsTimer = setInterval(refreshStats, 5000);
+    setConn(true); updateStats(s);
+    clearInterval(statsTimer); statsTimer = setInterval(refreshStats, 5000);
     toast('Connected');
-  } catch(e) {
-    document.getElementById('conn-status').textContent = '● ' + e.message;
-    document.getElementById('conn-status').className = 'text-xs text-red-400';
-    toast('Connection failed: ' + e.message, true);
-  }
+  } catch(e) { setConn(false, e.message); toast('Connection failed: ' + e.message, true); }
 }
 
-async function refreshStats() {
-  try { updateStats(await api('GET', '/stats')); } catch(_) {}
+function setConn(ok, msg) {
+  const dot = document.getElementById('conn-dot'), lbl = document.getElementById('conn-status');
+  dot.className = ok ? 'w-1.5 h-1.5 rounded-full bg-green-500 blink' : 'w-1.5 h-1.5 rounded-full bg-red-500';
+  lbl.textContent = ok ? 'connected' : (msg || 'error');
+  lbl.className = ok ? 'text-xs text-green-500' : 'text-xs text-red-500';
 }
+
+async function refreshStats() { try { updateStats(await api('GET', '/stats')); } catch(_) {} }
 
 function updateStats(s) {
-  const fmt  = n  => n == null ? '—' : n.toLocaleString();
-  const fmtf = n  => n == null ? '—' : Number(n).toFixed(1);
-  const ms   = n  => n == null ? '—' : n + ' ms';
-  const pct  = n  => n == null ? '—' : fmtf(n) + ' %';
-  const sec  = n  => {
-    if (n == null) return '—';
-    const d = Math.floor(n/86400), h = Math.floor((n%86400)/3600),
-          m = Math.floor((n%3600)/60);
-    return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
-  };
-
-  // Primary cards
-  set('ov-qps',         fmtf(s.qps_1m));
-  set('ov-total',       fmt(s.total));
-  set('ov-cache',       pct(s.cache_hit_rate));
-  set('ov-blocked',     fmt(s.blocked));
-  set('ov-blocked-pct', s.blocked_percent != null ? fmtf(s.blocked_percent) + '% of total' : '');
-  set('ov-forwarded',   fmt(s.forwarded));
-  set('ov-servfail',    fmt(s.servfail));
-  set('ov-latency',     ms(s.latency_p50_ms));
-  set('ov-uptime',      sec(s.uptime_secs));
-
-  // Latency breakdown
-  set('ov-p50',  ms(s.latency_p50_ms));
-  set('ov-p95',  ms(s.latency_p95_ms));
-  set('ov-p99',  ms(s.latency_p99_ms));
-
-  // QPS breakdown
-  set('ov-qps1m',    fmtf(s.qps_1m) + ' /s');
-  set('ov-qps5m',    fmtf(s.qps_5m) + ' /s');
-  set('ov-qpspeak',  fmt(s.qps_peak) + ' /s');
-
-  // Blocking detail
-  set('ov-nxdomain', fmt(s.nxdomain));
-  set('ov-refused',  fmt(s.refused));
-  set('ov-local',    fmt(s.local_hits));
-
-  // Cache
-  set('ov-cache-entries', fmt(s.cache_entries));
-  set('ov-cache-rate',    pct(s.cache_hit_rate));
-
-  // DNSSEC — if all counters are 0 but queries exist, validation is likely off
-  const d = s.dnssec ?? {};
-  const dnssecTotal = (d.secure ?? 0) + (d.bogus ?? 0) + (d.insecure ?? 0);
-  const dnssecOff = dnssecTotal === 0 && (s.total ?? 0) > 0;
-  set('ov-dnssec-secure',   dnssecOff ? '—' : fmt(d.secure));
-  set('ov-dnssec-bogus',    dnssecOff ? '—' : fmt(d.bogus));
-  set('ov-dnssec-insecure', dnssecOff ? '—' : fmt(d.insecure));
-  set('ov-dnssec-status',   dnssecOff ? '· validation off' : '');
-
-  // Header bar
-  set('stat-qps',    fmtf(s.qps_1m) + ' qps');
-  set('stat-total',  fmt(s.total) + ' queries');
-  set('stat-uptime', sec(s.uptime_secs));
-
-  // Refresh timestamp
-  set('ov-refreshed', 'updated ' + new Date().toLocaleTimeString());
-
-  // About tab runtime stats
-  set('about-uptime', sec(s.uptime_secs));
-  set('about-total',  fmt(s.total));
-  set('about-cache',  pct(s.cache_hit_rate));
-  set('about-qps',    fmtf(s.qps_1m) + ' /s');
+  const fmt  = n => n == null ? '—' : n.toLocaleString();
+  const fmtf = n => n == null ? '—' : Number(n).toFixed(1);
+  const ms   = n => n == null ? '—' : n + ' ms';
+  const pct  = n => n == null ? '—' : fmtf(n) + ' %';
+  const sec  = n => { if (n == null) return '—'; const d=Math.floor(n/86400),hh=Math.floor((n%86400)/3600),m=Math.floor((n%3600)/60); return d?`${d}d ${hh}h`:hh?`${hh}h ${m}m`:`${m}m`; };
+  set('ov-qps', fmtf(s.qps_1m)); set('ov-total', fmt(s.total)); set('ov-cache', pct(s.cache_hit_rate));
+  set('ov-blocked', fmt(s.blocked)); set('ov-blocked-pct', s.blocked_percent != null ? fmtf(s.blocked_percent) + '% of total' : '');
+  set('ov-forwarded', fmt(s.forwarded)); set('ov-servfail', fmt(s.servfail)); set('ov-latency', ms(s.latency_p50_ms)); set('ov-uptime', sec(s.uptime_secs));
+  set('ov-p50', ms(s.latency_p50_ms)); set('ov-p95', ms(s.latency_p95_ms)); set('ov-p99', ms(s.latency_p99_ms));
+  set('ov-qps1m', fmtf(s.qps_1m)+' /s'); set('ov-qps5m', fmtf(s.qps_5m)+' /s'); set('ov-qpspeak', fmt(s.qps_peak)+' /s');
+  set('ov-nxdomain', fmt(s.nxdomain)); set('ov-refused', fmt(s.refused)); set('ov-local', fmt(s.local_hits));
+  set('ov-cache-entries', fmt(s.cache_entries)); set('ov-cache-rate', pct(s.cache_hit_rate));
+  const d = s.dnssec ?? {}, tot = (d.secure??0)+(d.bogus??0)+(d.insecure??0), off = tot===0 && (s.total??0)>0;
+  set('ov-dnssec-secure', off?'—':fmt(d.secure)); set('ov-dnssec-bogus', off?'—':fmt(d.bogus)); set('ov-dnssec-insecure', off?'—':fmt(d.insecure));
+  set('ov-dnssec-status', off ? '· validation off' : '');
+  set('stat-qps', fmtf(s.qps_1m)+' qps'); set('stat-total', fmt(s.total)+' queries'); set('stat-uptime', sec(s.uptime_secs));
+  set('ov-refreshed', 'updated '+new Date().toLocaleTimeString());
+  set('about-uptime', sec(s.uptime_secs)); set('about-total', fmt(s.total)); set('about-cache', pct(s.cache_hit_rate)); set('about-qps', fmtf(s.qps_1m)+' /s');
 }
 
-// ── DNS Entries ─────────────────────────────────────────────────────
 async function loadDns() {
   try {
-    const d = await api('GET', '/dns');
-    const entries = d.entries ?? d.dns ?? [];
-    document.getElementById('dns-list').innerHTML = entries.length === 0
-      ? '<p class="text-gray-600 text-sm">No entries.</p>'
-      : entries.map(e => `
-        <div class="row">
-          <span class="text-cyan-300 w-48 truncate">${esc(e.name)}</span>
-          <span class="text-gray-500 w-16">${esc(e.type ?? e.qtype)}</span>
-          <span class="text-gray-300 flex-1">${esc(e.value ?? e.rdata)}</span>
-          <span class="text-gray-600 w-16 text-right">${e.ttl}s</span>
-          <button class="del ml-4" onclick="dnsDelete('${e.id}')">✕</button>
-        </div>`).join('');
-  } catch(e) { toast('DNS load failed: '+e.message, true); }
+    const d = await api('GET', '/dns'), entries = d.entries ?? d.dns ?? [];
+    document.getElementById('dns-list').innerHTML = entries.length === 0 ? empty('No local DNS records.') :
+      entries.map(e => `<div class="row"><span class="text-cyan-300 w-48 truncate">${esc(e.name)}</span><span class="text-gray-600 w-14">${esc(e.type??e.qtype)}</span><span class="text-gray-300 flex-1 truncate">${esc(e.value??e.rdata)}</span><span class="text-gray-700 w-14 text-right text-xs">${e.ttl}s</span><button class="del ml-3" onclick="dnsDelete('${e.id}')">✕</button></div>`).join('');
+  } catch(e) { toast('DNS: '+e.message, true); }
 }
 
 async function dnsAdd() {
-  const name  = document.getElementById('dns-name').value.trim();
-  const type  = document.getElementById('dns-type').value;
-  const value = document.getElementById('dns-value').value.trim();
-  const ttl   = parseInt(document.getElementById('dns-ttl').value) || 300;
-  if (!name || !value) return toast('Name and value are required', true);
-  try {
-    await api('POST', '/dns', { name, type, value, ttl });
-    toast('Entry added');
-    loadDns();
-    document.getElementById('dns-name').value = '';
-    document.getElementById('dns-value').value = '';
-  } catch(e) { toast('Add failed: '+e.message, true); }
+  const name=document.getElementById('dns-name').value.trim(), type=document.getElementById('dns-type').value,
+        value=document.getElementById('dns-value').value.trim(), ttl=parseInt(document.getElementById('dns-ttl').value)||300;
+  if (!name||!value) return toast('Name and value required', true);
+  try { await api('POST','/dns',{name,type,value,ttl}); toast('Entry added'); loadDns(); document.getElementById('dns-name').value=''; document.getElementById('dns-value').value=''; }
+  catch(e) { toast('Add failed: '+e.message, true); }
 }
 
-async function dnsDelete(id) {
-  try { await api('DELETE', '/dns/'+id); toast('Entry deleted'); loadDns(); }
-  catch(e) { toast('Delete failed: '+e.message, true); }
-}
+async function dnsDelete(id) { try { await api('DELETE','/dns/'+id); toast('Deleted'); loadDns(); } catch(e) { toast('Delete failed: '+e.message, true); } }
 
-// ── Blacklist ────────────────────────────────────────────────────────
 async function loadBlacklist() {
   try {
-    const d = await api('GET', '/blacklist');
-    const entries = d.blacklist ?? d.entries ?? [];
+    const d = await api('GET', '/blacklist'), entries = d.blacklist ?? d.entries ?? [];
     document.getElementById('bl-count').textContent = entries.length.toLocaleString() + ' entries';
-    document.getElementById('bl-list').innerHTML = entries.length === 0
-      ? '<p class="text-gray-600 text-sm">No entries.</p>'
-      : entries.map(e => `
-        <div class="row py-1">
-          <span class="text-red-300 flex-1">${esc(e.domain)}</span>
-          <span class="text-gray-600 w-20 text-right text-xs">${e.action}</span>
-          <button class="del ml-4" onclick="blDelete('${e.id}')">✕</button>
-        </div>`).join('');
-  } catch(e) { toast('Blacklist load failed: '+e.message, true); }
+    document.getElementById('bl-list').innerHTML = entries.length === 0 ? empty('No blocked domains.') :
+      entries.map(e => `<div class="row py-1"><span class="text-red-400 flex-1">${esc(e.domain)}</span><span class="text-gray-700 w-20 text-right text-xs">${e.action}</span><button class="del ml-3" onclick="blDelete('${e.id}')">✕</button></div>`).join('');
+  } catch(e) { toast('Blacklist: '+e.message, true); }
 }
 
 async function blAdd() {
-  const domain = document.getElementById('bl-domain').value.trim();
-  const action = document.getElementById('bl-action').value;
-  if (!domain) return toast('Domain is required', true);
-  try {
-    await api('POST', '/blacklist', { domain, action });
-    toast('Domain blocked');
-    loadBlacklist();
-    document.getElementById('bl-domain').value = '';
-  } catch(e) { toast('Add failed: '+e.message, true); }
+  const domain=document.getElementById('bl-domain').value.trim(), action=document.getElementById('bl-action').value;
+  if (!domain) return toast('Domain required', true);
+  try { await api('POST','/blacklist',{domain,action}); toast('Blocked'); loadBlacklist(); document.getElementById('bl-domain').value=''; }
+  catch(e) { toast('Add failed: '+e.message, true); }
 }
 
-async function blDelete(id) {
-  try { await api('DELETE', '/blacklist/'+id); toast('Entry removed'); loadBlacklist(); }
-  catch(e) { toast('Delete failed: '+e.message, true); }
-}
+async function blDelete(id) { try { await api('DELETE','/blacklist/'+id); toast('Removed'); loadBlacklist(); } catch(e) { toast('Delete failed: '+e.message, true); } }
 
-// ── Feeds ────────────────────────────────────────────────────────────
 let presetsCache = [];
 
 async function loadPresets() {
   try {
-    const d = await api('GET', '/feeds/presets');
-    presetsCache = d.presets ?? [];
-    const activeFeedsResp = await api('GET', '/feeds');
-    const activeUrls = new Set((activeFeedsResp.feeds ?? []).map(f => f.url));
-    document.getElementById('feed-presets').innerHTML = presetsCache.length === 0
-      ? '<span class="text-gray-600 italic text-xs">No presets available.</span>'
-      : presetsCache.map((p, i) => {
-          const already = activeUrls.has(p.url);
-          return `
-          <div class="row items-center gap-3 py-2 ${already ? 'opacity-40' : ''}">
-            <div class="flex-1 min-w-0">
-              <span class="text-gray-200 text-sm font-medium">${esc(p.name)}</span>
-              <span class="text-gray-500 text-xs ml-2">${esc(p.format ?? 'hosts')} · ${esc(p.action ?? 'nxdomain')}</span>
-              <div class="text-gray-500 text-xs mt-0.5">${esc(p.description ?? '')}</div>
-            </div>
-            <button onclick="feedAddPreset(${i})"
-              class="btn-primary text-xs px-3 py-1 shrink-0 ${already ? 'pointer-events-none opacity-50' : ''}"
-              ${already ? 'disabled title="Already added"' : ''}>
-              ${already ? '✓ Added' : '+ Add'}
-            </button>
-          </div>`;
-        }).join('');
-  } catch(e) {
-    document.getElementById('feed-presets').innerHTML = '<span class="text-gray-600 italic text-xs">Presets unavailable.</span>';
-  }
+    const d = await api('GET', '/feeds/presets'); presetsCache = d.presets ?? [];
+    const ar = await api('GET', '/feeds'); const activeUrls = new Set((ar.feeds ?? []).map(f => f.url));
+    document.getElementById('feed-presets').innerHTML = presetsCache.length === 0 ? '<span class="text-gray-700 italic text-xs">No presets.</span>' :
+      presetsCache.map((p,i) => { const already=activeUrls.has(p.url); return `<div class="row items-center gap-3 py-2 ${already?'opacity-40':''}"><div class="flex-1 min-w-0"><span class="text-gray-200 text-xs">${esc(p.name)}</span><span class="text-gray-600 text-xs ml-2">${esc(p.format??'hosts')} · ${esc(p.action??'nxdomain')}</span><div class="text-gray-600 text-xs mt-0.5">${esc(p.description??'')}</div></div><button onclick="feedAddPreset(${i})" class="btn-primary text-xs px-3 py-1 shrink-0 ${already?'pointer-events-none opacity-50':''}" ${already?'disabled':''}>${already?'✓':'+ Add'}</button></div>`; }).join('');
+  } catch(_) { document.getElementById('feed-presets').innerHTML = '<span class="text-gray-700 italic text-xs">Presets unavailable.</span>'; }
 }
 
 async function feedAddPreset(i) {
-  const p = presetsCache[i];
-  if (!p) return;
-  try {
-    const r = await api('POST', '/feeds', { name: p.name, url: p.url, format: p.format ?? 'hosts', action: p.action ?? 'nxdomain', enabled: true });
-    toast(`"${p.name}" added — fetching domains…`);
-    // Auto-trigger update so the feed is populated immediately
-    if (r.feed?.id) {
-      try { await api('POST', '/feeds/' + r.feed.id + '/update'); } catch(_) {}
-    }
-    setTimeout(() => { loadPresets(); loadFeeds(); }, 1500);
-  } catch(e) { toast('Add failed: '+e.message, true); }
+  const p=presetsCache[i]; if(!p) return;
+  try { const r=await api('POST','/feeds',{name:p.name,url:p.url,format:p.format??'hosts',action:p.action??'nxdomain',enabled:true}); toast(`"${p.name}" added`); if(r.feed?.id){try{await api('POST','/feeds/'+r.feed.id+'/update');}catch(_){}} setTimeout(()=>{loadPresets();loadFeeds();},1200); }
+  catch(e) { toast('Add failed: '+e.message, true); }
 }
 
 async function loadFeeds() {
   try {
-    const d = await api('GET', '/feeds');
-    const feeds = d.feeds ?? [];
-    document.getElementById('feed-list').innerHTML = feeds.length === 0
-      ? '<p class="text-gray-600 text-sm">No feeds configured. Use a preset above or add a custom URL.</p>'
-      : feeds.map(f => {
-          const updated = f.last_updated
-            ? new Date(f.last_updated).toLocaleString([], {dateStyle:'short', timeStyle:'short'})
-            : 'never';
-          return `
-          <div class="row gap-2">
-            <span class="w-3 h-3 rounded-full shrink-0 ${!f.enabled ? 'bg-gray-600' : (f.entry_count ?? 0) === 0 ? 'bg-red-500' : 'bg-green-500'}" title="${!f.enabled ? 'disabled' : (f.entry_count ?? 0) === 0 ? 'enabled — 0 entries (sync error?)' : 'enabled'}"></span>
-            <span class="text-cyan-300 w-32 truncate font-bold shrink-0">${esc(f.name)}</span>
-            <span class="text-gray-400 flex-1 truncate text-xs">${esc(f.url)}</span>
-            <span class="text-gray-500 w-20 text-right text-xs shrink-0">${(f.entry_count??0).toLocaleString()} entries</span>
-            <span class="text-gray-600 w-16 text-right text-xs shrink-0">${esc(f.action)}</span>
-            <span class="text-gray-700 w-28 text-right text-xs shrink-0" title="last updated">↻ ${updated}</span>
-            <button onclick="feedUpdate('${f.id}')" class="btn-secondary text-xs px-2 py-0.5 shrink-0" title="Force update now">↻</button>
-            <button class="del shrink-0" onclick="feedDelete('${f.id}')">✕</button>
-          </div>`;
-        }).join('');
-  } catch(e) { toast('Feeds load failed: '+e.message, true); }
+    const d=await api('GET','/feeds'), feeds=d.feeds??[];
+    document.getElementById('feed-list').innerHTML = feeds.length===0 ? empty('No feeds. Use a preset or add a custom URL.') :
+      feeds.map(f=>{const upd=f.last_updated?new Date(f.last_updated).toLocaleString([],{dateStyle:'short',timeStyle:'short'}):'never';const dot=!f.enabled?'bg-gray-700':(f.entry_count??0)===0?'bg-red-600':'bg-green-500';return `<div class="row gap-2"><span class="w-2.5 h-2.5 rounded-full shrink-0 ${dot}"></span><span class="text-cyan-300 w-28 truncate shrink-0 text-xs font-mono">${esc(f.name)}</span><span class="text-gray-500 flex-1 truncate text-xs">${esc(f.url)}</span><span class="text-gray-600 w-20 text-right text-xs shrink-0">${(f.entry_count??0).toLocaleString()} entries</span><span class="text-gray-700 w-16 text-right text-xs shrink-0">${esc(f.action)}</span><span class="text-gray-800 w-24 text-right text-xs shrink-0">↻ ${upd}</span><button onclick="feedUpdate('${f.id}')" class="btn-secondary text-xs px-2 py-0.5 shrink-0">↻</button><button class="del shrink-0" onclick="feedDelete('${f.id}')">✕</button></div>`;}).join('');
+  } catch(e) { toast('Feeds: '+e.message, true); }
 }
 
 async function feedAdd() {
-  const name   = document.getElementById('feed-name').value.trim();
-  const url    = document.getElementById('feed-url').value.trim();
-  const format = document.getElementById('feed-format').value;
-  const action = document.getElementById('feed-action').value;
-  if (!name || !url) return toast('Name and URL are required', true);
+  const name=document.getElementById('feed-name').value.trim(), url=document.getElementById('feed-url').value.trim(),
+        format=document.getElementById('feed-format').value, action=document.getElementById('feed-action').value;
+  if(!name||!url) return toast('Name and URL required', true);
+  try { await api('POST','/feeds',{name,url,format,action,enabled:true}); toast('Feed added'); loadFeeds(); document.getElementById('feed-name').value=''; document.getElementById('feed-url').value=''; }
+  catch(e) { toast('Add failed: '+e.message, true); }
+}
+
+async function feedUpdate(id) { try { await api('POST','/feeds/'+id+'/update'); toast('Update triggered'); setTimeout(loadFeeds,1500); } catch(e) { toast('Update failed: '+e.message, true); } }
+async function feedUpdateAll() { try { await api('POST','/feeds/update'); toast('All feeds updating…'); setTimeout(loadFeeds,1500); } catch(e) { toast('Update failed: '+e.message, true); } }
+async function feedDelete(id) { try { await api('DELETE','/feeds/'+id); toast('Feed removed'); loadFeeds(); } catch(e) { toast('Delete failed: '+e.message, true); } }
+
+let upstreamPresetsCache = [];
+
+async function loadUpstreamPresets() {
   try {
-    await api('POST', '/feeds', { name, url, format, action, enabled: true });
-    toast('Feed added');
-    loadFeeds();
-    document.getElementById('feed-name').value = '';
-    document.getElementById('feed-url').value = '';
-  } catch(e) { toast('Add failed: '+e.message, true); }
+    const data=await api('GET','/upstreams/presets'); upstreamPresetsCache=Array.isArray(data)?data:(data.presets??[]);
+    const ar=await api('GET','/upstreams'); const activeKeys=new Set((ar.upstreams??[]).map(u=>u.addr+'|'+u.protocol+'|'+u.port));
+    document.getElementById('upstream-presets').innerHTML = upstreamPresetsCache.length===0 ? '<span class="text-gray-700 italic text-xs col-span-3">No presets.</span>' :
+      upstreamPresetsCache.map((p,i)=>{ const key=p.addr+'|'+p.protocol+'|'+(p.port??(p.protocol==='dot'?853:53)); const already=activeKeys.has(key); const portStr=p.port?':'+p.port:''; const proto=p.protocol==='dot'?'<span class="badge badge-dot">DoT</span>':'<span class="badge badge-udp">UDP</span>'; return `<div class="row items-center gap-2 py-2 ${already?'opacity-30':''}"><div class="flex-1 min-w-0"><div class="flex items-center gap-2"><span class="text-gray-200 text-xs">${esc(p.name)}</span>${proto}</div><div class="text-cyan-400 text-xs font-mono mt-0.5">${esc(p.addr)}${portStr}</div><div class="text-gray-700 text-xs">${esc(p.description??'')}</div></div><button onclick="upstreamAddPreset(${i})" class="btn-primary text-xs px-2 py-1 shrink-0 ${already?'pointer-events-none':''}" ${already?'disabled':''}>${already?'✓':'+ Add'}</button></div>`; }).join('');
+  } catch(_) { document.getElementById('upstream-presets').innerHTML = '<span class="text-gray-700 italic text-xs">Presets unavailable.</span>'; }
 }
 
-async function feedUpdate(id) {
-  try { await api('POST', '/feeds/'+id+'/update'); toast('Feed update triggered'); setTimeout(loadFeeds, 1500); }
-  catch(e) { toast('Update failed: '+e.message, true); }
+async function upstreamAddPreset(i) {
+  const p=upstreamPresetsCache[i]; if(!p) return;
+  try { const body={addr:p.addr,protocol:p.protocol,name:p.name}; if(p.port) body.port=p.port; await api('POST','/upstreams',body); toast(`"${p.name}" added`); setTimeout(()=>{loadUpstreamPresets();loadUpstreams();},500); }
+  catch(e) { toast('Add failed: '+e.message, true); }
 }
 
-async function feedUpdateAll() {
-  try { await api('POST', '/feeds/update'); toast('All feeds update triggered'); setTimeout(loadFeeds, 1500); }
-  catch(e) { toast('Update failed: '+e.message, true); }
+function renderSparkline(history) {
+  if (!history || history.length === 0) return '';
+  const max = Math.max(...history, 1);
+  const bars = history.map(v => { const h = Math.max(3, Math.round((v/max)*14)); return `<span style="height:${h}px" title="${v} ms"></span>`; }).join('');
+  return `<span class="sparkbar">${bars}</span>`;
 }
 
-async function feedDelete(id) {
-  try { await api('DELETE', '/feeds/'+id); toast('Feed removed'); loadFeeds(); }
-  catch(e) { toast('Delete failed: '+e.message, true); }
+function dnssecBadge(v) {
+  if (v === true)  return '<span class="badge badge-dnssec-ok" title="DNSSEC validated by this upstream">DNSSEC</span>';
+  if (v === false) return '<span class="badge badge-dnssec-no" title="No DNSSEC validation">DNSSEC</span>';
+  return '';
 }
 
-// ── Logs ─────────────────────────────────────────────────────────────
+async function loadUpstreams() {
+  try {
+    const d=await api('GET','/upstreams'), upstreams=d.upstreams??[], healthy=d.healthy??0, total=d.total??upstreams.length;
+    const badge=document.getElementById('upstream-health-badge');
+    if(badge){badge.textContent=`${healthy}/${total}`;badge.className=healthy===total&&total>0?'ml-2 font-mono text-green-400':healthy===0?'ml-2 font-mono text-red-400':'ml-2 font-mono text-yellow-500';}
+    document.getElementById('upstream-list').innerHTML = upstreams.length===0 ? empty('No upstreams configured.') :
+      upstreams.map(u=>{
+        const latency=u.latency_ms!=null?u.latency_ms+' ms':'—';
+        const lastCheck=u.last_check&&u.last_check!==''?new Date(u.last_check).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'—';
+        const port=u.port??(u.protocol==='dot'?853:53);
+        const hDot=u.healthy?'<span class="w-2 h-2 rounded-full shrink-0 bg-green-500" title="healthy"></span>':'<span class="w-2 h-2 rounded-full shrink-0 bg-red-600" title="unhealthy"></span>';
+        const proto=u.protocol==='dot'?'<span class="badge badge-dot">DoT</span>':'<span class="badge badge-udp">UDP</span>';
+        const spark=renderSparkline(u.latency_history);
+        const dns=dnssecBadge(u.dnssec_supported);
+        const name=u.name?`<span class="text-gray-400 truncate text-xs">${esc(u.name)}</span>`:'<span class="text-gray-700 italic text-xs">unnamed</span>';
+        return `<div class="row gap-2">${hDot}<span class="text-cyan-400 font-mono shrink-0 text-xs w-36">${esc(u.addr)}<span class="text-gray-700">:${port}</span></span>${proto}${dns}<span class="flex-1 min-w-0 flex items-center gap-1.5">${name}<button class="edit-btn shrink-0" onclick="upstreamRename('${u.id}','${esc(u.name||'')}')" title="Rename">✎</button></span>${spark?`<span class="shrink-0">${spark}</span>`:''}<span class="text-gray-600 w-14 text-right text-xs shrink-0 tabular-nums">${latency}</span><span class="text-gray-800 w-20 text-right text-xs shrink-0">↻ ${lastCheck}</span><button class="del shrink-0" onclick="upstreamDelete('${u.id}')">✕</button></div>`;
+      }).join('');
+  } catch(e) { toast('Upstreams: '+e.message, true); }
+}
+
+function upsProtocolChange(sel) { const p=document.getElementById('ups-port'); if(p) p.value=sel.value==='dot'?'853':'53'; }
+
+async function upstreamAdd() {
+  const addr=document.getElementById('ups-addr').value.trim(), protocol=document.getElementById('ups-protocol').value,
+        name=document.getElementById('ups-name').value.trim()||undefined, portVal=parseInt(document.getElementById('ups-port').value), port=isNaN(portVal)?undefined:portVal;
+  if(!addr) return toast('IP address required', true);
+  try { await api('POST','/upstreams',{addr,protocol,name,port}); toast('Upstream added'); document.getElementById('ups-addr').value=''; document.getElementById('ups-name').value=''; document.getElementById('ups-port').value='53'; loadUpstreams(); }
+  catch(e) { toast('Add failed: '+e.message, true); }
+}
+
+async function upstreamRename(id, current) {
+  const name = prompt('Rename upstream:', current); if (name === null) return;
+  try { await api('PATCH', '/upstreams/' + id, {name: name.trim() || ''}); toast('Renamed'); loadUpstreams(); }
+  catch(e) { toast('Rename: '+e.message, true); }
+}
+
+async function upstreamDelete(id) { try { await api('DELETE','/upstreams/'+id); toast('Removed'); loadUpstreams(); } catch(e) { toast('Delete failed: '+e.message, true); } }
+
 async function loadLogs() {
   try {
-    const d = await api('GET', '/logs');
-    const logs = d.logs ?? d.entries ?? [];
-    const rcodeColor = r => r === 'NOERROR' ? 'text-green-400' :
-                            r === 'NXDOMAIN' ? 'text-yellow-400' : 'text-red-400';
-    document.getElementById('log-list').innerHTML = logs.length === 0
-      ? '<p class="text-gray-600">No logs yet — requires verbosity: 1 or higher.</p>'
-      : [...logs].reverse().map(l => `
-        <div class="flex gap-3 items-center py-0.5 border-b border-gray-900">
-          <span class="text-gray-600 w-20 shrink-0">${(l.timestamp??'').slice(11,19)}</span>
-          <span class="text-gray-500 w-28 truncate shrink-0">${esc(l.client??'')}</span>
-          <span class="text-cyan-300 flex-1 truncate">${esc(l.name??'')}</span>
-          <span class="text-gray-500 w-12 shrink-0">${esc(l.qtype??'')}</span>
-          <span class="${rcodeColor(l.rcode)} w-20 shrink-0">${esc(l.rcode??'')}</span>
-          <span class="text-gray-600 w-16 text-right shrink-0">${l.ms != null ? l.ms+'ms' : ''}</span>
-        </div>`).join('');
-  } catch(e) { toast('Logs load failed: '+e.message, true); }
+    const d=await api('GET','/logs'), logs=d.logs??d.entries??[];
+    const col=r=>r==='NOERROR'?'text-green-400':r==='NXDOMAIN'?'text-yellow-500':'text-red-400';
+    document.getElementById('log-list').innerHTML = logs.length===0 ? '<p class="text-gray-700">No logs — requires verbosity ≥ 1.</p>' :
+      [...logs].reverse().map(l=>`<div class="flex gap-3 items-baseline py-0.5 border-b border-gray-900/60 hover:bg-gray-900/40 transition-colors"><span class="text-gray-700 w-20 shrink-0">${(l.timestamp??'').slice(11,19)}</span><span class="text-gray-600 w-28 truncate shrink-0">${esc(l.client??'')}</span><span class="text-cyan-400 flex-1 truncate">${esc(l.name??'')}</span><span class="text-gray-600 w-12 shrink-0">${esc(l.qtype??'')}</span><span class="${col(l.rcode)} w-20 shrink-0">${esc(l.rcode??'')}</span><span class="text-gray-700 w-14 text-right shrink-0 tabular-nums">${l.ms!=null?l.ms+' ms':''}</span></div>`).join('');
+  } catch(e) { toast('Logs: '+e.message, true); }
 }
 
-function toggleAutoLogs(el) {
-  clearInterval(logsTimer);
-  if (el.checked) { loadLogs(); logsTimer = setInterval(loadLogs, 3000); }
-}
+function toggleAutoLogs(el) { clearInterval(logsTimer); if(el.checked){loadLogs();logsTimer=setInterval(loadLogs,3000);} }
 
-// ── System ───────────────────────────────────────────────────────────
 async function loadSystem() {
   try {
-    const s = await api('GET', '/system');
-    const sec = n => {
-      if (n == null) return '—';
-      const d = Math.floor(n/86400), h = Math.floor((n%86400)/3600), m = Math.floor((n%3600)/60);
-      return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
-    };
-    set('sys-version',   s.version ?? '—');
-    set('sys-uptime',    sec(s.uptime_secs));
-    set('sys-workers',   s.workers ?? '—');
-    set('sys-xdp-active', s.xdp_active ? 'yes' : 'no');
-    set('sys-xdp-mode',  s.xdp_mode ?? (s.xdp_active ? 'active' : 'disabled'));
-    set('sys-cpu-cores', s.cpu_cores ?? '—');
-    set('sys-cpu-pct',   s.cpu_percent != null ? s.cpu_percent.toFixed(1) + ' %' : '—');
-    set('sys-mem-total', s.mem_total_mb != null ? s.mem_total_mb.toLocaleString() + ' MB' : '—');
-    set('sys-mem-avail', s.mem_avail_mb != null ? s.mem_avail_mb.toLocaleString() + ' MB' : '—');
-    set('about-version', s.version ?? '—');
-    const badge = document.getElementById('about-version');
-    if (badge) badge.textContent = s.version ? 'v' + s.version : 'v0.6.0';
-    set('sys-refreshed', 'updated ' + new Date().toLocaleTimeString());
-  } catch(e) { toast('System load failed: '+e.message, true); }
-}
-
-// ── Reload ───────────────────────────────────────────────────────────
-async function doReload() {
+    const s=await api('GET','/system');
+    const sec=n=>{if(n==null)return'—';const d=Math.floor(n/86400),hh=Math.floor((n%86400)/3600),m=Math.floor((n%3600)/60);return d?`${d}d ${hh}h`:hh?`${hh}h ${m}m`:`${m}m`;};
+    set('sys-version',s.version??'—'); set('sys-uptime',sec(s.uptime_secs)); set('sys-workers',s.workers??'—');
+    set('sys-prefetch',s.prefetch_enabled!=null?(s.prefetch_enabled?'enabled':'disabled'):'—');
+    set('sys-xdp-active',s.xdp_active?'yes':'no'); set('sys-xdp-mode',s.xdp_mode??(s.xdp_active?'active':'disabled'));
+    set('sys-ups-healthy',s.upstreams_healthy??'—'); set('sys-ups-total',s.upstreams_total??'—');
+    set('sys-cpu-cores',s.cpu_cores??'—'); set('sys-cpu-pct',s.cpu_percent!=null?s.cpu_percent.toFixed(1)+' %':'—');
+    set('sys-mem-total',s.mem_total_mb!=null?s.mem_total_mb.toLocaleString()+' MB':'—');
+    set('sys-mem-avail',s.mem_avail_mb!=null?s.mem_avail_mb.toLocaleString()+' MB':'—');
+    set('ov-ups-healthy',s.upstreams_healthy??'—'); set('ov-ups-total',s.upstreams_total??'—');
+    set('ov-prefetch',s.prefetch_enabled!=null?(s.prefetch_enabled?'on':'off'):'—');
+    const badge=document.getElementById('about-version'); if(badge&&s.version) badge.textContent='v'+s.version;
+    if(s.cache_entries!=null) set('sys-cache-entries',s.cache_entries.toLocaleString());
+    set('sys-refreshed','updated '+new Date().toLocaleTimeString());
+  } catch(e) { toast('System: '+e.message, true); }
   try {
-    await api('POST', '/reload');
-    toast('Config reloaded');
-  } catch(e) { toast('Reload failed: '+e.message, true); }
+    const c=await api('GET','/cache/stats');
+    set('sys-cache-entries',c.entries!=null?c.entries.toLocaleString():'—');
+    set('sys-cache-hits',c.hits!=null?c.hits.toLocaleString():'—');
+    set('sys-cache-misses',c.misses!=null?c.misses.toLocaleString():'—');
+    set('sys-cache-rate',c.hit_rate_pct!=null?c.hit_rate_pct.toFixed(1)+' %':'—');
+    set('sys-cache-evict',c.evictions!=null?c.evictions.toLocaleString():'—');
+  } catch(_) {}
 }
 
-// ── Tabs ─────────────────────────────────────────────────────────────
+async function loadSlaves() {
+  const el=document.getElementById('sys-slaves-list');
+  try {
+    const d=await api('GET','/sync/slaves'), slaves=d.slaves??[];
+    if(slaves.length===0){el.innerHTML=d.note?`<span class="text-gray-700">${esc(d.note)}</span>`:'<span class="text-gray-700">No slaves connected.</span>';return;}
+    const col=s=>s==='connected'?'text-green-400':s==='stale'?'text-yellow-500':'text-red-400';
+    el.innerHTML=slaves.map(s=>`<div class="row gap-3 py-1 mb-1"><span class="${col(s.status)} w-20 text-xs shrink-0">${esc(s.status)}</span><span class="text-cyan-300 font-mono flex-1 text-xs">${esc(s.addr)}</span><span class="text-gray-600 text-xs w-24 text-right">${s.last_seen_secs??'?'}s ago</span><span class="text-gray-700 text-xs w-16 text-right">${s.zones_synced??0} zones</span><span class="text-gray-800 text-xs w-14 text-right">${esc(s.version??'')}</span></div>`).join('');
+  } catch(_) { if(el) el.innerHTML='<span class="text-gray-700 italic">Slave info unavailable.</span>'; }
+}
+
+async function cacheFlush() {
+  const btn=document.getElementById('btn-flush');
+  try {
+    const r=await api('POST','/cache/flush'); toast(`Cache flushed — ${r.flushed_entries??0} entries cleared`);
+    if(btn){btn.disabled=true;btn.classList.add('opacity-30','cursor-not-allowed');setTimeout(()=>{btn.disabled=false;btn.classList.remove('opacity-30','cursor-not-allowed');},60000);}
+    loadSystem();
+  } catch(e) { toast(e.message.includes('FLUSH_COOLDOWN')||e.message.includes('429')?'Cache flush on cooldown — wait 60 s':'Flush failed: '+e.message, true); }
+}
+
+async function doReload() { try { await api('POST','/reload'); toast('Config reloaded'); } catch(e) { toast('Reload failed: '+e.message, true); } }
+
 function showTab(name, btn) {
-  ['overview','dns','blacklist','feeds','logs','system','about'].forEach(t => {
-    document.getElementById('tab-'+t).classList.add('hidden');
-  });
-  document.querySelectorAll('.tab-active').forEach(b => {
-    b.classList.remove('tab-active');
-    b.classList.add('text-gray-500');
-  });
-  const el = document.getElementById('tab-'+name);
-  el.classList.remove('hidden');
-  el.classList.add('fade');
+  ['overview','dns','blacklist','feeds','upstreams','logs','system','about'].forEach(t => document.getElementById('tab-'+t).classList.add('hidden'));
+  document.querySelectorAll('.tab-active').forEach(b => b.classList.remove('tab-active'));
+  const el=document.getElementById('tab-'+name); el.classList.remove('hidden'); el.classList.add('fade');
   btn.classList.add('tab-active');
-  btn.classList.remove('text-gray-500');
-  if (name === 'dns')       loadDns();
-  if (name === 'blacklist') loadBlacklist();
-  if (name === 'feeds')     { loadPresets(); loadFeeds(); }
-  if (name === 'logs')      loadLogs();
-  if (name === 'system')    loadSystem();
+  if(name==='dns')       loadDns();
+  if(name==='blacklist') loadBlacklist();
+  if(name==='feeds')     { loadPresets(); loadFeeds(); }
+  if(name==='upstreams') { loadUpstreamPresets(); loadUpstreams(); }
+  if(name==='logs')      loadLogs();
+  if(name==='system')    { loadSystem(); loadSlaves(); }
 }
 
-// ── Utils ─────────────────────────────────────────────────────────────
-function set(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
-function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function set(id,v) { const el=document.getElementById(id); if(el) el.textContent=v; }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;').replace(/"/g,'&quot;'); }
+function empty(msg) { return `<p class="text-gray-700 text-sm py-2">${msg}</p>`; }
 
 let toastTimer;
 function toast(msg, err=false) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = `fixed bottom-6 right-6 text-sm px-4 py-2 rounded shadow-lg border
-    ${err ? 'bg-red-950 border-red-800 text-red-300' : 'bg-gray-800 border-gray-700 text-gray-200'}`;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.className = el.className + ' hidden', 3000);
+  const el=document.getElementById('toast');
+  el.textContent=msg;
+  el.className=`fixed bottom-8 right-6 text-xs px-4 py-2 rounded-lg shadow-xl border ${err?'bg-red-950 border-red-900 text-red-300':'bg-gray-900 border-gray-700 text-gray-200'}`;
+  el.style.animation='none'; void el.offsetWidth; el.style.animation='slideUp .2s ease';
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>el.classList.add('hidden'),3500);
 }
 
-// ── Init ──────────────────────────────────────────────────────────────
 window.onload = () => {
-  const url = localStorage.getItem('rb-url');
-  const key = localStorage.getItem('rb-key');
-  if (url) document.getElementById('cfg-url').value = url;
-  if (key) document.getElementById('cfg-key').value = key;
-  if (url && key) connect();
-  else {
-    const u = document.getElementById("cfg-url").value;
-    const k = document.getElementById("cfg-key").value;
-    if (u && k) connect();
-  }
+  const url=localStorage.getItem('rb-url'), key=localStorage.getItem('rb-key');
+  if(url) document.getElementById('cfg-url').value=url;
+  if(key) document.getElementById('cfg-key').value=key;
+  const u=document.getElementById('cfg-url').value, k=document.getElementById('cfg-key').value;
+  if(u&&k) connect();
 };
 </script>
-
+<script>
+/* dev-autoreload — retire en prod */
+(function(){
+  let mod='';
+  setInterval(async()=>{
+    try{
+      const r=await fetch(location.pathname,{method:'HEAD',cache:'no-store'});
+      const m=r.headers.get('last-modified')||r.headers.get('etag')||'';
+      if(mod&&m&&m!==mod)location.reload();
+      if(m)mod=m;
+    }catch(_){}
+  },1500);
+})();
+</script>
 </body>
 </html>
