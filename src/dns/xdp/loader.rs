@@ -21,6 +21,10 @@ use aya::programs::xdp::XdpLinkId;
 /// heap-allocated Vec inside `XdpHandle::load()` before calling `Ebpf::load()`.
 static XDP_PROG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns_xdp.o"));
 
+/// XDP attachment mode — reported by GET /api/system as `xdp_mode`.
+#[derive(Clone, Copy, Debug)]
+pub enum XdpMode { Drv, Skb }
+
 /// RAII handle for the loaded XDP program.
 ///
 /// Dropping this struct detaches the XDP program from the NIC and destroys
@@ -29,6 +33,7 @@ static XDP_PROG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns_xdp.o"));
 pub struct XdpHandle {
     bpf:     Ebpf,
     link_id: Option<XdpLinkId>,
+    pub mode: XdpMode,
 }
 
 impl Drop for XdpHandle {
@@ -79,14 +84,15 @@ impl XdpHandle {
 
         // Try DRV mode (zero-copy capable drivers). Fall back to SKB mode
         // (works on every NIC, slightly higher latency due to SKB allocation).
-        let link_id = program
+        let (link_id, mode) = program
             .attach(iface, XdpFlags::DRV_MODE)
-            .or_else(|_| program.attach(iface, XdpFlags::SKB_MODE))
+            .map(|id| (id, XdpMode::Drv))
+            .or_else(|_| program.attach(iface, XdpFlags::SKB_MODE).map(|id| (id, XdpMode::Skb)))
             .map_err(|e| format!("XDP attach to {iface} failed: {e}"))?;
 
-        tracing::info!(iface = %iface, link_id = ?link_id, "XDP program attached");
+        tracing::info!(iface = %iface, link_id = ?link_id, mode = ?mode, "XDP program attached");
 
-        Ok(XdpHandle { bpf, link_id: Some(link_id) })
+        Ok(XdpHandle { bpf, link_id: Some(link_id), mode })
     }
 
     /// Register an AF_XDP socket with the XSKMAP at the given queue index.

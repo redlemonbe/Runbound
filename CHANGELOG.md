@@ -28,6 +28,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   rejects unknown protocols (400) and invalid IP addresses (400) before any
   processing; `DELETE /api/upstreams/:id` returns 404 on unknown UUID.
 
+### Added
+
+- **`POST /api/cache/flush`** — Rebuilds the hickory `TokioResolver` with an empty
+  cache and swaps it in atomically via `ArcSwap`. Returns
+  `{"status":"ok","flushed_entries":N}`. Since hickory has no native flush API,
+  rebuild-and-swap is the safest zero-downtime approach.
+  (`src/api/mod.rs`, `src/dns/server.rs`)
+
+- **`GET /api/sync/slaves`** — Lists slave nodes that contacted the master in the
+  last 5 minutes. Returns `{"slaves":[…],"total":N}`. Returns an empty list with
+  a note when the node is not configured as master.
+  (`src/api/mod.rs`, `src/sync.rs`)
+
+- **Upstream CRUD via REST API**
+  - `POST /api/upstreams` — Add a runtime resolver (`{"addr","protocol","name"}`).
+    Validates that `addr` is a valid IP and `protocol` is `"udp"` or `"dot"`.
+    Rebuilds the resolver immediately after insertion.
+  - `DELETE /api/upstreams/:id` — Remove a resolver by UUID. Rebuilds the resolver.
+  - `GET /api/upstreams/presets` — Returns a list of nine well-known resolvers
+    (Cloudflare, Google, Quad9, OpenDNS — UDP and DoT variants).
+  (`src/api/mod.rs`, `src/upstreams.rs`, `src/dns/server.rs`)
+
+- **`GET /health` cleanup** — Response now contains `version` (from
+  `CARGO_PKG_VERSION`) and `uptime_secs`. The `hsm` field has been removed; HSM
+  status is available via `GET /api/config`.
+  (`src/api/mod.rs`)
+
+- **`last_error` field on feeds** — Each feed in `GET /api/feeds` now includes
+  `"last_error": null` when the last update succeeded, or an error string when it
+  failed. The field is persisted to `feeds.json`.
+  (`src/feeds/mod.rs`)
+
+- **Shared `SharedResolver`** — The DNS resolver is now created once in
+  `build_and_launch` and shared between the DNS server handler, the memory-pressure
+  guard, and all API handlers that need to rebuild it. This enables cache flush and
+  upstream CRUD without restarting the server.
+  (`src/dns/server.rs`, `src/main.rs`, `src/api/mod.rs`)
+
 ### Fixed
 
 - **`manual_map` pattern** — `if let Some(pos) = ... { Some(...) } else { None }`
@@ -61,34 +99,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 - **`GET /health` response cleaned** — Removed `hsm` field (vestige). Response
   is now `{"status":"ok","version":"0.6.1","uptime_secs":N}`. (`src/api/mod.rs`)
-
-### Added
-
-- **`POST /api/cache/flush`** — Atomically rebuilds the hickory resolver with
-  an empty cache. Returns `{"status":"ok","flushed_entries":N}`. Caller IP
-  logged at WARN level (destructive operation). (`src/api/mod.rs`)
-
-- **`GET /api/sync/slaves`** — Lists slaves seen in the last 5 minutes with
-  `addr`, `status` (`connected` / `stale` / `disconnected`), `last_seen_secs`,
-  `zones_synced`, and `version`. Returns empty list with a note when not in
-  master mode. (`src/api/mod.rs`)
-
-- **`POST /api/upstreams` / `DELETE /api/upstreams/:id`** — Runtime upstream
-  management. Validates `addr` (valid IP), `protocol` ∈ `{udp, dot}`, and
-  `port` (1–65535). Rebuilds the shared resolver immediately on change.
-  Rejects deletion of the last enabled upstream with HTTP 409.
-  (`src/api/mod.rs`, `src/upstreams.rs`)
-
-- **`GET /api/upstreams/presets`** — Nine preset resolvers: Cloudflare (UDP +
-  DoT), Google, Quad9 (UDP + DoT), OpenDNS, and AdGuard DNS. (`src/api/mod.rs`)
-
-- **`last_error` field in feed responses** — `GET /api/feeds` now includes
-  `"last_error": null | "error string"` on each feed entry, replacing the
-  silent `entry_count: 0` on sync failure. (`src/feeds/mod.rs`)
-
-- **`SharedResolver` wired end-to-end** — `build_and_launch` → `AppState` →
-  `run_dns_server` enables all API-driven resolver operations (cache flush,
-  upstream add/remove) to take effect without restart. (`src/main.rs`)
 
 ---
 

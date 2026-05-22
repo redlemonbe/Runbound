@@ -22,7 +22,7 @@ mod upstreams;
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use tracing::{error, info};
@@ -77,7 +77,7 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: String) -> Result<()> {
-    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_active) =
+    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver) =
         build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // ── XDP fast path (optional, feature-gated) ───────────────────────────
@@ -101,7 +101,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         match iface {
             Some(ref iface_name) => {
                 match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl)) {
-                    Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); xdp_active.store(true, Ordering::Relaxed); Some(h) }
+                    Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); xdp_mode.store(match h.mode { dns::xdp::XdpMode::Drv => 1, dns::xdp::XdpMode::Skb => 2 }, Ordering::Relaxed); Some(h) }
                     Ok(None)    => None, // virtual interface or self-test — already warned
                     Err(e) => {
                         let reason = if e.contains("BPF_PROG_LOAD") {
@@ -122,7 +122,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         }
     };
 
-    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer).await;
+    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver).await;
     audit.send(audit::AuditEvent::Shutdown);
     result
 }
@@ -267,7 +267,8 @@ async fn build_and_launch(
     Arc<Stats>,
     logbuffer::SharedLogBuffer,
     audit::AuditLogger,
-    Arc<AtomicBool>,
+    Arc<AtomicU8>,
+    dns::server::SharedResolver,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -380,6 +381,10 @@ async fn build_and_launch(
 
     let cfg_arc = Arc::new(cfg.clone());
 
+    // ── Shared DNS resolver (hot-swappable via ArcSwap) ───────────────────
+    let resolver = dns::server::create_shared_resolver(cfg)
+        .map_err(|e| anyhow::anyhow!("DNS resolver init: {e}"))?;
+
     // ── Slave/master sync ──────────────────────────────────────────────────
     let sync_journal = if let (true, Some(port)) = (cfg.is_master(), cfg.sync_port) {
         let journal = sync::SyncJournal::new();
@@ -434,7 +439,7 @@ async fn build_and_launch(
         }
     }
 
-    let xdp_active = Arc::new(AtomicBool::new(false));
+    let xdp_mode = Arc::new(AtomicU8::new(0)); // 0=disabled, 1=drv, 2=skb
 
     let state = AppState {
         zones:          Arc::clone(&zones),
@@ -451,7 +456,8 @@ async fn build_and_launch(
         slave_mode:     cfg.is_slave(),
         base_dir:       Arc::new(base_dir),
         audit:          audit.clone(),
-        xdp_active:     Arc::clone(&xdp_active),
+        xdp_active:     Arc::clone(&xdp_mode),
+        resolver:       Arc::clone(&resolver),
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
@@ -464,7 +470,7 @@ async fn build_and_launch(
     let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200));
     let acl          = Arc::new(Acl::from_config(&cfg.access_control));
 
-    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_active))
+    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver))
 }
 
 fn print_help() {

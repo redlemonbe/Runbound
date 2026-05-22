@@ -556,6 +556,83 @@ async fn send_error<R: ResponseHandler>(
         })
 }
 
+/// Shared, hot-swappable DNS resolver used by the server handler and the API.
+pub type SharedResolver = Arc<ArcSwap<TokioResolver>>;
+
+/// Create a SharedResolver from config at startup. Call once in build_and_launch.
+pub fn create_shared_resolver(cfg: &UnboundConfig) -> anyhow::Result<SharedResolver> {
+    let size = cache_size_from_meminfo();
+    let resolver = build_resolver(cfg, size)?;
+    Ok(Arc::new(ArcSwap::new(Arc::new(resolver))))
+}
+
+/// Rebuild the resolver from an explicit list of (addr_string, use_tls) pairs and
+/// atomically swap it in. Used by POST /api/cache/flush and upstreams CRUD.
+pub fn rebuild_and_swap(
+    shared: &SharedResolver,
+    addrs:  &[(String, bool)],
+    dnssec: bool,
+) -> anyhow::Result<()> {
+    let size = cache_size_from_meminfo();
+    let new_res = build_resolver_from_addrs(addrs, size, dnssec)?;
+    shared.store(Arc::new(new_res));
+    Ok(())
+}
+
+/// Build resolver from an explicit (addr, use_tls) list — used for runtime rebuilds.
+pub fn build_resolver_from_addrs(
+    addrs:      &[(String, bool)],
+    cache_size: usize,
+    dnssec:     bool,
+) -> anyhow::Result<TokioResolver> {
+    let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
+
+    for (addr_str, use_tls) in addrs {
+        let default_port: u16 = if *use_tls { 853 } else { 53 };
+        let (ip_str, port) = if let Some(at) = addr_str.find('@') {
+            let p: u16 = addr_str[at + 1..].parse().unwrap_or(default_port);
+            (&addr_str[..at], p)
+        } else {
+            (addr_str.as_str(), default_port)
+        };
+        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            if *use_tls {
+                let mut cc = ConnectionConfig::tls(Arc::from(ip.to_string()));
+                cc.port = port;
+                resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc]));
+            } else {
+                let mut cc_udp = ConnectionConfig::udp();
+                cc_udp.port = port;
+                let mut cc_tcp = ConnectionConfig::tcp();
+                cc_tcp.port = port;
+                resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc_udp, cc_tcp]));
+            }
+        }
+    }
+
+    if resolver_cfg.name_servers().is_empty() {
+        for ip_str in ["1.1.1.1", "1.0.0.1"] {
+            let ip: IpAddr = ip_str.parse().expect("valid Cloudflare IP");
+            resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![
+                ConnectionConfig::udp(), ConnectionConfig::tcp(),
+            ]));
+        }
+    }
+
+    let mut opts = ResolverOpts::default();
+    opts.recursion_desired = true;
+    opts.cache_size = cache_size as u64;
+    opts.timeout = Duration::from_secs(3);
+    opts.attempts = 2;
+    opts.validate = dnssec;
+    opts.use_hosts_file = ResolveHosts::Never;
+
+    TokioResolver::builder_with_config(resolver_cfg, TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+        .map_err(|e| anyhow::anyhow!("resolver build: {e}"))
+}
+
 /// Build resolver from forward-zones in unbound.conf, fallback to system resolvers.
 fn build_resolver(cfg: &UnboundConfig, cache_size: usize) -> anyhow::Result<TokioResolver> {
     let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
@@ -1069,6 +1146,7 @@ pub async fn run_dns_server(
     acl:          Arc<Acl>,
     stats:        Arc<Stats>,
     log_buffer:   SharedLogBuffer,
+    resolver:     SharedResolver,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -1080,7 +1158,6 @@ pub async fn run_dns_server(
 
     let initial_cache_size = cache_size_from_meminfo();
     info!(cache_size = initial_cache_size, "cache size auto-sized from MemAvailable");
-    let resolver = Arc::new(ArcSwap::new(Arc::new(build_resolver(cfg, initial_cache_size)?)));
 
     // Spawn memory pressure guard — monitors /proc/meminfo every 30 s and
     // adjusts the DNS cache size and flushes the rate limiter under pressure.

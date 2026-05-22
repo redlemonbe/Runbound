@@ -86,3 +86,5 @@ mod worker;
 
 #[cfg(feature = "xdp")]
 pub use worker::start_xdp;
+#[cfg(feature = "xdp")]
+pub use loader::XdpMode;

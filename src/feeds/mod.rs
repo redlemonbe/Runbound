@@ -75,6 +75,9 @@ pub struct Feed {
     pub last_updated: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Last error message from a failed update; null when last update was successful.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -436,6 +439,7 @@ pub async fn add_feed(
         entry_count: 0,
         last_updated: None,
         description,
+        last_error: None,
     };
     config.feeds.push(feed.clone());
     save_feeds(&config)?;
@@ -711,21 +715,26 @@ pub async fn update_all_feeds() -> Result<Vec<FeedUpdateResult>, AppError> {
         }
 
         match update_feed(feed, &client).await {
-            Ok(count) => results.push(FeedUpdateResult {
-                id: feed.id.clone(),
-                name: feed.name.clone(),
-                status: "updated".into(),
-                entry_count: count,
-                error: None,
-            }),
+            Ok(count) => {
+                feed.last_error = None;
+                results.push(FeedUpdateResult {
+                    id: feed.id.clone(),
+                    name: feed.name.clone(),
+                    status: "updated".into(),
+                    entry_count: count,
+                    error: None,
+                });
+            }
             Err(e) => {
-                error!("Failed to update feed '{}': {}", feed.name, e);
+                let msg = e.to_string();
+                feed.last_error = Some(msg.clone());
+                error!("Failed to update feed '{}': {}", feed.name, msg);
                 results.push(FeedUpdateResult {
                     id: feed.id.clone(),
                     name: feed.name.clone(),
                     status: "error".into(),
                     entry_count: feed.entry_count,
-                    error: Some(e.to_string()),
+                    error: Some(msg),
                 });
             }
         }
@@ -746,23 +755,27 @@ pub async fn update_one_feed(id: &str) -> Result<FeedUpdateResult, AppError> {
 
     let client = ssrf_safe_client();
     let result = match update_feed(feed, &client).await {
-        Ok(count) => FeedUpdateResult {
-            id: feed.id.clone(),
-            name: feed.name.clone(),
-            status: "updated".into(),
-            entry_count: count,
-            error: None,
-        },
+        Ok(count) => {
+            feed.last_error = None;
+            FeedUpdateResult {
+                id: feed.id.clone(),
+                name: feed.name.clone(),
+                status: "updated".into(),
+                entry_count: count,
+                error: None,
+            }
+        }
         Err(e) => {
-            let result = FeedUpdateResult {
+            let msg = e.to_string();
+            feed.last_error = Some(msg.clone());
+            warn!("Feed update failed for '{}': {}", feed.name, msg);
+            FeedUpdateResult {
                 id: feed.id.clone(),
                 name: feed.name.clone(),
                 status: "error".into(),
                 entry_count: feed.entry_count,
-                error: Some(e.to_string()),
-            };
-            warn!("Feed update failed for '{}': {}", feed.name, e);
-            result
+                error: Some(msg),
+            }
         }
     };
 
