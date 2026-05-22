@@ -1363,4 +1363,10 @@ detection via EDNS0+DO probe AD bit; #49 latency_history VecDeque capped at 5; #
 GET /api/cache/stats with hit_rate_pct null-safe). 10 security hardening items confirmed
 from source (SEC H1–H4, SEC M1–M3, SEC C1, PERF P3/P6). 1 new finding UI-XSS-01 (LOW):
 esc() in index.html did not escape single-quote → stored XSS in onclick; fixed same day
-by adding '→&#39; and "→&quot; to esc(). GitHub issue #52 opened and closed. 87/87 tests pass.*
+by adding '→&#39; and "→&quot; to esc(). GitHub issue #52 opened and closed. 87/87 tests pass.
+v0.6.6 verification (2026-05-22): binary at tag v0.6.6 (18:47) compiled before final commit
+2173182 — features #53 (last_error on upstream failures) and #54 (POST /api/upstreams/:id/probe)
+absent from binary (route list confirmed via strings(1)). Feed last_error field (#55) confirmed
+present in binary (struct Feed with 10 elements); UI updated same day: dot turns red on
+last_error, ⚠ badge with tooltip shows error string. New binary required from coding AI for
+complete v0.6.6 verification of #53 and #54.*
