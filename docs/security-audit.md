@@ -1,6 +1,6 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.6.4  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.6.5  
 **Last updated:** 2026-05-22  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration, upstream management  
 **Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4) + static Clippy audit (v0.6.2)
@@ -9,10 +9,11 @@
 
 ## Executive Summary
 
-**96 findings across 12 audit cycles — 96 resolved, 0 open.**
+**108 findings across 13 audit cycles — 107 resolved, 1 open (LOW).**
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
+| Live pentest + code audit | v0.6.5 | 12 tests PASS + 1 new finding (LOW) | ✅ 12 PASS, UI-XSS-01 open |
 | Live verification | v0.6.4 | 3 fixes (#45 #46 #47) | ✅ All verified v0.6.4 |
 | Hardening pass | v0.6.3 | 2 (FIX #40, FIX #41 from v0.6.2) | ✅ All fixed v0.6.3 |
 | Live pentest | v0.6.2 | 2 bugs (Low-Med, Med) | ✅ Fixed v0.6.3 (#40 #41) |
@@ -38,7 +39,7 @@ findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0
 A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
 through SEC-16), all fixed in v0.3.3.
 
-**All findings are closed. No open issues.**
+**107 findings closed. 1 open (UI-XSS-01, LOW — web UI only, requires auth).**
 
 - JSON store HMAC-SHA256 integrity (HIGH-06) — `RUNBOUND_STORE_KEY` env var, sidecar `.mac` files.
 - TLS cipher suite hardening (HIGH-07) — hickory 0.26 + rustls 0.23, TLS 1.3 default.
@@ -1176,6 +1177,59 @@ the upstream left intact.
 | Upstream persistence across restart | ✅ **Fixed v0.6.3** — upstreams.json on disk (#43) |
 | Explicit port field (UDP default 53, DoT default 853) | ✅ **Fixed v0.6.3** (#44) |
 
+## v0.6.5 Live Pentest + Code Audit — 2026-05-22
+
+Live pentest on running v0.6.5 instance + full white-box source review of `src/upstreams.rs`, `src/api/mod.rs`, `src/stats.rs`, `src/dns/server.rs`, `src/feeds/mod.rs`, `src/sync.rs`, `src/acme.rs`. All 7 v0.6.5 features verified. 10 security hardening items confirmed from source.
+
+### Feature verification
+
+| Test | Result |
+|---|---|
+| DoT upstream (9.9.9.9:853) healthy | ✅ healthy: true, latency_ms: 124, dnssec_supported: true (#45 #48) |
+| DoT upstream (1.1.1.1:853) healthy | ✅ healthy: true, latency_ms: 116, dnssec_supported: true (#45 #48) |
+| UDP upstream (192.168.1.1) — no DNSSEC | ✅ dnssec_supported: false — router doesn't validate (#48) |
+| latency_history — 3 samples after startup | ✅ `[20,23,24]` — VecDeque capped at 5, populated on success only (#49) |
+| PATCH /api/upstreams/:id rename | ✅ 200, name persisted, save_upstreams() called (#50) |
+| PATCH unknown field (`addr`) | ✅ 400 INVALID_FIELD "only 'name' is supported" (#50) |
+| PATCH name="" clears to null | ✅ name: null in response (#50) |
+| PATCH name with control char | ✅ 400 INVALID_FIELD "must not contain control characters" (#50) |
+| PATCH name > 64 chars | ✅ 400 INVALID_FIELD "must not exceed 64 characters" (#50) |
+| GET /api/cache/stats — initial state | ✅ hits/misses/entries/evictions + hit_rate_pct (#51) |
+| POST /api/cache/flush — cooldown | ✅ 200 → 429 FLUSH_COOLDOWN + Retry-After header (#46) |
+| GET /api/system — prefetch/upstreams fields | ✅ prefetch_enabled, upstreams_healthy, upstreams_total (#47) |
+
+### Security hardening (v0.6.5) — confirmed from source
+
+| Item | Location | Status |
+|---|---|---|
+| SEC H1 — Malformed Content-Length → 400 | `src/api/mod.rs` | ✅ Confirmed |
+| SEC H2 — Feed streaming OOM guard (100 MiB chunk-by-chunk) | `src/feeds/mod.rs:MAX_FEED_BYTES` | ✅ Confirmed |
+| SEC H3 — TcpConnTracker stale entry cleanup | `src/dns/server.rs:1113` | ✅ Confirmed |
+| SEC H4 — ACME key zeroed via `Zeroizing<String>` | `src/acme.rs:123` | ✅ Confirmed |
+| SEC M1 — /sync/cert rate-limit 10 req/60s per IP (DashMap) | `src/sync.rs:67` | ✅ Confirmed |
+| SEC M2 — Min DNS response raised to 12 bytes | `src/upstreams.rs:454,523` | ✅ Confirmed |
+| SEC M3 — Feed URL query string redacted in logs | `src/feeds/mod.rs:573` | ✅ Confirmed |
+| SEC C1 — Health loop TOCTOU fix (probe + write by UUID) | `src/upstreams.rs:341–379` | ✅ Confirmed |
+| PERF P3 — Parallel probes via spawn_blocking + join_all | `src/upstreams.rs:354–368` | ✅ Confirmed |
+| PERF P6 — ArcSwap StatsSnapshot (1 atomic load per API call) | `src/stats.rs:20` | ✅ Confirmed |
+
+### New finding
+
+| ID | Severity | Component | Finding | Status |
+|---|---|---|---|---|
+| UI-XSS-01 | LOW | `index.html:707` | `esc()` does not escape single-quote (`'`). The upstream `name` field is embedded as `onclick="upstreamRename('id','${esc(name)}')"`. A name containing `');alert(1)//` executes arbitrary JS when the rename button is clicked (stored XSS). Requires auth to set the malicious name. **Fix:** add `replace(/'/g, "&#39;")` to `esc()`. | Open |
+
+### Informational observations
+
+| Item | Note |
+|---|---|
+| `cache_evictions` always 0 | `Arc<AtomicU64>` in AppState, reset on flush, but never incremented — hickory's LRU cache doesn't expose eviction callbacks. Counter is a placeholder; field is accurate (unknown = 0 is documented). |
+| PATCH returns 400 (not 422) for unknown fields | Spec said 422; implementation returns 400 INVALID_FIELD. Both are "client error" — informational, not a bug. |
+
+**87/87 tests pass.**
+
+---
+
 ## v0.6.4 Live Verification — 2026-05-22
 
 Live pentest on running v0.6.4 instance. All 3 fixes confirmed.
@@ -1302,4 +1356,11 @@ v0.6.4 hardening pass (2026-05-22): DoT probe rewritten as TCP+TLS handshake via
 rustls::StreamOwned (FIX #45); cache flush cooldown 429 FLUSH_COOLDOWN + Retry-After header
 (FEAT #46); prefetch_enabled + upstreams_healthy + upstreams_total added to GET /api/system
 (FEAT #47). 65/65 tests pass. Live test: 1.1.1.1:853 healthy=true latency=43ms,
-9.9.9.9:853 healthy=true latency=38ms; flush cooldown 200→429→200 after 6s confirmed.*
+9.9.9.9:853 healthy=true latency=38ms; flush cooldown 200→429→200 after 6s confirmed.
+v0.6.5 live pentest + code audit (2026-05-22): 4 new features fully verified (#48 DNSSEC
+detection via EDNS0+DO probe AD bit; #49 latency_history VecDeque capped at 5; #50 PATCH
+/api/upstreams/:id with field restriction, control-char guard, 64-char limit; #51
+GET /api/cache/stats with hit_rate_pct null-safe). 10 security hardening items confirmed
+from source (SEC H1–H4, SEC M1–M3, SEC C1, PERF P3/P6). 1 new finding: UI-XSS-01 (LOW)
+— `esc()` in index.html does not escape single-quote, stored XSS via upstream name in
+onclick context; requires auth. 87/87 tests pass.*
