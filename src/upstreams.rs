@@ -78,6 +78,10 @@ pub struct UpstreamStatus {
     /// Not persisted; serialised as a JSON array.
     #[serde(serialize_with = "serialize_latency_history", skip_deserializing, default)]
     pub latency_history: VecDeque<u64>,
+    /// #53: last error message from a failed health probe.
+    /// Cleared on successful probe. Not persisted (runtime only).
+    #[serde(skip_serializing_if = "Option::is_none", skip_deserializing, default)]
+    pub last_error: Option<String>,
     // Internal backoff state — not serialised in API responses.
     #[serde(skip, default)]
     pub consecutive_failures: u32,
@@ -197,6 +201,7 @@ pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
         last_check:           String::new(),
         dnssec_supported:     None,
         latency_history:      VecDeque::new(),
+        last_error:           None,
         consecutive_failures: 0,
         next_check_at:        Instant::now(),
     }).collect()
@@ -242,6 +247,7 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
                 last_check:          String::new(),
                 dnssec_supported:    None,
                 latency_history:     VecDeque::new(),
+                last_error:          None,
                 consecutive_failures: 0,
                 next_check_at:       Instant::now(),
             });
@@ -281,6 +287,7 @@ pub fn add_upstream(
         last_check:          String::new(),
         dnssec_supported:    None,
         latency_history:     VecDeque::new(),
+        last_error:          None,
         zone:                ".".into(),
         consecutive_failures: 0,
         next_check_at:       Instant::now(),
@@ -355,12 +362,12 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
             .into_iter()
             .map(|(id, addr, port, protocol)| {
                 tokio::task::spawn_blocking(move || {
-                    let (healthy, latency, dnssec) = probe_upstream(&addr, port, &protocol);
-                    (id, healthy, latency, dnssec)
+                    let (healthy, latency, dnssec, last_error) = probe_upstream(&addr, port, &protocol);
+                    (id, healthy, latency, dnssec, last_error)
                 })
             })
             .collect();
-        let results: Vec<(String, bool, Option<u64>, Option<bool>)> =
+        let results: Vec<ProbeResultWithId> =
             futures_util::future::join_all(handles)
                 .await
                 .into_iter()
@@ -376,7 +383,7 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 .unwrap_or_default()
                 .as_secs(),
         );
-        for (id, healthy, latency_ms, dnssec_supported) in results {
+        for (id, healthy, latency_ms, dnssec_supported, last_error) in results {
             let Some(s) = statuses.iter_mut().find(|u| u.id == id) else { continue };
             if healthy {
                 if s.consecutive_failures > 0 {
@@ -394,6 +401,8 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 }
                 // #48: update DNSSEC detection result
                 s.dnssec_supported = dnssec_supported;
+                // #53: clear last_error on success
+                s.last_error = None;
             } else {
                 s.consecutive_failures += 1;
                 let wait = backoff_secs(s.consecutive_failures);
@@ -408,6 +417,8 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 // #48: unhealthy → dnssec_supported = None
                 s.dnssec_supported = None;
                 // #49: do NOT push to history on failure
+                // #53: record last_error
+                s.last_error = last_error;
             }
             s.healthy    = healthy;
             s.latency_ms = latency_ms;
@@ -416,9 +427,18 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
     }
 }
 
+// ── Probe result type ─────────────────────────────────────────────────────
+/// Return type of `probe_upstream` and its variants:
+/// `(healthy, latency_ms, dnssec_supported, last_error)`.
+type ProbeResult = (bool, Option<u64>, Option<bool>, Option<String>);
+
+/// Health-loop result tuple enriched with the upstream UUID:
+/// `(id, healthy, latency_ms, dnssec_supported, last_error)`.
+type ProbeResultWithId = (String, bool, Option<u64>, Option<bool>, Option<String>);
+
 // ── Probe dispatcher ──────────────────────────────────────────────────────
-// Returns (healthy, latency_ms, dnssec_supported).
-fn probe_upstream(addr: &str, port: u16, protocol: &str) -> (bool, Option<u64>, Option<bool>) {
+// Returns (healthy, latency_ms, dnssec_supported, last_error).
+pub fn probe_upstream(addr: &str, port: u16, protocol: &str) -> ProbeResult {
     if protocol == "dot" {
         probe_dot(addr, port)
     } else {
@@ -427,10 +447,10 @@ fn probe_upstream(addr: &str, port: u16, protocol: &str) -> (bool, Option<u64>, 
 }
 
 // ── UDP probe — sends EDNS0+DO query, checks AD bit (#48) ─────────────────
-fn probe_udp(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
+fn probe_udp(addr: &str, port: u16) -> ProbeResult {
     let ip: IpAddr = match addr.parse() {
         Ok(ip) => ip,
-        Err(_) => return (false, None, None),
+        Err(_) => return (false, None, None, Some("bind failed".into())),
     };
     let target = SocketAddr::new(ip, port);
     let bind: SocketAddr = match ip {
@@ -440,13 +460,13 @@ fn probe_udp(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
 
     let sock = match UdpSocket::bind(bind) {
         Ok(s)  => s,
-        Err(_) => return (false, None, None),
+        Err(_) => return (false, None, None, Some("bind failed".into())),
     };
     let _ = sock.set_read_timeout(Some(Duration::from_millis(PROBE_TIMEOUT_MS)));
 
     let t0 = Instant::now();
     if sock.send_to(&DNS_PROBE_PACKET, target).is_err() {
-        return (false, None, None);
+        return (false, None, None, Some("send failed".into()));
     }
 
     let mut buf = [0u8; 512];
@@ -456,12 +476,13 @@ fn probe_udp(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
                 let latency = Some(t0.elapsed().as_millis() as u64);
                 // #48: AD bit = bit 5 of flags byte 3
                 let dnssec = Some(parse_ad_bit(&buf[..n]));
-                (true, latency, dnssec)
+                (true, latency, dnssec, None)
             } else {
-                (false, None, None)
+                (false, None, None, Some("id mismatch".into()))
             }
         }
-        _ => (false, None, None),
+        Ok((n, _)) if n < 12 => (false, None, None, Some("short response".into())),
+        _ => (false, None, None, Some("timeout".into())),
     }
 }
 
@@ -470,10 +491,10 @@ fn probe_udp(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
 // length prefix required by RFC 7858. A matching response ID confirms the
 // upstream is both reachable and answering DNS. The AD bit is checked so
 // DNSSEC detection works identically for DoT and UDP upstreams.
-fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
+fn probe_dot(addr: &str, port: u16) -> ProbeResult {
     let ip: IpAddr = match addr.parse() {
         Ok(ip) => ip,
-        Err(_) => return (false, None, None),
+        Err(_) => return (false, None, None, Some("TCP connect failed".into())),
     };
     let target  = SocketAddr::new(ip, port);
     let timeout = Duration::from_millis(PROBE_TIMEOUT_MS);
@@ -483,7 +504,7 @@ fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
     // Step 1: TCP connect
     let tcp = match TcpStream::connect_timeout(&target, timeout) {
         Ok(s)  => s,
-        Err(_) => return (false, None, None),
+        Err(_) => return (false, None, None, Some("TCP connect failed".into())),
     };
     let _ = tcp.set_read_timeout(Some(timeout));
     let _ = tcp.set_write_timeout(Some(timeout));
@@ -491,7 +512,7 @@ fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
     // Step 2: TLS handshake
     let server_name = match rustls::pki_types::ServerName::try_from(addr.to_owned()) {
         Ok(n)  => n,
-        Err(_) => return (false, None, None),
+        Err(_) => return (false, None, None, Some("TLS handshake failed".into())),
     };
     let config = Arc::new(
         rustls::ClientConfig::builder_with_provider(
@@ -504,39 +525,39 @@ fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
     );
     let conn = match rustls::ClientConnection::new(config, server_name) {
         Ok(c)  => c,
-        Err(_) => return (false, None, None),
+        Err(_) => return (false, None, None, Some("TLS handshake failed".into())),
     };
     let mut tls = rustls::StreamOwned::new(conn, tcp);
 
     // Step 3: send DNS query with 2-byte TCP length prefix (RFC 7858 §3.3)
     let len_prefix = (DNS_PROBE_PACKET.len() as u16).to_be_bytes();
     if tls.write_all(&len_prefix).is_err() || tls.write_all(&DNS_PROBE_PACKET).is_err() {
-        return (false, None, None);
+        return (false, None, None, Some("DNS send failed".into()));
     }
 
     // Step 4: read response length
     let mut resp_len_buf = [0u8; 2];
     if tls.read_exact(&mut resp_len_buf).is_err() {
-        return (false, None, None);
+        return (false, None, None, Some("DNS response timeout".into()));
     }
     let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
     if resp_len < 12 {
-        return (false, None, None);
+        return (false, None, None, Some("short response".into()));
     }
 
     // Step 5: read response body
     let mut buf = vec![0u8; resp_len];
     if tls.read_exact(&mut buf).is_err() {
-        return (false, None, None);
+        return (false, None, None, Some("DNS response timeout".into()));
     }
 
     // Step 6: verify ID match and extract AD bit
     if buf[0] == DNS_PROBE_PACKET[0] && buf[1] == DNS_PROBE_PACKET[1] {
         let latency = Some(t0.elapsed().as_millis() as u64);
         let dnssec  = Some(parse_ad_bit(&buf));
-        (true, latency, dnssec)
+        (true, latency, dnssec, None)
     } else {
-        (false, None, None)
+        (false, None, None, Some("id mismatch".into()))
     }
 }
 
@@ -564,28 +585,32 @@ mod tests {
     #[test]
     #[ignore = "requires network access to 1.1.1.1:853"]
     fn probe_dot_cloudflare_healthy() {
-        let (healthy, latency, _dnssec) = probe_upstream("1.1.1.1", 853, "dot");
+        let (healthy, latency, _dnssec, last_error) = probe_upstream("1.1.1.1", 853, "dot");
         assert!(healthy, "Cloudflare DoT 1.1.1.1:853 should be healthy");
         assert!(latency.is_some());
+        assert!(last_error.is_none());
     }
 
     #[test]
     #[ignore = "requires network access to 1.1.1.1:53"]
     fn probe_udp_cloudflare_healthy() {
-        let (healthy, latency, dnssec) = probe_upstream("1.1.1.1", 53, "udp");
+        let (healthy, latency, dnssec, last_error) = probe_upstream("1.1.1.1", 53, "udp");
         assert!(healthy, "Cloudflare UDP 1.1.1.1:53 should be healthy");
         assert!(latency.is_some());
         // Cloudflare validates DNSSEC — AD bit expected
         assert_eq!(dnssec, Some(true), "Cloudflare should set AD bit");
+        assert!(last_error.is_none());
     }
 
     #[test]
     fn probe_dot_unreachable_returns_false() {
         // 192.0.2.0/24 is TEST-NET-1 — guaranteed unreachable (RFC 5737)
-        let (healthy, latency, dnssec) = probe_upstream("192.0.2.1", 853, "dot");
+        let (healthy, latency, dnssec, last_error) = probe_upstream("192.0.2.1", 853, "dot");
         assert!(!healthy, "unreachable host must not be reported healthy");
         assert!(latency.is_none());
         assert!(dnssec.is_none());
+        // #53: TCP connect to TEST-NET must produce a connect error
+        assert_eq!(last_error.as_deref(), Some("TCP connect failed"));
     }
 
     // ── #48: parse_ad_bit ─────────────────────────────────────────────────
@@ -655,9 +680,37 @@ mod tests {
     #[test]
     fn probe_unreachable_udp_dnssec_none() {
         // 192.0.2.0/24 is TEST-NET-1 — guaranteed unreachable (RFC 5737)
-        let (healthy, _lat, dnssec) = probe_upstream("192.0.2.1", 53, "udp");
+        let (healthy, _lat, dnssec, last_error) = probe_upstream("192.0.2.1", 53, "udp");
         assert!(!healthy);
         assert!(dnssec.is_none(), "unhealthy upstream must have dnssec_supported = None");
+        // #53: UDP timeout to TEST-NET must produce a timeout error
+        assert_eq!(last_error.as_deref(), Some("timeout"));
+    }
+
+    // ── #53: last_error cleared on successful probe ───────────────────────
+
+    #[test]
+    fn parse_last_error_cleared_on_healthy() {
+        let upstreams = init_upstreams(&crate::config::parser::UnboundConfig::default());
+        let entry = add_upstream(&upstreams, "1.1.1.1".into(), 53, "udp".into(), None);
+        // Simulate a previous failure
+        {
+            let mut list = upstreams.write().unwrap_or_else(|e| e.into_inner());
+            let s = list.iter_mut().find(|u| u.id == entry.id).unwrap_or_else(|| panic!("entry not found"));
+            s.last_error = Some("timeout".into());
+            s.healthy = false;
+        }
+        // Simulate a successful write-back (healthy=true → clear last_error)
+        {
+            let mut list = upstreams.write().unwrap_or_else(|e| e.into_inner());
+            let s = list.iter_mut().find(|u| u.id == entry.id).unwrap_or_else(|| panic!("entry not found"));
+            s.healthy    = true;
+            s.last_error = None;
+        }
+        let list = upstreams.read().unwrap_or_else(|e| e.into_inner());
+        let s = list.iter().find(|u| u.id == entry.id).unwrap_or_else(|| panic!("entry not found"));
+        assert!(s.last_error.is_none(), "last_error must be None after a successful probe");
+        assert!(s.healthy);
     }
 
     // ── #50: patch_upstream_name ──────────────────────────────────────────
