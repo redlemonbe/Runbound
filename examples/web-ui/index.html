@@ -743,11 +743,10 @@ async function loadSystem() {
   } catch(e) { toast('System: '+e.message, true); }
   try {
     const c=await api('GET','/cache/stats');
-    set('sys-cache-entries',c.entries!=null?c.entries.toLocaleString():'—');
-    set('sys-cache-hits',c.hits!=null?c.hits.toLocaleString():'—');
-    set('sys-cache-misses',c.misses!=null?c.misses.toLocaleString():'—');
+    set('sys-cache-hits',c.cache_hits!=null?c.cache_hits.toLocaleString():'—');
+    set('sys-cache-misses',c.cache_misses!=null?c.cache_misses.toLocaleString():'—');
     set('sys-cache-rate',c.hit_rate_pct!=null?c.hit_rate_pct.toFixed(1)+' %':'—');
-    set('sys-cache-evict',c.evictions!=null?c.evictions.toLocaleString():'—');
+    set('sys-cache-evict',c.cache_evictions!=null?c.cache_evictions.toLocaleString():'—');
   } catch(_) {}
 }
 
