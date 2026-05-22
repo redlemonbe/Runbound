@@ -9,6 +9,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.6] — 2026-05-22
+
+### Added
+
+- **FEAT #53 — `last_error` field on upstream health failures** (`src/upstreams.rs`)  
+  `UpstreamStatus` now exposes a `last_error` string when a probe fails.
+  The field is runtime-only (not persisted), omitted from JSON when `None`,
+  and cleared on the next successful probe.  
+  Error strings are deliberately generic (no OS details):  
+  - UDP: `"bind failed"`, `"send failed"`, `"timeout"`, `"short response"`, `"id mismatch"`  
+  - DoT: `"TCP connect failed"`, `"TLS handshake failed"`, `"DNS send failed"`,
+    `"DNS response timeout"`, `"short response"`, `"id mismatch"`
+
+- **FEAT #54 — `POST /api/upstreams/:id/probe` — on-demand upstream probe** (`src/api/mod.rs`)  
+  Triggers an immediate health probe for one upstream without waiting for
+  the background health loop. The probe runs in `spawn_blocking` (blocking I/O
+  off the async thread pool). Result fields `healthy`, `latency_ms`,
+  `dnssec_supported`, `last_error`, and `last_check` are written back by UUID.
+  `consecutive_failures` and `next_check_at` are intentionally left untouched.
+  Returns `200 {"status":"ok","upstream":{...}}` or `404` if the id is unknown.
+
+---
+
 ## [0.6.5] — 2026-05-22 (rev2 — security + performance hardening)
 
 ### Security
