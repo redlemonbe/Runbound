@@ -46,7 +46,10 @@ const DNS_PROBE_PACKET: [u8; 17] = [
 // ── Status per upstream ────────────────────────────────────────────────────
 #[derive(Serialize, Clone)]
 pub struct UpstreamStatus {
+    pub id:         String,
     pub addr:       String,
+    pub name:       Option<String>,
+    pub protocol:   String,   // "udp" or "dot"
     pub healthy:    bool,
     pub latency_ms: Option<u64>,
     pub last_check: String,
@@ -76,21 +79,67 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
     let mut statuses = Vec::new();
     for fz in &cfg.forward_zones {
         for addr in &fz.addrs {
-            // Strip port if present (e.g. "1.1.1.1@853")
             let clean = addr.split('@').next().unwrap_or(addr).to_string();
             statuses.push(UpstreamStatus {
+                id:                  uuid::Uuid::new_v4().to_string(),
                 addr:                clean,
+                name:                None,
+                protocol:            if fz.tls { "dot".into() } else { "udp".into() },
                 healthy:             false,
                 latency_ms:          None,
                 last_check:          String::new(),
                 zone:                fz.name.clone(),
                 consecutive_failures: 0,
-                // Due immediately so the first tick probes every upstream.
                 next_check_at:       Instant::now(),
             });
         }
     }
     Arc::new(RwLock::new(statuses))
+}
+
+/// Add a runtime upstream (POST /api/upstreams). Returns the new entry.
+pub fn add_upstream(
+    upstreams: &SharedUpstreams,
+    addr:      String,
+    protocol:  String,
+    name:      Option<String>,
+) -> UpstreamStatus {
+    let entry = UpstreamStatus {
+        id:                  uuid::Uuid::new_v4().to_string(),
+        addr,
+        name,
+        protocol,
+        healthy:             false,
+        latency_ms:          None,
+        last_check:          String::new(),
+        zone:                ".".into(),
+        consecutive_failures: 0,
+        next_check_at:       Instant::now(),
+    };
+    upstreams.write()
+        .expect("upstreams: RwLock poisoned in add_upstream")
+        .push(entry.clone());
+    entry
+}
+
+/// Remove a runtime upstream by id (DELETE /api/upstreams/:id).
+/// Returns the removed entry if found.
+pub fn remove_upstream(upstreams: &SharedUpstreams, id: &str) -> Option<UpstreamStatus> {
+    let mut list = upstreams.write().expect("upstreams: RwLock poisoned in remove_upstream");
+    if let Some(pos) = list.iter().position(|u| u.id == id) {
+        Some(list.remove(pos))
+    } else {
+        None
+    }
+}
+
+/// Snapshot of (addr, use_tls) for resolver rebuilds.
+pub fn upstream_addrs(upstreams: &SharedUpstreams) -> Vec<(String, bool)> {
+    upstreams.read()
+        .expect("upstreams: RwLock poisoned in upstream_addrs")
+        .iter()
+        .map(|u| (u.addr.clone(), u.protocol == "dot"))
+        .collect()
 }
 
 // ── Background health loop ─────────────────────────────────────────────────
