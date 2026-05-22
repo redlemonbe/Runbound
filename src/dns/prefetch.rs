@@ -3,48 +3,60 @@
 // DNS prefetch tracker — counts forwarded queries per domain per window.
 // When a domain exceeds the threshold the background task re-resolves it
 // proactively before the cached answer expires (opt-in, prefetch: yes).
+//
+// Uses DashMap<String, AtomicU32> instead of Mutex<HashMap> so that DNS
+// worker threads can increment counters without contending on a global lock.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use dashmap::DashMap;
 
 pub struct PrefetchTracker {
-    inner: Mutex<HashMap<String, u32>>,
+    inner: DashMap<String, AtomicU32, ahash::RandomState>,
 }
 
 impl PrefetchTracker {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { inner: Mutex::new(HashMap::new()) })
+        Arc::new(Self {
+            inner: DashMap::with_hasher(ahash::RandomState::default()),
+        })
     }
 
-    /// Increment the request counter for `domain`.
+    /// Increment the request counter for `domain` — lock-free on the fast path.
     pub fn increment(&self, domain: &str) {
-        let mut map = self.inner.lock()
-            .unwrap_or_else(|e| panic!("prefetch: Mutex poisoned in increment: {e}"));
-        *map.entry(domain.to_string()).or_insert(0) += 1;
+        if let Some(v) = self.inner.get(domain) {
+            v.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner
+                .entry(domain.to_owned())
+                .or_insert_with(|| AtomicU32::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Return all domains with count >= threshold and reset all counters to zero.
     pub fn take_hot(&self, threshold: u32) -> Vec<String> {
-        let mut map = self.inner.lock()
-            .unwrap_or_else(|e| panic!("prefetch: Mutex poisoned in take_hot: {e}"));
-        let hot: Vec<String> = map.iter()
-            .filter(|(_, &count)| count >= threshold)
-            .map(|(k, _)| k.clone())
+        let hot: Vec<String> = self.inner
+            .iter()
+            .filter(|e| e.value().load(Ordering::Relaxed) >= threshold)
+            .map(|e| e.key().clone())
             .collect();
-        map.clear();
+        self.inner.clear();
         hot
     }
 
     #[cfg(test)]
     pub fn count_for(&self, domain: &str) -> u32 {
-        let map = self.inner.lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *map.get(domain).unwrap_or(&0)
+        self.inner
+            .get(domain)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.inner.len()
     }
 }
 

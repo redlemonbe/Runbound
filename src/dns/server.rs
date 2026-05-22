@@ -152,8 +152,9 @@ impl RunboundHandler {
         if tracing::enabled!(tracing::Level::INFO)
             || (is_notable && tracing::enabled!(tracing::Level::WARN) && self.log_buffer.is_enabled())
         {
-            let safe_name = sanitize_dns_name(qname);
-            let client_log = self.log_buffer.push_query(&safe_name, &client, u16::from(qtype), action, elapsed_ms);
+            let safe_name     = sanitize_dns_name(qname);
+            let safe_name_str = safe_name.to_string();
+            let client_log = self.log_buffer.push_query(&safe_name_str, &client, u16::from(qtype), action, elapsed_ms);
             info!(
                 client = %client_log,
                 name   = %safe_name,
@@ -489,15 +490,29 @@ impl RequestHandler for RunboundHandler {
 
 /// MED-06: Strip control characters from DNS names before structured log emission.
 /// Prevents log injection via carefully crafted query names containing \n, \r, etc.
-/// Fast path: if the name contains only printable ASCII (the common case), the
-/// String from to_string() is returned as-is — no second allocation.
-fn sanitize_dns_name(name: &LowerName) -> String {
-    let s = name.to_string();
-    if s.bytes().any(|b| !(0x20..0x7f).contains(&b)) {
-        s.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '?' }).collect()
-    } else {
-        s
+///
+/// Returns a lazy Display wrapper so the formatting (and the String allocation)
+/// only happens when the log level is actually enabled, saving one alloc per query
+/// on disabled levels (e.g. debug! in production).
+struct SanitizedDnsName<'a>(&'a LowerName);
+
+impl std::fmt::Display for SanitizedDnsName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        let s = self.0.to_string();
+        if s.bytes().any(|b| !(0x20..0x7f).contains(&b)) {
+            for c in s.chars() {
+                f.write_char(if c.is_ascii() && !c.is_ascii_control() { c } else { '?' })?;
+            }
+        } else {
+            f.write_str(&s)?;
+        }
+        Ok(())
     }
+}
+
+fn sanitize_dns_name(name: &LowerName) -> SanitizedDnsName<'_> {
+    SanitizedDnsName(name)
 }
 
 /// Follow CNAME records within local zones, up to 8 hops (prevents loops).
@@ -832,7 +847,10 @@ pub async fn memory_guard_loop(
     loop {
         interval.tick().await;
 
-        let Some((avail_kb, total_kb)) = read_meminfo() else { continue };
+        // spawn_blocking: read_meminfo calls std::fs::read_to_string("/proc/meminfo")
+        // which is blocking I/O — must not run on the async thread pool.
+        let Some((avail_kb, total_kb)) = tokio::task::spawn_blocking(read_meminfo)
+            .await.ok().flatten() else { continue };
         let used_ratio = 1.0 - (avail_kb as f64 / total_kb as f64);
 
         // No-effect detection: check whether the previous halving reduced pressure.
@@ -1087,7 +1105,14 @@ impl TcpConnTracker {
 
     fn release(&self, ip: IpAddr) {
         if let Some(c) = self.counts.get(&ip) {
-            c.fetch_sub(1, Ordering::Relaxed);
+            let prev = c.fetch_sub(1, Ordering::Relaxed);
+            if prev == 1 {
+                // Count just reached 0 — evict the entry so the map does not
+                // grow unbounded when many distinct source IPs connect over time.
+                // Re-insertion is safe: a concurrent increment will use or_insert_with.
+                self.counts.remove_if(&ip, |_, v| v.load(Ordering::Relaxed) == 0);
+                self.last_warn.remove(&ip);
+            }
         }
     }
 }

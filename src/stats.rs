@@ -11,6 +11,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
+
+/// Shared, lock-free snapshot cache.
+/// Updated every second by `qps_update_loop`; API handlers read it
+/// instead of calling `snapshot()` on every request (avoids ~360 atomic
+/// loads per API call under monitoring load).
+pub type SharedSnapshot = Arc<ArcSwap<StatsSnapshot>>;
+
+pub fn new_snapshot_cache(stats: &Stats) -> SharedSnapshot {
+    Arc::new(ArcSwap::from_pointee(stats.snapshot()))
+}
+
 // ── Latency histogram ──────────────────────────────────────────────────────
 //
 // 12 upper-bound thresholds in microseconds define 13 buckets:
@@ -254,12 +266,13 @@ pub struct StatsSnapshot {
     pub dnssec_insecure: u64,
 }
 
-// ── QPS background task ────────────────────────────────────────────────────
+// ── QPS + snapshot background task ────────────────────────────────────────
 //
-// Runs every second, computes queries in the last second (delta of total
-// counter), stores in the ring buffer, and updates the all-time peak.
-// Spawned once in main.rs alongside the other background tasks.
-pub async fn qps_update_loop(stats: Arc<Stats>) {
+// Runs every second:
+//   1. Updates the QPS ring buffer and all-time peak.
+//   2. Atomically swaps the SharedSnapshot so API handlers read pre-computed
+//      values (avoids ~360 atomic loads per API call under monitoring load).
+pub async fn qps_update_loop(stats: Arc<Stats>, snapshot_cache: SharedSnapshot) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prev_total: u64 = 0;
@@ -276,5 +289,8 @@ pub async fn qps_update_loop(stats: Arc<Stats>) {
 
         // Update peak (lock-free max).
         stats.qps_peak.fetch_max(qps, Ordering::Relaxed);
+
+        // Refresh the shared snapshot cache used by API handlers.
+        snapshot_cache.store(Arc::new(stats.snapshot()));
     }
 }
