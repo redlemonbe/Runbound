@@ -1302,6 +1302,8 @@ struct AddUpstreamRequest {
     #[serde(default = "default_protocol")]
     protocol: String,
     name:     Option<String>,
+    /// Explicit port. Defaults to 53 (UDP) or 853 (DoT) if omitted.
+    port:     Option<u16>,
 }
 fn default_protocol() -> String { "udp".into() }
 
@@ -1315,25 +1317,48 @@ async fn add_upstream_handler(
             "error": "INVALID_PROTOCOL", "details": "protocol must be 'udp' or 'dot'"
         }))).into_response();
     }
-    // Validate addr is a valid IP (port optional via @ syntax)
-    let ip_part = req.addr.split('@').next().unwrap_or(&req.addr);
-    if ip_part.parse::<std::net::IpAddr>().is_err() {
+    // Validate addr is a valid IP (no @ syntax — port is a separate field now)
+    let ip: IpAddr = match req.addr.parse() {
+        Ok(ip) => ip,
+        Err(_) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_ADDR", "details": "addr must be a valid IP address (e.g. 1.1.1.1)"
+        }))).into_response(),
+    };
+    // FIX #40: reject loopback and IPv4 link-local
+    if ip.is_loopback() {
         return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_ADDR", "details": "addr must be a valid IP address (e.g. 1.1.1.1 or 1.1.1.1@853)"
+            "error": "INVALID_ADDR",
+            "details": "loopback addresses cannot be used as upstream resolvers"
+        }))).into_response();
+    }
+    if let IpAddr::V4(v4) = ip {
+        if v4.is_link_local() {
+            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                "error": "INVALID_ADDR",
+                "details": "link-local addresses cannot be used as upstream resolvers"
+            }))).into_response();
+        }
+    }
+    // FIX #44: resolve port with sensible defaults; reject port 0
+    let default_port: u16 = if req.protocol == "dot" { 853 } else { 53 };
+    let port = req.port.unwrap_or(default_port);
+    if port == 0 {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_PORT", "details": "port must be between 1 and 65535"
         }))).into_response();
     }
 
-    let use_tls = req.protocol == "dot";
-    let entry = upstreams::add_upstream(&s.upstreams, req.addr, req.protocol, req.name);
+    let entry = upstreams::add_upstream(&s.upstreams, req.addr, port, req.protocol, req.name);
 
     // Rebuild resolver with updated upstream list
     let addrs = upstreams::upstream_addrs(&s.upstreams);
     if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
         warn!(%e, "resolver rebuild after upstream add failed — upstream added but DNS unchanged");
     }
+    // FIX #43: persist after successful add
+    upstreams::save_upstreams(&s.upstreams, &s.base_dir);
 
-    let _ = use_tls; // already encoded in `entry.protocol`
-    info!(id = %entry.id, addr = %entry.addr, protocol = %entry.protocol, "upstream added via API");
+    info!(id = %entry.id, addr = %entry.addr, port = entry.port, protocol = %entry.protocol, "upstream added via API");
     (StatusCode::CREATED, JsonExtract(serde_json::json!({
         "status": "ok", "upstream": entry
     }))).into_response()
@@ -1345,12 +1370,27 @@ async fn delete_upstream_handler(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // FIX #41: refuse to delete the last upstream — resolver would be empty.
+    {
+        let list = s.upstreams.read()
+            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in delete handler: {e}"));
+        let target_exists = list.iter().any(|u| u.id == id);
+        if target_exists && list.len() == 1 {
+            return (StatusCode::CONFLICT, JsonExtract(serde_json::json!({
+                "error":   "LAST_UPSTREAM",
+                "details": "cannot delete the last upstream resolver"
+            }))).into_response();
+        }
+    }
+
     match upstreams::remove_upstream(&s.upstreams, &id) {
         Some(removed) => {
             let addrs = upstreams::upstream_addrs(&s.upstreams);
             if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
                 warn!(%e, "resolver rebuild after upstream delete failed");
             }
+            // FIX #43: persist after successful delete
+            upstreams::save_upstreams(&s.upstreams, &s.base_dir);
             info!(id = %id, addr = %removed.addr, "upstream deleted via API");
             (StatusCode::OK, JsonExtract(serde_json::json!({
                 "status": "ok", "deleted_id": id, "addr": removed.addr
@@ -1365,16 +1405,17 @@ async fn delete_upstream_handler(
 // ── GET /api/upstreams/presets ─────────────────────────────────────────────
 
 async fn upstream_presets_handler() -> impl IntoResponse {
+    // FIX #42: DoT entries use a separate `port` field — addr contains only the IP.
     JsonExtract(serde_json::json!({ "presets": [
-        {"name":"Cloudflare",       "addr":"1.1.1.1",   "protocol":"udp","description":"Cloudflare DNS — privacy-focused, fast"},
-        {"name":"Cloudflare alt",   "addr":"1.0.0.1",   "protocol":"udp","description":"Cloudflare secondary"},
-        {"name":"Cloudflare DoT",   "addr":"1.1.1.1@853","protocol":"dot","description":"Cloudflare DNS-over-TLS"},
-        {"name":"Google",           "addr":"8.8.8.8",   "protocol":"udp","description":"Google Public DNS"},
-        {"name":"Google alt",       "addr":"8.8.4.4",   "protocol":"udp","description":"Google Public DNS secondary"},
-        {"name":"Quad9",            "addr":"9.9.9.9",   "protocol":"udp","description":"Quad9 — malware-blocking, privacy-focused"},
-        {"name":"Quad9 DoT",        "addr":"9.9.9.9@853","protocol":"dot","description":"Quad9 DNS-over-TLS"},
-        {"name":"OpenDNS",          "addr":"208.67.222.222","protocol":"udp","description":"Cisco OpenDNS"},
-        {"name":"OpenDNS alt",      "addr":"208.67.220.220","protocol":"udp","description":"Cisco OpenDNS secondary"},
+        {"name":"Cloudflare",       "addr":"1.1.1.1",        "port":53,  "protocol":"udp","description":"Cloudflare DNS — privacy-focused, fast"},
+        {"name":"Cloudflare alt",   "addr":"1.0.0.1",        "port":53,  "protocol":"udp","description":"Cloudflare secondary"},
+        {"name":"Cloudflare DoT",   "addr":"1.1.1.1",        "port":853, "protocol":"dot","description":"Cloudflare DNS-over-TLS"},
+        {"name":"Google",           "addr":"8.8.8.8",        "port":53,  "protocol":"udp","description":"Google Public DNS"},
+        {"name":"Google alt",       "addr":"8.8.4.4",        "port":53,  "protocol":"udp","description":"Google Public DNS secondary"},
+        {"name":"Quad9",            "addr":"9.9.9.9",        "port":53,  "protocol":"udp","description":"Quad9 — malware-blocking, privacy-focused"},
+        {"name":"Quad9 DoT",        "addr":"9.9.9.9",        "port":853, "protocol":"dot","description":"Quad9 DNS-over-TLS"},
+        {"name":"OpenDNS",          "addr":"208.67.222.222", "port":53,  "protocol":"udp","description":"Cisco OpenDNS"},
+        {"name":"OpenDNS alt",      "addr":"208.67.220.220", "port":53,  "protocol":"udp","description":"Cisco OpenDNS secondary"},
     ]}))
 }
 
@@ -1746,21 +1787,21 @@ mod tests {
             .expect("test resolver");
 
         let state = AppState {
-            zones:          Arc::clone(&zones),
-            zones_mutex:    Arc::new(tokio::sync::Mutex::new(())),
-            tls_cfg:        Arc::new(crate::config::parser::TlsConfig::default()),
-            rate_limiter:   ApiRateLimiter::new_public(),
-            reload_limiter: Arc::new(ReloadLimiter::new()),
-            stats:          crate::stats::Stats::new(),
-            cfg:            Arc::clone(&cfg_arc),
-            cfg_path:       "/dev/null".to_string(),
+            zones:            Arc::clone(&zones),
+            zones_mutex:      Arc::new(tokio::sync::Mutex::new(())),
+            tls_cfg:          Arc::new(crate::config::parser::TlsConfig::default()),
+            rate_limiter:     ApiRateLimiter::new_public(),
+            reload_limiter:   Arc::new(ReloadLimiter::new()),
+            stats:            crate::stats::Stats::new(),
+            cfg:              Arc::clone(&cfg_arc),
+            cfg_path:         "/dev/null".to_string(),
             log_buffer,
             upstreams,
-            sync_journal:   None,
-            slave_mode:     false,
-            base_dir:       Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
-            audit:          crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
-            xdp_active:     Arc::new(AtomicU8::new(0)),
+            sync_journal:     None,
+            slave_mode:       false,
+            base_dir:         Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
+            audit:            crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
+            xdp_active:       Arc::new(AtomicU8::new(0)),
             resolver,
         };
         router(state)
@@ -2341,5 +2382,181 @@ mod tests {
         eprintln!("[HTTP_TEST] 200={ok} 429={r429} other={other:?}");
         assert!(ok <= 2,  "burst=2 but {ok} requests got 200");
         assert!(r429 >= 18, "expected ≥18 requests to get 429, got {r429}");
+    }
+
+    // ── FIX #40: loopback and IPv4 link-local are rejected ────────────────
+
+    fn post_upstream(app: axum::Router, auth: (&'static str, String), body_str: &'static str)
+        -> impl std::future::Future<Output = axum::response::Response>
+    {
+        use tower::ServiceExt;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/upstreams")
+            .header(auth.0, auth.1)
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body_str.len().to_string())
+            .body(Body::from(body_str))
+            .unwrap();
+        async move { app.oneshot(req).await.unwrap() }
+    }
+
+    #[tokio::test]
+    async fn add_upstream_loopback_v4_rejected() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"127.0.0.1"}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
+    }
+
+    #[tokio::test]
+    async fn add_upstream_loopback_v6_rejected() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"::1"}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
+    }
+
+    #[tokio::test]
+    async fn add_upstream_link_local_rejected() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"169.254.169.254"}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
+    }
+
+    #[tokio::test]
+    async fn add_upstream_private_v4_allowed() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"10.0.0.1"}"#).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_private_192_allowed() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"192.168.1.1"}"#).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ── FIX #41: last upstream cannot be deleted ──────────────────────────
+
+    #[tokio::test]
+    async fn delete_last_upstream_returns_409() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+
+        // Add the only upstream
+        let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"1.1.1.1"}"#).await;
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+        let j = body_json(add_resp.into_body()).await;
+        let id = j["upstream"]["id"].as_str().unwrap().to_string();
+
+        // Attempt to delete it — only one present, must return 409
+        let del_resp = app.clone().oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/upstreams/{id}"))
+                .header(k, &v)
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(del_resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(del_resp.into_body()).await["error"], "LAST_UPSTREAM");
+
+        // Upstream must still be present after 409
+        let list_resp = app.oneshot(
+            Request::builder()
+                .uri("/api/upstreams")
+                .header(k, &v)
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(body_json(list_resp.into_body()).await["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn delete_one_of_two_upstreams_returns_200() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+
+        let add1 = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"1.1.1.1"}"#).await;
+        assert_eq!(add1.status(), StatusCode::CREATED);
+        let id1 = body_json(add1.into_body()).await["upstream"]["id"]
+            .as_str().unwrap().to_string();
+
+        let add2 = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"8.8.8.8"}"#).await;
+        assert_eq!(add2.status(), StatusCode::CREATED);
+
+        // Delete first — two upstreams present, must return 200
+        let del_resp = app.oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/upstreams/{id1}"))
+                .header(k, &v)
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(del_resp.status(), StatusCode::OK);
+    }
+
+    // ── FIX #42: presets DoT entries have no @port in addr ────────────────
+
+    #[tokio::test]
+    async fn upstream_presets_dot_no_at_port() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder()
+                .uri("/api/upstreams/presets")
+                .header(k, v)
+                .body(Body::empty())
+                .unwrap(),
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        let presets = json["presets"].as_array().unwrap();
+        assert!(!presets.is_empty());
+        for preset in presets {
+            let addr = preset["addr"].as_str().unwrap();
+            assert!(!addr.contains('@'), "preset addr must not contain @port: {addr}");
+            if preset["protocol"] == "dot" {
+                assert_eq!(preset["port"], 853, "DoT preset must have port 853");
+            }
+        }
+    }
+
+    // ── FIX #44: port field in response, defaults, port=0 rejected ────────
+
+    #[tokio::test]
+    async fn add_upstream_default_port_udp() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","protocol":"udp"}"#).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(body_json(resp.into_body()).await["upstream"]["port"], 53);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_default_port_dot() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","protocol":"dot"}"#).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(body_json(resp.into_body()).await["upstream"]["port"], 853);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_explicit_port_in_response() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","port":5353}"#).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(body_json(resp.into_body()).await["upstream"]["port"], 5353);
+    }
+
+    #[tokio::test]
+    async fn add_upstream_port_zero_rejected() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","port":0}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_PORT");
     }
 }

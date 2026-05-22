@@ -136,6 +136,12 @@ pub struct UnboundConfig {
     /// Enable AF/XDP kernel-bypass fast path. Default: true (when compiled with xdp feature).
     /// Set to `no` in unbound.conf, or pass `--no-xdp` on the command line, to disable.
     pub xdp: bool,
+
+    // ── DNS prefetching ───────────────────────────────────────────────────────
+    /// Pre-resolve popular domains before their cache entry expires. Default: false.
+    pub prefetch: bool,
+    /// Minimum forwarded-query count per window to qualify for prefetch. Default: 5.
+    pub prefetch_threshold: u32,
 }
 
 impl UnboundConfig {
@@ -152,9 +158,11 @@ impl UnboundConfig {
             sync_interval: 30,
             log_retention: 1000,
             log_client_ip: true,
-            cpu_affinity:      true,
-            xdp:               true,
-            cache_min_entries: 2048,
+            cpu_affinity:       true,
+            xdp:                true,
+            cache_min_entries:  2048,
+            prefetch:           false,
+            prefetch_threshold: 5,
             ..Default::default()
         }
     }
@@ -339,11 +347,13 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
         "cpu-affinity"        => cfg.cpu_affinity        = val.trim_matches('"') != "no",
         "xdp"                 => cfg.xdp                 = val.trim_matches('"') != "no",
+        "prefetch"           => cfg.prefetch           = val.trim_matches('"') == "yes",
+        "prefetch-threshold" => cfg.prefetch_threshold = val.parse().unwrap_or(5),
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"
         | "infra-cache-slabs" | "key-cache-slabs" | "msg-cache-slabs"
-        | "rrset-cache-slabs" | "prefetch" | "prefetch-key"
+        | "rrset-cache-slabs" | "prefetch-key"
         | "use-syslog" | "log-queries" | "log-replies"
         | "hide-identity" | "hide-version" | "identity" | "version"
         | "username" | "chroot" | "directory"
@@ -352,5 +362,43 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         | "unwanted-reply-threshold" | "private-domain"
         => {} // silently accepted
         other => warn!("Line {}: unknown server directive '{}' — ignored", lineno, other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── FEAT #16: prefetch config parsing ─────────────────────────────────
+
+    #[test]
+    fn prefetch_defaults_to_false() {
+        let cfg = parse_str("server:\n").unwrap();
+        assert!(!cfg.prefetch);
+        assert_eq!(cfg.prefetch_threshold, 5);
+    }
+
+    #[test]
+    fn prefetch_yes_enables_prefetch() {
+        let cfg = parse_str("server:\n  prefetch: yes\n").unwrap();
+        assert!(cfg.prefetch);
+    }
+
+    #[test]
+    fn prefetch_no_disables_prefetch() {
+        let cfg = parse_str("server:\n  prefetch: no\n").unwrap();
+        assert!(!cfg.prefetch);
+    }
+
+    #[test]
+    fn prefetch_threshold_parsed() {
+        let cfg = parse_str("server:\n  prefetch-threshold: 10\n").unwrap();
+        assert_eq!(cfg.prefetch_threshold, 10);
+    }
+
+    #[test]
+    fn prefetch_threshold_invalid_falls_back_to_default() {
+        let cfg = parse_str("server:\n  prefetch-threshold: notanumber\n").unwrap();
+        assert_eq!(cfg.prefetch_threshold, 5);
     }
 }

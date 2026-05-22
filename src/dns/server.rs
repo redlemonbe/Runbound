@@ -87,6 +87,8 @@ pub struct RunboundHandler {
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
     dnssec_enabled:   bool,
     dnssec_log_bogus: bool,
+    /// Optional prefetch tracker — None when prefetch: no (default).
+    prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
 }
 
 impl RunboundHandler {
@@ -102,12 +104,13 @@ impl RunboundHandler {
         log_buffer:       SharedLogBuffer,
         dnssec_enabled:   bool,
         dnssec_log_bogus: bool,
+        prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
     ) -> Self {
         Self {
             zones, resolver, rate_limiter,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             acl, private_addrs, cache_max_ttl, stats, log_buffer,
-            dnssec_enabled, dnssec_log_bogus,
+            dnssec_enabled, dnssec_log_bogus, prefetch_tracker,
         }
     }
 
@@ -315,6 +318,10 @@ impl RunboundHandler {
                 }
 
                 debug!(name=%sanitize_dns_name(qname), %qtype, count = records.len(), "resolved");
+                // Prefetch: count forwarded queries so hot domains can be refreshed before expiry.
+                if let Some(ref tracker) = self.prefetch_tracker {
+                    tracker.increment(&qname.to_string());
+                }
                 let mut metadata = Metadata::response_from_request(&request.metadata);
                 metadata.recursion_available = true;
                 let builder = MessageResponseBuilder::from_message_request(request);
@@ -570,7 +577,7 @@ pub fn create_shared_resolver(cfg: &UnboundConfig) -> anyhow::Result<SharedResol
 /// atomically swap it in. Used by POST /api/cache/flush and upstreams CRUD.
 pub fn rebuild_and_swap(
     shared: &SharedResolver,
-    addrs:  &[(String, bool)],
+    addrs:  &[(String, u16, bool)],
     dnssec: bool,
 ) -> anyhow::Result<()> {
     let size = cache_size_from_meminfo();
@@ -579,32 +586,25 @@ pub fn rebuild_and_swap(
     Ok(())
 }
 
-/// Build resolver from an explicit (addr, use_tls) list — used for runtime rebuilds.
+/// Build resolver from an explicit (addr, port, use_tls) list — used for runtime rebuilds.
 pub fn build_resolver_from_addrs(
-    addrs:      &[(String, bool)],
+    addrs:      &[(String, u16, bool)],
     cache_size: usize,
     dnssec:     bool,
 ) -> anyhow::Result<TokioResolver> {
     let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
 
-    for (addr_str, use_tls) in addrs {
-        let default_port: u16 = if *use_tls { 853 } else { 53 };
-        let (ip_str, port) = if let Some(at) = addr_str.find('@') {
-            let p: u16 = addr_str[at + 1..].parse().unwrap_or(default_port);
-            (&addr_str[..at], p)
-        } else {
-            (addr_str.as_str(), default_port)
-        };
-        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+    for (addr_str, port, use_tls) in addrs {
+        if let Ok(ip) = addr_str.parse::<IpAddr>() {
             if *use_tls {
                 let mut cc = ConnectionConfig::tls(Arc::from(ip.to_string()));
-                cc.port = port;
+                cc.port = *port;
                 resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc]));
             } else {
                 let mut cc_udp = ConnectionConfig::udp();
-                cc_udp.port = port;
+                cc_udp.port = *port;
                 let mut cc_tcp = ConnectionConfig::tcp();
-                cc_tcp.port = port;
+                cc_tcp.port = *port;
                 resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc_udp, cc_tcp]));
             }
         }
@@ -1139,14 +1139,16 @@ async fn run_tcp_with_limit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_dns_server(
-    cfg:          &UnboundConfig,
-    zones:        Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter: Arc<RateLimiter>,
-    acl:          Arc<Acl>,
-    stats:        Arc<Stats>,
-    log_buffer:   SharedLogBuffer,
-    resolver:     SharedResolver,
+    cfg:              &UnboundConfig,
+    zones:            Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter:     Arc<RateLimiter>,
+    acl:              Arc<Acl>,
+    stats:            Arc<Stats>,
+    log_buffer:       SharedLogBuffer,
+    resolver:         SharedResolver,
+    prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -1187,7 +1189,7 @@ pub async fn run_dns_server(
 
     let handler = RunboundHandler::new(
         Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl, stats, log_buffer,
-        cfg.dnssec_validation, cfg.dnssec_log_bogus,
+        cfg.dnssec_validation, cfg.dnssec_log_bogus, prefetch_tracker,
     );
     let mut server = Server::new(handler);
 
