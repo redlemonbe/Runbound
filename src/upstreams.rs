@@ -10,7 +10,7 @@
 // On recovery, the backoff resets and an INFO message is emitted.
 
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -455,17 +455,18 @@ fn probe_udp(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
     }
 }
 
-// ── DoT probe (TCP + TLS handshake) ───────────────────────────────────────
-// A successful TLS handshake is sufficient proof that the server is up and
-// speaking TLS on the expected port. No DNS query is sent.
-// DNSSEC detection is not performed for DoT (TLS connectivity only → None).
+// ── DoT probe (TCP + TLS + DNS round-trip, RFC 7858) ─────────────────────
+// Sends DNS_PROBE_PACKET over an established TLS session with the 2-byte TCP
+// length prefix required by RFC 7858. A matching response ID confirms the
+// upstream is both reachable and answering DNS. The AD bit is checked so
+// DNSSEC detection works identically for DoT and UDP upstreams.
 fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
     let ip: IpAddr = match addr.parse() {
         Ok(ip) => ip,
         Err(_) => return (false, None, None),
     };
-    let target   = SocketAddr::new(ip, port);
-    let timeout  = Duration::from_millis(PROBE_TIMEOUT_MS);
+    let target  = SocketAddr::new(ip, port);
+    let timeout = Duration::from_millis(PROBE_TIMEOUT_MS);
 
     let t0 = Instant::now();
 
@@ -477,13 +478,11 @@ fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
     let _ = tcp.set_read_timeout(Some(timeout));
     let _ = tcp.set_write_timeout(Some(timeout));
 
-    // Step 2: TLS handshake — server name derived from the IP address
+    // Step 2: TLS handshake
     let server_name = match rustls::pki_types::ServerName::try_from(addr.to_owned()) {
         Ok(n)  => n,
         Err(_) => return (false, None, None),
     };
-    // Use the ring provider explicitly — avoids relying on a process-level
-    // install_default() that may not have run outside of the main binary.
     let config = Arc::new(
         rustls::ClientConfig::builder_with_provider(
             Arc::new(rustls::crypto::ring::default_provider()),
@@ -498,10 +497,36 @@ fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
         Err(_) => return (false, None, None),
     };
     let mut tls = rustls::StreamOwned::new(conn, tcp);
-    // flush() → complete_io() → blocks until TLS handshake is done or fails
-    match tls.flush() {
-        Ok(()) => (true, Some(t0.elapsed().as_millis() as u64), None),
-        Err(_) => (false, None, None),
+
+    // Step 3: send DNS query with 2-byte TCP length prefix (RFC 7858 §3.3)
+    let len_prefix = (DNS_PROBE_PACKET.len() as u16).to_be_bytes();
+    if tls.write_all(&len_prefix).is_err() || tls.write_all(&DNS_PROBE_PACKET).is_err() {
+        return (false, None, None);
+    }
+
+    // Step 4: read response length
+    let mut resp_len_buf = [0u8; 2];
+    if tls.read_exact(&mut resp_len_buf).is_err() {
+        return (false, None, None);
+    }
+    let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+    if resp_len < 4 {
+        return (false, None, None);
+    }
+
+    // Step 5: read response body
+    let mut buf = vec![0u8; resp_len];
+    if tls.read_exact(&mut buf).is_err() {
+        return (false, None, None);
+    }
+
+    // Step 6: verify ID match and extract AD bit
+    if buf[0] == DNS_PROBE_PACKET[0] && buf[1] == DNS_PROBE_PACKET[1] {
+        let latency = Some(t0.elapsed().as_millis() as u64);
+        let dnssec  = Some(parse_ad_bit(&buf));
+        (true, latency, dnssec)
+    } else {
+        (false, None, None)
     }
 }
 
