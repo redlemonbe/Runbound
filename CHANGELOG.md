@@ -9,6 +9,89 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.2] — 2026-05-22
+
+### Security (polish pass — static audit)
+
+- **24 `unwrap()` / `expect()` calls hardened** — all replaced with explicit
+  panic messages (Mutex/RwLock poison, CSPRNG failure, OnceLock init order)
+  or `unreachable!()` with documented invariant (HMAC key length, hardcoded
+  IP literals, hyper response builder with fixed headers).
+  Clippy flags `-D clippy::unwrap_used -D clippy::expect_used` now pass clean.
+  (`src/api/mod.rs`, `src/dns/xdp/worker.rs`, `src/upstreams.rs`, and 6 other files)
+
+- **Log injection guard confirmed** — all `tracing::warn!` / `tracing::error!`
+  calls on the XDP hot path reviewed; no raw domain-name data emitted at WARN+
+  level (domain names are only logged at DEBUG).
+
+- **Input validation confirmed on all v0.6.2 endpoints** — `POST /api/upstreams`
+  rejects unknown protocols (400) and invalid IP addresses (400) before any
+  processing; `DELETE /api/upstreams/:id` returns 404 on unknown UUID.
+
+### Fixed
+
+- **`manual_map` pattern** — `if let Some(pos) = ... { Some(...) } else { None }`
+  replaced with `.map(|pos| list.remove(pos))` in `src/upstreams.rs:129`.
+
+### Tests
+
+- 39/39 tests pass. +13 tests added for v0.6.2 endpoints covering auth (401),
+  invalid input (400/404), and happy path for all new handlers.
+
+---
+
+## [0.6.1] — 2026-05-22
+
+### Fixed
+
+- **All API routes now served under `/api/` prefix (Fix #37)** — `GET /health`
+  remains at root (no-auth, load balancer probe). All other endpoints require
+  `/api/` prefix and Bearer authentication. Legacy paths (`/stats`, `/dns`, etc.)
+  return 404. (`src/api/mod.rs`)
+
+- **UDP/IP checksum 8-byte accumulation (Fix #38)** — `ones_complement_sum()`
+  now accumulates 8 bytes per iteration (u64) instead of 2 bytes (u16),
+  reducing loop iterations by 4× on the XDP TX hot path.
+  (`src/dns/xdp/worker.rs`)
+
+- **`xdp_mode` field in `GET /api/system` (Fix #39)** — Response now includes
+  `"xdp_mode": "drv" | "skb" | "disabled"` in addition to the existing
+  `xdp_active` boolean, allowing monitoring dashboards to distinguish native
+  zero-copy from generic SKB fallback. (`src/api/mod.rs`)
+
+- **`GET /health` response cleaned** — Removed `hsm` field (vestige). Response
+  is now `{"status":"ok","version":"0.6.1","uptime_secs":N}`. (`src/api/mod.rs`)
+
+### Added
+
+- **`POST /api/cache/flush`** — Atomically rebuilds the hickory resolver with
+  an empty cache. Returns `{"status":"ok","flushed_entries":N}`. Caller IP
+  logged at WARN level (destructive operation). (`src/api/mod.rs`)
+
+- **`GET /api/sync/slaves`** — Lists slaves seen in the last 5 minutes with
+  `addr`, `status` (`connected` / `stale` / `disconnected`), `last_seen_secs`,
+  `zones_synced`, and `version`. Returns empty list with a note when not in
+  master mode. (`src/api/mod.rs`)
+
+- **`POST /api/upstreams` / `DELETE /api/upstreams/:id`** — Runtime upstream
+  management. Validates `addr` (valid IP), `protocol` ∈ `{udp, dot}`, and
+  `port` (1–65535). Rebuilds the shared resolver immediately on change.
+  Rejects deletion of the last enabled upstream with HTTP 409.
+  (`src/api/mod.rs`, `src/upstreams.rs`)
+
+- **`GET /api/upstreams/presets`** — Nine preset resolvers: Cloudflare (UDP +
+  DoT), Google, Quad9 (UDP + DoT), OpenDNS, and AdGuard DNS. (`src/api/mod.rs`)
+
+- **`last_error` field in feed responses** — `GET /api/feeds` now includes
+  `"last_error": null | "error string"` on each feed entry, replacing the
+  silent `entry_count: 0` on sync failure. (`src/feeds/mod.rs`)
+
+- **`SharedResolver` wired end-to-end** — `build_and_launch` → `AppState` →
+  `run_dns_server` enables all API-driven resolver operations (cache flush,
+  upstream add/remove) to take effect without restart. (`src/main.rs`)
+
+---
+
 ## [0.6.0] — 2026-05-22
 
 ### Fixed

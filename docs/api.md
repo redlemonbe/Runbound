@@ -13,7 +13,7 @@ except `GET /help` require a Bearer token.
 
 ```bash
 export RUNBOUND_API_KEY="$(cat /etc/runbound/api.key)"
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/dns
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/dns
 ```
 
 Timing-safe comparison is used server-side (constant-time, immune to timing attacks).
@@ -55,7 +55,7 @@ Changes take effect immediately. No restart required.
 List all local DNS entries.
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/dns
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/dns
 ```
 
 ```json
@@ -72,7 +72,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/dns
 Add a local DNS entry.
 
 ```bash
-curl -X POST http://localhost:8080/dns \
+curl -X POST http://localhost:8080/api/dns \
   -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name":"nas.home.","type":"A","value":"192.168.1.10","ttl":300}'
@@ -95,10 +95,10 @@ Remove an entry by its UUID (from the `id` field of `GET /dns`).
 
 ```bash
 # First get the UUID:
-ID=$(curl -s -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/dns \
+ID=$(curl -s -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/dns \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['entries'][0]['id'])")
 
-curl -X DELETE "http://localhost:8080/dns/$ID" \
+curl -X DELETE "http://localhost:8080/api/dns/$ID" \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
@@ -115,7 +115,7 @@ Block domains — equivalent to `local-zone: "domain." always_nxdomain`, but liv
 #### `GET /blacklist`
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/blacklist
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/blacklist
 ```
 
 ```json
@@ -125,7 +125,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/blacklis
 #### `POST /blacklist`
 
 ```bash
-curl -X POST http://localhost:8080/blacklist \
+curl -X POST http://localhost:8080/api/blacklist \
   -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"domain":"ads.example.com","action":"nxdomain"}'
@@ -140,7 +140,7 @@ curl -X POST http://localhost:8080/blacklist \
 Remove by UUID.
 
 ```bash
-curl -X DELETE "http://localhost:8080/blacklist/$ID" \
+curl -X DELETE "http://localhost:8080/api/blacklist/$ID" \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
@@ -153,7 +153,7 @@ Subscribe to remote block-list feeds. Feeds auto-refresh every 24 hours.
 #### `GET /feeds`
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/feeds
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/feeds
 ```
 
 ```json
@@ -165,7 +165,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/feeds
 Subscribe to a new feed. **Limit: 100 feeds maximum.**
 
 ```bash
-curl -X POST http://localhost:8080/feeds \
+curl -X POST http://localhost:8080/api/feeds \
   -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name":"urlhaus","url":"https://urlhaus.abuse.ch/downloads/hostfile/","format":"hosts","action":"nxdomain"}'
@@ -179,7 +179,7 @@ curl -X POST http://localhost:8080/feeds \
 List built-in feed presets (OISD, StevenBlack, Hagezi, URLhaus, AdGuard...).
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/feeds/presets
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/feeds/presets
 ```
 
 #### `DELETE /feeds/:id`
@@ -187,7 +187,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/feeds/pr
 Remove a feed subscription by UUID.
 
 ```bash
-curl -X DELETE "http://localhost:8080/feeds/$ID" \
+curl -X DELETE "http://localhost:8080/api/feeds/$ID" \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
@@ -196,7 +196,7 @@ curl -X DELETE "http://localhost:8080/feeds/$ID" \
 Refresh all enabled feeds immediately.
 
 ```bash
-curl -X POST http://localhost:8080/feeds/update \
+curl -X POST http://localhost:8080/api/feeds/update \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
@@ -209,7 +209,7 @@ curl -X POST http://localhost:8080/feeds/update \
 Refresh a single feed by UUID.
 
 ```bash
-curl -X POST "http://localhost:8080/feeds/$ID/update" \
+curl -X POST "http://localhost:8080/api/feeds/$ID/update" \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
@@ -236,7 +236,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/health
 Query statistics snapshot: counters, QPS, latency percentiles, cache metrics.
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/stats
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stats
 ```
 
 ```json
@@ -297,7 +297,7 @@ Live stats as Server-Sent Events — one JSON snapshot per second. Ideal for das
 
 ```bash
 curl -N -H "Authorization: Bearer $RUNBOUND_API_KEY" \
-     http://localhost:8080/stats/stream
+     http://localhost:8080/api/stats/stream
 ```
 
 ```
@@ -353,19 +353,19 @@ Recent DNS query log, newest first. Entries are kept in a fixed-size ring buffer
 
 ```bash
 # Last 100 queries (default)
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/logs
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/logs
 
 # Blocked queries only
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
-     "http://localhost:8080/logs?action=blocked&limit=50"
+     "http://localhost:8080/api/logs?action=blocked&limit=50"
 
 # Filter by client IP
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
-     "http://localhost:8080/logs?client=192.168.1.10"
+     "http://localhost:8080/api/logs?client=192.168.1.10"
 
 # Queries since a Unix timestamp
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
-     "http://localhost:8080/logs?since=1747483200"
+     "http://localhost:8080/api/logs?since=1747483200"
 ```
 
 ```json
@@ -429,7 +429,7 @@ GDPR right-to-erasure request.
 
 ```bash
 curl -X DELETE -H "Authorization: Bearer $RUNBOUND_API_KEY" \
-     http://localhost:8080/logs
+     http://localhost:8080/api/logs
 ```
 
 ```json
@@ -522,7 +522,7 @@ Any gap in `seq` or MAC mismatch indicates a tampered or missing entry.
 Dump active configuration (sanitised — API key is omitted).
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/config
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/config
 ```
 
 ```json
@@ -560,7 +560,7 @@ Hot-reload: re-parse `runbound.conf` and rebuild all in-memory DNS data without 
 Equivalent to `systemctl reload runbound` (SIGHUP).
 
 ```bash
-curl -X POST http://localhost:8080/reload \
+curl -X POST http://localhost:8080/api/reload \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
@@ -579,7 +579,7 @@ Prometheus text format (`text/plain; version=0.0.4`). Compatible with any Promet
 scraper, Grafana Agent, VictoriaMetrics, and OTEL Collector.
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/metrics
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/metrics
 ```
 
 ```
@@ -673,7 +673,7 @@ audit log as a `config_reload` event.
 DoT/DoH/DoQ protocol status.
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/tls
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/tls
 ```
 
 ```json
@@ -686,6 +686,144 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/tls
 ```
 
 ---
+
+### `GET /api/system`
+
+Runtime system metrics.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/system
+```
+
+```json
+{
+  "version": "0.6.2",
+  "uptime_secs": 3600,
+  "xdp_active": true,
+  "xdp_mode": "drv",
+  "cpu_cores": 64,
+  "cpu_percent": 1.2,
+  "mem_total_mb": 65536,
+  "mem_avail_mb": 62000,
+  "cache_entries": 48231,
+  "workers": 8
+}
+```
+
+`xdp_mode`: `"drv"` (native zero-copy), `"skb"` (generic fallback), `"disabled"`.
+
+---
+
+### `POST /api/cache/flush`
+
+Atomically rebuilds the resolver with an empty cache. Caller IP is logged at WARN level.
+
+```bash
+curl -X POST -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/cache/flush
+```
+
+```json
+{"status": "ok", "flushed_entries": 48231}
+```
+
+---
+
+### Upstreams
+
+Runtime upstream forwarder management. Changes take effect immediately — the shared
+resolver is rebuilt atomically on every add/remove.
+
+#### `GET /api/upstreams`
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upstreams
+```
+
+```json
+{
+  "upstreams": [
+    {
+      "id": "550e8400-...",
+      "name": "Cloudflare",
+      "addr": "1.1.1.1",
+      "port": 53,
+      "protocol": "udp",
+      "enabled": true,
+      "latency_ms": 12
+    }
+  ],
+  "total": 1
+}
+```
+
+#### `POST /api/upstreams`
+
+```bash
+curl -X POST http://localhost:8080/api/upstreams \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Cloudflare DoT","addr":"1.1.1.1","port":853,"protocol":"dot"}'
+```
+
+**Validation:** `addr` must be a valid IP address. `protocol` ∈ `{udp, dot}`. `port` 1–65535. Maximum 32 upstreams. Returns `409` when deleting the last enabled upstream.
+
+#### `DELETE /api/upstreams/:id`
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  http://localhost:8080/api/upstreams/550e8400-...
+```
+
+Returns `409` when deleting the last enabled upstream.
+
+#### `GET /api/upstreams/presets`
+
+Nine built-in presets: Cloudflare (UDP + DoT), Google, Quad9 (UDP + DoT), OpenDNS, AdGuard DNS.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upstreams/presets
+```
+
+---
+
+### `GET /api/sync/slaves`
+
+Lists slaves seen in the last 5 minutes. Returns empty list with a note when not in master mode.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/sync/slaves
+```
+
+```json
+{
+  "slaves": [
+    {
+      "addr": "192.168.8.13",
+      "status": "connected",
+      "last_seen_secs": 4,
+      "zones_synced": 12,
+      "version": "0.6.2"
+    }
+  ],
+  "total": 1
+}
+```
+
+`status`: `"connected"` (< 30 s), `"stale"` (< 120 s), `"disconnected"` (> 120 s).
+
+---
+
+### `GET /health`
+
+Health probe — **no authentication required** (load balancer / Kubernetes liveness probe).
+
+```bash
+curl http://localhost:8080/health
+```
+
+```json
+{"status": "ok", "version": "0.6.2", "uptime_secs": 3600}
+```
 
 ---
 
