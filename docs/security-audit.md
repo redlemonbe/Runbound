@@ -9,10 +9,11 @@
 
 ## Executive Summary
 
-**89 findings across 9 audit cycles — 89 resolved, 0 open.**
+**91 findings across 10 audit cycles — 89 resolved, 2 open.**
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
+| Live pentest | v0.6.2 | 2 bugs (Low-Med, Med) | ⚠️ 2 open — #40 #41 |
 | Static Clippy audit | v0.6.2 | 25 (24 Low, 1 Info) | ✅ All fixed v0.6.2 |
 | IA audit | v0.4.16 | 7 (5 Low, 2 Info) | ✅ All fixed/accepted v0.5.0 |
 | Live pentest | v0.4.16 | 2 bugs + 13 PASS + 2 observations | ✅ BUG-1/BUG-2 closed v0.5.0 |
@@ -35,7 +36,7 @@ findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0
 A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
 through SEC-16), all fixed in v0.3.3.
 
-**All HIGH and MEDIUM findings are closed. All LOW and INFO findings are resolved or accepted as known limitations. No open findings.**
+**All HIGH findings are closed. 2 LOW-MEDIUM findings are open from v0.6.2 live pentest (upstream input validation gaps — tracked in GitHub #40 and #41).**
 
 - JSON store HMAC-SHA256 integrity (HIGH-06) — `RUNBOUND_STORE_KEY` env var, sidecar `.mac` files.
 - TLS cipher suite hardening (HIGH-07) — hickory 0.26 + rustls 0.23, TLS 1.3 default.
@@ -1085,7 +1086,54 @@ On `parse_local_data` failure, the HTTP 400 response body included `"details": f
 
 ## Open Findings
 
-No open findings. All findings from all audit cycles are resolved or accepted.
+### BUG-1 (LOW-MEDIUM) — Loopback and link-local IPs accepted as upstreams
+
+**GitHub:** #40  
+**Version:** v0.6.2  
+**Status:** ⚠️ Open
+
+`POST /api/upstreams` accepts `127.0.0.1`, `::1`, and `169.254.169.254` as upstream DNS addresses. Loopback creates a self-referential DNS loop; `169.254.169.254` is the cloud metadata endpoint and is not a DNS resolver.
+
+Private ranges (10.x, 192.168.x, 172.16-31.x) are intentionally allowed for internal DNS servers.
+
+**Fix:** Block `is_loopback()` and IPv4 `is_link_local()` in the upstream address validator.
+
+---
+
+### BUG-2 (MEDIUM) — DELETE last upstream returns 200 instead of 409
+
+**GitHub:** #41  
+**Version:** v0.6.2  
+**Status:** ⚠️ Open
+
+`DELETE /api/upstreams/:id` returns 200 and removes the last upstream, leaving Runbound with zero upstreams. All non-cached, non-authoritative queries fail silently until an upstream is re-added.
+
+**Fix:** Check `upstreams.len() == 1` before deletion, return 409 Conflict.
+
+---
+
+## v0.6.2 Live Pentest — 2026-05-22
+
+**Method:** Black-box REST API testing against running v0.6.2 instance.  
+**Findings: 2 bugs, 15 PASS.**
+
+| Test | Result |
+|---|---|
+| GET /health — no auth | ✅ 200, no auth required |
+| GET /api/system — version/XDP info | ✅ 200 |
+| Old routes /stats, /dns (no prefix) | ✅ 404 |
+| Security headers (nosniff, DENY, CSP, no-store) | ✅ All present |
+| Auth 401 on missing token | ✅ 401 |
+| Bad token 401 | ✅ 401 |
+| SSRF feed (HTTP URL) | ✅ 400 rejected |
+| Path traversal | ✅ 404 |
+| Bad upstream protocol | ✅ 400 INVALID_PROTOCOL |
+| Bad upstream addr | ✅ 400 INVALID_ADDR |
+| GET /api/upstreams/presets | ✅ 9 presets |
+| Upstream CRUD add → delete | ✅ 201 / 200 |
+| Loopback upstream (127.0.0.1, ::1) | ⚠️ **Accepted** — should be 400 (#40) |
+| Link-local upstream (169.254.169.254) | ⚠️ **Accepted** — should be 400 (#40) |
+| DELETE last upstream | ⚠️ **200** — should be 409 (#41) |
 
 ---
 
@@ -1114,8 +1162,8 @@ No open findings. All findings from all audit cycles are resolved or accepted.
 **New endpoints (v0.6.1 / v0.6.2) — validated:**
 - All new POST/DELETE endpoints: auth 401 + input validation 400 + happy path tested ✓
 - No error response leaks internal paths, stack traces, or dependency versions ✓
-- `POST /api/upstreams`: protocol validated as enum `{udp, dot}`, addr validated as IP ✓
-- `DELETE /api/upstreams/:id`: 404 on unknown UUID, 409 on last-upstream deletion ✓
+- `POST /api/upstreams`: protocol validated as enum `{udp, dot}`, addr validated as parseable IP ✓ — loopback/link-local not blocked ⚠️ (issue #40)
+- `DELETE /api/upstreams/:id`: 404 on unknown UUID ✓ — last-upstream guard broken (returns 200 not 409) ⚠️ (issue #41)
 - Log injection: domain names only emitted at DEBUG level, never at WARN+ ✓
 
 **Result:** `cargo clippy --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used` → 0 errors. 39/39 tests pass.
