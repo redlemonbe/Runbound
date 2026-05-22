@@ -588,11 +588,36 @@ pub fn create_shared_resolver(cfg: &UnboundConfig) -> anyhow::Result<SharedResol
     Ok(Arc::new(ArcSwap::new(Arc::new(resolver))))
 }
 
-/// Rebuild the resolver from an explicit list of (addr_string, use_tls) pairs and
-/// atomically swap it in. Used by POST /api/cache/flush and upstreams CRUD.
+/// Derive a TLS SNI hostname for a DoT upstream.
+///
+/// Uses `explicit` when provided; otherwise maps well-known public resolver IPs
+/// to their correct certificate SANs. Falls back to the IP string for unknowns
+/// (produces a DnsName from the IP literal, which will fail TLS validation on
+/// servers that only advertise their DNS name as a SAN — the correct behaviour
+/// is to set `tls_hostname` explicitly for such servers).
+pub fn dot_tls_name(ip: &IpAddr, explicit: Option<&str>) -> Arc<str> {
+    if let Some(h) = explicit {
+        return Arc::from(h);
+    }
+    let known = match ip.to_string().as_str() {
+        "1.1.1.1" | "1.0.0.1"              => "cloudflare-dns.com",
+        "9.9.9.9" | "149.112.112.112"       => "dns.quad9.net",
+        "8.8.8.8" | "8.8.4.4"              => "dns.google",
+        "208.67.222.222" | "208.67.220.220" => "dns.opendns.com",
+        _                                    => "",
+    };
+    if known.is_empty() {
+        Arc::from(ip.to_string())
+    } else {
+        Arc::from(known)
+    }
+}
+
+/// Rebuild the resolver from an explicit list of (addr_string, port, use_tls, tls_hostname) tuples
+/// and atomically swap it in. Used by POST /api/cache/flush and upstreams CRUD.
 pub fn rebuild_and_swap(
     shared: &SharedResolver,
-    addrs:  &[(String, u16, bool)],
+    addrs:  &[(String, u16, bool, Option<String>)],
     dnssec: bool,
 ) -> anyhow::Result<()> {
     let size = cache_size_from_meminfo();
@@ -601,18 +626,19 @@ pub fn rebuild_and_swap(
     Ok(())
 }
 
-/// Build resolver from an explicit (addr, port, use_tls) list — used for runtime rebuilds.
+/// Build resolver from an explicit (addr, port, use_tls, tls_hostname) list — used for runtime rebuilds.
 pub fn build_resolver_from_addrs(
-    addrs:      &[(String, u16, bool)],
+    addrs:      &[(String, u16, bool, Option<String>)],
     cache_size: usize,
     dnssec:     bool,
 ) -> anyhow::Result<TokioResolver> {
     let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
 
-    for (addr_str, port, use_tls) in addrs {
+    for (addr_str, port, use_tls, tls_hostname) in addrs {
         if let Ok(ip) = addr_str.parse::<IpAddr>() {
             if *use_tls {
-                let mut cc = ConnectionConfig::tls(Arc::from(ip.to_string()));
+                let tls_name = dot_tls_name(&ip, tls_hostname.as_deref());
+                let mut cc = ConnectionConfig::tls(tls_name);
                 cc.port = *port;
                 resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc]));
             } else {
@@ -665,7 +691,9 @@ fn build_resolver(cfg: &UnboundConfig, cache_size: usize) -> anyhow::Result<Toki
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
                 if fwd.tls {
                     // DNS-over-TLS: encrypted channel, single TCP connection per server.
-                    let mut cc = ConnectionConfig::tls(Arc::from(ip.to_string()));
+                    // dot_tls_name derives the correct SNI hostname for well-known resolvers.
+                    let tls_name = dot_tls_name(&ip, None);
+                    let mut cc = ConnectionConfig::tls(tls_name);
                     cc.port = port;
                     resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc]));
                 } else {
@@ -1359,4 +1387,62 @@ pub async fn run_dns_server(
     info!("Runbound ready — RFC 1034/1035/2782/4033/6891/7858/8484/9250");
     server.block_until_done().await
         .map_err(|e| anyhow::anyhow!("Server error: {e}"))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dot_tls_name_cloudflare() {
+        let ip: IpAddr = "1.1.1.1".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(dot_tls_name(&ip, None), Arc::from("cloudflare-dns.com"));
+    }
+
+    #[test]
+    fn dot_tls_name_cloudflare_alt() {
+        let ip: IpAddr = "1.0.0.1".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(dot_tls_name(&ip, None), Arc::from("cloudflare-dns.com"));
+    }
+
+    #[test]
+    fn dot_tls_name_quad9() {
+        let ip: IpAddr = "9.9.9.9".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(dot_tls_name(&ip, None), Arc::from("dns.quad9.net"));
+    }
+
+    #[test]
+    fn dot_tls_name_quad9_alt() {
+        let ip: IpAddr = "149.112.112.112".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(dot_tls_name(&ip, None), Arc::from("dns.quad9.net"));
+    }
+
+    #[test]
+    fn dot_tls_name_google() {
+        let ip: IpAddr = "8.8.8.8".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(dot_tls_name(&ip, None), Arc::from("dns.google"));
+    }
+
+    #[test]
+    fn dot_tls_name_google_alt() {
+        let ip: IpAddr = "8.8.4.4".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(dot_tls_name(&ip, None), Arc::from("dns.google"));
+    }
+
+    #[test]
+    fn dot_tls_name_unknown_ip() {
+        let ip: IpAddr = "192.168.1.1".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(dot_tls_name(&ip, None), Arc::from("192.168.1.1"));
+    }
+
+    #[test]
+    fn dot_tls_name_explicit_override() {
+        let ip: IpAddr = "1.1.1.1".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            dot_tls_name(&ip, Some("my-custom-dot.example.com")),
+            Arc::from("my-custom-dot.example.com"),
+        );
+    }
 }

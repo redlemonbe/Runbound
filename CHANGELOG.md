@@ -9,6 +9,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.7] — 2026-05-22
+
+### Fixed
+
+- **FIX #56 — DoT SNI mismatch: IP passed as TLS server name** (`src/dns/server.rs`)  
+  `build_resolver` and `build_resolver_from_addrs` previously called  
+  `ConnectionConfig::tls(Arc::from(ip.to_string()))`, which caused hickory to  
+  present the IP literal as a `DnsName` SNI (e.g. `"1.1.1.1"`). Cloudflare's  
+  certificate advertises `"cloudflare-dns.com"`, not `"1.1.1.1"`, so rustls  
+  rejected the handshake → all real DNS queries over DoT returned SERVFAIL.  
+  The health probe was unaffected because it uses `ServerName::try_from(ip)`  
+  which creates a `ServerName::IpAddress` that matches the IP SAN — masking  
+  the bug.
+
+  New `dot_tls_name(ip, explicit)` derives the correct SNI hostname:  
+  - If an explicit `tls_hostname` is provided (e.g. via API), it is used as-is.  
+  - Well-known IPs are mapped to their certificate SANs:  
+    `1.1.1.1 / 1.0.0.1` → `cloudflare-dns.com`,  
+    `9.9.9.9 / 149.112.112.112` → `dns.quad9.net`,  
+    `8.8.8.8 / 8.8.4.4` → `dns.google`,  
+    `208.67.222.222 / 208.67.220.220` → `dns.opendns.com`.  
+  - Unknown IPs fall back to the IP string (produces the previous behaviour —
+    the operator must set `tls_hostname` explicitly for non-standard servers).
+
+### Added
+
+- **`tls_hostname` field on `UpstreamStatus`** (`src/upstreams.rs`)  
+  New optional field persisted in `upstreams.json`.  
+  Omitted from JSON when `None` (`skip_serializing_if`).  
+  Backward-compatible: existing files without the field parse as `None`.
+
+- **`tls_hostname` on `POST /api/upstreams`** (`src/api/mod.rs`)  
+  Optional field in the request body. Validated: max 253 chars, no control  
+  characters. `None` / absent → auto-derive via `dot_tls_name`.
+
+- **`tls_hostname` patchable via `PATCH /api/upstreams/:id`** (`src/api/mod.rs`)  
+  Now accepts `"name"` and `"tls_hostname"` (both optional).  
+  Empty string or `null` clears the field (falls back to auto-derive).
+
+- **`tls_hostname` in `GET /api/upstreams/presets`** (`src/api/mod.rs`)  
+  All DoT preset entries now include `tls_hostname` so the field is  
+  persisted automatically when a preset is added via the UI.  
+  Added missing presets: Cloudflare DoT alt, Google DoT, Google DoT alt,  
+  Quad9 alt, Quad9 DoT alt.
+
+---
+
 ## [0.6.6] — 2026-05-22
 
 ### Added
