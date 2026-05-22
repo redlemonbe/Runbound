@@ -11,17 +11,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [0.6.5] — 2026-05-22
 
-### Documentation
-
-- **Live verification of v0.6.4 fixes** (`docs/security-audit.md`)  
-  FIX #45 (DoT TCP+TLS probe), FEAT #46 (cache flush cooldown),
-  FEAT #47 (system fields) confirmed on a running instance.  
-  Security audit table updated: 96 findings tracked across 12 cycles, 0 open.
-
----
-
-## [0.6.6] — 2026-05-22
-
 ### Added
 
 - **FEAT #48 — DNSSEC auto-detection via DO bit / AD bit** (`src/upstreams.rs`)  
