@@ -9,11 +9,11 @@
 
 ## Executive Summary
 
-**108 findings across 13 audit cycles — 107 resolved, 1 open (LOW).**
+**108 findings across 13 audit cycles — 108 resolved, 0 open.**
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
-| Live pentest + code audit | v0.6.5 | 12 tests PASS + 1 new finding (LOW) | ✅ 12 PASS, UI-XSS-01 open |
+| Live pentest + code audit | v0.6.5 | 12 tests PASS + 1 new finding (LOW) | ✅ 12 PASS, UI-XSS-01 fixed same day |
 | Live verification | v0.6.4 | 3 fixes (#45 #46 #47) | ✅ All verified v0.6.4 |
 | Hardening pass | v0.6.3 | 2 (FIX #40, FIX #41 from v0.6.2) | ✅ All fixed v0.6.3 |
 | Live pentest | v0.6.2 | 2 bugs (Low-Med, Med) | ✅ Fixed v0.6.3 (#40 #41) |
@@ -39,7 +39,7 @@ findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0
 A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
 through SEC-16), all fixed in v0.3.3.
 
-**107 findings closed. 1 open (UI-XSS-01, LOW — web UI only, requires auth).**
+**All 108 findings closed. No open issues.**
 
 - JSON store HMAC-SHA256 integrity (HIGH-06) — `RUNBOUND_STORE_KEY` env var, sidecar `.mac` files.
 - TLS cipher suite hardening (HIGH-07) — hickory 0.26 + rustls 0.23, TLS 1.3 default.
@@ -1217,7 +1217,7 @@ Live pentest on running v0.6.5 instance + full white-box source review of `src/u
 
 | ID | Severity | Component | Finding | Status |
 |---|---|---|---|---|
-| UI-XSS-01 | LOW | `index.html:707` | `esc()` does not escape single-quote (`'`). The upstream `name` field is embedded as `onclick="upstreamRename('id','${esc(name)}')"`. A name containing `');alert(1)//` executes arbitrary JS when the rename button is clicked (stored XSS). Requires auth to set the malicious name. **Fix:** add `replace(/'/g, "&#39;")` to `esc()`. | Open |
+| UI-XSS-01 | LOW | `index.html:707` | `esc()` did not escape single-quote (`'`). The upstream `name` field is embedded as `onclick="upstreamRename('id','${esc(name)}')"`. A name containing `');alert(1)//` executes arbitrary JS when the rename button is clicked (stored XSS). Requires auth. **Fixed same day:** added `.replace(/'/g,"&#39;").replace(/"/g,"&quot;")` to `esc()`. | ✅ Fixed 2026-05-22 |
 
 ### Informational observations
 
@@ -1361,6 +1361,6 @@ v0.6.5 live pentest + code audit (2026-05-22): 4 new features fully verified (#4
 detection via EDNS0+DO probe AD bit; #49 latency_history VecDeque capped at 5; #50 PATCH
 /api/upstreams/:id with field restriction, control-char guard, 64-char limit; #51
 GET /api/cache/stats with hit_rate_pct null-safe). 10 security hardening items confirmed
-from source (SEC H1–H4, SEC M1–M3, SEC C1, PERF P3/P6). 1 new finding: UI-XSS-01 (LOW)
-— `esc()` in index.html does not escape single-quote, stored XSS via upstream name in
-onclick context; requires auth. 87/87 tests pass.*
+from source (SEC H1–H4, SEC M1–M3, SEC C1, PERF P3/P6). 1 new finding UI-XSS-01 (LOW):
+esc() in index.html did not escape single-quote → stored XSS in onclick; fixed same day
+by adding '→&#39; and "→&quot; to esc(). GitHub issue #52 opened and closed. 87/87 tests pass.*
