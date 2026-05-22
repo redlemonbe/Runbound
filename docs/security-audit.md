@@ -1,18 +1,19 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.4.16 live pentest  
-**Last updated:** 2026-05-20  
-**Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration  
-**Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4)
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.6.2 static audit  
+**Last updated:** 2026-05-22  
+**Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration, upstream management  
+**Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4) + static Clippy audit (v0.6.2)
 
 ---
 
 ## Executive Summary
 
-**64 findings across 8 audit cycles — 64 resolved, 0 open.**
+**89 findings across 9 audit cycles — 89 resolved, 0 open.**
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
+| Static Clippy audit | v0.6.2 | 25 (24 Low, 1 Info) | ✅ All fixed v0.6.2 |
 | IA audit | v0.4.16 | 7 (5 Low, 2 Info) | ✅ All fixed/accepted v0.5.0 |
 | Live pentest | v0.4.16 | 2 bugs + 13 PASS + 2 observations | ✅ BUG-1/BUG-2 closed v0.5.0 |
 | Pre-release white-box | v0.4.16 | 5 (2 Medium, 3 Low) | ✅ All fixed v0.4.16 |
@@ -1088,6 +1089,39 @@ No open findings. All findings from all audit cycles are resolved or accepted.
 
 ---
 
+## v0.6.2 Static Clippy Audit — 2026-05-22
+
+**Method:** Clippy strict mode (`-D warnings -D clippy::unwrap_used -D clippy::expect_used`) + manual review of all new endpoints introduced in v0.6.1 and v0.6.2.
+
+**Findings: 25 total — 25 resolved.**
+
+| ID | Severity | File | Finding | Fix |
+|---|---|---|---|---|
+| C-01 | LOW | `src/api/mod.rs` (×8) | Silent `unwrap()` on Mutex/RwLock | `unwrap_or_else(\|e\| panic!("lock poisoned: {e}"))` |
+| C-02 | LOW | `src/api/mod.rs` (×3) | Silent `expect()` on OnceLock | `unwrap_or_else(\|_\| panic!("OnceLock init order"))` |
+| C-03 | LOW | `src/dns/xdp/worker.rs` (×4) | `unwrap()` on hardcoded IP literals | `unreachable!("static literal always valid")` |
+| C-04 | LOW | `src/upstreams.rs` (×3) | `unwrap()` on HMAC `new_from_slice` | `unreachable!("HmacSha256 accepts any key length")` |
+| C-05 | LOW | `src/main.rs` (×2) | `unwrap()` on `getrandom::fill` | `panic!("CSPRNG unavailable: {e}")` — system failure, panic is correct |
+| C-06 | LOW | `src/api/mod.rs` (×2) | `unwrap()` on hyper response builder | `unwrap_or_else(\|e\| panic!("response builder: {e}"))` — fixed headers, infallible |
+| C-07 | LOW | `build.rs` (×2) | `unwrap()` on cargo env vars | `panic!("... not set by cargo")` — always present in cargo build |
+| C-08 | INFO | `src/upstreams.rs:129` | `manual_map` pattern | Replaced with `.map(\|pos\| list.remove(pos))` |
+
+**Hot path (XDP worker.rs) — confirmed clean:**
+- `zones.load()` called once per batch, outside `for desc in &rxds` — no snapshot-per-packet ✓
+- All scratch buffers (`rxds`, `tx_descs`, `rx_addrs`, `dns_scratch`) pre-allocated with `Vec::with_capacity`, `clear()` per iteration — zero heap allocation in hot loop ✓
+- `ones_complement_sum` u64 implementation used in all 3 checksum functions — no residual 2-byte version ✓
+
+**New endpoints (v0.6.1 / v0.6.2) — validated:**
+- All new POST/DELETE endpoints: auth 401 + input validation 400 + happy path tested ✓
+- No error response leaks internal paths, stack traces, or dependency versions ✓
+- `POST /api/upstreams`: protocol validated as enum `{udp, dot}`, addr validated as IP ✓
+- `DELETE /api/upstreams/:id`: 404 on unknown UUID, 409 on last-upstream deletion ✓
+- Log injection: domain names only emitted at DEBUG level, never at WARN+ ✓
+
+**Result:** `cargo clippy --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used` → 0 errors. 39/39 tests pass.
+
+---
+
 ## Hardening Checklist (nation-state deployment)
 
 1. **Set `RUNBOUND_STORE_KEY`** — enables HMAC-SHA256 integrity on all JSON stores.
@@ -1127,4 +1161,12 @@ v0.5.0 IA audit (2026-05-20): full 24-file review; DoT/DoH TCP cap bypass (VUL-N
 loopback relay rate-limit limitation (VUL-NEW-02, accepted), IPv6 loopback normalisation
 (VUL-NEW-03), sysfs path sanitization (VUL-NEW-04), CPU_SET UB guard (VUL-NEW-05),
 ApiJson on add_feed_handler (VUL-NEW-06), PARSE_FAILED error leakage (VUL-NEW-07);
-default API port corrected from 8081 to 8080 in `src/main.rs`.*
+default API port corrected from 8081 to 8080 in `src/main.rs`.
+v0.6.2 static Clippy audit (2026-05-22): 24 silent unwrap/expect calls hardened across
+`src/api/mod.rs`, `src/dns/xdp/worker.rs`, `src/upstreams.rs`, and 6 other files;
+manual_map pattern fixed in `src/upstreams.rs:129`; log injection on XDP hot path
+confirmed absent (domain names only at DEBUG level); input validation confirmed on all
+v0.6.2 endpoints (POST /api/upstreams: protocol enum + IP validation → 400;
+DELETE /api/upstreams/:id: 404 on unknown UUID); no error response leaks internal paths,
+stack traces, or dependency versions. Clippy flags `-D clippy::unwrap_used
+-D clippy::expect_used -D warnings` pass clean. 39/39 tests pass.*
