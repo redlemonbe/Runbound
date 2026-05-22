@@ -211,7 +211,7 @@ curl http://localhost:8080/health
 ```
 
 ```json
-{"status": "ok", "version": "0.6.4", "uptime_secs": 3600}
+{"status": "ok", "version": "0.6.5", "uptime_secs": 3600}
 ```
 
 ---
@@ -577,7 +577,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 
 ```json
 {
-  "version": "0.6.4",
+  "version": "0.6.5",
   "uptime_secs": 3600,
   "xdp_active": true,
   "xdp_mode": "drv",
@@ -629,6 +629,32 @@ Retry-After: 58
 
 Set `cache-flush-cooldown: 0` to disable the cooldown entirely.
 
+### `GET /api/cache/stats`
+
+DNS cache operation counters since the last `POST /api/cache/flush` (or process start).
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/cache/stats
+```
+
+```json
+{
+  "cache_hits":      4823,
+  "cache_misses":    1247,
+  "cache_evictions": 18,
+  "hit_rate_pct":    79.4
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `cache_hits` | u64 | Responses served from the in-process cache |
+| `cache_misses` | u64 | Cache misses forwarded to an upstream |
+| `cache_evictions` | u64 | Entries evicted to enforce the cache size limit |
+| `hit_rate_pct` | f64 or `null` | `hits / (hits + misses) × 100`, rounded to 1 decimal. `null` when both hits and misses are zero. |
+
+All counters reset to zero on `POST /api/cache/flush`.
+
 ---
 
 ### Upstreams
@@ -655,13 +681,22 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
       "healthy": true,
       "latency_ms": 12,
       "last_check": "2026-05-22T15:00:00Z",
-      "zone": "."
+      "zone": ".",
+      "dnssec_supported": true,
+      "latency_history": [11, 12, 14, 11, 13]
     }
   ],
   "total": 1,
   "healthy": 1
 }
 ```
+
+**New fields (v0.6.5):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `dnssec_supported` | `bool` or absent | `true` if the upstream sets the AD bit in probe responses. Absent (not `null`) when unhealthy or not yet probed. DoT upstreams always omit this field. |
+| `latency_history` | `[u64]` | Last ≤ 5 successful probe round-trip times (ms). Empty array until the first successful probe. Failed probes do not append. |
 
 #### `POST /api/upstreams`
 
@@ -689,6 +724,22 @@ curl -X DELETE -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 
 Returns `409 LAST_UPSTREAM` when the target is the only registered upstream — the
 resolver must always have at least one forwarder.
+
+#### `PATCH /api/upstreams/:id`
+
+Rename an upstream in-place. Only the `name` field is patchable.
+
+```bash
+curl -X PATCH http://localhost:8080/api/upstreams/550e8400-... \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"My Cloudflare"}'
+```
+
+- An empty string or `null` clears the name (`name` becomes absent in the response).
+- Any field other than `name` returns `400 INVALID_FIELD`.
+- Unknown id returns `404`.
+- The rename is persisted to `upstreams.json` immediately.
 
 #### `GET /api/upstreams/presets`
 

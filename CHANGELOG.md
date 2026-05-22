@@ -9,6 +9,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.5] — 2026-05-22
+
+### Added
+
+- **FEAT #48 — DNSSEC auto-detection via DO bit / AD bit** (`src/upstreams.rs`)  
+  The UDP health probe now includes an EDNS0 OPT RR with the DO bit set (RFC 6891,
+  RFC 3225). If the upstream sets the AD (Authenticated Data) bit in its response,
+  `dnssec_supported: true` is reported in `GET /api/upstreams`. The field is absent
+  from the JSON response when `None` (not yet probed or unhealthy). DoT upstreams
+  perform TLS-only probes and always return `None`.
+
+- **FEAT #49 — Rolling latency history per upstream** (`src/upstreams.rs`)  
+  Each upstream now maintains a `latency_history` ring buffer of the last 5
+  successful probe round-trip times (ms). The field appears as a JSON array in
+  `GET /api/upstreams`. Failed probes do not append to the history. The buffer
+  is runtime-only and not persisted across restarts.
+
+- **FEAT #50 — `PATCH /api/upstreams/:id` to rename upstreams** (`src/api/mod.rs`,
+  `src/upstreams.rs`)  
+  Accepts a JSON body `{"name": "My Resolver"}`. Only the `name` field is
+  patchable — any other key returns `400 INVALID_FIELD`. An empty string or `null`
+  clears the name. The rename is persisted to `upstreams.json` immediately.
+
+- **FEAT #51 — `GET /api/cache/stats` DNS cache counters** (`src/api/mod.rs`,
+  `src/main.rs`)  
+  New endpoint exposing `cache_hits`, `cache_misses`, `cache_evictions` (AtomicU64
+  counters), and `hit_rate_pct` (null when both hits and misses are zero).
+  All counters reset to zero on `POST /api/cache/flush`.
+
+---
+
 ## [0.6.4] — 2026-05-22
 
 ### Fixed
