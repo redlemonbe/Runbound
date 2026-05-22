@@ -1137,6 +1137,28 @@ the upstream left intact.
 | Loopback upstream (127.0.0.1, ::1) | ✅ **Fixed v0.6.3** — 400 INVALID_ADDR (#40) |
 | Link-local upstream (169.254.169.254) | ✅ **Fixed v0.6.3** — 400 INVALID_ADDR (#40) |
 | DELETE last upstream | ✅ **Fixed v0.6.3** — 409 LAST_UPSTREAM (#41) |
+| DoT preset addr (@port format) | ✅ **Fixed v0.6.3** — bare IP + port=853 field (#42) |
+| Upstream persistence across restart | ✅ **Fixed v0.6.3** — upstreams.json on disk (#43) |
+| Explicit port field (UDP default 53, DoT default 853) | ✅ **Fixed v0.6.3** (#44) |
+
+## v0.6.3 Live Verification — 2026-05-22
+
+Live pentest on running v0.6.3 instance. All 5 fixes confirmed.
+
+| Test | Result |
+|---|---|
+| POST 127.0.0.1 upstream | ✅ 400 INVALID_ADDR |
+| POST ::1 upstream | ✅ 400 INVALID_ADDR |
+| POST 169.254.169.254 upstream | ✅ 400 INVALID_ADDR |
+| POST 10.0.0.1 (private) | ✅ 201 accepted |
+| DELETE last upstream | ✅ 409 LAST_UPSTREAM, upstream still present |
+| DoT presets — no @port in addr | ✅ addr=1.1.1.1 port=853 (clean) |
+| POST upstream port:5353 | ✅ 201, port=5353 in response |
+| POST upstream port:0 | ✅ 400 INVALID_PORT |
+| Restart → upstreams still present | ✅ upstreams.json loaded on startup |
+| prefetch: absent (default off) | ✅ no prefetch logs, zero overhead |
+| Security headers | ✅ nosniff, DENY, CSP, no-store |
+| Auth 401 / Bearer 200 | ✅ |
 
 ---
 
