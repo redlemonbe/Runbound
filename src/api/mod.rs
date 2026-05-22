@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 use std::net::IpAddr;
 
@@ -248,6 +248,10 @@ pub struct AppState {
     /// FEAT #46: tracks when the last successful cache flush was requested.
     /// Guarded by a Mutex so the read-check-write is atomic without await.
     pub last_flush_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// #51: DNS cache counters — reset on flush, incremented on cache hit/miss.
+    pub cache_hits:      Arc<AtomicU64>,
+    pub cache_misses:    Arc<AtomicU64>,
+    pub cache_evictions: Arc<AtomicU64>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -493,7 +497,8 @@ pub fn router(state: AppState) -> Router {
         // Monitoring
         .route("/upstreams",         get(upstreams_handler).post(add_upstream_handler))
         .route("/upstreams/presets", get(upstream_presets_handler))
-        .route("/upstreams/:id",     delete(delete_upstream_handler))
+        .route("/upstreams/:id",     delete(delete_upstream_handler).patch(patch_upstream_handler))
+        .route("/cache/stats",       get(cache_stats_handler))
         .route("/logs",              get(logs_handler).delete(clear_logs_handler))
         .route("/audit/tail",        get(audit_tail_handler))
         .route("/metrics",           get(metrics_handler))
@@ -548,6 +553,8 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"DELETE", "path":"/api/upstreams/:id",     "description":"Remove a runtime upstream resolver"},
             {"method":"GET",    "path":"/api/upstreams/presets", "description":"List pre-configured upstream resolvers"},
             {"method":"POST",   "path":"/api/cache/flush",       "description":"Flush the DNS resolver cache"},
+            {"method":"GET",    "path":"/api/cache/stats",       "description":"DNS cache counters: hits, misses, evictions, hit rate"},
+            {"method":"PATCH",  "path":"/api/upstreams/:id",     "description":"Rename a runtime upstream resolver (only 'name' is patchable)"},
             {"method":"GET",    "path":"/api/sync/slaves",       "description":"List connected slave nodes (master mode only)"},
             {"method":"GET",    "path":"/api/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
             {"method":"DELETE", "path":"/api/logs",             "description":"Clear the in-memory query log ring buffer (GDPR right-to-erasure)"},
@@ -1468,6 +1475,10 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
     match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
         Ok(()) => {
             s.stats.reset_cache();
+            // #51: reset cache counters on flush
+            s.cache_hits.store(0, Ordering::Relaxed);
+            s.cache_misses.store(0, Ordering::Relaxed);
+            s.cache_evictions.store(0, Ordering::Relaxed);
             info!(flushed = before, "DNS cache flushed via API");
             s.audit.send(AuditEvent::ConfigReload);
             (StatusCode::OK, JsonExtract(serde_json::json!({
@@ -1481,6 +1492,85 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
             }))).into_response()
         }
     }
+}
+
+// ── PATCH /api/upstreams/:id ──────────────────────────────────────────────
+
+async fn patch_upstream_handler(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<serde_json::Value>,
+) -> impl IntoResponse {
+    // Only "name" is patchable — reject any other key immediately.
+    if let Some(obj) = body.as_object() {
+        for key in obj.keys() {
+            if key != "name" {
+                return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                    "error":   "INVALID_FIELD",
+                    "details": format!("field '{}' is not patchable; only 'name' is supported", key)
+                }))).into_response();
+            }
+        }
+    }
+
+    // Resolve name: absent or null → None; "" → None; non-empty string → Some(s).
+    let name: Option<String> = match body.get("name") {
+        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+        Some(serde_json::Value::String(s)) => {
+            if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                    "error":   "INVALID_FIELD",
+                    "details": "name must not contain control characters"
+                }))).into_response();
+            }
+            if s.len() > 64 {
+                return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                    "error":   "INVALID_FIELD",
+                    "details": "name must not exceed 64 characters"
+                }))).into_response();
+            }
+            Some(s.clone())
+        }
+        Some(serde_json::Value::Null) | None => None,
+        _ => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error":   "INVALID_FIELD",
+            "details": "field 'name' must be a string or null"
+        }))).into_response(),
+    };
+
+    match upstreams::patch_upstream_name(&s.upstreams, &id, name) {
+        Some(updated) => {
+            upstreams::save_upstreams(&s.upstreams, &s.base_dir);
+            info!(id = %id, "upstream renamed via PATCH");
+            (StatusCode::OK, JsonExtract(serde_json::json!({
+                "status": "ok", "upstream": updated
+            }))).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
+            "error": "NOT_FOUND", "id": id
+        }))).into_response(),
+    }
+}
+
+// ── GET /api/cache/stats ───────────────────────────────────────────────────
+
+async fn cache_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let hits      = s.cache_hits.load(Ordering::Relaxed);
+    let misses    = s.cache_misses.load(Ordering::Relaxed);
+    let evictions = s.cache_evictions.load(Ordering::Relaxed);
+    let total     = hits + misses;
+    let hit_rate_pct = if total == 0 {
+        serde_json::Value::Null
+    } else {
+        let pct = (hits as f64 / total as f64 * 1000.0).round() / 10.0;
+        serde_json::json!(pct)
+    };
+    (StatusCode::OK, JsonExtract(serde_json::json!({
+        "cache_hits":      hits,
+        "cache_misses":    misses,
+        "cache_evictions": evictions,
+        "hit_rate_pct":    hit_rate_pct,
+    }))).into_response()
 }
 
 // ── GET /api/sync/slaves ───────────────────────────────────────────────────
@@ -1849,6 +1939,9 @@ mod tests {
             xdp_active:       Arc::new(AtomicU8::new(0)),
             resolver,
             last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
+            cache_hits:       Arc::new(AtomicU64::new(0)),
+            cache_misses:     Arc::new(AtomicU64::new(0)),
+            cache_evictions:  Arc::new(AtomicU64::new(0)),
         };
         router(state)
     }
@@ -2702,5 +2795,207 @@ mod tests {
         let resp = post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","port":0}"#).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_PORT");
+    }
+
+    // ── #48/#49: upstreams response schema includes new fields ────────────────
+
+    #[tokio::test]
+    async fn upstreams_response_has_latency_history_array() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let add_body = r#"{"addr":"9.9.9.9","protocol":"udp"}"#;
+        post_upstream(app.clone(), (k, v.clone()), add_body).await;
+
+        let resp = app.oneshot(
+            Request::builder().uri("/api/upstreams").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        let upstreams = json["upstreams"].as_array().expect("upstreams must be array");
+        assert!(!upstreams.is_empty());
+        for u in upstreams {
+            assert!(u["latency_history"].is_array(),
+                "latency_history must be a JSON array; got: {:?}", u["latency_history"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstreams_new_entry_latency_history_empty() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let add_body = r#"{"addr":"9.9.9.9","protocol":"udp"}"#;
+        let add_resp = post_upstream(app.clone(), (k, v.clone()), add_body).await;
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+        let upstream = body_json(add_resp.into_body()).await;
+        assert_eq!(upstream["upstream"]["latency_history"].as_array().map(|a| a.len()), Some(0),
+            "newly added upstream must have empty latency_history");
+    }
+
+    #[tokio::test]
+    async fn upstreams_dnssec_supported_absent_when_not_probed() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let add_body = r#"{"addr":"9.9.9.9","protocol":"udp"}"#;
+        post_upstream(app.clone(), (k, v.clone()), add_body).await;
+
+        let resp = app.oneshot(
+            Request::builder().uri("/api/upstreams").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        let json = body_json(resp.into_body()).await;
+        let ups = json["upstreams"].as_array().unwrap();
+        for u in ups {
+            assert!(u.get("dnssec_supported").is_none(),
+                "dnssec_supported must be absent (None) before first probe; got: {:?}", u);
+        }
+    }
+
+    // ── #50: PATCH /api/upstreams/:id ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn patch_upstream_requires_auth() {
+        let app = make_test_app();
+        let body = serde_json::json!({"name":"Test"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PATCH").uri("/api/upstreams/some-id")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn patch_upstream_renames() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"9.9.9.9"}"#).await;
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+        let id = body_json(add_resp.into_body()).await["upstream"]["id"]
+            .as_str().unwrap().to_string();
+
+        let patch_body = serde_json::json!({"name":"Quad9 renamed"}).to_string();
+        let resp = app.clone().oneshot(
+            Request::builder()
+                .method("PATCH").uri(format!("/api/upstreams/{id}"))
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", patch_body.len().to_string())
+                .body(Body::from(patch_body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        assert_eq!(j["status"], "ok");
+        assert_eq!(j["upstream"]["name"], "Quad9 renamed");
+    }
+
+    #[tokio::test]
+    async fn patch_upstream_empty_name_clears() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let add_resp = post_upstream(app.clone(), (k, v.clone()),
+            r#"{"addr":"9.9.9.9","name":"Old Name"}"#).await;
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+        let id = body_json(add_resp.into_body()).await["upstream"]["id"]
+            .as_str().unwrap().to_string();
+
+        let patch_body = serde_json::json!({"name":""}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PATCH").uri(format!("/api/upstreams/{id}"))
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", patch_body.len().to_string())
+                .body(Body::from(patch_body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        assert!(j["upstream"]["name"].is_null(), "empty name must become null");
+    }
+
+    #[tokio::test]
+    async fn patch_upstream_unknown_field_returns_400() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"9.9.9.9"}"#).await;
+        let id = body_json(add_resp.into_body()).await["upstream"]["id"]
+            .as_str().unwrap().to_string();
+
+        let patch_body = serde_json::json!({"addr":"1.2.3.4"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PATCH").uri(format!("/api/upstreams/{id}"))
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", patch_body.len().to_string())
+                .body(Body::from(patch_body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_FIELD");
+    }
+
+    #[tokio::test]
+    async fn patch_upstream_not_found() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let patch_body = serde_json::json!({"name":"x"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PATCH").uri("/api/upstreams/nonexistent-uuid")
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", patch_body.len().to_string())
+                .body(Body::from(patch_body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── #51: GET /api/cache/stats ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cache_stats_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/cache/stats").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cache_stats_schema_initial_zeros() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/cache/stats").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        assert_eq!(j["cache_hits"],      0);
+        assert_eq!(j["cache_misses"],    0);
+        assert_eq!(j["cache_evictions"], 0);
+        assert!(j["hit_rate_pct"].is_null(), "hit_rate_pct must be null when both are 0");
+    }
+
+    #[tokio::test]
+    async fn cache_stats_reset_on_flush() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+
+        // Flush the cache (resets counters)
+        let flush_resp = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/cache/flush")
+                .header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(flush_resp.status(), StatusCode::OK);
+
+        // Stats should still be zero after reset
+        let resp = app.oneshot(
+            Request::builder().uri("/api/cache/stats").header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        assert_eq!(j["cache_hits"],      0);
+        assert_eq!(j["cache_misses"],    0);
+        assert_eq!(j["cache_evictions"], 0);
     }
 }
