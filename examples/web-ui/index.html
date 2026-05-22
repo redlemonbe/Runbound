@@ -605,7 +605,7 @@ async function feedUpdateAll() {
     (d.feeds??[]).forEach(f=>pollFeedUpdate(f.id,f.last_updated??null));
   } catch(e) { toast('Update failed: '+e.message, true); }
 }
-async function feedDelete(id) { try { await api('DELETE','/feeds/'+id); toast('Feed removed'); loadFeeds(); } catch(e) { toast('Delete failed: '+e.message, true); } }
+async function feedDelete(id) { try { await api('DELETE','/feeds/'+id); toast('Feed removed'); updatingFeeds.delete(id); loadFeeds(); loadPresets(); } catch(e) { toast('Delete failed: '+e.message, true); } }
 
 let upstreamPresetsCache = [];
 const probingUpstreams = new Set();
