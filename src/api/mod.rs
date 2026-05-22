@@ -507,6 +507,7 @@ pub fn router(state: AppState) -> Router {
         .route("/upstreams",         get(upstreams_handler).post(add_upstream_handler))
         .route("/upstreams/presets", get(upstream_presets_handler))
         .route("/upstreams/:id",     delete(delete_upstream_handler).patch(patch_upstream_handler))
+        .route("/upstreams/:id/probe", post(probe_upstream_handler))
         .route("/cache/stats",       get(cache_stats_handler))
         .route("/logs",              get(logs_handler).delete(clear_logs_handler))
         .route("/audit/tail",        get(audit_tail_handler))
@@ -563,7 +564,8 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/api/upstreams/presets", "description":"List pre-configured upstream resolvers"},
             {"method":"POST",   "path":"/api/cache/flush",       "description":"Flush the DNS resolver cache"},
             {"method":"GET",    "path":"/api/cache/stats",       "description":"DNS cache counters: hits, misses, evictions, hit rate"},
-            {"method":"PATCH",  "path":"/api/upstreams/:id",     "description":"Rename a runtime upstream resolver (only 'name' is patchable)"},
+            {"method":"PATCH",  "path":"/api/upstreams/:id",       "description":"Rename a runtime upstream resolver (only 'name' is patchable)"},
+            {"method":"POST",   "path":"/api/upstreams/:id/probe", "description":"Trigger an immediate health probe for one upstream"},
             {"method":"GET",    "path":"/api/sync/slaves",       "description":"List connected slave nodes (master mode only)"},
             {"method":"GET",    "path":"/api/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
             {"method":"DELETE", "path":"/api/logs",             "description":"Clear the in-memory query log ring buffer (GDPR right-to-erasure)"},
@@ -1552,6 +1554,76 @@ async fn patch_upstream_handler(
                 "status": "ok", "upstream": updated
             }))).into_response()
         }
+        None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
+            "error": "NOT_FOUND", "id": id
+        }))).into_response(),
+    }
+}
+
+// ── POST /api/upstreams/:id/probe ─────────────────────────────────────────
+
+async fn probe_upstream_handler(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // a. Find upstream by id (read lock) — 404 if not found
+    let probe_target = {
+        let list = s.upstreams.read()
+            .unwrap_or_else(|e| e.into_inner());
+        list.iter()
+            .find(|u| u.id == id)
+            .map(|u| (u.addr.clone(), u.port, u.protocol.clone()))
+    };
+    let (addr, port, protocol) = match probe_target {
+        Some(t) => t,
+        None => return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
+            "error": "NOT_FOUND", "id": id
+        }))).into_response(),
+    };
+
+    // b. Run probe in spawn_blocking (blocking I/O)
+    let result = tokio::task::spawn_blocking(move || {
+        upstreams::probe_upstream(&addr, port, &protocol)
+    }).await;
+
+    let (healthy, latency_ms, dnssec_supported, last_error) = match result {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+            "error": "PROBE_FAILED"
+        }))).into_response(),
+    };
+
+    // c. Write result back (write lock, find by id)
+    let now_str = crate::logbuffer::format_ts(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    let updated = {
+        let mut list = s.upstreams.write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = list.iter_mut().find(|u| u.id == id) {
+            u.healthy          = healthy;
+            u.latency_ms       = latency_ms;
+            u.dnssec_supported = if healthy { dnssec_supported } else { None };
+            u.last_error       = if healthy { None } else { last_error };
+            u.last_check       = now_str;
+            if healthy {
+                if let Some(lat) = latency_ms {
+                    upstreams::push_latency(&mut u.latency_history, lat);
+                }
+            }
+            Some(u.clone())
+        } else {
+            None
+        }
+    };
+
+    match updated {
+        Some(u) => (StatusCode::OK, JsonExtract(serde_json::json!({
+            "status": "ok", "upstream": u
+        }))).into_response(),
         None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
             "error": "NOT_FOUND", "id": id
         }))).into_response(),
@@ -2984,6 +3056,57 @@ mod tests {
         assert_eq!(j["evictions"], 0);
         assert!(j["entries"].is_number(), "entries must be a number");
         assert!(j["hit_rate_pct"].is_null(), "hit_rate_pct must be null when both are 0");
+    }
+
+    // ── #54: POST /api/upstreams/:id/probe ───────────────────────────────
+
+    #[tokio::test]
+    async fn probe_upstream_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams/any-id/probe")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn probe_upstream_not_found() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams/nonexistent-uuid/probe")
+                .header(k, &v)
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn probe_upstream_updates_status() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+
+        // Add an upstream pointing to TEST-NET-1 (192.0.2.1, RFC 5737 — guaranteed unreachable)
+        let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"192.0.2.1"}"#).await;
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+        let id = body_json(add_resp.into_body()).await["upstream"]["id"]
+            .as_str().unwrap_or_default().to_string();
+
+        // Trigger immediate probe
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri(format!("/api/upstreams/{id}/probe"))
+                .header(k, &v)
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        assert_eq!(j["status"], "ok");
+        assert_eq!(j["upstream"]["healthy"], false, "TEST-NET-1 must be unhealthy");
+        assert!(j["upstream"]["last_error"].is_string(), "last_error must be set on failure");
     }
 
     #[tokio::test]
