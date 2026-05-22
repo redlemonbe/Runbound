@@ -1558,6 +1558,7 @@ async fn cache_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
     let hits      = s.cache_hits.load(Ordering::Relaxed);
     let misses    = s.cache_misses.load(Ordering::Relaxed);
     let evictions = s.cache_evictions.load(Ordering::Relaxed);
+    let entries   = s.stats.snapshot().cache_entries;
     let total     = hits + misses;
     let hit_rate_pct = if total == 0 {
         serde_json::Value::Null
@@ -1566,10 +1567,11 @@ async fn cache_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
         serde_json::json!(pct)
     };
     (StatusCode::OK, JsonExtract(serde_json::json!({
-        "cache_hits":      hits,
-        "cache_misses":    misses,
-        "cache_evictions": evictions,
-        "hit_rate_pct":    hit_rate_pct,
+        "entries":      entries,
+        "hits":         hits,
+        "misses":       misses,
+        "evictions":    evictions,
+        "hit_rate_pct": hit_rate_pct,
     }))).into_response()
 }
 
@@ -2970,9 +2972,10 @@ mod tests {
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
-        assert_eq!(j["cache_hits"],      0);
-        assert_eq!(j["cache_misses"],    0);
-        assert_eq!(j["cache_evictions"], 0);
+        assert_eq!(j["hits"],      0);
+        assert_eq!(j["misses"],    0);
+        assert_eq!(j["evictions"], 0);
+        assert!(j["entries"].is_number(), "entries must be a number");
         assert!(j["hit_rate_pct"].is_null(), "hit_rate_pct must be null when both are 0");
     }
 
@@ -2988,14 +2991,14 @@ mod tests {
         ).await.unwrap();
         assert_eq!(flush_resp.status(), StatusCode::OK);
 
-        // Stats should still be zero after reset
+        // Counters must be zero after reset
         let resp = app.oneshot(
             Request::builder().uri("/api/cache/stats").header(k, &v).body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
-        assert_eq!(j["cache_hits"],      0);
-        assert_eq!(j["cache_misses"],    0);
-        assert_eq!(j["cache_evictions"], 0);
+        assert_eq!(j["hits"],      0);
+        assert_eq!(j["misses"],    0);
+        assert_eq!(j["evictions"], 0);
     }
 }

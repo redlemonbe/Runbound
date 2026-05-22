@@ -639,18 +639,20 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/cach
 
 ```json
 {
-  "cache_hits":      4823,
-  "cache_misses":    1247,
-  "cache_evictions": 18,
-  "hit_rate_pct":    79.4
+  "entries":      4823,
+  "hits":         58432,
+  "misses":       3201,
+  "evictions":    18,
+  "hit_rate_pct": 94.8
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `cache_hits` | u64 | Responses served from the in-process cache |
-| `cache_misses` | u64 | Cache misses forwarded to an upstream |
-| `cache_evictions` | u64 | Entries evicted to enforce the cache size limit |
+| `entries` | u64 | Approximate distinct domains currently cached |
+| `hits` | u64 | Responses served from the in-process cache |
+| `misses` | u64 | Cache misses forwarded to an upstream |
+| `evictions` | u64 | Entries evicted to enforce the cache size limit |
 | `hit_rate_pct` | f64 or `null` | `hits / (hits + misses) × 100`, rounded to 1 decimal. `null` when both hits and misses are zero. |
 
 All counters reset to zero on `POST /api/cache/flush`.
