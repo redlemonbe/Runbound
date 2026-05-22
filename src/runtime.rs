@@ -9,5 +9,5 @@ use std::sync::OnceLock;
 pub static BASE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn base_dir() -> &'static Path {
-    BASE_DIR.get().expect("BASE_DIR not initialized before use")
+    BASE_DIR.get().unwrap_or_else(|| panic!("BASE_DIR not initialized before use"))
 }

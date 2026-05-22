@@ -174,7 +174,8 @@ fn load_or_generate_hmac_key(config_key: Option<String>, base_dir: &std::path::P
 
 fn rand_byte() -> u8 {
     let mut buf = [0u8; 1];
-    getrandom::fill(&mut buf).expect("getrandom failed");
+    // CSPRNG failure means the OS entropy source is broken — unrecoverable.
+    getrandom::fill(&mut buf).unwrap_or_else(|e| panic!("CSPRNG unavailable: {e}"));
     buf[0]
 }
 
@@ -244,8 +245,9 @@ async fn writer_task(
 }
 
 fn compute_mac(key: &[u8], seq: u64, ts: u64, event: &str, fields: &str) -> String {
+    // new_from_slice only fails for zero-length key; any real key is fine.
     let mut mac = HmacSha256::new_from_slice(key)
-        .expect("HMAC accepts any key length");
+        .unwrap_or_else(|_| unreachable!("HMAC accepts any non-empty key"));
     mac.update(&seq.to_le_bytes());
     mac.update(&ts.to_le_bytes());
     mac.update(event.as_bytes());
