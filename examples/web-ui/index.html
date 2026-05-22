@@ -539,15 +539,27 @@ async function loadPresets() {
 
 async function feedAddPreset(i) {
   const p=presetsCache[i]; if(!p) return;
-  try { const r=await api('POST','/feeds',{name:p.name,url:p.url,format:p.format??'hosts',action:p.action??'nxdomain',enabled:true}); toast(`"${p.name}" added`); if(r.feed?.id){try{await api('POST','/feeds/'+r.feed.id+'/update');}catch(_){}} setTimeout(()=>{loadPresets();loadFeeds();},1200); }
-  catch(e) { toast('Add failed: '+e.message, true); }
+  try {
+    const r=await api('POST','/feeds',{name:p.name,url:p.url,format:p.format??'hosts',action:p.action??'nxdomain',enabled:true});
+    toast(`"${p.name}" added — fetching…`);
+    const id=r.feed?.id;
+    if(id){ updatingFeeds.add(id); loadPresets(); loadFeeds(); try{await api('POST','/feeds/'+id+'/update');}catch(_){} pollFeedUpdate(id,null); }
+    else { loadPresets(); loadFeeds(); }
+  } catch(e) { toast('Add failed: '+e.message, true); }
 }
 
 async function loadFeeds() {
   try {
     const d=await api('GET','/feeds'), feeds=d.feeds??[];
     document.getElementById('feed-list').innerHTML = feeds.length===0 ? empty('No feeds. Use a preset or add a custom URL.') :
-      feeds.map(f=>{const upd=f.last_updated?new Date(f.last_updated).toLocaleString([],{dateStyle:'short',timeStyle:'short'}):'never';const dot=!f.enabled?'bg-gray-700':(f.entry_count??0)===0?'bg-red-600':'bg-green-500';return `<div class="row gap-2"><span class="w-2.5 h-2.5 rounded-full shrink-0 ${dot}"></span><span class="text-cyan-300 w-28 truncate shrink-0 text-xs font-mono">${esc(f.name)}</span><span class="text-gray-500 flex-1 truncate text-xs">${esc(f.url)}</span><span class="text-gray-600 w-20 text-right text-xs shrink-0">${(f.entry_count??0).toLocaleString()} entries</span><span class="text-gray-700 w-16 text-right text-xs shrink-0">${esc(f.action)}</span><span class="text-gray-800 w-24 text-right text-xs shrink-0">↻ ${upd}</span><button onclick="feedUpdate('${f.id}')" class="btn-secondary text-xs px-2 py-0.5 shrink-0">↻</button><button class="del shrink-0" onclick="feedDelete('${f.id}')">✕</button></div>`;}).join('');
+      feeds.map(f=>{
+        const busy=updatingFeeds.has(f.id);
+        const dot=busy?'bg-yellow-400 blink':(!f.enabled?'bg-gray-700':(f.entry_count??0)===0?'bg-red-600':'bg-green-500');
+        const upd=busy?'<span class="text-yellow-400">updating…</span>':(f.last_updated?new Date(f.last_updated).toLocaleString([],{dateStyle:'short',timeStyle:'short'}):'never');
+        const cnt=busy&&(f.entry_count??0)===0?'<span class="text-yellow-400">…</span>':`${(f.entry_count??0).toLocaleString()} entries`;
+        const btn=busy?'<span class="text-yellow-400 text-xs w-8 text-center blink shrink-0">↻</span>':`<button onclick="feedUpdate('${f.id}')" class="btn-secondary text-xs px-2 py-0.5 shrink-0">↻</button>`;
+        return `<div class="row gap-2"><span class="w-2.5 h-2.5 rounded-full shrink-0 ${dot}"></span><span class="text-cyan-300 w-28 truncate shrink-0 text-xs font-mono">${esc(f.name)}</span><span class="text-gray-500 flex-1 truncate text-xs">${esc(f.url)}</span><span class="text-gray-600 w-20 text-right text-xs shrink-0">${cnt}</span><span class="text-gray-700 w-16 text-right text-xs shrink-0">${esc(f.action)}</span><span class="text-gray-800 w-24 text-right text-xs shrink-0">↻ ${upd}</span>${btn}<button class="del shrink-0" onclick="feedDelete('${f.id}')">✕</button></div>`;
+      }).join('');
   } catch(e) { toast('Feeds: '+e.message, true); }
 }
 
@@ -555,15 +567,49 @@ async function feedAdd() {
   const name=document.getElementById('feed-name').value.trim(), url=document.getElementById('feed-url').value.trim(),
         format=document.getElementById('feed-format').value, action=document.getElementById('feed-action').value;
   if(!name||!url) return toast('Name and URL required', true);
-  try { await api('POST','/feeds',{name,url,format,action,enabled:true}); toast('Feed added'); loadFeeds(); document.getElementById('feed-name').value=''; document.getElementById('feed-url').value=''; }
-  catch(e) { toast('Add failed: '+e.message, true); }
+  try {
+    const r=await api('POST','/feeds',{name,url,format,action,enabled:true});
+    toast('Feed added — fetching…');
+    document.getElementById('feed-name').value=''; document.getElementById('feed-url').value='';
+    const id=r.feed?.id;
+    if(id){ updatingFeeds.add(id); loadFeeds(); try{await api('POST','/feeds/'+id+'/update');}catch(_){} pollFeedUpdate(id,null); }
+    else loadFeeds();
+  } catch(e) { toast('Add failed: '+e.message, true); }
 }
 
-async function feedUpdate(id) { try { await api('POST','/feeds/'+id+'/update'); toast('Update triggered'); setTimeout(loadFeeds,1500); } catch(e) { toast('Update failed: '+e.message, true); } }
-async function feedUpdateAll() { try { await api('POST','/feeds/update'); toast('All feeds updating…'); setTimeout(loadFeeds,1500); } catch(e) { toast('Update failed: '+e.message, true); } }
+async function feedUpdate(id) {
+  try {
+    const d=await api('GET','/feeds'); const f=(d.feeds??[]).find(f=>f.id===id);
+    const prev=f?.last_updated??null;
+    await api('POST','/feeds/'+id+'/update');
+    toast('Updating…'); updatingFeeds.add(id); loadFeeds(); pollFeedUpdate(id,prev);
+  } catch(e) { toast('Update failed: '+e.message, true); }
+}
+async function pollFeedUpdate(id, prev) {
+  for(let i=0;i<30;i++){
+    await new Promise(r=>setTimeout(r,2000));
+    try{
+      const d=await api('GET','/feeds'); const f=(d.feeds??[]).find(f=>f.id===id);
+      if(!f) break;
+      loadFeeds();
+      const done=prev?f.last_updated!==prev:f.last_updated!=null;
+      if(done) break;
+    }catch(_){}
+  }
+  updatingFeeds.delete(id); loadFeeds();
+}
+async function feedUpdateAll() {
+  try {
+    const d=await api('GET','/feeds'); (d.feeds??[]).forEach(f=>{updatingFeeds.add(f.id);});
+    loadFeeds(); await api('POST','/feeds/update'); toast('All feeds updating…');
+    (d.feeds??[]).forEach(f=>pollFeedUpdate(f.id,f.last_updated??null));
+  } catch(e) { toast('Update failed: '+e.message, true); }
+}
 async function feedDelete(id) { try { await api('DELETE','/feeds/'+id); toast('Feed removed'); loadFeeds(); } catch(e) { toast('Delete failed: '+e.message, true); } }
 
 let upstreamPresetsCache = [];
+const probingUpstreams = new Set();
+const updatingFeeds = new Set();
 
 async function loadUpstreamPresets() {
   try {
@@ -576,8 +622,14 @@ async function loadUpstreamPresets() {
 
 async function upstreamAddPreset(i) {
   const p=upstreamPresetsCache[i]; if(!p) return;
-  try { const body={addr:p.addr,protocol:p.protocol,name:p.name}; if(p.port) body.port=p.port; await api('POST','/upstreams',body); toast(`"${p.name}" added`); setTimeout(()=>{loadUpstreamPresets();loadUpstreams();},500); }
-  catch(e) { toast('Add failed: '+e.message, true); }
+  try {
+    const body={addr:p.addr,protocol:p.protocol,name:p.name}; if(p.port) body.port=p.port;
+    const r=await api('POST','/upstreams',body);
+    toast(`"${p.name}" added — probing…`);
+    const id=r.upstream?.id;
+    if(id){ probingUpstreams.add(id); pollUpstreamHealth(id); }
+    loadUpstreamPresets(); loadUpstreams();
+  } catch(e) { toast('Add failed: '+e.message, true); }
 }
 
 function renderSparkline(history) {
@@ -603,7 +655,8 @@ async function loadUpstreams() {
         const latency=u.latency_ms!=null?u.latency_ms+' ms':'—';
         const lastCheck=u.last_check&&u.last_check!==''?new Date(u.last_check).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'—';
         const port=u.port??(u.protocol==='dot'?853:53);
-        const hDot=u.healthy?'<span class="w-2 h-2 rounded-full shrink-0 bg-green-500" title="healthy"></span>':'<span class="w-2 h-2 rounded-full shrink-0 bg-red-600" title="unhealthy"></span>';
+        const probing=probingUpstreams.has(u.id);
+        const hDot=probing?'<span class="w-2 h-2 rounded-full shrink-0 bg-yellow-400 blink" title="probing…"></span>':u.healthy?'<span class="w-2 h-2 rounded-full shrink-0 bg-green-500" title="healthy"></span>':'<span class="w-2 h-2 rounded-full shrink-0 bg-red-600" title="unhealthy"></span>';
         const proto=u.protocol==='dot'?'<span class="badge badge-dot">DoT</span>':'<span class="badge badge-udp">UDP</span>';
         const spark=renderSparkline(u.latency_history);
         const dns=dnssecBadge(u.dnssec_supported);
@@ -619,8 +672,25 @@ async function upstreamAdd() {
   const addr=document.getElementById('ups-addr').value.trim(), protocol=document.getElementById('ups-protocol').value,
         name=document.getElementById('ups-name').value.trim()||undefined, portVal=parseInt(document.getElementById('ups-port').value), port=isNaN(portVal)?undefined:portVal;
   if(!addr) return toast('IP address required', true);
-  try { await api('POST','/upstreams',{addr,protocol,name,port}); toast('Upstream added'); document.getElementById('ups-addr').value=''; document.getElementById('ups-name').value=''; document.getElementById('ups-port').value='53'; loadUpstreams(); }
-  catch(e) { toast('Add failed: '+e.message, true); }
+  try {
+    const r=await api('POST','/upstreams',{addr,protocol,name,port});
+    toast('Upstream added — probing…');
+    document.getElementById('ups-addr').value=''; document.getElementById('ups-name').value=''; document.getElementById('ups-port').value='53';
+    const id=r.upstream?.id;
+    if(id){ probingUpstreams.add(id); pollUpstreamHealth(id); }
+    loadUpstreams();
+  } catch(e) { toast('Add failed: '+e.message, true); }
+}
+async function pollUpstreamHealth(id) {
+  for(let i=0;i<15;i++){
+    await new Promise(r=>setTimeout(r,3000));
+    try{
+      const d=await api('GET','/upstreams'); const u=(d.upstreams??[]).find(u=>u.id===id);
+      if(!u||u.healthy) break;
+      loadUpstreams();
+    }catch(_){}
+  }
+  probingUpstreams.delete(id); loadUpstreams();
 }
 
 async function upstreamRename(id, current) {
