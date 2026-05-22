@@ -211,6 +211,7 @@
         <select id="ups-protocol" class="input w-20" onchange="upsProtocolChange(this)"><option value="udp">UDP</option><option value="dot">DoT</option></select>
         <input id="ups-port"     type="number" placeholder="Port" value="53" min="1" max="65535" class="input w-20" />
         <input id="ups-name"     type="text"   placeholder="Name (optional)" class="input w-36" />
+        <input id="ups-tls-name" type="text"   placeholder="SNI hostname (DoT, auto if empty)" class="input w-52 hidden" />
         <button onclick="upstreamAdd()" class="btn-primary">+ Add</button>
       </div>
     </div>
@@ -389,8 +390,9 @@
           <div class="space-y-0.5">
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/presets</code><span class="text-gray-700">9 built-in presets (Cloudflare, Google, Quad9, OpenDNS)</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams</code><span class="text-gray-700">List with health, latency, DNSSEC flag (v0.6.5+), history (v0.6.5+)</span></div>
-            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{addr, protocol: "udp|dot", port, name}</code> — no loopback/link-local</span></div>
-            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-yellow-600 w-12 shrink-0 font-bold">PATCH</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id</code><span class="text-gray-700">Rename — <code class="bg-gray-900 px-1 rounded">{name}</code> — v0.6.5+</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{addr, protocol: "udp|dot", port, name, tls_hostname?}</code> — no loopback/link-local</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-yellow-600 w-12 shrink-0 font-bold">PATCH</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id</code><span class="text-gray-700">Rename / set SNI — <code class="bg-gray-900 px-1 rounded">{name, tls_hostname}</code> — v0.6.5+</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id/probe</code><span class="text-gray-700">Trigger immediate health probe — v0.6.6+</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-red-600 w-12 shrink-0 font-bold">DEL</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id</code><span class="text-gray-700">Remove — 409 LAST_UPSTREAM if last</span></div>
           </div>
         </div>
@@ -624,7 +626,7 @@ async function loadUpstreamPresets() {
 async function upstreamAddPreset(i) {
   const p=upstreamPresetsCache[i]; if(!p) return;
   try {
-    const body={addr:p.addr,protocol:p.protocol,name:p.name}; if(p.port) body.port=p.port;
+    const body={addr:p.addr,protocol:p.protocol,name:p.name}; if(p.port) body.port=p.port; if(p.tls_hostname) body.tls_hostname=p.tls_hostname;
     const r=await api('POST','/upstreams',body);
     toast(`"${p.name}" added — probing…`);
     const id=r.upstream?.id;
@@ -662,21 +664,25 @@ async function loadUpstreams() {
         const spark=renderSparkline(u.latency_history);
         const dns=dnssecBadge(u.dnssec_supported);
         const name=u.name?`<span class="text-gray-400 truncate text-xs">${esc(u.name)}</span>`:'<span class="text-gray-700 italic text-xs">unnamed</span>';
-        return `<div class="row gap-2">${hDot}<span class="text-cyan-400 font-mono shrink-0 text-xs w-36">${esc(u.addr)}<span class="text-gray-700">:${port}</span></span>${proto}${dns}<span class="flex-1 min-w-0 flex items-center gap-1.5">${name}<button class="edit-btn shrink-0" onclick="upstreamRename('${u.id}','${esc(u.name||'')}')" title="Rename">✎</button></span>${spark?`<span class="shrink-0">${spark}</span>`:''}<span class="text-gray-600 w-14 text-right text-xs shrink-0 tabular-nums">${latency}</span><span class="text-gray-800 w-20 text-right text-xs shrink-0">↻ ${lastCheck}</span><button class="del shrink-0" onclick="upstreamDelete('${u.id}')">✕</button></div>`;
+        const sniBtn=u.protocol==='dot'?`<button class="edit-btn shrink-0" onclick="upstreamEditSni('${u.id}','${esc(u.tls_hostname||'')}')" title="SNI: ${esc(u.tls_hostname||'auto')}">SNI</button>`:'';
+        const lastErr=!probing&&u.last_error?`<span class="text-red-400 text-xs shrink-0 cursor-help" title="${esc(u.last_error)}">⚠</span>`:'';
+        return `<div class="row gap-2">${hDot}<span class="text-cyan-400 font-mono shrink-0 text-xs w-36">${esc(u.addr)}<span class="text-gray-700">:${port}</span></span>${proto}${dns}<span class="flex-1 min-w-0 flex items-center gap-1.5">${name}<button class="edit-btn shrink-0" onclick="upstreamRename('${u.id}','${esc(u.name||'')}')" title="Rename">✎</button>${sniBtn}</span>${spark?`<span class="shrink-0">${spark}</span>`:''}<span class="text-gray-600 w-14 text-right text-xs shrink-0 tabular-nums">${latency}</span><span class="text-gray-800 w-20 text-right text-xs shrink-0">↻ ${lastCheck}</span>${lastErr}<button class="del shrink-0" onclick="upstreamDelete('${u.id}')">✕</button></div>`;
       }).join('');
   } catch(e) { toast('Upstreams: '+e.message, true); }
 }
 
-function upsProtocolChange(sel) { const p=document.getElementById('ups-port'); if(p) p.value=sel.value==='dot'?'853':'53'; }
+function upsProtocolChange(sel) { const p=document.getElementById('ups-port'); if(p) p.value=sel.value==='dot'?'853':'53'; const t=document.getElementById('ups-tls-name'); if(t) t.classList.toggle('hidden',sel.value!=='dot'); }
 
 async function upstreamAdd() {
   const addr=document.getElementById('ups-addr').value.trim(), protocol=document.getElementById('ups-protocol').value,
-        name=document.getElementById('ups-name').value.trim()||undefined, portVal=parseInt(document.getElementById('ups-port').value), port=isNaN(portVal)?undefined:portVal;
+        name=document.getElementById('ups-name').value.trim()||undefined, portVal=parseInt(document.getElementById('ups-port').value), port=isNaN(portVal)?undefined:portVal,
+        tlsName=protocol==='dot'?(document.getElementById('ups-tls-name').value.trim()||undefined):undefined;
   if(!addr) return toast('IP address required', true);
   try {
-    const r=await api('POST','/upstreams',{addr,protocol,name,port});
+    const body={addr,protocol,name,port}; if(tlsName) body.tls_hostname=tlsName;
+    const r=await api('POST','/upstreams',body);
     toast('Upstream added — probing…');
-    document.getElementById('ups-addr').value=''; document.getElementById('ups-name').value=''; document.getElementById('ups-port').value='53';
+    document.getElementById('ups-addr').value=''; document.getElementById('ups-name').value=''; document.getElementById('ups-port').value='53'; document.getElementById('ups-tls-name').value='';
     const id=r.upstream?.id;
     if(id){ probingUpstreams.add(id); pollUpstreamHealth(id); }
     loadUpstreams();
@@ -698,6 +704,11 @@ async function upstreamRename(id, current) {
   const name = prompt('Rename upstream:', current); if (name === null) return;
   try { await api('PATCH', '/upstreams/' + id, {name: name.trim() || ''}); toast('Renamed'); loadUpstreams(); }
   catch(e) { toast('Rename: '+e.message, true); }
+}
+async function upstreamEditSni(id, current) {
+  const val=prompt('TLS SNI hostname for this DoT upstream\n(leave empty = auto-detect from well-known IPs):',current); if(val===null) return;
+  try { await api('PATCH','/upstreams/'+id,{tls_hostname:val.trim()}); toast('SNI updated'); loadUpstreams(); }
+  catch(e) { toast('SNI update: '+e.message, true); }
 }
 
 async function upstreamDelete(id) { try { await api('DELETE','/upstreams/'+id); toast('Removed'); loadUpstreams(); } catch(e) { toast('Delete failed: '+e.message, true); } }
