@@ -211,7 +211,7 @@ curl http://localhost:8080/health
 ```
 
 ```json
-{"status": "ok", "version": "0.6.6", "uptime_secs": 3600}
+{"status": "ok", "version": "0.6.5", "uptime_secs": 3600}
 ```
 
 ---
@@ -577,7 +577,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 
 ```json
 {
-  "version": "0.6.6",
+  "version": "0.6.5",
   "uptime_secs": 3600,
   "xdp_active": true,
   "xdp_mode": "drv",
