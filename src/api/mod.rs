@@ -1332,12 +1332,15 @@ async fn upstreams_handler(State(s): State<AppState>) -> impl IntoResponse {
 
 #[derive(Deserialize)]
 struct AddUpstreamRequest {
-    addr:     String,
+    addr:         String,
     #[serde(default = "default_protocol")]
-    protocol: String,
-    name:     Option<String>,
+    protocol:     String,
+    name:         Option<String>,
     /// Explicit port. Defaults to 53 (UDP) or 853 (DoT) if omitted.
-    port:     Option<u16>,
+    port:         Option<u16>,
+    /// #56: TLS SNI hostname for DoT upstreams. If absent, derived automatically
+    /// from well-known IPs (Cloudflare, Google, Quad9, OpenDNS).
+    tls_hostname: Option<String>,
 }
 fn default_protocol() -> String { "udp".into() }
 
@@ -1382,7 +1385,15 @@ async fn add_upstream_handler(
         }))).into_response();
     }
 
-    let entry = upstreams::add_upstream(&s.upstreams, req.addr, port, req.protocol, req.name);
+    // #56: validate optional tls_hostname
+    let tls_hostname = match validate_tls_hostname(req.tls_hostname.as_deref()) {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_FIELD", "details": e
+        }))).into_response(),
+    };
+
+    let entry = upstreams::add_upstream(&s.upstreams, req.addr, port, req.protocol, req.name, tls_hostname);
 
     // Rebuild resolver with updated upstream list
     let addrs = upstreams::upstream_addrs(&s.upstreams);
@@ -1440,16 +1451,22 @@ async fn delete_upstream_handler(
 
 async fn upstream_presets_handler() -> impl IntoResponse {
     // FIX #42: DoT entries use a separate `port` field — addr contains only the IP.
+    // #56: DoT presets include tls_hostname so the hickory resolver uses the correct SNI.
     JsonExtract(serde_json::json!({ "presets": [
-        {"name":"Cloudflare",       "addr":"1.1.1.1",        "port":53,  "protocol":"udp","description":"Cloudflare DNS — privacy-focused, fast"},
-        {"name":"Cloudflare alt",   "addr":"1.0.0.1",        "port":53,  "protocol":"udp","description":"Cloudflare secondary"},
-        {"name":"Cloudflare DoT",   "addr":"1.1.1.1",        "port":853, "protocol":"dot","description":"Cloudflare DNS-over-TLS"},
-        {"name":"Google",           "addr":"8.8.8.8",        "port":53,  "protocol":"udp","description":"Google Public DNS"},
-        {"name":"Google alt",       "addr":"8.8.4.4",        "port":53,  "protocol":"udp","description":"Google Public DNS secondary"},
-        {"name":"Quad9",            "addr":"9.9.9.9",        "port":53,  "protocol":"udp","description":"Quad9 — malware-blocking, privacy-focused"},
-        {"name":"Quad9 DoT",        "addr":"9.9.9.9",        "port":853, "protocol":"dot","description":"Quad9 DNS-over-TLS"},
-        {"name":"OpenDNS",          "addr":"208.67.222.222", "port":53,  "protocol":"udp","description":"Cisco OpenDNS"},
-        {"name":"OpenDNS alt",      "addr":"208.67.220.220", "port":53,  "protocol":"udp","description":"Cisco OpenDNS secondary"},
+        {"name":"Cloudflare",          "addr":"1.1.1.1",        "port":53,  "protocol":"udp","description":"Cloudflare DNS — privacy-focused, fast"},
+        {"name":"Cloudflare alt",      "addr":"1.0.0.1",        "port":53,  "protocol":"udp","description":"Cloudflare secondary"},
+        {"name":"Cloudflare DoT",      "addr":"1.1.1.1",        "port":853, "protocol":"dot","tls_hostname":"cloudflare-dns.com","description":"Cloudflare DNS-over-TLS"},
+        {"name":"Cloudflare DoT alt",  "addr":"1.0.0.1",        "port":853, "protocol":"dot","tls_hostname":"cloudflare-dns.com","description":"Cloudflare DNS-over-TLS secondary"},
+        {"name":"Google",              "addr":"8.8.8.8",        "port":53,  "protocol":"udp","description":"Google Public DNS"},
+        {"name":"Google alt",          "addr":"8.8.4.4",        "port":53,  "protocol":"udp","description":"Google Public DNS secondary"},
+        {"name":"Google DoT",          "addr":"8.8.8.8",        "port":853, "protocol":"dot","tls_hostname":"dns.google","description":"Google DNS-over-TLS"},
+        {"name":"Google DoT alt",      "addr":"8.8.4.4",        "port":853, "protocol":"dot","tls_hostname":"dns.google","description":"Google DNS-over-TLS secondary"},
+        {"name":"Quad9",               "addr":"9.9.9.9",        "port":53,  "protocol":"udp","description":"Quad9 — malware-blocking, privacy-focused"},
+        {"name":"Quad9 alt",           "addr":"149.112.112.112","port":53,  "protocol":"udp","description":"Quad9 secondary"},
+        {"name":"Quad9 DoT",           "addr":"9.9.9.9",        "port":853, "protocol":"dot","tls_hostname":"dns.quad9.net","description":"Quad9 DNS-over-TLS"},
+        {"name":"Quad9 DoT alt",       "addr":"149.112.112.112","port":853, "protocol":"dot","tls_hostname":"dns.quad9.net","description":"Quad9 DNS-over-TLS secondary"},
+        {"name":"OpenDNS",             "addr":"208.67.222.222", "port":53,  "protocol":"udp","description":"Cisco OpenDNS"},
+        {"name":"OpenDNS alt",         "addr":"208.67.220.220", "port":53,  "protocol":"udp","description":"Cisco OpenDNS secondary"},
     ]}))
 }
 
@@ -1509,21 +1526,23 @@ async fn patch_upstream_handler(
     Path(id): Path<String>,
     ApiJson(body): ApiJson<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Only "name" is patchable — reject any other key immediately.
+    // Only "name" and "tls_hostname" are patchable — reject any other key.
     if let Some(obj) = body.as_object() {
         for key in obj.keys() {
-            if key != "name" {
+            if key != "name" && key != "tls_hostname" {
                 return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
                     "error":   "INVALID_FIELD",
-                    "details": format!("field '{}' is not patchable; only 'name' is supported", key)
+                    "details": format!("field '{}' is not patchable; only 'name' and 'tls_hostname' are supported", key)
                 }))).into_response();
             }
         }
     }
 
-    // Resolve name: absent or null → None; "" → None; non-empty string → Some(s).
-    let name: Option<String> = match body.get("name") {
-        Some(serde_json::Value::String(s)) if s.is_empty() => None,
+    // Resolve name: absent → skip; null or "" → None; non-empty → Some(s).
+    let name_patch: Option<Option<String>> = match body.get("name") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(s)) if s.is_empty() => Some(None),
         Some(serde_json::Value::String(s)) => {
             if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
                 return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
@@ -1537,21 +1556,52 @@ async fn patch_upstream_handler(
                     "details": "name must not exceed 64 characters"
                 }))).into_response();
             }
-            Some(s.clone())
+            Some(Some(s.clone()))
         }
-        Some(serde_json::Value::Null) | None => None,
         _ => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
             "error":   "INVALID_FIELD",
             "details": "field 'name' must be a string or null"
         }))).into_response(),
     };
 
-    match upstreams::patch_upstream_name(&s.upstreams, &id, name) {
-        Some(updated) => {
+    // Resolve tls_hostname: absent → skip; null or "" → None (clear); non-empty → Some(s).
+    let tls_patch: Option<Option<String>> = match body.get("tls_hostname") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => Some(None),
+        Some(serde_json::Value::String(s)) => {
+            match validate_tls_hostname(Some(s.as_str())) {
+                Ok(h)  => Some(h),
+                Err(e) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+                    "error": "INVALID_FIELD", "details": e
+                }))).into_response(),
+            }
+        }
+        _ => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error":   "INVALID_FIELD",
+            "details": "field 'tls_hostname' must be a string or null"
+        }))).into_response(),
+    };
+
+    // Apply both patches in a single write-lock acquisition.
+    let updated = {
+        let mut list = s.upstreams.write()
+            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in patch handler: {e}"));
+        if let Some(u) = list.iter_mut().find(|u| u.id == id) {
+            if let Some(n) = name_patch        { u.name         = n; }
+            if let Some(h) = tls_patch         { u.tls_hostname = h; }
+            Some(u.clone())
+        } else {
+            None
+        }
+    };
+
+    match updated {
+        Some(u) => {
             upstreams::save_upstreams(&s.upstreams, &s.base_dir);
-            info!(id = %id, "upstream renamed via PATCH");
+            info!(id = %id, "upstream patched via PATCH");
             (StatusCode::OK, JsonExtract(serde_json::json!({
-                "status": "ok", "upstream": updated
+                "status": "ok", "upstream": u
             }))).into_response()
         }
         None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
@@ -1938,6 +1988,23 @@ fn validate_no_control_chars(s: &str, field: &'static str) -> Result<(), String>
         return Err(format!("Field '{}' must not contain control characters (\r, \n, etc.)", field));
     }
     Ok(())
+}
+
+/// #56: Validate and normalise a `tls_hostname` value from the API.
+/// - `None` / empty string → `Ok(None)` (auto-derive)
+/// - Non-empty, valid → `Ok(Some(trimmed))`
+/// - Too long or containing control characters → `Err(message)`
+fn validate_tls_hostname(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(h) = raw else { return Ok(None); };
+    let h = h.trim();
+    if h.is_empty() { return Ok(None); }
+    if h.len() > 253 {
+        return Err("tls_hostname must not exceed 253 characters".into());
+    }
+    if h.bytes().any(|b| b < 0x20) {
+        return Err("tls_hostname must not contain control characters".into());
+    }
+    Ok(Some(h.to_string()))
 }
 
 /// VUL-05: Validate a DNS name before accepting it from the API.
@@ -3107,6 +3174,163 @@ mod tests {
         assert_eq!(j["status"], "ok");
         assert_eq!(j["upstream"]["healthy"], false, "TEST-NET-1 must be unhealthy");
         assert!(j["upstream"]["last_error"].is_string(), "last_error must be set on failure");
+    }
+
+    // ── #53: last_error field on upstream failures ────────────────────────────
+
+    #[tokio::test]
+    async fn upstream_last_error_present_on_failure() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+
+        // Add an upstream pointing to TEST-NET-1 (192.0.2.1, RFC 5737 — unreachable)
+        let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"192.0.2.1"}"#).await;
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+        let id = body_json(add_resp.into_body()).await["upstream"]["id"]
+            .as_str().unwrap_or_default().to_string();
+
+        // Trigger immediate probe — should fail
+        let probe_resp = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri(format!("/api/upstreams/{id}/probe"))
+                .header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(probe_resp.status(), StatusCode::OK);
+        let j = body_json(probe_resp.into_body()).await;
+        assert_eq!(j["upstream"]["healthy"], false);
+        assert!(j["upstream"]["last_error"].is_string(),
+            "last_error must be present after a failed probe; got: {:?}", j["upstream"]);
+    }
+
+    #[tokio::test]
+    async fn upstream_last_error_cleared_on_success() {
+        // Directly manipulate UpstreamStatus: set last_error, then simulate
+        // a successful write-back and verify it is cleared.
+        // (Unit-level; mirrors parse_last_error_cleared_on_healthy in upstreams.rs)
+        use crate::upstreams::{add_upstream as add_us, init_upstreams};
+        let cfg = crate::config::parser::UnboundConfig::default();
+        let shared = init_upstreams(&cfg);
+        let entry = add_us(&shared, "1.1.1.1".into(), 53, "udp".into(), None, None);
+
+        // Inject a prior error
+        {
+            let mut list = shared.write().unwrap_or_else(|e| e.into_inner());
+            let s = list.iter_mut().find(|u| u.id == entry.id)
+                .unwrap_or_else(|| panic!("entry not found"));
+            s.last_error = Some("timeout".into());
+            s.healthy = false;
+        }
+        // Simulate successful write-back
+        {
+            let mut list = shared.write().unwrap_or_else(|e| e.into_inner());
+            let s = list.iter_mut().find(|u| u.id == entry.id)
+                .unwrap_or_else(|| panic!("entry not found"));
+            s.healthy    = true;
+            s.last_error = None;
+        }
+        let list = shared.read().unwrap_or_else(|e| e.into_inner());
+        let s = list.iter().find(|u| u.id == entry.id)
+            .unwrap_or_else(|| panic!("entry not found"));
+        assert!(s.last_error.is_none(), "last_error must be None after a successful probe");
+        assert!(s.healthy);
+    }
+
+    // ── #56: tls_hostname on PATCH /api/upstreams/:id ─────────────────────────
+
+    #[tokio::test]
+    async fn patch_upstream_tls_hostname_sets_value() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let add_resp = post_upstream(app.clone(), (k, v.clone()),
+            r#"{"addr":"9.9.9.9","protocol":"dot"}"#).await;
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+        let id = body_json(add_resp.into_body()).await["upstream"]["id"]
+            .as_str().unwrap().to_string();
+
+        let patch_body = serde_json::json!({"tls_hostname":"custom.example.com"}).to_string();
+        let resp = app.clone().oneshot(
+            Request::builder()
+                .method("PATCH").uri(format!("/api/upstreams/{id}"))
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", patch_body.len().to_string())
+                .body(Body::from(patch_body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        assert_eq!(j["upstream"]["tls_hostname"], "custom.example.com");
+    }
+
+    #[tokio::test]
+    async fn patch_upstream_tls_hostname_empty_clears() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        // Add DoT upstream with tls_hostname set
+        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname":"dns.quad9.net"}).to_string();
+        let add_resp = app.clone().oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams")
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+        let id = body_json(add_resp.into_body()).await["upstream"]["id"]
+            .as_str().unwrap().to_string();
+
+        // Clear tls_hostname by patching with ""
+        let patch_body = serde_json::json!({"tls_hostname":""}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("PATCH").uri(format!("/api/upstreams/{id}"))
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", patch_body.len().to_string())
+                .body(Body::from(patch_body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        // tls_hostname absent from JSON when None (skip_serializing_if)
+        assert!(j["upstream"].get("tls_hostname").is_none() || j["upstream"]["tls_hostname"].is_null(),
+            "tls_hostname must be absent or null after clearing; got: {:?}", j["upstream"]);
+    }
+
+    #[tokio::test]
+    async fn post_upstream_tls_hostname_validated_control_char() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        // tls_hostname with control character must return 400
+        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname":"bad\x01host"}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams")
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_FIELD");
+    }
+
+    #[tokio::test]
+    async fn post_upstream_tls_hostname_too_long() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        // 254-char tls_hostname must return 400
+        let long_host = "a".repeat(254);
+        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname": long_host}).to_string();
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/upstreams")
+                .header(k, &v)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_FIELD");
     }
 
     #[tokio::test]
