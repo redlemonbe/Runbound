@@ -36,7 +36,7 @@ use crate::dns::RateLimiter;
 use super::loader::XdpHandle;
 use super::socket::{
     XskSocket, create_xsk_socket, get_rx_queue_count, iface_index,
-    is_virtual_interface, parent_interface,
+    is_virtual_interface, parent_interface, sanitize_iface_name,
 };
 use super::umem::{XdpDesc, FRAME_SIZE};
 
@@ -52,17 +52,25 @@ const PROTO_UDP:   u8 = 17;
 /// Load the XDP program onto `iface`, open one AF_XDP socket per RX queue,
 /// and spawn a dedicated OS thread for each.  Returns `Ok(Some(handle))` when
 /// the fast path is active, `Ok(None)` when XDP is cleanly disabled (virtual
-/// interface with no detectable parent, or self-test failure), or `Err` for
-/// unexpected errors.
+/// interface with no detectable parent, self-test failure, or
+/// `RUNBOUND_DISABLE_XDP` is set), or `Err` for unexpected errors.
 ///
 /// If `iface` is a virtual interface (bridge, veth, ipvlan, macvlan), the
 /// function automatically retries on the physical parent before giving up.
+///
+/// Emergency escape hatch: set `RUNBOUND_DISABLE_XDP=1` in the environment
+/// to skip XDP entirely without editing the config file. Useful when the host
+/// is unreachable after XDP bricks the network and rescue-mode boot is needed.
 pub fn start_xdp(
     iface:        &str,
     zones:        Arc<ArcSwap<LocalZoneSet>>,
     rate_limiter: Arc<RateLimiter>,
     acl:          Arc<Acl>,
 ) -> Result<Option<XdpHandle>, String> {
+    if std::env::var("RUNBOUND_DISABLE_XDP").is_ok() {
+        tracing::info!("XDP disabled via RUNBOUND_DISABLE_XDP environment variable");
+        return Ok(None);
+    }
     if is_virtual_interface(iface) {
         match parent_interface(iface) {
             Some(ref parent) => {
@@ -98,19 +106,54 @@ fn start_xdp_on_iface(
     let ifidx = iface_index(iface)
         .ok_or_else(|| format!("interface {iface} not found"))?;
 
+    // Bug B: check MTU before attach — virtio-net refuses DRV mode when MTU > 3506.
+    // Falling back to SKB mode is acceptable but must be visible to the operator.
+    if let Some(iface_safe) = sanitize_iface_name(iface) {
+        if let Ok(s) = std::fs::read_to_string(format!("/sys/class/net/{iface_safe}/mtu")) {
+            if let Ok(mtu) = s.trim().parse::<u32>() {
+                if mtu > 3506 {
+                    tracing::warn!(
+                        iface = %iface, mtu, limit = 3506,
+                        "MTU exceeds virtio-net single-buffer XDP limit — \
+                         DRV mode unavailable, falling back to SKB mode (higher latency). \
+                         Reduce MTU to ≤3506 or accept SKB-mode operation."
+                    );
+                }
+            }
+        }
+    }
+
     let mut handle = XdpHandle::load(iface)?;
 
     let queue_count = get_rx_queue_count(iface).max(1);
+    let num_cpus = crate::cpu::physical_cores().len().max(1);
     tracing::info!(iface = %iface, queues = queue_count, "Starting XDP workers");
+
+    // Bug D: virtio-net often reports a single queue; XDP will use locked TX mode.
+    if queue_count == 1 && num_cpus > 1 {
+        tracing::warn!(
+            iface = %iface, cpus = num_cpus,
+            "virtio-net single-queue detected — XDP workers share queue 0 in locked TX \
+             mode. For multi-queue performance set queues=<N> in the VM NIC config."
+        );
+    }
 
     let cores = crate::cpu::physical_cores();
 
     // Create all sockets before spawning threads so we can run the self-test.
     let mut sockets: Vec<(u32, XskSocket)> = Vec::with_capacity(queue_count as usize);
     for q in 0..queue_count {
+        // S1: XSKMAP is created with max_entries=64; a queue_id ≥ 64 would write
+        // outside the map bounds inside the kernel.
+        if q >= 64 {
+            return Err(format!(
+                "queue_id {q} exceeds XSKMAP capacity (64) — \
+                 reduce NIC queue count or use SO_REUSEPORT path"
+            ));
+        }
         // SAFETY: `ifidx` is a valid ifindex returned by `iface_index`. `q` is
-        //         in [0, queue_count), which is the valid range of NIC RX queues.
-        //         On zero-copy failure we fall back to copy mode.
+        //         in [0, min(queue_count, 64)), which is the valid range of NIC RX
+        //         queues. On zero-copy failure we fall back to copy mode.
         let sock = unsafe { create_xsk_socket(ifidx, q, true) }
             .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false) })
             .map_err(|e| format!("AF_XDP socket creation failed: {e}"))?;
@@ -149,6 +192,14 @@ fn start_xdp_on_iface(
 fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), String> {
     use libc::{POLLIN, poll, pollfd};
 
+    // Emergency bypass for validation/debugging environments where XDP traffic
+    // cannot loop back (isolated VMs, CI, Proxmox virtio-net). Set
+    // RUNBOUND_SKIP_XDP_SELFTEST=1 to skip the loopback check.
+    if std::env::var("RUNBOUND_SKIP_XDP_SELFTEST").is_ok() {
+        tracing::warn!(iface = %iface, "XDP self-test bypassed via RUNBOUND_SKIP_XDP_SELFTEST");
+        return Ok(());
+    }
+
     // Hard check: fill ring must have been seeded by Umem::new().
     if sock.umem.fill.producer_count() == 0 {
         return Err(format!(
@@ -156,6 +207,11 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
              — disabling XDP, falling back to kernel UDP path"
         ));
     }
+
+    // S5: use the interface's own unicast MAC as dst to avoid ARP storms.
+    // Fall back to broadcast only if the address cannot be read.
+    let dst_mac = super::socket::read_iface_mac(iface)
+        .unwrap_or([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
 
     // Inject up to 3 synthetic DNS frames into the TX ring.
     let mut injected = 0u32;
@@ -166,7 +222,7 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
             //         FRAME_SIZE fits within `area_len`; `frame_mut` performs the
             //         bounds check and returns None on failure.
             if let Some(frame) = unsafe { sock.umem.frame_mut(tx_addr, FRAME_SIZE as usize) } {
-                let len = build_test_frame(frame);
+                let len = build_test_frame(frame, dst_mac);
                 if len > 0 {
                     sock.tx.enqueue_tx(&[XdpDesc { addr: tx_addr, len: len as u32, options: 0 }]);
                     injected += 1;
@@ -200,7 +256,7 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() { break; }
         let mut pfd = pollfd { fd: sock.fd, events: POLLIN, revents: 0 };
-        let timeout_ms = (remaining.as_millis() as i32).min(20).max(1);
+        let timeout_ms = (remaining.as_millis() as i32).clamp(1, 20);
         // SAFETY: `&mut pfd` is a valid pointer to a single `pollfd` struct.
         //         nfds=1 matches the array length. `timeout_ms` is a valid
         //         non-negative timeout in milliseconds.
@@ -225,7 +281,7 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
 /// Build a minimal Ethernet/IPv4/UDP/DNS query frame for the self-test.
 /// Destination: 192.0.2.2 (TEST-NET-1, RFC 5737 — not routable).
 /// Returns the total frame length, or 0 if `buf` is too small.
-fn build_test_frame(buf: &mut [u8]) -> usize {
+fn build_test_frame(buf: &mut [u8], dst_mac: [u8; 6]) -> usize {
     // DNS query: A record for "xdp.test." (ID=0xDEAD)
     const DNS: &[u8] = &[
         0xDE, 0xAD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -238,8 +294,8 @@ fn build_test_frame(buf: &mut [u8]) -> usize {
     let total = ETH + IP + UDP + DNS.len();
     if buf.len() < total { return 0; }
 
-    // Ethernet: broadcast dst, fake src, EtherType=IPv4
-    buf[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    // Ethernet: unicast dst (interface's own MAC), fake src, EtherType=IPv4
+    buf[0..6].copy_from_slice(&dst_mac);
     buf[6..12].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
     buf[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
 
@@ -317,11 +373,14 @@ fn xdp_worker(
             rx_addrs.push(desc.addr);
 
             if let Some(tx_addr) = sock.umem.tx_free.pop_front() {
-                // FIX 2.1: release-mode bounds check on kernel-provided descriptor.
-                // desc.addr/len come from the XDP RX ring (kernel-controlled); a
-                // corrupted or malicious kernel could supply out-of-bounds values.
+                // S3: bounds check on kernel-controlled descriptor fields.
+                // desc.addr and desc.len come from the XDP RX ring; use checked_add
+                // to avoid wrapping on 32-bit and verify desc.len ≤ FRAME_SIZE.
                 // Silently skip — never panic, never access memory outside UMEM.
-                if desc.addr as usize + desc.len as usize > sock.umem.area_len {
+                let end = (desc.addr as usize).checked_add(desc.len as usize);
+                if desc.len as usize > FRAME_SIZE as usize
+                    || end.map(|e| e > sock.umem.area_len).unwrap_or(true)
+                {
                     sock.umem.tx_free.push_back(tx_addr);
                     continue;
                 }
@@ -351,8 +410,11 @@ fn xdp_worker(
                 // the raw frame and consume a token from the shared bucket.
                 // Dropped frames are silently recycled — no REFUSED response
                 // is crafted in the XDP path (matches `deny` ACL semantics).
+                // S4: unwrap_or(true) — frames with no parseable source IP are
+                // dropped. Non-IP frames should never reach port 53 via XDP_PASS,
+                // but deny-by-default is the correct posture if they do.
                 let src_ip = extract_src_ip(rx_frame);
-                if src_ip.map(|ip| !rate_limiter.check(ip)).unwrap_or(false) {
+                if src_ip.map(|ip| !rate_limiter.check(ip)).unwrap_or(true) {
                     sock.umem.tx_free.push_back(tx_addr);
                     continue;
                 }
@@ -448,7 +510,7 @@ fn process_packet(
         if rx.len() < ip_off + IPV4_HDR_MIN { return None; }
         if rx[ip_off + 9] != PROTO_UDP { return None; }
         let ihl = (rx[ip_off] & 0x0F) as usize * 4;
-        if ihl < 20 || ihl > 60 { return None; }
+        if !(20..=60).contains(&ihl) { return None; }
         (ip_off + ihl, ihl, ip_off + 12, ip_off + 16, ip_off + 2)
     } else {
         if rx.len() < ip_off + IPV6_HDR { return None; }

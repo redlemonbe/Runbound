@@ -107,14 +107,14 @@ pub fn builtin_presets() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "OISD — Basic",
             "url": "https://small.oisd.nl/",
-            "format": "domains",
+            "format": "adblock",
             "action": "refuse",
             "description": "~100k domains. Carefully curated, low false-positive rate. Good for home networks."
         }),
         serde_json::json!({
             "name": "OISD — Big (full list)",
             "url": "https://big.oisd.nl/",
-            "format": "domains",
+            "format": "adblock",
             "action": "refuse",
             "description": "~600k domains. Extended OISD list. Recommended for Pi-hole / Unbound setups."
         }),

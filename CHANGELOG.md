@@ -9,6 +9,84 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.0] — 2026-05-22
+
+### Fixed
+
+- **XDP detach on shutdown (Bug A)** — `XdpHandle` now implements `Drop`: calls
+  `Xdp::detach(link_id)` to remove the NIC attachment before the process exits.
+  Previously the XDP program and XSKMAP lingered in the kernel after shutdown,
+  blocking hot-restart and NIC hot-unplug.
+  (`src/dns/xdp/loader.rs`)
+
+- **MTU warning before XDP attach (Bug B)** — Added a sysfs MTU check before
+  attaching the XDP program. When `MTU > 3506` on virtio-net (single-buffer XDP
+  limit), a tracing WARN is emitted and DRV-mode falls back to SKB-mode rather
+  than silently degrading performance.
+  (`src/dns/xdp/worker.rs`)
+
+- **Emergency XDP escape hatch (Bug C)** — Setting `RUNBOUND_DISABLE_XDP=1` in
+  the environment now skips the entire XDP fast path without editing the config
+  file. Useful when the host is unreachable after XDP attaches to the wrong NIC.
+  (`src/dns/xdp/worker.rs`)
+
+- **Single-queue multi-CPU warning (Bug D)** — When virtio-net reports a single
+  RX queue but the host has multiple CPUs, a WARN is logged advising the operator
+  to set `queues=<N>` in the VM NIC config for multi-queue XDP performance.
+  (`src/dns/xdp/worker.rs`)
+
+- **XSKMAP queue_id bounds check (S1)** — Added an explicit guard: `queue_id ≥ 64`
+  (the XSKMAP `max_entries`) now returns an error instead of silently writing
+  outside the BPF map.
+  (`src/dns/xdp/worker.rs`)
+
+- **UMEM descriptor overflow (S3)** — The hot-loop descriptor bounds check now
+  uses `checked_add` to prevent wrapping on 32-bit platforms, and also validates
+  `desc.len ≤ FRAME_SIZE` before any UMEM access.
+  (`src/dns/xdp/worker.rs`)
+
+- **Rate-limiter deny-by-default for non-IP frames (S4)** — Changed
+  `unwrap_or(false)` to `unwrap_or(true)` for frames whose source IP cannot be
+  parsed. Non-IP frames that somehow reach port 53 are now silently dropped.
+  (`src/dns/xdp/worker.rs`)
+
+- **Unicast MAC in XDP self-test frame (S5)** — `build_test_frame` now reads the
+  interface's own unicast MAC from `/sys/class/net/<iface>/address` and uses it
+  as the Ethernet destination, replacing the hardcoded broadcast `ff:ff:ff:ff:ff:ff`
+  that could trigger ARP storms on busy networks. Falls back to broadcast if the
+  address cannot be read.
+  (`src/dns/xdp/worker.rs`, `src/dns/xdp/socket.rs`)
+
+- **Latency histogram stuck at 750 ms (Fix #18)** — Extended `HIST_BOUNDS_US`
+  from 9 bounds (10 buckets) to 12 bounds (13 buckets), adding finer resolution
+  at 250 ms, 1 s, and 3 s. Fixed `percentile_ms()` overflow bucket: the
+  `unwrap_or(1_000_000)` midpoint calculation that produced a spurious 750 ms
+  artifact is replaced by returning the lower bound of the open-ended bucket.
+  (`src/stats.rs`)
+
+- **OISD preset 0 entries (Fix #24)** — The built-in OISD Basic and OISD Big
+  presets declared `format: "domains"` but the URLs (`small.oisd.nl`,
+  `big.oisd.nl`) serve Adblock Plus format. Changed to `format: "adblock"`.
+  (`src/feeds/mod.rs`)
+
+- **Cache overcommit inside cgroup v2 containers (Fix #27)** — `cache_size_from_meminfo()`
+  and `read_meminfo()` now check `/sys/fs/cgroup/memory.max` and
+  `/sys/fs/cgroup/memory.current` first. When running inside a container with a
+  hard memory limit, the cache is sized against the cgroup budget rather than
+  the host's `/proc/meminfo`, preventing OOM kills under memory pressure.
+  (`src/dns/server.rs`)
+
+### Added
+
+- **`GET /system` endpoint (Feature #19)** — Returns process and host info:
+  `version`, `uptime_secs`, `xdp_active`, `cpu_cores`, `cpu_percent`,
+  `mem_total_mb`, `mem_avail_mb`, `cache_entries`, `workers`. Useful for
+  dashboards and health monitoring without parsing `/stats`. Documented in
+  `GET /help`.
+  (`src/api/mod.rs`, `src/main.rs`)
+
+---
+
 ## [0.5.7] — 2026-05-20
 
 ### Fixed

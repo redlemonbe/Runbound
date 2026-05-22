@@ -38,6 +38,7 @@ Your existing `unbound.conf` works as-is. Zero migration.
 | Automatic TLS (Let's Encrypt) | ❌ external | ❌ external | ✅ built-in ACME |
 | Tamper-evident audit log | ❌ | ❌ | ✅ HMAC-SHA256 chain |
 | Prometheus metrics | ⚠️ XML/JSON channel | ❌ | ✅ `/metrics` OpenMetrics |
+| System info endpoint | ❌ | ❌ | ✅ `GET /system` — version, memory, XDP state |
 | API key rotation (no restart) | ❌ | ❌ | ✅ `POST /rotate-key` |
 | Hot config reload | ✅ rndc reload | ❌ | ✅ API |
 | Bare-metal throughput (UDP, NIC-limited) | ~same | ~same | ~same |
@@ -258,11 +259,16 @@ Works on VMs (virtio, copy mode) and bare metal Intel NICs (ixgbe/i40e/ice/igc, 
 All releases: [github.com/redlemonbe/Runbound/releases](https://github.com/redlemonbe/Runbound/releases)
 
 Or build from source: `cargo build --release`  
-XDP is compiled in by default. The fast path requires a **commercial license** to activate at runtime. To disable it explicitly:
-- Add `xdp: no` to `unbound.conf` (or `runbound.conf`), or
-- Pass `--no-xdp` on the command line: `runbound --no-xdp /etc/runbound/unbound.conf`
+XDP is compiled in by default. The fast path requires a **commercial license** to activate at runtime. To disable it:
 
-To remove the XDP code entirely at build time: `cargo build --release --no-default-features`
+| Method | Command |
+|---|---|
+| Config file | `xdp: no` in `unbound.conf` |
+| CLI flag | `runbound --no-xdp /etc/runbound/unbound.conf` |
+| Emergency env var | `RUNBOUND_DISABLE_XDP=1 runbound ...` (no config edit needed) |
+| Build-time removal | `cargo build --release --no-default-features` |
+
+See [docs/xdp.md](docs/xdp.md) for requirements, startup logs, and shutdown behavior.
 
 ---
 

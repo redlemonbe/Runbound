@@ -13,6 +13,7 @@ use aya::{
     maps::XskMap,
     programs::{Xdp, XdpFlags},
 };
+use aya::programs::xdp::XdpLinkId;
 
 /// Compiled XDP program bytes, embedded at build time.
 /// `include_bytes!` aligns to 1 byte, but aya's ELF64 parser (via the `object`
@@ -22,10 +23,24 @@ static XDP_PROG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns_xdp.o"));
 
 /// RAII handle for the loaded XDP program.
 ///
-/// The `Ebpf` inside keeps the XDP link alive. Dropping this struct
-/// detaches the program from the NIC and destroys all BPF maps.
+/// Dropping this struct detaches the XDP program from the NIC and destroys
+/// all BPF maps. Without explicit detach the program would remain attached
+/// after process exit (prevents NIC hot-unplug and re-attach on restart).
 pub struct XdpHandle {
-    bpf: Ebpf,
+    bpf:     Ebpf,
+    link_id: Option<XdpLinkId>,
+}
+
+impl Drop for XdpHandle {
+    fn drop(&mut self) {
+        if let Some(id) = self.link_id.take() {
+            if let Some(prog) = self.bpf.program_mut("dns_xdp") {
+                if let Ok(xdp) = <&mut Xdp>::try_from(prog) {
+                    let _ = xdp.detach(id);
+                }
+            }
+        }
+    }
 }
 
 impl XdpHandle {
@@ -37,7 +52,7 @@ impl XdpHandle {
         // Vec<u64> is guaranteed 8-byte aligned by any conforming allocator,
         // satisfying the object crate's FileHeader64 alignment check inside aya.
         // Vec<u8>.to_vec() does NOT guarantee 8-byte alignment.
-        let words = (XDP_PROG.len() + 7) / 8;
+        let words = XDP_PROG.len().div_ceil(8);
         let mut storage: Vec<u64> = vec![0u64; words];
         // SAFETY: storage has len=words*8 ≥ XDP_PROG.len(), u64 → u8 cast is valid.
         unsafe {
@@ -64,14 +79,14 @@ impl XdpHandle {
 
         // Try DRV mode (zero-copy capable drivers). Fall back to SKB mode
         // (works on every NIC, slightly higher latency due to SKB allocation).
-        let attach = program
+        let link_id = program
             .attach(iface, XdpFlags::DRV_MODE)
             .or_else(|_| program.attach(iface, XdpFlags::SKB_MODE))
             .map_err(|e| format!("XDP attach to {iface} failed: {e}"))?;
 
-        tracing::info!(iface = %iface, link_id = ?attach, "XDP program attached");
+        tracing::info!(iface = %iface, link_id = ?link_id, "XDP program attached");
 
-        Ok(XdpHandle { bpf })
+        Ok(XdpHandle { bpf, link_id: Some(link_id) })
     }
 
     /// Register an AF_XDP socket with the XSKMAP at the given queue index.

@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use std::net::IpAddr;
 
@@ -239,6 +240,8 @@ pub struct AppState {
     pub base_dir:     Arc<PathBuf>,
     /// Immutable audit log sender. No-op when audit is disabled.
     pub audit:        AuditLogger,
+    /// Set to true by main once the XDP fast path is confirmed active.
+    pub xdp_active:   Arc<AtomicBool>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -472,6 +475,8 @@ pub fn router(state: AppState) -> Router {
         .route("/feeds/update",      post(update_feeds_handler))
         .route("/feeds/:id",         delete(delete_feed_handler))
         .route("/feeds/:id/update",  post(update_one_feed_handler))
+        // System
+        .route("/system",            get(system_handler))
         // TLS / Protocol status
         .route("/tls",               get(tls_status_handler))
         // Monitoring
@@ -517,6 +522,7 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"POST",   "path":"/feeds/update",     "description":"Refresh all feeds"},
             {"method":"POST",   "path":"/feeds/:id/update", "description":"Refresh one feed"},
             {"method":"GET",    "path":"/feeds/presets",    "description":"List pre-configured blocklists"},
+            {"method":"GET",    "path":"/system",           "description":"Host system info: version, memory, CPU cores, XDP state, workers"},
             {"method":"GET",    "path":"/tls",              "description":"DoT/DoH/DoQ TLS status"},
             {"method":"GET",    "path":"/upstreams",        "description":"Upstream DNS resolver health"},
             {"method":"GET",    "path":"/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
@@ -588,6 +594,93 @@ async fn stats_stream_handler(
         Some((Ok::<Event, Infallible>(event), stats))
     });
     Sse::new(sse_stream).keep_alive(KeepAlive::default())
+}
+
+// ── GET /system ────────────────────────────────────────────────────────────
+
+async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let snap = s.stats.snapshot();
+    let xdp_active = s.xdp_active.load(Ordering::Relaxed);
+
+    // Memory: prefer cgroup v2 (container-aware) over /proc/meminfo.
+    let (mem_avail_mb, mem_total_mb) = system_memory_mb();
+
+    // Approximate average CPU% for this process since start.
+    let cpu_percent = process_cpu_percent();
+
+    // Worker count: one XDP worker per NIC queue + tokio thread pool.
+    let cpu_cores = crate::cpu::physical_cores().len().max(1);
+
+    JsonExtract(serde_json::json!({
+        "version":       env!("CARGO_PKG_VERSION"),
+        "uptime_secs":   snap.uptime_secs,
+        "xdp_active":    xdp_active,
+        "cpu_cores":     cpu_cores,
+        "cpu_percent":   cpu_percent,
+        "mem_total_mb":  mem_total_mb,
+        "mem_avail_mb":  mem_avail_mb,
+        "cache_entries": snap.cache_entries,
+        "workers":       cpu_cores,
+    }))
+}
+
+/// Read system memory (MB). Prefers cgroup v2 inside containers.
+fn system_memory_mb() -> (u64, u64) {
+    // cgroup v2
+    if let Some(max_bytes) = cgroup_memory_max_bytes() {
+        let current = cgroup_memory_current_bytes().unwrap_or(0);
+        return (
+            max_bytes.saturating_sub(current) / (1024 * 1024),
+            max_bytes / (1024 * 1024),
+        );
+    }
+    // /proc/meminfo fallback
+    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        let (mut total_kb, mut avail_kb) = (0u64, 0u64);
+        for line in text.lines() {
+            if line.starts_with("MemTotal:")     { total_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
+            if line.starts_with("MemAvailable:") { avail_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
+        }
+        return (avail_kb / 1024, total_kb / 1024);
+    }
+    (0, 0)
+}
+
+/// Read the cgroup v2 hard memory limit in bytes (None = unlimited).
+fn cgroup_memory_max_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    let s = s.trim();
+    if s == "max" { return None; }
+    s.parse().ok()
+}
+
+/// Read the cgroup v2 current memory usage in bytes.
+fn cgroup_memory_current_bytes() -> Option<u64> {
+    std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .ok()?.trim().parse().ok()
+}
+
+/// Compute average CPU% for this process since it started.
+/// Reads /proc/self/stat (utime+stime) and /proc/uptime.
+fn process_cpu_percent() -> f64 {
+    let stat = match std::fs::read_to_string("/proc/self/stat") {
+        Ok(s) => s, Err(_) => return 0.0,
+    };
+    // Skip past the comm field "(name)" which may contain spaces.
+    let after_comm = match stat.find(')') {
+        Some(p) => p + 2, None => return 0.0,
+    };
+    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    let utime:     u64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let stime:     u64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let starttime: u64 = fields.get(19).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let uptime_s: f64 = std::fs::read_to_string("/proc/uptime").ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0);
+    const CLK_TCK: f64 = 100.0; // sysconf(_SC_CLK_TCK) on all supported Linux targets
+    let proc_uptime = uptime_s - (starttime as f64 / CLK_TCK);
+    if proc_uptime <= 0.0 { return 0.0; }
+    ((utime + stime) as f64 / CLK_TCK / proc_uptime * 1000.0).round() / 10.0
 }
 
 // ── GET /config ────────────────────────────────────────────────────────────
@@ -1513,6 +1606,7 @@ mod tests {
             slave_mode:     false,
             base_dir:       Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
             audit:          crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
+            xdp_active:     Arc::new(AtomicBool::new(false)),
         };
         router(state)
     }
