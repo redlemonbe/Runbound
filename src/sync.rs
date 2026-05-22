@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // src/sync.rs — slave/master synchronisation (delta journal + TOFU TLS)
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,17 +55,50 @@ pub struct SyncEvent {
     pub op:  SyncOp,
 }
 
+/// Lightweight record of a connected slave, updated on each /sync/delta call.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlaveInfo {
+    pub addr:          String,
+    pub last_seen_secs: u64,
+    pub last_seq:      u64,
+}
+
 pub struct SyncJournal {
-    events: Mutex<VecDeque<SyncEvent>>,
-    seq:    AtomicU64,
+    events:            Mutex<VecDeque<SyncEvent>>,
+    seq:               AtomicU64,
+    connected_slaves:  Mutex<HashMap<String, SlaveInfo>>,
 }
 
 impl SyncJournal {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            events: Mutex::new(VecDeque::with_capacity(JOURNAL_CAPACITY)),
-            seq:    AtomicU64::new(0),
+            events:           Mutex::new(VecDeque::with_capacity(JOURNAL_CAPACITY)),
+            seq:              AtomicU64::new(0),
+            connected_slaves: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Record or refresh a slave connection (called from /sync/state and /sync/delta).
+    pub fn record_slave(&self, addr: String, seq: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut map = self.connected_slaves.lock().expect("sync: slaves mutex poisoned");
+        map.insert(addr.clone(), SlaveInfo { addr, last_seen_secs: now, last_seq: seq });
+    }
+
+    /// Return a snapshot of recently-seen slaves (last-seen ≤ 5 min ago).
+    pub fn connected_slaves(&self) -> Vec<SlaveInfo> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let map = self.connected_slaves.lock().expect("sync: slaves mutex poisoned");
+        map.values()
+            .filter(|s| now.saturating_sub(s.last_seen_secs) < 300)
+            .cloned()
+            .collect()
     }
 
     /// Push an operation, returns the assigned sequence number.
@@ -349,14 +382,16 @@ pub async fn start_master_sync_server(
         let sync_key       = sync_key.clone();
         let cert_fp        = cert_fingerprint.clone();
 
+        let peer_str = peer.to_string();
         tokio::spawn(async move {
             let tls = match acceptor.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => { warn!(%peer, "sync TLS: {e}"); return; }
             };
             let io = TokioIo::new(tls);
+            let peer_str2 = peer_str.clone();
             let svc = service_fn(move |req| {
-                handle_sync_request(req, Arc::clone(&journal), sync_key.clone(), cert_fp.clone())
+                handle_sync_request(req, Arc::clone(&journal), sync_key.clone(), cert_fp.clone(), peer_str2.clone())
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, svc)
@@ -373,6 +408,7 @@ async fn handle_sync_request(
     journal: Arc<SyncJournal>,
     sync_key: String,
     cert_fingerprint: String,
+    peer_addr: String,
 ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
     let path  = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -399,7 +435,9 @@ async fn handle_sync_request(
 
     match path.as_str() {
         "/sync/state" => {
-            Ok(json_ok(serde_json::json!({ "seq": journal.current_seq() })))
+            let seq = journal.current_seq();
+            journal.record_slave(peer_addr, seq);
+            Ok(json_ok(serde_json::json!({ "seq": seq })))
         }
         "/sync/config" => {
             let seq       = journal.current_seq();
@@ -416,9 +454,11 @@ async fn handle_sync_request(
                 .find_map(|p| p.strip_prefix("since="))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            let seq = journal.current_seq();
+            journal.record_slave(peer_addr, seq);
             match journal.delta(since) {
                 Some(events) => Ok(json_ok(serde_json::json!({
-                    "events": events, "seq": journal.current_seq(),
+                    "events": events, "seq": seq,
                 }))),
                 None => Ok(json_resp(410, serde_json::json!({ "error": "TOO_FAR_BEHIND" }))),
             }

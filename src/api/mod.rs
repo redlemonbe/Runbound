@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 use std::net::IpAddr;
 
@@ -30,6 +30,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::dns::{BlacklistAction, ZoneAction, local::{LocalZoneSet, parse_local_data}};
+use crate::dns::server::SharedResolver;
 use crate::feeds::{self, FeedFormat, add_feed, builtin_presets, remove_feed, update_all_feeds, update_one_feed};
 use crate::logbuffer::{LogAction, LogQuery, SharedLogBuffer};
 use crate::store::{self, DnsEntry, DnsType, BlacklistEntry};
@@ -37,7 +38,7 @@ use crate::config::parser::{TlsConfig, UnboundConfig};
 use crate::stats::Stats;
 use crate::audit::{AuditEvent, AuditLogger};
 use crate::sync::{SyncJournal, SyncOp};
-use crate::upstreams::SharedUpstreams;
+use crate::upstreams::{self, SharedUpstreams};
 
 /// Max TTL for API-created DNS entries (86400 s = 24 h).
 /// Prevents TTL-based cache persistence attacks and operator mistakes.
@@ -240,8 +241,10 @@ pub struct AppState {
     pub base_dir:     Arc<PathBuf>,
     /// Immutable audit log sender. No-op when audit is disabled.
     pub audit:        AuditLogger,
-    /// Set to true by main once the XDP fast path is confirmed active.
-    pub xdp_active:   Arc<AtomicBool>,
+    /// XDP mode set by main: 0=disabled, 1=drv, 2=skb.
+    pub xdp_active:   Arc<AtomicU8>,
+    /// Shared DNS resolver — allows cache flush and upstream rebuild from API handlers.
+    pub resolver:     SharedResolver,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -454,11 +457,15 @@ async fn slave_guard_middleware(
 // ── Router ─────────────────────────────────────────────────────────────────
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // /health stays at root — used by load-balancer probes without auth.
+    let health_route = Router::new()
+        .route("/health", get(health_handler))
+        .with_state(state.clone());
+
+    let api_routes = Router::new()
         // Info
         .route("/help",              get(help_handler))
         // Operations
-        .route("/health",            get(health_handler))
         .route("/stats",             get(stats_handler))
         .route("/stats/stream",      get(stats_stream_handler))
         .route("/config",            get(config_handler))
@@ -477,13 +484,18 @@ pub fn router(state: AppState) -> Router {
         .route("/feeds/:id/update",  post(update_one_feed_handler))
         // System
         .route("/system",            get(system_handler))
+        .route("/cache/flush",       post(cache_flush_handler))
         // TLS / Protocol status
         .route("/tls",               get(tls_status_handler))
         // Monitoring
-        .route("/upstreams",         get(upstreams_handler))
+        .route("/upstreams",         get(upstreams_handler).post(add_upstream_handler))
+        .route("/upstreams/presets", get(upstream_presets_handler))
+        .route("/upstreams/:id",     delete(delete_upstream_handler))
         .route("/logs",              get(logs_handler).delete(clear_logs_handler))
         .route("/audit/tail",        get(audit_tail_handler))
         .route("/metrics",           get(metrics_handler))
+        // Sync
+        .route("/sync/slaves",       get(sync_slaves_handler))
         // Administration
         .route("/rotate-key",        post(rotate_key_handler))
         .layer(middleware::from_fn_with_state(state.clone(), slave_guard_middleware))
@@ -492,7 +504,11 @@ pub fn router(state: AppState) -> Router {
         // regardless of payload size. tower_http::RequestBodyLimitLayer drops the
         // TCP connection for very large payloads (> ~512 KB) instead of 413.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
+        .with_state(state);
+
+    Router::new()
+        .merge(health_route)
+        .nest("/api", api_routes)
 }
 
 // ── GET /help ──────────────────────────────────────────────────────────────
@@ -504,32 +520,37 @@ async fn help_handler() -> impl IntoResponse {
         "protocols": ["DNS/UDP:53","DNS/TCP:53","DoT:853","DoH:443","DoQ:853/UDP"],
         "rfcs": ["RFC1034","RFC1035","RFC2782","RFC4033","RFC4034","RFC4035","RFC6698","RFC6891","RFC7858","RFC8484","RFC9250"],
         "endpoints": [
-            {"method":"GET",    "path":"/help",             "description":"API documentation"},
-            {"method":"GET",    "path":"/health",           "description":"Liveness check"},
-            {"method":"GET",    "path":"/stats",            "description":"Query statistics snapshot"},
-            {"method":"GET",    "path":"/stats/stream",     "description":"Live stats as Server-Sent Events (1-second interval)"},
-            {"method":"GET",    "path":"/config",           "description":"Running configuration"},
-            {"method":"POST",   "path":"/reload",           "description":"Hot-reload zones and blacklist from disk"},
-            {"method":"GET",    "path":"/dns",              "description":"List all local DNS entries"},
-            {"method":"POST",   "path":"/dns",              "description":"Add a local DNS entry (A/AAAA/CNAME/TXT/MX/SRV/CAA/PTR/NAPTR/SSHFP/TLSA/NS)"},
-            {"method":"DELETE", "path":"/dns/:id",          "description":"Remove a DNS entry by UUID"},
-            {"method":"GET",    "path":"/blacklist",        "description":"List blacklist entries"},
-            {"method":"POST",   "path":"/blacklist",        "description":"Add a domain to the blacklist (refuse/nxdomain)"},
-            {"method":"DELETE", "path":"/blacklist/:id",    "description":"Remove a blacklist entry"},
-            {"method":"GET",    "path":"/feeds",            "description":"List feed subscriptions"},
-            {"method":"POST",   "path":"/feeds",            "description":"Subscribe to a remote blocklist"},
-            {"method":"DELETE", "path":"/feeds/:id",        "description":"Remove a feed subscription"},
-            {"method":"POST",   "path":"/feeds/update",     "description":"Refresh all feeds"},
-            {"method":"POST",   "path":"/feeds/:id/update", "description":"Refresh one feed"},
-            {"method":"GET",    "path":"/feeds/presets",    "description":"List pre-configured blocklists"},
-            {"method":"GET",    "path":"/system",           "description":"Host system info: version, memory, CPU cores, XDP state, workers"},
-            {"method":"GET",    "path":"/tls",              "description":"DoT/DoH/DoQ TLS status"},
-            {"method":"GET",    "path":"/upstreams",        "description":"Upstream DNS resolver health"},
-            {"method":"GET",    "path":"/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
-            {"method":"DELETE", "path":"/logs",             "description":"Clear the in-memory query log ring buffer (GDPR right-to-erasure)"},
-            {"method":"GET",    "path":"/audit/tail",       "description":"Last N audit log entries — ?n=100"},
-            {"method":"GET",    "path":"/metrics",          "description":"Prometheus/OpenMetrics exposition (text/plain; version=0.0.4)"},
-            {"method":"POST",   "path":"/rotate-key",       "description":"Atomically rotate API key — reads new key from RUNBOUND_API_KEY env var"},
+            {"method":"GET",    "path":"/health",               "description":"Liveness check (no auth required)"},
+            {"method":"GET",    "path":"/api/help",             "description":"API documentation"},
+            {"method":"GET",    "path":"/api/stats",            "description":"Query statistics snapshot"},
+            {"method":"GET",    "path":"/api/stats/stream",     "description":"Live stats as Server-Sent Events (1-second interval)"},
+            {"method":"GET",    "path":"/api/config",           "description":"Running configuration"},
+            {"method":"POST",   "path":"/api/reload",           "description":"Hot-reload zones and blacklist from disk"},
+            {"method":"GET",    "path":"/api/dns",              "description":"List all local DNS entries"},
+            {"method":"POST",   "path":"/api/dns",              "description":"Add a local DNS entry (A/AAAA/CNAME/TXT/MX/SRV/CAA/PTR/NAPTR/SSHFP/TLSA/NS)"},
+            {"method":"DELETE", "path":"/api/dns/:id",          "description":"Remove a DNS entry by UUID"},
+            {"method":"GET",    "path":"/api/blacklist",        "description":"List blacklist entries"},
+            {"method":"POST",   "path":"/api/blacklist",        "description":"Add a domain to the blacklist (refuse/nxdomain)"},
+            {"method":"DELETE", "path":"/api/blacklist/:id",    "description":"Remove a blacklist entry"},
+            {"method":"GET",    "path":"/api/feeds",            "description":"List feed subscriptions"},
+            {"method":"POST",   "path":"/api/feeds",            "description":"Subscribe to a remote blocklist"},
+            {"method":"DELETE", "path":"/api/feeds/:id",        "description":"Remove a feed subscription"},
+            {"method":"POST",   "path":"/api/feeds/update",     "description":"Refresh all feeds"},
+            {"method":"POST",   "path":"/api/feeds/:id/update", "description":"Refresh one feed"},
+            {"method":"GET",    "path":"/api/feeds/presets",    "description":"List pre-configured blocklists"},
+            {"method":"GET",    "path":"/api/system",           "description":"Host system info: version, memory, CPU cores, XDP state, workers"},
+            {"method":"GET",    "path":"/api/tls",              "description":"DoT/DoH/DoQ TLS status"},
+            {"method":"GET",    "path":"/api/upstreams",         "description":"Upstream DNS resolver health"},
+            {"method":"POST",   "path":"/api/upstreams",         "description":"Add a runtime upstream resolver"},
+            {"method":"DELETE", "path":"/api/upstreams/:id",     "description":"Remove a runtime upstream resolver"},
+            {"method":"GET",    "path":"/api/upstreams/presets", "description":"List pre-configured upstream resolvers"},
+            {"method":"POST",   "path":"/api/cache/flush",       "description":"Flush the DNS resolver cache"},
+            {"method":"GET",    "path":"/api/sync/slaves",       "description":"List connected slave nodes (master mode only)"},
+            {"method":"GET",    "path":"/api/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
+            {"method":"DELETE", "path":"/api/logs",             "description":"Clear the in-memory query log ring buffer (GDPR right-to-erasure)"},
+            {"method":"GET",    "path":"/api/audit/tail",       "description":"Last N audit log entries — ?n=100"},
+            {"method":"GET",    "path":"/api/metrics",          "description":"Prometheus/OpenMetrics exposition (text/plain; version=0.0.4)"},
+            {"method":"POST",   "path":"/api/rotate-key",       "description":"Atomically rotate API key — reads new key from RUNBOUND_API_KEY env var"},
         ]
     }))
 }
@@ -540,9 +561,8 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.stats.snapshot();
     JsonExtract(serde_json::json!({
         "status":      "ok",
+        "version":     env!("CARGO_PKG_VERSION"),
         "uptime_secs": snap.uptime_secs,
-        "queries":     snap.total,
-        "hsm":         crate::hsm::is_active(),
     }))
 }
 
@@ -600,7 +620,13 @@ async fn stats_stream_handler(
 
 async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.stats.snapshot();
-    let xdp_active = s.xdp_active.load(Ordering::Relaxed);
+    let xdp_raw = s.xdp_active.load(Ordering::Relaxed);
+    let xdp_active = xdp_raw > 0;
+    let xdp_mode = match xdp_raw {
+        1 => "drv",
+        2 => "skb",
+        _ => "disabled",
+    };
 
     // Memory: prefer cgroup v2 (container-aware) over /proc/meminfo.
     let (mem_avail_mb, mem_total_mb) = system_memory_mb();
@@ -615,6 +641,7 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         "version":       env!("CARGO_PKG_VERSION"),
         "uptime_secs":   snap.uptime_secs,
         "xdp_active":    xdp_active,
+        "xdp_mode":      xdp_mode,
         "cpu_cores":     cpu_cores,
         "cpu_percent":   cpu_percent,
         "mem_total_mb":  mem_total_mb,
@@ -1246,7 +1273,7 @@ async fn feed_presets_handler() -> impl IntoResponse {
     JsonExtract(serde_json::json!({"presets": presets, "total": presets.len()}))
 }
 
-// ── GET /upstreams ─────────────────────────────────────────────────────────
+// ── GET /api/upstreams ─────────────────────────────────────────────────────
 
 async fn upstreams_handler(State(s): State<AppState>) -> impl IntoResponse {
     let statuses = match s.upstreams.read() {
@@ -1265,6 +1292,131 @@ async fn upstreams_handler(State(s): State<AppState>) -> impl IntoResponse {
         "total":     total,
         "healthy":   healthy,
     }))).into_response()
+}
+
+// ── POST /api/upstreams ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AddUpstreamRequest {
+    addr:     String,
+    #[serde(default = "default_protocol")]
+    protocol: String,
+    name:     Option<String>,
+}
+fn default_protocol() -> String { "udp".into() }
+
+async fn add_upstream_handler(
+    State(s): State<AppState>,
+    ApiJson(req): ApiJson<AddUpstreamRequest>,
+) -> impl IntoResponse {
+    // Validate protocol
+    if req.protocol != "udp" && req.protocol != "dot" {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_PROTOCOL", "details": "protocol must be 'udp' or 'dot'"
+        }))).into_response();
+    }
+    // Validate addr is a valid IP (port optional via @ syntax)
+    let ip_part = req.addr.split('@').next().unwrap_or(&req.addr);
+    if ip_part.parse::<std::net::IpAddr>().is_err() {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_ADDR", "details": "addr must be a valid IP address (e.g. 1.1.1.1 or 1.1.1.1@853)"
+        }))).into_response();
+    }
+
+    let use_tls = req.protocol == "dot";
+    let entry = upstreams::add_upstream(&s.upstreams, req.addr, req.protocol, req.name);
+
+    // Rebuild resolver with updated upstream list
+    let addrs = upstreams::upstream_addrs(&s.upstreams);
+    if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
+        warn!(%e, "resolver rebuild after upstream add failed — upstream added but DNS unchanged");
+    }
+
+    let _ = use_tls; // already encoded in `entry.protocol`
+    info!(id = %entry.id, addr = %entry.addr, protocol = %entry.protocol, "upstream added via API");
+    (StatusCode::CREATED, JsonExtract(serde_json::json!({
+        "status": "ok", "upstream": entry
+    }))).into_response()
+}
+
+// ── DELETE /api/upstreams/:id ──────────────────────────────────────────────
+
+async fn delete_upstream_handler(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match upstreams::remove_upstream(&s.upstreams, &id) {
+        Some(removed) => {
+            let addrs = upstreams::upstream_addrs(&s.upstreams);
+            if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
+                warn!(%e, "resolver rebuild after upstream delete failed");
+            }
+            info!(id = %id, addr = %removed.addr, "upstream deleted via API");
+            (StatusCode::OK, JsonExtract(serde_json::json!({
+                "status": "ok", "deleted_id": id, "addr": removed.addr
+            }))).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
+            "error": "NOT_FOUND", "id": id
+        }))).into_response(),
+    }
+}
+
+// ── GET /api/upstreams/presets ─────────────────────────────────────────────
+
+async fn upstream_presets_handler() -> impl IntoResponse {
+    JsonExtract(serde_json::json!({ "presets": [
+        {"name":"Cloudflare",       "addr":"1.1.1.1",   "protocol":"udp","description":"Cloudflare DNS — privacy-focused, fast"},
+        {"name":"Cloudflare alt",   "addr":"1.0.0.1",   "protocol":"udp","description":"Cloudflare secondary"},
+        {"name":"Cloudflare DoT",   "addr":"1.1.1.1@853","protocol":"dot","description":"Cloudflare DNS-over-TLS"},
+        {"name":"Google",           "addr":"8.8.8.8",   "protocol":"udp","description":"Google Public DNS"},
+        {"name":"Google alt",       "addr":"8.8.4.4",   "protocol":"udp","description":"Google Public DNS secondary"},
+        {"name":"Quad9",            "addr":"9.9.9.9",   "protocol":"udp","description":"Quad9 — malware-blocking, privacy-focused"},
+        {"name":"Quad9 DoT",        "addr":"9.9.9.9@853","protocol":"dot","description":"Quad9 DNS-over-TLS"},
+        {"name":"OpenDNS",          "addr":"208.67.222.222","protocol":"udp","description":"Cisco OpenDNS"},
+        {"name":"OpenDNS alt",      "addr":"208.67.220.220","protocol":"udp","description":"Cisco OpenDNS secondary"},
+    ]}))
+}
+
+// ── POST /api/cache/flush ──────────────────────────────────────────────────
+
+async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let before = s.stats.snapshot().cache_entries;
+    let addrs  = upstreams::upstream_addrs(&s.upstreams);
+    match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
+        Ok(()) => {
+            s.stats.reset_cache();
+            info!(flushed = before, "DNS cache flushed via API");
+            s.audit.send(AuditEvent::ConfigReload); // closest existing event for an admin action
+            (StatusCode::OK, JsonExtract(serde_json::json!({
+                "status": "ok", "flushed_entries": before
+            }))).into_response()
+        }
+        Err(e) => {
+            warn!(%e, "cache flush: resolver rebuild failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+                "error": "FLUSH_FAILED", "details": sanitize_error(&e)
+            }))).into_response()
+        }
+    }
+}
+
+// ── GET /api/sync/slaves ───────────────────────────────────────────────────
+
+async fn sync_slaves_handler(State(s): State<AppState>) -> impl IntoResponse {
+    match &s.sync_journal {
+        Some(journal) => {
+            let slaves = journal.connected_slaves();
+            let total  = slaves.len();
+            (StatusCode::OK, JsonExtract(serde_json::json!({
+                "slaves": slaves, "total": total
+            }))).into_response()
+        }
+        None => (StatusCode::OK, JsonExtract(serde_json::json!({
+            "slaves": [], "total": 0,
+            "note": "this node is not configured as master (no sync-port directive)"
+        }))).into_response(),
+    }
 }
 
 // ── GET /logs ──────────────────────────────────────────────────────────────
@@ -1590,6 +1742,8 @@ mod tests {
         let cfg_arc = Arc::new(crate::config::parser::UnboundConfig::default());
         let log_buffer = crate::logbuffer::new_shared(1000, true);
         let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
+        let resolver  = crate::dns::server::create_shared_resolver(&cfg_arc)
+            .expect("test resolver");
 
         let state = AppState {
             zones:          Arc::clone(&zones),
@@ -1606,7 +1760,8 @@ mod tests {
             slave_mode:     false,
             base_dir:       Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
             audit:          crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
-            xdp_active:     Arc::new(AtomicBool::new(false)),
+            xdp_active:     Arc::new(AtomicU8::new(0)),
+            resolver,
         };
         router(state)
     }
@@ -1620,13 +1775,24 @@ mod tests {
         ("Authorization", format!("Bearer {}", TEST_KEY))
     }
 
-    // ── /stats ────────────────────────────────────────────────────────────
+    // ── /health (root, no auth) ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_no_auth_required() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/health").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── /api/stats ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn stats_requires_auth() {
         let app = make_test_app();
         let resp = app.oneshot(
-            Request::builder().uri("/stats").body(Body::empty()).unwrap()
+            Request::builder().uri("/api/stats").body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -1636,7 +1802,7 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let resp = app.oneshot(
-            Request::builder().uri("/stats").header(k, v).body(Body::empty()).unwrap()
+            Request::builder().uri("/api/stats").header(k, v).body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
@@ -1646,13 +1812,13 @@ mod tests {
         }
     }
 
-    // ── /stats/stream ─────────────────────────────────────────────────────
+    // ── /api/stats/stream ─────────────────────────────────────────────────
 
     #[tokio::test]
     async fn stats_stream_requires_auth() {
         let app = make_test_app();
         let resp = app.oneshot(
-            Request::builder().uri("/stats/stream").body(Body::empty()).unwrap()
+            Request::builder().uri("/api/stats/stream").body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -1662,20 +1828,20 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let resp = app.oneshot(
-            Request::builder().uri("/stats/stream").header(k, v).body(Body::empty()).unwrap()
+            Request::builder().uri("/api/stats/stream").header(k, v).body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
         assert!(ct.contains("text/event-stream"), "unexpected Content-Type: {ct}");
     }
 
-    // ── /upstreams ────────────────────────────────────────────────────────
+    // ── /api/upstreams ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn upstreams_requires_auth() {
         let app = make_test_app();
         let resp = app.oneshot(
-            Request::builder().uri("/upstreams").body(Body::empty()).unwrap()
+            Request::builder().uri("/api/upstreams").body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -1685,7 +1851,7 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let resp = app.oneshot(
-            Request::builder().uri("/upstreams").header(k, v).body(Body::empty()).unwrap()
+            Request::builder().uri("/api/upstreams").header(k, v).body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
@@ -1694,13 +1860,13 @@ mod tests {
         assert!(json.get("healthy").is_some());
     }
 
-    // ── /logs ─────────────────────────────────────────────────────────────
+    // ── /api/logs ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn logs_requires_auth() {
         let app = make_test_app();
         let resp = app.oneshot(
-            Request::builder().uri("/logs").body(Body::empty()).unwrap()
+            Request::builder().uri("/api/logs").body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -1710,7 +1876,7 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let resp = app.oneshot(
-            Request::builder().uri("/logs").header(k, v).body(Body::empty()).unwrap()
+            Request::builder().uri("/api/logs").header(k, v).body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
@@ -1723,7 +1889,7 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let resp = app.oneshot(
-            Request::builder().uri("/logs?limit=2000").header(k, v).body(Body::empty()).unwrap()
+            Request::builder().uri("/api/logs?limit=2000").header(k, v).body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -1733,7 +1899,7 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let resp = app.oneshot(
-            Request::builder().uri("/logs?action=invalid").header(k, v).body(Body::empty()).unwrap()
+            Request::builder().uri("/api/logs?action=invalid").header(k, v).body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
@@ -1743,7 +1909,7 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let resp = app.oneshot(
-            Request::builder().uri("/logs?client=notanip").header(k, v).body(Body::empty()).unwrap()
+            Request::builder().uri("/api/logs?client=notanip").header(k, v).body(Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
@@ -1818,7 +1984,7 @@ mod tests {
         }).to_string();
         let resp = app.oneshot(
             Request::builder()
-                .method("POST").uri("/dns")
+                .method("POST").uri("/api/dns")
                 .header(k, v)
                 .header("Content-Type", "application/json")
                 .header("Content-Length", body.len().to_string())
@@ -1843,7 +2009,7 @@ mod tests {
         }).to_string();
         let resp = app.oneshot(
             Request::builder()
-                .method("POST").uri("/dns")
+                .method("POST").uri("/api/dns")
                 .header(k, v)
                 .header("Content-Type", "application/json")
                 .header("Content-Length", body.len().to_string())
@@ -1863,7 +2029,7 @@ mod tests {
         let body = serde_json::json!({"domain": name}).to_string();
         let resp = app.oneshot(
             Request::builder()
-                .method("POST").uri("/blacklist")
+                .method("POST").uri("/api/blacklist")
                 .header(k, v)
                 .header("Content-Type", "application/json")
                 .header("Content-Length", body.len().to_string())
@@ -1883,7 +2049,7 @@ mod tests {
         let body = serde_json::json!({"name": "example.com", "type": "A", "value": "1.2.3.4"}).to_string();
         let resp = app.oneshot(
             Request::builder()
-                .method("POST").uri("/dns")
+                .method("POST").uri("/api/dns")
                 .header(k, v)
                 .header("Content-Type", "application/json")
                 // Deliberately omit Content-Length
@@ -1900,7 +2066,7 @@ mod tests {
         // Bodyless POST (/reload) has no Content-Type → must not get 411.
         let resp = app.oneshot(
             Request::builder()
-                .method("POST").uri("/reload")
+                .method("POST").uri("/api/reload")
                 .header(k, v)
                 .body(Body::empty()).unwrap()
         ).await.unwrap();
@@ -1965,7 +2131,7 @@ mod tests {
                 app.oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/reload")
+                        .uri("/api/reload")
                         .header(k, v)
                         .body(Body::empty())
                         .unwrap(),

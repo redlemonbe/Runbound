@@ -685,20 +685,32 @@ fn answer_dns(
 
 // ── Checksum helpers ──────────────────────────────────────────────────────────
 
-fn ones_complement_sum(data: &[u8]) -> u32 {
-    let mut sum: u32 = 0;
+// Process 8 bytes per loop iteration (4 sixteen-bit words) into a u64 accumulator.
+// u64 can hold up to 2^48 words without overflow — far beyond any DNS packet —
+// so we fold only once at the end rather than after every addition.
+#[inline]
+fn ones_complement_sum(data: &[u8]) -> u64 {
+    let mut acc: u64 = 0;
+    let mut chunks = data.chunks_exact(8);
+    for chunk in chunks.by_ref() {
+        acc += u16::from_be_bytes([chunk[0], chunk[1]]) as u64
+             + u16::from_be_bytes([chunk[2], chunk[3]]) as u64
+             + u16::from_be_bytes([chunk[4], chunk[5]]) as u64
+             + u16::from_be_bytes([chunk[6], chunk[7]]) as u64;
+    }
+    let rem = chunks.remainder();
     let mut i = 0;
-    while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+    while i + 1 < rem.len() {
+        acc += u16::from_be_bytes([rem[i], rem[i + 1]]) as u64;
         i += 2;
     }
-    if data.len() % 2 == 1 {
-        sum += (data[data.len() - 1] as u32) << 8;
+    if rem.len() % 2 == 1 {
+        acc += (rem[rem.len() - 1] as u64) << 8;
     }
-    sum
+    acc
 }
 
-fn fold_checksum(mut s: u32) -> u16 {
+fn fold_checksum(mut s: u64) -> u16 {
     while s >> 16 != 0 {
         s = (s & 0xFFFF) + (s >> 16);
     }
@@ -711,10 +723,10 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 }
 
 fn udp_checksum_v4(src: &[u8; 4], dst: &[u8; 4], udp: &[u8]) -> u16 {
-    let udp_len = udp.len() as u32;
+    let udp_len = udp.len() as u64;
     let s = ones_complement_sum(src)
           + ones_complement_sum(dst)
-          + PROTO_UDP as u32
+          + PROTO_UDP as u64
           + udp_len
           + ones_complement_sum(udp);
     fold_checksum(s)
@@ -727,7 +739,49 @@ fn udp_checksum_v6(src: &[u8; 16], dst: &[u8; 16], udp: &[u8]) -> u16 {
     let s = ones_complement_sum(src)
           + ones_complement_sum(dst)
           + ones_complement_sum(&udp_len_bytes)
-          + PROTO_UDP as u32
+          + PROTO_UDP as u64
           + ones_complement_sum(udp);
     fold_checksum(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verify the u64 8-byte accumulator produces the same sum as the naive
+    // 2-byte u32 reference, across different payload lengths and alignments.
+    #[test]
+    fn checksum_u64_matches_reference() {
+        fn reference_sum(data: &[u8]) -> u64 {
+            let mut s: u64 = 0;
+            let mut i = 0;
+            while i + 1 < data.len() {
+                s += u16::from_be_bytes([data[i], data[i + 1]]) as u64;
+                i += 2;
+            }
+            if data.len() % 2 == 1 {
+                s += (data[data.len() - 1] as u64) << 8;
+            }
+            s
+        }
+
+        // 64-byte payload (8 full chunks, no remainder)
+        let data64: Vec<u8> = (0u8..64).collect();
+        assert_eq!(ones_complement_sum(&data64), reference_sum(&data64), "64-byte payload");
+
+        // 65-byte payload (8 full chunks + 1 odd byte)
+        let data65: Vec<u8> = (0u8..65).collect();
+        assert_eq!(ones_complement_sum(&data65), reference_sum(&data65), "65-byte payload");
+
+        // 6-byte payload (no full 8-byte chunk, pure remainder path)
+        let data6 = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert_eq!(ones_complement_sum(&data6), reference_sum(&data6), "6-byte payload");
+
+        // 1-byte payload (odd byte only)
+        let data1 = [0x42u8];
+        assert_eq!(ones_complement_sum(&data1), reference_sum(&data1), "1-byte payload");
+
+        // Empty payload
+        assert_eq!(ones_complement_sum(&[]), reference_sum(&[]), "empty payload");
+    }
 }
