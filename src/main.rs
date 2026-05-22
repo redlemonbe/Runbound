@@ -496,6 +496,9 @@ async fn build_and_launch(
         xdp_active:       Arc::clone(&xdp_mode),
         resolver:         Arc::clone(&resolver),
         last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
+        cache_hits:       Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        cache_misses:     Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        cache_evictions:  Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
