@@ -45,6 +45,7 @@
   <button class="py-3 hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
   <button class="py-3 hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
   <button class="py-3 hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
+  <button class="py-3 hover:text-gray-300" onclick="showTab('system',this)">System</button>
   <button class="py-3 hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
 </div>
 
@@ -225,7 +226,6 @@
       <input id="feed-url"  type="text" placeholder="URL (hosts or domains format)" class="input flex-1 min-w-64" />
       <select id="feed-format" class="input w-28">
         <option value="hosts">hosts</option>
-        <option value="domains">domains</option>
         <option value="adblock">adblock</option>
       </select>
       <select id="feed-action" class="input w-32">
@@ -246,12 +246,48 @@
     <div id="feed-list" class="space-y-2"></div>
   </div>
 
+  <!-- System -->
+  <div id="tab-system" class="hidden fade">
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 max-w-2xl">
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Runtime</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Version</span><span id="sys-version" class="text-cyan-300">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Uptime</span><span id="sys-uptime" class="text-white">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Workers</span><span id="sys-workers" class="text-white">—</span></div>
+        </div>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">XDP</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Active</span><span id="sys-xdp-active" class="text-white">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Mode</span><span id="sys-xdp-mode" class="text-white">—</span></div>
+        </div>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">CPU</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Cores</span><span id="sys-cpu-cores" class="text-white">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Usage</span><span id="sys-cpu-pct" class="text-yellow-400">—</span></div>
+        </div>
+      </div>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-3">Memory</div>
+        <div class="space-y-2 text-sm">
+          <div class="flex justify-between"><span class="text-gray-500">Total</span><span id="sys-mem-total" class="text-white">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Available</span><span id="sys-mem-avail" class="text-green-400">—</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="text-right text-xs text-gray-700 mt-3 max-w-2xl" id="sys-refreshed">—</div>
+  </div>
+
   <!-- About -->
   <div id="tab-about" class="hidden fade">
     <div class="max-w-2xl">
       <div class="flex items-center gap-4 mb-6">
         <span class="text-cyan-400 font-bold text-3xl tracking-tight">RUNBOUND</span>
-        <span class="bg-gray-800 border border-gray-700 text-cyan-300 text-xs px-2 py-0.5 rounded">v0.5.7</span>
+        <span id="about-version" class="bg-gray-800 border border-gray-700 text-cyan-300 text-xs px-2 py-0.5 rounded">v0.6.0</span>
         <span class="bg-gray-800 border border-gray-700 text-gray-400 text-xs px-2 py-0.5 rounded">AGPL-3.0</span>
       </div>
       <p class="text-gray-400 text-sm mb-6">
@@ -562,10 +598,13 @@ async function feedAddPreset(i) {
   const p = presetsCache[i];
   if (!p) return;
   try {
-    await api('POST', '/feeds', { name: p.name, url: p.url, format: p.format ?? 'hosts', action: p.action ?? 'nxdomain', enabled: true });
-    toast(`"${p.name}" added`);
-    loadPresets();
-    loadFeeds();
+    const r = await api('POST', '/feeds', { name: p.name, url: p.url, format: p.format ?? 'hosts', action: p.action ?? 'nxdomain', enabled: true });
+    toast(`"${p.name}" added — fetching domains…`);
+    // Auto-trigger update so the feed is populated immediately
+    if (r.feed?.id) {
+      try { await api('POST', '/feeds/' + r.feed.id + '/update'); } catch(_) {}
+    }
+    setTimeout(() => { loadPresets(); loadFeeds(); }, 1500);
   } catch(e) { toast('Add failed: '+e.message, true); }
 }
 
@@ -650,6 +689,31 @@ function toggleAutoLogs(el) {
   if (el.checked) { loadLogs(); logsTimer = setInterval(loadLogs, 3000); }
 }
 
+// ── System ───────────────────────────────────────────────────────────
+async function loadSystem() {
+  try {
+    const s = await api('GET', '/system');
+    const sec = n => {
+      if (n == null) return '—';
+      const d = Math.floor(n/86400), h = Math.floor((n%86400)/3600), m = Math.floor((n%3600)/60);
+      return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+    };
+    set('sys-version',   s.version ?? '—');
+    set('sys-uptime',    sec(s.uptime_secs));
+    set('sys-workers',   s.workers ?? '—');
+    set('sys-xdp-active', s.xdp_active ? 'yes' : 'no');
+    set('sys-xdp-mode',  s.xdp_mode ?? (s.xdp_active ? 'active' : 'disabled'));
+    set('sys-cpu-cores', s.cpu_cores ?? '—');
+    set('sys-cpu-pct',   s.cpu_percent != null ? s.cpu_percent.toFixed(1) + ' %' : '—');
+    set('sys-mem-total', s.mem_total_mb != null ? s.mem_total_mb.toLocaleString() + ' MB' : '—');
+    set('sys-mem-avail', s.mem_avail_mb != null ? s.mem_avail_mb.toLocaleString() + ' MB' : '—');
+    set('about-version', s.version ?? '—');
+    const badge = document.getElementById('about-version');
+    if (badge) badge.textContent = s.version ? 'v' + s.version : 'v0.6.0';
+    set('sys-refreshed', 'updated ' + new Date().toLocaleTimeString());
+  } catch(e) { toast('System load failed: '+e.message, true); }
+}
+
 // ── Reload ───────────────────────────────────────────────────────────
 async function doReload() {
   try {
@@ -660,7 +724,7 @@ async function doReload() {
 
 // ── Tabs ─────────────────────────────────────────────────────────────
 function showTab(name, btn) {
-  ['overview','dns','blacklist','feeds','logs','about'].forEach(t => {
+  ['overview','dns','blacklist','feeds','logs','system','about'].forEach(t => {
     document.getElementById('tab-'+t).classList.add('hidden');
   });
   document.querySelectorAll('.tab-active').forEach(b => {
@@ -676,6 +740,7 @@ function showTab(name, btn) {
   if (name === 'blacklist') loadBlacklist();
   if (name === 'feeds')     { loadPresets(); loadFeeds(); }
   if (name === 'logs')      loadLogs();
+  if (name === 'system')    loadSystem();
 }
 
 // ── Utils ─────────────────────────────────────────────────────────────
