@@ -9,7 +9,88 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [0.6.5] — 2026-05-22
+## [0.6.5] — 2026-05-22 (rev2 — security + performance hardening)
+
+### Security
+
+- **SEC H1 — Malformed `Content-Length` rejected** (`src/api/mod.rs`)  
+  Non-parseable `Content-Length` headers now return `400 BAD_REQUEST` instead of
+  silently defaulting to 0, which previously allowed the size-limit check to be
+  bypassed entirely.
+
+- **SEC H2 — Feed download: streaming with per-chunk size check** (`src/feeds/mod.rs`)  
+  Feed HTTP responses are now consumed chunk-by-chunk. Both the `Content-Length`
+  pre-check and an accumulated-bytes counter enforce the `MAX_FEED_BYTES` limit,
+  preventing an OOM if a server sends a large body without a declared length.
+
+- **SEC H3 — `TcpConnTracker` entry cleanup on release** (`src/dns/server.rs`)  
+  DashMap entries are removed when the per-IP connection count reaches 0, capping
+  unbounded memory growth under high-churn connection patterns.
+
+- **SEC H4 — ACME credentials zeroed from memory on drop** (`src/acme.rs`)  
+  The JSON string containing the ACME account private key is now wrapped in
+  `zeroize::Zeroizing<String>`; the allocator buffer is overwritten with zeros
+  as soon as the variable goes out of scope.
+
+- **SEC M1 — Rate-limit on `POST /sync/cert`** (`src/sync.rs`)  
+  Per-IP sliding window: 10 requests per 60 s. Excess requests receive `429 RATE_LIMITED`.
+  Uses a lock-free `DashMap<String, (u32, Instant)>`.
+
+- **SEC M2 — Minimum valid DNS response raised to 12 bytes** (`src/upstreams.rs`)  
+  UDP and DoT health probes previously accepted 4-byte responses (header only).
+  The threshold is now 12 bytes (full DNS header), matching RFC 1035 §4.1.
+
+- **SEC M3 — Feed URL query string redacted from logs** (`src/feeds/mod.rs`)  
+  Everything from `?` onward is stripped before writing the URL to the tracing
+  log, preventing API keys or tokens embedded in feed URLs from leaking into logs.
+
+- **SEC C1 — TOCTOU eliminated in upstream health loop** (`src/upstreams.rs`)  
+  The health loop previously captured Vec indices; a concurrent add/remove could
+  shift entries before the write-back. Probes now capture UUID strings and the
+  write-back finds entries by UUID, making it race-free.
+
+### Performance
+
+- **PERF P1 — Lazy `SanitizedDnsName` Display wrapper** (`src/dns/server.rs`)  
+  `sanitize_dns_name` now returns a zero-cost `SanitizedDnsName<'_>` struct
+  implementing `Display`. The sanitized string is only allocated when the log
+  level is enabled, eliminating a per-query heap allocation at `verbosity: 0/1`.
+
+- **PERF P3 — Parallel upstream health probes** (`src/upstreams.rs`)  
+  All upstreams due for a probe are dispatched in parallel via
+  `tokio::task::spawn_blocking` + `futures_util::future::join_all`, replacing
+  sequential probing. Latency impact on the DNS path during health checks is
+  eliminated.
+
+- **PERF P4 — Lock-free `PrefetchTracker`** (`src/dns/prefetch.rs`)  
+  `Mutex<HashMap<String, u32>>` replaced with `DashMap<String, AtomicU32,
+  ahash::RandomState>`. Increment operations on existing entries are now fully
+  lock-free (atomic CAS only); the mutex is only taken on first insertion of a
+  new domain.
+
+- **PERF P5 — `/proc/meminfo` read moved to `spawn_blocking`** (`src/dns/server.rs`)  
+  Reading `/proc/meminfo` is a blocking syscall; it previously ran on the tokio
+  async thread pool. Moved to `spawn_blocking` to avoid stalling async tasks.
+
+- **PERF P6 — Pre-computed `ArcSwap<StatsSnapshot>` for API handlers** (`src/stats.rs`, `src/api/mod.rs`, `src/main.rs`)  
+  The `qps_update_loop` (already ticking every second) now also publishes a fresh
+  `StatsSnapshot` into an `ArcSwap`. All API handlers (`/stats`, `/health`,
+  `/system`, `/stats/stream`) load the pre-computed snapshot with a single atomic
+  pointer load instead of calling `stats.snapshot()` which performed ~360 atomic
+  loads per request.
+
+- **PERF P7 — Client IP filter pre-formatted once in `LogBuffer::query`** (`src/logbuffer.rs`)  
+  The `IpAddr → String` conversion for the client-IP filter is now done once
+  before the loop instead of inside, removing N redundant allocations per query.
+
+### Fixed
+
+- **FIX — `GET /api/cache/stats` always returned 0 for hits/misses** (`src/api/mod.rs`)  
+  The handler was reading from dead `AppState.cache_hits/misses` fields (never
+  incremented). Now reads directly from `s.stats.cache_hits/misses`. The dead
+  fields have been removed from `AppState`.
+
+---
 
 ### Added
 
