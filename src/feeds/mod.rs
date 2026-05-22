@@ -568,8 +568,15 @@ pub fn parse_feed_content(content: &str, format: &FeedFormat) -> Vec<String> {
 // Feed update (HTTP fetch + parse + cache)
 // ============================================================
 
+/// Strip query-string and fragment from a URL for safe log output.
+/// Prevents API keys or tokens embedded in query params from appearing in logs.
+fn redact_url(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+        .split('#').next().unwrap_or(url)
+}
+
 pub async fn update_feed(feed: &mut Feed, client: &reqwest::Client) -> Result<usize, AppError> {
-    info!("Updating feed '{}' from {}", feed.name, feed.url);
+    info!("Updating feed '{}' from {}", feed.name, redact_url(&feed.url));
 
     // VUL-FIX (TOCTOU): re-validate the URL before every fetch, not just at
     // subscription time.  An attacker who controls the feed's DNS can change
@@ -580,7 +587,7 @@ pub async fn update_feed(feed: &mut Feed, client: &reqwest::Client) -> Result<us
         AppError::Internal(format!("Feed '{}' URL re-validation failed: {}", feed.name, e))
     })?;
 
-    let response = client
+    let mut response = client
         .get(&feed.url)
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -593,16 +600,26 @@ pub async fn update_feed(feed: &mut Feed, client: &reqwest::Client) -> Result<us
         )));
     }
 
-    // VUL-03: Enforce 100 MiB cap — stream into bytes first so we can check
-    // the size before decoding, preventing OOM via an oversized response body.
-    let bytes = response.bytes().await.map_err(|e| {
-        AppError::Internal(format!("Failed to read feed '{}' body: {}", feed.name, e))
-    })?;
-    if bytes.len() > MAX_FEED_BYTES {
+    // VUL-03: Enforce 100 MiB cap — stream chunk-by-chunk so the check fires
+    // before the full body is buffered, preventing OOM via an oversized response.
+    // Pre-flight: reject early if Content-Length already exceeds the limit.
+    if response.content_length().map(|n| n as usize > MAX_FEED_BYTES).unwrap_or(false) {
         return Err(AppError::Internal(format!(
-            "Feed '{}' response too large ({} bytes, max {} MiB)",
-            feed.name, bytes.len(), MAX_FEED_BYTES / 1_048_576
+            "Feed '{}' Content-Length exceeds {} MiB limit",
+            feed.name, MAX_FEED_BYTES / 1_048_576
         )));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e|
+        AppError::Internal(format!("Failed to read feed '{}' body: {}", feed.name, e))
+    )? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_FEED_BYTES {
+            return Err(AppError::Internal(format!(
+                "Feed '{}' response too large (max {} MiB)",
+                feed.name, MAX_FEED_BYTES / 1_048_576
+            )));
+        }
     }
     let content = String::from_utf8_lossy(&bytes).into_owned();
 

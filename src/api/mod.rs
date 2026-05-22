@@ -228,6 +228,10 @@ pub struct AppState {
     pub rate_limiter:   ApiRateLimiter,
     pub reload_limiter: Arc<ReloadLimiter>,
     pub stats:          Arc<Stats>,
+    /// Pre-computed snapshot refreshed every second by `qps_update_loop`.
+    /// API handlers load this instead of calling `stats.snapshot()` on every
+    /// request, avoiding ~360 atomic loads per call under monitoring load.
+    pub stats_cache:    crate::stats::SharedSnapshot,
     pub cfg:          Arc<UnboundConfig>,
     pub cfg_path:     String,
     pub log_buffer:   SharedLogBuffer,
@@ -248,9 +252,8 @@ pub struct AppState {
     /// FEAT #46: tracks when the last successful cache flush was requested.
     /// Guarded by a Mutex so the read-check-write is atomic without await.
     pub last_flush_at: Arc<std::sync::Mutex<Option<Instant>>>,
-    /// #51: DNS cache counters — reset on flush, incremented on cache hit/miss.
-    pub cache_hits:      Arc<AtomicU64>,
-    pub cache_misses:    Arc<AtomicU64>,
+    /// #51: Cache eviction counter — reset on flush. Hits/misses are read
+    /// directly from `stats.cache_hits/misses` (they are incremented there).
     pub cache_evictions: Arc<AtomicU64>,
 }
 
@@ -341,7 +344,13 @@ async fn security_middleware(
         .unwrap_or(false);
 
     if let Some(cl) = req.headers().get(axum::http::header::CONTENT_LENGTH) {
-        let len: usize = cl.to_str().unwrap_or("0").parse().unwrap_or(0);
+        let len: usize = match cl.to_str().ok().and_then(|s| s.parse().ok()) {
+            Some(n) => n,
+            None => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+                "error": "BAD_REQUEST",
+                "details": "Malformed Content-Length header"
+            }))).into_response(),
+        };
         if len > MAX_BODY_BYTES {
             return (StatusCode::PAYLOAD_TOO_LARGE, axum::Json(serde_json::json!({
                 "error": "REQUEST_TOO_LARGE",
@@ -568,7 +577,7 @@ async fn help_handler() -> impl IntoResponse {
 // ── GET /health ────────────────────────────────────────────────────────────
 
 async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let snap = s.stats.snapshot();
+    let snap = s.stats_cache.load();
     JsonExtract(serde_json::json!({
         "status":      "ok",
         "version":     env!("CARGO_PKG_VERSION"),
@@ -579,7 +588,7 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
 // ── GET /stats ─────────────────────────────────────────────────────────────
 
 async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
-    JsonExtract(stats_json(&s.stats.snapshot()))
+    JsonExtract(stats_json(&s.stats_cache.load()))
 }
 
 fn stats_json(snap: &crate::stats::StatsSnapshot) -> serde_json::Value {
@@ -617,11 +626,11 @@ fn stats_json(snap: &crate::stats::StatsSnapshot) -> serde_json::Value {
 async fn stats_stream_handler(
     State(s): State<AppState>,
 ) -> Sse<impl stream::Stream<Item = Result<Event, Infallible>>> {
-    let sse_stream = stream::unfold(s.stats, |stats| async move {
+    let sse_stream = stream::unfold(s.stats_cache, |cache| async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let data = stats_json(&stats.snapshot()).to_string();
+        let data = stats_json(&cache.load()).to_string();
         let event = Event::default().data(data);
-        Some((Ok::<Event, Infallible>(event), stats))
+        Some((Ok::<Event, Infallible>(event), cache))
     });
     Sse::new(sse_stream).keep_alive(KeepAlive::default())
 }
@@ -629,7 +638,7 @@ async fn stats_stream_handler(
 // ── GET /system ────────────────────────────────────────────────────────────
 
 async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let snap = s.stats.snapshot();
+    let snap = s.stats_cache.load();
     let xdp_raw = s.xdp_active.load(Ordering::Relaxed);
     let xdp_active = xdp_raw > 0;
     let xdp_mode = match xdp_raw {
@@ -1475,9 +1484,6 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
     match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
         Ok(()) => {
             s.stats.reset_cache();
-            // #51: reset cache counters on flush
-            s.cache_hits.store(0, Ordering::Relaxed);
-            s.cache_misses.store(0, Ordering::Relaxed);
             s.cache_evictions.store(0, Ordering::Relaxed);
             info!(flushed = before, "DNS cache flushed via API");
             s.audit.send(AuditEvent::ConfigReload);
@@ -1555,10 +1561,10 @@ async fn patch_upstream_handler(
 // ── GET /api/cache/stats ───────────────────────────────────────────────────
 
 async fn cache_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let hits      = s.cache_hits.load(Ordering::Relaxed);
-    let misses    = s.cache_misses.load(Ordering::Relaxed);
+    let hits      = s.stats.cache_hits.load(Ordering::Relaxed);
+    let misses    = s.stats.cache_misses.load(Ordering::Relaxed);
     let evictions = s.cache_evictions.load(Ordering::Relaxed);
-    let entries   = s.stats.snapshot().cache_entries;
+    let entries   = s.stats.cache_entries.load(Ordering::Relaxed);
     let total     = hits + misses;
     let hit_rate_pct = if total == 0 {
         serde_json::Value::Null
@@ -1923,13 +1929,16 @@ mod tests {
         let resolver  = crate::dns::server::create_shared_resolver(&cfg_arc)
             .expect("test resolver");
 
+        let stats = crate::stats::Stats::new();
+        let stats_cache = crate::stats::new_snapshot_cache(&stats);
         let state = AppState {
             zones:            Arc::clone(&zones),
             zones_mutex:      Arc::new(tokio::sync::Mutex::new(())),
             tls_cfg:          Arc::new(crate::config::parser::TlsConfig::default()),
             rate_limiter:     ApiRateLimiter::new_public(),
             reload_limiter:   Arc::new(ReloadLimiter::new()),
-            stats:            crate::stats::Stats::new(),
+            stats,
+            stats_cache,
             cfg:              Arc::clone(&cfg_arc),
             cfg_path:         "/dev/null".to_string(),
             log_buffer,
@@ -1941,8 +1950,6 @@ mod tests {
             xdp_active:       Arc::new(AtomicU8::new(0)),
             resolver,
             last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
-            cache_hits:       Arc::new(AtomicU64::new(0)),
-            cache_misses:     Arc::new(AtomicU64::new(0)),
             cache_evictions:  Arc::new(AtomicU64::new(0)),
         };
         router(state)

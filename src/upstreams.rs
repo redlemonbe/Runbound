@@ -335,29 +335,39 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
 
         let now = Instant::now();
 
-        // Collect (index, addr, port, protocol) for upstreams that are due for a probe.
-        let to_probe: Vec<(usize, String, u16, String)> = {
+        // Collect (id, addr, port, protocol) for upstreams that are due for a probe.
+        // Use UUID (not index) to avoid TOCTOU: the Vec may be reordered between
+        // the snapshot and the write-back if an upstream is added/removed via API.
+        let to_probe: Vec<(String, String, u16, String)> = {
             upstreams
                 .read()
                 .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health task: {e}"))
                 .iter()
-                .enumerate()
-                .filter(|(_, s)| now >= s.next_check_at)
-                .map(|(i, s)| (i, s.addr.clone(), s.port, s.protocol.clone()))
+                .filter(|s| now >= s.next_check_at)
+                .map(|s| (s.id.clone(), s.addr.clone(), s.port, s.protocol.clone()))
                 .collect()
         };
 
-        // Probe each due upstream (blocking I/O — UDP for plain, TCP+TLS for DoT).
-        // Returns (index, healthy, latency_ms, dnssec_supported).
-        let results: Vec<(usize, bool, Option<u64>, Option<bool>)> = to_probe
-            .iter()
-            .map(|(i, addr, port, protocol)| {
-                let (healthy, latency, dnssec) = probe_upstream(addr, *port, protocol);
-                (*i, healthy, latency, dnssec)
+        // Probe each due upstream in parallel using spawn_blocking (blocking I/O).
+        // join_all runs all probes concurrently instead of serially, so N × timeout
+        // does not stall the runtime on unhealthy upstreams.
+        let handles: Vec<_> = to_probe
+            .into_iter()
+            .map(|(id, addr, port, protocol)| {
+                tokio::task::spawn_blocking(move || {
+                    let (healthy, latency, dnssec) = probe_upstream(&addr, port, &protocol);
+                    (id, healthy, latency, dnssec)
+                })
             })
             .collect();
+        let results: Vec<(String, bool, Option<u64>, Option<bool>)> =
+            futures_util::future::join_all(handles)
+                .await
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .collect();
 
-        // Write results back, updating backoff state.
+        // Write results back, matching by UUID to avoid index aliasing.
         let mut statuses = upstreams.write()
             .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health task: {e}"));
         let now_str = crate::logbuffer::format_ts(
@@ -366,8 +376,8 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 .unwrap_or_default()
                 .as_secs(),
         );
-        for (idx, healthy, latency_ms, dnssec_supported) in results {
-            let Some(s) = statuses.get_mut(idx) else { continue };
+        for (id, healthy, latency_ms, dnssec_supported) in results {
+            let Some(s) = statuses.iter_mut().find(|u| u.id == id) else { continue };
             if healthy {
                 if s.consecutive_failures > 0 {
                     info!(
@@ -441,7 +451,7 @@ fn probe_udp(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
 
     let mut buf = [0u8; 512];
     match sock.recv_from(&mut buf) {
-        Ok((n, _)) if n >= 4 => {
+        Ok((n, _)) if n >= 12 => {
             if buf[0] == DNS_PROBE_PACKET[0] && buf[1] == DNS_PROBE_PACKET[1] {
                 let latency = Some(t0.elapsed().as_millis() as u64);
                 // #48: AD bit = bit 5 of flags byte 3
@@ -510,7 +520,7 @@ fn probe_dot(addr: &str, port: u16) -> (bool, Option<u64>, Option<bool>) {
         return (false, None, None);
     }
     let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
-    if resp_len < 4 {
+    if resp_len < 12 {
         return (false, None, None);
     }
 

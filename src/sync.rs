@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -63,10 +64,16 @@ pub struct SlaveInfo {
     pub last_seq:      u64,
 }
 
+// Max calls to /sync/cert per peer IP per 60-second window (TOFU bootstrap guard).
+const CERT_RL_MAX: u32 = 10;
+
 pub struct SyncJournal {
     events:            Mutex<VecDeque<SyncEvent>>,
     seq:               AtomicU64,
     connected_slaves:  Mutex<HashMap<String, SlaveInfo>>,
+    /// Per-peer rate-limit for the public /sync/cert endpoint:
+    /// maps peer-addr → (request_count_in_window, window_start).
+    cert_rl:           dashmap::DashMap<String, (u32, Instant), ahash::RandomState>,
 }
 
 impl SyncJournal {
@@ -75,6 +82,7 @@ impl SyncJournal {
             events:           Mutex::new(VecDeque::with_capacity(JOURNAL_CAPACITY)),
             seq:              AtomicU64::new(0),
             connected_slaves: Mutex::new(HashMap::new()),
+            cert_rl:          dashmap::DashMap::with_hasher(ahash::RandomState::default()),
         })
     }
 
@@ -413,8 +421,26 @@ async fn handle_sync_request(
     let path  = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
-    // /sync/cert — returns fingerprint, no auth (TOFU bootstrap)
+    // /sync/cert — returns fingerprint, no auth (TOFU bootstrap).
+    // Rate-limited per peer IP: max 10 requests per 60-second window to prevent
+    // enumeration of certificate rotations by unauthenticated callers.
     if path == "/sync/cert" {
+        let now = Instant::now();
+        let allowed = {
+            let mut entry = journal.cert_rl
+                .entry(peer_addr.clone())
+                .or_insert((0u32, now));
+            if entry.1.elapsed().as_secs() >= 60 {
+                *entry = (1, now);
+                true
+            } else {
+                entry.0 += 1;
+                entry.0 <= CERT_RL_MAX
+            }
+        };
+        if !allowed {
+            return Ok(json_resp(429, serde_json::json!({ "error": "RATE_LIMITED" })));
+        }
         return Ok(json_ok(serde_json::json!({ "fingerprint": cert_fingerprint })));
     }
 
