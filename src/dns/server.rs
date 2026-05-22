@@ -63,10 +63,10 @@ static IDENTITY_PROBE_NAMES: OnceLock<[LowerName; 4]> = OnceLock::new();
 
 fn identity_probe_names() -> &'static [LowerName; 4] {
     IDENTITY_PROBE_NAMES.get_or_init(|| [
-        LowerName::from(Name::from_str("version.bind.").expect("static DNS name")),
-        LowerName::from(Name::from_str("hostname.bind.").expect("static DNS name")),
-        LowerName::from(Name::from_str("id.server.").expect("static DNS name")),
-        LowerName::from(Name::from_str("version.server.").expect("static DNS name")),
+        LowerName::from(Name::from_str("version.bind.").unwrap_or_else(|e| panic!("bad static DNS name: {e}"))),
+        LowerName::from(Name::from_str("hostname.bind.").unwrap_or_else(|e| panic!("bad static DNS name: {e}"))),
+        LowerName::from(Name::from_str("id.server.").unwrap_or_else(|e| panic!("bad static DNS name: {e}"))),
+        LowerName::from(Name::from_str("version.server.").unwrap_or_else(|e| panic!("bad static DNS name: {e}"))),
     ])
 }
 
@@ -612,7 +612,7 @@ pub fn build_resolver_from_addrs(
 
     if resolver_cfg.name_servers().is_empty() {
         for ip_str in ["1.1.1.1", "1.0.0.1"] {
-            let ip: IpAddr = ip_str.parse().expect("valid Cloudflare IP");
+            let ip: IpAddr = ip_str.parse().unwrap_or_else(|_| unreachable!("hardcoded Cloudflare IP is valid"));
             resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![
                 ConnectionConfig::udp(), ConnectionConfig::tcp(),
             ]));
@@ -680,7 +680,7 @@ fn build_resolver(cfg: &UnboundConfig, cache_size: usize) -> anyhow::Result<Toki
              Add forward-zone blocks to runbound.conf to suppress this warning."
         );
         for ip_str in ["1.1.1.1", "1.0.0.1"] {
-            let ip: IpAddr = ip_str.parse().expect("valid Cloudflare IP");
+            let ip: IpAddr = ip_str.parse().unwrap_or_else(|_| unreachable!("hardcoded Cloudflare IP is valid"));
             resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![
                 ConnectionConfig::udp(),
                 ConnectionConfig::tcp(),

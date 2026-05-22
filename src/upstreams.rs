@@ -117,7 +117,7 @@ pub fn add_upstream(
         next_check_at:       Instant::now(),
     };
     upstreams.write()
-        .expect("upstreams: RwLock poisoned in add_upstream")
+        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in add_upstream: {e}"))
         .push(entry.clone());
     entry
 }
@@ -125,18 +125,15 @@ pub fn add_upstream(
 /// Remove a runtime upstream by id (DELETE /api/upstreams/:id).
 /// Returns the removed entry if found.
 pub fn remove_upstream(upstreams: &SharedUpstreams, id: &str) -> Option<UpstreamStatus> {
-    let mut list = upstreams.write().expect("upstreams: RwLock poisoned in remove_upstream");
-    if let Some(pos) = list.iter().position(|u| u.id == id) {
-        Some(list.remove(pos))
-    } else {
-        None
-    }
+    let mut list = upstreams.write()
+        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in remove_upstream: {e}"));
+    list.iter().position(|u| u.id == id).map(|pos| list.remove(pos))
 }
 
 /// Snapshot of (addr, use_tls) for resolver rebuilds.
 pub fn upstream_addrs(upstreams: &SharedUpstreams) -> Vec<(String, bool)> {
     upstreams.read()
-        .expect("upstreams: RwLock poisoned in upstream_addrs")
+        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in upstream_addrs: {e}"))
         .iter()
         .map(|u| (u.addr.clone(), u.protocol == "dot"))
         .collect()
@@ -156,7 +153,7 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
         let to_probe: Vec<(usize, String)> = {
             upstreams
                 .read()
-                .expect("upstreams: RwLock poisoned in health task")
+                .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health task: {e}"))
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| now >= s.next_check_at)
@@ -174,7 +171,8 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
             .collect();
 
         // Write results back, updating backoff state.
-        let mut statuses = upstreams.write().expect("upstreams: RwLock poisoned in health task");
+        let mut statuses = upstreams.write()
+            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health task: {e}"));
         let now_str = crate::logbuffer::format_ts(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

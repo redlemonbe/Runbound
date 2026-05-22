@@ -15,8 +15,10 @@ fn main() {
 fn compile_ebpf() {
     use std::{env, path::PathBuf, process::Command};
 
-    let out_dir      = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir      = PathBuf::from(env::var("OUT_DIR")
+        .unwrap_or_else(|_| panic!("OUT_DIR not set by cargo")));
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")
+        .unwrap_or_else(|_| panic!("CARGO_MANIFEST_DIR not set by cargo")));
 
     // Target architecture → BPF define expected by kernel headers
     let bpf_arch_flag = match env::var("CARGO_CFG_TARGET_ARCH")
@@ -60,8 +62,8 @@ fn compile_ebpf() {
         bpf_arch_flag.into(),
         "-Wall".into(),
         "-Wno-missing-prototypes".into(),
-        "-c".into(), src.to_str().unwrap().into(),
-        "-o".into(), dst.to_str().unwrap().into(),
+        "-c".into(), src.to_str().unwrap_or_else(|| panic!("src path not UTF-8")).into(),
+        "-o".into(), dst.to_str().unwrap_or_else(|| panic!("dst path not UTF-8")).into(),
     ];
     if let Some(inc) = multiarch_inc {
         clang_args.push(format!("-I{inc}"));

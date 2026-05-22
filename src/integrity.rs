@@ -39,7 +39,8 @@ pub fn store_key() -> Option<Vec<u8>> {
 
 /// HMAC-SHA256(content, key) → lowercase hex (64 chars).
 pub fn compute_mac(content: &[u8], key: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC accepts any non-empty key"));
     mac.update(content);
     hex::encode(mac.finalize().into_bytes())
 }
