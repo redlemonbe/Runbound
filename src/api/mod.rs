@@ -245,6 +245,9 @@ pub struct AppState {
     pub xdp_active:   Arc<AtomicU8>,
     /// Shared DNS resolver — allows cache flush and upstream rebuild from API handlers.
     pub resolver:     SharedResolver,
+    /// FEAT #46: tracks when the last successful cache flush was requested.
+    /// Guarded by a Mutex so the read-check-write is atomic without await.
+    pub last_flush_at: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -637,17 +640,30 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
     // Worker count: one XDP worker per NIC queue + tokio thread pool.
     let cpu_cores = crate::cpu::physical_cores().len().max(1);
 
+    // FEAT #47: upstream health counts
+    let (upstreams_healthy, upstreams_total) = {
+        let list = s.upstreams.read()
+            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in system handler: {e}"));
+        (
+            list.iter().filter(|u| u.healthy).count() as u32,
+            list.len() as u32,
+        )
+    };
+
     JsonExtract(serde_json::json!({
-        "version":       env!("CARGO_PKG_VERSION"),
-        "uptime_secs":   snap.uptime_secs,
-        "xdp_active":    xdp_active,
-        "xdp_mode":      xdp_mode,
-        "cpu_cores":     cpu_cores,
-        "cpu_percent":   cpu_percent,
-        "mem_total_mb":  mem_total_mb,
-        "mem_avail_mb":  mem_avail_mb,
-        "cache_entries": snap.cache_entries,
-        "workers":       cpu_cores,
+        "version":           env!("CARGO_PKG_VERSION"),
+        "uptime_secs":       snap.uptime_secs,
+        "xdp_active":        xdp_active,
+        "xdp_mode":          xdp_mode,
+        "cpu_cores":         cpu_cores,
+        "cpu_percent":       cpu_percent,
+        "mem_total_mb":      mem_total_mb,
+        "mem_avail_mb":      mem_avail_mb,
+        "cache_entries":     snap.cache_entries,
+        "workers":           cpu_cores,
+        "prefetch_enabled":  s.cfg.prefetch,
+        "upstreams_healthy": upstreams_healthy,
+        "upstreams_total":   upstreams_total,
     }))
 }
 
@@ -1422,13 +1438,38 @@ async fn upstream_presets_handler() -> impl IntoResponse {
 // ── POST /api/cache/flush ──────────────────────────────────────────────────
 
 async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
+    // FEAT #46: cooldown guard — reject if called too soon after the last flush.
+    let cooldown = s.cfg.cache_flush_cooldown;
+    if cooldown > 0 {
+        let mut last = s.last_flush_at.lock()
+            .unwrap_or_else(|e| panic!("last_flush_at poisoned: {e}"));
+        if let Some(t) = *last {
+            let elapsed = t.elapsed().as_secs();
+            if elapsed < cooldown {
+                let retry_after = cooldown - elapsed;
+                let mut resp = (StatusCode::TOO_MANY_REQUESTS, JsonExtract(serde_json::json!({
+                    "error": "FLUSH_COOLDOWN",
+                    "retry_after_secs": retry_after
+                }))).into_response();
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_str(&retry_after.to_string())
+                        .unwrap_or_else(|e| panic!("Retry-After header value: {e}")),
+                );
+                return resp;
+            }
+        }
+        *last = Some(Instant::now());
+        // Lock released here — flush proceeds without holding the mutex.
+    }
+
     let before = s.stats.snapshot().cache_entries;
     let addrs  = upstreams::upstream_addrs(&s.upstreams);
     match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
         Ok(()) => {
             s.stats.reset_cache();
             info!(flushed = before, "DNS cache flushed via API");
-            s.audit.send(AuditEvent::ConfigReload); // closest existing event for an admin action
+            s.audit.send(AuditEvent::ConfigReload);
             (StatusCode::OK, JsonExtract(serde_json::json!({
                 "status": "ok", "flushed_entries": before
             }))).into_response()
@@ -1772,6 +1813,10 @@ mod tests {
     const TEST_KEY: &str = "test-api-key-for-unit-tests";
 
     fn make_test_app() -> Router {
+        make_test_app_with_cfg(crate::config::parser::UnboundConfig::default())
+    }
+
+    fn make_test_app_with_cfg(cfg: crate::config::parser::UnboundConfig) -> Router {
         // Initialise API key (OnceLock — safe to call multiple times with same value)
         init_api_key(Some(TEST_KEY.to_string()));
         // Initialise BASE_DIR for store/feeds path resolution (OnceLock — idempotent).
@@ -1780,7 +1825,7 @@ mod tests {
         let zones = Arc::new(ArcSwap::new(Arc::new(
             crate::dns::local::LocalZoneSet::default()
         )));
-        let cfg_arc = Arc::new(crate::config::parser::UnboundConfig::default());
+        let cfg_arc = Arc::new(cfg);
         let log_buffer = crate::logbuffer::new_shared(1000, true);
         let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
         let resolver  = crate::dns::server::create_shared_resolver(&cfg_arc)
@@ -1803,6 +1848,7 @@ mod tests {
             audit:            crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
             xdp_active:       Arc::new(AtomicU8::new(0)),
             resolver,
+            last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
         };
         router(state)
     }
@@ -2257,6 +2303,104 @@ mod tests {
         let json = body_json(resp.into_body()).await;
         assert_eq!(json["status"], "ok");
         assert!(json["flushed_entries"].is_number());
+    }
+
+    // ── FEAT #46: cache flush cooldown ────────────────────────────────────────
+
+    fn make_flush_app(cooldown_secs: u64) -> Router {
+        let mut cfg = crate::config::parser::UnboundConfig::defaults();
+        cfg.cache_flush_cooldown = cooldown_secs;
+        make_test_app_with_cfg(cfg)
+    }
+
+    #[tokio::test]
+    async fn cache_flush_cooldown_second_call_429() {
+        let app = make_flush_app(60);
+        let (k, v) = auth_header();
+
+        let r1 = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/cache/flush")
+                .header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let r2 = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/cache/flush")
+                .header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+        let j = body_json(r2.into_body()).await;
+        assert_eq!(j["error"], "FLUSH_COOLDOWN");
+        assert!(j["retry_after_secs"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[tokio::test]
+    async fn cache_flush_cooldown_disabled_allows_two_calls() {
+        let app = make_flush_app(0);
+        let (k, v) = auth_header();
+
+        let r1 = app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/cache/flush")
+                .header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let r2 = app.oneshot(
+            Request::builder().method("POST").uri("/api/cache/flush")
+                .header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+    }
+
+    // ── FEAT #47: /api/system new fields ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn system_has_prefetch_fields() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/system").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        // Default config has prefetch: false (derived Default)
+        assert_eq!(j["prefetch_enabled"], false);
+        assert!(j.get("upstreams_healthy").is_some());
+        assert!(j.get("upstreams_total").is_some());
+    }
+
+    #[tokio::test]
+    async fn system_prefetch_enabled_reflects_config() {
+        let mut cfg = crate::config::parser::UnboundConfig::defaults();
+        cfg.prefetch = true;
+        let app = make_test_app_with_cfg(cfg);
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/system").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp.into_body()).await["prefetch_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn system_upstreams_healthy_matches_upstreams_endpoint() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+
+        let sys = body_json(
+            app.clone().oneshot(
+                Request::builder().uri("/api/system").header(k, &v).body(Body::empty()).unwrap()
+            ).await.unwrap().into_body()
+        ).await;
+
+        let ups = body_json(
+            app.oneshot(
+                Request::builder().uri("/api/upstreams").header(k, &v).body(Body::empty()).unwrap()
+            ).await.unwrap().into_body()
+        ).await;
+
+        assert_eq!(sys["upstreams_healthy"], ups["healthy"]);
+        assert_eq!(sys["upstreams_total"],   ups["total"]);
     }
 
     // ── GET /api/sync/slaves ──────────────────────────────────────────────────

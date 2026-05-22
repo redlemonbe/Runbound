@@ -495,6 +495,7 @@ async fn build_and_launch(
         audit:            audit.clone(),
         xdp_active:       Arc::clone(&xdp_mode),
         resolver:         Arc::clone(&resolver),
+        last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
