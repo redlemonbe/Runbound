@@ -9,10 +9,11 @@
 
 ## Executive Summary
 
-**93 findings across 11 audit cycles — 93 resolved, 0 open.**
+**96 findings across 12 audit cycles — 96 resolved, 0 open.**
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
+| Live verification | v0.6.4 | 3 fixes (#45 #46 #47) | ✅ All verified v0.6.4 |
 | Hardening pass | v0.6.3 | 2 (FIX #40, FIX #41 from v0.6.2) | ✅ All fixed v0.6.3 |
 | Live pentest | v0.6.2 | 2 bugs (Low-Med, Med) | ✅ Fixed v0.6.3 (#40 #41) |
 | Static Clippy audit | v0.6.2 | 25 (24 Low, 1 Info) | ✅ All fixed v0.6.2 |
@@ -1174,6 +1175,22 @@ the upstream left intact.
 | DoT preset addr (@port format) | ✅ **Fixed v0.6.3** — bare IP + port=853 field (#42) |
 | Upstream persistence across restart | ✅ **Fixed v0.6.3** — upstreams.json on disk (#43) |
 | Explicit port field (UDP default 53, DoT default 853) | ✅ **Fixed v0.6.3** (#44) |
+
+## v0.6.4 Live Verification — 2026-05-22
+
+Live pentest on running v0.6.4 instance. All 3 fixes confirmed.
+
+| Test | Result |
+|---|---|
+| DoT upstream (9.9.9.9:853) healthy | ✅ healthy: true, latency_ms: 44 — TCP+TLS probe (#45) |
+| DoT upstream (1.1.1.1:853) healthy | ✅ healthy: true, latency_ms: 48 — TCP+TLS probe (#45) |
+| POST /api/cache/flush — first call | ✅ 200 `{"flushed_entries":10,"status":"ok"}` (#46) |
+| POST /api/cache/flush — immediate retry | ✅ 429 `{"error":"FLUSH_COOLDOWN","retry_after_secs":60}` (#46) |
+| GET /api/system — prefetch_enabled | ✅ present, value: false (#47) |
+| GET /api/system — upstreams_healthy | ✅ present, value: 10 (#47) |
+| GET /api/system — upstreams_total | ✅ present, value: 10 (#47) |
+
+---
 
 ## v0.6.3 Live Verification — 2026-05-22
 
