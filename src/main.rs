@@ -369,8 +369,9 @@ async fn build_and_launch(
         }
     }
 
-    let global_stats = Stats::new();
-    tokio::spawn(stats::qps_update_loop(Arc::clone(&global_stats)));
+    let global_stats   = Stats::new();
+    let snapshot_cache = stats::new_snapshot_cache(&global_stats);
+    tokio::spawn(stats::qps_update_loop(Arc::clone(&global_stats), Arc::clone(&snapshot_cache)));
     let log_buffer = logbuffer::new_shared(cfg.log_retention, cfg.log_client_ip);
 
     // ── Upstream health monitor ────────────────────────────────────────────
@@ -485,6 +486,7 @@ async fn build_and_launch(
         reload_limiter:   Arc::new(api::ReloadLimiter::new()),
         zones_mutex:      Arc::clone(&zones_mutex),
         stats:            Arc::clone(&global_stats),
+        stats_cache:      Arc::clone(&snapshot_cache),
         cfg:              Arc::clone(&cfg_arc),
         cfg_path,
         log_buffer:       Arc::clone(&log_buffer),
@@ -496,8 +498,6 @@ async fn build_and_launch(
         xdp_active:       Arc::clone(&xdp_mode),
         resolver:         Arc::clone(&resolver),
         last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
-        cache_hits:       Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        cache_misses:     Arc::new(std::sync::atomic::AtomicU64::new(0)),
         cache_evictions:  Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let app      = api::router(state);

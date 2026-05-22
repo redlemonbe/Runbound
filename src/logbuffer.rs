@@ -204,6 +204,9 @@ impl LogBuffer {
         let filled = self.count.min(self.capacity);
         if filled == 0 { return (vec![], 0); }
 
+        // Pre-format the client IP filter once to avoid N allocations inside the loop.
+        let client_filter: Option<String> = q.client.as_ref().map(|c| c.to_string());
+
         // Collect matching entries newest-first
         let mut matched: Vec<LogEntryView> = Vec::new();
         for i in 0..filled {
@@ -216,9 +219,9 @@ impl LogBuffer {
             if let Some(a) = q.action {
                 if entry.action != a { continue; }
             }
-            if let Some(ref c) = q.client {
+            if let Some(ref cs) = client_filter {
                 // Filter on raw stored value: redacted entries never match an IP filter.
-                if entry.client() != c.to_string() { continue; }
+                if entry.client() != cs.as_str() { continue; }
             }
             if let Some(since) = q.since_secs {
                 if entry.ts_secs < since { continue; }

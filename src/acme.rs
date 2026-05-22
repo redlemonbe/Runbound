@@ -119,8 +119,10 @@ async fn build_account(config: &AcmeConfig) -> Result<Account> {
     let creds_path = config.cache_dir.join("account.json");
 
     if creds_path.exists() {
-        let json = std::fs::read_to_string(&creds_path)
-            .context("read ACME account credentials")?;
+        // Wrap in Zeroizing so the key material is wiped from memory on drop.
+        let json = zeroize::Zeroizing::new(
+            std::fs::read_to_string(&creds_path).context("read ACME account credentials")?
+        );
         let creds: AccountCredentials = serde_json::from_str(&json)
             .context("parse ACME account credentials")?;
         return Account::builder_with_http(Box::new(ReqwestClient(reqwest::Client::new())))
@@ -145,8 +147,9 @@ async fn build_account(config: &AcmeConfig) -> Result<Account> {
     .await
     .context("create ACME account")?;
 
-    let json = serde_json::to_string_pretty(&creds)?;
-    std::fs::write(&creds_path, &json).context("save ACME account credentials")?;
+    // Zeroizing<String>: private key material is zeroed from memory on drop.
+    let json = zeroize::Zeroizing::new(serde_json::to_string_pretty(&creds)?);
+    std::fs::write(&creds_path, json.as_bytes()).context("save ACME account credentials")?;
     info!(path = %creds_path.display(), "ACME account credentials saved");
     Ok(account)
 }
