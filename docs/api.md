@@ -2,7 +2,7 @@
 
 Runbound exposes a REST API on **localhost only** (HTTP). The port defaults to
 **8080** and is configurable with `api-port` in `runbound.conf`. All endpoints
-except `GET /help` require a Bearer token.
+require a Bearer token. `GET /health` is the only unauthenticated endpoint (liveness probe).
 
 > **Looking for a GUI?** A ready-made browser dashboard is included at
 > `examples/web-ui/index.html`. Setup in [web-ui.md](web-ui.md).
@@ -26,19 +26,6 @@ Timing-safe comparison is used server-side (constant-time, immune to timing atta
 
 ## Endpoints
 
-### `GET /help`
-
-API documentation and endpoint list. **Requires Bearer authentication** (same as all
-other endpoints — exposing version and endpoint list without auth enables fingerprinting,
-see security rationale in [`docs/security.md`](security.md)).
-
-```bash
-export RUNBOUND_API_KEY="$(cat /etc/runbound/api.key)"
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/help
-```
-
----
-
 ### DNS entries
 
 Local DNS records — equivalent to `local-data` in the config file, but live.
@@ -50,7 +37,7 @@ Changes take effect immediately. No restart required.
 > new queries immediately see the updated zone. Read throughput is unaffected during
 > writes — there are no locks on the hot query path.
 
-#### `GET /dns`
+#### `GET /api/dns`
 
 List all local DNS entries.
 
@@ -67,7 +54,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/dns
 }
 ```
 
-#### `POST /dns`
+#### `POST /api/dns`
 
 Add a local DNS entry.
 
@@ -89,7 +76,7 @@ curl -X POST http://localhost:8080/api/dns \
 
 **Limit:** Maximum 10,000 entries. Returns `422` when exceeded.
 
-#### `DELETE /dns/:id`
+#### `DELETE /api/dns/:id`
 
 Remove an entry by its UUID (from the `id` field of `GET /dns`).
 
@@ -112,7 +99,7 @@ curl -X DELETE "http://localhost:8080/api/dns/$ID" \
 
 Block domains — equivalent to `local-zone: "domain." always_nxdomain`, but live.
 
-#### `GET /blacklist`
+#### `GET /api/blacklist`
 
 ```bash
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/blacklist
@@ -122,7 +109,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/blac
 {"blacklist": [{"id": "...", "domain": "ads.example.com", "action": "nxdomain"}], "total": 1}
 ```
 
-#### `POST /blacklist`
+#### `POST /api/blacklist`
 
 ```bash
 curl -X POST http://localhost:8080/api/blacklist \
@@ -135,7 +122,7 @@ curl -X POST http://localhost:8080/api/blacklist \
 
 **Limit:** Maximum 100,000 entries. Returns `422` when exceeded.
 
-#### `DELETE /blacklist/:id`
+#### `DELETE /api/blacklist/:id`
 
 Remove by UUID.
 
@@ -150,7 +137,7 @@ curl -X DELETE "http://localhost:8080/api/blacklist/$ID" \
 
 Subscribe to remote block-list feeds. Feeds auto-refresh every 24 hours.
 
-#### `GET /feeds`
+#### `GET /api/feeds`
 
 ```bash
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/feeds
@@ -160,7 +147,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/feed
 {"feeds": [{"id": "...", "name": "urlhaus", "url": "https://...", "entry_count": 8432, "last_updated": "2026-05-16T10:00:00Z"}], "total": 1}
 ```
 
-#### `POST /feeds`
+#### `POST /api/feeds`
 
 Subscribe to a new feed. **Limit: 100 feeds maximum.**
 
@@ -174,7 +161,7 @@ curl -X POST http://localhost:8080/api/feeds \
 **formats:** `hosts` (default), `domains`, `adblock`  
 **Security:** Only HTTPS is accepted. HTTP URLs are **rejected** (HTTP 400). Redirects to private IPs or internal hostnames are blocked.
 
-#### `GET /feeds/presets`
+#### `GET /api/feeds/presets`
 
 List built-in feed presets (OISD, StevenBlack, Hagezi, URLhaus, AdGuard...).
 
@@ -182,7 +169,7 @@ List built-in feed presets (OISD, StevenBlack, Hagezi, URLhaus, AdGuard...).
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/feeds/presets
 ```
 
-#### `DELETE /feeds/:id`
+#### `DELETE /api/feeds/:id`
 
 Remove a feed subscription by UUID.
 
@@ -191,7 +178,7 @@ curl -X DELETE "http://localhost:8080/api/feeds/$ID" \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
-#### `POST /feeds/update`
+#### `POST /api/feeds/update`
 
 Refresh all enabled feeds immediately.
 
@@ -204,7 +191,7 @@ curl -X POST http://localhost:8080/api/feeds/update \
 {"status": "ok", "results": [...], "summary": {"updated": 2, "errors": 0}}
 ```
 
-#### `POST /feeds/:id/update`
+#### `POST /api/feeds/:id/update`
 
 Refresh a single feed by UUID.
 
@@ -215,23 +202,21 @@ curl -X POST "http://localhost:8080/api/feeds/$ID/update" \
 
 ---
 
-### TLS status
+### `GET /health`
 
-#### `GET /health`
-
-Liveness probe. Returns uptime and total query count.
+Liveness probe. **No authentication required.** Returns version, uptime, and status.
 
 ```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/health
+curl http://localhost:8080/health
 ```
 
 ```json
-{"status": "ok", "uptime_secs": 3600, "queries": 125432}
+{"status": "ok", "version": "0.6.2", "uptime_secs": 3600}
 ```
 
 ---
 
-### `GET /stats`
+### `GET /api/stats`
 
 Query statistics snapshot: counters, QPS, latency percentiles, cache metrics.
 
@@ -291,7 +276,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stat
 
 ---
 
-### `GET /stats/stream`
+### `GET /api/stats/stream`
 
 Live stats as Server-Sent Events — one JSON snapshot per second. Ideal for dashboards.
 
@@ -312,42 +297,7 @@ The stream is a standard SSE event stream (`Content-Type: text/event-stream`). E
 
 ---
 
-### `GET /upstreams`
-
-Health status of each configured `forward-addr` upstream resolver. Probed every 30 seconds with a minimal DNS query (`. IN A`).
-
-```bash
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/upstreams
-```
-
-```json
-{
-  "upstreams": [
-    {
-      "addr":       "1.1.1.1",
-      "zone":       ".",
-      "healthy":    true,
-      "latency_ms": 12,
-      "last_check": "2026-05-17T14:23:05Z"
-    },
-    {
-      "addr":       "1.0.0.1",
-      "zone":       ".",
-      "healthy":    true,
-      "latency_ms": 14,
-      "last_check": "2026-05-17T14:23:05Z"
-    }
-  ],
-  "total":   2,
-  "healthy": 2
-}
-```
-
-`healthy: false` means the last probe timed out or received no valid DNS response. Runbound continues resolving — an unhealthy upstream only affects its own weight in hickory's load balancing. A WARN log is emitted on each failure.
-
----
-
-### `GET /logs`
+### `GET /api/logs`
 
 Recent DNS query log, newest first. Entries are kept in a fixed-size ring buffer pre-allocated at startup (zero allocation per query). The buffer size is controlled by `log-retention` in `runbound.conf` (default: **1,000**, compile-time max: 10,000). Set to `0` to disable the buffer entirely.
 
@@ -422,7 +372,7 @@ The ring buffer capacity is controlled by `log-retention` in `runbound.conf` (de
 
 ---
 
-### `DELETE /logs`
+### `DELETE /api/logs`
 
 Clear the in-memory query log ring buffer immediately. Useful for responding to a
 GDPR right-to-erasure request.
@@ -445,79 +395,7 @@ curl -X DELETE -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 
 ---
 
-### `GET /audit/tail`
-
-Return the last N entries from the immutable audit log. Requires `audit-log: yes` in
-`runbound.conf`.
-
-```bash
-# Last 50 audit entries (default: 100)
-curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
-     "http://localhost:8080/audit/tail?n=50"
-```
-
-```json
-{
-  "lines": [
-    {
-      "seq":    42,
-      "ts":     1715000123,
-      "event":  "dns_add",
-      "fields": {"name": "nas.home.", "type": "A", "value": "192.168.1.10"},
-      "mac":    "a3f1c2d8e5..."
-    },
-    {
-      "seq":    41,
-      "ts":     1715000100,
-      "event":  "auth_failure",
-      "fields": {"path": "/dns"},
-      "mac":    "9e2b47f1a8..."
-    }
-  ],
-  "count": 2
-}
-```
-
-**Query parameters:**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `n` | `100` | Number of entries to return (1–1000). |
-
-**Event names** (snake_case in the `event` field):
-
-| Event | Trigger | Fields |
-|---|---|---|
-| `startup` | Runbound process started | — |
-| `shutdown` | Clean shutdown initiated | — |
-| `dns_add` | `POST /dns` — local DNS record added | `name`, `type`, `value` |
-| `dns_delete` | `DELETE /dns/:id` — local DNS record removed | `id` |
-| `feed_add` | `POST /feeds` — feed subscription added | `id`, `name`, `url` |
-| `feed_delete` | `DELETE /feeds/:id` — feed removed | `id` |
-| `blacklist_add` | `POST /blacklist` — entry added | `domain` |
-| `blacklist_delete` | `DELETE /blacklist/:id` — entry removed | `id` |
-| `auth_failure` | Request with missing or invalid Bearer token | `path` |
-| `config_reload` | `POST /reload` or SIGHUP | — |
-| `logs_clear` | `DELETE /logs` — ring buffer cleared (GDPR erasure) | `entries_deleted` |
-
-**Returns `404`** (with `error: "AUDIT_LOG_UNAVAILABLE"`) when `audit-log: yes` is not configured or the log file doesn't exist yet.
-
-**MAC verification:**
-
-The `mac` field is HMAC-SHA256 over `seq(8 LE) ‖ ts(8 LE) ‖ event ‖ fields_json`.
-Verify it with the same key used in `audit-log-hmac-key` (or `RUNBOUND_AUDIT_HMAC_KEY`).
-Any gap in `seq` or MAC mismatch indicates a tampered or missing entry.
-
-**Errors:**
-
-| Code | Meaning |
-|---|---|
-| `404` | Audit log not enabled or log file not found |
-| `500` | Log file could not be read |
-
----
-
-### `GET /config`
+### `GET /api/config`
 
 Dump active configuration (sanitised — API key is omitted).
 
@@ -554,7 +432,7 @@ for the full live lists.
 
 ---
 
-### `POST /reload`
+### `POST /api/reload`
 
 Hot-reload: re-parse `runbound.conf` and rebuild all in-memory DNS data without dropping connections.
 Equivalent to `systemctl reload runbound` (SIGHUP).
@@ -572,7 +450,7 @@ curl -X POST http://localhost:8080/api/reload \
 
 ---
 
-### `GET /metrics`
+### `GET /api/metrics`
 
 Prometheus/OpenMetrics exposition. Returns all counters and gauges from `GET /stats` in
 Prometheus text format (`text/plain; version=0.0.4`). Compatible with any Prometheus
@@ -623,7 +501,7 @@ scrape_configs:
 
 ---
 
-### `POST /rotate-key`
+### `POST /api/rotate-key`
 
 Atomically replace the active Bearer token **without restarting Runbound**. The old token
 is invalidated the instant this endpoint returns. Designed for PCI-DSS / NIS2 key
@@ -668,7 +546,7 @@ audit log as a `config_reload` event.
 
 ---
 
-### `GET /tls`
+### `GET /api/tls`
 
 DoT/DoH/DoQ protocol status.
 
@@ -810,20 +688,6 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/sync
 ```
 
 `status`: `"connected"` (< 30 s), `"stale"` (< 120 s), `"disconnected"` (> 120 s).
-
----
-
-### `GET /health`
-
-Health probe — **no authentication required** (load balancer / Kubernetes liveness probe).
-
-```bash
-curl http://localhost:8080/health
-```
-
-```json
-{"status": "ok", "version": "0.6.2", "uptime_secs": 3600}
-```
 
 ---
 
