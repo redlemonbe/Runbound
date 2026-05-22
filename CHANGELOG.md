@@ -9,6 +9,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.4] — 2026-05-22
+
+### Fixed
+
+- **FIX #45 — DoT upstream health probe via TCP+TLS** (`src/upstreams.rs`)  
+  `probe_upstream` now routes by protocol: UDP upstreams use the existing DNS/UDP
+  probe; DoT upstreams open a TCP connection and complete a TLS handshake
+  (`rustls::StreamOwned::flush → complete_io`). A successful handshake confirms
+  the server is up and speaking TLS — no DNS query is needed.  
+  Root CAs: system native certs (`rustls-native-certs`) with fallback to bundled
+  WebPKI roots (`webpki-roots`).  
+  Cloudflare DoT (1.1.1:853) and Quad9 DoT (9.9.9.9:853) now report
+  `healthy: true`.
+
+### Added
+
+- **FEAT #46 — Cache flush cooldown** (`src/api/mod.rs`, `src/config/parser.rs`)  
+  `POST /api/cache/flush` returns `429 FLUSH_COOLDOWN` with a `Retry-After` header
+  if called within `cache-flush-cooldown` seconds of the previous flush.  
+  Config directive: `cache-flush-cooldown: 60` (default 60 s; set to 0 to disable).
+
+- **FEAT #47 — Upstream health and prefetch fields in GET /api/system**
+  (`src/api/mod.rs`)  
+  Response now includes:
+  - `prefetch_enabled: bool` — true when `prefetch: yes` is set in config
+  - `upstreams_healthy: u32` — count of upstreams with `healthy == true`
+  - `upstreams_total: u32` — total registered upstreams
+
+---
+
 ## [0.6.3] — 2026-05-22
 
 ### Fixed
