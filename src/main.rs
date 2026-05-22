@@ -77,7 +77,7 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: String) -> Result<()> {
-    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver) =
+    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker) =
         build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // ── XDP fast path (optional, feature-gated) ───────────────────────────
@@ -122,7 +122,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         }
     };
 
-    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver).await;
+    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker).await;
     audit.send(audit::AuditEvent::Shutdown);
     result
 }
@@ -269,6 +269,7 @@ async fn build_and_launch(
     audit::AuditLogger,
     Arc<AtomicU8>,
     dns::server::SharedResolver,
+    Option<Arc<dns::prefetch::PrefetchTracker>>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -374,6 +375,11 @@ async fn build_and_launch(
 
     // ── Upstream health monitor ────────────────────────────────────────────
     let upstreams = upstreams::init_upstreams(cfg);
+    // FIX #43: merge any upstreams persisted via the API (API entry wins on duplicate)
+    {
+        let saved = upstreams::load_upstreams(&base_dir);
+        upstreams::merge_persisted(&upstreams, saved);
+    }
     {
         let ups = Arc::clone(&upstreams);
         tokio::spawn(async move { upstreams::upstream_health_loop(ups).await });
@@ -441,23 +447,54 @@ async fn build_and_launch(
 
     let xdp_mode = Arc::new(AtomicU8::new(0)); // 0=disabled, 1=drv, 2=skb
 
+    // ── DNS prefetch tracker (FEAT #16, opt-in via prefetch: yes) ─────────
+    let prefetch_tracker: Option<Arc<dns::prefetch::PrefetchTracker>> = if cfg.prefetch {
+        let tracker = dns::prefetch::PrefetchTracker::new();
+        let t = Arc::clone(&tracker);
+        let res = Arc::clone(&resolver);
+        let threshold = cfg.prefetch_threshold;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let hot = t.take_hot(threshold);
+                if hot.is_empty() { continue; }
+                tracing::debug!(count = hot.len(), "prefetch: queuing {} domain(s)", hot.len());
+                for name in hot {
+                    let r = Arc::clone(&res);
+                    tokio::spawn(async move {
+                        use hickory_proto::rr::RecordType;
+                        use hickory_proto::rr::Name;
+                        if let Ok(n) = name.parse::<Name>() {
+                            let _ = r.load().lookup(n, RecordType::A).await;
+                        }
+                    });
+                }
+            }
+        });
+        Some(tracker)
+    } else {
+        None
+    };
+
     let state = AppState {
-        zones:          Arc::clone(&zones),
-        tls_cfg:        Arc::clone(&tls_cfg),
-        rate_limiter:   api::ApiRateLimiter::new_public(),
-        reload_limiter: Arc::new(api::ReloadLimiter::new()),
-        zones_mutex:    Arc::clone(&zones_mutex),
-        stats:          Arc::clone(&global_stats),
-        cfg:            Arc::clone(&cfg_arc),
+        zones:            Arc::clone(&zones),
+        tls_cfg:          Arc::clone(&tls_cfg),
+        rate_limiter:     api::ApiRateLimiter::new_public(),
+        reload_limiter:   Arc::new(api::ReloadLimiter::new()),
+        zones_mutex:      Arc::clone(&zones_mutex),
+        stats:            Arc::clone(&global_stats),
+        cfg:              Arc::clone(&cfg_arc),
         cfg_path,
-        log_buffer:     Arc::clone(&log_buffer),
-        upstreams:      Arc::clone(&upstreams),
+        log_buffer:       Arc::clone(&log_buffer),
+        upstreams:        Arc::clone(&upstreams),
         sync_journal,
-        slave_mode:     cfg.is_slave(),
-        base_dir:       Arc::new(base_dir),
-        audit:          audit.clone(),
-        xdp_active:     Arc::clone(&xdp_mode),
-        resolver:       Arc::clone(&resolver),
+        slave_mode:       cfg.is_slave(),
+        base_dir:         Arc::new(base_dir),
+        audit:            audit.clone(),
+        xdp_active:       Arc::clone(&xdp_mode),
+        resolver:         Arc::clone(&resolver),
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
@@ -470,7 +507,7 @@ async fn build_and_launch(
     let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200));
     let acl          = Arc::new(Acl::from_config(&cfg.access_control));
 
-    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver))
+    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker))
 }
 
 fn print_help() {

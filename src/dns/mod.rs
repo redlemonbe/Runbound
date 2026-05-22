@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 pub mod acl;
 pub mod local;
+pub mod prefetch;
 pub mod ratelimit;
 pub mod server;
 pub mod xdp;

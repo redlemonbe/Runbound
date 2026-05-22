@@ -9,6 +9,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.3] — 2026-05-22
+
+### Fixed
+
+- **FIX #40 — Reject unsafe upstream addresses** (`src/api/mod.rs`)  
+  `POST /api/upstreams` now returns `400 INVALID_ADDR` for loopback addresses
+  (`127.x.x.x`, `::1`) and IPv4 link-local addresses (`169.254.x.x`).
+  IPv4 private ranges (RFC 1918) and IPv6 ULA (`fc00::/7`) remain allowed,
+  supporting split-horizon deployments with internal resolvers.
+
+- **FIX #41 — Guard last upstream deletion** (`src/api/mod.rs`)  
+  `DELETE /api/upstreams/:id` returns `409 LAST_UPSTREAM` when the target is
+  the only registered upstream. Deleting all upstreams would leave the resolver
+  with an empty forward list; the upstream is left untouched on 409.
+
+- **FIX #42 — Presets DoT: port as separate field** (`src/api/mod.rs`)  
+  All `GET /api/upstreams/presets` DoT entries now return
+  `"addr":"1.1.1.1","port":853` instead of the previous `"addr":"1.1.1.1@853"`.
+  The `@port` syntax was an Unbound config-file convention and must not appear
+  in JSON API responses.
+
+- **FIX #43 — Upstream persistence across restarts** (`src/upstreams.rs`, `src/main.rs`)  
+  Upstreams added via the REST API are now written to `$BASE_DIR/upstreams.json`
+  (atomic write via `.tmp` rename). An optional HMAC sidecar (`.mac`) is
+  generated when `RUNBOUND_STORE_KEY` is set. On startup, `load_upstreams` reads
+  the file, verifies the HMAC, and `merge_persisted` merges API entries over
+  config-file entries (persisted entry wins on `(addr, protocol)` conflict).
+  Save is called after every successful `POST` or `DELETE`.
+
+- **FIX #44 — Explicit `port` field on upstreams** (`src/upstreams.rs`, `src/api/mod.rs`)  
+  `UpstreamStatus` now carries a `port: u16` field. Defaults: 53 for UDP,
+  853 for DoT. Callers may supply an explicit port via `POST /api/upstreams`
+  `{"port":N}`; port 0 is rejected with `400 INVALID_PORT`. The explicit port
+  is propagated through `upstream_addrs` → `rebuild_and_swap` →
+  `build_resolver_from_addrs`, eliminating `@port` string parsing at resolver
+  build time.
+
+### Added
+
+- **FEAT #16 — DNS prefetching** (`src/dns/prefetch.rs`, `src/dns/server.rs`,
+  `src/config/parser.rs`, `src/main.rs`)  
+  When `prefetch: yes` is set in `unbound.conf`, Runbound tracks forwarded-query
+  counts per domain in a `PrefetchTracker` (`Arc<Mutex<HashMap<String, u32>>>`).
+  Every 30 s a background task calls `take_hot(threshold)` and fires
+  `resolver.lookup(name, A)` for each hot domain. All activity is logged at
+  `DEBUG` level only — no operational noise.  
+  Config directives: `prefetch: yes|no` (default `no`),
+  `prefetch-threshold: N` (minimum hit count per window, default `5`).
+
+---
+
 ## [0.6.2] — 2026-05-22
 
 ### Security (polish pass — static audit)
