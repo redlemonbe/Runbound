@@ -421,7 +421,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/conf
   "log_retention": 1000,
   "log_client_ip": true,
   "api_port": null,
-  "logfile": null
+  "logfile": null,
+  "prefetch": false,
+  "prefetch_threshold": 5
 }
 ```
 
@@ -609,7 +611,8 @@ curl -X POST -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/
 ### Upstreams
 
 Runtime upstream forwarder management. Changes take effect immediately — the shared
-resolver is rebuilt atomically on every add/remove.
+resolver is rebuilt atomically on every add/remove. Runtime upstreams are persisted to
+`$BASE_DIR/upstreams.json` and reloaded on startup (merged over config-file entries).
 
 #### `GET /api/upstreams`
 
@@ -626,11 +629,14 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
       "addr": "1.1.1.1",
       "port": 53,
       "protocol": "udp",
-      "enabled": true,
-      "latency_ms": 12
+      "healthy": true,
+      "latency_ms": 12,
+      "last_check": "2026-05-22T15:00:00Z",
+      "zone": "."
     }
   ],
-  "total": 1
+  "total": 1,
+  "healthy": 1
 }
 ```
 
@@ -643,7 +649,13 @@ curl -X POST http://localhost:8080/api/upstreams \
   -d '{"name":"Cloudflare DoT","addr":"1.1.1.1","port":853,"protocol":"dot"}'
 ```
 
-**Validation:** `addr` must be a valid IP address. `protocol` ∈ `{udp, dot}`. `port` 1–65535. Maximum 32 upstreams. Returns `409` when deleting the last enabled upstream.
+**Validation:**
+
+| Field | Rules |
+|-------|-------|
+| `addr` | Valid IP address. Loopback (`127.x.x.x`, `::1`) and IPv4 link-local (`169.254.x.x`) are rejected (`400 INVALID_ADDR`). Private ranges (RFC 1918) and IPv6 ULA are allowed. |
+| `protocol` | `"udp"` or `"dot"` (`400 INVALID_PROTOCOL` otherwise). |
+| `port` | 1–65535. Defaults to 53 (UDP) or 853 (DoT) when omitted. Port 0 returns `400 INVALID_PORT`. |
 
 #### `DELETE /api/upstreams/:id`
 
@@ -652,11 +664,13 @@ curl -X DELETE -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   http://localhost:8080/api/upstreams/550e8400-...
 ```
 
-Returns `409` when deleting the last enabled upstream.
+Returns `409 LAST_UPSTREAM` when the target is the only registered upstream — the
+resolver must always have at least one forwarder.
 
 #### `GET /api/upstreams/presets`
 
 Nine built-in presets: Cloudflare (UDP + DoT), Google, Quad9 (UDP + DoT), OpenDNS, AdGuard DNS.
+Each preset carries a bare IP `addr` and a separate `port` field (no `@port` suffix).
 
 ```bash
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upstreams/presets
@@ -714,9 +728,10 @@ on slave nodes.
 |---|---|
 | `200` | Success |
 | `201` | Created |
-| `400` | Bad request — malformed JSON or invalid field value |
+| `400` | Bad request — malformed JSON or invalid field value (`INVALID_ADDR`, `INVALID_PORT`, `INVALID_PROTOCOL`, …) |
 | `401` | Unauthorized — missing or invalid Bearer token |
 | `404` | Not found — UUID does not exist |
+| `409` | Conflict — operation refused by a guard (e.g. `LAST_UPSTREAM`: cannot delete the last upstream) |
 | `422` | Unprocessable — entry limit reached |
 | `429` | Too many requests — rate limit exceeded |
 | `500` | Internal server error |

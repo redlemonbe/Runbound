@@ -1,6 +1,6 @@
 # Runbound — Security Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.6.2 static audit  
+**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.6.3  
 **Last updated:** 2026-05-22  
 **Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration, upstream management  
 **Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4) + static Clippy audit (v0.6.2)
@@ -9,11 +9,12 @@
 
 ## Executive Summary
 
-**91 findings across 10 audit cycles — 89 resolved, 2 open.**
+**93 findings across 11 audit cycles — 93 resolved, 0 open.**
 
 | Cycle | Target | Findings | Status |
 |---|---|---|---|
-| Live pentest | v0.6.2 | 2 bugs (Low-Med, Med) | ⚠️ 2 open — #40 #41 |
+| Hardening pass | v0.6.3 | 2 (FIX #40, FIX #41 from v0.6.2) | ✅ All fixed v0.6.3 |
+| Live pentest | v0.6.2 | 2 bugs (Low-Med, Med) | ✅ Fixed v0.6.3 (#40 #41) |
 | Static Clippy audit | v0.6.2 | 25 (24 Low, 1 Info) | ✅ All fixed v0.6.2 |
 | IA audit | v0.4.16 | 7 (5 Low, 2 Info) | ✅ All fixed/accepted v0.5.0 |
 | Live pentest | v0.4.16 | 2 bugs + 13 PASS + 2 observations | ✅ BUG-1/BUG-2 closed v0.5.0 |
@@ -36,7 +37,7 @@ findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0
 A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
 through SEC-16), all fixed in v0.3.3.
 
-**All HIGH findings are closed. 2 LOW-MEDIUM findings are open from v0.6.2 live pentest (upstream input validation gaps — tracked in GitHub #40 and #41).**
+**All findings are closed. No open issues.**
 
 - JSON store HMAC-SHA256 integrity (HIGH-06) — `RUNBOUND_STORE_KEY` env var, sidecar `.mac` files.
 - TLS cipher suite hardening (HIGH-07) — hickory 0.26 + rustls 0.23, TLS 1.3 default.
@@ -1084,31 +1085,33 @@ On `parse_local_data` failure, the HTTP 400 response body included `"details": f
 
 ---
 
-## Open Findings
+## v0.6.3 Hardening Pass — 2026-05-22
+
+Closed the two open findings from the v0.6.2 live pentest (FIX #40 and FIX #41).
+Also added upstream persistence (FIX #43), explicit port field (FIX #44), fixed
+preset DoT format (FIX #42), and DNS prefetching feature (FEAT #16).
+
+**Findings: 2 closed, 0 open.**
 
 ### BUG-1 (LOW-MEDIUM) — Loopback and link-local IPs accepted as upstreams
 
 **GitHub:** #40  
-**Version:** v0.6.2  
-**Status:** ⚠️ Open
+**Version fixed:** v0.6.3  
+**Status:** ✅ Fixed
 
-`POST /api/upstreams` accepts `127.0.0.1`, `::1`, and `169.254.169.254` as upstream DNS addresses. Loopback creates a self-referential DNS loop; `169.254.169.254` is the cloud metadata endpoint and is not a DNS resolver.
-
-Private ranges (10.x, 192.168.x, 172.16-31.x) are intentionally allowed for internal DNS servers.
-
-**Fix:** Block `is_loopback()` and IPv4 `is_link_local()` in the upstream address validator.
-
----
+`POST /api/upstreams` previously accepted `127.0.0.1`, `::1`, and `169.254.169.254`.
+Fixed: `is_loopback()` and IPv4 `is_link_local()` checked before insertion; both return
+`400 INVALID_ADDR`. Private ranges (RFC 1918) and IPv6 ULA remain allowed.
 
 ### BUG-2 (MEDIUM) — DELETE last upstream returns 200 instead of 409
 
 **GitHub:** #41  
-**Version:** v0.6.2  
-**Status:** ⚠️ Open
+**Version fixed:** v0.6.3  
+**Status:** ✅ Fixed
 
-`DELETE /api/upstreams/:id` returns 200 and removes the last upstream, leaving Runbound with zero upstreams. All non-cached, non-authoritative queries fail silently until an upstream is re-added.
-
-**Fix:** Check `upstreams.len() == 1` before deletion, return 409 Conflict.
+`DELETE /api/upstreams/:id` previously removed the last upstream. Fixed: guard checks
+`list.len() == 1 && target_exists` before removal; returns `409 LAST_UPSTREAM` with
+the upstream left intact.
 
 ---
 
@@ -1131,9 +1134,9 @@ Private ranges (10.x, 192.168.x, 172.16-31.x) are intentionally allowed for inte
 | Bad upstream addr | ✅ 400 INVALID_ADDR |
 | GET /api/upstreams/presets | ✅ 9 presets |
 | Upstream CRUD add → delete | ✅ 201 / 200 |
-| Loopback upstream (127.0.0.1, ::1) | ⚠️ **Accepted** — should be 400 (#40) |
-| Link-local upstream (169.254.169.254) | ⚠️ **Accepted** — should be 400 (#40) |
-| DELETE last upstream | ⚠️ **200** — should be 409 (#41) |
+| Loopback upstream (127.0.0.1, ::1) | ✅ **Fixed v0.6.3** — 400 INVALID_ADDR (#40) |
+| Link-local upstream (169.254.169.254) | ✅ **Fixed v0.6.3** — 400 INVALID_ADDR (#40) |
+| DELETE last upstream | ✅ **Fixed v0.6.3** — 409 LAST_UPSTREAM (#41) |
 
 ---
 
@@ -1162,8 +1165,8 @@ Private ranges (10.x, 192.168.x, 172.16-31.x) are intentionally allowed for inte
 **New endpoints (v0.6.1 / v0.6.2) — validated:**
 - All new POST/DELETE endpoints: auth 401 + input validation 400 + happy path tested ✓
 - No error response leaks internal paths, stack traces, or dependency versions ✓
-- `POST /api/upstreams`: protocol validated as enum `{udp, dot}`, addr validated as parseable IP ✓ — loopback/link-local not blocked ⚠️ (issue #40)
-- `DELETE /api/upstreams/:id`: 404 on unknown UUID ✓ — last-upstream guard broken (returns 200 not 409) ⚠️ (issue #41)
+- `POST /api/upstreams`: protocol validated as enum `{udp, dot}`, addr validated as parseable IP ✓ — loopback/link-local not blocked ⚠️ (fixed v0.6.3 — #40)
+- `DELETE /api/upstreams/:id`: 404 on unknown UUID ✓ — last-upstream guard broken (returns 200 not 409) ⚠️ (fixed v0.6.3 — #41)
 - Log injection: domain names only emitted at DEBUG level, never at WARN+ ✓
 
 **Result:** `cargo clippy --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used` → 0 errors. 39/39 tests pass.
