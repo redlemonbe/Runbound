@@ -1369,4 +1369,11 @@ v0.6.6 verification (2026-05-22): binary at tag v0.6.6 (18:47) compiled before f
 absent from binary (route list confirmed via strings(1)). Feed last_error field (#55) confirmed
 present in binary (struct Feed with 10 elements); UI updated same day: dot turns red on
 last_error, ⚠ badge with tooltip shows error string. New binary required from coding AI for
-complete v0.6.6 verification of #53 and #54.*
+complete v0.6.6 verification of #53 and #54.
+v0.6.7 live pentest (2026-05-22): 3 issues fully verified on binary downloaded from GitHub
+Releases (SHA256 confirmed). #53 (last_error on upstream failures): probe on unreachable
+10.255.255.1:53 → healthy=false, last_error="timeout" ✓. #54 (POST /api/upstreams/:id/probe):
+200 JSON response with full upstream object ✓ (was 404 empty in v0.6.6 binary). #56 (DoT SNI
+fix): 1.1.1.1:853 probe → healthy=true, latency=119ms ✓; PATCH tls_hostname set/clear ✓;
+presets DoT all carry correct tls_hostname (cloudflare-dns.com, dns.google, dns.quad9.net) ✓.
+DNS resolution confirmed via dig @127.0.0.1. 105/105 tests pass, 0 clippy warnings.*
