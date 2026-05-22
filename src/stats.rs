@@ -13,14 +13,16 @@ use std::time::{Duration, Instant};
 
 // ── Latency histogram ──────────────────────────────────────────────────────
 //
-// 9 upper-bound thresholds in microseconds define 10 buckets:
+// 12 upper-bound thresholds in microseconds define 13 buckets:
 //   [0]  ≤ 0.1 ms   [1]  ≤ 0.5 ms   [2]  ≤ 1 ms    [3]  ≤ 2 ms
 //   [4]  ≤ 5 ms     [5]  ≤ 10 ms    [6]  ≤ 50 ms   [7]  ≤ 100 ms
-//   [8]  ≤ 500 ms   [9]  > 500 ms  (overflow)
-pub const HIST_BOUNDS_US: [u64; 9] = [
-    100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000, 500_000,
+//   [8]  ≤ 250 ms   [9]  ≤ 500 ms  [10]  ≤ 1 s     [11]  ≤ 3 s
+//   [12] > 3 s     (overflow — reported as lower bound, not a fake midpoint)
+pub const HIST_BOUNDS_US: [u64; 12] = [
+    100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000,
+    250_000, 500_000, 1_000_000, 3_000_000,
 ];
-pub const HIST_BUCKETS: usize = 10;
+pub const HIST_BUCKETS: usize = 13;
 
 // ── QPS ring buffer ────────────────────────────────────────────────────────
 // 300 slots × 1 second each = 5-minute sliding window.
@@ -155,13 +157,17 @@ impl Stats {
         for (i, &c) in counts.iter().enumerate() {
             cum += c;
             if cum >= target {
-                // Midpoint of bucket in µs → convert to ms
+                // Midpoint of bucket in µs → convert to ms.
+                // Overflow bucket (no upper bound): report lower bound to avoid
+                // returning a fake midpoint artifact.
                 let mid_us: u64 = if i == 0 {
                     50 // midpoint of [0, 100µs]
                 } else {
                     let lo = HIST_BOUNDS_US[i - 1];
-                    let hi = HIST_BOUNDS_US.get(i).copied().unwrap_or(1_000_000);
-                    (lo + hi) / 2
+                    match HIST_BOUNDS_US.get(i) {
+                        Some(&hi) => (lo + hi) / 2,
+                        None      => lo,
+                    }
                 };
                 return (mid_us as f64 / 1000.0 * 10.0).round() / 10.0;
             }

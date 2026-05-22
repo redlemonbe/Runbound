@@ -644,25 +644,49 @@ const MEM_LOW_WATERMARK:    f64 = 0.60; // below → scale up if cache was reduc
 const MEM_MOD_WATERMARK:    f64 = 0.70; // [0.70, 0.80) → halve cache
 const MEM_HIGH_WATERMARK:   f64 = 0.80; // ≥ 0.80 → recalc + flush rate limiter
 
+/// Read the cgroup v2 hard memory limit in bytes.
+/// Returns None when the limit is "max" (unrestricted) or the file is absent.
+fn cgroup_memory_max_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    let s = s.trim();
+    if s == "max" { return None; }
+    s.parse().ok()
+}
+
+/// Read the cgroup v2 current memory usage in bytes.
+fn cgroup_memory_current_bytes() -> Option<u64> {
+    std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .ok()?.trim().parse().ok()
+}
+
 /// Compute an appropriate resolver cache size from current available RAM.
 ///
 /// 1 hickory cache entry ≈ 512 bytes.
-/// Allocates up to 10 % of MemAvailable, clamped to [512, 65536].
-/// Falls back to 8192 when /proc/meminfo is unavailable.
+/// Allocates up to 10 % of available memory, clamped to [512, 65536].
+/// Inside a cgroup v2 container /proc/meminfo reflects host RAM; we use the
+/// cgroup limit instead to avoid overcommitting the container's memory budget.
+/// Falls back to 8192 when neither source is available.
 fn cache_size_from_meminfo() -> usize {
-    let avail_kb: u64 = std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|t| t.lines()
-            .find(|l| l.starts_with("MemAvailable:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse().ok()))
-        .unwrap_or(0);
+    let avail_kb: u64 = if let Some(max_bytes) = cgroup_memory_max_bytes() {
+        let current_bytes = cgroup_memory_current_bytes().unwrap_or(0);
+        max_bytes.saturating_sub(current_bytes) / 1024
+    } else {
+        std::fs::read_to_string("/proc/meminfo").ok()
+            .and_then(|t| t.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok()))
+            .unwrap_or(0)
+    };
     if avail_kb == 0 {
         return 8192;
     }
     ((avail_kb * 1024 / 10 / 512) as usize).clamp(512, 65536)
 }
 
-/// Read /proc/meminfo and return (available_kb, total_kb).
+/// Read system memory and return (available_kb, total_kb).
+/// Prefers cgroup v2 limits over /proc/meminfo when inside a container —
+/// /proc/meminfo reports host RAM which would cause cache overcommit.
 /// Returns None on any parse or I/O error (non-Linux, container without /proc, etc.).
 fn read_meminfo() -> Option<(u64, u64)> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -675,7 +699,17 @@ fn read_meminfo() -> Option<(u64, u64)> {
         }
         if total > 0 && available > 0 { break; }
     }
-    if total > 0 { Some((available, total)) } else { None }
+    if total == 0 { return None; }
+    // Cap at cgroup v2 limit when running inside a container.
+    if let Some(max_bytes) = cgroup_memory_max_bytes() {
+        let max_kb = max_bytes / 1024;
+        if max_kb < total {
+            let current_kb = cgroup_memory_current_bytes().unwrap_or(0) / 1024;
+            total     = max_kb;
+            available = max_kb.saturating_sub(current_kb);
+        }
+    }
+    Some((available, total))
 }
 
 /// Background task: monitors system memory and adjusts the DNS resolver cache size.

@@ -674,6 +674,8 @@ The sync port number is configurable. The REST API stays on localhost on all nod
 | `RUNBOUND_API_KEY` | REST API Bearer token. Overrides `api-key` in config. |
 | `RUNBOUND_AUDIT_HMAC_KEY` | HMAC key for the audit log. Overrides `audit-log-hmac-key` in config. |
 | `RUNBOUND_STORE_KEY` | HMAC-SHA256 key for JSON store integrity (HIGH-06). See below. |
+| `RUNBOUND_DISABLE_XDP` | Set to any value to skip the entire XDP fast path without editing config. Emergency escape hatch when the host becomes unreachable after XDP attaches to the wrong NIC. Equivalent to `xdp: no`. |
+| `RUNBOUND_SKIP_XDP_SELFTEST` | Set to any value to bypass the XDP loopback self-test. Useful in isolated environments (CI, VMs with no DNS traffic) where the self-test would always time out and disable XDP. |
 | `RUST_LOG` | Log filter (e.g. `runbound=debug,info`). |
 
 ### `RUNBOUND_STORE_KEY` — JSON store integrity (HIGH-06)
