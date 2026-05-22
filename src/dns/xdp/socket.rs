@@ -151,12 +151,27 @@ pub unsafe fn create_xsk_socket(
 /// Validate a network interface name before using it in sysfs paths.
 /// Linux IFNAMSIZ is 16 (including NUL), so names are at most 15 characters.
 /// Only ASCII alphanumeric, hyphen, period, and underscore are accepted.
-fn sanitize_iface_name(name: &str) -> Option<&str> {
+pub(super) fn sanitize_iface_name(name: &str) -> Option<&str> {
     if !name.is_empty()
         && name.len() <= 15
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
     {
         Some(name)
+    } else {
+        None
+    }
+}
+
+/// Read the hardware MAC address of `iface` from sysfs.
+/// Returns None if the interface does not exist or the address cannot be parsed.
+pub(super) fn read_iface_mac(iface: &str) -> Option<[u8; 6]> {
+    let iface = sanitize_iface_name(iface)?;
+    let content = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")).ok()?;
+    let parts: Vec<u8> = content.trim().split(':')
+        .filter_map(|s| u8::from_str_radix(s, 16).ok())
+        .collect();
+    if parts.len() == 6 {
+        Some([parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]])
     } else {
         None
     }

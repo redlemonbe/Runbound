@@ -16,12 +16,13 @@ commercial license.
 
 ## Disabling XDP
 
-There are three ways to disable the XDP fast path, depending on the context:
+There are four ways to disable the XDP fast path, depending on the context:
 
 | Method | When to use |
 |---|---|
 | `xdp: no` in `unbound.conf` | Persistent disable — survives restarts |
 | `runbound --no-xdp [config]` | One-shot disable without editing config |
+| `RUNBOUND_DISABLE_XDP=1` env var | Emergency — host unreachable after XDP attach, no config access |
 | `cargo build --release --no-default-features` | Build-time disable — removes the code entirely |
 
 **Config file (`unbound.conf`):**
@@ -37,10 +38,16 @@ server:
 runbound --no-xdp /etc/runbound/unbound.conf
 ```
 
-Both produce the same log line at startup:
+Config file and CLI produce the same log line:
 
 ```
 INFO runbound: XDP fast path disabled (xdp: no / --no-xdp)
+```
+
+The env var produces:
+
+```
+INFO runbound::dns::xdp::worker: XDP disabled via RUNBOUND_DISABLE_XDP environment variable
 ```
 
 The server then runs on the standard `SO_REUSEPORT` kernel path with no capability
@@ -94,11 +101,39 @@ INFO runbound::dns::xdp::worker: Starting XDP workers iface=eth0 queues=N
 INFO runbound: XDP kernel-bypass fast path active iface=eth0
 ```
 
-If XDP is unavailable, Runbound continues normally:
+**virtio-net MTU warning** — emitted when `MTU > 3506` (virtio-net single-buffer limit).
+DRV mode falls back to SKB mode automatically; no action required unless lower latency is needed:
+
+```
+WARN runbound::dns::xdp::worker: MTU exceeds virtio-net single-buffer XDP limit —
+     DRV mode unavailable, falling back to SKB mode (higher latency).
+     Reduce MTU to ≤3506 or accept SKB-mode operation. iface=eth0 mtu=9000 limit=3506
+```
+
+**Single-queue warning** — emitted on virtio-net VMs with a single RX queue and multiple CPUs.
+XDP workers share queue 0 in locked TX mode. To improve throughput, set `queues=<N>` in the VM NIC config:
+
+```
+WARN runbound::dns::xdp::worker: virtio-net single-queue detected — XDP workers share queue 0
+     in locked TX mode. For multi-queue performance set queues=<N> in the VM NIC config.
+```
+
+If XDP is unavailable, Runbound continues normally on the SO_REUSEPORT path:
 
 ```
 WARN runbound: XDP disabled: <reason> — server running normally on SO_REUSEPORT path
 ```
+
+## Shutdown and restart
+
+The XDP program is attached via `BPF_LINK_CREATE` (fd-backed link). It is detached in two cases:
+
+- **Graceful shutdown** (SIGTERM / `systemctl stop`) — Runbound's `Drop` implementation explicitly
+  calls `Xdp::detach()` before the process exits. This prevents a race window during hot-restarts.
+- **Crash / SIGKILL** — the kernel closes the link file descriptor on process exit, which
+  automatically removes the XDP attachment. DNS traffic resumes on the kernel UDP stack immediately.
+
+In both cases `bpftool prog list` and `ip link show` will show no XDP program after exit.
 
 ## Manual service file configuration
 

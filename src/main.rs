@@ -22,10 +22,8 @@ mod upstreams;
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use anyhow::Result;
-#[cfg(target_os = "linux")]
-use libc;
 use arc_swap::ArcSwap;
 use tracing::{error, info};
 
@@ -79,7 +77,7 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: String) -> Result<()> {
-    let (zones, rate_limiter, acl, global_stats, log_buffer, audit) =
+    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_active) =
         build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // ── XDP fast path (optional, feature-gated) ───────────────────────────
@@ -99,11 +97,11 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
                 }
                 Some(s.to_string())
             })
-            .or_else(|| dns::xdp::socket::default_interface());
+            .or_else(dns::xdp::socket::default_interface);
         match iface {
             Some(ref iface_name) => {
                 match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl)) {
-                    Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); Some(h) }
+                    Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); xdp_active.store(true, Ordering::Relaxed); Some(h) }
                     Ok(None)    => None, // virtual interface or self-test — already warned
                     Err(e) => {
                         let reason = if e.contains("BPF_PROG_LOAD") {
@@ -269,6 +267,7 @@ async fn build_and_launch(
     Arc<Stats>,
     logbuffer::SharedLogBuffer,
     audit::AuditLogger,
+    Arc<AtomicBool>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -435,6 +434,8 @@ async fn build_and_launch(
         }
     }
 
+    let xdp_active = Arc::new(AtomicBool::new(false));
+
     let state = AppState {
         zones:          Arc::clone(&zones),
         tls_cfg:        Arc::clone(&tls_cfg),
@@ -450,6 +451,7 @@ async fn build_and_launch(
         slave_mode:     cfg.is_slave(),
         base_dir:       Arc::new(base_dir),
         audit:          audit.clone(),
+        xdp_active:     Arc::clone(&xdp_active),
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
@@ -462,7 +464,7 @@ async fn build_and_launch(
     let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200));
     let acl          = Arc::new(Acl::from_config(&cfg.access_control));
 
-    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit))
+    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_active))
 }
 
 fn print_help() {
