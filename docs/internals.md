@@ -103,21 +103,21 @@ DNS header       →  QR bit == 0 (query, not response) ?
 
 All header accesses are bounds-checked against `data_end` — BPF verifier rejects the program otherwise.
 
-### CPUMAP routing **[partially planned]**
+### CPUMAP routing (#67)
 
-**Implemented:** `bpf_redirect_map(&cpumap, queue_id % nb_workers, XDP_PASS)` steers packets to a specific CPU.
-
-**Planned (#67):** FNV-1a hash of QNAME → `hash % NB_WORKERS` → always the same CPU for the same domain. Effect: L1/L2 cache warm for that domain's cache entry on every query. Cross-core cache line bouncing eliminated.
+**Implemented.** FNV-1a hash of QNAME → `hash % NB_WORKERS` → always the same CPU for the same domain. Enabled with `xdp-domain-routing: yes`.
 
 ```c
-// planned
-uint32_t h = 2166136261u;
-for (int i = 0; i < 64 && qname[i]; i++) {
-    h ^= (uint8_t)qname[i];
-    h *= 16777619u;
+// ebpf/dns_xdp.c — dns_qname_hash()
+uint32_t h = 2166136261u;  // FNV-1a offset basis
+for (int i = 0; i < 64 && ...; i++) {
+    h ^= (b | 0x20u);      // ASCII lowercase
+    h *= 16777619u;         // FNV-1a prime
 }
-bpf_redirect_map(&cpumap, h % nb_workers, XDP_PASS);
+bpf_redirect_map(&CPUMAP, h % nb_workers, XDP_PASS);
 ```
+
+Effect: L1/L2 cache stays warm for each domain on its dedicated core. Cross-core cache line bouncing eliminated. CPUMAP initialized in `src/dns/xdp/loader.rs`, flag `DOMAIN_ROUTING_ENABLED` passed via aya global.
 
 ### XSKMAP
 
@@ -265,10 +265,9 @@ DNS responses from upstream are inserted into `DashMap<QuestionKey, CacheEntry>`
 | Rate limiter (DashMap) | v0.5.0 | ~100 ns |
 | LocalZoneSet lookup | v0.4.14 | ~200 ns |
 | Cache snapshot lookup (DashMap) | v0.6.9 | ~100 ns |
-| Build response (memcpy) | v0.4.14 | ~200 ns |
+| Build response (wire_payload memcpy + QueryID patch) | v0.6.9 | ~80 ns |
 | TX enqueue + kick (batch/32) | v0.6.8 | ~50 ns |
-| **Total — cache hit** | | **~980 ns** |
-| **Total — wire format cache [planned]** | #64 | **< 300 ns** |
+| **Total — cache hit (wire format)** | | **~580 ns** |
 | Slow path — local zone (Tokio) | v0.4.14 | ~200 µs |
 | Slow path — upstream UDP | v0.4.14 | RTT + ~50 µs |
 | Slow path — upstream DoT | v0.6.7 | RTT + ~2 ms |
@@ -303,17 +302,7 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 
 ## 8. Planned optimisations
 
-### #64 — Wire format cache
-
-Pre-serialize DNS response payloads at cache insert time. XDP worker: `memcpy` + QueryID patch only. Eliminates DNS parsing on cache hit. Target: < 300 ns/query. See §4 above.
-
-### #67 — DNS-aware CPUMAP routing
-
-FNV-1a hash of QNAME → fixed CPU assignment per domain. Cache entries for `google.com` always live in the L1/L2 of the same core. Eliminates cache-line bouncing between cores. Target: −20% latency variance.
-
-### #64 + #67 combined
-
-The two optimisations compound: domain X always goes to CPU Y, and on CPU Y the response for X is already in L1 as a pre-built wire blob. Target: **< 200 ns** for hot cache entries.
+### #65 — io_uring slow path
 
 ### #65 — io_uring slow path
 
