@@ -265,7 +265,7 @@ DNS responses from upstream are inserted into `DashMap<QuestionKey, CacheEntry>`
 | Rate limiter (DashMap) | v0.5.0 | ~100 ns |
 | LocalZoneSet lookup | v0.4.14 | ~200 ns |
 | Cache snapshot lookup (DashMap) | v0.6.9 | ~100 ns |
-| Build response (wire_payload memcpy + QueryID patch) | v0.6.9 | ~80 ns |
+| Build response (wire_payload memcpy + QueryID patch) | v0.6.8 | ~80 ns |
 | TX enqueue + kick (batch/32) | v0.6.8 | ~50 ns |
 | **Total — cache hit (wire format)** | | **~580 ns** |
 | Slow path — local zone (Tokio) | v0.4.14 | ~200 µs |

@@ -75,6 +75,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 - **`GET /api/upstreams`**: new `source` field (`"config"` or `"runtime"`).
 
+- **#64 — Wire format cache** (`src/dns/cache_snapshot.rs`): `CacheEntry` now stores a pre-serialized UDP payload (`wire_payload: Bytes`). XDP worker answers cache hits with a direct `memcpy` + QueryID patch — no DNS parsing on the hot path. Reduces cache-hit latency to ~580 ns.
+
+- **#67 — DNS-aware CPUMAP routing** (`ebpf/dns_xdp.c`, `src/dns/xdp/loader.rs`): FNV-1a hash of QNAME (`dns_qname_hash()`, ASCII-lowercased, max 64 bytes) selects a dedicated CPU via CPUMAP. All queries for the same domain always land on the same core — L1/L2 stays warm. Enable with `xdp-domain-routing: yes`. Falls back to RSS with a `WARN` if CPUMAP init fails.
+
 ### Fixed
 
 - **#77 — DoT pool exhaustion after idle**: `rebuild_and_swap` now calls `warm_up()` (3 × 250 ms probes) on new resolvers before swapping. Eliminates SERVFAIL burst on first post-idle query.
