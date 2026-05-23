@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 # Runbound installer for Debian / Ubuntu / RHEL-compatible distros
 # Downloads the latest release binary from GitHub — no Rust toolchain required.
 #

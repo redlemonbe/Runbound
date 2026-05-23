@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // XDP filter — redirects UDP port 53 (IPv4 + IPv6) to AF_XDP sockets.
 // The user-space handler answers local-zone queries directly from the NIC
 // ring buffer, bypassing the kernel network stack entirely.
