@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use config::parser::UnboundConfig;
 use dns::local::LocalZoneSet;
@@ -557,7 +557,7 @@ async fn build_and_launch(
                 // ── Relay server + auto-registration (#85, #88) ──────────────────────
                 match cfg.sync_port {
                     None => {
-                        info!("Slave relay disabled — add sync-port to config to enable config push and relay forwarding");
+                        warn!("Slave relay disabled — add sync-port to slave config to enable config push and relay forwarding");
                     }
                     Some(port) => {
                         match sync::ensure_relay_cert() {
@@ -615,9 +615,19 @@ async fn build_and_launch(
                                             tokio::spawn(async move {
                                                 // Brief delay — let relay server bind before registering.
                                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                                api::relay::register_with_master(
-                                                    master_addr, key2, nid2, relay_host, fp, ver,
-                                                ).await;
+                                                // Retry with exponential backoff until success or shutdown.
+                                                let mut delay = 2u64;
+                                                loop {
+                                                    if api::relay::register_with_master(
+                                                        master_addr.clone(), key2.clone(),
+                                                        nid2.clone(), relay_host.clone(),
+                                                        fp.clone(), ver.clone(),
+                                                    ).await {
+                                                        break;
+                                                    }
+                                                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                                                    delay = (delay * 2).min(300);
+                                                }
                                             });
                                         }
                                     }

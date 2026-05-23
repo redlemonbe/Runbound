@@ -273,6 +273,7 @@ pub fn push_to_slaves(
 //
 // Called at slave startup: generates/loads node_id, registers with master.
 
+/// Returns true on success (HTTP 200), false otherwise.
 pub async fn register_with_master(
     master_sync_addr: String,  // "ip:port"
     sync_key:         String,
@@ -280,7 +281,7 @@ pub async fn register_with_master(
     relay_host:       String,  // "{slave_ip}:{slave_sync_port}"
     cert_fingerprint: String,
     version:          String,
-) {
+) -> bool {
     use http_body_util::Full;
     use hyper_util::rt::TokioIo;
 
@@ -291,7 +292,7 @@ pub async fn register_with_master(
         "version":          version,
     })) {
         Ok(b) => Bytes::from(b),
-        Err(e) => { warn!("register: serialize failed: {e}"); return; }
+        Err(e) => { warn!("register: serialize failed: {e}"); return false; }
     };
 
     let ts  = hmac_unix_now();
@@ -300,7 +301,7 @@ pub async fn register_with_master(
     let tls_config = relay_tls_config();
     let server_name = match rustls::pki_types::ServerName::try_from("runbound-relay") {
         Ok(n) => n,
-        Err(e) => { warn!("register: SNI error: {e}"); return; }
+        Err(e) => { warn!("register: SNI error: {e}"); return false; }
     };
 
     let result: anyhow::Result<u16> = async {
@@ -352,8 +353,17 @@ pub async fn register_with_master(
     }.await;
 
     match result {
-        Ok(200) => info!(master = %master_sync_addr, "Registered with master"),
-        Ok(s)   => warn!(master = %master_sync_addr, status = s, "Registration returned non-200"),
-        Err(e)  => warn!(master = %master_sync_addr, err = %e, "Registration failed"),
+        Ok(200) => {
+            warn!(master = %master_sync_addr, "Registered with master");
+            true
+        }
+        Ok(s) => {
+            warn!(master = %master_sync_addr, status = s, "Registration returned non-200");
+            false
+        }
+        Err(e) => {
+            warn!(master = %master_sync_addr, err = %e, "Registration failed");
+            false
+        }
     }
 }
