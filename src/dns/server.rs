@@ -13,8 +13,8 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
@@ -60,6 +60,14 @@ use super::ratelimit::RateLimiter;
 const MAX_INFLIGHT_REQUESTS: usize = 4_096;
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
+
+// ── DoT rebuild rate-limiter ────────────────────────────────────────────────
+// At most one resolver rebuild every 2 s. Under sustained DoT pool exhaustion
+// every failed query would otherwise trigger its own rebuild, creating a
+// positive-feedback loop that saturates the Tokio runtime with rebuild tasks.
+// DOT_REBUILD_LAST_LOG_SECS throttles the log to at most one message per 10 s.
+static DOT_REBUILD_LAST_SECS:     AtomicU64 = AtomicU64::new(0);
+static DOT_REBUILD_LAST_LOG_SECS: AtomicU64 = AtomicU64::new(0);
 
 // ── Identity-probe name set (zero-alloc hot path) ──────────────────────────
 // Initialised once on first DNS query; compared directly as LowerName.
@@ -323,13 +331,33 @@ impl RunboundHandler {
         };
 
         // Level 2: transparent reconnection on DoT pool exhaustion (#77).
+        // Rate-limited to one rebuild every 2 s: under sustained pool exhaustion,
+        // every failed query would otherwise spawn its own rebuild task, creating
+        // a positive-feedback loop that saturates the Tokio scheduler.
+        // Queries that lose the CAS race return SERVFAIL immediately — no rebuild.
         if let Err(ref e) = result {
             if is_pool_exhausted(e) {
-                warn!(name=%sanitize_dns_name(qname), "DoT pool exhausted — rebuilding resolver for retry");
-                let addrs = crate::upstreams::upstream_addrs(&self.upstreams);
-                if rebuild_and_swap(&self.resolver, &addrs, self.dnssec_enabled).await.is_ok() {
-                    self.stats.record_dot_reconnect();
-                    result = self.resolver.load().lookup(Name::from(qname), qtype).await;
+                let now_s = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let last = DOT_REBUILD_LAST_SECS.load(Ordering::Relaxed);
+                if now_s.saturating_sub(last) >= 2
+                    && DOT_REBUILD_LAST_SECS
+                        .compare_exchange(last, now_s, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    // At most one log line per 10 s so the event is visible without spam.
+                    let last_log = DOT_REBUILD_LAST_LOG_SECS.load(Ordering::Relaxed);
+                    if now_s.saturating_sub(last_log) >= 10 {
+                        DOT_REBUILD_LAST_LOG_SECS.store(now_s, Ordering::Relaxed);
+                        info!(name=%sanitize_dns_name(qname), "DoT pool exhausted — rebuilding resolver");
+                    }
+                    let addrs = crate::upstreams::upstream_addrs(&self.upstreams);
+                    if rebuild_and_swap(&self.resolver, &addrs, self.dnssec_enabled).await.is_ok() {
+                        self.stats.record_dot_reconnect();
+                        result = self.resolver.load().lookup(Name::from(qname), qtype).await;
+                    }
                 }
             }
         }
