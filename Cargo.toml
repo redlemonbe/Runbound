@@ -1,6 +1,6 @@
 [package]
 name = "runbound"
-version = "0.6.11"
+version = "0.6.12"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "AGPL-3.0-or-later"
@@ -107,6 +107,9 @@ http = "1"
 
 # Stream utilities — SSE streaming for /stats/stream endpoint
 futures-util = "0.3"
+
+# Zero-copy cache persistence (#29)
+rkyv = { version = "0.8", features = ["bytecheck", "smallvec-1"] }
 
 # Async trait (required by RequestHandler impl)
 async-trait = "0.1"

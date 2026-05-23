@@ -36,6 +36,7 @@ use hickory_server::{
 use bytes::Bytes;
 use smallvec::SmallVec;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use futures_util::future::select_ok;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -99,25 +100,33 @@ pub struct RunboundHandler {
     cache_max_entries: usize,
     /// #77: upstream list for transparent pool reconnection on DoT exhaustion.
     upstreams:         crate::upstreams::SharedUpstreams,
+    /// #33: per-upstream resolvers for racing mode.
+    per_upstream_resolvers: SharedResolversVec,
+    upstream_racing:   bool,
+    /// #33: per-upstream win counters — how many times each upstream answered first.
+    pub racing_wins: Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
 }
 
 impl RunboundHandler {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        zones:             Arc<ArcSwap<LocalZoneSet>>,
-        resolver:          Arc<ArcSwap<TokioResolver>>,
-        rate_limiter:      Arc<RateLimiter>,
-        acl:               Arc<Acl>,
-        private_addrs:     Arc<PrivateAddressSet>,
-        cache_max_ttl:     u32,
-        stats:             Arc<Stats>,
-        log_buffer:        SharedLogBuffer,
-        dnssec_enabled:    bool,
-        dnssec_log_bogus:  bool,
-        prefetch_tracker:  Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
-        xdp_cache:         Option<super::cache_snapshot::MutableCacheMap>,
-        cache_max_entries: usize,
-        upstreams:         crate::upstreams::SharedUpstreams,
+        zones:                   Arc<ArcSwap<LocalZoneSet>>,
+        resolver:                Arc<ArcSwap<TokioResolver>>,
+        rate_limiter:            Arc<RateLimiter>,
+        acl:                     Arc<Acl>,
+        private_addrs:           Arc<PrivateAddressSet>,
+        cache_max_ttl:           u32,
+        stats:                   Arc<Stats>,
+        log_buffer:              SharedLogBuffer,
+        dnssec_enabled:          bool,
+        dnssec_log_bogus:        bool,
+        prefetch_tracker:        Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
+        xdp_cache:               Option<super::cache_snapshot::MutableCacheMap>,
+        cache_max_entries:       usize,
+        upstreams:               crate::upstreams::SharedUpstreams,
+        per_upstream_resolvers:  SharedResolversVec,
+        upstream_racing:         bool,
+        racing_wins:             Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
     ) -> Self {
         Self {
             zones, resolver, rate_limiter,
@@ -125,6 +134,7 @@ impl RunboundHandler {
             acl, private_addrs, cache_max_ttl, stats, log_buffer,
             dnssec_enabled, dnssec_log_bogus, prefetch_tracker,
             xdp_cache, cache_max_entries, upstreams,
+            per_upstream_resolvers, upstream_racing, racing_wins,
         }
     }
 
@@ -279,7 +289,38 @@ impl RunboundHandler {
         client_ip: IpAddr,
         start: Instant,
     ) -> ResponseInfo {
-        let mut result = self.resolver.load().lookup(Name::from(qname), qtype).await;
+        // #33: racing mode — send to all upstreams simultaneously, first wins.
+        let mut result = if self.upstream_racing {
+            let resolvers = self.per_upstream_resolvers.load();
+            if resolvers.len() >= 2 {
+                let name = Name::from(qname);
+                let futs: Vec<_> = resolvers.iter()
+                    .map(|(addr, r)| {
+                        let r    = Arc::clone(r);
+                        let n    = name.clone();
+                        let addr = addr.clone();
+                        Box::pin(async move {
+                            r.lookup(n, qtype).await.map(|l| (l, addr))
+                        })
+                    })
+                    .collect();
+                match select_ok(futs).await {
+                    Ok(((lookup, winner), _rest)) => {
+                        // Record win for the upstream that answered first.
+                        self.racing_wins
+                            .entry(winner)
+                            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
+                            .fetch_add(1, Ordering::Relaxed);
+                        Ok(lookup)
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                self.resolver.load().lookup(Name::from(qname), qtype).await
+            }
+        } else {
+            self.resolver.load().lookup(Name::from(qname), qtype).await
+        };
 
         // Level 2: transparent reconnection on DoT pool exhaustion (#77).
         if let Err(ref e) = result {
@@ -663,6 +704,32 @@ async fn send_error<R: ResponseHandler>(
 
 /// Shared, hot-swappable DNS resolver used by the server handler and the API.
 pub type SharedResolver = Arc<ArcSwap<TokioResolver>>;
+
+/// One resolver per upstream, used for DNS racing (#33).
+/// Each entry is `(upstream_addr, resolver)`.
+pub type SharedResolversVec = Arc<ArcSwap<Vec<(String, Arc<TokioResolver>)>>>;
+
+/// Build one TokioResolver per upstream for racing mode.
+pub fn build_per_upstream_resolvers(
+    addrs:  &[(String, u16, bool, Option<String>)],
+    dnssec: bool,
+) -> anyhow::Result<Vec<(String, Arc<TokioResolver>)>> {
+    let mut result = Vec::with_capacity(addrs.len());
+    for (addr_str, port, use_tls, tls_hostname) in addrs {
+        let single = build_resolver_from_addrs(
+            &[(addr_str.clone(), *port, *use_tls, tls_hostname.clone())],
+            0, // no hickory-cache needed for racing path
+            dnssec,
+        )?;
+        result.push((addr_str.clone(), Arc::new(single)));
+    }
+    Ok(result)
+}
+
+/// Create an empty SharedResolversVec — populated when upstream-racing is enabled.
+pub fn create_shared_resolvers_vec() -> SharedResolversVec {
+    Arc::new(ArcSwap::new(Arc::new(Vec::new())))
+}
 
 /// Create a SharedResolver from config at startup. Call once in build_and_launch.
 pub fn create_shared_resolver(cfg: &UnboundConfig) -> anyhow::Result<SharedResolver> {
@@ -1371,17 +1438,19 @@ async fn run_tcp_with_limit(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dns_server(
-    cfg:               &UnboundConfig,
-    zones:             Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter:      Arc<RateLimiter>,
-    acl:               Arc<Acl>,
-    stats:             Arc<Stats>,
-    log_buffer:        SharedLogBuffer,
-    resolver:          SharedResolver,
-    prefetch_tracker:  Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
-    xdp_cache:         Option<super::cache_snapshot::MutableCacheMap>,
-    cache_max_entries: usize,
-    upstreams:         crate::upstreams::SharedUpstreams,
+    cfg:                    &UnboundConfig,
+    zones:                  Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter:           Arc<RateLimiter>,
+    acl:                    Arc<Acl>,
+    stats:                  Arc<Stats>,
+    log_buffer:             SharedLogBuffer,
+    resolver:               SharedResolver,
+    prefetch_tracker:       Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
+    xdp_cache:              Option<super::cache_snapshot::MutableCacheMap>,
+    cache_max_entries:      usize,
+    upstreams:              crate::upstreams::SharedUpstreams,
+    per_upstream_resolvers: SharedResolversVec,
+    racing_wins:            Arc<DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -1439,6 +1508,7 @@ pub async fn run_dns_server(
         Arc::clone(&zones), Arc::clone(&resolver), rate_limiter, acl, private_addrs,
         cache_max_ttl, stats, log_buffer, cfg.dnssec_validation, cfg.dnssec_log_bogus,
         prefetch_tracker, xdp_cache, cache_max_entries, upstreams,
+        per_upstream_resolvers, cfg.upstream_racing, racing_wins,
     );
     let mut server = Server::new(handler);
 
