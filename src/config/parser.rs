@@ -146,6 +146,10 @@ pub struct UnboundConfig {
     /// Attempt to allocate UMEM using 2 MiB huge pages. Default: true.
     /// Falls back silently to standard 4 KiB pages when huge pages are unavailable.
     pub xdp_hugepages: bool,
+    /// Enable the XDP DNS cache snapshot (ArcSwap-backed, zero-lock reads). Default: true.
+    pub xdp_cache_snapshot: bool,
+    /// Maximum entries in the XDP cache snapshot. Default: 10 000.
+    pub xdp_cache_snapshot_size: usize,
 
     // ── DNS prefetching ───────────────────────────────────────────────────────
     /// Pre-resolve popular domains before their cache entry expires. Default: false.
@@ -173,9 +177,11 @@ impl UnboundConfig {
             sync_interval: 30,
             log_retention: 1000,
             log_client_ip: true,
-            cpu_affinity:       true,
-            xdp:                true,
-            xdp_hugepages:      true,
+            cpu_affinity:            true,
+            xdp:                     true,
+            xdp_hugepages:           true,
+            xdp_cache_snapshot:      true,
+            xdp_cache_snapshot_size: 10_000,
             cache_min_entries:  2048,
             prefetch:             false,
             prefetch_threshold:   5,
@@ -366,7 +372,9 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "xdp"                 => cfg.xdp                 = val.trim_matches('"') != "no",
         "xdp-cpu-governor"    => cfg.xdp_cpu_governor    = val.trim_matches('"') == "yes",
         "xdp-irq-affinity"    => cfg.xdp_irq_affinity    = val.trim_matches('"') == "yes",
-        "xdp-hugepages"       => cfg.xdp_hugepages       = val.trim_matches('"') != "no",
+        "xdp-hugepages"            => cfg.xdp_hugepages            = val.trim_matches('"') != "no",
+        "xdp-cache-snapshot"       => cfg.xdp_cache_snapshot       = val.trim_matches('"') != "no",
+        "xdp-cache-snapshot-size"  => cfg.xdp_cache_snapshot_size  = val.parse().unwrap_or(10_000),
         "prefetch"              => cfg.prefetch              = val.trim_matches('"') == "yes",
         "prefetch-threshold"    => cfg.prefetch_threshold    = val.parse().unwrap_or(5),
         "cache-flush-cooldown"  => cfg.cache_flush_cooldown  = val.parse().unwrap_or(60),

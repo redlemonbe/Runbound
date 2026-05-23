@@ -49,6 +49,23 @@ const HICKORY_CACHE_SIZE: u64 = 8_192;
 // hickory's in-process cache (real upstream RTT is typically 5–200 ms).
 pub const CACHE_HIT_THRESHOLD_US: u64 = 2_000;
 
+// ── Cache-line padding (#70) ───────────────────────────────────────────────
+// Wraps a value so it occupies its own 64-byte cache line.
+// Used for fields that are written by different CPU cores (qps_head / qps_peak
+// written by qps_update_loop vs. the per-query counters written by DNS handlers)
+// to prevent false sharing — a read-for-ownership on one core invalidating the
+// cache line of another core that modified an unrelated field in the same line.
+#[repr(align(64))]
+pub struct CachePadded<T>(pub T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline] fn deref(&self) -> &T { &self.0 }
+}
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline] fn deref_mut(&mut self) -> &mut T { &mut self.0 }
+}
+
 pub struct Stats {
     // Core query counters
     pub total:     AtomicU64,
@@ -64,8 +81,11 @@ pub struct Stats {
 
     // QPS ring buffer — 300 one-second slots
     pub qps_ring:  Vec<AtomicU64>,
-    pub qps_head:  AtomicU64,   // next write slot index
-    pub qps_peak:  AtomicU64,   // all-time peak (queries in any one second)
+    // #70: each field lives on its own 64-byte cache line — qps_update_loop writes
+    // these from a background task while DNS handlers write total/blocked/… on other
+    // cores.  Without padding both would share a line causing false-sharing evictions.
+    pub qps_head:  CachePadded<AtomicU64>,  // next write slot index
+    pub qps_peak:  CachePadded<AtomicU64>,  // all-time peak (queries in any one second)
 
     // Cache / local resolution metrics
     // cache_hits: forwarded lookups < CACHE_HIT_THRESHOLD_US (likely in-process cache)
@@ -98,8 +118,8 @@ impl Stats {
             started_at: Instant::now(),
             lat_hist:   (0..HIST_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
             qps_ring:   (0..QPS_RING_SIZE).map(|_| AtomicU64::new(0)).collect(),
-            qps_head:   AtomicU64::new(0),
-            qps_peak:   AtomicU64::new(0),
+            qps_head:   CachePadded(AtomicU64::new(0)),
+            qps_peak:   CachePadded(AtomicU64::new(0)),
             cache_hits:    AtomicU64::new(0),
             cache_misses:  AtomicU64::new(0),
             cache_entries: AtomicU64::new(0),
