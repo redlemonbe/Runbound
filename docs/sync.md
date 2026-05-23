@@ -4,13 +4,28 @@ Runbound supports active/passive replication. The master holds the authoritative
 state (blacklist, DNS zones, feeds). Slaves connect to the master, receive the
 full state on first connection, and receive incremental updates in real time.
 
+Starting with v0.6.20, the synchronisation stack also includes:
+
+- **HMAC-SHA256 encrypted relay** (#85) — master can forward REST API commands to any slave over a signed TLS channel
+- **Config push** (#87) — every write on the master is immediately pushed to all registered slaves (fire-and-forget)
+- **Slave auto-registration** (#88) — slaves register themselves with the master at startup; no manual node setup required
+
 ---
 
 ## Architecture
 
 ```
-clients → slave (192.168.1.11:53)  ──sync──▶  master (192.168.1.10:53)
-clients → master (192.168.1.10:53)
+                 ┌──────────────────────────────────┐
+clients ──DNS──▶ │  slave  192.168.1.11:53           │
+                 │  relay server :8082 (TLS + HMAC)  │◀── config push ──┐
+                 └──────────────────────────────────┘                    │
+                                  │ sync (delta journal)                 │
+                                  ▼                                       │
+                 ┌──────────────────────────────────┐                    │
+clients ──DNS──▶ │  master 192.168.1.10:53           │ ─── relay fwd ───▶│
+                 │  sync server :8082 (HTTPS)        │
+                 │  REST API    :8080 (localhost)     │
+                 └──────────────────────────────────┘
 ```
 
 The slave answers DNS queries autonomously. If the master is unreachable, the
@@ -27,7 +42,9 @@ server:
     sync-key:   <generate with: openssl rand -hex 32>
 ```
 
-`sync-port` defines the TCP port the master listens on for incoming slave connections.
+`sync-port` opens the HTTPS sync server (delta journal + node registration).  
+`sync-key` authenticates slaves and signs relay traffic. If omitted, a random 256-bit
+key is generated at startup and printed to the log.
 
 ---
 
@@ -36,16 +53,73 @@ server:
 ```
 server:
     mode:        slave
-    sync-master: 192.168.1.10:8082   # IP:port — port must match master's sync-port
+    sync-master: 192.168.1.10:8082   # master IP:port
     sync-key:    <same key as master>
+    sync-port:   8082                # opens the slave relay server (TLS + HMAC)
 ```
 
-> **Note:** `sync-port` is a master-only directive. On the slave, the master
-> address and port are combined in `sync-master: <IP>:<port>`. Using a separate
-> `sync-port` directive on the slave produces `invalid socket address` at startup.
+`sync-port` on the slave starts a TLS relay server on that port. The master connects
+to this port to push config changes and forward API commands.
+
+On startup the slave:
+1. Generates (or loads) a stable UUID from `/etc/runbound/node-id`.
+2. Generates (or loads) a self-signed TLS certificate at `/etc/runbound/relay-cert.pem`.
+3. Starts the TLS relay server on `sync-port`.
+4. Registers with the master via `POST /nodes/register` (HMAC-signed), advertising its
+   `relay_host` (`<slave_ip>:<sync-port>`) and cert fingerprint.
 
 All other directives (`interface`, `port`, `forward-zone`, `access-control`, etc.)
 are identical to the master.
+
+---
+
+## HMAC relay security
+
+All relay traffic is authenticated with **HMAC-SHA256** using the shared `sync-key`.
+Each request carries two headers:
+
+| Header | Content |
+|---|---|
+| `X-Runbound-TS` | Unix timestamp (seconds) — anti-replay window |
+| `X-Runbound-Sig` | `HMAC-SHA256(key, METHOD + PATH + TS)` encoded as hex |
+
+The receiver rejects any request where the timestamp differs by more than **±30 seconds**
+from its own clock. Signature comparison is constant-time (via `subtle::ConstantTimeEq`).
+
+TLS provides encryption; HMAC provides authentication. The TLS layer does not validate
+certificates (both sides use self-signed certs) — the shared key is the trust anchor.
+
+---
+
+## Config push (#87)
+
+After every write operation on the master (add/delete DNS entry, blacklist, upstream),
+the master fires-and-forgets the same operation to all registered slaves over the relay
+channel. If a slave is unreachable, the push fails silently and a `WARN` is logged; the
+slave will catch up via the normal delta-journal sync on its next poll.
+
+---
+
+## Relay forwarding
+
+The master's REST API exposes a relay endpoint that forwards any request to a specific
+slave:
+
+```
+ANY /api/nodes/{node_id}/relay/{path}
+```
+
+Example — flush the cache on a specific slave:
+
+```bash
+curl -X POST "http://localhost:8080/api/nodes/a1b2c3.../relay/cache/flush" \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
+```
+
+The master looks up the slave by `node_id`, signs the request with HMAC, and proxies it
+to the slave's relay server. The slave's response is returned verbatim.
+
+Anti-recursion: the master refuses to relay to `/relay/*` (prevents relay loops).
 
 ---
 
@@ -56,10 +130,11 @@ This is the most common reason synchronisation fails.
 | Port | Protocol | Direction | Purpose |
 |---|---|---|---|
 | 53 | UDP + TCP | clients → master/slave | DNS queries |
-| 8082 | TCP | slave → master | sync channel |
+| 8082 | TCP | slave → master | delta journal (slave initiates) |
+| 8082 | TCP | master → slave | relay / config push (master initiates) |
 | 8080 | TCP | localhost only | REST API (not exposed by default) |
 
-**On the master**, open port 8082 to the slave subnet:
+**On the master**, open port 8082 inbound from the slave subnet:
 
 ```bash
 # UFW (Debian/Ubuntu)
@@ -73,11 +148,18 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=1
 sudo firewall-cmd --reload
 ```
 
-> **Port 8082 is the #1 reason sync fails.** The port is open on Runbound's
-> side but blocked by the host firewall. Verify from the slave:
+**On the slave**, open port 8082 inbound from the master:
+
+```bash
+sudo ufw allow from 192.168.1.10 to any port 8082 proto tcp comment "Runbound relay"
+```
+
+> **Port 8082 is the #1 reason sync fails.** Verify both directions:
 > ```bash
+> # From slave — can it reach the master?
 > nc -zv 192.168.1.10 8082
-> # Expected: Connection to 192.168.1.10 8082 port [tcp/*] succeeded
+> # From master — can it reach the slave?
+> nc -zv 192.168.1.11 8082
 > ```
 
 ---
@@ -87,17 +169,44 @@ sudo firewall-cmd --reload
 On the slave, check the logs shortly after startup:
 
 ```bash
-journalctl -u runbound -n 20
+journalctl -u runbound -n 30
 ```
 
 Expected:
 ```
 INFO runbound::sync: connected to master master=192.168.1.10:8082
 INFO runbound::sync: initial state received zones=42 blacklist=1200 feeds=2
+INFO runbound::sync: relay server listening port=8082
+INFO runbound::api::relay: Registered with master master=192.168.1.10:8082
 ```
 
-If you see `Connection timed out` → firewall on the master blocking port 8082.  
-If you see `Unauthorized` → `sync-key` mismatch between master and slave.
+On the master:
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/nodes
+```
+
+```json
+{
+  "nodes": [
+    {
+      "node_id":          "a1b2c3d4-...",
+      "addr":             "192.168.1.11",
+      "relay_host":       "192.168.1.11:8082",
+      "cert_fingerprint": "ab:cd:ef:...",
+      "status":           "connected",
+      "last_seen_secs":   5,
+      "zones_synced":     42,
+      "version":          "0.6.20"
+    }
+  ],
+  "total": 1
+}
+```
+
+If you see `Connection timed out` → firewall blocking port 8082.  
+If you see `Unauthorized` → `sync-key` mismatch between master and slave.  
+If the slave appears in `GET /api/nodes` but `relay_host` is absent → slave's `sync-port` is not configured.
 
 ---
 
