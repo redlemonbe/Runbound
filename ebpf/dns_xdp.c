@@ -38,12 +38,17 @@ struct {
 // Entries are initialised from Rust after the worker threads are started.
 // max_entries=256 covers any realistic machine; unused entries are 0-qsize
 // (not callable) and bpf_redirect_map returns XDP_PASS for them.
+// Excluded via -DNO_CPUMAP on systems where BPF_MAP_TYPE_CPUMAP creation
+// fails (missing CAP_BPF or old kernel) — the minimal binary falls back to
+// RSS-based XSKMAP routing.
+#ifndef NO_CPUMAP
 struct {
     __uint(type, BPF_MAP_TYPE_CPUMAP);
     __uint(max_entries, 256);
     __type(key,   __u32);
     __type(value, struct bpf_cpumap_val);
 } CPUMAP SEC(".maps");
+#endif
 
 // Number of XDP worker threads — injected by Rust at load time via aya.
 // Used as the modulus for the per-domain hash so each name always maps to
@@ -54,39 +59,25 @@ volatile const __u32 NB_WORKERS = 1;
 // When 0 (default), the CPUMAP path is skipped and XSKMAP (RSS) is used.
 volatile const __u32 DOMAIN_ROUTING_ENABLED = 0;
 
-// CRC32C (Castagnoli polynomial 0x82F63B78) software hash over the first
-// 64 bytes of the DNS QNAME at `off`.
+// FNV-1a hash over the first 64 bytes of the DNS QNAME.
+//
+// CRC32C's 8-iteration inner loop (#pragma unroll 8) causes exponential
+// scalar state explosion in the BPF verifier and is rejected.  FNV-1a's
+// single multiply per byte bounds scalar state cleanly and passes the
+// verifier on all kernels that support XDP (4.8+).
 //
 // Bytes are ASCII-lowercased so "Example.com" and "example.com" hash
-// identically.  Iteration is capped at 64 — handles names up to ~60 chars
-// without heap allocation and keeps the generated BPF instruction count
-// within verifier limits.
-//
-// NOTE: __builtin_ia32_crc32qi is an x86 intrinsic and cannot be used when
-// compiling with -target bpf.  This software implementation achieves the same
-// CRC32C result and works on every kernel that supports XDP.  The BPF JIT on
-// x86 may further optimise the inner loop to hardware CRC instructions.
-// No kernel-version gating is needed: software CRC32C works from kernel 4.8+.
-static __always_inline __u32 dns_qname_hash(
-    const void *data, const void *data_end, __u32 off)
+// identically.  Iteration is capped at 64 — handles names up to ~60 chars.
+static __always_inline __u32 dns_qname_hash(const __u8 *qname, const __u8 *data_end)
 {
-    __u32 crc = 0xFFFFFFFF;
-    int i;
-
-    for (i = 0; i < 64; i++) {
-        const __u8 *p = (const __u8 *)data + off + i;
-        if ((void *)(p + 1) > data_end || *p == 0) break;
-        __u8 b = *p | 0x20u;  // ASCII lowercase (no-op for digits / dots)
-        crc ^= b;
-        // Inner loop unrolled: 8 CRC steps per byte.
-        // Branchless mask: (0 - (crc & 1)) == 0xFFFFFFFF when bit=1, 0 when bit=0.
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            __u32 mask = (__u32)(0 - (crc & 1));
-            crc = (crc >> 1) ^ (mask & 0x82F63B78u);
-        }
+    __u32 h = 2166136261u; // FNV offset basis
+    for (int i = 0; i < 64; i++) {
+        if (qname + 1 > data_end || *qname == 0) break;
+        h ^= (*qname | 0x20u); // ASCII lowercase (no-op for digits / dots)
+        h *= 16777619u;        // FNV prime
+        qname++;
     }
-    return crc ^ 0xFFFFFFFF;
+    return h;
 }
 
 SEC("xdp")
@@ -149,17 +140,19 @@ int dns_xdp(struct xdp_md *ctx)
     // verified above, IPv6 header is always fixed 40 bytes — so no packet
     // pointer arithmetic is needed here (BPF verifier forbids ptr-ptr subtraction).
     if (DOMAIN_ROUTING_ENABLED) {
+#ifndef NO_CPUMAP
         __u32 nb = NB_WORKERS;
         if (nb > 1) {
             // Constant offsets per protocol — no pointer subtraction.
             // IPv4: eth(14) + ip(20, IHL=5 verified) + udp(8) + dns_header(12) = 54
             // IPv6: eth(14) + ip6(40)                + udp(8) + dns_header(12) = 74
             __u32 qname_off = (eth_proto == ETH_P_IP) ? 54u : 74u;
-            __u32 h = dns_qname_hash(data, data_end, qname_off);
+            __u32 h = dns_qname_hash((const __u8 *)data + qname_off, (const __u8 *)data_end);
             __u32 cpu = h % nb;
             // bpf_redirect_map returns XDP_PASS when the entry is not initialised.
             return bpf_redirect_map(&CPUMAP, cpu, XDP_PASS);
         }
+#endif
     }
 
     // ── Default path: redirect to AF_XDP socket for this NIC queue ────────────

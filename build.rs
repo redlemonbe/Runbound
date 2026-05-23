@@ -2,9 +2,14 @@
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Build script: compiles the eBPF XDP filter when the "xdp" feature is enabled.
 // Requires: clang (apt install clang) + libbpf-dev (apt install libbpf-dev).
-// The compiled object is embedded into the binary with include_bytes!.
+// The compiled objects are embedded into the binary with include_bytes!.
 // This is a BUILD-time dependency only; the final binary needs neither clang
 // nor libbpf installed on the target machine.
+//
+// Two binaries are produced:
+//   dns_xdp.o         — full, with BPF_MAP_TYPE_CPUMAP (domain-affinity routing)
+//   dns_xdp_minimal.o — compiled with -DNO_CPUMAP; fallback on systems where
+//                       CPUMAP creation fails (missing CAP_BPF or old kernel)
 
 fn main() {
     println!("cargo:rerun-if-changed=ebpf/dns_xdp.c");
@@ -15,7 +20,7 @@ fn main() {
 
 #[cfg(feature = "xdp")]
 fn compile_ebpf() {
-    use std::{env, path::PathBuf, process::Command};
+    use std::{env, path::PathBuf};
 
     let out_dir      = PathBuf::from(env::var("OUT_DIR")
         .unwrap_or_else(|_| panic!("OUT_DIR not set by cargo")));
@@ -34,7 +39,6 @@ fn compile_ebpf() {
     };
 
     let src = manifest_dir.join("ebpf/dns_xdp.c");
-    let dst = out_dir.join("dns_xdp.o");
 
     // On Debian/Ubuntu the asm/* kernel headers live under the multiarch path
     // (e.g. /usr/include/x86_64-linux-gnu) rather than /usr/include/asm.
@@ -55,7 +59,8 @@ fn compile_ebpf() {
         }
     };
 
-    let mut clang_args: Vec<String> = vec![
+    // Base flags shared by both compilations.
+    let mut base_flags: Vec<String> = vec![
         "-O2".into(),
         // -g on -target bpf generates BTF (.BTF/.BTF.ext sections), not DWARF.
         // aya-obj requires BTF for BTF-style map definitions (SEC(".maps")).
@@ -64,25 +69,53 @@ fn compile_ebpf() {
         bpf_arch_flag.into(),
         "-Wall".into(),
         "-Wno-missing-prototypes".into(),
-        "-c".into(), src.to_str().unwrap_or_else(|| panic!("src path not UTF-8")).into(),
-        "-o".into(), dst.to_str().unwrap_or_else(|| panic!("dst path not UTF-8")).into(),
     ];
-    if let Some(inc) = multiarch_inc {
-        clang_args.push(format!("-I{inc}"));
+    if let Some(ref inc) = multiarch_inc {
+        base_flags.push(format!("-I{inc}"));
     }
 
+    // Full binary — with BPF_MAP_TYPE_CPUMAP for domain-affinity routing.
+    let dst = out_dir.join("dns_xdp.o");
+    run_clang_compile(&base_flags, &src, &dst, &[]);
+
+    // Minimal binary — CPUMAP excluded; used as fallback when CPUMAP creation
+    // fails on the target host (slave VM, restricted CAP_BPF, old kernel).
+    let dst_minimal = out_dir.join("dns_xdp_minimal.o");
+    run_clang_compile(&base_flags, &src, &dst_minimal, &["-DNO_CPUMAP"]);
+
+    println!(
+        "cargo:warning=eBPF programs compiled: {} + {}",
+        dst.display(),
+        dst_minimal.display(),
+    );
+}
+
+#[cfg(feature = "xdp")]
+fn run_clang_compile(
+    base_flags:  &[String],
+    src:         &std::path::Path,
+    dst:         &std::path::Path,
+    extra_flags: &[&str],
+) {
+    use std::process::Command;
+
+    let mut args: Vec<String> = base_flags.to_vec();
+    args.extend(extra_flags.iter().map(|s| s.to_string()));
+    args.push("-c".into());
+    args.push(src.to_str().unwrap_or_else(|| panic!("src path not UTF-8")).into());
+    args.push("-o".into());
+    args.push(dst.to_str().unwrap_or_else(|| panic!("dst path not UTF-8")).into());
+
     let out = Command::new("clang")
-        .args(&clang_args)
+        .args(&args)
         .output()
         .unwrap_or_else(|e| {
             panic!("clang not found ({e}). Install with: apt install clang libbpf-dev")
         });
 
     if !out.status.success() {
-        eprintln!("--- eBPF compilation stderr ---");
+        eprintln!("--- eBPF compilation stderr ({}) ---", dst.display());
         eprintln!("{}", String::from_utf8_lossy(&out.stderr));
-        panic!("eBPF compilation failed (see above)");
+        panic!("eBPF compilation of {} failed (see above)", dst.display());
     }
-
-    println!("cargo:warning=eBPF program compiled → {}", dst.display());
 }

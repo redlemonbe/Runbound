@@ -15,11 +15,17 @@ use aya::{
 };
 use aya::programs::xdp::XdpLinkId;
 
-/// Compiled XDP program bytes, embedded at build time.
+/// Full XDP binary — includes BPF_MAP_TYPE_CPUMAP for domain-affinity routing.
 /// `include_bytes!` aligns to 1 byte, but aya's ELF64 parser (via the `object`
 /// crate) requires 8-byte alignment for the ELF header read. We copy to a
-/// heap-allocated Vec inside `XdpHandle::load()` before calling `Ebpf::load()`.
+/// heap-allocated Vec<u64> inside `load_ebpf_bytes()` before calling `Ebpf::load()`.
 static XDP_PROG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns_xdp.o"));
+
+/// Minimal XDP binary — compiled with -DNO_CPUMAP.
+/// Used as fallback when BPF_MAP_TYPE_CPUMAP creation fails on the target host
+/// (slave VM, restricted CAP_BPF, or kernel < 4.15 without CPUMAP support).
+/// Domain routing is disabled when this binary is active; XSKMAP (RSS) is used.
+static XDP_PROG_MINIMAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns_xdp_minimal.o"));
 
 /// XDP attachment mode — reported by GET /api/system as `xdp_mode`.
 #[derive(Clone, Copy, Debug)]
@@ -61,35 +67,33 @@ impl XdpHandle {
     ///   `NB_WORKERS`); used for CPUMAP domain-affinity routing.
     /// - `domain_routing`: if true, enable CPUMAP-based per-domain CPU affinity (#67).
     ///
+    /// Tries the full binary (with CPUMAP) first.  If BPF_MAP_TYPE_CPUMAP
+    /// creation fails (missing CAP_BPF, slave VM, old kernel), retries with the
+    /// minimal binary (-DNO_CPUMAP) and disables domain routing automatically.
+    ///
     /// Tries native (DRV) mode first for lowest latency; falls back to
     /// generic (SKB) mode if the driver does not support native XDP.
     pub fn load(iface: &str, nb_workers: u32, domain_routing: bool) -> Result<Self, String> {
-        // Vec<u64> is guaranteed 8-byte aligned by any conforming allocator,
-        // satisfying the object crate's FileHeader64 alignment check inside aya.
-        // Vec<u8>.to_vec() does NOT guarantee 8-byte alignment.
-        let words = XDP_PROG.len().div_ceil(8);
-        let mut storage: Vec<u64> = vec![0u64; words];
-        // SAFETY: storage has len=words*8 ≥ XDP_PROG.len(), u64 → u8 cast is valid.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                XDP_PROG.as_ptr(),
-                storage.as_mut_ptr() as *mut u8,
-                XDP_PROG.len(),
-            );
-        }
-        let aligned = unsafe {
-            std::slice::from_raw_parts(storage.as_ptr() as *const u8, XDP_PROG.len())
-        };
+        let routing_flag: u32  = if domain_routing { 1 } else { 0 };
+        let effective_workers  = nb_workers.max(1);
 
-        // Inject global constants into the eBPF object before loading.
-        // These are `volatile const` variables in dns_xdp.c patched by EbpfLoader.
-        let routing_flag: u32 = if domain_routing { 1 } else { 0 };
-        let effective_workers = nb_workers.max(1);
-        let mut bpf = EbpfLoader::new()
-            .set_global("NB_WORKERS",             &effective_workers, false)
-            .set_global("DOMAIN_ROUTING_ENABLED",  &routing_flag,     false)
-            .load(aligned)
-            .map_err(|e| format!("BPF ELF load failed: {e}"))?;
+        // Try full binary (with CPUMAP).
+        let bpf_result = load_ebpf_bytes(XDP_PROG, effective_workers, routing_flag);
+
+        let (mut bpf, actual_routing) = match bpf_result {
+            Ok(bpf) => (bpf, domain_routing),
+            Err(ref e) if is_cpumap_error(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "CPUMAP creation failed — domain routing disabled, \
+                     retrying with minimal XDP binary (no CPUMAP)"
+                );
+                let bpf = load_ebpf_bytes(XDP_PROG_MINIMAL, effective_workers, 0)
+                    .map_err(|e2| format!("minimal BPF ELF load also failed: {e2}"))?;
+                (bpf, false)
+            }
+            Err(e) => return Err(e),
+        };
 
         let program: &mut Xdp = bpf
             .program_mut("dns_xdp")
@@ -111,7 +115,7 @@ impl XdpHandle {
         tracing::info!(
             iface   = %iface,
             mode    = ?mode,
-            hash    = "crc32c-software",
+            hash    = "fnv1a",
             "XDP program attached"
         );
 
@@ -119,7 +123,7 @@ impl XdpHandle {
 
         // Init CPUMAP entries when domain routing is enabled.
         // Silently skip on any error so the XDP path still works via XSKMAP fallback.
-        if domain_routing {
+        if actual_routing {
             if let Err(e) = handle.init_cpumap(effective_workers) {
                 tracing::warn!(err=%e, "CPUMAP init failed — domain routing disabled, falling back to RSS");
             } else {
@@ -164,4 +168,37 @@ impl XdpHandle {
             .set(queue_id, sock_fd, 0)
             .map_err(|e| format!("XskMap::set q={queue_id} fd={sock_fd}: {e}"))
     }
+}
+
+/// Align `bytes` to 8-byte boundary (required by aya's ELF64 parser), inject
+/// global constants, and call `Ebpf::load()`.
+fn load_ebpf_bytes(bytes: &[u8], nb_workers: u32, routing_flag: u32) -> Result<Ebpf, String> {
+    // Vec<u64> is guaranteed 8-byte aligned by any conforming allocator,
+    // satisfying the object crate's FileHeader64 alignment check inside aya.
+    let words = bytes.len().div_ceil(8);
+    let mut storage: Vec<u64> = vec![0u64; words];
+    // SAFETY: storage has len=words*8 ≥ bytes.len(), u64 → u8 cast is valid.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            storage.as_mut_ptr() as *mut u8,
+            bytes.len(),
+        );
+    }
+    let aligned = unsafe {
+        std::slice::from_raw_parts(storage.as_ptr() as *const u8, bytes.len())
+    };
+
+    EbpfLoader::new()
+        .set_global("NB_WORKERS",            &nb_workers,   false)
+        .set_global("DOMAIN_ROUTING_ENABLED", &routing_flag, false)
+        .load(aligned)
+        .map_err(|e| format!("BPF ELF load failed: {e}"))
+}
+
+/// Returns true when the aya error string indicates a CPUMAP map creation
+/// failure, so the caller can retry with the minimal (no-CPUMAP) binary.
+fn is_cpumap_error(e: &str) -> bool {
+    let lower = e.to_ascii_lowercase();
+    lower.contains("cpumap") || lower.contains("cpu_map")
 }
