@@ -2,7 +2,7 @@
 
 Runbound ships a single-file HTML/JS dashboard (`examples/web-ui/index.html`) that
 lets you manage DNS entries, the blacklist, feeds, and live logs from any browser —
-no build step, no framework, no dependencies beyond a CDN-hosted Tailwind CSS.
+no build step, no framework, no external CDN dependency (Tailwind JS is bundled).
 
 ---
 
@@ -11,10 +11,13 @@ no build step, no framework, no dependencies beyond a CDN-hosted Tailwind CSS.
 | Tab | What you can do |
 |---|---|
 | **Overview** | Real-time stats: QPS, total queries, cache hit rate, blocked, forwarded, SERVFAIL, avg latency, uptime |
-| **DNS Entries** | Add / delete local A, AAAA, CNAME, TXT, MX records |
+| **DNS Entries** | Add / delete local A, AAAA, CNAME, TXT, MX records; **DNS Lookup** panel (live resolve with cache hit indicator) |
 | **Blacklist** | Add / delete blocked domains (nxdomain or refuse action) |
-| **Feeds** | Add / delete blocklist feed URLs with live entry count |
+| **Feeds** | Add / delete blocklist feed URLs; live entry count, **blocked count**, and full error text when last refresh fails |
+| **Upstreams** | Add / delete / rename upstream resolvers; 9 built-in presets; health dots, DNSSEC badge, latency sparkline, DoT SNI config; **cfg** badge for config-file upstreams; **↺ Reconnect DoT** button |
 | **Logs** | Tail the query ring buffer with 3-second auto-refresh |
+| **System** | Runtime metrics (version, memory, XDP mode, prefetch state); cache stats; slave list with version + zones; cache flush button with 60 s cooldown |
+| **About** | Version, licence, links, full API reference |
 
 The header bar also shows a live QPS / query count / uptime and a **↺ Reload** button
 that sends `POST /reload` to apply config changes without restarting the service.
@@ -57,7 +60,7 @@ server {
 
     # Proxy to Runbound API — keeps the API off the LAN
     location /api/ {
-        proxy_pass            http://127.0.0.1:8080/;
+        proxy_pass            http://127.0.0.1:8080;
         proxy_http_version    1.0;
         proxy_set_header      Host $host;
         proxy_set_header      X-Real-IP $remote_addr;

@@ -194,31 +194,31 @@ API="http://localhost:8080"
 TOKEN="$RUNBOUND_API_KEY"
 
 # OISD — comprehensive tracker + ad block list
-curl -s -X POST "$API/feeds" \
+curl -s -X POST "$API/api/feeds" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"oisd","url":"https://big.oisd.nl/"}'
 
 # URLhaus — active malware domains
-curl -s -X POST "$API/feeds" \
+curl -s -X POST "$API/api/feeds" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"urlhaus","url":"https://urlhaus.abuse.ch/downloads/hostfile/"}'
 
 # Check subscribed feeds
-curl -s "$API/feeds" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+curl -s "$API/api/feeds" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
 Or use the built-in presets:
 
 ```bash
-curl -s "$API/feeds/presets" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+curl -s "$API/api/feeds/presets" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
 Feeds auto-refresh every 24 hours. To force an immediate refresh:
 
 ```bash
-curl -s -X POST "$API/feeds/update" -H "Authorization: Bearer $TOKEN"
+curl -s -X POST "$API/api/feeds/update" -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
@@ -232,7 +232,7 @@ routine changes.
 
 ```bash
 # A new IoT device joined the network
-curl -s -X POST "$API/dns" \
+curl -s -X POST "$API/api/dns" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"thermostat.home.","type":"A","value":"192.168.1.42","ttl":300}'
@@ -241,7 +241,7 @@ curl -s -X POST "$API/dns" \
 ### Block a domain manually
 
 ```bash
-curl -s -X POST "$API/blacklist" \
+curl -s -X POST "$API/api/blacklist" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"domain":"doubleclick.net"}'
@@ -250,7 +250,7 @@ curl -s -X POST "$API/blacklist" \
 ### Check query statistics
 
 ```bash
-curl -s "$API/stats" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+curl -s "$API/api/stats" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 # → { "total": 48291, "blocked": 3847, "forwarded": 41203, "nxdomain": 3241 }
 ```
 
@@ -306,11 +306,11 @@ sudo iptables -A INPUT -p tcp --dport 53 -s 192.168.1.0/24 -j ACCEPT
 
 ```bash
 # Check if it's in the blacklist — note the UUID in the "id" field
-curl -s "$API/blacklist" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool | grep -A2 example.com
+curl -s "$API/api/blacklist" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool | grep -A2 example.com
 
-# Remove it by UUID (the "id" field from GET /blacklist)
+# Remove it by UUID (the "id" field from GET /api/blacklist)
 ID="<uuid-from-above>"
-curl -s -X DELETE "$API/blacklist/$ID" -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE "$API/api/blacklist/$ID" -H "Authorization: Bearer $TOKEN"
 ```
 
 ### View live DNS queries

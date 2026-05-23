@@ -41,7 +41,7 @@ log-client-ip: no
 **Right to erasure:** flush the ring buffer on demand:
 
 ```
-curl -X DELETE http://localhost:8080/logs -H "Authorization: Bearer $KEY"
+curl -X DELETE http://localhost:8080/api/logs -H "Authorization: Bearer $KEY"
 ```
 
 **Disk logfile:** if you enable `logfile:`, set up rotation with `logrotate`

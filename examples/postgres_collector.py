@@ -2,7 +2,7 @@
 """
 Runbound → PostgreSQL collector (reference example)
 
-Polls /stats every minute and /logs every 30 s, inserts into two tables.
+Polls /api/stats every minute and /api/logs every 30 s, inserts into two tables.
 Not production code — no retry logic, no connection pooling, no backoff.
 
 Schema (run once):
@@ -33,8 +33,8 @@ RUNBOUND   = os.getenv("RUNBOUND_URL", "http://localhost:8081")
 API_KEY    = os.environ["RUNBOUND_API_KEY"]
 HEADERS    = {"Authorization": f"Bearer {API_KEY}"}
 DSN        = os.getenv("DATABASE_URL", "")           # or rely on PG* env vars
-STATS_INT  = 60   # seconds between /stats polls
-LOGS_INT   = 30   # seconds between /logs polls
+STATS_INT  = 60   # seconds between /api/stats polls
+LOGS_INT   = 30   # seconds between /api/logs polls
 
 _last_log_ts = 0  # Unix timestamp of the most recent log entry inserted
 
@@ -84,9 +84,9 @@ def main() -> None:
     while True:
         now = time.time()
         if now >= next_stats:
-            insert_stats(cur, fetch("/stats"))
+            insert_stats(cur, fetch("/api/stats"))
             next_stats = now + STATS_INT
-        logs = fetch(f"/logs?limit=1000&since={int(_last_log_ts)}")
+        logs = fetch(f"/api/logs?limit=1000&since={int(_last_log_ts)}")
         insert_logs(cur, logs["entries"])
         time.sleep(LOGS_INT)
 
