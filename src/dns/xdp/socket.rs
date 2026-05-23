@@ -51,9 +51,10 @@ impl Drop for XskSocket {
 /// does not support zero-copy. Returns an error only if even copy mode fails,
 /// which indicates the NIC does not support AF_XDP at all.
 pub unsafe fn create_xsk_socket(
-    ifindex:  u32,
-    queue_id: u32,
+    ifindex:      u32,
+    queue_id:     u32,
     use_zerocopy: bool,
+    hugepages:    bool,
 ) -> Result<XskSocket, String> {
     // 1. Create the socket
     // SAFETY: `socket(2)` is safe to call with valid constants. AF_XDP=44,
@@ -68,7 +69,7 @@ pub unsafe fn create_xsk_socket(
 
     // 2. Allocate and register UMEM (also maps fill + completion rings)
     // SAFETY: `fd` is a valid AF_XDP socket fd returned by `socket(2)` above.
-    let umem = unsafe { Umem::new(fd) }.inspect_err(|_| {
+    let umem = unsafe { Umem::new(fd, hugepages) }.inspect_err(|_| {
         // SAFETY: `fd` is a valid open file descriptor not yet transferred
         //         to any owner. We close it here on the error path only.
         unsafe { libc::close(fd) };

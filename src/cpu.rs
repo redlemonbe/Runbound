@@ -76,6 +76,48 @@ pub fn restore_governor(core_id: usize, original: &str) {
     let _ = std::fs::write(&path, original.as_bytes());
 }
 
+/// Pin NIC queue IRQs to their corresponding XDP worker cores.
+///
+/// Reads /proc/interrupts to find IRQs for `iface` (patterns: `{iface}-TxRx-N`,
+/// `{iface}-rx-N`, `{iface}-N`), then writes the core bitmask to
+/// `/proc/irq/<irq>/smp_affinity_list`. Silent no-op on any failure.
+pub fn set_irq_affinity(iface: &str, queue_to_core: &[(u32, usize)]) {
+    #[cfg(target_os = "linux")]
+    {
+        let content = match std::fs::read_to_string("/proc/interrupts") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        for &(queue_id, core_id) in queue_to_core {
+            if let Some(irq) = find_irq_for_queue(&content, iface, queue_id) {
+                let path = format!("/proc/irq/{irq}/smp_affinity_list");
+                let _ = std::fs::write(&path, format!("{core_id}"));
+                tracing::debug!(iface, queue_id, core_id, irq, "IRQ affinity set");
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (iface, queue_to_core);
+}
+
+#[cfg(target_os = "linux")]
+fn find_irq_for_queue(proc_interrupts: &str, iface: &str, queue_id: u32) -> Option<u32> {
+    let patterns = [
+        format!("{iface}-TxRx-{queue_id}"),
+        format!("{iface}-rx-{queue_id}"),
+        format!("{iface}-{queue_id}"),
+    ];
+    for line in proc_interrupts.lines() {
+        let trimmed = line.trim();
+        let (irq_str, rest) = trimmed.split_once(':')?;
+        let irq = irq_str.trim().parse::<u32>().ok()?;
+        if patterns.iter().any(|p| rest.contains(p.as_str())) {
+            return Some(irq);
+        }
+    }
+    None
+}
+
 /// Pin the calling thread to `cpu_id` using `sched_setaffinity(2)`.
 /// Silent no-op on failure or on non-Linux targets.
 pub fn pin_to_cpu(cpu_id: usize) {
