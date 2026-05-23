@@ -157,7 +157,12 @@ int dns_xdp(struct xdp_md *ctx)
             __u32 qname_off = (eth_proto == ETH_P_IP) ? 54u : 74u;
             __u32 h = dns_qname_hash((const __u8 *)data + qname_off, (const __u8 *)data_end);
             __u32 cpu = h % nb;
-            // bpf_redirect_map returns XDP_PASS when the entry is not initialised.
+            // Guard: after h *= FNV_prime, h is an unbounded scalar.
+            // h % nb is still unbounded from the verifier's perspective
+            // (nb is a runtime value).  The explicit bound check below
+            // proves cpu ∈ [0, 63] — matching CPUMAP max_entries=64 —
+            // so bpf_redirect_map can verify the key is in range.
+            if (cpu >= 64) return XDP_PASS;
             return bpf_redirect_map(&CPUMAP, cpu, XDP_PASS);
         }
 #endif
