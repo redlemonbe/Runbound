@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary
 
-Runbound is architecturally sound for national-scale DNS deployment. The codebase presents strong security guarantees on critical surfaces (auth, memory, eBPF). The 5 M QPS target is achievable on dedicated multi-queue hardware with XDP enabled, pending four corrections before sovereign deployment.
+Runbound is architecturally sound for production deployment. The codebase presents strong security guarantees on critical surfaces (auth, memory, eBPF). The 5 M QPS target is achievable on dedicated multi-queue hardware with XDP enabled, pending four corrections before production deployment.
 
 **Overall verdict: production-ready with four blocking items (listed in §6).**
 
@@ -76,7 +76,7 @@ Residual risk: HTTP header length is observable (~non-exploitable in practice; A
 | HMAC audit | `Zeroizing<Vec<u8>>` | Auto-generated if absent |
 | PKCS#11 | Single session at startup | Explicit cleanup on shutdown |
 
-HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable — correct behavior for sovereign deployment.
+HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable — correct behavior for production deployment.
 
 **Verdict: ✅ HSM-compliant. Zero plaintext secrets in memory.**
 
@@ -138,9 +138,9 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 
 **version.bind, hostname.bind, id.server:** Blocked (CHAOS class fingerprinting).
 
-**DNSSEC:** Optional. In forwarder mode (default), the upstream AD bit is accepted without local validation. For a sovereign recursive deployment, `dnssec-validation: yes` is mandatory.
+**DNSSEC:** Optional. In forwarder mode (default), the upstream AD bit is accepted without local validation. For a recursive production deployment, `dnssec-validation: yes` is mandatory.
 
-**Verdict: ✅ Robust. ⚠️ RECOMMENDATION: enable DNSSEC for national deployment.**
+**Verdict: ✅ Robust. ⚠️ RECOMMENDATION: enable DNSSEC in production.**
 
 ### 3.7 Signal Handling — GOOD (fixed in v0.6.9)
 
@@ -164,7 +164,7 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 
 **Verdict: ✅ Clean dependency chain.**
 
-### 3.9 Sovereign Deployment Checklist
+### 3.9 Production Deployment Checklist
 
 | ID | Risk | Severity | Action required |
 |----|------|----------|----------------|
@@ -307,7 +307,7 @@ The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify th
 
 ## 6. Priority Recommendations
 
-### Blocking — required before national deployment
+### Blocking — required before production deployment
 
 1. **SEC-06** — systemd unit hardening:
    ```ini
@@ -343,4 +343,4 @@ The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify th
 
 ## 7. Conclusion
 
-Runbound v0.6.9 is production-ready for sovereign DNS deployment pending the four blocking items above. The XDP kernel-bypass architecture is correct, memory guarantees are solid, and the dependency chain is clean. The 5 M QPS target is realistic on a 1U server with a 10G 8-queue NIC with hugepages enabled and the publish interval fix applied.
+Runbound v0.6.9 is production-ready pending the four blocking items above. The XDP kernel-bypass architecture is correct, memory guarantees are solid, and the dependency chain is clean. The 5 M QPS target is realistic on a 1U server with a 10G 8-queue NIC with hugepages enabled and the publish interval fix applied.
