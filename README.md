@@ -29,17 +29,113 @@ Your existing `unbound.conf` works as-is. Runbound adds a live REST API, AF_XDP 
 
 ## Install
 
+### Requirements
+
+- Linux x86\_64 or arm64
+- systemd
+- Port 53 available (stop `unbound`, `bind9`, `dnsmasq` or `systemd-resolved` first if running)
+- `curl` or `wget`
+- Root access (`sudo`)
+
+### One-line install
+
 ```bash
-sudo bash <(curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh)
+curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh | sudo bash
 ```
 
-Or download a binary directly from the [releases page](https://github.com/redlemonbe/Runbound/releases/latest).
+That's it. The script:
+1. Downloads the latest binary for your architecture
+2. Creates a `runbound` system user
+3. Writes a default config to `/etc/runbound/runbound.conf`
+4. Generates a random API key in `/etc/runbound/env`
+5. Installs and starts the systemd service
+
+At the end you'll see:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Version:  runbound 0.6.x
+ API key:  a1b2c3d4...   ← save this
+ Config:   /etc/runbound/runbound.conf
+ Logs:     journalctl -u runbound -f
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**Save the API key** — you'll need it to use the dashboard and the REST API.
+
+### Verify it works
 
 ```bash
-# Test against your existing Unbound config
-sudo ./runbound /etc/unbound/unbound.conf
+# DNS is responding
 dig @127.0.0.1 google.com
+
+# Service status
+sudo systemctl status runbound
+
+# API is up
+curl -s http://127.0.0.1:8080/api/stats \
+  -H "Authorization: Bearer YOUR_API_KEY" | python3 -m json.tool
 ```
+
+### Stop conflicting services first (if needed)
+
+If port 53 is already taken:
+
+```bash
+# Check what's using port 53
+sudo ss -tlnp | grep :53
+
+# Common culprits
+sudo systemctl stop unbound        # Unbound
+sudo systemctl stop bind9          # BIND9
+sudo systemctl stop dnsmasq        # dnsmasq
+sudo systemctl disable systemd-resolved && sudo systemctl stop systemd-resolved  # systemd-resolved
+```
+
+Then re-run the install command.
+
+### Uninstall
+
+```bash
+curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh | sudo bash -s -- --uninstall
+```
+
+Your config and data in `/etc/runbound` and `/var/lib/runbound` are kept.
+
+---
+
+## Dashboard (Web UI)
+
+Runbound ships with a browser dashboard. To serve it, install nginx:
+
+```bash
+sudo apt install nginx
+
+# Create the site config
+sudo tee /etc/nginx/sites-enabled/runbound-ui << 'EOF'
+server {
+    listen 8090;
+    server_name _;
+    root /var/www/runbound-ui;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location /api/ {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.0;
+        proxy_set_header   Host $host;
+        proxy_read_timeout 30s;
+    }
+}
+EOF
+
+sudo systemctl reload nginx
+```
+
+Open `http://YOUR_SERVER_IP:8090` in your browser, enter your API key, click **Connect**.
 
 ---
 
@@ -48,7 +144,7 @@ dig @127.0.0.1 google.com
 ```bash
 TOKEN="your-api-key"
 
-# Add a DNS entry — live, no restart
+# Add a local DNS entry — live, no restart
 curl -s -X POST http://localhost:8080/api/dns \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -66,8 +162,6 @@ curl -s -X POST http://localhost:8080/api/feeds \
   -H "Content-Type: application/json" \
   -d '{"name":"urlhaus","url":"https://urlhaus.abuse.ch/downloads/hostfile/"}'
 ```
-
-A browser dashboard is included — see [docs/web-ui.md](docs/web-ui.md).
 
 ---
 
@@ -93,7 +187,6 @@ An eBPF XDP program attaches to the NIC at startup. UDP/53 packets for local zon
 ```bash
 # Verify XDP is active
 journalctl -u runbound | grep XDP
-# INFO runbound: XDP kernel-bypass fast path active iface=eth0
 ```
 
 Disable without editing config: `RUNBOUND_DISABLE_XDP=1` — useful if the host becomes unreachable after an XDP attach. Details: [docs/xdp.md](docs/xdp.md).
