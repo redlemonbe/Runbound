@@ -31,7 +31,7 @@ use tracing::{error, info, warn};
 
 use hickory_proto::rr::{LowerName, Name, RecordType};
 use crate::dns::{BlacklistAction, ZoneAction, local::{LocalZoneSet, parse_local_data}};
-use crate::dns::server::SharedResolver;
+use crate::dns::server::{SharedResolver, SharedResolversVec};
 use crate::feeds::{self, FeedFormat, add_feed, builtin_presets, remove_feed, update_all_feeds, update_one_feed};
 use crate::logbuffer::{LogAction, LogQuery, SharedLogBuffer};
 use crate::store::{self, DnsEntry, DnsType, BlacklistEntry};
@@ -264,6 +264,10 @@ pub struct AppState {
     /// The API binds to 127.0.0.1 only, so a global limit is equivalent
     /// to a per-IP limit in practice.
     pub lookup_limiter: Arc<ReloadLimiter>,
+    /// #33: per-upstream resolvers used by racing mode — rebuilt when upstreams change.
+    pub per_upstream_resolvers: SharedResolversVec,
+    /// #33: per-upstream win counters — how many times each upstream answered first.
+    pub racing_wins: Arc<DashMap<String, Arc<AtomicU64>, ahash::RandomState>>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -728,6 +732,14 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         .map(|iface| crate::dns::xdp::socket::read_nic_rx_dropped(iface))
         .unwrap_or(0);
 
+    // #33: upstream racing wins per upstream.
+    let upstream_racing_wins: serde_json::Map<String, serde_json::Value> = s.racing_wins
+        .iter()
+        .map(|kv| (kv.key().clone(), serde_json::Value::Number(
+            serde_json::Number::from(kv.value().load(Ordering::Relaxed))
+        )))
+        .collect();
+
     JsonExtract(serde_json::json!({
         "version":              env!("CARGO_PKG_VERSION"),
         "uptime_secs":          snap.uptime_secs,
@@ -754,6 +766,8 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         "nic_rx_ring":     nic_rx_ring,
         "nic_rx_ring_max": nic_rx_ring_max,
         "nic_rx_dropped":  nic_rx_dropped,
+        "upstream_racing":      s.cfg.upstream_racing,
+        "upstream_racing_wins": upstream_racing_wins,
     }))
 }
 
@@ -1505,6 +1519,20 @@ async fn feed_presets_handler() -> impl IntoResponse {
     JsonExtract(serde_json::json!({"presets": presets, "total": presets.len()}))
 }
 
+/// #33: rebuild per-upstream resolvers if racing is enabled.
+/// Called after any upstream list change (add, delete, reconnect).
+fn rebuild_racing_resolvers(s: &AppState) {
+    if !s.cfg.upstream_racing { return; }
+    let addrs = upstreams::upstream_addrs(&s.upstreams);
+    match crate::dns::server::build_per_upstream_resolvers(&addrs, s.cfg.dnssec_validation) {
+        Ok(vec) => {
+            info!(count = vec.len(), "upstream-racing: per-upstream resolvers rebuilt");
+            s.per_upstream_resolvers.store(Arc::new(vec));
+        }
+        Err(e) => warn!(err = %e, "upstream-racing: rebuild failed — racing resolvers unchanged"),
+    }
+}
+
 // ── GET /api/upstreams ─────────────────────────────────────────────────────
 
 async fn upstreams_handler(State(s): State<AppState>) -> impl IntoResponse {
@@ -1605,6 +1633,7 @@ async fn add_upstream_handler(
     if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
         warn!(%e, "resolver rebuild after upstream add failed — upstream added but DNS unchanged");
     }
+    rebuild_racing_resolvers(&s);
     // FIX #43: persist after successful add
     upstreams::save_upstreams(&s.upstreams, &s.base_dir);
 
@@ -1658,6 +1687,7 @@ async fn delete_upstream_handler(
             if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
                 warn!(%e, "resolver rebuild after upstream delete failed");
             }
+            rebuild_racing_resolvers(&s);
             // FIX #43: persist after successful delete
             upstreams::save_upstreams(&s.upstreams, &s.base_dir);
             info!(id = %id, addr = %removed.addr, "upstream deleted via API");
@@ -1921,6 +1951,7 @@ async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResp
     };
 
     s.stats.record_dot_reconnect();
+    rebuild_racing_resolvers(&s);
 
     // Probe every DoT upstream in parallel to report reconnected vs failed.
     // UDP upstreams are ignored.
@@ -2427,6 +2458,8 @@ mod tests {
             last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
             cache_evictions:  Arc::new(AtomicU64::new(0)),
             lookup_limiter:   Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
+            per_upstream_resolvers: crate::dns::server::create_shared_resolvers_vec(),
+            racing_wins:           Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
         };
         router(state)
     }
@@ -3909,6 +3942,8 @@ mod tests {
             last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
             cache_evictions:  Arc::new(AtomicU64::new(0)),
             lookup_limiter:   Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
+            per_upstream_resolvers: crate::dns::server::create_shared_resolvers_vec(),
+            racing_wins:           Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
         };
         let app = router(state);
 

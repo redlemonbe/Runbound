@@ -9,6 +9,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.12] — 2026-05-23
+
+### Added
+
+- **#33 — Upstream racing** (`src/dns/server.rs`, `src/config/parser.rs`, `src/api/mod.rs`)  
+  New directive `upstream-racing: yes` sends the query to **all** configured upstreams simultaneously and returns the first valid response. Losers are silently dropped. Per-upstream win counters exposed in `GET /api/system` as `upstream_racing_wins: {"ip": count}`. Racing resolvers are rebuilt when upstreams are added, deleted, or reconnected via the API. Falls back to single-resolver path when fewer than 2 upstreams are available or racing is disabled.
+
+- **#29 — rkyv zero-copy cache persistence** (`src/dns/cache_snapshot.rs`)  
+  `save_xdp_cache` and `load_xdp_cache` use rkyv 0.8 binary format prefixed with magic header `b"RBv1"`. Cache is saved atomically (temp file + rename) on **SIGUSR2**. Cache is loaded on startup if the file exists and the magic matches. Stale/corrupt files are silently ignored. `Instant` → UNIX timestamp, `Bytes/SmallVec` → `Vec<u8>` for serialization compatibility.
+
+- **#64 — Zero-copy XDP cache hits** (`src/dns/xdp/worker.rs`)  
+  `answer_from_cache` now parses raw DNS wire bytes directly (header flags, OPCODE, QDCOUNT, QNAME label walk, QTYPE/QCLASS) without invoking the hickory DNS parser. QTYPE ANY (255) is rejected. Compression pointers are rejected (must not appear in client queries). Label content bytes are ASCII-lowercased with `| 0x20` to match the server-side `LowerName` normalization. Target: < 300 ns per cache hit on x86_64.
+
+### Changed
+
+- **`GET /api/system`**: new fields `upstream_racing` (bool), `upstream_racing_wins` (object).
+
+- **SIGUSR2**: repurposed from "ignored" to XDP cache persistence trigger.
+
+### Fixed
+
+- **#72 — CRC32 hardware hash** (eBPF): `__builtin_ia32_crc32qi` is an x86 intrinsic and cannot compile with `clang -target bpf`. Software CRC32C (Castagnoli polynomial 0x82F63B78) was correctly implemented in v0.6.10. No code change needed — BPF JIT on x86 may emit hardware CRC instructions automatically.
+
+---
+
 ## [0.6.9] — 2026-05-23
 
 ### Added

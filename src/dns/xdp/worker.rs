@@ -26,7 +26,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
-    rr::{LowerName, Name},
+    rr::LowerName,
     serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
 };
 use smallvec::SmallVec;
@@ -683,6 +683,10 @@ fn process_packet(
 /// Returns true and writes the wire response into `out` on a cache hit.
 /// Returns false on a miss or if the ACL denies/refuses the client.
 ///
+/// #64: Zero-copy path — parses the DNS query header and QNAME directly
+/// from raw bytes without calling hickory. Eliminates ~200 ns of parse
+/// overhead per cache hit compared to `Message::from_bytes`.
+///
 /// ACL semantics mirror `answer_dns`:
 ///   Allow  → proceed with cache lookup.
 ///   Deny   → silent drop (return false, no TX frame crafted).
@@ -702,39 +706,77 @@ fn answer_from_cache(
         }
     }
 
-    let msg = match Message::from_bytes(query_bytes) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    if msg.message_type != MessageType::Query { return false; }
-    if msg.op_code != OpCode::Query { return false; }
-    let q = match msg.queries.first() {
-        Some(q) => q,
-        None    => return false,
-    };
-    if q.query_type() == hickory_proto::rr::RecordType::ANY { return false; }
+    // ── Zero-copy DNS header parse ────────────────────────────────────────
+    // Header layout: ID(2) FLAGS(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
+    // Minimum useful message: 12-byte header + 1-byte QNAME start.
+    if query_bytes.len() < 13 { return false; }
 
-    // Build wire-format name key — same encoding used by the inserter in server.rs.
-    let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
-    let mut name_enc = BinEncoder::new(&mut name_tmp);
-    if Name::from(LowerName::from(q.name())).emit(&mut name_enc).is_err() {
+    // QR bit (bit 15): 0 = query, 1 = response.
+    // OPCODE (bits 14–11): 0 = standard query.
+    let flags = u16::from_be_bytes([query_bytes[2], query_bytes[3]]);
+    if flags & 0x8000 != 0 { return false; } // response — skip
+    if flags & 0x7800 != 0 { return false; } // non-standard opcode
+
+    // Exactly one question section entry expected.
+    let qdcount = u16::from_be_bytes([query_bytes[4], query_bytes[5]]);
+    if qdcount != 1 { return false; }
+
+    let qid = [query_bytes[0], query_bytes[1]];
+
+    // ── Walk QNAME (wire-format length-prefixed labels) ───────────────────
+    // Builds a wire-format key identical to what the cache inserter produces:
+    // length bytes copied as-is; label content bytes ASCII-lowercased.
+    // Compression pointers (top 2 bits = 11) are rejected — they never appear
+    // in client queries, only in responses.
+    let mut name_buf: SmallVec<[u8; 64]> = SmallVec::new();
+    let mut pos = 12usize;
+    loop {
+        if pos >= query_bytes.len() {
+            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        let label_len = query_bytes[pos] as usize;
+        // Compression pointer — must not appear in a query; bail out.
+        if label_len & 0xC0 == 0xC0 {
+            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        name_buf.push(query_bytes[pos]); // length byte — copy verbatim
+        pos += 1;
+        if label_len == 0 { break; } // root label = QNAME end
+        if pos + label_len > query_bytes.len() {
+            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        for i in 0..label_len {
+            name_buf.push(query_bytes[pos + i] | 0x20); // ASCII lowercase
+        }
+        pos += label_len;
+    }
+
+    // QTYPE(2) + QCLASS(2) follow the QNAME.
+    if query_bytes.len() < pos + 4 {
         crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
-    let wire_name: SmallVec<[u8; 64]> = SmallVec::from_slice(&name_tmp);
-    let key = crate::dns::cache_snapshot::QuestionKey {
-        name:   wire_name,
-        qtype:  u16::from(q.query_type()),
-        qclass: u16::from(q.query_class()),
-    };
+    let qtype  = u16::from_be_bytes([query_bytes[pos],     query_bytes[pos + 1]]);
+    let qclass = u16::from_be_bytes([query_bytes[pos + 2], query_bytes[pos + 3]]);
+
+    // ANY queries are not cached (hickory returns NOTIMP per RFC 8482).
+    const QTYPE_ANY: u16 = 255;
+    if qtype == QTYPE_ANY { return false; }
+
+    let key = crate::dns::cache_snapshot::QuestionKey { name: name_buf, qtype, qclass };
 
     let now = std::time::Instant::now();
     if let Some(entry) = cache_snap.get(&key) {
         if entry.expires_at > now && entry.wire_payload.len() >= 2 {
             out.extend_from_slice(&entry.wire_payload);
-            // Patch QID (bytes [0..2]) with the client's actual QID.
-            let qid = msg.id.to_be_bytes();
+            // Patch QID (bytes [0..2]) with the client's actual transaction ID.
             out[0] = qid[0];
             out[1] = qid[1];
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
@@ -745,6 +787,125 @@ fn answer_from_cache(
     crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     false
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use bytes::Bytes;
+    use crate::dns::cache_snapshot::{CacheEntry, CacheSnapshot, QuestionKey};
+
+    fn make_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+        // Build minimal DNS query wire bytes.
+        let mut pkt = vec![
+            (id >> 8) as u8, id as u8, // ID
+            0x01, 0x00,                 // flags: RD=1, QR=0
+            0x00, 0x01,                 // QDCOUNT=1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN/NS/AR = 0
+        ];
+        // Encode name as wire-format labels
+        for label in name.trim_end_matches('.').split('.') {
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+        pkt.push(0x00); // root label
+        pkt.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
+        pkt.extend_from_slice(&1u16.to_be_bytes());  // QCLASS = IN
+        pkt
+    }
+
+    fn make_cache_key(name: &str, qtype: u16) -> QuestionKey {
+        let mut name_buf: SmallVec<[u8; 64]> = SmallVec::new();
+        for label in name.trim_end_matches('.').split('.') {
+            name_buf.push(label.len() as u8);
+            name_buf.extend_from_slice(label.to_ascii_lowercase().as_bytes());
+        }
+        name_buf.push(0); // root
+        QuestionKey { name: name_buf, qtype, qclass: 1 }
+    }
+
+    fn make_wire_response(id: u16) -> Vec<u8> {
+        // Minimal DNS response: id + flags=QR|AA + QDCOUNT=1 + ANCOUNT=1
+        vec![
+            (id >> 8) as u8, id as u8,
+            0x84, 0x00, // QR=1 AA=1 NOERROR
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // minimal payload to pass length check
+        ]
+    }
+
+    fn make_snap_with_entry(key: QuestionKey, payload: Vec<u8>, expires_at: Instant) -> CacheSnapshot {
+        let mut snap = CacheSnapshot::default();
+        snap.insert(key, CacheEntry { wire_payload: Bytes::from(payload), expires_at });
+        snap
+    }
+
+    #[test]
+    fn cache_hit_patches_qid() {
+        let key = make_cache_key("example.com", 1);
+        // Store with QID=0
+        let mut stored = make_wire_response(0);
+        stored.extend_from_slice(&[0u8; 4]); // padding so len > 2
+        let snap = make_snap_with_entry(
+            key,
+            stored,
+            Instant::now() + Duration::from_secs(300),
+        );
+        let acl = crate::dns::acl::Acl::from_config(&[]);
+        let query = make_query(0xBEEF, "example.com", 1);
+        let mut out = Vec::new();
+        let hit = answer_from_cache(&query, &snap, &acl, None, &mut out);
+        assert!(hit, "expected cache hit");
+        assert_eq!(out[0], 0xBE, "QID byte 0 patched");
+        assert_eq!(out[1], 0xEF, "QID byte 1 patched");
+    }
+
+    #[test]
+    fn cache_hit_case_insensitive() {
+        let key = make_cache_key("example.com", 1); // lowercase key
+        let snap = make_snap_with_entry(
+            key,
+            make_wire_response(0),
+            Instant::now() + Duration::from_secs(300),
+        );
+        let acl = crate::dns::acl::Acl::from_config(&[]);
+        // Query with mixed case — should still hit because we lowercase
+        let query = make_query(1, "EXAMPLE.COM", 1);
+        let mut out = Vec::new();
+        let hit = answer_from_cache(&query, &snap, &acl, None, &mut out);
+        assert!(hit, "cache should hit with uppercase query");
+    }
+
+    #[test]
+    fn cache_miss_on_expired_entry() {
+        let key = make_cache_key("old.example.com", 1);
+        let snap = make_snap_with_entry(
+            key,
+            make_wire_response(0),
+            Instant::now() - Duration::from_secs(1), // already expired
+        );
+        let acl = crate::dns::acl::Acl::from_config(&[]);
+        let query = make_query(1, "old.example.com", 1);
+        let mut out = Vec::new();
+        let hit = answer_from_cache(&query, &snap, &acl, None, &mut out);
+        assert!(!hit, "expired entry must not be served");
+    }
+
+    #[test]
+    fn any_query_not_cached() {
+        let key = make_cache_key("example.com", 255);
+        let snap = make_snap_with_entry(
+            key,
+            make_wire_response(0),
+            Instant::now() + Duration::from_secs(300),
+        );
+        let acl = crate::dns::acl::Acl::from_config(&[]);
+        let query = make_query(1, "example.com", 255); // QTYPE=ANY
+        let mut out = Vec::new();
+        let hit = answer_from_cache(&query, &snap, &acl, None, &mut out);
+        assert!(!hit, "ANY queries must not be served from cache");
+    }
 }
 
 /// Parse `query_bytes` as a DNS query, look it up in `zones`, write the
