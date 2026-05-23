@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.23] — 2026-05-23
+
+### Fixed
+
+- **Relay registration : retry + visibilité (#95 round 2)** (`src/main.rs`, `src/api/relay.rs`)
+
+  Deux bugs résiduels corrigés après le fix TLS du round 1 :
+
+  1. **Enregistrement one-shot sans retry** — la registration slave→master était tentée une seule fois (T+2 s au démarrage). Si le master n'était pas encore prêt, ou si le réseau flanchait, le slave restait orphelin sans jamais réessayer. Fix : boucle de retry avec backoff exponentiel (2 s → 4 s → 8 s → … → max 300 s) jusqu'au premier succès (HTTP 200).
+
+  2. **Logs de registration invisibles à verbosity 1** — les messages `"Slave relay disabled"` (info) et `"Registered with master"` (info) étaient filtrés par le filtre `error,runbound=warn` actif à `verbosity: 1`. Passés en `warn!` pour être visibles dans la configuration par défaut.
+
+---
+
 ## [0.6.22] — 2026-05-23
 
 ### Changed
