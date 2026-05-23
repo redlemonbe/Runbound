@@ -26,9 +26,10 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
-    rr::LowerName,
+    rr::{LowerName, Name},
     serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
 };
+use smallvec::SmallVec;
 
 use crate::dns::acl::{Acl, AclAction};
 use crate::dns::local::{LocalZoneSet, ZoneAction};
@@ -37,6 +38,7 @@ use super::loader::XdpHandle;
 use super::socket::{
     XskSocket, create_xsk_socket, get_rx_queue_count, iface_index,
     is_virtual_interface, parent_interface, sanitize_iface_name,
+    maximize_nic_ring, XDP_ACTIVE_IFACE,
 };
 use super::umem::{XdpDesc, FRAME_SIZE};
 
@@ -48,6 +50,7 @@ const UDP_HDR: usize = 8;
 const ETH_P_IP:   u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const PROTO_UDP:   u8 = 17;
+
 
 /// Load the XDP program onto `iface`, open one AF_XDP socket per RX queue,
 /// and spawn a dedicated OS thread for each.  Returns `Ok(Some(handle))` when
@@ -71,6 +74,8 @@ pub fn start_xdp(
     irq_affinity:    bool,
     hugepages:       bool,
     cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
+    domain_routing:  bool,
+    ring_size:       Option<u32>,
 ) -> Result<Option<XdpHandle>, String> {
     if std::env::var("RUNBOUND_DISABLE_XDP").is_ok() {
         tracing::info!("XDP disabled via RUNBOUND_DISABLE_XDP environment variable");
@@ -83,7 +88,7 @@ pub fn start_xdp(
                     virt = %iface, parent = %parent,
                     "XDP: virtual interface detected — retrying on parent"
                 );
-                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot);
+                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot, domain_routing, ring_size);
                 if result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
                     tracing::info!(parent = %parent, "XDP active on parent interface");
                 }
@@ -99,7 +104,7 @@ pub fn start_xdp(
             }
         }
     }
-    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot)
+    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot, domain_routing, ring_size)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -112,9 +117,16 @@ fn start_xdp_on_iface(
     irq_affinity:    bool,
     hugepages:       bool,
     cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
+    domain_routing:  bool,
+    ring_size:       Option<u32>,
 ) -> Result<Option<XdpHandle>, String> {
     let ifidx = iface_index(iface)
         .ok_or_else(|| format!("interface {iface} not found"))?;
+
+    // #80: maximize NIC ring buffers before attaching XDP to prevent hardware
+    // FIFO overflow at ≥10M QPS. Silent fallback on EOPNOTSUPP / EPERM.
+    let _ = XDP_ACTIVE_IFACE.set(iface.to_owned());
+    maximize_nic_ring(iface, ring_size);
 
     // Bug B: check MTU before attach — virtio-net refuses DRV mode when MTU > 3506.
     // Falling back to SKB mode is acceptable but must be visible to the operator.
@@ -133,9 +145,8 @@ fn start_xdp_on_iface(
         }
     }
 
-    let mut handle = XdpHandle::load(iface)?;
-
     let queue_count = get_rx_queue_count(iface).max(1);
+    let mut handle = XdpHandle::load(iface, queue_count, domain_routing)?;
     let num_cpus = crate::cpu::physical_cores().len().max(1);
     tracing::info!(iface = %iface, queues = queue_count, "Starting XDP workers");
 
@@ -194,9 +205,10 @@ fn start_xdp_on_iface(
                 handle.governor_backups.push((core_id, gov));
             }
         }
+        let q_idx = q as usize;
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
-            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor, cs))
+            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor, cs, q_idx))
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
@@ -352,6 +364,7 @@ fn build_test_frame(buf: &mut [u8], dst_mac: [u8; 6]) -> usize {
 }
 
 /// Poll loop for one NIC queue. Runs until the socket fd is closed.
+#[allow(clippy::too_many_arguments)]
 fn xdp_worker(
     mut sock:        XskSocket,
     zones:           Arc<ArcSwap<LocalZoneSet>>,
@@ -360,11 +373,15 @@ fn xdp_worker(
     core_id:         usize,
     cpu_governor:    bool,
     cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
+    worker_id:       usize,
 ) {
     use libc::{poll, pollfd, POLLIN};
-    use super::umem::RING_SIZE;
+    use super::umem::RX_RING_SIZE;
 
     crate::cpu::pin_to_cpu(core_id);
+    // Migrate UMEM pages to the local NUMA node now that the thread is pinned.
+    #[cfg(target_os = "linux")]
+    super::umem::rebind_to_local_numa(sock.umem.area, sock.umem.area_len);
     // #69: switch to performance governor after pinning to the target core
     if cpu_governor {
         crate::cpu::set_performance_governor(core_id);
@@ -373,9 +390,9 @@ fn xdp_worker(
     // Pre-allocate scratch buffers outside the hot loop to avoid per-batch
     // heap allocations.  Each Vec retains its capacity across iterations;
     // clear() resets length without releasing memory.
-    let mut rxds:       Vec<XdpDesc> = Vec::with_capacity(RING_SIZE as usize);
-    let mut tx_descs:   Vec<XdpDesc> = Vec::with_capacity(RING_SIZE as usize);
-    let mut rx_addrs:   Vec<u64>     = Vec::with_capacity(RING_SIZE as usize);
+    let mut rxds:       Vec<XdpDesc> = Vec::with_capacity(RX_RING_SIZE as usize);
+    let mut tx_descs:   Vec<XdpDesc> = Vec::with_capacity(RX_RING_SIZE as usize);
+    let mut rx_addrs:   Vec<u64>     = Vec::with_capacity(RX_RING_SIZE as usize);
     let mut dns_scratch: Vec<u8>     = Vec::with_capacity(512);
 
     loop {
@@ -476,11 +493,18 @@ fn xdp_worker(
 
                 dns_scratch.clear();
                 match process_packet(rx_frame, tx_frame, &snapshot, &acl, src_ip, &mut dns_scratch, cache_arc.as_deref()) {
-                    Some(tx_len) => tx_descs.push(XdpDesc {
-                        addr: tx_addr,
-                        len:  tx_len as u32,
-                        options: 0,
-                    }),
+                    Some(tx_len) => {
+                        // Track per-worker packet distribution (#67)
+                        if worker_id < crate::dns::cache_snapshot::XDP_WORKER_PKTS.len() {
+                            crate::dns::cache_snapshot::XDP_WORKER_PKTS[worker_id]
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        tx_descs.push(XdpDesc {
+                            addr: tx_addr,
+                            len:  tx_len as u32,
+                            options: 0,
+                        });
+                    }
                     None => {
                         sock.umem.tx_free.push_back(tx_addr);
                     }
@@ -690,15 +714,25 @@ fn answer_from_cache(
     };
     if q.query_type() == hickory_proto::rr::RecordType::ANY { return false; }
 
+    // Build wire-format name key — same encoding used by the inserter in server.rs.
+    let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
+    let mut name_enc = BinEncoder::new(&mut name_tmp);
+    if Name::from(LowerName::from(q.name())).emit(&mut name_enc).is_err() {
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    let wire_name: SmallVec<[u8; 64]> = SmallVec::from_slice(&name_tmp);
     let key = crate::dns::cache_snapshot::QuestionKey {
-        name:  LowerName::from(q.name()).to_string(),
-        qtype: u16::from(q.query_type()),
+        name:   wire_name,
+        qtype:  u16::from(q.query_type()),
+        qclass: u16::from(q.query_class()),
     };
 
     let now = std::time::Instant::now();
     if let Some(entry) = cache_snap.get(&key) {
-        if entry.expires_at > now && entry.wire_response.len() >= 2 {
-            out.extend_from_slice(&entry.wire_response);
+        if entry.expires_at > now && entry.wire_payload.len() >= 2 {
+            out.extend_from_slice(&entry.wire_payload);
             // Patch QID (bytes [0..2]) with the client's actual QID.
             let qid = msg.id.to_be_bytes();
             out[0] = qid[0];
@@ -708,6 +742,8 @@ fn answer_from_cache(
             return true;
         }
     }
+    crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     false
 }
 

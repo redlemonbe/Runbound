@@ -1,6 +1,6 @@
 [package]
 name = "runbound"
-version = "0.6.8"
+version = "0.6.9"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "AGPL-3.0-or-later"
@@ -96,8 +96,11 @@ cryptoki = "0.6"
 # Secure memory zeroing — used for HSM-loaded key material (Zeroizing<T>)
 zeroize = "1"
 
-# Zero-copy byte buffers — used in ACME HttpClient bridge
+# Zero-copy byte buffers — used in ACME HttpClient bridge and XDP cache (#64)
 bytes = "1"
+
+# Stack-allocated small vectors — used in XDP wire-format cache keys (#64)
+smallvec = { version = "1", features = ["union"] }
 
 # HTTP types shared across hyper / axum / instant-acme
 http = "1"
