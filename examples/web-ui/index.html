@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Runbound — Management Console</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="/tailwind.js"></script>
   <style>
     body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
     .tab-active { border-bottom: 2px solid #22d3ee; color: #22d3ee; }
@@ -28,6 +28,7 @@
     .badge-dot  { background:#1a3a2a; color:#34d399; }
     .badge-dnssec-ok  { background:#14291a; color:#4ade80; border:1px solid #166534; }
     .badge-dnssec-no  { background:#1a1a1a; color:#4b5563; border:1px solid #374151; }
+    .badge-cfg        { background:#2d1f3a; color:#c084fc; border:1px solid #6b21a8; }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-200 min-h-screen pb-8">
@@ -152,6 +153,15 @@
       <button onclick="loadDns()" class="btn-secondary">↻ Refresh</button>
     </div>
     <div id="dns-list" class="space-y-1.5"></div>
+    <div class="card mt-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DNS Lookup</div>
+      <div class="flex gap-2 flex-wrap mb-3">
+        <input id="lookup-name" type="text" placeholder="domain (e.g. google.com)" class="input flex-1 min-w-48" onkeydown="if(event.key==='Enter')dnsLookup()" />
+        <select id="lookup-type" class="input w-24"><option>A</option><option>AAAA</option><option>CNAME</option><option>MX</option><option>TXT</option><option>PTR</option></select>
+        <button onclick="dnsLookup()" class="btn-primary">Lookup</button>
+      </div>
+      <div id="lookup-result" class="text-xs text-gray-700 font-mono">—</div>
+    </div>
   </div>
 
   <!-- Blacklist -->
@@ -201,7 +211,10 @@
     </div>
     <div class="flex items-center justify-between mb-3">
       <span class="text-xs text-gray-600 uppercase tracking-wide">Active resolvers <span id="upstream-health-badge" class="ml-2 font-mono"></span></span>
-      <button onclick="loadUpstreams()" class="btn-secondary text-xs">↻ Refresh</button>
+      <div class="flex gap-2">
+        <button onclick="reconnectDoT()" class="btn-secondary text-xs" title="Reconnect all DoT connections">↺ Reconnect DoT</button>
+        <button onclick="loadUpstreams()" class="btn-secondary text-xs">↻ Refresh</button>
+      </div>
     </div>
     <div id="upstream-list" class="space-y-1.5 mb-4"></div>
     <div id="reconnect-dot-wrap" class="hidden mb-5 flex items-center gap-3">
@@ -300,7 +313,7 @@
   <div id="tab-about" class="hidden fade max-w-3xl">
     <div class="flex items-center gap-3 mb-5">
       <span class="text-cyan-400 font-bold text-2xl tracking-widest" style="text-shadow:0 0 18px #22d3ee44">RUNBOUND</span>
-      <span id="about-version" class="badge" style="background:#0e2233;color:#67e8f9;border:1px solid #164e63">v0.6.4</span>
+      <span id="about-version" class="badge" style="background:#0e2233;color:#67e8f9;border:1px solid #164e63">v0.6.8</span>
       <span class="badge" style="background:#1a1a1a;color:#6b7280;border:1px solid #374151">AGPL-3.0</span>
     </div>
     <p class="text-gray-400 text-sm mb-5 leading-relaxed">
@@ -352,7 +365,8 @@
         <div>
           <div class="text-gray-700 uppercase tracking-wide mb-2">Health &amp; Stats</div>
           <div class="space-y-0.5">
-            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/health</code><span class="text-gray-700">No auth — liveness probe — <code class="bg-gray-900 px-1 rounded">{status, version, uptime_secs}</code></span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/health</code><span class="text-gray-700">No auth — <code class="bg-gray-900 px-1 rounded">{status, version, uptime_secs, xdp_active, upstreams_healthy, cache_entries}</code></span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/metrics</code><span class="text-gray-700">Prometheus text format — no auth required</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/stats</code><span class="text-gray-700">QPS, latency percentiles (p50/p95/p99), counters, DNSSEC stats</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/system</code><span class="text-gray-700">Version, CPU, memory, XDP mode, upstream health, prefetch flag</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/logs</code><span class="text-gray-700">Last 100 query log entries (requires verbosity ≥ 1)</span></div>
@@ -365,6 +379,7 @@
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-green-600 w-12 shrink-0 font-bold">GET</span><code class="text-gray-300 w-52 shrink-0">/api/dns</code><span class="text-gray-700">List all local records</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/dns</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{name, type, value, ttl}</code> — A AAAA CNAME TXT MX SRV PTR SSHFP TLSA</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-red-600 w-12 shrink-0 font-bold">DEL</span><code class="text-gray-300 w-52 shrink-0">/api/dns/:id</code><span class="text-gray-700">Remove by UUID</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/dns/lookup</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{name, type?}</code> — live DNS resolve — <code class="bg-gray-900 px-1 rounded">{rcode, records, from_cache, elapsed_ms, action}</code></span></div>
           </div>
         </div>
 
@@ -397,6 +412,7 @@
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams</code><span class="text-gray-700"><code class="bg-gray-900 px-1 rounded">{addr, protocol: "udp|dot", port, name, tls_hostname?}</code> — no loopback/link-local</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-yellow-600 w-12 shrink-0 font-bold">PATCH</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id</code><span class="text-gray-700">Rename / set SNI — <code class="bg-gray-900 px-1 rounded">{name, tls_hostname}</code> — v0.6.5+</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id/probe</code><span class="text-gray-700">Trigger immediate health probe — v0.6.6+</span></div>
+            <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-blue-500 w-12 shrink-0 font-bold">POST</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/reconnect</code><span class="text-gray-700">Reconnect all DoT connections — <code class="bg-gray-900 px-1 rounded">{reconnected, failed}</code> — v0.6.8+</span></div>
             <div class="flex gap-3 items-baseline py-1.5 border-b border-gray-800/50"><span class="text-red-600 w-12 shrink-0 font-bold">DEL</span><code class="text-gray-300 w-52 shrink-0">/api/upstreams/:id</code><span class="text-gray-700">Remove — 409 LAST_UPSTREAM if last</span></div>
           </div>
         </div>
@@ -564,8 +580,11 @@ async function loadFeeds() {
         const upd=busy?'<span class="text-yellow-400">updating…</span>':(f.last_updated?new Date(f.last_updated).toLocaleString([],{dateStyle:'short',timeStyle:'short'}):'never');
         const cnt=busy&&(f.entry_count??0)===0?'<span class="text-yellow-400">…</span>':`${(f.entry_count??0).toLocaleString()} entries`;
         const btn=busy?'<span class="text-yellow-400 text-xs w-8 text-center blink shrink-0">↻</span>':`<button onclick="feedUpdate('${f.id}')" class="btn-secondary text-xs px-2 py-0.5 shrink-0">↻</button>`;
-        const err=f.last_error?`<span class="text-red-400 text-xs shrink-0 cursor-help" title="${esc(f.last_error)}">⚠</span>`:''; 
-        return `<div class="row gap-2"><span class="w-2.5 h-2.5 rounded-full shrink-0 ${dot}"></span><span class="text-cyan-300 w-28 truncate shrink-0 text-xs font-mono">${esc(f.name)}</span><span class="text-gray-500 flex-1 truncate text-xs">${esc(f.url)}</span><span class="text-gray-600 w-20 text-right text-xs shrink-0">${cnt}</span><span class="text-gray-700 w-16 text-right text-xs shrink-0">${esc(f.action)}</span><span class="text-gray-800 w-24 text-right text-xs shrink-0">↻ ${upd}</span>${err}${btn}<button class="del shrink-0" onclick="feedDelete('${f.id}')">✕</button></div>`;
+        const blockedSpan=!busy&&f.blocked_count!=null?`<span class="text-red-500 text-xs shrink-0 tabular-nums">${f.blocked_count.toLocaleString()} blk</span>`:'';
+        const err=f.last_error?`<span class="text-red-400 text-xs shrink-0 cursor-help" title="${esc(f.last_error)}">⚠</span>`:'';
+        const errLine=f.last_error?`<div class="text-red-400 text-xs px-3 py-1 font-mono leading-snug" style="background:#160808;border:1px solid #3b0f0f;border-top:none;border-radius:0 0 6px 6px;word-break:break-all">⚠ ${esc(f.last_error)}</div>`:'';
+        const rowRad=f.last_error?'border-radius:6px 6px 0 0':'';
+        return `<div><div class="row gap-2" style="${rowRad}"><span class="w-2.5 h-2.5 rounded-full shrink-0 ${dot}"></span><span class="text-cyan-300 w-28 truncate shrink-0 text-xs font-mono">${esc(f.name)}</span><span class="text-gray-500 flex-1 truncate text-xs">${esc(f.url)}</span><span class="text-gray-600 w-20 text-right text-xs shrink-0">${cnt}</span>${blockedSpan}<span class="text-gray-700 w-16 text-right text-xs shrink-0">${esc(f.action)}</span><span class="text-gray-800 w-24 text-right text-xs shrink-0">↻ ${upd}</span>${err}${btn}<button class="del shrink-0" onclick="feedDelete('${f.id}')">✕</button></div>${errLine}</div>`;
       }).join('');
   } catch(e) { toast('Feeds: '+e.message, true); }
 }
@@ -665,12 +684,13 @@ async function loadUpstreams() {
         const probing=probingUpstreams.has(u.id);
         const hDot=probing?'<span class="w-2 h-2 rounded-full shrink-0 bg-yellow-400 blink" title="probing…"></span>':u.healthy?'<span class="w-2 h-2 rounded-full shrink-0 bg-green-500" title="healthy"></span>':'<span class="w-2 h-2 rounded-full shrink-0 bg-red-600" title="unhealthy"></span>';
         const proto=u.protocol==='dot'?'<span class="badge badge-dot">DoT</span>':'<span class="badge badge-udp">UDP</span>';
+        const cfgBadge=u.source==='config'?'<span class="badge badge-cfg" title="From unbound.conf">cfg</span>':'';
         const spark=renderSparkline(u.latency_history);
         const dns=dnssecBadge(u.dnssec_supported);
         const name=u.name?`<span class="text-gray-400 truncate text-xs">${esc(u.name)}</span>`:'<span class="text-gray-700 italic text-xs">unnamed</span>';
         const sniBtn=u.protocol==='dot'?`<button class="edit-btn shrink-0" onclick="upstreamEditSni('${u.id}','${esc(u.tls_hostname||'')}')" title="SNI: ${esc(u.tls_hostname||'auto')}">SNI</button>`:'';
         const lastErr=!probing&&u.last_error?`<span class="text-red-400 text-xs shrink-0 cursor-help" title="${esc(u.last_error)}">⚠</span>`:'';
-        return `<div class="row gap-2">${hDot}<span class="text-cyan-400 font-mono shrink-0 text-xs w-36">${esc(u.addr)}<span class="text-gray-700">:${port}</span></span>${proto}${dns}<span class="flex-1 min-w-0 flex items-center gap-1.5">${name}<button class="edit-btn shrink-0" onclick="upstreamRename('${u.id}','${esc(u.name||'')}')" title="Rename">✎</button>${sniBtn}</span>${spark?`<span class="shrink-0">${spark}</span>`:''}<span class="text-gray-600 w-14 text-right text-xs shrink-0 tabular-nums">${latency}</span><span class="text-gray-800 w-20 text-right text-xs shrink-0">↻ ${lastCheck}</span>${lastErr}<button class="del shrink-0" onclick="upstreamDelete('${u.id}')">✕</button></div>`;
+        return `<div class="row gap-2">${hDot}<span class="text-cyan-400 font-mono shrink-0 text-xs w-36">${esc(u.addr)}<span class="text-gray-700">:${port}</span></span>${proto}${cfgBadge}${dns}<span class="flex-1 min-w-0 flex items-center gap-1.5">${name}<button class="edit-btn shrink-0" onclick="upstreamRename('${u.id}','${esc(u.name||'')}')" title="Rename">✎</button>${sniBtn}</span>${spark?`<span class="shrink-0">${spark}</span>`:''}<span class="text-gray-600 w-14 text-right text-xs shrink-0 tabular-nums">${latency}</span><span class="text-gray-800 w-20 text-right text-xs shrink-0">↻ ${lastCheck}</span>${lastErr}<button class="del shrink-0" onclick="upstreamDelete('${u.id}')">✕</button></div>`;
       }).join('');
     const hasDot = upstreams.some(u => u.protocol === 'dot');
     const wrap = document.getElementById('reconnect-dot-wrap');
@@ -735,6 +755,30 @@ async function upstreamEditSni(id, current) {
 
 async function upstreamDelete(id) { try { await api('DELETE','/upstreams/'+id); toast('Removed'); loadUpstreams(); } catch(e) { toast('Delete failed: '+e.message, true); } }
 
+async function dnsLookup() {
+  const name=document.getElementById('lookup-name').value.trim(), type=document.getElementById('lookup-type').value;
+  if(!name) return toast('Domain required', true);
+  const el=document.getElementById('lookup-result');
+  el.textContent='Querying…'; el.className='text-xs text-gray-500 font-mono';
+  try {
+    const r=await api('POST','/dns/lookup',{name,type});
+    const action=r.action??'';
+    const from=r.from_cache?'<span class="text-cyan-600">cache</span>':'<span class="text-gray-600">upstream</span>';
+    const rcode=r.rcode==='NOERROR'?'<span class="text-green-400">NOERROR</span>':action==='blocked'?'<span class="text-red-400">BLOCKED</span>':`<span class="text-yellow-400">${esc(r.rcode||'?')}</span>`;
+    const records=(r.records??[]).map(rec=>`<div class="py-0.5 text-gray-300">${esc(rec.value??rec.data??JSON.stringify(rec))}</div>`).join('');
+    el.innerHTML=`<div class="flex gap-3 mb-1.5">${rcode}<span class="text-gray-700">·</span>${from}<span class="text-gray-700">·</span><span class="text-gray-500">${r.elapsed_ms!=null?r.elapsed_ms+' ms':''}</span></div>${records||'<span class="text-gray-600">No records</span>'}`;
+    el.className='text-xs font-mono';
+  } catch(e) { el.textContent='Error: '+e.message; el.className='text-xs text-red-400 font-mono'; }
+}
+
+async function reconnectDoT() {
+  try {
+    const r=await api('POST','/upstreams/reconnect');
+    toast(`DoT reconnect: ${r.reconnected??0} reconnected, ${r.failed??0} failed`);
+    loadUpstreams();
+  } catch(e) { toast('Reconnect failed: '+e.message, true); }
+}
+
 async function loadLogs() {
   try {
     const d=await api('GET','/logs'), logs=d.logs??d.entries??[];
@@ -777,8 +821,33 @@ async function loadSlaves() {
   try {
     const d=await api('GET','/sync/slaves'), slaves=d.slaves??[];
     if(slaves.length===0){el.innerHTML=d.note?`<span class="text-gray-700">${esc(d.note)}</span>`:'<span class="text-gray-700">No slaves connected.</span>';return;}
-    const col=s=>s==='connected'?'text-green-400':s==='stale'?'text-yellow-500':'text-red-400';
-    el.innerHTML=slaves.map(s=>`<div class="row gap-3 py-1 mb-1"><span class="${col(s.status)} w-20 text-xs shrink-0">${esc(s.status)}</span><span class="text-cyan-300 font-mono flex-1 text-xs">${esc(s.addr)}</span><span class="text-gray-600 text-xs w-24 text-right">${s.last_seen_secs??'?'}s ago</span><span class="text-gray-700 text-xs w-16 text-right">${s.zones_synced??0} zones</span><span class="text-gray-800 text-xs w-14 text-right">${esc(s.version??'')}</span></div>`).join('');
+    const now=Math.floor(Date.now()/1000);
+    const byIp={};
+    slaves.forEach(s=>{const ip=s.addr.replace(/:\d+$/,'');if(!byIp[ip]||s.last_seen_secs>byIp[ip].last_seen_secs)byIp[ip]=s;});
+    const deduped=Object.values(byIp);
+    const elapsed=s=>Math.max(0,now-(s.last_seen_secs??0));
+    const connStatus=s=>{const e=elapsed(s);return e<30?'synced':e<120?'stale':'offline';};
+    const syncTime=s=>{
+      if(!s.last_seen_secs) return'—';
+      const d=new Date(s.last_seen_secs*1000);
+      return d.toLocaleTimeString('fr-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+    };
+    const badge=st=>{
+      if(st==='synced') return'<span class="text-xs font-semibold text-green-400">&#10003; synced</span>';
+      if(st==='stale')  return'<span class="text-xs font-semibold text-yellow-400">&#9679; stale</span>';
+      return'<span class="text-xs font-semibold text-red-400">&#10007; offline</span>';
+    };
+    el.innerHTML=deduped.map(s=>{
+      const st=s.status==='connected'?'synced':s.status??connStatus(s),ip=s.addr.replace(/:\d+$/,'');
+      const ver=s.version?`<span class="text-gray-700 text-xs font-mono">${esc(s.version)}</span>`:'';
+      const zones=s.zones_synced!=null?`<span class="text-gray-600 text-xs">${s.zones_synced} zones</span>`:'';
+      return`<div class="flex items-center gap-3 py-1.5 border-b border-gray-800/40">
+        <span class="text-cyan-300 font-mono text-xs flex-1">${esc(ip)}</span>
+        ${ver}${zones}
+        <span class="w-24 text-right">${badge(st)}</span>
+        <span class="text-gray-600 text-xs w-20 text-right font-mono">${syncTime(s)}</span>
+      </div>`;
+    }).join('');
   } catch(_) { if(el) el.innerHTML='<span class="text-gray-700 italic">Slave info unavailable.</span>'; }
 }
 
@@ -849,20 +918,6 @@ window.onload = () => {
   const u=document.getElementById('cfg-url').value, k=document.getElementById('cfg-key').value;
   if(u&&k) connect();
 };
-</script>
-<script>
-/* dev-autoreload — retire en prod */
-(function(){
-  let mod='';
-  setInterval(async()=>{
-    try{
-      const r=await fetch(location.pathname,{method:'HEAD',cache:'no-store'});
-      const m=r.headers.get('last-modified')||r.headers.get('etag')||'';
-      if(mod&&m&&m!==mod)location.reload();
-      if(m)mod=m;
-    }catch(_){}
-  },1500);
-})();
 </script>
 
 <!-- Input modal -->

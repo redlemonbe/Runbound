@@ -240,7 +240,7 @@ Add a DNS entry on the master, verify it appears on the slave:
 
 ```bash
 # Master: add an entry via the REST API
-curl -X POST http://localhost:8080/dns \
+curl -X POST http://localhost:8080/api/dns \
   -H "Authorization: Bearer $(cat /etc/runbound/api.key)" \
   -H "Content-Type: application/json" \
   -d '{"name":"test.home.","type":"A","value":"192.168.1.99","ttl":60}'
@@ -262,7 +262,7 @@ When running as a slave, all write operations are blocked at the API level:
 
 ```bash
 # On slave — write attempt
-curl -X POST http://localhost:8080/dns ...
+curl -X POST http://localhost:8080/api/dns ...
 # HTTP 503
 # {"error":"READ_ONLY","details":"This node is a slave replica — write operations are disabled"}
 ```
@@ -270,11 +270,11 @@ curl -X POST http://localhost:8080/dns ...
 **Read operations work normally on the slave:**
 
 ```bash
-curl http://localhost:8080/dns       # list DNS entries
-curl http://localhost:8080/blacklist  # list blacklist
-curl http://localhost:8080/stats      # live statistics
-curl http://localhost:8080/logs       # query log
-curl http://localhost:8080/health     # liveness probe (for load balancer checks)
+curl http://localhost:8080/api/dns       # list DNS entries
+curl http://localhost:8080/api/blacklist  # list blacklist
+curl http://localhost:8080/api/stats      # live statistics
+curl http://localhost:8080/api/logs       # query log
+curl http://localhost:8080/health         # liveness probe (for load balancer checks)
 ```
 
 Use `GET /health` on both nodes for load balancer health probes.

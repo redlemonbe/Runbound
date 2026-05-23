@@ -38,7 +38,7 @@ Your existing `unbound.conf` works as-is. Zero migration.
 | Automatic TLS (Let's Encrypt) | ❌ external | ❌ external | ✅ built-in ACME |
 | Tamper-evident audit log | ❌ | ❌ | ✅ HMAC-SHA256 chain |
 | Prometheus metrics | ⚠️ XML/JSON channel | ❌ | ✅ `/metrics` OpenMetrics |
-| System info endpoint | ❌ | ❌ | ✅ `GET /system` — version, memory, XDP state |
+| System info endpoint | ❌ | ❌ | ✅ `GET /api/system` — version, memory, XDP state |
 | API key rotation (no restart) | ❌ | ❌ | ✅ `POST /rotate-key` |
 | Hot config reload | ✅ rndc reload | ❌ | ✅ API |
 | Bare-metal throughput (UDP, NIC-limited) | ~same | ~same | ~same |
@@ -115,25 +115,25 @@ API="http://localhost:8080"
 TOKEN="your-api-key"
 
 # Add a DNS entry — live, no restart
-curl -s -X POST "$API/dns" \
+curl -s -X POST "$API/api/dns" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"nas.home.","type":"A","value":"192.168.1.10","ttl":300}'
 
 # Block a domain — live
-curl -s -X POST "$API/blacklist" \
+curl -s -X POST "$API/api/blacklist" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"domain":"ads.example.com"}'
 
 # Subscribe to URLhaus malware feed — auto-refreshed
-curl -s -X POST "$API/feeds" \
+curl -s -X POST "$API/api/feeds" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"urlhaus","url":"https://urlhaus.abuse.ch/downloads/hostfile/"}'
 
 # Live query stats
-curl -s "$API/stats" -H "Authorization: Bearer $TOKEN"
+curl -s "$API/api/stats" -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
@@ -356,7 +356,7 @@ Copyright (C) 2024-2026 RedLemonBe
 
 ### Security audit history
 
-**64 findings across 8 audit cycles — 64 resolved, 0 open.**
+**108 findings across 13 audit cycles — 108 resolved, 0 open.**
 
 Every release goes through a systematic security review cycle:
 

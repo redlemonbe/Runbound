@@ -356,7 +356,7 @@ to prefer the environment variable. When the env var is set it overrides the con
 **Read the last N entries via the API:**
 
 ```bash
-curl -s -H "Authorization: Bearer $KEY" http://localhost:8080/audit/tail?n=50
+curl -s -H "Authorization: Bearer $KEY" http://localhost:8080/api/audit/tail?n=50
 ```
 
 See [api.md](api.md) for the full `/audit/tail` endpoint documentation.
@@ -484,6 +484,50 @@ The auto-select path logs the chosen interface at startup (verbosity ≥ 2):
 INFO XDP auto-selected interface: ens18 (use xdp-interface: to override)
 ```
 
+### XDP hugepages
+
+```
+server:
+    xdp-hugepages: 512    # default: 0 (disabled)
+```
+
+Number of 2 MiB hugepages to pre-allocate for AF_XDP UMEM. Hugepages reduce TLB
+pressure on the hot packet path. Requires `vm.nr_hugepages` to be set in the kernel
+before Runbound starts:
+
+```bash
+echo 512 | sudo tee /proc/sys/vm/nr_hugepages
+```
+
+A value of 0 disables hugepage allocation (default). At 100 k QPS, 512 pages
+(1 GiB) is a comfortable working set.
+
+### XDP cache snapshot
+
+```
+server:
+    xdp-cache-snapshot: yes    # default: no
+```
+
+Enable the XDP cache snapshot path: cache hits are answered directly by the XDP worker
+thread from an `ArcSwap<HashMap>` without entering the hickory resolver.
+Requires `xdp: yes`. Reduces per-query latency for cached responses to < 1 µs.
+
+**Requires v1.0+** — planned for the v1.0 milestone (#60).
+
+### XDP CPU governor
+
+```
+server:
+    xdp-cpu-governor: performance    # default: (unset — do not touch)
+```
+
+Set the Linux CPU frequency governor for cores running XDP worker threads.
+`performance` disables P-state transitions during the XDP polling loop, eliminating
+the 10–50 µs wakeup latency spike seen when cores return from C-states.
+
+Accepted values: `performance`, `powersave`, `ondemand`. Requires root and
+`cpufreq` kernel support. Has no effect on systems without governor control.
 ### CPU affinity
 
 ```
@@ -756,7 +800,7 @@ NEW_KEY=$(openssl rand -hex 32)
 export RUNBOUND_API_KEY="$NEW_KEY"   # or update your systemd EnvironmentFile
 
 # 2. Rotate — call with the CURRENT key, the new key is read from env:
-curl -X POST http://localhost:8080/rotate-key \
+curl -X POST http://localhost:8080/api/rotate-key \
   -H "Authorization: Bearer $OLD_KEY"
 
 # 3. From this point on, $NEW_KEY is required for all API calls.
