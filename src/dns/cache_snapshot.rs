@@ -12,11 +12,15 @@
 //
 // #64 upgrade: QuestionKey now uses wire-format DNS name bytes (SmallVec) +
 // qclass field; CacheEntry uses bytes::Bytes for zero-copy payload access.
+//
+// #29: rkyv zero-copy persistence. save_xdp_cache / load_xdp_cache write and
+// read the mutable DashMap to/from disk using rkyv's binary format, prefixed
+// with a 4-byte magic header b"RBv1" for format detection.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 
@@ -100,6 +104,140 @@ pub fn cache_insert(
         }
     }
     mutable.insert(key, entry);
+}
+
+// ── #29: rkyv-based cache persistence ────────────────────────────────────────
+//
+// Separate "persist" types are used because:
+//   - Instant is not serializable → replaced by u64 UNIX timestamp
+//   - bytes::Bytes is not rkyv-serializable → Vec<u8>
+//   - SmallVec inline storage size must match exactly for rkyv → Vec<u8>
+//
+// Magic header guards against loading old/corrupt files: if the first 4 bytes
+// are not b"RBv1" the file is silently ignored and the server starts cold.
+
+const CACHE_MAGIC: &[u8; 4] = b"RBv1";
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
+pub struct PersistKey {
+    pub name:   Vec<u8>,
+    pub qtype:  u16,
+    pub qclass: u16,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
+pub struct PersistEntry {
+    pub wire_payload: Vec<u8>,
+    /// Absolute UNIX timestamp (seconds) when this entry expires.
+    pub expires_secs: u64,
+}
+
+/// Serialize the live DashMap to disk at `path`.
+/// The file is written atomically via a temp file + rename.
+/// Returns the number of entries written, or an error string.
+pub fn save_xdp_cache(cache: &MutableCacheMap, path: &std::path::Path) -> Result<usize, String> {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let instant_now = Instant::now();
+
+    let snapshot: Vec<(PersistKey, PersistEntry)> = cache.iter()
+        .filter(|kv| kv.value().expires_at > instant_now)
+        .map(|kv| {
+            let remaining = kv.value().expires_at
+                .saturating_duration_since(instant_now)
+                .as_secs();
+            (
+                PersistKey {
+                    name:   kv.key().name.to_vec(),
+                    qtype:  kv.key().qtype,
+                    qclass: kv.key().qclass,
+                },
+                PersistEntry {
+                    wire_payload: kv.value().wire_payload.to_vec(),
+                    expires_secs: now_unix + remaining,
+                },
+            )
+        })
+        .collect();
+
+    let count = snapshot.len();
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot)
+        .map_err(|e| format!("rkyv serialize: {e}"))?;
+
+    // Write magic + rkyv bytes to a temp file, then atomically rename.
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create tmp cache file: {e}"))?;
+        f.write_all(CACHE_MAGIC)
+            .map_err(|e| format!("write magic: {e}"))?;
+        f.write_all(&bytes)
+            .map_err(|e| format!("write rkyv bytes: {e}"))?;
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename cache file: {e}"))?;
+
+    Ok(count)
+}
+
+/// Load the on-disk cache into `cache`.
+/// Silently returns 0 if the file is absent or has an invalid magic header.
+/// Logs a warning on corruption.
+pub fn load_xdp_cache(
+    cache:       &MutableCacheMap,
+    path:        &std::path::Path,
+    max_entries: usize,
+) -> usize {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+
+    if data.len() < 4 || &data[..4] != CACHE_MAGIC {
+        tracing::warn!(
+            path = %path.display(),
+            "XDP cache: missing or invalid magic header — ignored (stale format?)"
+        );
+        return 0;
+    }
+
+    let snapshot: Vec<(PersistKey, PersistEntry)> = match
+        rkyv::from_bytes::<Vec<(PersistKey, PersistEntry)>, rkyv::rancor::Error>(&data[4..])
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(err = %e, path = %path.display(), "XDP cache: rkyv validation failed — ignored");
+            return 0;
+        }
+    };
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let instant_now = Instant::now();
+    let mut loaded = 0usize;
+
+    for (pk, pe) in snapshot {
+        if pe.expires_secs <= now_unix { continue; } // already expired
+        let remaining = Duration::from_secs(pe.expires_secs - now_unix);
+        let key = QuestionKey {
+            name:   SmallVec::from_vec(pk.name),
+            qtype:  pk.qtype,
+            qclass: pk.qclass,
+        };
+        let entry = CacheEntry {
+            wire_payload: Bytes::from(pe.wire_payload),
+            expires_at:   instant_now + remaining,
+        };
+        cache_insert(cache, key, entry, max_entries);
+        loaded += 1;
+    }
+    loaded
 }
 
 /// Background task: every 10 ms, clone the mutable map (evicting expired

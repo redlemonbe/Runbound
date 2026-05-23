@@ -174,6 +174,13 @@ pub struct UnboundConfig {
     /// Minimum seconds between two consecutive POST /api/cache/flush calls.
     /// 0 disables the cooldown entirely. Default: 60.
     pub cache_flush_cooldown: u64,
+
+    // ── Upstream racing (#33) ─────────────────────────────────────────────────
+    /// Send the same query to ALL configured upstreams simultaneously and return
+    /// the first valid response.  Remaining in-flight queries are cancelled.
+    /// Reduces p99 latency to the fastest upstream when 2+ are configured.
+    /// Default: false (backward-compatible round-robin/failover via hickory).
+    pub upstream_racing: bool,
 }
 
 impl UnboundConfig {
@@ -397,6 +404,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "prefetch"              => cfg.prefetch              = val.trim_matches('"') == "yes",
         "prefetch-threshold"    => cfg.prefetch_threshold    = val.parse().unwrap_or(5),
         "cache-flush-cooldown"  => cfg.cache_flush_cooldown  = val.parse().unwrap_or(60),
+        "upstream-racing"       => cfg.upstream_racing       = val.trim_matches('"') == "yes",
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"
