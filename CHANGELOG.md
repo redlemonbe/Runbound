@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.15] — 2026-05-23
+
+### Fixed
+
+- **BPF verifier: `math between pkt pointer and register with unbounded min value`** (`ebpf/dns_xdp.c`)  
+  After `h *= 16777619u` (FNV-1a prime), `h` becomes an unbounded scalar. `h % nb_workers` remains unbounded from the verifier's perspective because `nb_workers` is a runtime value — the verifier cannot prove the result is within `[0, max_entries)` of CPUMAP. Fix: add `if (cpu >= 64) return XDP_PASS;` immediately after the modulo. 64 matches `CPUMAP max_entries`; the explicit bound proves `cpu ∈ [0, 63]` statically.
+
+---
+
 ## [0.6.14] — 2026-05-23
 
 ### Fixed
