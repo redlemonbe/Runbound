@@ -1574,6 +1574,13 @@ async fn add_upstream_handler(
             }))).into_response();
         }
     }
+    // SEC-11: reject unspecified (0.0.0.0 / ::) — routes to loopback on Linux (SSRF)
+    if ip.is_unspecified() {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_ADDR",
+            "details": "unspecified addresses cannot be used as upstream resolvers"
+        }))).into_response();
+    }
     // FIX #44: resolve port with sensible defaults; reject port 0
     let default_port: u16 = if req.protocol == "dot" { 853 } else { 53 };
     let port = req.port.unwrap_or(default_port);
@@ -3263,6 +3270,22 @@ mod tests {
     async fn add_upstream_link_local_rejected() {
         let app = make_test_app();
         let resp = post_upstream(app, auth_header(), r#"{"addr":"169.254.169.254"}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
+    }
+
+    #[tokio::test]
+    async fn add_upstream_unspecified_v4_rejected() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"0.0.0.0"}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
+    }
+
+    #[tokio::test]
+    async fn add_upstream_unspecified_v6_rejected() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"::"}"#).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
     }
