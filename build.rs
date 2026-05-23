@@ -43,13 +43,22 @@ fn compile_ebpf() {
     // On Debian/Ubuntu the asm/* kernel headers live under the multiarch path
     // (e.g. /usr/include/x86_64-linux-gnu) rather than /usr/include/asm.
     // Detect the right path and pass it to clang so <asm/types.h> resolves.
+    //
+    // clang executes on the HOST machine, so we must use the HOST arch's
+    // multiarch path — not the cargo cross-compile target arch.  Using the
+    // target arch (e.g. aarch64) when the host is x86_64 would look for
+    // /usr/include/aarch64-linux-gnu which is absent on cross-compile CI.
     let multiarch_inc = {
-        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
-        let triplet = match arch.as_str() {
-            "x86_64"  => "x86_64-linux-gnu",
-            "aarch64" => "aarch64-linux-gnu",
-            "arm"     => "arm-linux-gnueabihf",
-            _         => "",
+        // HOST is set by cargo for build scripts (e.g. "x86_64-unknown-linux-gnu").
+        let host = env::var("HOST").unwrap_or_else(|_| "x86_64-unknown-linux-gnu".into());
+        let triplet = if host.starts_with("x86_64") {
+            "x86_64-linux-gnu"
+        } else if host.starts_with("aarch64") {
+            "aarch64-linux-gnu"
+        } else if host.starts_with("arm") {
+            "arm-linux-gnueabihf"
+        } else {
+            ""
         };
         let candidate = format!("/usr/include/{triplet}");
         if !triplet.is_empty() && std::path::Path::new(&candidate).exists() {
