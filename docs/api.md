@@ -93,6 +93,49 @@ curl -X DELETE "http://localhost:8080/api/dns/$ID" \
 {"status": "ok", "deleted_id": "550e8400-..."}
 ```
 
+#### `POST /api/dns/lookup`
+
+Perform a live DNS resolution via the configured resolver, with cache visibility.
+Useful for debugging and validating blocklist/DNSSEC behaviour from the UI or API.
+
+```bash
+curl -X POST http://localhost:8080/api/dns/lookup \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"google.com","type":"A"}'
+```
+
+```json
+{
+  "rcode":      "NOERROR",
+  "action":     "forwarded",
+  "from_cache": false,
+  "elapsed_ms": 14,
+  "records": [
+    {"value": "142.250.179.46", "ttl": 300}
+  ]
+}
+```
+
+Blocked domain example:
+
+```json
+{
+  "rcode":      "NXDOMAIN",
+  "action":     "blocked",
+  "from_cache": true,
+  "elapsed_ms": 0,
+  "records":    []
+}
+```
+
+**Fields:**
+
+| Field | Required | Default | Notes |
+|-------|----------|---------|-------|
+| `name` | Yes | — | Domain name (trailing dot optional) |
+| `type` | No | `"A"` | Record type: `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `PTR`, `NS`, `SOA` |
+
 ---
 
 ### Blacklist
@@ -144,8 +187,26 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/feed
 ```
 
 ```json
-{"feeds": [{"id": "...", "name": "urlhaus", "url": "https://...", "entry_count": 8432, "last_updated": "2026-05-16T10:00:00Z"}], "total": 1}
+{
+  "feeds": [
+    {
+      "id": "...",
+      "name": "urlhaus",
+      "url": "https://...",
+      "enabled": true,
+      "entry_count": 8432,
+      "blocked_count": 8432,
+      "last_updated": "2026-05-16T10:00:00Z",
+      "last_error": null
+    }
+  ],
+  "total": 1
+}
 ```
+
+`last_error` is `null` on success, or a short error string (e.g. `"connection timeout"`) when the last refresh failed. A feed with a non-null `last_error` still serves its previously loaded entries.
+
+`blocked_count` is the number of domains from this feed currently active in the blocklist (always ≤ `entry_count`; can differ if duplicate domains are deduplicated across feeds).
 
 #### `POST /api/feeds`
 
@@ -204,14 +265,21 @@ curl -X POST "http://localhost:8080/api/feeds/$ID/update" \
 
 ### `GET /health`
 
-Liveness probe. **No authentication required.** Returns version, uptime, and status.
+Liveness probe. **No authentication required.**
 
 ```bash
 curl http://localhost:8080/health
 ```
 
 ```json
-{"status": "ok", "version": "0.6.5", "uptime_secs": 3600}
+{
+  "status":              "ok",
+  "version":             "0.6.8",
+  "uptime_secs":         3600,
+  "xdp_active":          true,
+  "upstreams_healthy":   4,
+  "cache_entries":       48231
+}
 ```
 
 ---
@@ -521,7 +589,7 @@ rotation requirements.
 NEW_KEY="$(openssl rand -hex 32)"
 
 # Call with the CURRENT (old) key in Authorization, new key in the body:
-curl -X POST http://localhost:8080/rotate-key \
+curl -X POST http://localhost:8080/api/rotate-key \
   -H "Authorization: Bearer $OLD_KEY" \
   -H "Content-Type: application/json" \
   -d "{\"new_key\": \"$NEW_KEY\"}"
@@ -577,7 +645,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 
 ```json
 {
-  "version": "0.6.5",
+  "version": "0.6.8",
   "uptime_secs": 3600,
   "xdp_active": true,
   "xdp_mode": "drv",
@@ -639,21 +707,19 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/cach
 
 ```json
 {
-  "entries":      4823,
-  "hits":         58432,
-  "misses":       3201,
-  "evictions":    18,
-  "hit_rate_pct": 94.8
+  "cache_hits":      58432,
+  "cache_misses":    3201,
+  "cache_evictions": 18,
+  "hit_rate_pct":    94.8
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `entries` | u64 | Approximate distinct domains currently cached |
-| `hits` | u64 | Responses served from the in-process cache |
-| `misses` | u64 | Cache misses forwarded to an upstream |
-| `evictions` | u64 | Entries evicted to enforce the cache size limit |
-| `hit_rate_pct` | f64 or `null` | `hits / (hits + misses) × 100`, rounded to 1 decimal. `null` when both hits and misses are zero. |
+| `cache_hits` | u64 | Responses served from the in-process cache |
+| `cache_misses` | u64 | Cache misses forwarded to an upstream |
+| `cache_evictions` | u64 | Entries evicted to enforce the cache size limit |
+| `hit_rate_pct` | f64 or `null` | `cache_hits / (cache_hits + cache_misses) × 100`, rounded to 1 decimal. `null` when both are zero. |
 
 All counters reset to zero on `POST /api/cache/flush`.
 
@@ -676,15 +742,16 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
   "upstreams": [
     {
       "id": "550e8400-...",
-      "name": "Cloudflare",
+      "name": "Cloudflare DoT",
       "addr": "1.1.1.1",
-      "port": 53,
-      "protocol": "udp",
+      "port": 853,
+      "protocol": "dot",
+      "tls_hostname": "one.one.one.one",
       "healthy": true,
-      "latency_ms": 12,
+      "latency_ms": 14,
       "last_check": "2026-05-22T15:00:00Z",
+      "last_error": null,
       "zone": ".",
-      "dnssec_supported": true,
       "latency_history": [11, 12, 14, 11, 13]
     }
   ],
@@ -693,11 +760,12 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
 }
 ```
 
-**New fields (v0.6.5):**
-
 | Field | Type | Description |
 |-------|------|-------------|
-| `dnssec_supported` | `bool` or absent | `true` if the upstream sets the AD bit in probe responses. Absent (not `null`) when unhealthy or not yet probed. DoT upstreams always omit this field. |
+| `source` | `"runtime"` or `"config"` | `"config"` for upstreams loaded from `forward-zone` in `runbound.conf`; `"runtime"` for upstreams added via API. Config upstreams persist only via the config file; deleting them removes the `forward-addr` line and reloads. |
+| `tls_hostname` | `string` or absent | DoT only. TLS SNI hostname used for certificate validation. Absent when not set (auto-detected from well-known IPs). |
+| `last_error` | `string` or `null` | Short description of the last probe failure (`"connection timeout"`, `"tls handshake failed"`, etc.). `null` when the last probe succeeded. |
+| `dnssec_supported` | `bool` or absent | `true` if the upstream sets the AD bit in probe responses. Absent when unhealthy or not yet probed. DoT upstreams always omit this field. |
 | `latency_history` | `[u64]` | Last ≤ 5 successful probe round-trip times (ms). Empty array until the first successful probe. Failed probes do not append. |
 
 #### `POST /api/upstreams`
@@ -706,16 +774,18 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
 curl -X POST http://localhost:8080/api/upstreams \
   -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name":"Cloudflare DoT","addr":"1.1.1.1","port":853,"protocol":"dot"}'
+  -d '{"name":"Cloudflare DoT","addr":"1.1.1.1","port":853,"protocol":"dot","tls_hostname":"one.one.one.one"}'
 ```
 
-**Validation:**
+**Fields:**
 
-| Field | Rules |
-|-------|-------|
-| `addr` | Valid IP address. Loopback (`127.x.x.x`, `::1`) and IPv4 link-local (`169.254.x.x`) are rejected (`400 INVALID_ADDR`). Private ranges (RFC 1918) and IPv6 ULA are allowed. |
-| `protocol` | `"udp"` or `"dot"` (`400 INVALID_PROTOCOL` otherwise). |
-| `port` | 1–65535. Defaults to 53 (UDP) or 853 (DoT) when omitted. Port 0 returns `400 INVALID_PORT`. |
+| Field | Required | Rules |
+|-------|----------|-------|
+| `addr` | Yes | Valid IP address. Loopback (`127.x.x.x`, `::1`) and IPv4 link-local (`169.254.x.x`) are rejected (`400 INVALID_ADDR`). Private ranges (RFC 1918) and IPv6 ULA are allowed. |
+| `protocol` | Yes | `"udp"` or `"dot"` (`400 INVALID_PROTOCOL` otherwise). |
+| `port` | No | 1–65535. Defaults to 53 (UDP) or 853 (DoT) when omitted. Port 0 returns `400 INVALID_PORT`. |
+| `name` | No | Human-readable label. Max 64 characters. |
+| `tls_hostname` | No | DoT only. SNI hostname for TLS certificate validation. When omitted, Runbound auto-detects from well-known IPs (Cloudflare, Quad9, Google). Set explicitly for private or custom DoT resolvers. |
 
 #### `DELETE /api/upstreams/:id`
 
@@ -729,19 +799,27 @@ resolver must always have at least one forwarder.
 
 #### `PATCH /api/upstreams/:id`
 
-Rename an upstream in-place. Only the `name` field is patchable.
+Update an upstream in-place. Patchable fields: `name`, `tls_hostname`.
 
 ```bash
+# Rename
 curl -X PATCH http://localhost:8080/api/upstreams/550e8400-... \
   -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"name":"My Cloudflare"}'
+
+# Set or update the DoT SNI hostname
+curl -X PATCH http://localhost:8080/api/upstreams/550e8400-... \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"tls_hostname":"dns.example.com"}'
 ```
 
-- An empty string or `null` clears the name (`name` becomes absent in the response).
-- Any field other than `name` returns `400 INVALID_FIELD`.
+- `name`: max 64 characters, no control characters. Empty string or `null` clears the name.
+- `tls_hostname`: DoT upstreams only. Empty string or `null` clears it (falls back to auto-detect). Ignored for UDP upstreams.
+- Any field other than `name` or `tls_hostname` returns `400 INVALID_FIELD`.
 - Unknown id returns `404`.
-- The rename is persisted to `upstreams.json` immediately.
+- Changes are persisted to `upstreams.json` immediately.
 
 #### `GET /api/upstreams/presets`
 
@@ -751,6 +829,58 @@ Each preset carries a bare IP `addr` and a separate `port` field (no `@port` suf
 ```bash
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upstreams/presets
 ```
+
+#### `POST /api/upstreams/:id/probe`
+
+Trigger an immediate health probe for one upstream, outside the normal probe schedule.
+Returns the result synchronously.
+
+```bash
+curl -X POST -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  http://localhost:8080/api/upstreams/550e8400-.../probe
+```
+
+```json
+{
+  "id": "550e8400-...",
+  "healthy": true,
+  "latency_ms": 14,
+  "dnssec_supported": true,
+  "probed_at": "2026-05-22T15:00:00Z"
+}
+```
+
+On failure:
+
+```json
+{
+  "id": "550e8400-...",
+  "healthy": false,
+  "latency_ms": null,
+  "dnssec_supported": null,
+  "last_error": "connection timeout",
+  "probed_at": "2026-05-22T15:00:00Z"
+}
+```
+
+Returns `404` if the upstream id is unknown.
+
+#### `POST /api/upstreams/reconnect`
+
+Force-reconnect all DoT upstreams. Useful when TCP connections have gone idle after a
+network interruption or when the `no connections available` error is observed.
+
+```bash
+curl -X POST -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  http://localhost:8080/api/upstreams/reconnect
+```
+
+```json
+{"reconnected": 4, "failed": 0}
+```
+
+The shared resolver is atomically rebuilt with fresh connections. All in-flight queries
+complete against the old resolver before it is dropped.
 
 ---
 

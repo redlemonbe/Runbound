@@ -101,7 +101,7 @@ In-flight queries are not interrupted — they finish against the old snapshot.
 systemctl reload runbound
 
 # Via REST API — same effect as SIGHUP
-curl -X POST http://localhost:8080/reload \
+curl -X POST http://localhost:8080/api/reload \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 # → {"status":"ok","cfg_path":"/etc/runbound/runbound.conf","local_zones":5,"local_data":12}
 ```
@@ -126,7 +126,7 @@ curl -X POST http://localhost:8080/reload \
 
 ```bash
 # Feed domains are active immediately after this call — no reload needed
-curl -X POST http://localhost:8080/feeds/update \
+curl -X POST http://localhost:8080/api/feeds/update \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 

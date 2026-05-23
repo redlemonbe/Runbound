@@ -95,7 +95,7 @@ API="http://localhost:8080"
 TOKEN="your-key"
 
 # Add a local DNS entry
-curl -s -X POST "$API/dns" \
+curl -s -X POST "$API/api/dns" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"myserver.home.","type":"A","value":"192.168.1.50","ttl":300}'
@@ -104,7 +104,7 @@ curl -s -X POST "$API/dns" \
 dig @127.0.0.1 myserver.home.
 
 # View stats
-curl -s "$API/stats" -H "Authorization: Bearer $TOKEN"
+curl -s "$API/api/stats" -H "Authorization: Bearer $TOKEN"
 ```
 
 That's all. For the full API reference see [api.md](api.md).
