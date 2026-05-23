@@ -9,6 +9,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.14] — 2026-05-23
+
+### Fixed
+
+- **BPF verifier rejects `qname++` on PTR_TO_PACKET** (`ebpf/dns_xdp.c`)  
+  In `dns_qname_hash()`, incrementing the `qname` pointer (`qname++`) creates a
+  `PTR_TO_PACKET` with variable offset. The verifier calculates the worst-case
+  advance (`packet_end − qname_start`, up to 786 bytes on a 840-byte packet) and
+  rejects the program because `qname + worst_case + 1` exceeds the verified range.
+  Fix: keep `qname` immobile, use `qname[i]` with bounded index `i < 64`.
+  The bounds check `(qname + i + 1) > data_end` is then statically provable.
+  Same fix class as the v0.6.10 `pointer -= pointer` verifier rejection.
+  Hash output is unchanged — FNV-1a logic (seed, XOR, multiply) is identical.
+
+---
+
 ## [0.6.13] — 2026-05-23
 
 ### Fixed
