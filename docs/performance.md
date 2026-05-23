@@ -144,7 +144,7 @@ A follow-up benchmark with an Intel X540-T2 client will test:
 - Expected range: 500 000 – 14 000 000 QPS
 - Both BIND9 and Unbound lack XDP support — comparison becomes one-sided
 
-Results will be published in [docs/benchmark-xdp.md](benchmark-xdp.md) when available.
+Results will be published in a dedicated benchmark report when available (pending Intel X520 hardware — see issue #84).
 
 ---
 
