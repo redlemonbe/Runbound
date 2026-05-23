@@ -27,6 +27,7 @@ use crate::feeds::{load_feeds, save_feeds, update_one_feed, Feed, FeedsConfig};
 use crate::store::{
     load, load_blacklist, save, save_blacklist, BlacklistEntry, BlacklistStore, DnsEntry, DnsStore,
 };
+use crate::upstreams::{SharedUpstreams, add_upstream, remove_upstream};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -52,9 +53,106 @@ fn slave_ip(addr: &str) -> String {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const JOURNAL_CAPACITY: usize = 1_000;
-fn fingerprint_path() -> std::path::PathBuf { crate::runtime::base_dir().join("sync-master.fingerprint") }
-fn sync_cert_path() -> std::path::PathBuf { crate::runtime::base_dir().join("sync-cert.pem") }
-fn sync_key_path() -> std::path::PathBuf { crate::runtime::base_dir().join("sync-key.pem") }
+fn fingerprint_path()  -> std::path::PathBuf { crate::runtime::base_dir().join("sync-master.fingerprint") }
+fn sync_cert_path()    -> std::path::PathBuf { crate::runtime::base_dir().join("sync-cert.pem") }
+fn sync_key_path()     -> std::path::PathBuf { crate::runtime::base_dir().join("sync-key.pem") }
+fn slaves_json_path()  -> std::path::PathBuf { crate::runtime::base_dir().join("slaves.json") }
+fn node_id_path()      -> std::path::PathBuf { crate::runtime::base_dir().join("node-id") }
+fn relay_cert_path()   -> std::path::PathBuf { crate::runtime::base_dir().join("relay-cert.pem") }
+fn relay_key_path()    -> std::path::PathBuf { crate::runtime::base_dir().join("relay-key.pem") }
+
+// ── HMAC-SHA256 relay authentication (#85) ────────────────────────────────────
+//
+// Message = METHOD + "\n" + path + "\n" + unix_timestamp_decimal
+// Signature = HMAC-SHA256(sync_key_bytes, message_bytes) — hex-encoded
+// Headers: X-Runbound-TS (unix secs)  +  X-Runbound-Sig (hex)
+
+pub fn hmac_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub fn hmac_sign(key: &str, method: &str, path: &str, ts: u64) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let msg = format!("{method}\n{path}\n{ts}");
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes())
+        .expect("HMAC accepts any key size");
+    mac.update(msg.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Constant-time HMAC verification. Returns true iff the signature is valid
+/// AND the timestamp is within ±30 s of the current server clock.
+pub fn hmac_verify_with_ts(key: &str, method: &str, path: &str, ts: u64, sig: &str) -> bool {
+    use subtle::ConstantTimeEq as _;
+    let now = hmac_unix_now();
+    let diff = if now >= ts { now - ts } else { ts - now };
+    if diff > 30 {
+        return false;
+    }
+    let expected = hmac_sign(key, method, path, ts);
+    // Length mismatch also returns false.
+    // Fold both length check and byte comparison into a single constant-time accumulator.
+    let len_ok: u8 = if expected.len() == sig.len() { 1 } else { 0 };
+    let byte_diff: u8 = sig.bytes().zip(expected.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    // Both checks must pass: len_ok == 1 AND byte_diff == 0.
+    let combined = byte_diff | (1u8.wrapping_sub(len_ok)); // non-zero if either fails
+    combined.ct_eq(&0u8).into()
+}
+
+/// Generate or load the relay TLS cert (separate from sync cert — each node has its own).
+pub fn ensure_relay_cert() -> anyhow::Result<(String, String)> {
+    use std::fs;
+    #[cfg(unix)] use std::os::unix::fs::PermissionsExt;
+
+    let cert_path = relay_cert_path();
+    let key_path  = relay_key_path();
+    if let (Ok(cert), Ok(key)) = (
+        fs::read_to_string(&cert_path),
+        fs::read_to_string(&key_path),
+    ) {
+        return Ok((cert, key));
+    }
+    info!("Generating self-signed relay certificate");
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["runbound-relay".to_string()])
+            .map_err(|e| anyhow::anyhow!("relay cert generation failed: {e}"))?;
+    fs::create_dir_all(crate::runtime::base_dir())
+        .map_err(|e| anyhow::anyhow!("create base_dir: {e}"))?;
+    let cert_pem = cert.pem();
+    let key_pem  = key_pair.serialize_pem();
+    fs::write(&cert_path, &cert_pem)
+        .map_err(|e| anyhow::anyhow!("write relay-cert.pem: {e}"))?;
+    fs::write(&key_path, &key_pem)
+        .map_err(|e| anyhow::anyhow!("write relay-key.pem: {e}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow::anyhow!("chmod relay-key.pem: {e}"))?;
+    Ok((cert_pem, key_pem))
+}
+
+/// Load or generate the stable node UUID (persisted in node-id file).
+pub fn ensure_node_id() -> anyhow::Result<String> {
+    let path = node_id_path();
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return Ok(id);
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    std::fs::create_dir_all(crate::runtime::base_dir())
+        .map_err(|e| anyhow::anyhow!("create base_dir: {e}"))?;
+    std::fs::write(&path, &id)
+        .map_err(|e| anyhow::anyhow!("write node-id: {e}"))?;
+    info!(%id, "Generated new node UUID");
+    Ok(id)
+}
 
 // ── SyncJournal ───────────────────────────────────────────────────────────────
 
@@ -68,6 +166,9 @@ pub enum SyncOp {
     AddFeed         { feed: Feed },
     DeleteFeed      { id: String },
     UpdateFeed      { id: String, url: String },
+    // #87 — upstream replication
+    AddUpstream    { addr: String, port: u16, protocol: String, name: Option<String>, tls_hostname: Option<String> },
+    DeleteUpstream { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,21 +179,32 @@ pub struct SyncEvent {
 }
 
 /// Snapshot of a connected slave returned by GET /api/sync/slaves.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaveInfo {
+    /// Stable UUID identifying this node (set at registration, #88).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id:          Option<String>,
     /// Slave IP address (deduplicated — ephemeral port stripped).
-    pub addr:           String,
+    pub addr:             String,
+    /// "{ip}:{sync_port}" used by master to reach slave for relay (#85).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_host:       Option<String>,
+    /// SHA-256 hex of slave's TLS cert — pinned for relay connections (#85).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
     /// Unix timestamp of the last contact.
-    pub last_seen_at:   u64,
+    pub last_seen_at:     u64,
     /// Seconds elapsed since last contact (computed at query time).
-    pub last_seen_secs: u64,
+    #[serde(default)]
+    pub last_seen_secs:   u64,
     /// "connected" (seen ≤30s ago) or "disconnected".
-    pub status:         String,
-    pub last_seq:       u64,
+    #[serde(default)]
+    pub status:           String,
+    pub last_seq:         u64,
     /// Number of zones synchronised (0 = not tracked yet).
-    pub zones_synced:   u32,
+    pub zones_synced:     u32,
     /// Slave binary version (null = not reported yet).
-    pub version:        Option<String>,
+    pub version:          Option<String>,
 }
 
 // Max calls to /sync/cert per peer IP per 60-second window (TOFU bootstrap guard).
@@ -102,6 +214,8 @@ pub struct SyncJournal {
     events:            Mutex<VecDeque<SyncEvent>>,
     seq:               AtomicU64,
     connected_slaves:  Mutex<HashMap<String, SlaveInfo>>,
+    /// Registered nodes (node_id → SlaveInfo). Persisted to slaves.json (#88).
+    registered_nodes:  Mutex<HashMap<String, SlaveInfo>>,
     /// Per-peer rate-limit for the public /sync/cert endpoint:
     /// maps peer-addr → (request_count_in_window, window_start).
     cert_rl:           dashmap::DashMap<String, (u32, Instant), ahash::RandomState>,
@@ -109,12 +223,15 @@ pub struct SyncJournal {
 
 impl SyncJournal {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        let j = Arc::new(Self {
             events:           Mutex::new(VecDeque::with_capacity(JOURNAL_CAPACITY)),
             seq:              AtomicU64::new(0),
             connected_slaves: Mutex::new(HashMap::new()),
+            registered_nodes: Mutex::new(HashMap::new()),
             cert_rl:          dashmap::DashMap::with_hasher(ahash::RandomState::default()),
-        })
+        });
+        j.load_nodes();
+        j
     }
 
     /// Record or refresh a slave connection (called from /sync/state and /sync/delta).
@@ -128,39 +245,23 @@ impl SyncJournal {
         let ip = slave_ip(&addr);
         let mut map = self.connected_slaves.lock().unwrap_or_else(|e| panic!("sync: slaves mutex poisoned: {e}"));
         map.insert(ip.clone(), SlaveInfo {
-            addr:           ip,
-            last_seen_at:   now,
-            last_seen_secs: 0,          // computed at query time
-            status:         String::new(), // computed at query time
-            last_seq:       seq,
-            zones_synced:   0,
-            version:        None,
+            node_id:          None,
+            addr:             ip,
+            relay_host:       None,
+            cert_fingerprint: None,
+            last_seen_at:     now,
+            last_seen_secs:   0,
+            status:           String::new(),
+            last_seq:         seq,
+            zones_synced:     0,
+            version:          None,
         });
     }
 
     /// Return a snapshot of recently-seen slaves (last-seen ≤ 5 min ago).
-    /// Computes last_seen_secs and status at call time.
+    /// Delegates to all_slaves_snapshot for a merged view of legacy + registered.
     pub fn connected_slaves(&self) -> Vec<SlaveInfo> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let map = self.connected_slaves.lock().unwrap_or_else(|e| panic!("sync: slaves mutex poisoned: {e}"));
-        map.values()
-            .filter(|s| now.saturating_sub(s.last_seen_at) < 300)
-            .map(|s| {
-                let secs = now.saturating_sub(s.last_seen_at);
-                SlaveInfo {
-                    addr:           s.addr.clone(),
-                    last_seen_at:   s.last_seen_at,
-                    last_seen_secs: secs,
-                    status:         if secs < 30 { "connected".to_string() } else { "disconnected".to_string() },
-                    last_seq:       s.last_seq,
-                    zones_synced:   s.zones_synced,
-                    version:        s.version.clone(),
-                }
-            })
-            .collect()
+        self.all_slaves_snapshot()
     }
 
     /// Push an operation, returns the assigned sequence number.
@@ -192,6 +293,151 @@ impl SyncJournal {
 
     pub fn current_seq(&self) -> u64 {
         self.seq.load(Ordering::SeqCst)
+    }
+
+    // ── Node registration (#88) ───────────────────────────────────────────
+
+    pub fn register_node(
+        &self,
+        node_id:          String,
+        addr:             String,
+        relay_host:       String,
+        cert_fingerprint: String,
+        version:          Option<String>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let info = SlaveInfo {
+            node_id:          Some(node_id.clone()),
+            addr,
+            relay_host:       Some(relay_host),
+            cert_fingerprint: Some(cert_fingerprint),
+            last_seen_at:     now,
+            last_seen_secs:   0,
+            status:           String::new(),
+            last_seq:         0,
+            zones_synced:     0,
+            version,
+        };
+        self.registered_nodes.lock()
+            .unwrap_or_else(|e| panic!("sync: registered_nodes mutex poisoned: {e}"))
+            .insert(node_id, info);
+        self.save_nodes();
+    }
+
+    /// Refresh last_seen for a registered node (called on relay contact).
+    pub fn touch_node(&self, node_id: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Ok(mut map) = self.registered_nodes.lock() {
+            if let Some(s) = map.get_mut(node_id) {
+                s.last_seen_at = now;
+            }
+        }
+    }
+
+    /// Return all registered nodes with relay_host set (for config push).
+    pub fn registered_slaves(&self) -> Vec<SlaveInfo> {
+        self.registered_nodes.lock()
+            .unwrap_or_else(|e| panic!("sync: registered_nodes mutex poisoned: {e}"))
+            .values()
+            .filter(|s| s.relay_host.is_some())
+            .cloned()
+            .collect()
+    }
+
+    /// Return a slave by node_id (for relay forward).
+    pub fn get_node(&self, node_id: &str) -> Option<SlaveInfo> {
+        self.registered_nodes.lock()
+            .unwrap_or_else(|e| panic!("sync: registered_nodes mutex poisoned: {e}"))
+            .get(node_id)
+            .cloned()
+    }
+
+    /// Merged list for GET /api/sync/slaves (legacy connected + registered).
+    pub fn all_slaves_snapshot(&self) -> Vec<SlaveInfo> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut out: Vec<SlaveInfo> = Vec::new();
+
+        // Legacy sync-connected (IP keyed, no node_id)
+        if let Ok(map) = self.connected_slaves.lock() {
+            for s in map.values().filter(|s| now.saturating_sub(s.last_seen_at) < 300) {
+                let secs = now.saturating_sub(s.last_seen_at);
+                out.push(SlaveInfo {
+                    node_id:          s.node_id.clone(),
+                    addr:             s.addr.clone(),
+                    relay_host:       s.relay_host.clone(),
+                    cert_fingerprint: None,
+                    last_seen_at:     s.last_seen_at,
+                    last_seen_secs:   secs,
+                    status:           if secs < 30 { "connected".into() } else { "disconnected".into() },
+                    last_seq:         s.last_seq,
+                    zones_synced:     s.zones_synced,
+                    version:          s.version.clone(),
+                });
+            }
+        }
+
+        // Registered nodes
+        if let Ok(map) = self.registered_nodes.lock() {
+            for s in map.values() {
+                // Skip if already present as legacy (by IP)
+                if out.iter().any(|x| x.addr == s.addr && x.node_id.is_none()) {
+                    continue;
+                }
+                let secs = now.saturating_sub(s.last_seen_at);
+                out.push(SlaveInfo {
+                    node_id:          s.node_id.clone(),
+                    addr:             s.addr.clone(),
+                    relay_host:       s.relay_host.clone(),
+                    cert_fingerprint: None, // never expose fingerprint in API
+                    last_seen_at:     s.last_seen_at,
+                    last_seen_secs:   secs,
+                    status:           if secs < 30 { "connected".into() } else { "disconnected".into() },
+                    last_seq:         s.last_seq,
+                    zones_synced:     s.zones_synced,
+                    version:          s.version.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    fn save_nodes(&self) {
+        if let Ok(map) = self.registered_nodes.lock() {
+            let path = slaves_json_path();
+            match serde_json::to_string_pretty(map.values().collect::<Vec<_>>().as_slice()) {
+                Ok(json) => { let _ = std::fs::write(&path, &json); }
+                Err(e) => warn!("save_nodes: serialize failed: {e}"),
+            }
+        }
+    }
+
+    fn load_nodes(&self) {
+        let path = slaves_json_path();
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            match serde_json::from_str::<Vec<SlaveInfo>>(&data) {
+                Ok(nodes) => {
+                    let mut map = self.registered_nodes.lock()
+                        .unwrap_or_else(|e| panic!("sync: registered_nodes mutex poisoned: {e}"));
+                    for node in nodes {
+                        if let Some(ref id) = node.node_id.clone() {
+                            map.insert(id.clone(), node);
+                        }
+                    }
+                    info!(count = map.len(), "Loaded registered nodes from slaves.json");
+                }
+                Err(e) => warn!("load_nodes: parse slaves.json failed: {e}"),
+            }
+        }
     }
 }
 
@@ -472,8 +718,9 @@ async fn handle_sync_request(
     cert_fingerprint: String,
     peer_addr: String,
 ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
-    let path  = req.uri().path().to_string();
-    let query = req.uri().query().unwrap_or("").to_string();
+    let method = req.method().to_string();
+    let path   = req.uri().path().to_string();
+    let query  = req.uri().query().unwrap_or("").to_string();
 
     // /sync/cert — returns fingerprint, no auth (TOFU bootstrap).
     // Rate-limited per peer IP: max 10 requests per 60-second window to prevent
@@ -496,6 +743,51 @@ async fn handle_sync_request(
             return Ok(json_resp(429, serde_json::json!({ "error": "RATE_LIMITED" })));
         }
         return Ok(json_ok(serde_json::json!({ "fingerprint": cert_fingerprint })));
+    }
+
+    // /nodes/register — HMAC-SHA256 auth (slave→master, #88).
+    // Uses X-Runbound-TS + X-Runbound-Sig headers instead of Bearer token.
+    if path == "/nodes/register" && method == "POST" {
+        let ts_str = req.headers()
+            .get("x-runbound-ts").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let sig = req.headers()
+            .get("x-runbound-sig").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let ts: u64 = ts_str.parse().unwrap_or(0);
+        if !hmac_verify_with_ts(&sync_key, "POST", "/nodes/register", ts, sig) {
+            return Ok(json_resp(401, serde_json::json!({ "error": "UNAUTHORIZED" })));
+        }
+        let body_bytes = match req.collect().await {
+            Ok(b) => b.to_bytes(),
+            Err(e) => return Ok(json_resp(400, serde_json::json!({ "error": format!("body read: {e}") }))),
+        };
+        if body_bytes.len() > 4096 {
+            return Ok(json_resp(413, serde_json::json!({ "error": "REQUEST_TOO_LARGE" })));
+        }
+        #[derive(serde::Deserialize)]
+        struct RegisterReq {
+            node_id:          String,
+            relay_host:       String,  // "{slave_ip}:{slave_sync_port}"
+            cert_fingerprint: String,
+            version:          Option<String>,
+        }
+        let reg: RegisterReq = match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") }))),
+        };
+        // Validate node_id is a non-empty string (no UUID format enforcement — flexible)
+        if reg.node_id.is_empty() || reg.relay_host.is_empty() || reg.cert_fingerprint.is_empty() {
+            return Ok(json_resp(400, serde_json::json!({ "error": "MISSING_FIELDS" })));
+        }
+        let peer_ip = slave_ip(&peer_addr);
+        info!(node_id = %reg.node_id, relay_host = %reg.relay_host, peer = %peer_ip, "Node registered");
+        journal.register_node(
+            reg.node_id.clone(),
+            peer_ip,
+            reg.relay_host,
+            reg.cert_fingerprint,
+            reg.version,
+        );
+        return Ok(json_ok(serde_json::json!({ "ok": true, "node_id": reg.node_id })));
     }
 
     // All other endpoints require Bearer auth — constant-time to prevent
@@ -569,6 +861,7 @@ pub struct SlaveClient {
     zones:       Arc<ArcSwap<LocalZoneSet>>,
     zones_mutex: Arc<tokio::sync::Mutex<()>>,
     cfg:         Arc<UnboundConfig>,
+    upstreams:   SharedUpstreams,
 }
 
 impl SlaveClient {
@@ -579,6 +872,7 @@ impl SlaveClient {
         zones:       Arc<ArcSwap<LocalZoneSet>>,
         zones_mutex: Arc<tokio::sync::Mutex<()>>,
         cfg:         Arc<UnboundConfig>,
+        upstreams:   SharedUpstreams,
     ) -> Self {
         Self {
             host_port: master.to_string(),
@@ -587,6 +881,7 @@ impl SlaveClient {
             zones,
             zones_mutex,
             cfg,
+            upstreams,
         }
     }
 
@@ -841,8 +1136,206 @@ impl SlaveClient {
                     warn!("Slave sync: UpdateFeed {id} failed: {e}");
                 }
             }
+            SyncOp::AddUpstream { addr, port, protocol, name, tls_hostname } => {
+                add_upstream(&self.upstreams, addr, port, protocol, name, tls_hostname);
+            }
+            SyncOp::DeleteUpstream { id } => {
+                remove_upstream(&self.upstreams, &id);
+            }
         }
         Ok(())
+    }
+}
+
+// ── Node relay server (slave side, #85) ───────────────────────────────────────
+
+/// State passed to the slave relay server for executing relayed operations.
+pub struct NodeRelay {
+    pub zones:       Arc<ArcSwap<LocalZoneSet>>,
+    pub zones_mutex: Arc<tokio::sync::Mutex<()>>,
+    pub cfg:         Arc<UnboundConfig>,
+    pub upstreams:   SharedUpstreams,
+}
+
+/// Slave relay TLS server — listens on sync_port, handles /relay/* paths.
+/// Only HMAC-authenticated requests from master are accepted.
+pub async fn start_node_server(
+    port:     u16,
+    sync_key: String,
+    cert_pem: String,
+    key_pem:  String,
+    relay:    Arc<NodeRelay>,
+) -> anyhow::Result<()> {
+    let tls_config = Arc::new(server_tls_config(&cert_pem, &key_pem)?);
+    let acceptor   = TlsAcceptor::from(tls_config);
+    let listener   = TcpListener::bind(format!("0.0.0.0:{port}")).await
+        .map_err(|e| anyhow::anyhow!("bind node relay port {port}: {e}"))?;
+    info!(port, "Node relay server listening");
+
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(x)  => x,
+            Err(e) => { warn!("relay accept: {e}"); continue; }
+        };
+        let acceptor  = acceptor.clone();
+        let sync_key  = sync_key.clone();
+        let relay     = Arc::clone(&relay);
+        let peer_str  = peer.to_string();
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(tcp).await {
+                Ok(s)  => s,
+                Err(e) => { warn!(peer = %peer_str, "relay TLS: {e}"); return; }
+            };
+            let io = TokioIo::new(tls);
+            let svc = service_fn(move |req| {
+                handle_relay_request(req, sync_key.clone(), Arc::clone(&relay))
+            });
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await
+            {
+                warn!(peer = %peer_str, "relay conn: {e}");
+            }
+        });
+    }
+}
+
+async fn handle_relay_request(
+    req:      hyper::Request<hyper::body::Incoming>,
+    sync_key: String,
+    relay:    Arc<NodeRelay>,
+) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
+    let method = req.method().to_string();
+    let path   = req.uri().path().to_string();
+
+    // Only /relay/* is served here.
+    if !path.starts_with("/relay/") && path != "/relay" {
+        return Ok(json_resp(404, serde_json::json!({ "error": "NOT_FOUND" })));
+    }
+
+    // Validate HMAC + timestamp (replay protection ±30s).
+    let ts_str = req.headers()
+        .get("x-runbound-ts").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let sig = req.headers()
+        .get("x-runbound-sig").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ts: u64 = ts_str.parse().unwrap_or(0);
+    if !hmac_verify_with_ts(&sync_key, &method, &path, ts, sig) {
+        return Ok(json_resp(401, serde_json::json!({ "error": "UNAUTHORIZED" })));
+    }
+
+    // Strip /relay/ prefix to get the operation path.
+    let op = path.strip_prefix("/relay/").unwrap_or("").trim_matches('/');
+
+    // Read body (max 64 KiB).
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => return Ok(json_resp(400, serde_json::json!({ "error": format!("body read: {e}") }))),
+    };
+    if body_bytes.len() > 65_536 {
+        return Ok(json_resp(413, serde_json::json!({ "error": "REQUEST_TOO_LARGE" })));
+    }
+
+    match (method.as_str(), op) {
+        // ── DNS ──────────────────────────────────────────────────────────────
+        ("POST", "dns") => {
+            let entry: DnsEntry = match serde_json::from_slice(&body_bytes) {
+                Ok(e) => e,
+                Err(e) => return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") }))),
+            };
+            let _guard = relay.zones_mutex.lock().await;
+            let mut st = load().unwrap_or_default();
+            if !st.entries.iter().any(|e| e.id == entry.id) {
+                if let Some(rr) = entry.to_rr_string() {
+                    if let Some(record) = parse_local_data(&rr) {
+                        let current = relay.zones.load_full();
+                        let mut new_zones = (*current).clone();
+                        let name = record.name.clone();
+                        new_zones.zones.entry(name.clone()).or_insert(ZoneAction::Static);
+                        new_zones.records.entry(name).or_default().push(record);
+                        relay.zones.store(Arc::new(new_zones));
+                    }
+                }
+                st.entries.push(entry.clone());
+                if let Err(e) = save(&st) {
+                    return Ok(json_resp(500, serde_json::json!({ "error": format!("save: {e}") })));
+                }
+            }
+            Ok(json_ok(serde_json::json!({ "ok": true, "id": entry.id })))
+        }
+        ("DELETE", op) if op.starts_with("dns/") => {
+            let id = op.trim_start_matches("dns/");
+            let _guard = relay.zones_mutex.lock().await;
+            let mut st = load().unwrap_or_default();
+            st.entries.retain(|e| e.id != id);
+            if let Err(e) = save(&st) {
+                return Ok(json_resp(500, serde_json::json!({ "error": format!("save: {e}") })));
+            }
+            let new_zones = crate::build_zone_set(&relay.cfg);
+            relay.zones.store(Arc::new(new_zones));
+            Ok(json_ok(serde_json::json!({ "ok": true })))
+        }
+        // ── Blacklist ────────────────────────────────────────────────────────
+        ("POST", "blacklist") => {
+            let entry: BlacklistEntry = match serde_json::from_slice(&body_bytes) {
+                Ok(e) => e,
+                Err(e) => return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") }))),
+            };
+            let _guard = relay.zones_mutex.lock().await;
+            let mut bl = load_blacklist().unwrap_or_default();
+            if !bl.entries.iter().any(|e| e.id == entry.id) {
+                let action = ZoneAction::from(&entry.action);
+                bl.entries.push(entry.clone());
+                if let Err(e) = save_blacklist(&bl) {
+                    return Ok(json_resp(500, serde_json::json!({ "error": format!("save: {e}") })));
+                }
+                let current = relay.zones.load_full();
+                let mut new_zones = (*current).clone();
+                new_zones.override_zone(&entry.domain, action);
+                relay.zones.store(Arc::new(new_zones));
+            }
+            Ok(json_ok(serde_json::json!({ "ok": true, "id": entry.id })))
+        }
+        ("DELETE", op) if op.starts_with("blacklist/") => {
+            let id = op.trim_start_matches("blacklist/");
+            let _guard = relay.zones_mutex.lock().await;
+            let mut bl = load_blacklist().unwrap_or_default();
+            bl.entries.retain(|e| e.id != id);
+            if let Err(e) = save_blacklist(&bl) {
+                return Ok(json_resp(500, serde_json::json!({ "error": format!("save: {e}") })));
+            }
+            let new_zones = crate::build_zone_set(&relay.cfg);
+            relay.zones.store(Arc::new(new_zones));
+            Ok(json_ok(serde_json::json!({ "ok": true })))
+        }
+        // ── Upstreams ────────────────────────────────────────────────────────
+        ("POST", "upstreams") => {
+            #[derive(serde::Deserialize)]
+            struct RelayUpstream {
+                addr: String, port: u16, protocol: String,
+                name: Option<String>, tls_hostname: Option<String>,
+            }
+            let u: RelayUpstream = match serde_json::from_slice(&body_bytes) {
+                Ok(u) => u,
+                Err(e) => return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") }))),
+            };
+            let entry = add_upstream(&relay.upstreams, u.addr, u.port, u.protocol, u.name, u.tls_hostname);
+            Ok(json_ok(serde_json::json!({ "ok": true, "id": entry.id })))
+        }
+        ("DELETE", op) if op.starts_with("upstreams/") => {
+            let id = op.trim_start_matches("upstreams/");
+            remove_upstream(&relay.upstreams, id);
+            Ok(json_ok(serde_json::json!({ "ok": true })))
+        }
+        // ── Snapshot (#87) ───────────────────────────────────────────────────
+        ("GET", "snapshot") => {
+            let dns       = load().unwrap_or_default().entries;
+            let blacklist = load_blacklist().unwrap_or_default().entries;
+            let feeds     = load_feeds().unwrap_or_default().feeds;
+            Ok(json_ok(serde_json::json!({
+                "dns": dns, "blacklist": blacklist, "feeds": feeds,
+            })))
+        }
+        _ => Ok(json_resp(404, serde_json::json!({ "error": "NOT_FOUND" }))),
     }
 }
 
