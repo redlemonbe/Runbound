@@ -9,6 +9,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.13] — 2026-05-23
+
+### Fixed
+
+- **Bug 1 — BPF verifier rejects CRC32C** (`ebpf/dns_xdp.c`)  
+  CRC32C's 8-iteration inner loop (`#pragma unroll 8`) generates exponential scalar state explosion in the BPF verifier, causing program rejection. Replaced with FNV-1a: `h ^= (*qname | 0x20u); h *= 16777619u;` — single multiply per byte, scalar state bounded cleanly. Function signature updated to `dns_qname_hash(const __u8 *qname, const __u8 *data_end)` — pointer passed directly instead of offset arithmetic.
+
+- **Bug 2 — CPUMAP creation fails on slave VM** (`ebpf/dns_xdp.c`, `build.rs`, `src/dns/xdp/loader.rs`)  
+  `EbpfLoader::load()` creates ALL ELF maps at once; if `BPF_MAP_TYPE_CPUMAP` fails (missing `CAP_BPF`, old kernel, slave VM), the entire XDP subsystem was disabled. Fix: compile two eBPF binaries — `dns_xdp.o` (full, with CPUMAP) and `dns_xdp_minimal.o` (`-DNO_CPUMAP`). CPUMAP struct and `bpf_redirect_map` call are guarded with `#ifndef NO_CPUMAP` in C. `loader.rs` tries the full binary first; if the aya error contains "cpumap", it retries with the minimal binary and disables domain routing automatically.
+
+- **#64 — UDP checksum computed over stale bytes** (`src/dns/xdp/worker.rs`)  
+  In `process_packet`, the UDP checksum was computed over `tx[udp_off..dns_off+len]` before the DNS payload was copied into `tx[dns_off..]`, producing a checksum over uninitialised frame bytes. Fixed by restructuring: DNS payload is written into `tx` first, then Ethernet/IP/UDP headers are set, then the checksum is computed.
+
+### Changed
+
+- **#64 — Zero-copy cache hits eliminate intermediate Vec** (`src/dns/xdp/worker.rs`)  
+  `answer_from_cache` signature changed from `(…, out: &mut Vec<u8>) -> bool` to `(…, tx_dns: &mut [u8]) -> Option<usize>`. Cache responses are written directly into the TX UMEM frame (`tx[dns_off..]`) with no intermediate allocation. Eliminates one `extend_from_slice` + one `copy_from_slice` per cache hit.
+
+---
+
 ## [0.6.12] — 2026-05-23
 
 ### Added

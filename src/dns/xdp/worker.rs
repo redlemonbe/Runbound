@@ -609,17 +609,30 @@ fn process_packet(
     let dns_in = &rx[dns_off..];
 
     // ── DNS ──────────────────────────────────────────────────────────────────
-    // Fast path 1: local zone (refuse/nxdomain/static) — already implemented.
-    // Fast path 2 (#60): XDP cache snapshot — check after local zone miss.
-    let has_answer = answer_dns(dns_in, zones, acl, src_ip, dns_scratch)
-        || cache_snap.map(|snap| answer_from_cache(dns_in, snap, acl, src_ip, dns_scratch))
-            .unwrap_or(false);
-    if !has_answer {
-        return None; // not a local query and cache miss — XDP_PASS to hickory
-    }
+    // Fast path 1: local zone (refuse/nxdomain/static).
+    // Fast path 2 (#60/#64): XDP cache snapshot — check after local zone miss.
+    //
+    // DNS payload is written into tx BEFORE checksum computation so that the
+    // UDP checksum covers the actual response bytes (fixing a latent bug where
+    // the checksum was computed over uninitialised tx bytes).
+    let dns_len = if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
+        // Local zone hit — copy dns_scratch into tx first.
+        let len = dns_scratch.len();
+        if dns_off + len > tx.len() { return None; }
+        tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
+        len
+    } else if let Some(snap) = cache_snap {
+        // Cache hit — answer_from_cache writes directly into tx[dns_off..].
+        match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..]) {
+            Some(len) => len,
+            None => return None,
+        }
+    } else {
+        return None; // not a local query and no cache — XDP_PASS to hickory
+    };
 
     // ── Build reply frame ────────────────────────────────────────────────────
-    let reply_len = dns_off + dns_scratch.len();
+    let reply_len = dns_off + dns_len;
     if reply_len > tx.len() { return None; }
 
     // Ethernet: swap src ↔ dst MAC
@@ -630,7 +643,7 @@ fn process_packet(
     if !is_v6 {
         // IPv4: copy then fix length, swap src/dst, recompute checksum
         tx[ip_off..ip_off + ip_hdr_len].copy_from_slice(&rx[ip_off..ip_off + ip_hdr_len]);
-        let new_tot = (ip_hdr_len + UDP_HDR + dns_scratch.len()) as u16;
+        let new_tot = (ip_hdr_len + UDP_HDR + dns_len) as u16;
         tx[ip_len_off..ip_len_off + 2].copy_from_slice(&new_tot.to_be_bytes());
 
         let src: [u8; 4] = rx[src_ip_off..src_ip_off + 4].try_into().ok()?;
@@ -645,7 +658,7 @@ fn process_packet(
     } else {
         // IPv6: copy, set payload length, swap src/dst
         tx[ip_off..ip_off + IPV6_HDR].copy_from_slice(&rx[ip_off..ip_off + IPV6_HDR]);
-        let payload_len = (UDP_HDR + dns_scratch.len()) as u16;
+        let payload_len = (UDP_HDR + dns_len) as u16;
         tx[ip_len_off..ip_len_off + 2].copy_from_slice(&payload_len.to_be_bytes());
 
         let src: [u8; 16] = rx[src_ip_off..src_ip_off + 16].try_into().ok()?;
@@ -655,71 +668,70 @@ fn process_packet(
     }
 
     // UDP: swap ports, set length
-    let udp_len = (UDP_HDR + dns_scratch.len()) as u16;
+    let udp_len = (UDP_HDR + dns_len) as u16;
     tx[udp_off..udp_off + 2].copy_from_slice(&dst_port.to_be_bytes()); // src = 53
     tx[udp_off + 2..udp_off + 4].copy_from_slice(&src_port.to_be_bytes());
     tx[udp_off + 4..udp_off + 6].copy_from_slice(&udp_len.to_be_bytes());
 
-    // Compute UDP checksum using the reply frame already in tx
+    // Compute UDP checksum — DNS payload is now in tx (correct!).
     tx[udp_off + 6..udp_off + 8].fill(0);
     let cksum = if !is_v6 {
         let si: [u8; 4] = tx[ip_off + 12..ip_off + 16].try_into().ok()?;
         let di: [u8; 4] = tx[ip_off + 16..ip_off + 20].try_into().ok()?;
-        udp_checksum_v4(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_scratch.len()])
+        udp_checksum_v4(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_len])
     } else {
         let si: [u8; 16] = tx[ip_off + 8..ip_off + 24].try_into().ok()?;
         let di: [u8; 16] = tx[ip_off + 24..ip_off + 40].try_into().ok()?;
-        udp_checksum_v6(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_scratch.len()])
+        udp_checksum_v6(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_len])
     };
     tx[udp_off + 6..udp_off + 8].copy_from_slice(&cksum.to_be_bytes());
 
-    // DNS payload
-    tx[dns_off..dns_off + dns_scratch.len()].copy_from_slice(dns_scratch);
-
+    // DNS payload is already in tx — no final copy needed.
     Some(reply_len)
 }
 
 /// Look up `query_bytes` in the frozen XDP cache snapshot.
-/// Returns true and writes the wire response into `out` on a cache hit.
-/// Returns false on a miss or if the ACL denies/refuses the client.
+/// On a hit, writes the wire response directly into `tx_dns` (a slice of the TX
+/// UMEM frame starting at the DNS payload offset) and returns `Some(len)`.
+/// Returns `None` on a miss, ACL deny/refuse, or if `tx_dns` is too small.
 ///
-/// #64: Zero-copy path — parses the DNS query header and QNAME directly
-/// from raw bytes without calling hickory. Eliminates ~200 ns of parse
-/// overhead per cache hit compared to `Message::from_bytes`.
+/// #64: Zero-copy path — no intermediate Vec allocation.  Parses the DNS
+/// query header and QNAME directly from raw bytes without calling hickory.
+/// Writing directly into the TX frame eliminates one memcpy per cache hit.
 ///
 /// ACL semantics mirror `answer_dns`:
 ///   Allow  → proceed with cache lookup.
-///   Deny   → silent drop (return false, no TX frame crafted).
-///   Refuse → return false (let hickory send a proper REFUSED response).
+///   Deny   → silent drop (return None, no TX frame crafted).
+///   Refuse → return None (let hickory send a proper REFUSED response).
 fn answer_from_cache(
     query_bytes: &[u8],
     cache_snap:  &crate::dns::cache_snapshot::CacheSnapshot,
     acl:         &Acl,
     src_ip:      Option<IpAddr>,
-    out:         &mut Vec<u8>,
-) -> bool {
+    tx_dns:      &mut [u8],
+) -> Option<usize> {
     // ACL check first — denied clients must not receive cached data.
     if let Some(ip) = src_ip {
         match acl.check(ip) {
             AclAction::Allow  => {}
-            AclAction::Deny | AclAction::Refuse => return false,
+            AclAction::Deny | AclAction::Refuse => return None,
         }
     }
 
     // ── Zero-copy DNS header parse ────────────────────────────────────────
     // Header layout: ID(2) FLAGS(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
     // Minimum useful message: 12-byte header + 1-byte QNAME start.
-    if query_bytes.len() < 13 { return false; }
+    if query_bytes.len() < 13 { return None; }
 
     // QR bit (bit 15): 0 = query, 1 = response.
     // OPCODE (bits 14–11): 0 = standard query.
     let flags = u16::from_be_bytes([query_bytes[2], query_bytes[3]]);
-    if flags & 0x8000 != 0 { return false; } // response — skip
-    if flags & 0x7800 != 0 { return false; } // non-standard opcode
+    if flags & 0x8000 != 0 { return None; } // response — skip
+    if flags & 0x7800 != 0 { return None; } // non-standard opcode
 
     // Exactly one question section entry expected.
     let qdcount = u16::from_be_bytes([query_bytes[4], query_bytes[5]]);
-    if qdcount != 1 { return false; }
+    if qdcount != 1 { return None; }
 
     let qid = [query_bytes[0], query_bytes[1]];
 
@@ -734,14 +746,14 @@ fn answer_from_cache(
         if pos >= query_bytes.len() {
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
+            return None;
         }
         let label_len = query_bytes[pos] as usize;
         // Compression pointer — must not appear in a query; bail out.
         if label_len & 0xC0 == 0xC0 {
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
+            return None;
         }
         name_buf.push(query_bytes[pos]); // length byte — copy verbatim
         pos += 1;
@@ -749,7 +761,7 @@ fn answer_from_cache(
         if pos + label_len > query_bytes.len() {
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
+            return None;
         }
         for i in 0..label_len {
             name_buf.push(query_bytes[pos + i] | 0x20); // ASCII lowercase
@@ -761,32 +773,40 @@ fn answer_from_cache(
     if query_bytes.len() < pos + 4 {
         crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
+        return None;
     }
     let qtype  = u16::from_be_bytes([query_bytes[pos],     query_bytes[pos + 1]]);
     let qclass = u16::from_be_bytes([query_bytes[pos + 2], query_bytes[pos + 3]]);
 
     // ANY queries are not cached (hickory returns NOTIMP per RFC 8482).
     const QTYPE_ANY: u16 = 255;
-    if qtype == QTYPE_ANY { return false; }
+    if qtype == QTYPE_ANY { return None; }
 
     let key = crate::dns::cache_snapshot::QuestionKey { name: name_buf, qtype, qclass };
 
     let now = std::time::Instant::now();
     if let Some(entry) = cache_snap.get(&key) {
         if entry.expires_at > now && entry.wire_payload.len() >= 2 {
-            out.extend_from_slice(&entry.wire_payload);
+            let wire = &entry.wire_payload;
+            // Bail out if the TX frame slice is too small to hold the response.
+            if tx_dns.len() < wire.len() {
+                crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+            // Write directly into the TX UMEM frame — no intermediate Vec.
+            tx_dns[..wire.len()].copy_from_slice(wire);
             // Patch QID (bytes [0..2]) with the client's actual transaction ID.
-            out[0] = qid[0];
-            out[1] = qid[1];
+            tx_dns[0] = qid[0];
+            tx_dns[1] = qid[1];
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return true;
+            return Some(wire.len());
         }
     }
     crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    false
+    None
 }
 
 #[cfg(test)]
@@ -854,11 +874,11 @@ mod cache_tests {
         );
         let acl = crate::dns::acl::Acl::from_config(&[]);
         let query = make_query(0xBEEF, "example.com", 1);
-        let mut out = Vec::new();
-        let hit = answer_from_cache(&query, &snap, &acl, None, &mut out);
-        assert!(hit, "expected cache hit");
-        assert_eq!(out[0], 0xBE, "QID byte 0 patched");
-        assert_eq!(out[1], 0xEF, "QID byte 1 patched");
+        let mut tx_dns = vec![0u8; 512];
+        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
+        assert!(result.is_some(), "expected cache hit");
+        assert_eq!(tx_dns[0], 0xBE, "QID byte 0 patched");
+        assert_eq!(tx_dns[1], 0xEF, "QID byte 1 patched");
     }
 
     #[test]
@@ -872,9 +892,9 @@ mod cache_tests {
         let acl = crate::dns::acl::Acl::from_config(&[]);
         // Query with mixed case — should still hit because we lowercase
         let query = make_query(1, "EXAMPLE.COM", 1);
-        let mut out = Vec::new();
-        let hit = answer_from_cache(&query, &snap, &acl, None, &mut out);
-        assert!(hit, "cache should hit with uppercase query");
+        let mut tx_dns = vec![0u8; 512];
+        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
+        assert!(result.is_some(), "cache should hit with uppercase query");
     }
 
     #[test]
@@ -887,9 +907,9 @@ mod cache_tests {
         );
         let acl = crate::dns::acl::Acl::from_config(&[]);
         let query = make_query(1, "old.example.com", 1);
-        let mut out = Vec::new();
-        let hit = answer_from_cache(&query, &snap, &acl, None, &mut out);
-        assert!(!hit, "expired entry must not be served");
+        let mut tx_dns = vec![0u8; 512];
+        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
+        assert!(result.is_none(), "expired entry must not be served");
     }
 
     #[test]
@@ -902,9 +922,9 @@ mod cache_tests {
         );
         let acl = crate::dns::acl::Acl::from_config(&[]);
         let query = make_query(1, "example.com", 255); // QTYPE=ANY
-        let mut out = Vec::new();
-        let hit = answer_from_cache(&query, &snap, &acl, None, &mut out);
-        assert!(!hit, "ANY queries must not be served from cache");
+        let mut tx_dns = vec![0u8; 512];
+        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
+        assert!(result.is_none(), "ANY queries must not be served from cache");
     }
 }
 
