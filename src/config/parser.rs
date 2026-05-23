@@ -136,6 +136,11 @@ pub struct UnboundConfig {
     /// Enable AF/XDP kernel-bypass fast path. Default: true (when compiled with xdp feature).
     /// Set to `no` in unbound.conf, or pass `--no-xdp` on the command line, to disable.
     pub xdp: bool,
+    /// Explicit XDP network interface name (#79).
+    /// `None`        = auto-detect first non-loopback interface (default, backward-compatible).
+    /// `Some("none")` = disable XDP via interface override (useful when `xdp: yes` is shared).
+    /// `Some("eth1")` = pin XDP to eth1 regardless of `interface:` directives.
+    pub xdp_interface: Option<String>,
     /// Set scaling governor to 'performance' on XDP worker cores. Default: false.
     /// Eliminates frequency-scaling ramp-up jitter on DNS burst traffic.
     /// Silent no-op when /sys/devices/system/cpu/cpuN/cpufreq/ is absent (containers, VMs).
@@ -370,6 +375,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
         "cpu-affinity"        => cfg.cpu_affinity        = val.trim_matches('"') != "no",
         "xdp"                 => cfg.xdp                 = val.trim_matches('"') != "no",
+        "xdp-interface"       => cfg.xdp_interface       = Some(val.trim_matches('"').to_string()),
         "xdp-cpu-governor"    => cfg.xdp_cpu_governor    = val.trim_matches('"') == "yes",
         "xdp-irq-affinity"    => cfg.xdp_irq_affinity    = val.trim_matches('"') == "yes",
         "xdp-hugepages"            => cfg.xdp_hugepages            = val.trim_matches('"') != "no",

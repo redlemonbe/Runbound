@@ -203,7 +203,11 @@
       <span class="text-xs text-gray-600 uppercase tracking-wide">Active resolvers <span id="upstream-health-badge" class="ml-2 font-mono"></span></span>
       <button onclick="loadUpstreams()" class="btn-secondary text-xs">↻ Refresh</button>
     </div>
-    <div id="upstream-list" class="space-y-1.5 mb-6"></div>
+    <div id="upstream-list" class="space-y-1.5 mb-4"></div>
+    <div id="reconnect-dot-wrap" class="hidden mb-5 flex items-center gap-3">
+      <button id="reconnect-dot-btn" onclick="reconnectUpstreams()" class="btn-secondary text-xs">⟳ Reconnect DoT</button>
+      <span id="reconnect-dot-msg" class="text-xs text-gray-500"></span>
+    </div>
     <div class="card max-w-xl">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Add custom resolver</div>
       <div class="flex flex-wrap gap-2">
@@ -668,7 +672,25 @@ async function loadUpstreams() {
         const lastErr=!probing&&u.last_error?`<span class="text-red-400 text-xs shrink-0 cursor-help" title="${esc(u.last_error)}">⚠</span>`:'';
         return `<div class="row gap-2">${hDot}<span class="text-cyan-400 font-mono shrink-0 text-xs w-36">${esc(u.addr)}<span class="text-gray-700">:${port}</span></span>${proto}${dns}<span class="flex-1 min-w-0 flex items-center gap-1.5">${name}<button class="edit-btn shrink-0" onclick="upstreamRename('${u.id}','${esc(u.name||'')}')" title="Rename">✎</button>${sniBtn}</span>${spark?`<span class="shrink-0">${spark}</span>`:''}<span class="text-gray-600 w-14 text-right text-xs shrink-0 tabular-nums">${latency}</span><span class="text-gray-800 w-20 text-right text-xs shrink-0">↻ ${lastCheck}</span>${lastErr}<button class="del shrink-0" onclick="upstreamDelete('${u.id}')">✕</button></div>`;
       }).join('');
+    const hasDot = upstreams.some(u => u.protocol === 'dot');
+    const wrap = document.getElementById('reconnect-dot-wrap');
+    if (wrap) wrap.classList.toggle('hidden', !hasDot);
   } catch(e) { toast('Upstreams: '+e.message, true); }
+}
+
+async function reconnectUpstreams() {
+  const btn = document.getElementById('reconnect-dot-btn');
+  const msg = document.getElementById('reconnect-dot-msg');
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = 'Reconnecting…';
+  try {
+    const r = await api('POST', '/upstreams/reconnect');
+    if (msg) msg.textContent = `${r.reconnected} reconnected in ${r.duration_ms} ms`;
+  } catch(e) {
+    if (msg) msg.textContent = 'Error: ' + e.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function upsProtocolChange(sel) { const p=document.getElementById('ups-port'); if(p) p.value=sel.value==='dot'?'853':'53'; const t=document.getElementById('ups-tls-name'); if(t) t.classList.toggle('hidden',sel.value!=='dot'); }
