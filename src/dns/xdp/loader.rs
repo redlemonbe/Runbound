@@ -108,7 +108,12 @@ impl XdpHandle {
             .or_else(|_| program.attach(iface, XdpFlags::SKB_MODE).map(|id| (id, XdpMode::Skb)))
             .map_err(|e| format!("XDP attach to {iface} failed: {e}"))?;
 
-        tracing::info!(iface = %iface, link_id = ?link_id, mode = ?mode, "XDP program attached");
+        tracing::info!(
+            iface   = %iface,
+            mode    = ?mode,
+            hash    = "crc32c-software",
+            "XDP program attached"
+        );
 
         let mut handle = XdpHandle { bpf, link_id: Some(link_id), mode, governor_backups: Vec::new() };
 
