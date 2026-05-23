@@ -23,6 +23,7 @@ use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_resolver::{
     TokioResolver,
+    lookup::Lookup,
     config::{ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts},
     net::runtime::TokioRuntimeProvider,
     net::{DnsError, NetError, NoRecords},
@@ -60,6 +61,36 @@ use super::ratelimit::RateLimiter;
 const MAX_INFLIGHT_REQUESTS: usize = 4_096;
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
+
+// ── Resolver lookup hard timeout (#83) ─────────────────────────────────────
+//
+// hickory-resolver's internal timeout is opts.timeout × opts.attempts = 3 s × 2 = 6 s.
+// Under sustained pool exhaustion (upstream unreachable or pool not yet established),
+// N concurrent queries each block a Tokio worker for up to 6 s.  When N ≥ num_cpus
+// all workers are occupied, preventing the background reconnect task from running —
+// the runtime deadlocks completely (even loopback stops responding).
+//
+// RESOLVER_LOOKUP_TIMEOUT is a hard outer fuse applied by Runbound independently of
+// hickory's internal retry/timeout mechanism.  The tokio::time::timeout future is
+// cancelled when it fires, immediately freeing the worker regardless of hickory's
+// internal state.  2500 ms keeps latency low while remaining above 1 RTT for any
+// realistic upstream.
+const RESOLVER_LOOKUP_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Wrap a resolver lookup with a hard external timeout.
+/// Returns `Err(NetError::Timeout)` if hickory does not respond within
+/// `RESOLVER_LOOKUP_TIMEOUT`, cancelling the hickory future and freeing the
+/// Tokio worker immediately.
+async fn timed_lookup(
+    resolver: &TokioResolver,
+    name:     Name,
+    qtype:    RecordType,
+) -> Result<Lookup, NetError> {
+    match tokio::time::timeout(RESOLVER_LOOKUP_TIMEOUT, resolver.lookup(name, qtype)).await {
+        Ok(r)  => r,
+        Err(_) => Err(NetError::Timeout),
+    }
+}
 
 // ── DoT rebuild rate-limiter ────────────────────────────────────────────────
 // At most one resolver rebuild every 2 s. Under sustained DoT pool exhaustion
@@ -298,7 +329,8 @@ impl RunboundHandler {
         start: Instant,
     ) -> ResponseInfo {
         // #33: racing mode — send to all upstreams simultaneously, first wins.
-        let mut result = if self.upstream_racing {
+        // All lookup calls go through timed_lookup (#83) to cap worker occupancy.
+        let result = if self.upstream_racing {
             let resolvers = self.per_upstream_resolvers.load();
             if resolvers.len() >= 2 {
                 let name = Name::from(qname);
@@ -308,7 +340,7 @@ impl RunboundHandler {
                         let n    = name.clone();
                         let addr = addr.clone();
                         Box::pin(async move {
-                            r.lookup(n, qtype).await.map(|l| (l, addr))
+                            timed_lookup(&r, n, qtype).await.map(|l| (l, addr))
                         })
                     })
                     .collect();
@@ -324,17 +356,22 @@ impl RunboundHandler {
                     Err(e) => Err(e),
                 }
             } else {
-                self.resolver.load().lookup(Name::from(qname), qtype).await
+                timed_lookup(&self.resolver.load(), Name::from(qname), qtype).await
             }
         } else {
-            self.resolver.load().lookup(Name::from(qname), qtype).await
+            timed_lookup(&self.resolver.load(), Name::from(qname), qtype).await
         };
 
-        // Level 2: transparent reconnection on DoT pool exhaustion (#77).
+        // Level 2: transparent reconnection on DoT pool exhaustion (#77 + #83).
         // Rate-limited to one rebuild every 2 s: under sustained pool exhaustion,
         // every failed query would otherwise spawn its own rebuild task, creating
         // a positive-feedback loop that saturates the Tokio scheduler.
         // Queries that lose the CAS race return SERVFAIL immediately — no rebuild.
+        //
+        // #83: the rebuild is spawned as a background task instead of being awaited
+        // in the query handler.  Awaiting rebuild_and_swap() (which calls warm_up()
+        // internally) could block the current worker for up to 3 s, compounding the
+        // worker-exhaustion problem.  The next query will use the rebuilt resolver.
         if let Err(ref e) = result {
             if is_pool_exhausted(e) {
                 let now_s = SystemTime::now()
@@ -353,11 +390,16 @@ impl RunboundHandler {
                         DOT_REBUILD_LAST_LOG_SECS.store(now_s, Ordering::Relaxed);
                         info!(name=%sanitize_dns_name(qname), "DoT pool exhausted — rebuilding resolver");
                     }
-                    let addrs = crate::upstreams::upstream_addrs(&self.upstreams);
-                    if rebuild_and_swap(&self.resolver, &addrs, self.dnssec_enabled).await.is_ok() {
-                        self.stats.record_dot_reconnect();
-                        result = self.resolver.load().lookup(Name::from(qname), qtype).await;
-                    }
+                    let addrs            = crate::upstreams::upstream_addrs(&self.upstreams);
+                    let resolver_rebuild = Arc::clone(&self.resolver);
+                    let stats_rebuild    = Arc::clone(&self.stats);
+                    let dnssec           = self.dnssec_enabled;
+                    tokio::spawn(async move {
+                        if rebuild_and_swap(&resolver_rebuild, &addrs, dnssec).await.is_ok() {
+                            stats_rebuild.record_dot_reconnect();
+                        }
+                    });
+                    // This query returns SERVFAIL; the next query will find the rebuilt resolver.
                 }
             }
         }
