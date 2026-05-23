@@ -68,14 +68,22 @@ volatile const __u32 DOMAIN_ROUTING_ENABLED = 0;
 //
 // Bytes are ASCII-lowercased so "Example.com" and "example.com" hash
 // identically.  Iteration is capped at 64 — handles names up to ~60 chars.
+//
+// The pointer `qname` is kept immobile — only index `i` varies.
+// A mobile pointer (`qname++`) is a PTR_TO_PACKET with variable offset:
+// the verifier tracks the worst-case advance (packet_end - qname_start) and
+// rejects the program because `qname + worst_case + 1` exceeds the verified
+// range.  With a fixed base and bounded `i < 64`, `qname + i + 1` is
+// statically provable — same fix class as the v0.6.10 pointer-subtract bug.
 static __always_inline __u32 dns_qname_hash(const __u8 *qname, const __u8 *data_end)
 {
     __u32 h = 2166136261u; // FNV offset basis
     for (int i = 0; i < 64; i++) {
-        if (qname + 1 > data_end || *qname == 0) break;
-        h ^= (*qname | 0x20u); // ASCII lowercase (no-op for digits / dots)
-        h *= 16777619u;        // FNV prime
-        qname++;
+        if ((const void *)(qname + i + 1) > data_end) break;
+        __u8 b = qname[i];
+        if (b == 0) break;
+        h ^= (b | 0x20u); // ASCII lowercase (no-op for digits / dots)
+        h *= 16777619u;   // FNV prime
     }
     return h;
 }
