@@ -222,6 +222,31 @@ arrives but is never delivered to the AF_XDP socket.
 
 Full details, reference architecture, and troubleshooting: [docs/proxmox.md](proxmox.md)
 
+## IRQ affinity
+
+By default, the kernel distributes NIC interrupts across any available core. If queue N's IRQ fires on a different core than the XDP worker handling queue N, the packet data arrives in the wrong L1/L2 cache — guaranteed cache miss on every RX.
+
+Runbound automates IRQ pinning at startup with `xdp-irq-affinity: auto`:
+
+```
+server:
+    xdp-irq-affinity: auto    # default: off
+```
+
+When enabled, after spawning XDP workers Runbound reads `/proc/interrupts` to locate the IRQ numbers for the active NIC, then writes the matching core mask to `/proc/irq/<N>/smp_affinity_list` — queue N's IRQ → core N's XDP worker.
+
+Requires `CAP_NET_ADMIN` (already required for XDP). Silent no-op if `/proc/irq/` is not writable (containers).
+
+**Verify:**
+
+```bash
+# Queue 0 IRQ pinned to core 0
+cat /proc/irq/$(grep -m1 eth0 /proc/interrupts | cut -d: -f1 | tr -d ' ')/smp_affinity_list
+# → 0
+```
+
+---
+
 ## NIC ring buffer auto-sizing
 
 Intel ixgbe cards (X520, X540, X710) ship with a default RX ring of **512 descriptors**.
