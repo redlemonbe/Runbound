@@ -287,7 +287,7 @@ The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify th
 | SEC-08 | SIGUSR1/2 kill process | HIGH | ✅ Fixed v0.6.9 |
 | SEC-09 | DNS rebinding | HIGH | ✅ CIDR guards |
 | SEC-10 | ANY amplification | HIGH | ✅ Blocked |
-| SEC-11 | SSRF via upstream 0.0.0.0 | MEDIUM | ⚠️ Fix in v0.6.10 |
+| SEC-11 | SSRF via upstream 0.0.0.0 | MEDIUM | ✅ Fixed v0.6.11 |
 
 ### Performance
 
