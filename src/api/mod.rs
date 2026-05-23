@@ -1428,6 +1428,25 @@ async fn delete_upstream_handler(
         }
     }
 
+    // #57: if this is a config-file upstream, remove its forward-addr from unbound.conf.
+    {
+        let list = s.upstreams.read()
+            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in delete handler: {e}"));
+        if let Some(u) = list.iter().find(|u| u.id == id) {
+            if u.source == "config" {
+                let addr  = u.addr.clone();
+                let port  = u.port;
+                let path  = s.cfg_path.clone();
+                drop(list);
+                match upstreams::remove_forward_addr_from_config(&path, &addr, port) {
+                    Ok(true)  => info!(id = %id, addr = %addr, cfg = %path, "config upstream removed from unbound.conf"),
+                    Ok(false) => warn!(id = %id, addr = %addr, "forward-addr line not found in config"),
+                    Err(e)    => warn!(%e, id = %id, addr = %addr, "failed to edit unbound.conf"),
+                }
+            }
+        }
+    }
+
     match upstreams::remove_upstream(&s.upstreams, &id) {
         Some(removed) => {
             let addrs = upstreams::upstream_addrs(&s.upstreams);
@@ -3354,5 +3373,117 @@ mod tests {
         assert_eq!(j["hits"],      0);
         assert_eq!(j["misses"],    0);
         assert_eq!(j["evictions"], 0);
+    }
+
+    // ── #57: config upstreams have source field ───────────────────────────────
+
+    #[tokio::test]
+    async fn config_upstream_has_source_field() {
+        let mut cfg = crate::config::parser::UnboundConfig::default();
+        cfg.forward_zones.push(crate::config::parser::ForwardZone {
+            name: ".".into(),
+            addrs: vec!["1.1.1.1@53".into()],
+            tls: false,
+        });
+        let app = make_test_app_with_cfg(cfg);
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/upstreams").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        let ups = json["upstreams"].as_array().expect("upstreams must be array");
+        let config_up = ups.iter().find(|u| u["addr"] == "1.1.1.1").expect("1.1.1.1 must be present");
+        assert_eq!(config_up["source"], "config", "config-file upstream must have source=config");
+    }
+
+    #[tokio::test]
+    async fn config_upstream_delete_idempotent_404() {
+        // Create a real temp config file with a forward-addr line.
+        let tmp = std::env::temp_dir().join(format!("runbound-test-{}.conf", std::process::id()));
+        let conf_content = "server:\n    port: 5353\n\nforward-zone:\n    name: \".\"\n    forward-addr: 9.9.9.9@53\n";
+        std::fs::write(&tmp, conf_content).expect("write temp conf");
+
+        init_api_key(Some(TEST_KEY.to_string()));
+        let _ = crate::runtime::BASE_DIR.set(std::path::PathBuf::from("/tmp/runbound-test"));
+
+        let mut cfg = crate::config::parser::UnboundConfig::default();
+        cfg.forward_zones.push(crate::config::parser::ForwardZone {
+            name: ".".into(),
+            addrs: vec!["9.9.9.9@53".into()],
+            tls: false,
+        });
+        // Add a second upstream so the first can be deleted (FIX #41)
+        cfg.forward_zones.push(crate::config::parser::ForwardZone {
+            name: ".".into(),
+            addrs: vec!["8.8.8.8@53".into()],
+            tls: false,
+        });
+
+        let zones = Arc::new(ArcSwap::new(Arc::new(crate::dns::local::LocalZoneSet::default())));
+        let cfg_arc = Arc::new(cfg);
+        let log_buffer = crate::logbuffer::new_shared(1000, true);
+        let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
+        let resolver  = crate::dns::server::create_shared_resolver(&cfg_arc).expect("test resolver");
+        let stats = crate::stats::Stats::new();
+        let stats_cache = crate::stats::new_snapshot_cache(&stats);
+        let state = AppState {
+            zones:            Arc::clone(&zones),
+            zones_mutex:      Arc::new(tokio::sync::Mutex::new(())),
+            tls_cfg:          Arc::new(crate::config::parser::TlsConfig::default()),
+            rate_limiter:     ApiRateLimiter::new_public(),
+            reload_limiter:   Arc::new(ReloadLimiter::new()),
+            stats,
+            stats_cache,
+            cfg:              Arc::clone(&cfg_arc),
+            cfg_path:         tmp.to_string_lossy().to_string(),
+            log_buffer,
+            upstreams,
+            sync_journal:     None,
+            slave_mode:       false,
+            base_dir:         Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
+            audit:            crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
+            xdp_active:       Arc::new(AtomicU8::new(0)),
+            resolver,
+            last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
+            cache_evictions:  Arc::new(AtomicU64::new(0)),
+        };
+        let app = router(state);
+
+        // Compute the deterministic config upstream ID for 9.9.9.9:53:udp
+        let id = {
+            use sha2::{Digest, Sha256};
+            let key = "cfg:9.9.9.9:53:udp";
+            let h = Sha256::digest(key.as_bytes());
+            let b = h.as_slice();
+            format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7],
+                b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]
+            )
+        };
+        let (k, v) = auth_header();
+
+        // First DELETE — must succeed
+        let del1 = app.clone().oneshot(
+            Request::builder()
+                .method("DELETE").uri(format!("/api/upstreams/{id}"))
+                .header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(del1.status(), StatusCode::OK, "first delete must return 200");
+
+        // Config file must no longer contain forward-addr: 9.9.9.9@53
+        let after = std::fs::read_to_string(&tmp).expect("read temp conf after delete");
+        assert!(!after.contains("9.9.9.9"), "forward-addr must be removed from config file");
+
+        // Second DELETE — must return 404 (idempotent)
+        let del2 = app.oneshot(
+            Request::builder()
+                .method("DELETE").uri(format!("/api/upstreams/{id}"))
+                .header(k, &v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(del2.status(), StatusCode::NOT_FOUND, "re-delete must return 404");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
