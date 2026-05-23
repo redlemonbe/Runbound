@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
+#
+# Release workflow — triggered by pushing a vX.Y.Z tag.
+#
+# Build order: install deps → build 4 targets → package → create release →
+# upload assets.
+#
+# IMPORTANT: the release is created as *published* (no --draft) BEFORE assets
+# are uploaded.  GitHub only generates stable browser_download_url for assets
+# that land on an already-published release.  Creating as draft and then
+# editing to published corrupts the CDN URLs and causes 404 for anonymous
+# downloads (e.g. install.sh users).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Build dependencies ────────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libbpf-dev \
+            mold \
+            gcc-aarch64-linux-gnu \
+            musl-tools
+
+      # ── Linker wrapper ───────────────────────────────────────────────────
+      # Strips -B*/x86_64-unknown-linux-gnu/* args that rustc injects for the
+      # HOST target and that confuse aarch64-linux-gnu-gcc when cross-compiling.
+      # Referenced by .cargo/config.toml [target.aarch64-unknown-linux-gnu].
+      - name: Install aarch64-gnu linker wrapper
+        run: sudo install -m 755 scripts/aarch64-gnu-linker-wrapper /usr/local/bin/
+
+      # ── Rust toolchain ───────────────────────────────────────────────────
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
+
+      # ── Cargo cache ──────────────────────────────────────────────────────
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # ── Builds ───────────────────────────────────────────────────────────
+      - name: Build x86_64-gnu
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build x86_64-musl
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Build aarch64-gnu
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Build aarch64-musl
+        run: cargo build --release --target aarch64-unknown-linux-musl
+
+      # ── Package ──────────────────────────────────────────────────────────
+      - name: Package binaries
+        run: |
+          cp target/x86_64-unknown-linux-gnu/release/runbound  runbound-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/runbound runbound-linux-x86_64-musl
+          cp target/aarch64-unknown-linux-gnu/release/runbound  runbound-linux-aarch64
+          cp target/aarch64-unknown-linux-musl/release/runbound runbound-linux-aarch64-musl
+          sha256sum \
+            runbound-linux-x86_64 \
+            runbound-linux-x86_64-musl \
+            runbound-linux-aarch64 \
+            runbound-linux-aarch64-musl \
+            > SHA256SUMS
+
+      # ── Changelog fragment ───────────────────────────────────────────────
+      - name: Extract changelog fragment
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk "/^\#\# \[${VERSION}\]/{p=1;next} p && /^\#\# \[/{p=0} p" \
+            CHANGELOG.md | sed '/^---$/d' > CHANGELOG_FRAGMENT.md
+          # Fallback if version not yet in CHANGELOG
+          [ -s CHANGELOG_FRAGMENT.md ] || echo "Release ${GITHUB_REF_NAME}" \
+            > CHANGELOG_FRAGMENT.md
+
+      # ── Publish release then upload assets ───────────────────────────────
+      # Two-step: create published release first, then upload.
+      # This ensures stable browser_download_url for all assets.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file CHANGELOG_FRAGMENT.md
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            runbound-linux-x86_64 \
+            runbound-linux-x86_64-musl \
+            runbound-linux-aarch64 \
+            runbound-linux-aarch64-musl \
+            SHA256SUMS
