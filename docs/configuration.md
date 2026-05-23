@@ -241,13 +241,13 @@ without enabling full `verbosity: 2` noise.
 ```
 server:
     log-retention: 1000   # max entries in the /logs ring buffer (0 = disabled)
-    log-client-ip: yes    # include client IPs in /logs (no = replace with "[redacted]")
+    log-client-ip: no     # include client IPs in /logs (no = replace with "[redacted]")
 ```
 
 | Directive | Type | Default | Description |
 |---|---|---|---|
 | `log-retention` | integer | `1000` | 🔒 RGPD — Maximum number of entries kept in the in-memory query log ring buffer. Set to `0` to disable the ring buffer entirely and return an empty array from `GET /logs`. No client IPs are held in RAM when set to `0`. |
-| `log-client-ip` | bool | `yes` | 🔒 RGPD — Whether to record the client IP in `/logs` and the logfile. Set to `no` to replace every IP with `[redacted]` before storing. Does **not** affect the audit log (IPs are required there for PCI-DSS / NIS2 traceability). |
+| `log-client-ip` | bool | `no` | 🔒 RGPD — Whether to record the client IP in `/logs` and the logfile. Set to `yes` to include real IPs (debugging, investigation). Default `no` replaces every IP with `[redacted]` before storing. Does **not** affect the audit log (IPs are required there for PCI-DSS / NIS2 traceability). |
 
 Both directives take effect at **startup only** — a full restart is required to change them
 (SIGHUP hot-reload only reloads DNS zones, not the ring buffer configuration).
@@ -501,6 +501,34 @@ echo 512 | sudo tee /proc/sys/vm/nr_hugepages
 
 A value of 0 disables hugepage allocation (default). At 100 k QPS, 512 pages
 (1 GiB) is a comfortable working set.
+
+### XDP NIC ring size
+
+```
+server:
+    xdp-ring-size: auto    # default: auto (maximize to driver max)
+```
+
+At startup, Runbound queries the NIC driver for the maximum supported RX/TX ring depth
+via `SIOCETHTOOL` and applies it before attaching the XDP program. This eliminates
+hardware FIFO overflows that would otherwise drop packets silently before XDP sees them
+(common on Intel ixgbe cards whose default ring is 512 descriptors).
+
+| Value | Behavior |
+|---|---|
+| `auto` | Detect and apply `rx_max_pending` / `tx_max_pending` from the driver |
+| integer (e.g. `4096`) | Set ring to this exact value, capped at the driver maximum |
+
+**Fallback:** If the driver does not support ethtool ring queries (virtio-net, some cloud
+NICs) or Runbound lacks `CAP_NET_ADMIN`, the resize is silently skipped and the driver
+default is used. A `WARN` is emitted in the log.
+
+```
+[INFO]  xdp: NIC ring ens18 rx 512→4096 tx 256→4096
+[WARN]  xdp: ring resize failed on ens18 — Operation not permitted
+```
+
+Monitor via `GET /api/system`: `nic_rx_ring`, `nic_rx_ring_max`, `nic_rx_dropped`.
 
 ### XDP cache snapshot
 

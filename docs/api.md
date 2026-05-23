@@ -274,7 +274,7 @@ curl http://localhost:8080/health
 ```json
 {
   "status":              "ok",
-  "version":             "0.6.8",
+  "version":             "0.6.9",
   "uptime_secs":         3600,
   "xdp_active":          true,
   "upstreams_healthy":   4,
@@ -552,6 +552,15 @@ runbound_latency_ms{quantile="0.99"} 22.5
 runbound_dnssec_total{status="secure"} 1000
 runbound_dnssec_total{status="bogus"} 5
 runbound_dnssec_total{status="insecure"} 100
+# HELP runbound_nic_rx_ring NIC RX ring depth currently applied (descriptors)
+# TYPE runbound_nic_rx_ring gauge
+runbound_nic_rx_ring 4096
+# HELP runbound_nic_rx_ring_max Maximum NIC RX ring depth supported by the driver
+# TYPE runbound_nic_rx_ring_max gauge
+runbound_nic_rx_ring_max 4096
+# HELP runbound_nic_rx_dropped_total Hardware RX drops at NIC level (pre-XDP)
+# TYPE runbound_nic_rx_dropped_total counter
+runbound_nic_rx_dropped_total 0
 ...
 ```
 
@@ -645,7 +654,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 
 ```json
 {
-  "version": "0.6.8",
+  "version": "0.6.9",
   "uptime_secs": 3600,
   "xdp_active": true,
   "xdp_mode": "drv",
@@ -657,7 +666,10 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
   "workers": 8,
   "prefetch_enabled": true,
   "upstreams_healthy": 3,
-  "upstreams_total": 3
+  "upstreams_total": 3,
+  "nic_rx_ring": 4096,
+  "nic_rx_ring_max": 4096,
+  "nic_rx_dropped": 0
 }
 ```
 
@@ -668,6 +680,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 | `prefetch_enabled` | bool | `true` when `prefetch: yes` is set in `runbound.conf` |
 | `upstreams_healthy` | u32 | Count of upstreams with `healthy == true` at last health check |
 | `upstreams_total` | u32 | Total registered upstreams (config + API) |
+| `nic_rx_ring` | u32 | Current RX ring depth applied to the NIC (descriptors). `0` when XDP is disabled or the driver does not support ethtool ring queries. |
+| `nic_rx_ring_max` | u32 | Maximum RX ring depth supported by the driver. Equal to `nic_rx_ring` when auto-sizing succeeded. |
+| `nic_rx_dropped` | u64 | Hardware-level RX drops read from `/sys/class/net/<iface>/statistics/rx_dropped`. A non-zero value under load indicates the NIC FIFO is overflowing before XDP sees the packets. |
 
 ---
 
