@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.16] — 2026-05-23
+
+### Fixed
+
+- **BPF verifier: `math between pkt pointer and register with unbounded min value`** (`ebpf/dns_xdp.c`)  
+  Root cause: `qname[i]` compiles to `r0 += r1` (PTR_TO_PACKET + loop variable). At the loop back-edge the verifier loses the minimum bound on `r1` and marks it `scalar()` (unbounded) — any `PTR_TO_PACKET + loop_var` arithmetic is then rejected, regardless of index bounds or guard checks.  
+  Fix: `#pragma unroll` on the FNV-1a loop. The compiler emits 64 sequential copies of the loop body with no back-edge. The verifier processes them linearly; each iteration's `qname + 1 > data_end` bounds check constrains the pointer correctly, and `qname++` is a single `r6 += 1` on an already-validated pointer. FNV-1a's XOR + multiply generates O(N) verifier states (unlike CRC32C's bit loop which was O(2^N)).
+
+---
+
 ## [0.6.15] — 2026-05-23
 
 ### Fixed
