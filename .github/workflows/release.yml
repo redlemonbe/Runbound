@@ -39,6 +39,7 @@ jobs:
             libbpf-dev \
             mold \
             gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
             musl-tools
 
       # ── Linker wrapper ───────────────────────────────────────────────────
@@ -73,9 +74,17 @@ jobs:
         run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Build aarch64-gnu
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          RING_HOST_CC: gcc
         run: cargo build --release --target aarch64-unknown-linux-gnu
 
       - name: Build aarch64-musl
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
+          RING_HOST_CC: gcc
         run: cargo build --release --target aarch64-unknown-linux-musl
 
       # ── Package ──────────────────────────────────────────────────────────
