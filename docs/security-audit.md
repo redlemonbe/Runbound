@@ -1,1379 +1,346 @@
-# Runbound — Security Audit Report
+# Runbound — Security & Performance Audit Report
 
-**Version audited:** 0.2.3 (initial audit) — findings tracked through v0.6.5  
-**Last updated:** 2026-05-22  
-**Scope:** Full source review — DNS engine, REST API, feed subsystem, ACL, rate limiter, XDP fast-path, persistence layer, TLS, configuration parser, HSM integration, upstream management  
-**Methodology:** Manual white-box source code review of all Rust modules + external penetration test (v0.4.4) + static Clippy audit (v0.6.2)
-
----
-
-## Executive Summary
-
-**108 findings across 13 audit cycles — 108 resolved, 0 open.**
-
-| Cycle | Target | Findings | Status |
-|---|---|---|---|
-| Live pentest + code audit | v0.6.5 | 12 tests PASS + 1 new finding (LOW) | ✅ 12 PASS, UI-XSS-01 fixed same day |
-| Live verification | v0.6.4 | 3 fixes (#45 #46 #47) | ✅ All verified v0.6.4 |
-| Hardening pass | v0.6.3 | 2 (FIX #40, FIX #41 from v0.6.2) | ✅ All fixed v0.6.3 |
-| Live pentest | v0.6.2 | 2 bugs (Low-Med, Med) | ✅ Fixed v0.6.3 (#40 #41) |
-| Static Clippy audit | v0.6.2 | 25 (24 Low, 1 Info) | ✅ All fixed v0.6.2 |
-| IA audit | v0.4.16 | 7 (5 Low, 2 Info) | ✅ All fixed/accepted v0.5.0 |
-| Live pentest | v0.4.16 | 2 bugs + 13 PASS + 2 observations | ✅ BUG-1/BUG-2 closed v0.5.0 |
-| Pre-release white-box | v0.4.16 | 5 (2 Medium, 3 Low) | ✅ All fixed v0.4.16 |
-| Initial white-box | v0.2.3 | 20 (4 Critical, 8 High, 5 Medium, 3 Low) | ✅ All fixed v0.2.4–v0.4.0 |
-| Second white-box | v0.3.3 | 9 (1 High, 6 Medium, 2 Low) | ✅ All fixed v0.3.3–v0.3.5 |
-| Third white-box | v0.4.0 | 8 (1 Blocking, 2 Medium, 5 Low) | ✅ All fixed v0.4.1 |
-| IA audit | v0.4.1 | 9 (3 Low, 3 Info, 2 Doc, 1 false positive) | ✅ All closed v0.4.3 |
-| External pentest | v0.4.4 | 4 (1 High, 1 Medium/false positive, 1 Low, 1 Info) | ✅ All closed v0.4.5 |
-
-Runbound's core DNS path is well-engineered: memory-safe Rust, lock-free hot path
-via ArcSwap, per-IP token-bucket rate limiting with aggressive eviction, RFC 8482
-ANY-query blocking, IPv4-mapped IPv6 normalisation in the ACL, HMAC-SHA256 audit
-chain, and constant-time Bearer comparison (timing oracle fixed in v0.4.0 and
-re-hardened in v0.4.5 by moving the brute-force brake to before the comparison).
-
-The four original critical findings (ghost API endpoints, DNSSEC unconditionally
-disabled, IPv6 SSRF bypass, SSRF hostname-redirect bypass) and all high-severity
-findings from the initial audit have been resolved across v0.2.4, v0.2.5, and v0.3.x.
-A second audit cycle targeting v0.3.3 identified eight additional findings (SEC-09
-through SEC-16), all fixed in v0.3.3.
-
-**All 108 findings closed. No open issues.**
-
-- JSON store HMAC-SHA256 integrity (HIGH-06) — `RUNBOUND_STORE_KEY` env var, sidecar `.mac` files.
-- TLS cipher suite hardening (HIGH-07) — hickory 0.26 + rustls 0.23, TLS 1.3 default.
-- DoT mutual TLS (HIGH-08) — `dot-client-auth-ca` directive + `WebPkiClientVerifier`.
-- SSRF at connection layer (MED-03) — custom `reqwest::dns::Resolve` filtering private IPs.
-- qname log injection (MED-06) — `sanitize_dns_name()` strips control chars before structured logging.
-- Config entry cap (LOW-03) — 1,000,000 limit on `local-zone` / `local-data`.
+**Version audited:** v0.6.9
+**Date:** 2026-05-23
+**Scope:** Full source — DNS engine, XDP fast-path, REST API, cache, feed subsystem, ACL, rate limiter, TLS, configuration parser, HSM integration, upstream management, eBPF program, signal handling, dependency chain
 
 ---
 
-## Severity Classification
+## 1. Executive Summary
 
-| Rating | Criteria |
-|---|---|
-| **CRITICAL** | Exploitable without authentication, or completely breaks a documented security guarantee |
-| **HIGH** | Exploitable with authentication, or silently breaks operational correctness |
-| **MEDIUM** | Reduces defence-in-depth; exploitable under specific conditions |
-| **LOW** | Best-practice gap; no direct exploitability |
-| **INFO** | Architectural note for hardened deployments |
+Runbound is architecturally sound for national-scale DNS deployment. The codebase presents strong security guarantees on critical surfaces (auth, memory, eBPF). The 5 M QPS target is achievable on dedicated multi-queue hardware with XDP enabled, pending four corrections before sovereign deployment.
+
+**Overall verdict: production-ready with four blocking items (listed in §6).**
 
 ---
 
-## Initial Audit Cycle — v0.2.3
+## 2. Architecture Overview
 
-### Critical Findings
-
-#### AUDIT-CRIT-01 — Ghost API endpoints (404 in production)
-
-**File:** `src/api/mod.rs`, `docs/api.md`  
-**Status:** ✅ Fixed in v0.2.5 — all four endpoints implemented
-
-The following endpoints appeared in the documentation but had no handler in the
-actual router: `GET /health`, `GET /stats`, `GET /config`, `POST /reload`.
-All returned HTTP 404, breaking monitoring probes, Prometheus scrapers, and the
-documented REST reload path. Path parameter mismatches (`{name}` vs `:id`) caused
-all DELETE operations to return 404.
-
-All four endpoints implemented in v0.2.5. Path parameters corrected in documentation.
-
----
-
-#### AUDIT-CRIT-02 — DNSSEC validation unconditionally disabled
-
-**File:** `src/dns/server.rs`  
-**Status:** ✅ Mitigated in v0.2.5 — `dnssec-validation` directive added
-
-```rust
-// v0.2.3 — hardcoded
-opts.validate = false;
+```
+NIC
+ │
+ ├──[eBPF XDP filter — kernel bypass]────────────────────────────────┐
+ │   • Identifies UDP/53                                               │
+ │   • CPUMAP routing (FNV-1a hash of QNAME → pinned CPU)            │
+ │   • XDP_PASS fallback on everything else                           │
+ │                                                                     ▼
+ │                                           AF_XDP socket (1 per NIC queue)
+ │                                               │
+ │                                     XDP worker thread (OS thread)
+ │                                       • Parse Ethernet/IP/UDP/DNS
+ │                                       • ACL + rate limiter (DashMap)
+ │                                       • LocalZoneSet (ArcSwap)
+ │                                       • Cache snapshot (ArcSwap)
+ │                                       • Reply via TX ring
+ │
+ └──[Kernel path → Tokio / hickory-server]
+     • Recursive queries / DoT / DoH / DoQ
+     • DNSSEC validation (optional)
+     • REST API (localhost:8081)
 ```
 
-Runbound trusted the AD bit set by upstream resolvers without local re-validation.
-A compromised upstream could serve forged responses with AD=1.
-
-`dnssec-validation: yes` now sets `opts.validate = true` and the DNSSEC stats
-counters (`secure`, `bogus`, `insecure`) are tracked per-query. Operators running
-a DNSSEC-validating recursive resolver upstream (Unbound, BIND) and enabling this
-directive get local chain verification. Default remains `no` for compatibility with
-enterprise forwarders that strip DNSSEC records.
+Architectural strengths: strict separation between XDP OS-threads and Tokio async workers, zero-lock read path on zones, jemalloc multi-thread allocator.
 
 ---
 
-#### AUDIT-CRIT-03 — IPv6 ULA/link-local addresses bypass SSRF guard
+## 3. Security Audit
 
-**File:** `src/feeds/mod.rs`  
-**Status:** ✅ Fixed in v0.2.4
+### 3.1 API Authentication — GOOD
 
-`is_private_ip()` only checked `::1` (loopback) and `::` (unspecified). The
-following IPv6 ranges were not blocked: `fc00::/7` (ULA, `fd00::x` common in
-enterprise networks), `fe80::/10` (link-local), `::ffff:0:0/96` (IPv4-mapped).
+Mechanism: 256-bit Bearer token (CSPRNG), stored at `/etc/runbound/api.key` (chmod 600).
 
-Current implementation (v0.3.5):
+Constant-time comparison (`src/auth.rs`):
 
 ```rust
-std::net::IpAddr::V6(v6) => {
-    let s = v6.segments();
-    v6.is_loopback() || v6.is_unspecified()
-    || (s[0] & 0xfe00) == 0xfc00   // ULA fc00::/7
-    || (s[0] & 0xffc0) == 0xfe80   // link-local fe80::/10
-    || (s[0] == 0x2001 && s[1] == 0x0db8)  // documentation
+use subtle::ConstantTimeEq;
+let diff = b.iter().enumerate().fold(len_mismatch, |acc, (i, &bi)| {
+    acc | (a.get(i).copied().unwrap_or(0) ^ bi)
+});
+diff.ct_eq(&0u8).into()
+```
+
+The `subtle` crate prevents compiler optimizations that would create a timing oracle.
+
+Anti-brute-force: 500 ms sleep after 50 consecutive failures, applied before comparison — no timing signal on key content.
+
+Residual risk: HTTP header length is observable (~non-exploitable in practice; API bound to 127.0.0.1 only).
+
+**Verdict: ✅ Compliant with ANSSI secure API guidelines.**
+
+### 3.2 Secret Management — VERY GOOD
+
+| Secret | Storage | Protection |
+|--------|---------|------------|
+| API key | `Zeroizing<String>` | Zeroed on drop |
+| HSM PIN | `Zeroizing<String>` | Env var `HSM_PIN` > config |
+| HMAC audit | `Zeroizing<Vec<u8>>` | Auto-generated if absent |
+| PKCS#11 | Single session at startup | Explicit cleanup on shutdown |
+
+HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable — correct behavior for sovereign deployment.
+
+**Verdict: ✅ HSM-compliant. Zero plaintext secrets in memory.**
+
+### 3.3 Unsafe Code — ACCEPTABLE with reservations
+
+The project enforces `#![deny(unsafe_op_in_unsafe_fn)]` in all XDP modules — every unsafe block must be explicitly justified.
+
+| File | Nature | Justification | Verdict |
+|------|--------|---------------|---------|
+| `umem.rs` | 45+ `read/write_volatile` on rings | Kernel/userspace shared memory, protocol requires volatile access | ✅ Correctly barriered (Acquire/Release fences) |
+| `socket.rs` | libc syscalls (socket, bind, ioctl) | No safe abstraction available | ✅ Post-call validation |
+| `worker.rs` | UMEM frame access | Kernel-controlled descriptors | ⚠️ See §3.4 |
+| `loader.rs` | `ptr::copy_nonoverlapping` for ELF alignment | Required by aya parser | ✅ Bounds checked before copy |
+
+**Verdict: ✅ Dense but correctly documented. No UB detected.**
+
+### 3.4 UMEM Security — POTENTIAL VULNERABILITY
+
+Context: RX descriptors arrive from the kernel via the AF_XDP ring. A kernel bug or confused-deputy attack could inject a descriptor with `addr + len` exceeding the UMEM region.
+
+Mitigation in place (`worker.rs`):
+
+```rust
+let end = (desc.addr as usize).checked_add(desc.len as usize);
+if desc.len as usize > FRAME_SIZE as usize
+    || end.map(|e| e > sock.umem.area_len).unwrap_or(true) {
+    // drop silently
 }
 ```
 
----
+`checked_add` prevents integer overflow. Each kernel descriptor is validated before memory access.
 
-#### AUDIT-CRIT-04 — SSRF redirect guard only checked literal IPs, not hostnames
+**Verdict: ✅ Protection in place. Kernel trust is implicit (acceptable for dedicated hardware deployment).**
 
-**File:** `src/feeds/mod.rs`  
-**Status:** ✅ Fixed in v0.2.4
+### 3.5 eBPF Surface — GOOD
 
-The redirect policy only called `is_private_ip()` when the redirect destination
-parsed as a literal `IpAddr`. A redirect to `http://internal.corp/data` passed
-`host.parse::<IpAddr>()` fails, so `attempt.follow()` was called unconditionally.
+eBPF program (`ebpf/dns_xdp.c`, 154 lines):
 
-Fix: the reqwest redirect policy now resolves hostname destinations before following.
-TOCTOU re-validation (SEC-05) also added — URL is re-validated on every fetch, not
-just at subscription time.
+- No unbounded loops: FNV-1a hash capped at 64 iterations — respects BPF verifier limits
+- All memory accesses have bounds checks: eth/ip/ipv6/udp headers validated before access (lines 85, 95, 109, 121)
+- `XSKMAP max_entries = 64`: architectural limit documented; Rust code rejects any `queue_id >= 64` before loading
+- `XDP_PASS` fallback on all non-UDP/53 packets → no black-hole possible
 
----
+Potential vector: A malformed DNS packet reaches the XDP worker. Protection is in `process_packet()` (Rust, not eBPF), which validates structure before processing.
 
-### High Findings
+**Verdict: ✅ Verifier-compliant. No OOB detected.**
 
-#### AUDIT-HIGH-01 — No feed subscription count limit (authenticated DoS)
+### 3.6 DNS Protection — GOOD
 
-**File:** `src/api/mod.rs`, `src/feeds/mod.rs`  
-**Status:** ✅ Fixed in v0.2.4 (`MAX_FEEDS = 100`)
+**DNS rebinding:** Each upstream response is filtered against configured private CIDR ranges. RFC 1918 + loopback + link-local blocked by default.
 
-No upper bound on feed subscriptions — each feed could download up to 100 MiB,
-enabling an authenticated client to trigger unbounded network I/O. Cap of 100
-subscriptions enforced in v0.2.4.
+**Rate limiting:**
+- 200 QPS/IP default (configurable)
+- Burst: 2× limit
+- IPv6 /48 aggregation: an attacker with a /48 is treated as a single IP — protection against distributed IPv6 floods
+- Anti-bucket-exhaustion: max 65,536 entries + aggressive GC when full
 
----
+**ANY queries:** Blocked (amplification protection per RFC 8482).
 
-#### AUDIT-HIGH-02 — `/help` endpoint information disclosure (unauthenticated)
+**version.bind, hostname.bind, id.server:** Blocked (CHAOS class fingerprinting).
 
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.2.5 — Bearer authentication required
+**DNSSEC:** Optional. In forwarder mode (default), the upstream AD bit is accepted without local validation. For a sovereign recursive deployment, `dnssec-validation: yes` is mandatory.
 
-Previously returned exact version string, endpoint list, RFC claims, and author
-identity without authentication, enabling version fingerprinting for targeted
-exploitation. All endpoints now require Bearer token.
+**Verdict: ✅ Robust. ⚠️ RECOMMENDATION: enable DNSSEC for national deployment.**
 
----
+### 3.7 Signal Handling — GOOD (fixed in v0.6.9)
 
-#### AUDIT-HIGH-03 — Silent fallback to Cloudflare when no `forward-zone` configured
+| Signal | Behavior |
+|--------|----------|
+| SIGHUP | Hot-reload zones without DNS interruption |
+| SIGUSR1 | Dump live stats to log (monitoring) |
+| SIGUSR2 | Ignored (reserved) |
+| SIGTERM | Graceful shutdown via Tokio runtime |
 
-**File:** `src/dns/server.rs`  
-**Status:** ✅ Mitigated in v0.2.4 — loud WARN log emitted
+Before fix: SIGUSR1/SIGUSR2 → immediate process death (OS default behavior). Fixed in v0.6.9.
 
-If the config has no `forward-zone:` block, all DNS queries fall back to Cloudflare
-(1.1.1.1/1.0.0.1) over plain UDP. For classified deployments this is a data exfiltration
-risk. A startup WARN is now logged. Operators should always configure explicit
-`forward-zone:` blocks.
+### 3.8 Dependency Security
 
----
+| CVE/Advisory | Dependency | Status |
+|-------------|-----------|--------|
+| RUSTSEC-2025-0009 | `ring < 0.17.9` (AES panic) | ✅ Patched, `ring` pinned ≥ 0.17.9 |
+| RUSTSEC-2026-0037 | `quinn` DoS | ✅ Patched via `hickory v0.26` |
 
-#### AUDIT-HIGH-04 — ACL not reloaded on SIGHUP (documentation wrong)
+TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency chain.
 
-**File:** `src/main.rs`, `docs/systemd.md`  
-**Status:** ✅ Fixed in v0.2.5 — documentation corrected
+**Verdict: ✅ Clean dependency chain.**
 
-The SIGHUP handler reloads DNS zones but the `Arc<Acl>` is built once at startup.
-The `systemd.md` hot-reload table erroneously stated that `access-control` rules
-are reloaded on SIGHUP. Table corrected — ACL change requires restart.
+### 3.9 Sovereign Deployment Checklist
 
----
-
-#### AUDIT-HIGH-05 — Rate limiter bucket exhaustion under UDP source IP spoofing
-
-**File:** `src/dns/ratelimit.rs`  
-**Status:** ✅ Mitigated — aggressive eviction on bucket table full
-
-UDP source IP spoofing can fill the bucket table (65,536 entries). Original
-implementation refused new IPs when full, including legitimate clients.
-
-Current implementation evicts idle entries (last seen > 10 s) before refusing.
-If still full after eviction, the flood is active and the drop is intentional.
-Network-layer controls (BCP38 ingress filtering) remain the correct primary
-defence.
+| ID | Risk | Severity | Action required |
+|----|------|----------|----------------|
+| R1 | No internal privilege dropping | MEDIUM | Delegate to systemd (`User=`, `CapabilityBoundingSet=`) |
+| R2 | DNSSEC disabled by default | MEDIUM | Enable `dnssec-validation: yes` in production |
+| R3 | `log-client-ip: yes` by default | LOW/GDPR | Set to `no` if IP retention is not legally justified |
+| R4 | No NUMA awareness | LOW | On NUMA servers (multi-socket), XDP workers may cross memory banks |
 
 ---
 
-#### AUDIT-HIGH-06 — JSON data stores have no integrity protection
+## 4. Performance Audit
 
-**File:** `src/store.rs`, `src/feeds/mod.rs`, `src/integrity.rs`  
-**Status:** ✅ Fixed in v0.4.0 — HMAC-SHA256 sidecar `.mac` files
+### 4.1 XDP Hot Path Analysis
 
-`dns_entries.json`, `blacklist.json`, and `feeds.json` are stored as cleartext JSON
-(mode 0640). An attacker with filesystem write access can inject arbitrary DNS
-records without touching the API, bypassing authentication, rate limiting, and entry
-count limits.
-
-**Fix:** Set `RUNBOUND_STORE_KEY` (hex-encoded 32+ bytes or any UTF-8 string). On every
-write, `src/integrity.rs` computes `HMAC-SHA256(content, key)` and writes it to a
-sidecar `.mac` file (e.g. `dns_entries.mac`). On every load, the HMAC is verified
-before deserialization:
-- `.mac` missing, key set → WARN, load proceeds (backwards compatibility).
-- `.mac` present, mismatch → ERROR, load refused, server exits.
-- `.mac` present, key unset → WARN, load proceeds (cannot verify).
-
-Domain cache files (per-feed `.json`) are regeneratable from the internet; HMAC mismatch
-discards the cache (WARN) and triggers a re-fetch on next update cycle.
-
----
-
-#### AUDIT-HIGH-07 — TLS cipher suites inherit rustls 0.21 defaults
-
-**File:** `Cargo.toml`, `src/dns/server.rs`  
-**Status:** ✅ Fixed in v0.4.0 — hickory 0.26 + rustls 0.23, TLS 1.3 default
-
-`rustls 0.21` (pulled by hickory-server 0.24) enabled TLS 1.2 + cipher suites
-below BSI TR-02102 / NIST SP 800-52 Rev 2. Upgraded to hickory-server 0.26 + rustls 0.23.
-DoQ uses `ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])` —
-Quinn rejects configs that permit TLS 1.2. DoT and DoH use the rustls 0.23 default
-which offers TLS 1.3 by preference. Six hickory-proto CVEs (RUSTSEC-2026-0119,
-RUSTSEC-2026-0037, RUSTSEC-2025-0009, RUSTSEC-2026-0104, RUSTSEC-2026-0098,
-RUSTSEC-2026-0099) resolved. All ignores removed from `audit.toml`.
-
----
-
-#### AUDIT-HIGH-08 — No mTLS for DoT client authentication
-
-**File:** `src/dns/server.rs`, `src/config/parser.rs`  
-**Status:** ✅ Fixed in v0.4.0 — `dot-client-auth-ca` + `WebPkiClientVerifier`
-
-DoT uses server-only TLS by default. Mutual TLS is now enabled with:
+Critical path for a DNS query in XDP mode:
 
 ```
-server:
-    dot-client-auth-ca: "/etc/runbound/client-ca.pem"
+[Packet arrives at NIC]
+    ↓ ~0 ns   — Hardware DMA → UMEM frame
+    ↓ ~50 ns  — eBPF filter (bounds checks + FNV-1a hash if CPUMAP)
+    ↓ ~0 ns   — AF_XDP ring enqueue
+    ↓ ~100 ns — poll() wakeup XDP worker thread
+    ↓ ~200 ns — parse Ethernet/IP/UDP/DNS (inline, no allocation)
+    ↓ ~50 ns  — ACL check (ArcSwap load, DashMap lookup)
+    ↓ ~100 ns — rate limiter (DashMap per-IP)
+    ↓ ~200 ns — LocalZoneSet lookup (hashmap)
+    ↓ ~100 ns — Cache snapshot lookup (ArcSwap load + HashMap)
+    ↓ ~200 ns — Build DNS response (inline into TX UMEM frame)
+    ↓ ~50 ns  — TX ring enqueue + kick
+    ↓ ~0 ns   — Hardware DMA → NIC TX
+Total estimated: ~1 µs (single-threaded, cache-warm)
 ```
 
-`build_tls_config()` detects the CA path and builds a `WebPkiClientVerifier` via
-`rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?`.
-The DoT `ServerConfig` is then constructed with `with_client_cert_verifier(verifier)`.
-DoH and DoQ are unaffected (they authenticate via application-layer tokens).
-When `dot-client-auth-ca` is absent, DoT falls back to server-only authentication.
+Theoretical throughput: at 1 µs/query on 1 core → 1 M QPS/core. With 8 XDP cores → 8 M QPS. The 5 M QPS target is achievable on 8-queue+ hardware.
 
----
+### 4.2 AF_XDP Configuration
 
-### Medium Findings
+| Parameter | Current value | Assessment |
+|-----------|--------------|------------|
+| `FRAME_SIZE` | 4,096 bytes | ✅ Optimal (1 page = 1 DNS packet) |
+| `FRAME_COUNT` | 8,192 | ✅ 32 MiB/socket |
+| `RX_RING_SIZE` | 4,096 | ✅ Deep enough for 10 µs burst |
+| `TX_RING_SIZE` | 4,096 | ✅ |
+| `FILL_RING_SIZE` | 4,096 | ✅ |
+| `COMP_RING_SIZE` | 4,096 | ✅ |
+| NIC ring buffer | `maximize_nic_ring()` auto | ✅ Maximized before XDP attach |
+| Hugepages | Optional, 4K fallback | ⚠️ Enable in production (reduce TLB misses) |
 
-#### AUDIT-MED-01 — Feed parser accepts underscore labels
+Buffer margin at 10 M QPS:
+- 10 M QPS / 10 queues = 1 M QPS/queue = 1 packet/µs
+- Ring depth 4,096 × 1 µs/packet = 4 ms buffer
+- Overflow tolerance: 4 ms — sufficient
 
-**File:** `src/feeds/mod.rs`  
-**Status:** ✅ Accepted — intentional RFC relaxation, documented
+### 4.3 Bottlenecks Identified
 
-`is_valid_domain()` requires at least one dot but allows underscore labels
-(`_dmarc.example.com`). RFC 1035 §2.3.1 disallows underscores in host labels, but
-service labels use them by convention (RFC 2782/6763). Blocklist pragmatism takes
-precedence. No action required.
-
----
-
-#### AUDIT-MED-02 — TOCTOU window in feed URL validation
-
-**File:** `src/feeds/mod.rs`  
-**Status:** ✅ Mitigated — SEC-05 (v0.2.0) + re-validation on every fetch (v0.3.0)
-
-`validate_feed_url()` resolves the hostname then reqwest re-resolves for the actual
-TCP connection. DNS rebinding with TTL=0 could switch the A record in that window
-(< 10 ms). URL is now re-validated on every fetch, not just at subscription time,
-closing the window for pre-subscribed records. Residual risk requires attacker
-control of both the feed's DNS zone and precise millisecond timing.
-
----
-
-#### AUDIT-MED-03 — SSRF hostname resolution uses system resolver
-
-**File:** `src/feeds/mod.rs`  
-**Status:** ✅ Fixed in v0.4.0 — `SsrfSafeDnsResolver` implements `reqwest::dns::Resolve`
-
-`validate_feed_url()` uses `tokio::net::lookup_host()` which resolves via
-`/etc/resolv.conf`. On a Runbound host that is its own resolver, this creates a
-loop, and the system resolver is not guaranteed to give accurate SSRF-blocking
-results.
-
-**Fix:** `SsrfSafeDnsResolver` implements `reqwest::dns::Resolve` and is installed
-via `Client::builder().dns_resolver(Arc::new(SsrfSafeDnsResolver))`. On every TCP
-connection, the resolver calls `tokio::net::lookup_host`, filters all returned
-`SocketAddr`s through `is_private_ip()`, and returns an error if no public address
-remains. This operates at the network layer — independent of `validate_feed_url()`
-and active on every redirect followed by the client.
-
----
-
-#### AUDIT-MED-04 — XDP `frame_mut()` had no bounds enforcement
-
-**File:** `src/dns/xdp/umem.rs`  
-**Status:** ✅ Fixed in v0.2.4 — `debug_assert!` bounds checks added
+#### PERF-01 — MAJOR: Cache snapshot publish interval 100 ms ⚠️
 
 ```rust
-debug_assert!(
-    (offset as usize) + len <= self.area_len,
-    "XDP frame_mut: offset {offset} + len {len} exceeds UMEM size {}",
-    ...
-);
+// cache_snapshot.rs, line 107
+let mut interval = tokio::time::interval(Duration::from_millis(100));
 ```
 
----
+Impact: New cache entries are visible to XDP workers with up to 100 ms latency. At 1 M QPS on a popular domain, the first 100 ms pass through the slow path (hickory) — ~100,000 unnecessarily forwarded queries per popularity burst.
 
-#### AUDIT-MED-05 — No authentication failure rate limiting
+**Fix: Reduce to 10 ms** (still non-blocking, negligible CPU cost).
 
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.2.5 — 500 ms async delay after each failure
-
-`AUTH_FAILURES` global counter increments on every failed authentication.
-A 500 ms `tokio::time::sleep` is injected after each failed attempt, reducing
-brute-force throughput from 30 req/s to 2 req/s. Counter resets on successful
-authentication.
-
----
-
-#### AUDIT-MED-06 — Log injection via structured DNS query names
-
-**File:** `src/dns/server.rs`  
-**Status:** ✅ Fixed in v0.4.0 — `sanitize_dns_name()` strips control characters
-
-DNS query names are emitted verbatim as structured log fields. With JSON output
-(`RUST_LOG=json`), a crafted name containing `"` or `}` could break downstream
-log consumers (Elasticsearch, Splunk).
-
-**Fix:** `sanitize_dns_name(name: &LowerName) -> String` replaces any ASCII control
-character (0x00–0x1F, 0x7F) with `?` before the name is used in any `tracing` macro.
-Non-ASCII bytes are also replaced with `?`. The function is called on every query before
-the structured log event is emitted, ensuring the logged field is always printable ASCII.
-
----
-
-#### AUDIT-MED-07 — `api-key` stored cleartext in `runbound.conf`
-
-**File:** `src/config/parser.rs`  
-**Status:** ✅ Mitigated in v0.2.4 — WARN log when `api-key:` is used in config
-
-Production deployments should set `RUNBOUND_API_KEY` via environment variable (systemd
-`EnvironmentFile`, Docker secret) rather than the config file. A WARN is logged at
-startup when the config-file `api-key:` directive is used.
-
----
-
-### Low Findings
-
-#### AUDIT-LOW-01 — Hand-rolled UTC timestamp in `feeds/mod.rs`
-
-**File:** `src/feeds/mod.rs`  
-**Status:** ✅ Fixed in v0.2.5 — replaced with `humantime::format_rfc3339`
-
-30-line custom Gregorian calendar implementation replaced by `humantime` (already a
-dependency), eliminating leap year edge case risk.
-
----
-
-#### AUDIT-LOW-02 — `/help` exposes author identity and repository URL (unauthenticated)
-
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.2.5 — endpoint requires Bearer authentication
-
-See AUDIT-HIGH-02.
-
----
-
-#### AUDIT-LOW-03 — No cap on `local-zone` / `local-data` entries in config
-
-**File:** `src/config/parser.rs`  
-**Status:** ✅ Fixed in v0.4.0 — `MAX_LOCAL_ZONES = MAX_LOCAL_DATA = 1_000_000`
-
-The config parser now enforces a 1,000,000 entry limit for both `local-zone:` and
-`local-data:` directives. When the limit is reached, subsequent entries are silently
-dropped and a WARN is emitted: `local-zone limit (1000000) reached — entry ignored`.
-This prevents accidental OOM from pathological configs while supporting any realistic
-deployment size (1M entries ≈ 200 MiB of zone data at 200 bytes average).
-
----
-
-#### AUDIT-LOW-04 — TCP idle timeout too short for high-latency DoT
-
-**File:** `src/dns/server.rs`  
-**Status:** ✅ Fixed in v0.2.5 — TCP timeout raised to 30 s (RFC 7858 §3.5)
-
----
-
----
-
-## Second Audit Cycle — v0.3.3
-
-The following eight findings were identified during the v0.3.3 audit and all fixed
-in the same release. They are cross-referenced as SEC-09 through SEC-16 in
-[`docs/security.md`](security.md).
-
----
-
-### SEC-09 (High) — `POST /rotate-key` was a silent no-op
-
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.3.3
-
-The handler read `RUNBOUND_API_KEY` from `std::env::var()`, which is frozen at
-process startup. Updating the systemd `EnvironmentFile` and calling `POST /rotate-key`
-appeared to succeed (HTTP 200) but the in-memory key was never updated. The new key
-was unreachable until restart.
-
-**Fix:** `POST /rotate-key` now accepts `{"new_key": "<32+ chars>"}` in the request
-body and atomically swaps the live key via `ArcSwap<String>`. The old key remains
-valid until the swap completes (zero downtime). The new key is written to
-`/etc/runbound/api.key` with `chmod 600`.
-
----
-
-### SEC-10 (Medium) — CHAOS class queries returned NOERROR
-
-**File:** `src/dns/server.rs`  
-**Status:** ✅ Fixed in v0.3.3 — confirmed correct in v0.3.5 pentest re-test
-
-CHAOS class queries (`version.bind CH TXT`, `hostname.bind CH TXT`) expose server
-identity and are used for DNS fingerprinting. RFC 5358 §4 specifies that resolvers
-which do not implement CHAOS SHOULD return NOTIMP.
-
-The check was added in v0.3.3:
+#### PERF-02 — MAJOR: Mutex on mutable cache ⚠️
 
 ```rust
-if u16::from(request.query().query_class()) == 3 {
-    return send_error(request, response_handle, ResponseCode::NotImp).await;
-}
+// cache_snapshot.rs, line 90
+let mut map = mutable.lock().unwrap_or_else(|e| e.into_inner());
 ```
 
-**Pentest note (v0.3.5):** A subsequent pentest reported NOERROR for
-`version.bind CH TXT`. Root-cause analysis confirmed the test tool was querying the
-system Unbound daemon on port 53, not Runbound on port 5353. Direct test against
-Runbound confirms `status: NOTIMP`.
+The `Mutex<MutableCacheMap>` is contended by the DNS insertion thread (Tokio) AND the publish loop every 100 ms. Above 500 K insertions/second, this mutex becomes a bottleneck.
+
+**Fix: Replace with `DashMap`** (sharded RwLock) or `crossbeam::SkipMap`.
+
+#### PERF-03 — MEDIUM: No NUMA awareness ⚠️
+
+On dual-socket servers (2× EPYC or 2× Xeon), XDP workers for socket-0 queues potentially access UMEM allocated on socket-1 — 3× memory latency.
+
+**Fix: Allocate UMEM with `mbind()` or `numactl --cpunodebind` consistent with worker affinity.**
+
+#### PERF-04 — MEDIUM: Hugepages optional ⚠️
+
+**Fix: Enable in production config and set `vm.nr_hugepages = 8192` in sysctl.**
+
+#### PERF-05 — LOW: No explicit TX batching
+
+Responses are sent individually via `sock.tx.enqueue_tx(&[desc])`. Batching 16–64 responses per `sendto()`/kick call would reduce syscalls. Estimated impact: +10–15% throughput.
+
+#### PERF-06 — MEDIUM: SO_REUSEPORT on UDP fallback
+
+The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify that `SO_REUSEPORT` is active on all UDP listeners — otherwise single-threaded bottleneck.
+
+### 4.4 Performance Projection
+
+| Scenario | Hardware | Estimated QPS | p99 latency |
+|----------|---------|--------------|------------|
+| XDP disabled (Tokio only) | 32 cores | ~500 K QPS | 2–5 ms |
+| XDP + 4 NIC queues | 4 XDP cores | ~4 M QPS | < 200 µs |
+| XDP + 8 NIC queues | 8 XDP cores | ~8 M QPS | < 150 µs |
+| XDP + 8 queues + hugepages + CPUMAP | 8 dedicated cores | ~10 M QPS | < 100 µs |
 
 ---
 
-### SEC-11 (Medium) — Body limit dropped TCP instead of returning HTTP 413
+## 5. Consolidated Risk Matrix
 
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.3.3
+### Security
 
-Payloads above axum's default `DefaultBodyLimit` caused the middleware to drop the
-TCP connection without sending a response. Clients (including `curl`) reported
-"connection reset" rather than a structured error.
+| ID | Title | Severity | Status |
+|----|-------|----------|--------|
+| SEC-01 | Auth timing oracle | MEDIUM | ✅ Mitigated (subtle + sleep) |
+| SEC-02 | Plaintext secrets in memory | HIGH | ✅ Zeroizing |
+| SEC-03 | UMEM buffer overflow | HIGH | ✅ checked_add |
+| SEC-04 | HTTP body unbounded | MEDIUM | ✅ Capped 65 KiB |
+| SEC-05 | DNSSEC disabled by default | MEDIUM | ⚠️ Enable in production |
+| SEC-06 | Privilege dropping | MEDIUM | ⚠️ Delegate to systemd |
+| SEC-07 | Dependency CVEs | HIGH | ✅ Patched |
+| SEC-08 | SIGUSR1/2 kill process | HIGH | ✅ Fixed v0.6.9 |
+| SEC-09 | DNS rebinding | HIGH | ✅ CIDR guards |
+| SEC-10 | ANY amplification | HIGH | ✅ Blocked |
 
-**Fix:** Explicit `DefaultBodyLimit::max(65_536)` (64 KiB). axum returns HTTP 413
-`Content Too Large` with a JSON body before reading oversized payloads into RAM.
+### Performance
 
----
-
-### SEC-12 (Medium) — Negative TTL caused `unwrap()` panic
-
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.3.3
-
-`POST /dns` with `{"ttl": -1}` caused a `u32::try_from` failure that propagated
-as an `unwrap()` panic, crashing the handler task. Clients received a 500 with no
-JSON body.
-
-**Fix:** TTL is validated in range 0–2,147,483,647 (RFC 2181 §8) before conversion.
-Out-of-range values return HTTP 422 `INVALID_TTL`.
-
----
-
-### SEC-13 (Medium) — Production `unwrap()` / `expect()` in request handlers
-
-**File:** `src/api/mod.rs`, `src/feeds/mod.rs`  
-**Status:** ✅ Fixed in v0.3.3
-
-Several request-path functions used `unwrap()` and `expect()` on fallible operations
-(lock acquisition, JSON serialisation, store reads). A poisoned mutex or corrupt
-store would crash the handler task, and in some paths the entire process via
-`Mutex::lock().unwrap()`.
-
-**Fix:** All `unwrap()` / `expect()` in handler paths replaced with `?` or explicit
-match arms that return HTTP 500 or 503 with structured JSON error responses.
+| ID | Title | Impact | Status |
+|----|-------|--------|--------|
+| PERF-01 | Cache publish 100 ms | MAJOR | ⚠️ Reduce to 10 ms |
+| PERF-02 | Mutex on mutable cache | MAJOR | ⚠️ Replace with DashMap |
+| PERF-03 | No NUMA awareness | MEDIUM | ⚠️ Enable in production |
+| PERF-04 | Hugepages optional | MEDIUM | ⚠️ Enable in production |
+| PERF-05 | TX not batched | LOW | Post-5M optimization |
+| PERF-06 | SO_REUSEPORT fallback | MEDIUM | Verify |
+| PERF-07 | jemalloc | — | ✅ Configured |
+| PERF-08 | CPU affinity | — | ✅ Physical cores |
+| PERF-09 | IRQ affinity | — | ✅ Optional, recommended |
+| PERF-10 | NIC ring maximized | — | ✅ SIOCETHTOOL auto |
 
 ---
 
-### SEC-14 (Medium) — Sync Bearer comparison was timing-vulnerable
+## 6. Priority Recommendations
 
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.3.3
+### Blocking — required before national deployment
 
-The authentication middleware compared Bearer tokens with a synchronous string
-equality check that short-circuits on the first differing byte. With sufficiently
-precise timing measurements, an attacker could determine the number of correct prefix
-characters.
+1. **SEC-06** — systemd unit hardening:
+   ```ini
+   User=runbound
+   CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_BPF
+   NoNewPrivileges=yes
+   MemoryDenyWriteExecute=no
+   ```
 
-**Fix:** Comparison replaced with `subtle::ConstantTimeEq` (constant-time byte-by-byte
-comparison, no early exit). The `subtle` crate is designed specifically to prevent
-timing side-channels.
+2. **SEC-05** — Enable in production config:
+   ```
+   server:
+       dnssec-validation: yes
+   ```
 
----
+3. **PERF-01** — `cache_snapshot.rs` line 107: `Duration::from_millis(100)` → `Duration::from_millis(10)`
 
-### SEC-15 (Low) — Feed URLs with embedded credentials not rejected
+4. **PERF-04** — Production config:
+   ```
+   server:
+       xdp-hugepages: yes
+   ```
+   System: `vm.nr_hugepages = 8192`
 
-**File:** `src/feeds/mod.rs`  
-**Status:** ✅ Fixed in v0.3.3
+### Post-deployment improvements
 
-Feed URLs containing `user:pass@host` were accepted and stored in `feeds.json` at
-rest. The credentials were sent in the `Authorization` header on every fetch and
-could be logged by the upstream feed server.
-
-**Fix:** `validate_feed_url()` rejects URLs containing `@` in the host component
-(userinfo present) with HTTP 400 before any network request.
-
----
-
-### SEC-16 (Low) — `rate-limit: u64::MAX` silently disabled rate limiting
-
-**File:** `src/config/parser.rs`, `src/dns/ratelimit.rs`  
-**Status:** ✅ Fixed in v0.3.3
-
-Setting `rate-limit:` to `u64::MAX` or any value that overflowed `u64` when
-doubled (for burst calculation) silently disabled the rate limiter without warning.
-
-**Fix:** Values above 10,000,000 (10M qps) are capped at 10M and a WARN is logged.
-`rate-limit: 0` explicitly disables the limiter with an explicit WARN at startup.
+- **PERF-02** — Replace `Mutex<HashMap>` with `DashMap` on mutable cache to exceed 1 M insertions/s
+- **PERF-03** — Topology-aware UMEM allocation on dual-socket servers
+- **PERF-05** — TX batching: group 32 responses per `sendto()` kick
+- **GDPR** — `log-client-ip: no` if GDPR applies to the deployment
 
 ---
 
----
+## 7. Conclusion
 
-## v0.3.5 Fix
-
-### GET /config missing `log_retention` / `log_client_ip`
-
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.3.5
-
-The two GDPR privacy directives added in v0.3.4 (`log-retention`, `log-client-ip`)
-were not exposed in the `GET /config` snapshot endpoint. All other runtime parameters
-are visible; the omission was an incomplete rebuild (binary pre-dated the source
-change). Both fields appear in the config response from v0.3.5 onward:
-
-```json
-"log_client_ip": true,
-"log_retention": 1000
-```
-
----
-
----
-
-## Informational Notes
-
-### AUDIT-INFO-01 — Single shared API key, no roles
-
-There is one API key shared by all operators. No per-operator keys, no read-only
-vs. read-write separation, no per-key audit attribution. For multi-operator
-deployments, individual operator keys with per-key audit logs are required.
-
-### AUDIT-INFO-02 — No OCSP stapling for DoT certificates
-
-The TLS configuration does not implement OCSP stapling. DoT clients performing
-certificate revocation checks incur additional round-trip latency. For production
-DoT, use Let's Encrypt certificates with OCSP stapling enabled in the TLS stack.
-
-### AUDIT-INFO-03 — Memory pressure guard requires `/proc/meminfo`
-
-The 30-second memory check reads `/proc/meminfo` (Linux-only). On systems or
-containers without `/proc/meminfo`, the guard silently skips — DNS service continues
-normally. A WARN is logged on the first missed check.
-
-### AUDIT-INFO-04 — XDP fast path is safe-by-design for query forwarding
-
-The AF_XDP worker correctly falls through to the kernel (hickory-server) for
-recursive queries, ANY queries, and malformed frames. ACL-denied sources receive a
-crafted REFUSED frame in-kernel. There is no data exfiltration risk from the XDP path.
-
----
-
-## Finding Summary
-
-### Initial Audit (v0.2.3) — status as of v0.4.0
-
-| ID | Severity | Component | Status |
-|---|---|---|---|
-| CRIT-01 | CRITICAL | API | ✅ Fixed v0.2.5 |
-| CRIT-02 | CRITICAL | DNSSEC | ✅ Mitigated v0.2.5 — `dnssec-validation` directive |
-| CRIT-03 | CRITICAL | SSRF/IPv6 | ✅ Fixed v0.2.4 |
-| CRIT-04 | CRITICAL | SSRF/redirect | ✅ Fixed v0.2.4 |
-| HIGH-01 | HIGH | Feeds | ✅ Fixed v0.2.4 — MAX_FEEDS = 100 |
-| HIGH-02 | HIGH | API | ✅ Fixed v0.2.5 — /help requires Bearer |
-| HIGH-03 | HIGH | DNS | ✅ Mitigated v0.2.4 — startup WARN |
-| HIGH-04 | HIGH | Reload | ✅ Fixed v0.2.5 — docs corrected |
-| HIGH-05 | HIGH | RateLimit | ✅ Mitigated — aggressive eviction on flood |
-| HIGH-06 | HIGH | Storage | ✅ Fixed v0.4.0 — HMAC-SHA256 sidecar `.mac` files |
-| HIGH-07 | HIGH | TLS | ✅ Fixed v0.4.0 — hickory 0.26 + rustls 0.23, TLS 1.3 |
-| HIGH-08 | HIGH | TLS/DoT | ✅ Fixed v0.4.0 — `dot-client-auth-ca` mTLS |
-| MED-01 | MEDIUM | Feeds | ✅ Accepted — intentional RFC relaxation |
-| MED-02 | MEDIUM | SSRF/TOCTOU | ✅ Mitigated — re-validation on every fetch |
-| MED-03 | MEDIUM | SSRF | ✅ Fixed v0.4.0 — `SsrfSafeDnsResolver` at connect time |
-| MED-04 | MEDIUM | XDP | ✅ Fixed v0.2.4 — debug_assert bounds |
-| MED-05 | MEDIUM | API auth | ✅ Fixed v0.2.5 — 500 ms lockout per failure |
-| MED-06 | MEDIUM | Logging | ✅ Fixed v0.4.0 — `sanitize_dns_name()` |
-| MED-07 | MEDIUM | Config | ✅ Mitigated v0.2.4 — WARN on api-key in config |
-| LOW-01 | LOW | Feeds | ✅ Fixed v0.2.5 — humantime::format_rfc3339 |
-| LOW-02 | LOW | API | ✅ Fixed v0.2.5 — /help requires Bearer |
-| LOW-03 | LOW | Config | ✅ Fixed v0.4.0 — 1,000,000 entry cap |
-| LOW-04 | LOW | DNS/TLS | ✅ Fixed v0.2.5 — TCP timeout 30 s |
-
-### Second Audit Cycle (v0.3.x) — status as of v0.3.5
-
-| ID | Severity | Component | Status |
-|---|---|---|---|
-| SEC-09 | HIGH | API | ✅ Fixed v0.3.3 — /rotate-key JSON body + ArcSwap |
-| SEC-10 | MEDIUM | DNS | ✅ Fixed v0.3.3 — CHAOS → NOTIMP (confirmed v0.3.5) |
-| SEC-11 | MEDIUM | API | ✅ Fixed v0.3.3 — DefaultBodyLimit → HTTP 413 |
-| SEC-12 | MEDIUM | API | ✅ Fixed v0.3.3 — negative TTL → HTTP 422 |
-| SEC-13 | MEDIUM | API | ✅ Fixed v0.3.3 — unwrap() → structured errors |
-| SEC-14 | MEDIUM | API auth | ✅ Fixed v0.3.3 — subtle::ConstantTimeEq |
-| SEC-15 | LOW | Feeds | ✅ Fixed v0.3.3 — credential URL rejected |
-| SEC-16 | LOW | RateLimit | ✅ Fixed v0.3.3 — u64::MAX capped at 10M |
-
-### v0.3.5 Fix
-
-| ID | Severity | Component | Status |
-|---|---|---|---|
-| CONF-01 | LOW | API | ✅ Fixed v0.3.5 — /config exposes log_retention + log_client_ip |
-
----
-
-### v0.4.1 Audit Findings (IA audit on v0.4.0)
-
-| ID | Severity | Component | Status |
-|---|---|---|---|
-| BUG-01 | BLOCKING | Sync/TLS | ✅ Fixed v0.4.1 — CryptoProvider install in main() |
-| S-10 | MEDIUM | API/DNS | ✅ Fixed v0.4.1 — validate_dns_name on CNAME/MX/NS/PTR/SRV values |
-| S-11 | LOW | API | ✅ Fixed v0.4.1 — Content-Length check before rate limit (413 not 429) |
-| Q-01 | LOW | API | ✅ Fixed v0.4.1 — ApiJson extractor: JSON body on POST /dns rejection |
-| Q-02 | LOW | API | ✅ Fixed v0.4.1 — ApiJson extractor: JSON body on POST /blacklist rejection |
-| Q-03 | LOW | API | ✅ Fixed v0.4.1 — ApiJson extractor: JSON body on POST /rotate-key rejection |
-| Q-04 | LOW | API | ✅ Fixed v0.4.1 — QueryRejection: JSON body on GET /logs?page=-1 |
-| S-12 | INFO | DNS | ℹ️ False positive — version.bind CHAOS → NOTIMP confirmed in code |
-
----
-
-### v0.4.3 Audit Findings (IA audit on v0.4.1)
-
-| ID | Severity | Component | Status |
-|---|---|---|---|
-| SEC-02 | MEDIUM | API/DNS | ✅ Fixed v0.4.3 — false positive; added unit tests confirming 253/254-char boundary |
-| SEC-03 | LOW | DNS | ✅ Fixed v0.4.3 — name-based identity probe block (defense-in-depth vs CHAOS class) |
-| SEC-04 | LOW | API | ✅ Mitigated v0.4.1/v0.4.3 — Content-Length pre-check (413 for well-behaved clients); TCP RST for chunked >64 KB bodies is an inherent HTTP/1.1 limitation on localhost-only API |
-| DOC-01 | INFO | Docs | ✅ Fixed v0.4.3 — README updated to current binary names |
-| DOC-02 | INFO | Docs | ✅ Fixed v0.4.3 — Fixed runtime limits section added to configuration.md |
-| DOC-03 | INFO | Docs | ✅ Fixed v0.4.3 — Slave DNS behaviour section added to ha.md |
-
----
-
-### Pentest v0.4.4 Findings (external pentest on v0.4.4)
-
-| ID | Severity | Component | Status |
-|---|---|---|---|
-| NEW-HIGH | 🔴 HIGH | API auth | ✅ Fixed v0.4.5 — timing oracle eliminated (pre-auth sleep + async side effects) |
-| SEC-02 | 🟡 MEDIUM | API/DNS | ✅ Confirmed false positive — integration tests added; see analysis below |
-| SEC-04 | 🟢 LOW | API | ✅ Fixed v0.4.5 — 411 for JSON POST without Content-Length (SEC-04 partial close) |
-| NEW-LOW | 🟢 LOW | HTTP | ℹ️ Acknowledged — hyper-level HTTP parse rejection; not addressable in application code |
-
-#### NEW-HIGH — Timing oracle (+183 ms on "nearly correct" key)
-
-**Root cause:** The brute-force brake (`tokio::time::sleep(500 ms)` at ≥ 50 failures) ran
-*after* `constant_time_eq` on the failure path, i.e. on the critical path before the 401
-response. Two channels of leakage:
-1. The sleep itself — applied only on failure, after the comparison. Pentest measured 184 ms
-   (consistent with a sleep triggered at exactly failure #50, then cancelled by the rate limiter
-   or measured mid-sleep).
-2. The `warn!()` tracing call at multiples of 10 failures — file I/O on the handler task.
-
-**Fix:** Pre-auth brake — `AUTH_FAILURES.load()` is checked *before* `constant_time_eq`; the
-500 ms sleep applies equally to all requests (correct key, wrong key, any key) when failures
-are high. The post-comparison side effects (audit event, warn!) are moved to `tokio::spawn`
-so the 401 is returned immediately with no timing signal.
-
-#### SEC-02 — Domain name > 253 chars (confirmed false positive)
-
-The pentest reported "254 chars → HTTP 201". Investigation + added integration tests
-(`dns_name_254_chars_is_rejected`, `blacklist_name_254_chars_is_rejected`) confirm that:
-
-- A true 254-char name (no trailing dot) → HTTP **400** ✓
-- The pentest used a 253-char name + trailing FQDN dot (= 254 bytes submitted) → HTTP 201,
-  which is **correct**: the trailing dot is stripped before the 253-char check per RFC 1035 §2.3.4.
-
-This is the same false positive identified in the IA audit (v0.4.3 SEC-02). The added
-HTTP-level integration tests document and prove the boundary end-to-end.
-
-#### SEC-04 — Chunked body drop without 413 (partial close)
-
-The 412KB/5 MB bodies without `Content-Length` (chunked transfer encoding) caused
-`DefaultBodyLimit` to drop the TCP connection instead of returning 413. The Content-Length
-pre-check in the middleware only applies when the header is present.
-
-**Fix:** JSON POST requests without `Content-Length` now return **411 Length Required**
-before reaching rate limiting or auth. Non-JSON POST endpoints (`/reload`,
-`/feeds/update`, `/feeds/:id/update`) are unaffected (no `Content-Type: application/json`).
-
-#### NEW-LOW — UUID null byte → TCP drop
-
-A null byte (`\x00`) in the HTTP request path causes hyper to reject the request at the
-HTTP/1.1 parsing layer — before any application middleware runs. The connection is dropped
-with no response rather than returning 400. This is **inherent hyper behaviour**: raw null bytes
-are invalid in HTTP request targets per RFC 9110 §4.1. Fixing this would require patching the
-HTTP library or adding a pre-parse TCP stream filter — both out of scope for this API.
-
-**Impact:** LOW — affects only malformed/buggy clients (no well-behaved HTTP client sends raw
-null bytes in a URI). No data is leaked; the client sees a connection reset.
-
----
-
----
-
-## Live Pentest — v0.4.16
-
-**Date:** 2026-05-19  
-**Scope:** `src/api/mod.rs`, `src/dns/server.rs`, DNS protocol handling, REST API  
-**Methodology:** Black-box + white-box, automated + manual  
-**Status:** 13 checks PASS, 2 bugs found (fixed in v0.5.0), 2 observations
-
----
-
-### Results — PASS
-
-| Test | Expected | Result |
-|---|---|---|
-| DNS resolution (A, AAAA, TCP) | Correct answers | ✅ PASS |
-| Blacklist enforcement | REFUSED rcode | ✅ PASS |
-| ANY → NOTIMP | NOTIMP rcode | ✅ PASS |
-| Compression pointer loop | FORMERR | ✅ PASS |
-| Label > 63 bytes | FORMERR | ✅ PASS |
-| QNAME > 253 bytes | FORMERR | ✅ PASS |
-| Zero-length UDP packet | Dropped | ✅ PASS |
-| Truncated header (5 bytes) | Dropped | ✅ PASS |
-| RRSIG amplification | 0 bytes (blocked) | ✅ PASS |
-| Log injection (`\r\n` in QNAME) | Escaped as `\012\015` | ✅ PASS |
-| API authentication (no token / wrong token) | HTTP 401 | ✅ PASS |
-| API input validation (path traversal, XSS, buffer overflow) | HTTP 400 / 405 | ✅ PASS |
-| XDP compiled by default, active on ens18 | XDP fast path active | ✅ PASS |
-
----
-
-### Results — FAIL
-
-#### BUG-1 — `/reload` rate limit (2 RPS) not enforced
-
-**Severity:** Low  
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.5.0
-
-**Test:** 10 rapid `POST /reload` requests sent within 500 ms.  
-**Actual:** 10 × HTTP 200, zero 429 responses.  
-**Expected:** HTTP 429 after the 2nd request within the 500 ms window.
-
-The dedicated `ReloadLimiter` token bucket was added in v0.4.16 (VUL-3.2) but is not
-correctly wired into the request path — the check does not gate the handler in practice.
-
----
-
-#### BUG-2 — TCP per-IP connection cap (20) not enforced
-
-**Severity:** Low  
-**File:** `src/dns/server.rs` (`TcpConnTracker`)  
-**Status:** ✅ Fixed in v0.5.0
-
-**Test:** 30 simultaneous TCP connections opened from 127.0.0.1.  
-**Actual:** All 30 accepted.  
-**Expected:** Connections beyond 20 refused.
-
-**Note:** 127.0.0.1 (loopback) is intentionally exempt from the cap by design. The test
-should be re-run from a non-loopback source IP to confirm whether the cap fails for external
-addresses as well. The reported failure may be entirely explained by the loopback exemption,
-but the enforcement path for non-loopback sources has not been independently verified.
-
----
-
-### Observations
-
-| # | Description | Priority |
-|---|---|---|
-| OBS-1 | Unknown opcode (7) returns NOERROR instead of NOTIMP — inherent hickory-server behaviour | Low |
-| OBS-2 | `api.md` documented port 8081 but default REST API port is 8080 — corrected in this doc update | Fixed |
-
----
-
-## Pre-release Audit Cycle — v0.4.16
-
-**Scope:** `src/dns/xdp/umem.rs`, `src/dns/xdp/worker.rs`, `src/dns/ratelimit.rs`,
-`src/dns/server.rs`, `src/api/mod.rs`, `src/main.rs`  
-**Methodology:** Manual white-box source code review focusing on the XDP kernel-bypass path,
-rate limiter, TCP connection handling, and REST API error surface.  
-**Status:** All 5 findings resolved in v0.4.16.
-
----
-
-### VUL-2.1 — UMEM bounds enforced only in debug builds
-
-**Severity:** MEDIUM  
-**File:** `src/dns/xdp/umem.rs`, `src/dns/xdp/worker.rs`  
-**Status:** ✅ Fixed in v0.4.16
-
-`frame_mut()` and `frame()` used `debug_assert!` to check that the descriptor offset + length
-fit within the UMEM region. In release builds (`--release`) all `debug_assert!` calls compile
-to no-ops, so a kernel-provided descriptor with an out-of-range `addr` would produce a
-dangling pointer slice with undefined behaviour.
-
-Although `addr` comes from the kernel XDP ring and is normally trustworthy, a buggy or
-maliciously patched kernel, or UMEM ring corruption by a future bug, could supply an
-out-of-range value. In that case, the process would access memory outside the UMEM region —
-a safety violation in an otherwise memory-safe codebase.
-
-**Fix:**
-- `frame_mut` and `frame` now return `Option<&mut [u8]>` / `Option<&[u8]>`. A
-  `saturating_add` bounds check runs unconditionally in both debug and release builds;
-  `None` is returned if the bounds are exceeded.
-- The XDP worker (`worker.rs`) adds a matching release-mode check before the raw-pointer
-  slice construction on the direct (non-`frame_mut`) path: if
-  `desc.addr + desc.len > umem.area_len`, the TX frame is returned to the free pool and
-  the descriptor is skipped.
-- No measurable performance impact: the branch is predicted-taken on every iteration.
-
----
-
-### VUL-6.1 — IPv6 /128 addresses exhaust rate-limit bucket table
-
-**Severity:** MEDIUM  
-**File:** `src/dns/ratelimit.rs`  
-**Status:** ✅ Fixed in v0.4.16
-
-The `DashMap` bucket table has a hard cap of 65 536 slots (`MAX_RATE_LIMIT_BUCKETS`). With
-per-/128 bucketing, an attacker controlling a /48 routed block (65 536 host addresses) could
-fill the entire table from a single network announcement, causing all subsequent source IPs —
-including legitimate clients — to be refused without rate-limit protection until the aggressive
-10-second eviction reacted.
-
-**Fix:** A `normalize_ip()` helper truncates every IPv6 address to its /48 prefix
-(`octets[6..].fill(0)`) before the bucket lookup. The same routed block now occupies exactly
-one bucket instead of up to 65 536. IPv4 addresses are unchanged (full /32 per address). The
-same normalisation is applied in `server.rs` (`normalize_tcp_ip()`) for the TCP connection
-tracker introduced by VUL-6.2.
-
----
-
-### VUL-6.2 — No per-source-IP TCP connection limit
-
-**Severity:** LOW  
-**File:** `src/dns/server.rs`  
-**Status:** ✅ Fixed in v0.4.16
-
-TCP DNS (RFC 1035 §4.2.2, used by DNSSEC responses and zone transfers) had no per-IP
-concurrency cap. A single source could exhaust the process file-descriptor table by opening
-thousands of TCP connections, causing new UDP and TCP requests from all sources to fail.
-
-**Fix:** A `TcpConnTracker` struct (backed by `DashMap<IpAddr, Arc<AtomicU16>>`) tracks
-concurrent TCP connections per source IP (aggregated at /48 for IPv6). The cap is 20
-connections per IP (`TCP_CONN_PER_IP_MAX`). Loopback addresses (`127.x`, `::1`) are exempt.
-
-Architecture: a **loopback relay** runs between the public TCP listener and hickory-server's
-internal TCP listener bound on `127.0.0.1:0`. The relay's accept loop enforces the per-IP
-cap before proxying allowed connections via `tokio::io::copy_bidirectional`. Connections that
-exceed the cap are dropped immediately after a warning (rate-throttled to one log line per IP
-per 10 seconds).
-
-Trade-off: all TCP sessions proxied through the relay appear as `127.0.0.1` to hickory-server's
-own rate limiter, which is acceptable because the relay already enforces per-IP limits before
-any proxying occurs.
-
----
-
-### VUL-3.4 — REST API error bodies expose file-system paths
-
-**Severity:** LOW  
-**File:** `src/api/mod.rs`  
-**Status:** ✅ Fixed in v0.4.16
-
-Several API error responses included the raw `e.to_string()` of `std::io::Error` and `anyhow`
-errors, which on Linux often contain absolute file-system paths (e.g.,
-`"failed to open file /etc/runbound/dns_entries.json: No such file or directory"`). These paths
-were returned in the HTTP 500 response body visible to any authenticated API caller, disclosing
-the server's directory layout and potentially aiding privilege escalation planning.
-
-**Affected handlers (8 sites):** `reload_handler`, `list_dns_handler`, `persist_and_swap`,
-`delete_dns_handler` (load + save), `list_blacklist_handler`, `add_blacklist_handler`,
-`delete_blacklist_handler` (load + save).
-
-**Fix:** A `sanitize_error()` helper is called at every error site:
-
-```rust
-fn sanitize_error(e: &impl std::fmt::Display) -> String {
-    let s = e.to_string();
-    if s.contains('/') { "internal error".to_string() } else { s }
-}
-```
-
-The full error string (with path) is always emitted at `WARN` level via `tracing` for
-operator observability. Only the sanitised string appears in the HTTP response body.
-
----
-
-### VUL-3.2 — `/reload` endpoint not independently rate-limited
-
-**Severity:** LOW  
-**File:** `src/api/mod.rs`, `src/main.rs`  
-**Status:** ✅ Fixed in v0.4.16
-
-`POST /reload` triggers a full zone-set rebuild (config parse + zone trie reconstruction).
-It was only protected by the general API rate limiter (shared across all endpoints), which
-means an authenticated caller could burst-reload the zone set at up to the global API
-query rate — potentially causing sustained elevated CPU consumption on large configs with
-many zones.
-
-**Fix:** A dedicated `ReloadLimiter` token bucket (2 RPS, burst 2) is stored in `AppState`
-and checked at the start of `reload_handler`. Callers that exceed the rate receive HTTP 429
-with `{"error": "RATE_LIMITED", "details": "reload rate limit exceeded"}`. The general API
-rate limiter still applies in addition.
-
----
-
-## Audit v0.5.2 — 2026-05-20
-
-**Scope:** Targeted review — `POST /reload` rate limiter  
-**Methodology:** Production symptom + white-box source review (IA)  
-**Status:** 1 finding — fixed in v0.5.2
-
----
-
-### Findings
-
-| ID | Severity | Area | Status |
-|---|---|---|---|
-| VUL-052-01 | 🟡 LOW | `POST /reload` rate limit race condition — parallel requests bypassed token bucket | ✅ Fixed v0.5.2 |
-
----
-
-### VUL-052-01 — POST /reload rate limit TOCTOU
-
-**Severity:** LOW  
-**Component:** `src/api/mod.rs` — `ReloadLimiter::check()`  
-**Symptom:** 20 simultaneous `POST /reload` requests → 0 × 429; all requests bypassed the 2 req/s cap.
-
-**Root cause:** The token bucket used integer arithmetic with a conditional timestamp update:
-`if new > 0 { *last = now }`. When `elapsed_ms < 1` (sub-millisecond arrivals), `new = 0`
-and `last` was NOT updated. On the next call, elapsed time accumulated from the un-advanced
-timestamp, effectively crediting extra tokens to subsequent callers.
-
-**Fix:** Rewritten with `f64` arithmetic. `last_refill` is updated unconditionally on every
-call — no conditional branch. Refill and consumption are serialised under a single
-`std::sync::Mutex` with no TOCTOU possible.
-
-**Verification:** `reload_limiter_parallel` unit test — 20 threads via `std::sync::Barrier`:  
-`assert!(allowed <= 2)` and `assert!(denied >= 18)` — both pass.
-
-**Status:** ✅ Fixed in v0.5.2
-
----
-
-## Audit v0.5.0 — 2026-05-20
-
-**Scope:** Full source review — all 24 Rust source files  
-**Methodology:** Manual white-box source code review (IA)  
-**Status:** 7 findings — 6 fixed in v0.5.0, 1 accepted (known limitation)
-
----
-
-### Findings
-
-| ID | Severity | Area | Status |
-|---|---|---|---|
-| VUL-NEW-01 | 🟡 LOW | DoT/DoH TCP cap bypass | ✅ Fixed v0.5.0 |
-| VUL-NEW-02 | ℹ️ INFO | TCP rate-limit bypass via loopback relay | ✅ Accepted — documented known limitation |
-| VUL-NEW-03 | 🟡 LOW | IPv6 `::1` collapsed by `normalize_tcp_ip` before loopback check | ✅ Fixed v0.5.0 |
-| VUL-NEW-04 | 🟡 LOW | sysfs path injection via unsanitized interface name | ✅ Fixed v0.5.0 |
-| VUL-NEW-05 | 🟡 LOW | `CPU_SET` UB for `cpu_id >= 1024` | ✅ Fixed v0.5.0 |
-| VUL-NEW-06 | 🟡 LOW | `add_feed_handler` uses raw `Json` extractor | ✅ Fixed v0.5.0 |
-| VUL-NEW-07 | 🟡 LOW | `validate_dns_entry` reflects internal RR string in HTTP error | ✅ Fixed v0.5.0 |
-
----
-
-### VUL-NEW-01 — DoT/DoH listeners bypass the TCP per-IP connection cap
-
-**Severity:** LOW  
-**File:** `src/dns/server.rs`  
-**Status:** ✅ Fixed in v0.5.0
-
-DoT (port 853) and DoH (port 443) TCP listeners were registered directly with hickory-server via `register_tls_listener_with_tls_config` / `register_https_listener_with_tls_config`, bypassing `run_tcp_with_limit`. A client could open more than `TCP_CONN_PER_IP_MAX` (20) concurrent TLS connections per source IP, exhausting file descriptors.
-
-**Fix:** Each DoT and DoH listener now follows the same relay pattern as DNS/TCP: a public `TcpListener` is bound on the configured address; a loopback relay listener is bound on `127.0.0.1:0` and registered with hickory; `run_tcp_with_limit` is spawned on the public listener. The same `TcpConnTracker` is shared across DNS/TCP, DoT, and DoH, enforcing the 20-connection per-IP cap uniformly.
-
----
-
-### VUL-NEW-02 — TCP clients share a single loopback rate-limit bucket (INFO)
-
-**Severity:** INFO  
-**File:** `src/dns/server.rs`  
-**Status:** ✅ Accepted — documented as known limitation (see `docs/security.md`)
-
-The relay architecture (TCP clients → loopback → hickory) causes hickory to see `127.0.0.1` as the source for all TCP queries, so the per-IP DNS rate limiter uses a shared loopback bucket for all TCP clients. A client sending many queries over TCP can consume the entire loopback bucket, affecting other TCP clients.
-
-**Accepted:** TCP DNS is inherently low-volume (large DNSSEC responses, slow connection setup). The TCP connection cap (`TCP_CONN_PER_IP_MAX = 20`) is the primary DoS mitigation. Replacing the relay with a full per-packet source-IP forwarding scheme would require significant rearchitecting of the hickory integration.
-
----
-
-### VUL-NEW-03 — `::1` collapsed by `normalize_tcp_ip` before loopback check
-
-**Severity:** LOW  
-**File:** `src/dns/server.rs` (`run_tcp_with_limit`)  
-**Status:** ✅ Fixed in v0.5.0
-
-`normalize_tcp_ip` truncates IPv6 addresses to their /48 prefix. The loopback check in `run_tcp_with_limit` was applied after normalization, so `::1` was first collapsed to `::` (all-zeros, not loopback) and then tested against `is_loopback()`. `::` is not loopback, so `::1` connections were subjected to the connection cap rather than being unconditionally allowed as health checks.
-
-**Fix:** Loopback check performed on `peer.ip()` before `normalize_tcp_ip`.
-
----
-
-### VUL-NEW-04 — Interface names used in sysfs paths without sanitization
-
-**Severity:** LOW  
-**File:** `src/dns/xdp/socket.rs`  
-**Status:** ✅ Fixed in v0.5.0
-
-Four functions (`is_virtual_interface`, `parent_interface`, `first_physical_bridge_port`, `get_rx_queue_count`) embedded interface names directly into `/sys/class/net/{iface}/…` path strings via `format!`. Interface names sourced from config or resolved via `/proc/net/route` were not validated, permitting path traversal or directory escape via crafted names.
-
-**Fix:** `sanitize_iface_name(name: &str) -> Option<&str>` added; accepts names ≤ 15 chars (Linux `IFNAMSIZ`) composed only of ASCII alphanumeric characters, hyphen, period, and underscore. All four sysfs-path functions call it and return a safe default on rejection.
-
----
-
-### VUL-NEW-05 — `CPU_SET` undefined behaviour for `cpu_id >= 1024`
-
-**Severity:** LOW  
-**File:** `src/cpu.rs` (`pin_to_cpu`)  
-**Status:** ✅ Fixed in v0.5.0
-
-`libc::CPU_SET(cpu_id, &mut set)` writes a bit into a `cpu_set_t` (128 bytes = 1 024 bits). For `cpu_id >= 1024` it writes beyond the struct boundary — undefined behaviour inside an `unsafe` block. The `physical_cores()` scanner iterates up to 4 096 CPUs; a system reporting more than 1 024 logical CPUs could trigger this.
-
-**Fix:** `if cpu_id >= 1024 { return; }` guard added before the `unsafe` block.
-
----
-
-### VUL-NEW-06 — `add_feed_handler` uses raw `axum::Json` extractor
-
-**Severity:** LOW  
-**File:** `src/api/mod.rs` (`add_feed_handler`)  
-**Status:** ✅ Fixed in v0.5.0
-
-`add_feed_handler` extracted the request body with `JsonExtract(p): JsonExtract<AddFeedRequest>` (raw `axum::Json`). On deserialization failure, axum returns a plain-text 422 instead of the structured JSON error produced by the project's `ApiJson<T>` wrapper. All other mutation handlers already used `ApiJson`; this was an oversight.
-
-**Fix:** Signature changed to `ApiJson(p): ApiJson<AddFeedRequest>`.
-
----
-
-### VUL-NEW-07 — `validate_dns_entry` reflects internal RR string in HTTP error response
-
-**Severity:** LOW  
-**File:** `src/api/mod.rs` (`validate_dns_entry`)  
-**Status:** ✅ Fixed in v0.5.0
-
-On `parse_local_data` failure, the HTTP 400 response body included `"details": format!("Could not parse RR: {rr}")`. The RR string is assembled from user-supplied fields and internal config values; including it in the response leaks zone-syntax internals and could aid an attacker in probing record parsing logic.
-
-**Fix:** Response detail replaced with the static string `"Record validation failed"`. The RR string is logged server-side at `warn!` level for operator diagnostics.
-
----
-
-### Pentest BUG-1 and BUG-2 — Status update
-
-| ID | Prior status | v0.5.0 status |
-|---|---|---|
-| BUG-1 — `/reload` rate limit not enforced | ⚠️ Open | ✅ Confirmed fixed — `ReloadLimiter` correctly wired; verified functional |
-| BUG-2 — TCP cap not enforced for non-loopback | ⚠️ Open | ✅ Clarified — DNS/TCP cap functional; DoT/DoH gap fixed by VUL-NEW-01 |
-
----
-
-## v0.6.4 Hardening Pass — 2026-05-22
-
-Replaced UDP-only DoT probe with a proper TCP+TLS handshake (FIX #45).
-Added cache flush cooldown to prevent rapid cache invalidation (FEAT #46).
-Added upstream health and prefetch status to `GET /api/system` (FEAT #47).
-
-**Findings: 1 FIX, 0 open.**
-
-### FIX #45 — DoT upstream health probe used UDP instead of TCP+TLS
-
-**GitHub:** #45  
-**Version fixed:** v0.6.4  
-**Status:** ✅ Fixed  
-**Severity:** LOW
-
-`probe_upstream` used a DNS/UDP probe (send a query, wait for reply) for all
-upstreams regardless of protocol. A DoT upstream (port 853) communicates over
-TCP+TLS — a UDP probe would always fail or produce a false positive via unrelated
-port traffic.
-
-**Fix:** `probe_upstream` dispatches to `probe_dot` for `protocol == "dot"`.
-`probe_dot` opens a `std::net::TcpStream` with a 2-second timeout, wraps it with
-`rustls::StreamOwned`, and calls `flush()` to drive `complete_io()` until the TLS
-handshake completes. A successful handshake → `healthy: true`; any error →
-`healthy: false`. Root CAs are loaded from the system store
-(`rustls-native-certs`) with a fallback to bundled WebPKI roots (`webpki-roots`).
-The ring cryptographic provider is installed explicitly to avoid the
-`no CryptoProvider` panic in non-hickory test contexts.
-
-**Verified:** Cloudflare DoT (1.1.1.1:853) latency 43 ms, Quad9 DoT
-(9.9.9.9:853) latency 38 ms — both `healthy: true` in live test.
-
----
-
-## v0.6.3 Hardening Pass — 2026-05-22
-
-Closed the two open findings from the v0.6.2 live pentest (FIX #40 and FIX #41).
-Also added upstream persistence (FIX #43), explicit port field (FIX #44), fixed
-preset DoT format (FIX #42), and DNS prefetching feature (FEAT #16).
-
-**Findings: 2 closed, 0 open.**
-
-### BUG-1 (LOW-MEDIUM) — Loopback and link-local IPs accepted as upstreams
-
-**GitHub:** #40  
-**Version fixed:** v0.6.3  
-**Status:** ✅ Fixed
-
-`POST /api/upstreams` previously accepted `127.0.0.1`, `::1`, and `169.254.169.254`.
-Fixed: `is_loopback()` and IPv4 `is_link_local()` checked before insertion; both return
-`400 INVALID_ADDR`. Private ranges (RFC 1918) and IPv6 ULA remain allowed.
-
-### BUG-2 (MEDIUM) — DELETE last upstream returns 200 instead of 409
-
-**GitHub:** #41  
-**Version fixed:** v0.6.3  
-**Status:** ✅ Fixed
-
-`DELETE /api/upstreams/:id` previously removed the last upstream. Fixed: guard checks
-`list.len() == 1 && target_exists` before removal; returns `409 LAST_UPSTREAM` with
-the upstream left intact.
-
----
-
-## v0.6.2 Live Pentest — 2026-05-22
-
-**Method:** Black-box REST API testing against running v0.6.2 instance.  
-**Findings: 2 bugs, 15 PASS.**
-
-| Test | Result |
-|---|---|
-| GET /health — no auth | ✅ 200, no auth required |
-| GET /api/system — version/XDP info | ✅ 200 |
-| Old routes /stats, /dns (no prefix) | ✅ 404 |
-| Security headers (nosniff, DENY, CSP, no-store) | ✅ All present |
-| Auth 401 on missing token | ✅ 401 |
-| Bad token 401 | ✅ 401 |
-| SSRF feed (HTTP URL) | ✅ 400 rejected |
-| Path traversal | ✅ 404 |
-| Bad upstream protocol | ✅ 400 INVALID_PROTOCOL |
-| Bad upstream addr | ✅ 400 INVALID_ADDR |
-| GET /api/upstreams/presets | ✅ 9 presets |
-| Upstream CRUD add → delete | ✅ 201 / 200 |
-| Loopback upstream (127.0.0.1, ::1) | ✅ **Fixed v0.6.3** — 400 INVALID_ADDR (#40) |
-| Link-local upstream (169.254.169.254) | ✅ **Fixed v0.6.3** — 400 INVALID_ADDR (#40) |
-| DELETE last upstream | ✅ **Fixed v0.6.3** — 409 LAST_UPSTREAM (#41) |
-| DoT preset addr (@port format) | ✅ **Fixed v0.6.3** — bare IP + port=853 field (#42) |
-| Upstream persistence across restart | ✅ **Fixed v0.6.3** — upstreams.json on disk (#43) |
-| Explicit port field (UDP default 53, DoT default 853) | ✅ **Fixed v0.6.3** (#44) |
-
-## v0.6.5 Live Pentest + Code Audit — 2026-05-22
-
-Live pentest on running v0.6.5 instance + full white-box source review of `src/upstreams.rs`, `src/api/mod.rs`, `src/stats.rs`, `src/dns/server.rs`, `src/feeds/mod.rs`, `src/sync.rs`, `src/acme.rs`. All 7 v0.6.5 features verified. 10 security hardening items confirmed from source.
-
-### Feature verification
-
-| Test | Result |
-|---|---|
-| DoT upstream (9.9.9.9:853) healthy | ✅ healthy: true, latency_ms: 124, dnssec_supported: true (#45 #48) |
-| DoT upstream (1.1.1.1:853) healthy | ✅ healthy: true, latency_ms: 116, dnssec_supported: true (#45 #48) |
-| UDP upstream (192.168.1.1) — no DNSSEC | ✅ dnssec_supported: false — router doesn't validate (#48) |
-| latency_history — 3 samples after startup | ✅ `[20,23,24]` — VecDeque capped at 5, populated on success only (#49) |
-| PATCH /api/upstreams/:id rename | ✅ 200, name persisted, save_upstreams() called (#50) |
-| PATCH unknown field (`addr`) | ✅ 400 INVALID_FIELD "only 'name' is supported" (#50) |
-| PATCH name="" clears to null | ✅ name: null in response (#50) |
-| PATCH name with control char | ✅ 400 INVALID_FIELD "must not contain control characters" (#50) |
-| PATCH name > 64 chars | ✅ 400 INVALID_FIELD "must not exceed 64 characters" (#50) |
-| GET /api/cache/stats — initial state | ✅ hits/misses/entries/evictions + hit_rate_pct (#51) |
-| POST /api/cache/flush — cooldown | ✅ 200 → 429 FLUSH_COOLDOWN + Retry-After header (#46) |
-| GET /api/system — prefetch/upstreams fields | ✅ prefetch_enabled, upstreams_healthy, upstreams_total (#47) |
-
-### Security hardening (v0.6.5) — confirmed from source
-
-| Item | Location | Status |
-|---|---|---|
-| SEC H1 — Malformed Content-Length → 400 | `src/api/mod.rs` | ✅ Confirmed |
-| SEC H2 — Feed streaming OOM guard (100 MiB chunk-by-chunk) | `src/feeds/mod.rs:MAX_FEED_BYTES` | ✅ Confirmed |
-| SEC H3 — TcpConnTracker stale entry cleanup | `src/dns/server.rs:1113` | ✅ Confirmed |
-| SEC H4 — ACME key zeroed via `Zeroizing<String>` | `src/acme.rs:123` | ✅ Confirmed |
-| SEC M1 — /sync/cert rate-limit 10 req/60s per IP (DashMap) | `src/sync.rs:67` | ✅ Confirmed |
-| SEC M2 — Min DNS response raised to 12 bytes | `src/upstreams.rs:454,523` | ✅ Confirmed |
-| SEC M3 — Feed URL query string redacted in logs | `src/feeds/mod.rs:573` | ✅ Confirmed |
-| SEC C1 — Health loop TOCTOU fix (probe + write by UUID) | `src/upstreams.rs:341–379` | ✅ Confirmed |
-| PERF P3 — Parallel probes via spawn_blocking + join_all | `src/upstreams.rs:354–368` | ✅ Confirmed |
-| PERF P6 — ArcSwap StatsSnapshot (1 atomic load per API call) | `src/stats.rs:20` | ✅ Confirmed |
-
-### New finding
-
-| ID | Severity | Component | Finding | Status |
-|---|---|---|---|---|
-| UI-XSS-01 | LOW | `index.html:707` | `esc()` did not escape single-quote (`'`). The upstream `name` field is embedded as `onclick="upstreamRename('id','${esc(name)}')"`. A name containing `');alert(1)//` executes arbitrary JS when the rename button is clicked (stored XSS). Requires auth. **Fixed same day:** added `.replace(/'/g,"&#39;").replace(/"/g,"&quot;")` to `esc()`. | ✅ Fixed 2026-05-22 |
-
-### Informational observations
-
-| Item | Note |
-|---|---|
-| `cache_evictions` always 0 | `Arc<AtomicU64>` in AppState, reset on flush, but never incremented — hickory's LRU cache doesn't expose eviction callbacks. Counter is a placeholder; field is accurate (unknown = 0 is documented). |
-| PATCH returns 400 (not 422) for unknown fields | Spec said 422; implementation returns 400 INVALID_FIELD. Both are "client error" — informational, not a bug. |
-
-**87/87 tests pass.**
-
----
-
-## v0.6.4 Live Verification — 2026-05-22
-
-Live pentest on running v0.6.4 instance. All 3 fixes confirmed.
-
-| Test | Result |
-|---|---|
-| DoT upstream (9.9.9.9:853) healthy | ✅ healthy: true, latency_ms: 44 — TCP+TLS probe (#45) |
-| DoT upstream (1.1.1.1:853) healthy | ✅ healthy: true, latency_ms: 48 — TCP+TLS probe (#45) |
-| POST /api/cache/flush — first call | ✅ 200 `{"flushed_entries":10,"status":"ok"}` (#46) |
-| POST /api/cache/flush — immediate retry | ✅ 429 `{"error":"FLUSH_COOLDOWN","retry_after_secs":60}` (#46) |
-| GET /api/system — prefetch_enabled | ✅ present, value: false (#47) |
-| GET /api/system — upstreams_healthy | ✅ present, value: 10 (#47) |
-| GET /api/system — upstreams_total | ✅ present, value: 10 (#47) |
-
----
-
-## v0.6.3 Live Verification — 2026-05-22
-
-Live pentest on running v0.6.3 instance. All 5 fixes confirmed.
-
-| Test | Result |
-|---|---|
-| POST 127.0.0.1 upstream | ✅ 400 INVALID_ADDR |
-| POST ::1 upstream | ✅ 400 INVALID_ADDR |
-| POST 169.254.169.254 upstream | ✅ 400 INVALID_ADDR |
-| POST 10.0.0.1 (private) | ✅ 201 accepted |
-| DELETE last upstream | ✅ 409 LAST_UPSTREAM, upstream still present |
-| DoT presets — no @port in addr | ✅ addr=1.1.1.1 port=853 (clean) |
-| POST upstream port:5353 | ✅ 201, port=5353 in response |
-| POST upstream port:0 | ✅ 400 INVALID_PORT |
-| Restart → upstreams still present | ✅ upstreams.json loaded on startup |
-| prefetch: absent (default off) | ✅ no prefetch logs, zero overhead |
-| Security headers | ✅ nosniff, DENY, CSP, no-store |
-| Auth 401 / Bearer 200 | ✅ |
-
----
-
-## v0.6.2 Static Clippy Audit — 2026-05-22
-
-**Method:** Clippy strict mode (`-D warnings -D clippy::unwrap_used -D clippy::expect_used`) + manual review of all new endpoints introduced in v0.6.1 and v0.6.2.
-
-**Findings: 25 total — 25 resolved.**
-
-| ID | Severity | File | Finding | Fix |
-|---|---|---|---|---|
-| C-01 | LOW | `src/api/mod.rs` (×8) | Silent `unwrap()` on Mutex/RwLock | `unwrap_or_else(\|e\| panic!("lock poisoned: {e}"))` |
-| C-02 | LOW | `src/api/mod.rs` (×3) | Silent `expect()` on OnceLock | `unwrap_or_else(\|_\| panic!("OnceLock init order"))` |
-| C-03 | LOW | `src/dns/xdp/worker.rs` (×4) | `unwrap()` on hardcoded IP literals | `unreachable!("static literal always valid")` |
-| C-04 | LOW | `src/upstreams.rs` (×3) | `unwrap()` on HMAC `new_from_slice` | `unreachable!("HmacSha256 accepts any key length")` |
-| C-05 | LOW | `src/main.rs` (×2) | `unwrap()` on `getrandom::fill` | `panic!("CSPRNG unavailable: {e}")` — system failure, panic is correct |
-| C-06 | LOW | `src/api/mod.rs` (×2) | `unwrap()` on hyper response builder | `unwrap_or_else(\|e\| panic!("response builder: {e}"))` — fixed headers, infallible |
-| C-07 | LOW | `build.rs` (×2) | `unwrap()` on cargo env vars | `panic!("... not set by cargo")` — always present in cargo build |
-| C-08 | INFO | `src/upstreams.rs:129` | `manual_map` pattern | Replaced with `.map(\|pos\| list.remove(pos))` |
-
-**Hot path (XDP worker.rs) — confirmed clean:**
-- `zones.load()` called once per batch, outside `for desc in &rxds` — no snapshot-per-packet ✓
-- All scratch buffers (`rxds`, `tx_descs`, `rx_addrs`, `dns_scratch`) pre-allocated with `Vec::with_capacity`, `clear()` per iteration — zero heap allocation in hot loop ✓
-- `ones_complement_sum` u64 implementation used in all 3 checksum functions — no residual 2-byte version ✓
-
-**New endpoints (v0.6.1 / v0.6.2) — validated:**
-- All new POST/DELETE endpoints: auth 401 + input validation 400 + happy path tested ✓
-- No error response leaks internal paths, stack traces, or dependency versions ✓
-- `POST /api/upstreams`: protocol validated as enum `{udp, dot}`, addr validated as parseable IP ✓ — loopback/link-local not blocked ⚠️ (fixed v0.6.3 — #40)
-- `DELETE /api/upstreams/:id`: 404 on unknown UUID ✓ — last-upstream guard broken (returns 200 not 409) ⚠️ (fixed v0.6.3 — #41)
-- Log injection: domain names only emitted at DEBUG level, never at WARN+ ✓
-
-**Result:** `cargo clippy --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used` → 0 errors. 39/39 tests pass.
-
----
-
-## Hardening Checklist (nation-state deployment)
-
-1. **Set `RUNBOUND_STORE_KEY`** — enables HMAC-SHA256 integrity on all JSON stores.
-2. **Configure explicit `forward-zone:` blocks** — never rely on the Cloudflare fallback.
-3. **Enable `forward-tls-upstream: yes`** — plain UDP to upstream is observable.
-4. **Set `dot-client-auth-ca:` if DoT is enabled** — restricts service to authorised endpoints.
-5. **Route Runbound through a DNSSEC-validating upstream** and set `dnssec-validation: yes`.
-6. **Set `RUNBOUND_API_KEY` in `/etc/runbound/env` (chmod 640)** — never use `api-key:` in config.
-
----
-
-*Initial white-box audit performed on commit `7dd3a66` (tag v0.2.3). Source files reviewed:
-`src/main.rs`, `src/api/mod.rs`, `src/config/parser.rs`, `src/dns/server.rs`,
-`src/dns/local.rs`, `src/dns/acl.rs`, `src/dns/ratelimit.rs`, `src/dns/xdp/worker.rs`,
-`src/dns/xdp/umem.rs`, `src/feeds/mod.rs`, `src/store.rs`.
-Second audit cycle targeting v0.3.3. Third audit cycle targeting v0.4.0.
-v0.4.0 adds: `src/integrity.rs` (HIGH-06), hickory 0.26 + rustls 0.23 migration (HIGH-07),
-`dot-client-auth-ca` mTLS (HIGH-08), `SsrfSafeDnsResolver` in `src/feeds/mod.rs` (MED-03),
-`sanitize_dns_name()` (MED-06), local-zone cap (LOW-03).
-v0.4.1 adds: CryptoProvider install (BUG-01), CNAME/MX/NS/PTR/SRV value validation (S-10),
-Content-Length pre-check (S-11), ApiJson extractor (Q-01–Q-03), QueryRejection handling (Q-04).
-v0.4.3 adds: defense-in-depth identity-probe block by name in `src/dns/server.rs` (SEC-03);
-unit tests for 253/254-char boundary in `src/api/mod.rs` (SEC-02 false-positive documentation).
-v0.4.4 adds: `src/hsm.rs` (PKCS#11 HSM key storage, cryptoki 0.6); `deny.toml` (supply-chain
-policy); `docs/audit.md` (audit process and SBOM procedure).
-v0.4.5 adds: pre-auth brute-force brake + async side-effects in `security_middleware`
-(timing oracle elimination, NEW-HIGH pentest); 411 for JSON POST without Content-Length
-(SEC-04 partial close); HTTP integration tests for 253/254-char name boundary (SEC-02).
-v0.4.16 adds: release-mode UMEM bounds check returning `Option` in `src/dns/xdp/umem.rs` +
-`src/dns/xdp/worker.rs` (VUL-2.1); IPv6 /48 normalisation in `src/dns/ratelimit.rs` and
-`src/dns/server.rs` (VUL-6.1); TCP per-IP cap via loopback relay in `src/dns/server.rs`
-(VUL-6.2); `sanitize_error()` at 8 API error sites in `src/api/mod.rs` (VUL-3.4);
-`ReloadLimiter` token bucket (2 RPS) in `src/api/mod.rs` + `src/main.rs` (VUL-3.2).
-v0.4.16 live pentest (2026-05-19): 13 PASS, 2 bugs open (BUG-1: ReloadLimiter not wired;
-BUG-2: TcpConnTracker not enforced for non-loopback) → closed v0.5.0.
-v0.5.0 IA audit (2026-05-20): full 24-file review; DoT/DoH TCP cap bypass (VUL-NEW-01),
-loopback relay rate-limit limitation (VUL-NEW-02, accepted), IPv6 loopback normalisation
-(VUL-NEW-03), sysfs path sanitization (VUL-NEW-04), CPU_SET UB guard (VUL-NEW-05),
-ApiJson on add_feed_handler (VUL-NEW-06), PARSE_FAILED error leakage (VUL-NEW-07);
-default API port corrected from 8081 to 8080 in `src/main.rs`.
-v0.6.2 static Clippy audit (2026-05-22): 24 silent unwrap/expect calls hardened across
-`src/api/mod.rs`, `src/dns/xdp/worker.rs`, `src/upstreams.rs`, and 6 other files;
-manual_map pattern fixed in `src/upstreams.rs:129`; log injection on XDP hot path
-confirmed absent (domain names only at DEBUG level); input validation confirmed on all
-v0.6.2 endpoints (POST /api/upstreams: protocol enum + IP validation → 400;
-DELETE /api/upstreams/:id: 404 on unknown UUID); no error response leaks internal paths,
-stack traces, or dependency versions. Clippy flags `-D clippy::unwrap_used
--D clippy::expect_used -D warnings` pass clean. 39/39 tests pass.
-v0.6.3 hardening pass (2026-05-22): loopback/link-local upstream guard (FIX #40);
-last-upstream deletion guard 409 LAST_UPSTREAM (FIX #41); presets DoT port field (FIX #42);
-upstream persistence across restarts HMAC-protected (FIX #43); explicit port field on
-UpstreamStatus (FIX #44); DNS prefetching feature (FEAT #16). 65/65 tests pass.
-v0.6.4 hardening pass (2026-05-22): DoT probe rewritten as TCP+TLS handshake via
-rustls::StreamOwned (FIX #45); cache flush cooldown 429 FLUSH_COOLDOWN + Retry-After header
-(FEAT #46); prefetch_enabled + upstreams_healthy + upstreams_total added to GET /api/system
-(FEAT #47). 65/65 tests pass. Live test: 1.1.1.1:853 healthy=true latency=43ms,
-9.9.9.9:853 healthy=true latency=38ms; flush cooldown 200→429→200 after 6s confirmed.
-v0.6.5 live pentest + code audit (2026-05-22): 4 new features fully verified (#48 DNSSEC
-detection via EDNS0+DO probe AD bit; #49 latency_history VecDeque capped at 5; #50 PATCH
-/api/upstreams/:id with field restriction, control-char guard, 64-char limit; #51
-GET /api/cache/stats with hit_rate_pct null-safe). 10 security hardening items confirmed
-from source (SEC H1–H4, SEC M1–M3, SEC C1, PERF P3/P6). 1 new finding UI-XSS-01 (LOW):
-esc() in index.html did not escape single-quote → stored XSS in onclick; fixed same day
-by adding '→&#39; and "→&quot; to esc(). GitHub issue #52 opened and closed. 87/87 tests pass.
-v0.6.6 verification (2026-05-22): binary at tag v0.6.6 (18:47) compiled before final commit
-2173182 — features #53 (last_error on upstream failures) and #54 (POST /api/upstreams/:id/probe)
-absent from binary (route list confirmed via strings(1)). Feed last_error field (#55) confirmed
-present in binary (struct Feed with 10 elements); UI updated same day: dot turns red on
-last_error, ⚠ badge with tooltip shows error string. New binary required from coding AI for
-complete v0.6.6 verification of #53 and #54.
-v0.6.7 live pentest (2026-05-22): 3 issues fully verified on binary downloaded from GitHub
-Releases (SHA256 confirmed). #53 (last_error on upstream failures): probe on unreachable
-10.255.255.1:53 → healthy=false, last_error="timeout" ✓. #54 (POST /api/upstreams/:id/probe):
-200 JSON response with full upstream object ✓ (was 404 empty in v0.6.6 binary). #56 (DoT SNI
-fix): 1.1.1.1:853 probe → healthy=true, latency=119ms ✓; PATCH tls_hostname set/clear ✓;
-presets DoT all carry correct tls_hostname (cloudflare-dns.com, dns.google, dns.quad9.net) ✓.
-DNS resolution confirmed via dig @127.0.0.1. 105/105 tests pass, 0 clippy warnings.*
+Runbound v0.6.9 is production-ready for sovereign DNS deployment pending the four blocking items above. The XDP kernel-bypass architecture is correct, memory guarantees are solid, and the dependency chain is clean. The 5 M QPS target is realistic on a 1U server with a 10G 8-queue NIC with hugepages enabled and the publish interval fix applied.
