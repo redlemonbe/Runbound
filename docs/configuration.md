@@ -530,6 +530,17 @@ default is used. A `WARN` is emitted in the log.
 
 Monitor via `GET /api/system`: `nic_rx_ring`, `nic_rx_ring_max`, `nic_rx_dropped`.
 
+### XDP IRQ affinity
+
+```
+server:
+    xdp-irq-affinity: auto    # default: off
+```
+
+When set to `auto`, Runbound pins each NIC queue's IRQ to the same physical core as its XDP worker at startup. Reads `/proc/interrupts`, writes `/proc/irq/<N>/smp_affinity_list`. Requires `CAP_NET_ADMIN`. Silent no-op in containers or when `/proc/irq/` is not writable.
+
+Gain: −1–5 µs latency variance, +1–3% throughput on high-frequency workloads.
+
 ### XDP cache snapshot
 
 ```

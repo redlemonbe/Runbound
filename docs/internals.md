@@ -62,7 +62,16 @@ Fallback: `EOPNOTSUPP` or `EPERM` → WARN + continue with driver default.
 
 ### IRQ affinity
 
-**Optional, documented in [xdp.md](xdp.md).** Steer NIC queue N interrupts to core N with `ethtool -N` + `/proc/irq/*/smp_affinity`. Eliminates cross-core IRQ delivery latency (~1–5 µs).
+**Implemented (#68).** At startup, after spawning XDP workers, Runbound reads `/proc/interrupts` to find the IRQ numbers for the active NIC interface, then writes the correct core mask to `/proc/irq/<N>/smp_affinity_list` — one IRQ per queue, pinned to the same physical core as its XDP worker.
+
+Requires `CAP_NET_ADMIN` (already required for XDP attach). Enabled via config:
+
+```
+server:
+    xdp-irq-affinity: auto    # default: off
+```
+
+Effect: eliminates cross-core IRQ delivery. Without pinning, the kernel may wake a different core to handle the interrupt, causing guaranteed L1/L2 cache misses when the XDP worker reads the packet. Gain: 1–3% throughput, −1–5 µs latency variance.
 
 ---
 
