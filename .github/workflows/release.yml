@@ -40,6 +40,7 @@ jobs:
             mold \
             gcc-aarch64-linux-gnu \
             libc6-dev-arm64-cross \
+            linux-libc-dev-arm64-cross \
             musl-tools
 
       # ── Linker wrapper ───────────────────────────────────────────────────
