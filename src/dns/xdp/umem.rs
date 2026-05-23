@@ -29,17 +29,20 @@ use libc::{
 /// DNS packets are ≤ 4096 bytes (EDNS0 UDP), so one frame = one packet.
 pub const FRAME_SIZE: u32 = 4096;
 
-/// Total frames in the UMEM. 4096 × 4096 = 16 MiB per socket.
-pub const FRAME_COUNT: u32 = 4096;
+/// Total frames in the UMEM. 8192 × 4096 = 32 MiB per socket.
+pub const FRAME_COUNT: u32 = 8192;
 
-/// Ring capacity (must be a power of 2, ≤ FRAME_COUNT/2).
-pub const RING_SIZE: u32 = 2048;
+/// AF_XDP ring capacities (must be powers of 2, each ≤ FRAME_COUNT/2 = 4096).
+pub const FILL_RING_SIZE: u32 = 4096;
+pub const COMP_RING_SIZE: u32 = 4096;
+pub const RX_RING_SIZE:   u32 = 4096;
+pub const TX_RING_SIZE:   u32 = 4096;
 
 /// Number of frames reserved for RX (seeded into fill ring at startup).
-pub const RX_FRAME_COUNT: u32 = RING_SIZE;
+pub const RX_FRAME_COUNT: u32 = RX_RING_SIZE;
 
 /// Number of frames reserved for TX (managed by the handler free pool).
-pub const TX_FRAME_COUNT: u32 = RING_SIZE;
+pub const TX_FRAME_COUNT: u32 = TX_RING_SIZE;
 
 // ── Kernel structures (from <linux/if_xdp.h>) ─────────────────────────────
 
@@ -414,8 +417,8 @@ impl Umem {
 
         // Set ring sizes
         for (opt, sz) in [
-            (XDP_UMEM_FILL_RING,        RING_SIZE),
-            (XDP_UMEM_COMPLETION_RING,  RING_SIZE),
+            (XDP_UMEM_FILL_RING,        FILL_RING_SIZE),
+            (XDP_UMEM_COMPLETION_RING,  COMP_RING_SIZE),
         ] {
             // SAFETY: `xsk_fd` is a valid AF_XDP socket fd. `&sz` is a valid
             //         pointer to an initialised u32. The socklen matches sizeof(u32).
@@ -442,7 +445,7 @@ impl Umem {
                 xsk_fd,
                 XDP_UMEM_PGOFF_FILL_RING,
                 &offsets.fr,
-                RING_SIZE,
+                FILL_RING_SIZE,
             )
         }?;
         // mmap completion ring
@@ -451,7 +454,7 @@ impl Umem {
                 xsk_fd,
                 XDP_UMEM_PGOFF_COMPLETION_RING,
                 &offsets.cr,
-                RING_SIZE,
+                COMP_RING_SIZE,
             )
         }?;
 
@@ -514,6 +517,51 @@ impl Drop for Umem {
         //         that call. `Drop` is called exactly once, so there is no
         //         double-unmap.
         unsafe { munmap(self.area as *mut libc::c_void, self.area_len); }
+    }
+}
+
+// ── NUMA locality ──────────────────────────────────────────────────────────
+
+/// Migrate UMEM pages to the local NUMA node of the calling thread.
+///
+/// Call this from the XDP worker thread right after CPU pinning so that memory
+/// is co-located with the core processing it. Silent no-op on single-node
+/// systems, containers without NUMA, or when the kernel returns any error.
+#[cfg(target_os = "linux")]
+pub fn rebind_to_local_numa(area: *mut u8, area_len: usize) {
+    let mut node: u32 = 0;
+    // getcpu: vDSO call — fills current NUMA node without a full syscall round-trip.
+    // SAFETY: passing null for cpu (we only need the node) and null for tcache.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_getcpu,
+            std::ptr::null::<u32>(),
+            &mut node as *mut u32,
+            std::ptr::null::<libc::c_void>(),
+        )
+    };
+    if rc != 0 || node >= 64 { return; }
+
+    // nodemask: one bit per NUMA node; node < 64 is always true in practice.
+    let nodemask: u64 = 1u64 << node;
+    // max_node must be strictly greater than the highest set bit index.
+    let max_node:  u64 = node as u64 + 2;
+
+    // MPOL_PREFERRED=1: prefer node but fall back on exhaustion (non-strict).
+    // MPOL_MF_MOVE=2:   migrate already-allocated pages to the preferred node.
+    // SAFETY: `area` is a valid mmap'd region of `area_len` bytes owned by this
+    //         process. mbind failure (ENOSYS, EPERM, ENOTSUP) leaves the pages
+    //         on their current node — the UMEM remains fully functional.
+    unsafe {
+        libc::syscall(
+            libc::SYS_mbind,
+            area as *mut libc::c_void,
+            area_len,
+            1i64,                      // MPOL_PREFERRED
+            &nodemask as *const u64,
+            max_node,
+            2u64,                      // MPOL_MF_MOVE
+        );
     }
 }
 

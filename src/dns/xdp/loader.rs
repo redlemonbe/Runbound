@@ -9,8 +9,8 @@
 use std::os::fd::RawFd;
 
 use aya::{
-    Ebpf,
-    maps::XskMap,
+    Ebpf, EbpfLoader,
+    maps::{CpuMap, XskMap},
     programs::{Xdp, XdpFlags},
 };
 use aya::programs::xdp::XdpLinkId;
@@ -57,9 +57,13 @@ impl Drop for XdpHandle {
 impl XdpHandle {
     /// Load and attach the DNS XDP filter to `iface`.
     ///
+    /// - `nb_workers`: number of XDP worker threads (injected into the eBPF global
+    ///   `NB_WORKERS`); used for CPUMAP domain-affinity routing.
+    /// - `domain_routing`: if true, enable CPUMAP-based per-domain CPU affinity (#67).
+    ///
     /// Tries native (DRV) mode first for lowest latency; falls back to
     /// generic (SKB) mode if the driver does not support native XDP.
-    pub fn load(iface: &str) -> Result<Self, String> {
+    pub fn load(iface: &str, nb_workers: u32, domain_routing: bool) -> Result<Self, String> {
         // Vec<u64> is guaranteed 8-byte aligned by any conforming allocator,
         // satisfying the object crate's FileHeader64 alignment check inside aya.
         // Vec<u8>.to_vec() does NOT guarantee 8-byte alignment.
@@ -76,7 +80,15 @@ impl XdpHandle {
         let aligned = unsafe {
             std::slice::from_raw_parts(storage.as_ptr() as *const u8, XDP_PROG.len())
         };
-        let mut bpf = Ebpf::load(aligned)
+
+        // Inject global constants into the eBPF object before loading.
+        // These are `volatile const` variables in dns_xdp.c patched by EbpfLoader.
+        let routing_flag: u32 = if domain_routing { 1 } else { 0 };
+        let effective_workers = nb_workers.max(1);
+        let mut bpf = EbpfLoader::new()
+            .set_global("NB_WORKERS",             &effective_workers, false)
+            .set_global("DOMAIN_ROUTING_ENABLED",  &routing_flag,     false)
+            .load(aligned)
             .map_err(|e| format!("BPF ELF load failed: {e}"))?;
 
         let program: &mut Xdp = bpf
@@ -98,7 +110,37 @@ impl XdpHandle {
 
         tracing::info!(iface = %iface, link_id = ?link_id, mode = ?mode, "XDP program attached");
 
-        Ok(XdpHandle { bpf, link_id: Some(link_id), mode, governor_backups: Vec::new() })
+        let mut handle = XdpHandle { bpf, link_id: Some(link_id), mode, governor_backups: Vec::new() };
+
+        // Init CPUMAP entries when domain routing is enabled.
+        // Silently skip on any error so the XDP path still works via XSKMAP fallback.
+        if domain_routing {
+            if let Err(e) = handle.init_cpumap(effective_workers) {
+                tracing::warn!(err=%e, "CPUMAP init failed — domain routing disabled, falling back to RSS");
+            } else {
+                tracing::info!(workers = effective_workers, "CPUMAP domain routing enabled");
+            }
+        }
+
+        Ok(handle)
+    }
+
+    /// Initialise CPUMAP entries for `nb_workers` CPUs.
+    ///
+    /// Each entry is initialised with `queue_size=192` packets (enough headroom
+    /// for burst traffic) and no chained BPF program.
+    fn init_cpumap(&mut self, nb_workers: u32) -> Result<(), String> {
+        let map = self.bpf
+            .map_mut("CPUMAP")
+            .ok_or_else(|| "CPUMAP map not found in BPF object".to_string())?;
+        let mut cpu_map = CpuMap::try_from(map)
+            .map_err(|e| format!("CPUMAP is not a CpuMap: {e}"))?;
+        for cpu_idx in 0..nb_workers {
+            cpu_map
+                .set(cpu_idx, 192, None, 0)
+                .map_err(|e| format!("CpuMap::set cpu={cpu_idx}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Register an AF_XDP socket with the XSKMAP at the given queue index.

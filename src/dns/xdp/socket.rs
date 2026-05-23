@@ -16,15 +16,57 @@
 #![allow(dead_code)]
 
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 use crate::dns::xdp::umem::{
     mmap_desc_ring, get_rx_tx_offsets,
     Umem, DescRing,
     SOL_XDP, XDP_RX_RING, XDP_TX_RING,
     XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING,
-    RING_SIZE, SockaddrXdp,
+    RX_RING_SIZE, TX_RING_SIZE, SockaddrXdp,
     XDP_ZEROCOPY, XDP_COPY, XDP_USE_NEED_WAKEUP,
 };
+
+// ── SIOCETHTOOL constants (linux/sockios.h + linux/ethtool.h) ─────────────
+
+const SIOCETHTOOL:        libc::c_ulong = 0x8946;
+const ETHTOOL_GRINGPARAM: u32           = 0x0000_0010;
+const ETHTOOL_SRINGPARAM: u32           = 0x0000_0011;
+
+/// Matches `struct ethtool_ringparam` in <linux/ethtool.h>.
+#[repr(C)]
+struct EthtoolRingParam {
+    cmd:                  u32,
+    rx_max_pending:       u32,
+    rx_mini_max_pending:  u32,
+    rx_jumbo_max_pending: u32,
+    tx_max_pending:       u32,
+    rx_pending:           u32,
+    rx_mini_pending:      u32,
+    rx_jumbo_pending:     u32,
+    tx_pending:           u32,
+}
+
+/// Minimal `ifreq` layout for SIOCETHTOOL.
+/// On x86-64 / aarch64: name(16) + union(24) = 40 bytes.
+/// The data pointer occupies the first 8 bytes of the 24-byte union;
+/// the remaining 16 are unused for SIOCETHTOOL.
+#[repr(C)]
+struct IfReqEthtool {
+    ifr_name: [u8; 16],
+    ifr_data: *mut libc::c_void,
+    _pad:     [u8; 16],
+}
+
+// ── NIC ring-buffer stats, populated by maximize_nic_ring ─────────────────
+
+/// Applied NIC RX ring size (0 = ethtool unavailable or not yet called).
+pub static XDP_NIC_RX_RING:     AtomicU32 = AtomicU32::new(0);
+/// Hardware maximum NIC RX ring size (0 = unavailable).
+pub static XDP_NIC_RX_RING_MAX: AtomicU32 = AtomicU32::new(0);
+/// Active XDP interface, set once at startup. Used to read sysfs rx_dropped.
+pub static XDP_ACTIVE_IFACE: OnceLock<String> = OnceLock::new();
 
 pub const AF_XDP: libc::c_int = 44;
 
@@ -76,7 +118,7 @@ pub unsafe fn create_xsk_socket(
     })?;
 
     // 3. Set RX and TX ring sizes
-    for (opt, sz) in [(XDP_RX_RING, RING_SIZE), (XDP_TX_RING, RING_SIZE)] {
+    for (opt, sz) in [(XDP_RX_RING, RX_RING_SIZE), (XDP_TX_RING, TX_RING_SIZE)] {
         // SAFETY: `fd` is a valid AF_XDP socket fd. `&sz` points to an
         //         initialised u32 on the stack. The socklen matches sizeof(u32).
         let rc = unsafe {
@@ -101,13 +143,13 @@ pub unsafe fn create_xsk_socket(
     // SAFETY: `fd` is a valid AF_XDP socket fd with ring sizes already configured.
     let (rx_off, tx_off) = unsafe { get_rx_tx_offsets(fd) }?;
     // SAFETY: `fd` is valid; `rx_off` contains the offsets returned by the kernel.
-    let rx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, RING_SIZE) }
+    let rx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, RX_RING_SIZE) }
         .inspect_err(|_| {
             // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
             unsafe { libc::close(fd) };
         })?;
     // SAFETY: `fd` is valid; `tx_off` contains the offsets returned by the kernel.
-    let tx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, RING_SIZE) }
+    let tx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, TX_RING_SIZE) }
         .inspect_err(|_| {
             // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
             unsafe { libc::close(fd) };
@@ -358,4 +400,114 @@ fn first_physical_bridge_port(bridge: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── NIC ring-buffer tuning (#80) ──────────────────────────────────────────
+
+/// Maximize the NIC RX/TX ring buffers via `SIOCETHTOOL` before XDP attachment.
+///
+/// `target`:
+///   - `None`    → GET hardware max, SET rings to max (best throughput at 10M QPS).
+///   - `Some(n)` → GET hardware max (for reporting), SET rings to `n` capped at max.
+///
+/// Stores results in `XDP_NIC_RX_RING` / `XDP_NIC_RX_RING_MAX`.
+/// On any error (EOPNOTSUPP, EPERM, virtual NIC, …) emits a `warn!` and returns
+/// `(0, 0)` — startup is never aborted.
+pub fn maximize_nic_ring(iface: &str, target: Option<u32>) -> (u32, u32) {
+    match maximize_nic_ring_inner(iface, target) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(
+                iface,
+                "[XDP] maximize_nic_ring({iface}): {e} — continuing with default ring size"
+            );
+            (0, 0)
+        }
+    }
+}
+
+fn maximize_nic_ring_inner(iface: &str, target: Option<u32>) -> std::io::Result<(u32, u32)> {
+    /// RAII fd — closes on any early return.
+    struct AutoClose(libc::c_int);
+    impl Drop for AutoClose {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the fd returned by socket(2) below; closed exactly once.
+            unsafe { libc::close(self.0); }
+        }
+    }
+
+    let iface_safe = sanitize_iface_name(iface)
+        .ok_or_else(|| std::io::Error::other("invalid interface name"))?;
+
+    // SAFETY: socket(AF_INET, SOCK_DGRAM, 0) creates a standard UDP socket used
+    //         only as a handle for the SIOCETHTOOL ioctl — no data is sent.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let _guard = AutoClose(fd);
+
+    // ── GET current + hardware-maximum ring sizes ──────────────────────────
+    // SAFETY: zeroed() is valid for a repr(C) struct of plain u32 fields.
+    let mut ring: EthtoolRingParam = unsafe { std::mem::zeroed() };
+    ring.cmd = ETHTOOL_GRINGPARAM;
+    let mut ifr = build_ifreq(iface_safe, (&mut ring as *mut EthtoolRingParam).cast());
+
+    // SAFETY: `fd` is a valid socket fd. `ifr` is fully initialised with a
+    //         valid `ifr_data` pointer. The ioctl writes results back into `ring`.
+    if unsafe { libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let rx_cur = ring.rx_pending;
+    let rx_max = ring.rx_max_pending;
+    let tx_cur = ring.tx_pending;
+    let tx_max = ring.tx_max_pending;
+
+    let rx_set = target.map_or(rx_max, |n| n.min(rx_max).max(1));
+    let tx_set = target.map_or(tx_max, |n| n.min(tx_max).max(1));
+
+    // ── SET ring sizes ────────────────────────────────────────────────────
+    // SAFETY: zeroed() valid for this plain C struct.
+    let mut ring_s: EthtoolRingParam = unsafe { std::mem::zeroed() };
+    ring_s.cmd        = ETHTOOL_SRINGPARAM;
+    ring_s.rx_pending = rx_set;
+    ring_s.tx_pending = tx_set;
+    let mut ifr_s = build_ifreq(iface_safe, (&mut ring_s as *mut EthtoolRingParam).cast());
+
+    // SAFETY: same as the GET call above.
+    if unsafe { libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr_s as *mut IfReqEthtool).cast::<libc::c_void>()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    tracing::info!(
+        "[XDP] NIC {iface} ring RX {rx_cur} → {rx_set}  TX {tx_cur} → {tx_set}  \
+         (max RX {rx_max}  TX {tx_max})"
+    );
+
+    XDP_NIC_RX_RING.store(rx_set, Ordering::Relaxed);
+    XDP_NIC_RX_RING_MAX.store(rx_max, Ordering::Relaxed);
+
+    Ok((rx_set, rx_max))
+}
+
+fn build_ifreq(iface: &str, data: *mut libc::c_void) -> IfReqEthtool {
+    let mut ifr = IfReqEthtool { ifr_name: [0u8; 16], ifr_data: data, _pad: [0u8; 16] };
+    for (i, &b) in iface.as_bytes().iter().take(15).enumerate() {
+        ifr.ifr_name[i] = b;
+    }
+    ifr
+}
+
+/// Read the kernel RX drop counter for `iface` from sysfs.
+/// Returns 0 when the file is unavailable (virtual NIC, older kernel, XDP off).
+pub fn read_nic_rx_dropped(iface: &str) -> u64 {
+    let iface = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None    => return 0,
+    };
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/rx_dropped"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }

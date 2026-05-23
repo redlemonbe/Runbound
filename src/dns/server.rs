@@ -33,6 +33,8 @@ use hickory_server::{
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
     net::runtime::Time,
 };
+use bytes::Bytes;
+use smallvec::SmallVec;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -284,7 +286,8 @@ impl RunboundHandler {
             if is_pool_exhausted(e) {
                 warn!(name=%sanitize_dns_name(qname), "DoT pool exhausted — rebuilding resolver for retry");
                 let addrs = crate::upstreams::upstream_addrs(&self.upstreams);
-                if rebuild_and_swap(&self.resolver, &addrs, self.dnssec_enabled).is_ok() {
+                if rebuild_and_swap(&self.resolver, &addrs, self.dnssec_enabled).await.is_ok() {
+                    self.stats.record_dot_reconnect();
                     result = self.resolver.load().lookup(Name::from(qname), qtype).await;
                 }
             }
@@ -345,30 +348,44 @@ impl RunboundHandler {
 
                 debug!(name=%sanitize_dns_name(qname), %qtype, count = records.len(), "resolved");
 
-                // #60: populate the XDP cache snapshot with the serialized response.
+                // #60 / #64: populate the XDP cache snapshot with wire-format response.
+                // Key uses wire-format DNS name bytes + qclass for fast XDP lookup.
                 // Stored with QID=0; XDP workers patch bytes [0..2] before sending.
+                // Insert is spawned to avoid blocking the response path.
                 if let Some(ref cache) = self.xdp_cache {
                     if !records.is_empty() {
                         let min_ttl = records.iter().map(|r| r.ttl).min().unwrap_or(60)
                             .min(self.cache_max_ttl);
-                        let key = super::cache_snapshot::QuestionKey {
-                            name:  qname.to_string(),
-                            qtype: u16::from(qtype),
-                        };
-                        let mut wire: Vec<u8> = Vec::with_capacity(512);
-                        let mut cache_msg = Message::new(0, MessageType::Response, OpCode::Query);
-                        cache_msg.metadata.recursion_available = true;
-                        cache_msg.metadata.response_code = ResponseCode::NoError;
-                        cache_msg.add_query(DnsQuery::query(Name::from(qname), qtype));
-                        for r in records { cache_msg.add_answer(r.clone()); }
-                        let mut enc = BinEncoder::new(&mut wire);
-                        if cache_msg.emit(&mut enc).is_ok() {
-                            let entry = super::cache_snapshot::CacheEntry {
-                                wire_response: std::sync::Arc::new(wire),
-                                expires_at:    std::time::Instant::now()
-                                    + std::time::Duration::from_secs(min_ttl as u64),
+                        // Build wire-format name key
+                        let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
+                        let mut name_enc = BinEncoder::new(&mut name_tmp);
+                        if Name::from(qname).emit(&mut name_enc).is_ok() {
+                            let wire_name: SmallVec<[u8; 64]> = SmallVec::from_slice(&name_tmp);
+                            let key = super::cache_snapshot::QuestionKey {
+                                name:   wire_name,
+                                qtype:  u16::from(qtype),
+                                qclass: 1u16, // IN class
                             };
-                            super::cache_snapshot::cache_insert(cache, key, entry, self.cache_max_entries);
+                            let mut wire: Vec<u8> = Vec::with_capacity(512);
+                            let mut cache_msg = Message::new(0, MessageType::Response, OpCode::Query);
+                            cache_msg.metadata.recursion_available = true;
+                            cache_msg.metadata.response_code = ResponseCode::NoError;
+                            cache_msg.add_query(DnsQuery::query(Name::from(qname), qtype));
+                            for r in records { cache_msg.add_answer((*r).clone()); }
+                            let mut enc = BinEncoder::new(&mut wire);
+                            if cache_msg.emit(&mut enc).is_ok() {
+                                let expires_at = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(min_ttl as u64);
+                                let entry = super::cache_snapshot::CacheEntry {
+                                    wire_payload: Bytes::from(wire),
+                                    expires_at,
+                                };
+                                let cache_ref = Arc::clone(cache);
+                                let max_ent   = self.cache_max_entries;
+                                tokio::spawn(async move {
+                                    super::cache_snapshot::cache_insert(&cache_ref, key, entry, max_ent);
+                                });
+                            }
                         }
                     }
                 }
@@ -679,17 +696,45 @@ pub fn dot_tls_name(ip: &IpAddr, explicit: Option<&str>) -> Arc<str> {
     }
 }
 
+/// Try to establish at least one live TCP/TLS connection in `resolver`.
+/// Hickory opens connections lazily, so we must probe BEFORE making the
+/// resolver visible via ArcSwap — otherwise the first real query races
+/// against connection setup and gets `NetError::NoConnections`.
+///
+/// Retries up to 3 times with 250 ms delay on `NoConnections`; treats
+/// every other outcome (including DNS errors) as "connection established".
+/// Returns `true` when the pool is confirmed live, `false` after 3 failures.
+async fn warm_up(resolver: &TokioResolver) -> bool {
+    let probe = Name::from_str("example.com.").unwrap_or_else(|_| unreachable!("static DNS name"));
+    for _ in 0..3u8 {
+        match resolver.lookup(probe.clone(), RecordType::A).await {
+            Ok(_)                                           => return true,
+            Err(ref e) if matches!(e, NetError::NoConnections) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(_) => return true, // connected but query failed (NXDOMAIN etc.) — pool is live
+        }
+    }
+    false
+}
+
 /// Rebuild the resolver from an explicit list of (addr_string, port, use_tls, tls_hostname) tuples
 /// and atomically swap it in. Used by POST /api/cache/flush and upstreams CRUD.
-pub fn rebuild_and_swap(
+///
+/// Calls `warm_up()` on the new resolver **before** the ArcSwap::store so that
+/// TCP/TLS connections are established before any query can reach it (#77).
+/// Returns `Ok(true)` when warm-up succeeded, `Ok(false)` when it timed out
+/// (3 × 250 ms with no response) — the resolver is still stored in both cases.
+pub async fn rebuild_and_swap(
     shared: &SharedResolver,
     addrs:  &[(String, u16, bool, Option<String>)],
     dnssec: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let size = cache_size_from_meminfo();
     let new_res = build_resolver_from_addrs(addrs, size, dnssec)?;
+    let warmed = warm_up(&new_res).await;
     shared.store(Arc::new(new_res));
-    Ok(())
+    Ok(warmed)
 }
 
 /// Level 1 (#77): proactively warm up DoT TCP connections at startup.
@@ -716,6 +761,7 @@ pub async fn warm_up_dot_connections(resolver: &SharedResolver, dot_count: usize
 pub async fn dot_keepalive_loop(
     resolver:  SharedResolver,
     upstreams: crate::upstreams::SharedUpstreams,
+    stats:     Arc<crate::stats::Stats>,
     dnssec:    bool,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(90));
@@ -744,8 +790,11 @@ pub async fn dot_keepalive_loop(
         }
         if any_exhausted {
             let addrs = crate::upstreams::upstream_addrs(&upstreams);
-            match rebuild_and_swap(&resolver, &addrs, dnssec) {
-                Ok(()) => info!("DoT keepalive: pool rebuilt after connection loss"),
+            match rebuild_and_swap(&resolver, &addrs, dnssec).await {
+                Ok(warmed) => {
+                    stats.record_dot_reconnect();
+                    info!(warmed, "DoT keepalive: pool rebuilt after connection loss");
+                }
                 Err(e) => warn!(err=%e, "DoT keepalive: resolver rebuild failed"),
             }
         } else {
@@ -1379,10 +1428,11 @@ pub async fn run_dns_server(
 
     // Level 3 (#77): spawn keepalive task.
     {
-        let res_ka  = Arc::clone(&resolver);
-        let ups_ka  = upstreams.clone();
-        let dnssec  = cfg.dnssec_validation;
-        tokio::spawn(dot_keepalive_loop(res_ka, ups_ka, dnssec));
+        let res_ka    = Arc::clone(&resolver);
+        let ups_ka    = upstreams.clone();
+        let stats_ka  = Arc::clone(&stats);
+        let dnssec    = cfg.dnssec_validation;
+        tokio::spawn(dot_keepalive_loop(res_ka, ups_ka, stats_ka, dnssec));
     }
 
     let handler = RunboundHandler::new(
