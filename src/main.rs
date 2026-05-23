@@ -488,6 +488,18 @@ async fn build_and_launch(
         .map_err(|e| anyhow::anyhow!("DNS resolver init: {e}"))?;
 
     // ── Slave/master sync ──────────────────────────────────────────────────
+    // Hoist sync_key: master may auto-generate it; both master and slave need it for relay.
+    let sync_key_resolved: Option<String> = cfg.sync_key.clone().or_else(|| {
+        if cfg.is_master() && cfg.sync_port.is_some() {
+            let k = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+            info!("No sync-key in config — generated: {}...{}", &k[..8], &k[k.len()-4..]);
+            info!("Add  sync-key: {k}  to both master and slave configs.");
+            Some(k)
+        } else {
+            None
+        }
+    });
+
     let sync_journal = if let (true, Some(port)) = (cfg.is_master(), cfg.sync_port) {
         let journal = sync::SyncJournal::new();
         match sync::ensure_sync_cert() {
@@ -497,13 +509,7 @@ async fn build_and_launch(
                         info!(port, sha256 = %fingerprint, "Sync HTTPS server starting");
                         let j        = Arc::clone(&journal);
                         let cert_fp  = fingerprint.clone();
-                        let sync_key = cfg.sync_key.clone()
-                            .unwrap_or_else(|| {
-                                let k = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-                                info!("No sync-key in config — generated: {}...{}", &k[..8], &k[k.len()-4..]);
-                                info!("Add  sync-key: {k}  to both master and slave configs.");
-                                k
-                            });
+                        let sync_key = sync_key_resolved.clone().unwrap_or_default();
                         tokio::spawn(async move {
                             if let Err(e) = sync::start_master_sync_server(
                                 port, j, sync_key, cert_fp, cert_pem, key_pem,
@@ -525,17 +531,79 @@ async fn build_and_launch(
     // Hoisted so both SlaveClient and AppState share the same mutex instance.
     let zones_mutex = Arc::new(tokio::sync::Mutex::new(()));
 
+    // Slave node UUID — generated once, persisted to disk (#88).
+    let node_id: Option<String> = if cfg.is_slave() {
+        match sync::ensure_node_id() {
+            Ok(id) => Some(id),
+            Err(e) => { tracing::warn!("node-id generation failed: {e}"); None }
+        }
+    } else {
+        None
+    };
+
     if cfg.is_slave() {
-        match (&cfg.sync_master, &cfg.sync_key) {
+        match (&cfg.sync_master, &sync_key_resolved) {
             (Some(master), Some(key)) => {
                 let client = sync::SlaveClient::new(
                     master, key, cfg.sync_interval,
                     Arc::clone(&zones),
                     Arc::clone(&zones_mutex),
                     Arc::clone(&cfg_arc),
+                    Arc::clone(&upstreams),
                 );
                 tokio::spawn(async move { client.run().await });
                 info!("Slave sync started → master {master}");
+
+                // Start slave relay server on sync_port (#85).
+                if let Some(port) = cfg.sync_port {
+                    match sync::ensure_relay_cert() {
+                        Ok((cert_pem, key_pem)) => {
+                            let relay_state = std::sync::Arc::new(sync::NodeRelay {
+                                zones:       Arc::clone(&zones),
+                                zones_mutex: Arc::clone(&zones_mutex),
+                                cfg:         Arc::clone(&cfg_arc),
+                                upstreams:   Arc::clone(&upstreams),
+                            });
+                            let sk = key.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = sync::start_node_server(port, sk, cert_pem, key_pem, relay_state).await {
+                                    error!("Node relay server exited: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => tracing::warn!("Relay cert error: {e} — relay disabled"),
+                    }
+                }
+
+                // Auto-register with master (#88).
+                if let (Some(ref nid), Some(port)) = (&node_id, cfg.sync_port) {
+                    match sync::ensure_relay_cert() {
+                        Ok((cert_pem, _)) => {
+                            match sync::cert_sha256_hex(&cert_pem) {
+                                Ok(fp) => {
+                                    // Resolve slave's own IP from the master connection perspective.
+                                    // Use the configured listen address or fall back to loopback.
+                                    let slave_ip = cfg.interfaces.first().cloned()
+                                        .unwrap_or_else(|| "127.0.0.1".to_string());
+                                    let relay_host = format!("{slave_ip}:{port}");
+                                    let master_addr = master.clone();
+                                    let key2 = key.clone();
+                                    let nid2 = nid.clone();
+                                    let ver  = env!("CARGO_PKG_VERSION").to_string();
+                                    tokio::spawn(async move {
+                                        // Brief delay so the relay server is up before registration.
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                        api::relay::register_with_master(
+                                            master_addr, key2, nid2, relay_host, fp, ver,
+                                        ).await;
+                                    });
+                                }
+                                Err(e) => tracing::warn!("Relay cert fingerprint error: {e}"),
+                            }
+                        }
+                        Err(e) => tracing::warn!("Relay cert error (registration): {e}"),
+                    }
+                }
             }
             _ => tracing::warn!("Slave mode enabled but sync-master or sync-key not set — sync disabled"),
         }
@@ -602,6 +670,8 @@ async fn build_and_launch(
         log_buffer:       Arc::clone(&log_buffer),
         upstreams:        Arc::clone(&upstreams),
         sync_journal,
+        sync_key:         sync_key_resolved,
+        node_id,
         slave_mode:       cfg.is_slave(),
         base_dir:         Arc::new(base_dir),
         audit:            audit.clone(),
