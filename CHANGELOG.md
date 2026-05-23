@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.19] — 2026-05-23
+
+### Fixed
+
+- **XDP SKB mode deadlock Tokio runtime — pool exhaustion (#83)** (`src/dns/server.rs`)
+
+  **Cause** : `opts.timeout = 3 s × opts.attempts = 2` → chaque `lookup()` peut bloquer un worker Tokio pendant 6 s. Sous charge (XDP SKB mode produit des rafales), N lookups simultanés occupent les N workers et la tâche background de reconnexion du pool ne peut plus s'exécuter — deadlock complet (même le loopback cesse de répondre).
+
+  **Fix 1 — timeout externe par lookup** : chaque appel à `resolver.lookup()` est désormais enveloppé dans `tokio::time::timeout(2500 ms)` via `timed_lookup()`. La future hickory est **annulée** (droppée) si elle ne répond pas dans les 2,5 s, libérant immédiatement le worker quelle que soit l'état interne du pool. Appliqué à tous les chemins : mode normal, mode racing (`select_ok`), retry post-rebuild.
+
+  **Fix 2 — rebuild spawné en tâche indépendante** : le `rebuild_and_swap()` (qui appelle `warm_up()` en interne, pouvant bloquer 3 s) est désormais `tokio::spawn`-é au lieu d'être `await`-é dans le query handler. Le handler retourne SERVFAIL pour la requête courante ; la requête suivante utilisera le resolver reconstruit. Supprime le risque d'enchaîner un blocage de 3 s (warm-up) immédiatement après un blocage de 2,5 s (timeout lookup).
+
+---
+
 ## [0.6.18] — 2026-05-23
 
 ### Fixed
