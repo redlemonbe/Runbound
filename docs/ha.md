@@ -182,6 +182,7 @@ server:
     sync-master:   192.168.1.10:8082     # master IP:sync-port
     sync-key:      "PASTE-YOUR-64-CHAR-HEX-HERE"   # same as master
     sync-interval: 30                   # poll every 30 s (default)
+    sync-port:     8082                 # relay server — enables auto-registration + config push
 
     # ── REST API (read-only on slave) ──────────────────────────────────────
     api-port: 8080
@@ -618,8 +619,8 @@ Use different ports for the slave and update your test clients accordingly, or u
 | Directive | Node | Default | Description |
 |---|:---:|---|---|
 | `mode` | both | `master` | Set to `slave` on replica nodes. |
-| `sync-port` | master | — | HTTPS sync server port (e.g. 8082). Required on master. |
-| `sync-key` | both | — | Shared Bearer token for sync auth. Required on both. |
+| `sync-port` | both | — | Master: HTTPS sync server port. Slave: TLS relay server port (enables auto-registration + config push). |
+| `sync-key` | both | — | Shared HMAC key for sync and relay auth. Required on both. |
 | `sync-master` | slave | — | Master `ip:port` (e.g. `192.168.1.10:8082`). Required on slave. |
 | `sync-interval` | slave | `30` | Poll interval in seconds. |
 

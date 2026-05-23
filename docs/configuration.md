@@ -707,6 +707,17 @@ server:
     acme-email:  admin@example.com
     acme-domain: dns.example.com
 
+    # Replication — master side:
+    # mode:      master
+    # sync-port: 8082
+    # sync-key:  <openssl rand -hex 32>
+
+    # Replication — slave side:
+    # mode:        slave
+    # sync-master: 192.168.1.10:8082
+    # sync-key:    <same key as master>
+    # sync-port:   8082   # enables relay server + auto-registration
+
 forward-zone:
     name:                 "."
     forward-addr:         1.1.1.1@853
@@ -747,7 +758,12 @@ server:
     sync-master:   192.168.1.10:8082    # master ip:port (same as sync-port above)
     sync-key:      <same-secret>
     sync-interval: 30                   # poll interval in seconds (default: 30)
+    sync-port:     8082                 # opens the slave relay server (TLS + HMAC)
 ```
+
+`sync-port` on a slave starts a TLS relay server that the master connects to for
+config push and relay forwarding. When set, the slave registers with the master at
+startup and advertises `<slave_ip>:<sync-port>` as its relay address.
 
 On first start, the slave performs a **TOFU (Trust On First Use)** TLS handshake:
 
@@ -759,6 +775,11 @@ On first start, the slave performs a **TOFU (Trust On First Use)** TLS handshake
 
 All subsequent connections pin the saved fingerprint. A mismatch aborts the connection.
 To re-key, delete `/etc/runbound/sync-master.fingerprint` on the slave and restart.
+
+**Auto-registration** — when `sync-port` is set on the slave, it generates (or reloads)
+a stable UUID from `/etc/runbound/node-id` and a self-signed relay certificate at
+`/etc/runbound/relay-cert.pem`, then registers with the master via a HMAC-signed
+`POST /nodes/register` request. Registered nodes appear in `GET /api/nodes` on the master.
 
 ### Slave read-only mode
 
@@ -790,13 +811,15 @@ lightweight regardless of feed size.
 
 ### Sync ports reference
 
-| Port | Protocol | Purpose |
-|---|---|---|
-| 53 | UDP + TCP | DNS (all nodes) |
-| 8080 | HTTP | REST API (localhost only, all nodes) |
-| 8082 | HTTPS | Sync server (master only, network-accessible) |
+| Port | Protocol | Direction | Purpose |
+|---|---|---|---|
+| 53 | UDP + TCP | clients → any node | DNS queries |
+| 8080 | HTTP | localhost only | REST API (all nodes) |
+| 8082 | HTTPS | slave → master | Delta journal sync (slave initiates) |
+| 8082 | TLS | master → slave | Relay / config push (master initiates) |
 
-The sync port number is configurable. The REST API stays on localhost on all nodes.
+The sync port number is configurable. Both sides use the same port number by convention.
+The REST API stays on localhost on all nodes.
 
 ---
 
