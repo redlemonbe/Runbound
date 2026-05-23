@@ -65,6 +65,9 @@ pub struct UpstreamStatus {
     pub port:       u16,
     pub name:       Option<String>,
     pub protocol:   String,   // "udp" or "dot"
+    /// #57: "config" = from unbound.conf forward-zone; "api" = added via REST API.
+    #[serde(default = "default_source")]
+    pub source:     String,
     pub healthy:    bool,
     pub latency_ms: Option<u64>,
     pub last_check: String,
@@ -92,6 +95,23 @@ pub struct UpstreamStatus {
     pub consecutive_failures: u32,
     #[serde(skip, default = "Instant::now")]
     pub next_check_at: Instant,
+}
+
+fn default_source() -> String { "api".into() }
+
+/// #57: Deterministic stable UUID-format ID for config-file upstreams.
+/// Same addr+port+protocol always produces the same ID across restarts,
+/// enabling idempotent DELETE without persisting config entries.
+fn config_upstream_id(addr: &str, port: u16, protocol: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let key = format!("cfg:{addr}:{port}:{protocol}");
+    let h = Sha256::digest(key.as_bytes());
+    let b = h.as_slice();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7],
+        b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]
+    )
 }
 
 fn serialize_latency_history<S>(v: &VecDeque<u64>, s: S) -> Result<S::Ok, S::Error>
@@ -139,8 +159,9 @@ struct UpstreamsFile {
 pub fn save_upstreams(upstreams: &SharedUpstreams, base_dir: &Path) {
     let list = upstreams.read()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in save_upstreams: {e}"));
+    // #57: only persist API upstreams; config upstreams are re-derived from unbound.conf at startup.
     let file = UpstreamsFile {
-        upstreams: list.iter().map(|u| PersistedUpstream {
+        upstreams: list.iter().filter(|u| u.source == "api").map(|u| PersistedUpstream {
             id:           u.id.clone(),
             addr:         u.addr.clone(),
             port:         u.port,
@@ -203,6 +224,7 @@ pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
         port:                 p.port,
         name:                 p.name,
         protocol:             p.protocol,
+        source:               "api".into(),
         zone:                 p.zone,
         tls_hostname:         p.tls_hostname,
         healthy:              false,
@@ -244,12 +266,16 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
         let default_port: u16 = if fz.tls { 853 } else { 53 };
         for addr in &fz.addrs {
             let (clean, port) = parse_addr_port(addr, default_port);
+            let protocol = if fz.tls { "dot" } else { "udp" };
+            // #57: stable deterministic ID — survives restarts, enables idempotent DELETE.
+            let id = config_upstream_id(&clean, port, protocol);
             statuses.push(UpstreamStatus {
-                id:                  uuid::Uuid::new_v4().to_string(),
+                id,
                 addr:                clean,
                 port,
                 name:                None,
-                protocol:            if fz.tls { "dot".into() } else { "udp".into() },
+                protocol:            protocol.into(),
+                source:              "config".into(),
                 zone:                fz.name.clone(),
                 tls_hostname:        None,
                 healthy:             false,
@@ -293,6 +319,7 @@ pub fn add_upstream(
         port,
         name,
         protocol,
+        source:              "api".into(),
         tls_hostname,
         healthy:             false,
         latency_ms:          None,
@@ -343,6 +370,34 @@ pub fn upstream_addrs(upstreams: &SharedUpstreams) -> Vec<(String, u16, bool, Op
         .iter()
         .map(|u| (u.addr.clone(), u.port, u.protocol == "dot", u.tls_hostname.clone()))
         .collect()
+}
+
+/// #57: Remove a `forward-addr: addr@port` line from the config file in-place.
+/// Returns Ok(true) if a line was removed and the file was rewritten, Ok(false) if not found.
+/// The port suffix is optional in the file — matches both "1.1.1.1" and "1.1.1.1@53".
+pub fn remove_forward_addr_from_config(cfg_path: &str, addr: &str, port: u16) -> std::io::Result<bool> {
+    let content = std::fs::read_to_string(cfg_path)?;
+    let target_with_port = format!("{addr}@{port}");
+    let mut removed = false;
+    let lines: Vec<&str> = content.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if let Some(val_raw) = trimmed.strip_prefix("forward-addr:") {
+                let val = val_raw.trim().trim_matches('"');
+                if val == target_with_port || val == addr {
+                    removed = true;
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    if removed {
+        let mut new_content = lines.join("\n");
+        if content.ends_with('\n') { new_content.push('\n'); }
+        std::fs::write(cfg_path, new_content)?;
+    }
+    Ok(removed)
 }
 
 // ── Background health loop ─────────────────────────────────────────────────

@@ -34,6 +34,9 @@ pub struct XdpHandle {
     bpf:     Ebpf,
     link_id: Option<XdpLinkId>,
     pub mode: XdpMode,
+    /// #69: (core_id, original_governor) pairs saved before switching to "performance".
+    /// Restored on Drop so the OS scheduler is left in its original state.
+    pub(crate) governor_backups: Vec<(usize, String)>,
 }
 
 impl Drop for XdpHandle {
@@ -44,6 +47,9 @@ impl Drop for XdpHandle {
                     let _ = xdp.detach(id);
                 }
             }
+        }
+        for (core_id, original) in &self.governor_backups {
+            crate::cpu::restore_governor(*core_id, original);
         }
     }
 }
@@ -92,7 +98,7 @@ impl XdpHandle {
 
         tracing::info!(iface = %iface, link_id = ?link_id, mode = ?mode, "XDP program attached");
 
-        Ok(XdpHandle { bpf, link_id: Some(link_id), mode })
+        Ok(XdpHandle { bpf, link_id: Some(link_id), mode, governor_backups: Vec::new() })
     }
 
     /// Register an AF_XDP socket with the XSKMAP at the given queue index.
