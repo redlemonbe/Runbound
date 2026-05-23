@@ -36,7 +36,7 @@ NIC
  └──[Kernel path → Tokio / hickory-server]
      • Recursive queries / DoT / DoH / DoQ
      • DNSSEC validation (optional)
-     • REST API (localhost:8081)
+     • REST API (localhost:8080)
 ```
 
 Architectural strengths: strict separation between XDP OS-threads and Tokio async workers, zero-lock read path on zones, jemalloc multi-thread allocator.
