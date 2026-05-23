@@ -552,7 +552,21 @@ Enable the XDP cache snapshot path: cache hits are answered directly by the XDP 
 thread from an `ArcSwap<HashMap>` without entering the hickory resolver.
 Requires `xdp: yes`. Reduces per-query latency for cached responses to < 1 µs.
 
-**Requires v1.0+** — planned for the v1.0 milestone (#60).
+Cache entries are stored with a pre-serialized wire-format payload (`wire_payload: Bytes`).
+The worker does a direct memcpy + QueryID patch — no DNS parsing on cache hit.
+
+### XDP domain-affinity routing
+
+```
+server:
+    xdp-domain-routing: no    # default: no
+```
+
+When enabled, the eBPF program hashes each DNS QNAME with FNV-1a and redirects the packet to a dedicated CPU via CPUMAP. All queries for the same domain always land on the same core — the cache entry stays warm in L1/L2.
+
+ASCII-lowercased before hashing: `Example.com` and `example.com` route to the same core.
+
+Requires multi-queue NIC and XDP native mode. Falls back to RSS (random distribution) with a `WARN` if CPUMAP init fails.
 
 ### XDP CPU governor
 
