@@ -403,6 +403,10 @@ fn xdp_worker(
         tx_descs.clear();
         rx_addrs.clear();
 
+        // `i` is used only inside #[cfg(target_arch = "x86_64")] for the prefetch hint.
+        // Suppress unused_variables on other arches with cfg_attr rather than the _i prefix
+        // (which would trigger clippy::unused_enumerate_index instead).
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
         for (i, desc) in rxds.iter().enumerate() {
             // #71: prefetch the next packet's payload into L1 cache while processing
             // this one. _mm_prefetch is a non-faulting hint — safe even for out-of-range
