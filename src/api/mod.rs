@@ -515,9 +515,10 @@ pub fn router(state: AppState) -> Router {
         .route("/tls",               get(tls_status_handler))
         // Monitoring
         .route("/upstreams",         get(upstreams_handler).post(add_upstream_handler))
-        .route("/upstreams/presets", get(upstream_presets_handler))
-        .route("/upstreams/:id",     delete(delete_upstream_handler).patch(patch_upstream_handler))
-        .route("/upstreams/:id/probe", post(probe_upstream_handler))
+        .route("/upstreams/presets",    get(upstream_presets_handler))
+        .route("/upstreams/reconnect",  post(reconnect_upstreams_handler))
+        .route("/upstreams/:id",        delete(delete_upstream_handler).patch(patch_upstream_handler))
+        .route("/upstreams/:id/probe",  post(probe_upstream_handler))
         .route("/cache/stats",       get(cache_stats_handler))
         .route("/logs",              get(logs_handler).delete(clear_logs_handler))
         .route("/audit/tail",        get(audit_tail_handler))
@@ -1854,6 +1855,54 @@ async fn probe_upstream_handler(
             "error": "NOT_FOUND", "id": id
         }))).into_response(),
     }
+}
+
+// ── POST /api/upstreams/reconnect (#78) ────────────────────────────────────
+
+async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    // Rebuild the resolver (resets the entire DoT connection pool).
+    let addrs = crate::upstreams::upstream_addrs(&s.upstreams);
+    if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+            "error": "REBUILD_FAILED", "details": e.to_string()
+        }))).into_response();
+    }
+
+    // Probe every DoT upstream in parallel to report reconnected vs failed.
+    // UDP upstreams are ignored.
+    let dot_targets: Vec<(String, u16)> = {
+        s.upstreams.read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|u| u.protocol == "dot")
+            .map(|u| (u.addr.clone(), u.port))
+            .collect()
+    };
+
+    let mut probe_tasks = Vec::with_capacity(dot_targets.len());
+    for (addr, port) in dot_targets {
+        probe_tasks.push(tokio::task::spawn_blocking(move || {
+            crate::upstreams::probe_upstream(&addr, port, "dot")
+        }));
+    }
+
+    let mut reconnected = 0u32;
+    let mut failed      = 0u32;
+    for task in probe_tasks {
+        match task.await {
+            Ok((healthy, _, _, _)) => if healthy { reconnected += 1; } else { failed += 1; },
+            Err(_)                 => { failed += 1; }
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    (StatusCode::OK, JsonExtract(serde_json::json!({
+        "reconnected": reconnected,
+        "failed":      failed,
+        "duration_ms": duration_ms,
+    }))).into_response()
 }
 
 // ── GET /api/cache/stats ───────────────────────────────────────────────────
@@ -3903,5 +3952,43 @@ mod tests {
         ).await.unwrap();
         // Missing required field → unprocessable entity from ApiJson
         assert!(resp.status().is_client_error());
+    }
+
+    // ── POST /api/upstreams/reconnect (#78) ───────────────────────────────
+
+    #[tokio::test]
+    async fn upstreams_reconnect_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().method("POST").uri("/api/upstreams/reconnect")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn upstreams_reconnect_get_not_allowed() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().method("GET").uri("/api/upstreams/reconnect")
+                .header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn upstreams_reconnect_returns_schema() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().method("POST").uri("/api/upstreams/reconnect")
+                .header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        for field in &["reconnected", "failed", "duration_ms"] {
+            assert!(json.get(field).is_some(), "missing field: {field}");
+        }
     }
 }
