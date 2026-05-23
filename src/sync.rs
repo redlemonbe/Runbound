@@ -694,7 +694,18 @@ pub async fn start_master_sync_server(
         tokio::spawn(async move {
             let tls = match acceptor.accept(tcp).await {
                 Ok(s) => s,
-                Err(e) => { warn!(%peer, "sync TLS: {e}"); return; }
+                Err(e) => {
+                    // InvalidContentType = plain-HTTP client connected to TLS port.
+                    let hint = if e.to_string().contains("InvalidContentType")
+                        || e.to_string().contains("corrupt message")
+                    {
+                        " — plain-HTTP client? use HTTPS (TLS) on this port"
+                    } else {
+                        ""
+                    };
+                    warn!(%peer, "sync TLS: {e}{hint}");
+                    return;
+                }
             };
             let io = TokioIo::new(tls);
             let peer_str2 = peer_str.clone();
@@ -895,7 +906,24 @@ impl SlaveClient {
 
         let mut last_seq = match self.full_sync(&tls_config).await {
             Ok(seq) => { info!("Slave sync: initial full sync complete (seq={seq})"); seq }
-            Err(e)  => { warn!("Slave sync: initial full sync failed: {e}"); 0 }
+            Err(e) => {
+                let s = e.to_string();
+                // TLS errors here almost always mean a stale pinned fingerprint —
+                // master cert was replaced. Guide the admin to the exact fix.
+                if s.contains("TLS") || s.contains("handshake") || s.contains("reset")
+                    || s.contains("fingerprint") || s.contains("InvalidCertificate")
+                {
+                    error!(
+                        "Slave sync: TLS failure on initial sync: {e}\n\
+                         The master certificate may have changed since TOFU was performed.\n\
+                         To re-pin: delete {} and restart the slave.",
+                        fingerprint_path().display()
+                    );
+                } else {
+                    warn!("Slave sync: initial full sync failed: {e}");
+                }
+                0
+            }
         };
 
         let mut backoff_secs: u64 = 5;
