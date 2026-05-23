@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.22] — 2026-05-23
+
+### Changed
+
+- **Thin LTO — build multithread par défaut** (`Cargo.toml`)
+
+  `lto = true` (fat LTO, single-thread) → `lto = "thin"` (thin LTO, parallélisé sur tous les cœurs). `codegen-units = 1` supprimé — retour au défaut release (16 unités, compilation parallèle). Résultat local : 45 s au lieu de ~2 min. CI attendu : ~7-8 min au lieu de 19 min. Impact perf binaire : négligeable — thin LTO conserve ~95 % des gains d'optimisation de fat LTO.
+
+---
+
 ## [0.6.21] — 2026-05-23
 
 ### Fixed
