@@ -554,54 +554,76 @@ async fn build_and_launch(
                 tokio::spawn(async move { client.run().await });
                 info!("Slave sync started → master {master}");
 
-                // Start slave relay server on sync_port (#85).
-                if let Some(port) = cfg.sync_port {
-                    match sync::ensure_relay_cert() {
-                        Ok((cert_pem, key_pem)) => {
-                            let relay_state = std::sync::Arc::new(sync::NodeRelay {
-                                zones:       Arc::clone(&zones),
-                                zones_mutex: Arc::clone(&zones_mutex),
-                                cfg:         Arc::clone(&cfg_arc),
-                                upstreams:   Arc::clone(&upstreams),
-                            });
-                            let sk = key.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = sync::start_node_server(port, sk, cert_pem, key_pem, relay_state).await {
-                                    error!("Node relay server exited: {e}");
-                                }
-                            });
-                        }
-                        Err(e) => tracing::warn!("Relay cert error: {e} — relay disabled"),
+                // ── Relay server + auto-registration (#85, #88) ──────────────────────
+                match cfg.sync_port {
+                    None => {
+                        info!("Slave relay disabled — add sync-port to config to enable config push and relay forwarding");
                     }
-                }
+                    Some(port) => {
+                        match sync::ensure_relay_cert() {
+                            Err(e) => error!("Relay cert generation failed — relay disabled: {e}"),
+                            Ok((cert_pem, key_pem)) => {
+                                // Start relay TLS server.
+                                let relay_state = std::sync::Arc::new(sync::NodeRelay {
+                                    zones:       Arc::clone(&zones),
+                                    zones_mutex: Arc::clone(&zones_mutex),
+                                    cfg:         Arc::clone(&cfg_arc),
+                                    upstreams:   Arc::clone(&upstreams),
+                                });
+                                let sk = key.clone();
+                                let cp = cert_pem.clone();
+                                let kp = key_pem.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = sync::start_node_server(port, sk, cp, kp, relay_state).await {
+                                        error!("Node relay server exited: {e}");
+                                    }
+                                });
 
-                // Auto-register with master (#88).
-                if let (Some(ref nid), Some(port)) = (&node_id, cfg.sync_port) {
-                    match sync::ensure_relay_cert() {
-                        Ok((cert_pem, _)) => {
-                            match sync::cert_sha256_hex(&cert_pem) {
-                                Ok(fp) => {
-                                    // Resolve slave's own IP from the master connection perspective.
-                                    // Use the configured listen address or fall back to loopback.
-                                    let slave_ip = cfg.interfaces.first().cloned()
-                                        .unwrap_or_else(|| "127.0.0.1".to_string());
-                                    let relay_host = format!("{slave_ip}:{port}");
-                                    let master_addr = master.clone();
-                                    let key2 = key.clone();
-                                    let nid2 = nid.clone();
-                                    let ver  = env!("CARGO_PKG_VERSION").to_string();
-                                    tokio::spawn(async move {
-                                        // Brief delay so the relay server is up before registration.
-                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                        api::relay::register_with_master(
-                                            master_addr, key2, nid2, relay_host, fp, ver,
-                                        ).await;
-                                    });
+                                // Auto-register with master.
+                                if let Some(ref nid) = node_id {
+                                    match sync::cert_sha256_hex(&cert_pem) {
+                                        Err(e) => error!("Relay cert fingerprint error: {e}"),
+                                        Ok(fp) => {
+                                            // Derive the actual outbound IP toward the master via the
+                                            // routing table. cfg.interfaces contains bind addresses
+                                            // (e.g. 0.0.0.0) which are not routable from the master.
+                                            let master_host = if master.starts_with('[') {
+                                                master.trim_start_matches('[')
+                                                    .split(']').next()
+                                                    .unwrap_or("127.0.0.1").to_string()
+                                            } else {
+                                                master.split(':').next()
+                                                    .unwrap_or("127.0.0.1").to_string()
+                                            };
+                                            let slave_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+                                                .and_then(|s| {
+                                                    s.connect((master_host.as_str(), 1u16))?;
+                                                    s.local_addr()
+                                                })
+                                                .map(|a| a.ip().to_string())
+                                                .unwrap_or_else(|_| {
+                                                    cfg.interfaces.iter()
+                                                        .find(|ip| *ip != "0.0.0.0" && *ip != "::")
+                                                        .cloned()
+                                                        .unwrap_or_else(|| "127.0.0.1".to_string())
+                                                });
+                                            let relay_host = format!("{slave_ip}:{port}");
+                                            let master_addr = master.clone();
+                                            let key2 = key.clone();
+                                            let nid2 = nid.clone();
+                                            let ver  = env!("CARGO_PKG_VERSION").to_string();
+                                            tokio::spawn(async move {
+                                                // Brief delay — let relay server bind before registering.
+                                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                                api::relay::register_with_master(
+                                                    master_addr, key2, nid2, relay_host, fp, ver,
+                                                ).await;
+                                            });
+                                        }
+                                    }
                                 }
-                                Err(e) => tracing::warn!("Relay cert fingerprint error: {e}"),
                             }
                         }
-                        Err(e) => tracing::warn!("Relay cert error (registration): {e}"),
                     }
                 }
             }

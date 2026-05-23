@@ -9,6 +9,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.21] — 2026-05-23
+
+### Fixed
+
+- **Relay TLS handshake (#95)** (`src/main.rs`, `src/sync.rs`)
+
+  Quatre bugs corrigés dans le relay chiffré v0.6.20 :
+
+  1. **`relay_host` erroné (`0.0.0.0:8082`)** — le slave utilisait `cfg.interfaces.first()` (adresse de bind) pour construire l'adresse relay envoyée au master. Avec `interface: 0.0.0.0`, le master enregistrait `0.0.0.0:8082` et ne pouvait jamais se connecter. Fix : détection de l'IP sortante réelle via une socket UDP (`connect()` sans envoi, puis `local_addr()`) — technique standard de résolution de route. Fallback sur la première interface non-wildcard si la socket échoue.
+
+  2. **`ensure_relay_cert()` appelé deux fois** — le cert était chargé/généré séparément pour le serveur relay et pour l'enregistrement. Refactorisé en un seul appel, résultat réutilisé pour les deux.
+
+  3. **Erreurs relay loggées en `warn` au lieu de `error`** — les échecs de génération du cert relay (`ensure_relay_cert`) et du fingerprint passaient silencieusement. Passés en `error!`. Ajout d'un `info!` explicite quand `sync-port` est absent de la config slave (relay désactivé intentionnellement vs silencieusement).
+
+  4. **Fingerprint stale → message générique** — quand le cert du master change après le TOFU initial, le slave loggait `"initial full sync failed: TLS handshake: Connection reset by peer"` sans explication. Désormais : `error!` avec instruction explicite pour supprimer le fichier `sync-master.fingerprint` et redémarrer.
+
+  Bonus : le master ajoute un hint `"plain-HTTP client?"` dans les logs TLS `InvalidContentType` (connexion non-TLS sur le port sync).
+
+---
+
 ## [0.6.20] — 2026-05-23
 
 ### Added
