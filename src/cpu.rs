@@ -55,6 +55,27 @@ pub fn physical_cores() -> Vec<usize> {
     }
 }
 
+/// Read the current scaling governor for `cpu_id`.
+/// Returns None when /sys/…/cpufreq/ is absent (containers, VMs, non-Linux).
+pub fn read_governor(core_id: usize) -> Option<String> {
+    let path = format!("/sys/devices/system/cpu/cpu{core_id}/cpufreq/scaling_governor");
+    std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
+}
+
+/// Set the scaling governor to 'performance' for `core_id`.
+/// Silent no-op when the sysfs path is absent.
+pub fn set_performance_governor(core_id: usize) {
+    let path = format!("/sys/devices/system/cpu/cpu{core_id}/cpufreq/scaling_governor");
+    let _ = std::fs::write(&path, "performance\n");
+}
+
+/// Restore a previously saved governor value for `core_id`.
+/// Silent no-op on any I/O error.
+pub fn restore_governor(core_id: usize, original: &str) {
+    let path = format!("/sys/devices/system/cpu/cpu{core_id}/cpufreq/scaling_governor");
+    let _ = std::fs::write(&path, original.as_bytes());
+}
+
 /// Pin the calling thread to `cpu_id` using `sched_setaffinity(2)`.
 /// Silent no-op on failure or on non-Linux targets.
 pub fn pin_to_cpu(cpu_id: usize) {

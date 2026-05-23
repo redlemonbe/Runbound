@@ -66,6 +66,7 @@ pub fn start_xdp(
     zones:        Arc<ArcSwap<LocalZoneSet>>,
     rate_limiter: Arc<RateLimiter>,
     acl:          Arc<Acl>,
+    cpu_governor: bool,
 ) -> Result<Option<XdpHandle>, String> {
     if std::env::var("RUNBOUND_DISABLE_XDP").is_ok() {
         tracing::info!("XDP disabled via RUNBOUND_DISABLE_XDP environment variable");
@@ -78,7 +79,7 @@ pub fn start_xdp(
                     virt = %iface, parent = %parent,
                     "XDP: virtual interface detected — retrying on parent"
                 );
-                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl);
+                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor);
                 if result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
                     tracing::info!(parent = %parent, "XDP active on parent interface");
                 }
@@ -94,7 +95,7 @@ pub fn start_xdp(
             }
         }
     }
-    start_xdp_on_iface(iface, zones, rate_limiter, acl)
+    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor)
 }
 
 fn start_xdp_on_iface(
@@ -102,6 +103,7 @@ fn start_xdp_on_iface(
     zones:        Arc<ArcSwap<LocalZoneSet>>,
     rate_limiter: Arc<RateLimiter>,
     acl:          Arc<Acl>,
+    cpu_governor: bool,
 ) -> Result<Option<XdpHandle>, String> {
     let ifidx = iface_index(iface)
         .ok_or_else(|| format!("interface {iface} not found"))?;
@@ -174,9 +176,15 @@ fn start_xdp_on_iface(
         let rl      = Arc::clone(&rate_limiter);
         let acl     = Arc::clone(&acl);
         let core_id = if cores.is_empty() { 0 } else { cores[q as usize % cores.len()] };
+        // #69: save original governor before the worker switches to "performance"
+        if cpu_governor {
+            if let Some(gov) = crate::cpu::read_governor(core_id) {
+                handle.governor_backups.push((core_id, gov));
+            }
+        }
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
-            .spawn(move || xdp_worker(sock, z, rl, acl, core_id))
+            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor))
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
@@ -333,11 +341,16 @@ fn xdp_worker(
     rate_limiter: Arc<RateLimiter>,
     acl:          Arc<Acl>,
     core_id:      usize,
+    cpu_governor: bool,
 ) {
     use libc::{poll, pollfd, POLLIN};
     use super::umem::RING_SIZE;
 
     crate::cpu::pin_to_cpu(core_id);
+    // #69: switch to performance governor after pinning to the target core
+    if cpu_governor {
+        crate::cpu::set_performance_governor(core_id);
+    }
 
     // Pre-allocate scratch buffers outside the hot loop to avoid per-batch
     // heap allocations.  Each Vec retains its capacity across iterations;
@@ -369,7 +382,24 @@ fn xdp_worker(
         tx_descs.clear();
         rx_addrs.clear();
 
-        for desc in &rxds {
+        for (i, desc) in rxds.iter().enumerate() {
+            // #71: prefetch the next packet's payload into L1 cache while processing
+            // this one. _mm_prefetch is a non-faulting hint — safe even for out-of-range
+            // addresses; the processor simply ignores an invalid prefetch target.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(next_desc) = rxds.get(i + 1) {
+                // SAFETY: `sock.umem.area` is the base of the mmap'd UMEM region. Adding
+                //         next_desc.addr stays within the mapped region for valid kernel-
+                //         supplied descriptors; _mm_prefetch never faults on bad addresses.
+                unsafe {
+                    let next_ptr = sock.umem.area.add(next_desc.addr as usize);
+                    std::arch::x86_64::_mm_prefetch(
+                        next_ptr as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
+
             rx_addrs.push(desc.addr);
 
             if let Some(tx_addr) = sock.umem.tx_free.pop_front() {

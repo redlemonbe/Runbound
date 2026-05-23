@@ -136,6 +136,10 @@ pub struct UnboundConfig {
     /// Enable AF/XDP kernel-bypass fast path. Default: true (when compiled with xdp feature).
     /// Set to `no` in unbound.conf, or pass `--no-xdp` on the command line, to disable.
     pub xdp: bool,
+    /// Set scaling governor to 'performance' on XDP worker cores. Default: false.
+    /// Eliminates frequency-scaling ramp-up jitter on DNS burst traffic.
+    /// Silent no-op when /sys/devices/system/cpu/cpuN/cpufreq/ is absent (containers, VMs).
+    pub xdp_cpu_governor: bool,
 
     // ── DNS prefetching ───────────────────────────────────────────────────────
     /// Pre-resolve popular domains before their cache entry expires. Default: false.
@@ -353,6 +357,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
         "cpu-affinity"        => cfg.cpu_affinity        = val.trim_matches('"') != "no",
         "xdp"                 => cfg.xdp                 = val.trim_matches('"') != "no",
+        "xdp-cpu-governor"    => cfg.xdp_cpu_governor    = val.trim_matches('"') == "yes",
         "prefetch"              => cfg.prefetch              = val.trim_matches('"') == "yes",
         "prefetch-threshold"    => cfg.prefetch_threshold    = val.parse().unwrap_or(5),
         "cache-flush-cooldown"  => cfg.cache_flush_cooldown  = val.parse().unwrap_or(60),

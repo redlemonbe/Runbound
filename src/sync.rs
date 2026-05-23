@@ -28,6 +28,27 @@ use crate::store::{
     load, load_blacklist, save, save_blacklist, BlacklistEntry, BlacklistStore, DnsEntry, DnsStore,
 };
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Extract the IP from a peer address string (strips the ephemeral port).
+/// Handles IPv4 ("1.2.3.4:port"), IPv6 ("[::1]:port"), and bare IPs.
+fn slave_ip(addr: &str) -> String {
+    // IPv6 bracketed: [::1]:54321
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some(pos) = rest.rfind(']') {
+            return rest[..pos].to_string();
+        }
+    }
+    // IPv4: 1.2.3.4:54321
+    if let Some(pos) = addr.rfind(':') {
+        // Ensure the part after ':' looks like a port, not an IPv6 segment
+        if addr[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+            return addr[..pos].to_string();
+        }
+    }
+    addr.to_string()
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const JOURNAL_CAPACITY: usize = 1_000;
@@ -56,12 +77,22 @@ pub struct SyncEvent {
     pub op:  SyncOp,
 }
 
-/// Lightweight record of a connected slave, updated on each /sync/delta call.
+/// Snapshot of a connected slave returned by GET /api/sync/slaves.
 #[derive(Debug, Clone, Serialize)]
 pub struct SlaveInfo {
-    pub addr:          String,
+    /// Slave IP address (deduplicated — ephemeral port stripped).
+    pub addr:           String,
+    /// Unix timestamp of the last contact.
+    pub last_seen_at:   u64,
+    /// Seconds elapsed since last contact (computed at query time).
     pub last_seen_secs: u64,
-    pub last_seq:      u64,
+    /// "connected" (seen ≤30s ago) or "disconnected".
+    pub status:         String,
+    pub last_seq:       u64,
+    /// Number of zones synchronised (0 = not tracked yet).
+    pub zones_synced:   u32,
+    /// Slave binary version (null = not reported yet).
+    pub version:        Option<String>,
 }
 
 // Max calls to /sync/cert per peer IP per 60-second window (TOFU bootstrap guard).
@@ -87,16 +118,28 @@ impl SyncJournal {
     }
 
     /// Record or refresh a slave connection (called from /sync/state and /sync/delta).
+    /// Deduplicates by IP — the ephemeral port is stripped so reconnects from the
+    /// same slave don't create duplicate entries.
     pub fn record_slave(&self, addr: String, seq: u64) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let ip = slave_ip(&addr);
         let mut map = self.connected_slaves.lock().unwrap_or_else(|e| panic!("sync: slaves mutex poisoned: {e}"));
-        map.insert(addr.clone(), SlaveInfo { addr, last_seen_secs: now, last_seq: seq });
+        map.insert(ip.clone(), SlaveInfo {
+            addr:           ip,
+            last_seen_at:   now,
+            last_seen_secs: 0,          // computed at query time
+            status:         String::new(), // computed at query time
+            last_seq:       seq,
+            zones_synced:   0,
+            version:        None,
+        });
     }
 
     /// Return a snapshot of recently-seen slaves (last-seen ≤ 5 min ago).
+    /// Computes last_seen_secs and status at call time.
     pub fn connected_slaves(&self) -> Vec<SlaveInfo> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -104,8 +147,19 @@ impl SyncJournal {
             .as_secs();
         let map = self.connected_slaves.lock().unwrap_or_else(|e| panic!("sync: slaves mutex poisoned: {e}"));
         map.values()
-            .filter(|s| now.saturating_sub(s.last_seen_secs) < 300)
-            .cloned()
+            .filter(|s| now.saturating_sub(s.last_seen_at) < 300)
+            .map(|s| {
+                let secs = now.saturating_sub(s.last_seen_at);
+                SlaveInfo {
+                    addr:           s.addr.clone(),
+                    last_seen_at:   s.last_seen_at,
+                    last_seen_secs: secs,
+                    status:         if secs < 30 { "connected".to_string() } else { "disconnected".to_string() },
+                    last_seq:       s.last_seq,
+                    zones_synced:   s.zones_synced,
+                    version:        s.version.clone(),
+                }
+            })
             .collect()
     }
 

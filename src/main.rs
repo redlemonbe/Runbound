@@ -100,7 +100,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
             .or_else(dns::xdp::socket::default_interface);
         match iface {
             Some(ref iface_name) => {
-                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl)) {
+                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor) {
                     Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); xdp_mode.store(match h.mode { dns::xdp::XdpMode::Drv => 1, dns::xdp::XdpMode::Skb => 2 }, Ordering::Relaxed); Some(h) }
                     Ok(None)    => None, // virtual interface or self-test — already warned
                     Err(e) => {
