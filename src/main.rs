@@ -77,7 +77,7 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: String) -> Result<()> {
-    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams) =
+    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams, per_upstream_resolvers, racing_wins) =
         build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
@@ -90,6 +90,40 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         tokio::spawn(dns::cache_snapshot::publish_loop(Arc::clone(&snapshot), Arc::clone(&mutable)));
         xdp_cache_snapshot = Some(snapshot);
         xdp_cache_mutable  = Some(mutable);
+    }
+
+    // #29: load XDP cache from disk on startup.
+    #[cfg(feature = "xdp")]
+    if let Some(ref cache) = xdp_cache_mutable {
+        let cache_file = runtime::base_dir().join("xdp_cache.rkyv");
+        let loaded = dns::cache_snapshot::load_xdp_cache(cache, &cache_file, cfg.xdp_cache_snapshot_size);
+        if loaded > 0 {
+            info!(entries = loaded, path = %cache_file.display(), "XDP cache loaded from disk");
+        }
+    }
+
+    // #29: SIGUSR2 — save XDP cache to disk.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let cache_for_usr2 = xdp_cache_mutable.clone();
+        tokio::spawn(async move {
+            let mut usr2 = match signal(SignalKind::user_defined2()) {
+                Ok(s) => s,
+                Err(e) => { tracing::warn!("Cannot install SIGUSR2 handler: {e}"); return; }
+            };
+            let cache_file = runtime::base_dir().join("xdp_cache.rkyv");
+            loop {
+                usr2.recv().await;
+                match &cache_for_usr2 {
+                    Some(cache) => match dns::cache_snapshot::save_xdp_cache(cache, &cache_file) {
+                        Ok(n)  => info!(entries = n, path = %cache_file.display(), "SIGUSR2 — XDP cache saved"),
+                        Err(e) => tracing::warn!(err = %e, "SIGUSR2 — XDP cache save failed"),
+                    },
+                    None => tracing::debug!("SIGUSR2 — XDP cache not active, nothing to save"),
+                }
+            }
+        });
     }
 
     // ── XDP fast path (optional, feature-gated) ───────────────────────────
@@ -148,7 +182,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         }
     };
 
-    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker, xdp_cache_mutable, cfg.xdp_cache_snapshot_size, upstreams).await;
+    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker, xdp_cache_mutable, cfg.xdp_cache_snapshot_size, upstreams, per_upstream_resolvers, racing_wins).await;
     audit.send(audit::AuditEvent::Shutdown);
     result
 }
@@ -297,6 +331,8 @@ async fn build_and_launch(
     dns::server::SharedResolver,
     Option<Arc<dns::prefetch::PrefetchTracker>>,
     upstreams::SharedUpstreams,
+    dns::server::SharedResolversVec,
+    Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -402,11 +438,11 @@ async fn build_and_launch(
     tokio::spawn(stats::qps_update_loop(Arc::clone(&global_stats), Arc::clone(&snapshot_cache)));
     let log_buffer = logbuffer::new_shared(cfg.log_retention, cfg.log_client_ip);
 
-    // ── SIGUSR1/SIGUSR2: explicit handlers to prevent accidental kills ────────
+    // ── SIGUSR1: stats dump (SIGUSR2 is wired in async_main after cache init) ──
     // The default OS action for SIGUSR1/SIGUSR2 is to terminate the process.
     // A production DNS server must never die from a monitoring tool or logrotate
     // script sending these signals.  SIGUSR1 dumps a live stats snapshot to the
-    // log; SIGUSR2 is reserved (ignored).
+    // log; SIGUSR2 triggers XDP cache persistence (#29).
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -429,16 +465,6 @@ async fn build_and_launch(
                     hit_rate  = snap.cache_hit_rate,
                     "SIGUSR1 — live stats dump"
                 );
-            }
-        });
-        tokio::spawn(async move {
-            let mut usr2 = match signal(SignalKind::user_defined2()) {
-                Ok(s) => s,
-                Err(e) => { tracing::warn!("Cannot install SIGUSR2 handler: {e}"); return; }
-            };
-            loop {
-                usr2.recv().await;
-                tracing::debug!("SIGUSR2 received — ignored (reserved for future use)");
             }
         });
     }
@@ -548,6 +574,21 @@ async fn build_and_launch(
         None
     };
 
+    // #33: per-upstream resolvers for racing mode.
+    let per_upstream_resolvers = dns::server::create_shared_resolvers_vec();
+    if cfg.upstream_racing {
+        let addrs = upstreams::upstream_addrs(&upstreams);
+        match dns::server::build_per_upstream_resolvers(&addrs, cfg.dnssec_validation) {
+            Ok(vec) => {
+                info!(count = vec.len(), "upstream-racing: per-upstream resolvers built");
+                per_upstream_resolvers.store(Arc::new(vec));
+            }
+            Err(e) => tracing::warn!(err = %e, "upstream-racing: failed to build per-upstream resolvers — racing disabled"),
+        }
+    }
+    let racing_wins: Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>> =
+        Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new()));
+
     let state = AppState {
         zones:            Arc::clone(&zones),
         tls_cfg:          Arc::clone(&tls_cfg),
@@ -569,6 +610,8 @@ async fn build_and_launch(
         last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
         cache_evictions:  Arc::new(std::sync::atomic::AtomicU64::new(0)),
         lookup_limiter:   Arc::new(api::ReloadLimiter::new_with_params(10.0, 10.0)),
+        per_upstream_resolvers: Arc::clone(&per_upstream_resolvers),
+        racing_wins:            Arc::clone(&racing_wins),
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
@@ -581,7 +624,7 @@ async fn build_and_launch(
     let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200));
     let acl          = Arc::new(Acl::from_config(&cfg.access_control));
 
-    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams))
+    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams, per_upstream_resolvers, racing_wins))
 }
 
 fn print_help() {
