@@ -1,6 +1,6 @@
 [package]
 name = "runbound"
-version = "0.6.10"
+version = "0.6.11"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "AGPL-3.0-or-later"
