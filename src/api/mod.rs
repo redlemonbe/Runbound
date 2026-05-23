@@ -2,6 +2,8 @@
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Runbound REST API — full DNS management + feeds + DoT/DoH status
 
+pub mod relay;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -15,13 +17,13 @@ use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State, rejection::QueryRejection},
-    http::{HeaderValue, Request, StatusCode},
+    http::{HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     response::sse::{Event, KeepAlive, Sse},
     Json as JsonExtract,
     Router,
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
 };
 use arc_swap::ArcSwap;
 use futures_util::stream;
@@ -244,6 +246,10 @@ pub struct AppState {
     /// Master: Some(journal) to record write events for slave replication.
     /// Slave / standalone: None.
     pub sync_journal: Option<Arc<SyncJournal>>,
+    /// Sync/relay HMAC key — used to sign relay requests (#85/#87).
+    pub sync_key:     Option<String>,
+    /// This node's stable UUID — set on slave for identification (#88).
+    pub node_id:      Option<String>,
     /// True when running as slave — all write operations are blocked (503).
     pub slave_mode:   bool,
     /// Directory where runtime files (api.key, dns_entries.json, …) are stored.
@@ -529,6 +535,9 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics",           get(metrics_handler))
         // Sync
         .route("/sync/slaves",       get(sync_slaves_handler))
+        // Node relay (#85/#87/#88) — master side
+        .route("/nodes",                          get(relay::list_nodes_handler))
+        .route("/nodes/:node_id/relay/*path",     any(relay::relay_forward_handler))
         // Administration
         .route("/rotate-key",        post(rotate_key_handler))
         .layer(middleware::from_fn_with_state(state.clone(), slave_guard_middleware))
@@ -582,6 +591,8 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"PATCH",  "path":"/api/upstreams/:id",       "description":"Rename a runtime upstream resolver (only 'name' is patchable)"},
             {"method":"POST",   "path":"/api/upstreams/:id/probe", "description":"Trigger an immediate health probe for one upstream"},
             {"method":"GET",    "path":"/api/sync/slaves",       "description":"List connected slave nodes (master mode only)"},
+            {"method":"GET",    "path":"/api/nodes",             "description":"List registered nodes with relay capability (#88)"},
+            {"method":"ANY",    "path":"/api/nodes/{id}/relay/*", "description":"Relay request to a registered slave via HMAC-signed channel (#85)"},
             {"method":"GET",    "path":"/api/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
             {"method":"DELETE", "path":"/api/logs",             "description":"Clear the in-memory query log ring buffer (GDPR right-to-erasure)"},
             {"method":"GET",    "path":"/api/audit/tail",       "description":"Last N audit log entries — ?n=100"},
@@ -1081,6 +1092,11 @@ async fn persist_and_swap(
     });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::AddDns { entry: entry.clone() });
+        if let Some(ref k) = s.sync_key {
+            if let Ok(b) = serde_json::to_vec(&entry) {
+                relay::push_to_slaves(j, k, Method::POST, "dns".to_string(), bytes::Bytes::from(b));
+            }
+        }
     }
     Ok(())
 }
@@ -1161,6 +1177,9 @@ async fn delete_dns_handler(
     s.audit.send(AuditEvent::DnsDelete { id: id.clone() });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::DeleteDns { id: id.clone() });
+        if let Some(ref k) = s.sync_key {
+            relay::push_to_slaves(j, k, Method::DELETE, format!("dns/{id}"), bytes::Bytes::new());
+        }
     }
     (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id})))
 }
@@ -1351,6 +1370,11 @@ async fn add_blacklist_handler(
     s.audit.send(AuditEvent::BlacklistAdd { domain: entry.domain.clone() });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::AddBlacklist { entry: entry.clone() });
+        if let Some(ref k) = s.sync_key {
+            if let Ok(b) = serde_json::to_vec(&entry) {
+                relay::push_to_slaves(j, k, Method::POST, "blacklist".to_string(), bytes::Bytes::from(b));
+            }
+        }
     }
     (StatusCode::CREATED, JsonExtract(serde_json::json!({
         "status": "ok",
@@ -1390,6 +1414,9 @@ async fn delete_blacklist_handler(
     s.audit.send(AuditEvent::BlacklistDelete { id: id.clone() });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::DeleteBlacklist { id: id.clone() });
+        if let Some(ref k) = s.sync_key {
+            relay::push_to_slaves(j, k, Method::DELETE, format!("blacklist/{id}"), bytes::Bytes::new());
+        }
     }
     (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id,"domain":removed.domain})))
 }
@@ -1638,6 +1665,20 @@ async fn add_upstream_handler(
     upstreams::save_upstreams(&s.upstreams, &s.base_dir);
 
     info!(id = %entry.id, addr = %entry.addr, port = entry.port, protocol = %entry.protocol, "upstream added via API");
+    if let (Some(ref j), Some(ref k)) = (&s.sync_journal, &s.sync_key) {
+        j.push(SyncOp::AddUpstream {
+            addr: entry.addr.clone(), port: entry.port,
+            protocol: entry.protocol.clone(), name: entry.name.clone(),
+            tls_hostname: entry.tls_hostname.clone(),
+        });
+        let body = serde_json::json!({
+            "addr": entry.addr, "port": entry.port,
+            "protocol": entry.protocol, "name": entry.name, "tls_hostname": entry.tls_hostname,
+        });
+        if let Ok(b) = serde_json::to_vec(&body) {
+            relay::push_to_slaves(j, k, Method::POST, "upstreams".to_string(), bytes::Bytes::from(b));
+        }
+    }
     (StatusCode::CREATED, JsonExtract(serde_json::json!({
         "status": "ok", "upstream": entry
     }))).into_response()
@@ -1691,6 +1732,10 @@ async fn delete_upstream_handler(
             // FIX #43: persist after successful delete
             upstreams::save_upstreams(&s.upstreams, &s.base_dir);
             info!(id = %id, addr = %removed.addr, "upstream deleted via API");
+            if let (Some(ref j), Some(ref k)) = (&s.sync_journal, &s.sync_key) {
+                j.push(SyncOp::DeleteUpstream { id: id.clone() });
+                relay::push_to_slaves(j, k, Method::DELETE, format!("upstreams/{id}"), bytes::Bytes::new());
+            }
             (StatusCode::OK, JsonExtract(serde_json::json!({
                 "status": "ok", "deleted_id": id, "addr": removed.addr
             }))).into_response()
@@ -2450,6 +2495,8 @@ mod tests {
             log_buffer,
             upstreams,
             sync_journal:     None,
+            sync_key:         None,
+            node_id:          None,
             slave_mode:       false,
             base_dir:         Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
             audit:            crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
@@ -3934,6 +3981,8 @@ mod tests {
             log_buffer,
             upstreams,
             sync_journal:     None,
+            sync_key:         None,
+            node_id:          None,
             slave_mode:       false,
             base_dir:         Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
             audit:            crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),

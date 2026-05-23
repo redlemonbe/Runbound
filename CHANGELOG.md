@@ -9,6 +9,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.20] — 2026-05-23
+
+### Added
+
+- **Relay chiffré master→slave (#85)** (`src/api/relay.rs`, `src/sync.rs`)
+
+  Les handlers de l'API maître acceptent désormais `GET|POST|PUT|DELETE /api/nodes/{node_id}/relay/*path` et relaient la requête vers l'esclave identifié avec un canal HMAC-SHA256 (sync-key partagé). Chaque requête est signée via `X-Runbound-TS` (timestamp Unix) + `X-Runbound-Sig` (HMAC-SHA256 hex). Protection anti-rejeu : le serveur esclave rejette tout timestamp avec |now − ts| > 30 s. La clé sync est réutilisée ; la vérification est en temps constant (`subtle`). Le serveur relay de l'esclave écoute sur `sync-port` (TLS auto-signé, même infrastructure que le sync), accessible depuis le maître.
+
+- **Config push master→slaves (#87)** (`src/api/mod.rs`, `src/api/relay.rs`)
+
+  Après chaque mutation réussie sur le maître (POST/DELETE dns, blacklist, upstreams), le maître pousse la même opération vers tous les esclaves enregistrés via le canal relay HMAC. Implémenté en fire-and-forget (spawn) : l'opération maître n'est jamais bloquée par un esclave injoignable. Les journaux retracent les succès et échecs par node_id. Nouveaux variants `AddUpstream` / `DeleteUpstream` dans `SyncOp` pour la réplication des upstreams.
+
+- **Slave auto-registration (#88)** (`src/sync.rs`, `src/main.rs`)
+
+  À démarrage, chaque esclave génère (ou recharge depuis `node-id`) un UUID stable et s'enregistre auprès du maître via `POST /nodes/register` sur le sync-port TLS (HMAC signé). L'enregistrement inclut `node_id`, `relay_host` (`ip:port`) et le fingerprint SHA-256 du cert relay. Le maître persiste les enregistrements dans `slaves.json` (rechargé à chaque démarrage). Nouvel endpoint `GET /api/nodes` retourne la liste des esclaves enregistrés avec relay capability.
+
+---
+
 ## [0.6.19] — 2026-05-23
 
 ### Fixed
