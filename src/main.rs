@@ -615,10 +615,30 @@ async fn build_and_launch(
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");
-    let listener = tokio::net::TcpListener::bind(&api_addr).await
+    // Bind with std so the fd is runtime-agnostic; convert inside the API runtime.
+    let std_listener = std::net::TcpListener::bind(&api_addr)
         .map_err(|e| anyhow::anyhow!("API bind {api_addr}: {e}"))?;
+    std_listener.set_nonblocking(true)
+        .map_err(|e| anyhow::anyhow!("API set_nonblocking: {e}"))?;
     info!(addr=%api_addr, "REST API listening (localhost only)");
-    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+    // Dedicated 2-thread runtime isolated from the DNS runtime.
+    // Under DoT rebuild storms the DNS runtime can be flooded with hundreds of
+    // tasks/second, which starves axum task slots and freezes the API entirely.
+    // A separate runtime gives the HTTP server its own scheduler queue.
+    // Box::leak is intentional: the runtime must stay alive for the whole process.
+    let api_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("runbound-api")
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("API runtime: {e}"))?;
+    api_rt.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .expect("TcpListener::from_std failed");
+        axum::serve(listener, app).await.ok()
+    });
+    Box::leak(Box::new(api_rt));
 
     // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
     let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200));

@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.18] — 2026-05-23
+
+### Fixed
+
+- **DoT pool exhaustion: boucle de rebuild sans backoff** (`src/dns/server.rs`)  
+  Sous charge soutenue, chaque query échouant sur `NoConnections` déclenchait immédiatement un `rebuild_and_swap`, produisant des centaines de rebuilds/seconde. Chaque rebuild crée N tâches Tokio supplémentaires qui génèrent à leur tour d'autres rebuilds — boucle de feedback positive.  
+  Fix : debounce global avec deux atomiques `AtomicU64`. Le rebuild n'est autorisé qu'une fois toutes les 2 s via `compare_exchange`. Les queries concurrentes qui perdent la CAS retournent SERVFAIL immédiatement sans déclencher de rebuild. Le log est throttlé à au plus une ligne toutes les 10 s (niveau `INFO`).
+
+- **API HTTP freeze sous charge Tokio** (`src/main.rs`)  
+  Le serveur axum (REST API) partageait le runtime Tokio DNS principal. Lors d'une storm de rebuilds DoT, le scheduler était saturé de tâches et les handlers axum ne recevaient plus de slots CPU. La socket TCP restait en `LISTEN` mais les accepts n'étaient jamais traités — nginx renvoyait `504`.  
+  Fix : runtime Tokio dédié à 2 threads (`runbound-api`) pour axum, isolé du runtime DNS. Le fd TCP est lié avec `std::net::TcpListener` (runtime-agnostic) puis converti en `tokio::net::TcpListener` à l'intérieur du runtime API. Le runtime est `Box::leak`-é pour vivre toute la durée du process.
+
+---
+
 ## [0.6.17] — 2026-05-23
 
 ### Fixed
