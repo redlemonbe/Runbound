@@ -26,9 +26,13 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# Give runbound access to port 53 without running as root
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Capabilities — CAP_NET_ADMIN + CAP_BPF required for XDP attach
+# CAP_NET_RAW required for AF_XDP socket
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+
+# AF_XDP socket family
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
 
 # Hardening
 NoNewPrivileges=yes
@@ -37,10 +41,17 @@ PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
+ProtectKernelModules=no        # eBPF JIT requires kernel module access
 ProtectControlGroups=yes
 ReadWritePaths=/etc/runbound /var/log/runbound
-LimitNOFILE=65536
+MemoryDenyWriteExecute=no      # required for eBPF JIT compilation
+LimitNOFILE=131072             # 32× SO_REUSEPORT sockets + XDP sockets + DoT connections
+LimitNPROC=4096                # cap on XDP worker threads (max 64) + tokio pool
+LimitMEMLOCK=infinity          # required for AF_XDP UMEM mmap
+
+# Optional: pre-allocate hugepages before Runbound starts (recommended in production)
+# Uncomment and adjust the count to match xdp-hugepages in runbound.conf
+# ExecStartPre=/usr/sbin/sysctl -w vm.nr_hugepages=512
 
 [Install]
 WantedBy=multi-user.target
@@ -142,6 +153,26 @@ systemctl reload runbound
 # Look for this log line after reload:
 journalctl -u runbound -n 20 | grep "Hot-reload complete"
 # → INFO Hot-reload complete local_zones=5 local_data=12
+```
+
+---
+
+## Signal handling
+
+| Signal | Effect |
+|--------|--------|
+| `SIGHUP` | Hot-reload zones and config (same as `POST /api/reload`). In-flight queries finish on the old snapshot. |
+| `SIGTERM` | Graceful shutdown — XDP detached, connections drained, process exits cleanly. |
+| `SIGUSR1` | Dump live stats to the log: total queries, forwarded, blocked, 1-minute QPS, cache hit rate, uptime. |
+| `SIGUSR2` | Ignored (reserved for future use). |
+
+```bash
+# Reload zones
+systemctl reload runbound          # sends SIGHUP
+
+# Dump live stats to journal
+kill -USR1 $(systemctl show -p MainPID --value runbound)
+journalctl -u runbound -n 5        # look for the stats line
 ```
 
 ---

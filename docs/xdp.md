@@ -222,6 +222,56 @@ arrives but is never delivered to the AF_XDP socket.
 
 Full details, reference architecture, and troubleshooting: [docs/proxmox.md](proxmox.md)
 
+## NIC ring buffer auto-sizing
+
+Intel ixgbe cards (X520, X540, X710) ship with a default RX ring of **512 descriptors**.
+At 10 M QPS that represents only 51 µs of tolerance before the hardware FIFO overflows —
+packets are dropped silently before the XDP program ever sees them
+(`rx_no_buffer_count` increments in `ethtool -S`, zero Runbound log).
+
+At startup, Runbound calls `SIOCETHTOOL` (kernel ioctl, no libnetlink dependency) to:
+
+1. **GET** `ETHTOOL_GRINGPARAM` — read `rx_max_pending` / `tx_max_pending` from the driver
+2. **SET** `ETHTOOL_SRINGPARAM` — apply the maximum supported ring depth before XDP attach
+
+```
+[INFO]  xdp: NIC ring ens18 rx 512→4096 tx 256→4096
+[INFO]  xdp: fill ring 4096 · rx ring 4096 · tx ring 4096
+```
+
+If the resize fails (insufficient privileges, virtual NIC, cloud hypervisor):
+
+```
+[WARN]  xdp: ring resize failed on ens18 — Operation not permitted
+```
+
+The server continues normally with the driver default — performance degrades under extreme
+load but the service remains functional.
+
+**Verify post-startup:**
+
+```bash
+ethtool -g enp4s0 | grep "RX:"               # → 4096
+ethtool -S enp4s0 | grep rx_no_buffer_count  # → 0 under load
+```
+
+**Monitor via API:**
+
+```bash
+curl -s -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/system \
+  | python3 -c "import sys,json; s=json.load(sys.stdin); \
+    print(f'ring {s[\"nic_rx_ring\"]}/{s[\"nic_rx_ring_max\"]}  dropped {s[\"nic_rx_dropped\"]}')"
+```
+
+Config override — force a specific ring size:
+
+```
+server:
+    xdp-ring-size: 4096    # default: auto
+```
+
+---
+
 ## Expected QPS
 
 | Hardware | Mode | Estimated peak |
