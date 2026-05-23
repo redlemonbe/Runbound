@@ -29,6 +29,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+use hickory_proto::rr::{LowerName, Name, RecordType};
 use crate::dns::{BlacklistAction, ZoneAction, local::{LocalZoneSet, parse_local_data}};
 use crate::dns::server::SharedResolver;
 use crate::feeds::{self, FeedFormat, add_feed, builtin_presets, remove_feed, update_all_feeds, update_one_feed};
@@ -67,12 +68,16 @@ pub struct ReloadLimiter {
 
 impl ReloadLimiter {
     pub fn new() -> Self {
+        Self::new_with_params(2.0, 2.0)
+    }
+
+    pub fn new_with_params(rate: f64, burst: f64) -> Self {
         Self {
             inner: std::sync::Mutex::new(ReloadLimiterInner {
-                tokens:      2.0,
+                tokens:      burst,
                 last_refill: Instant::now(),
-                rate:        2.0,
-                burst:       2.0,
+                rate,
+                burst,
             }),
         }
     }
@@ -255,6 +260,10 @@ pub struct AppState {
     /// #51: Cache eviction counter — reset on flush. Hits/misses are read
     /// directly from `stats.cache_hits/misses` (they are incremented there).
     pub cache_evictions: Arc<AtomicU64>,
+    /// #75: Rate limiter for POST /api/dns/lookup — 10 req/s global.
+    /// The API binds to 127.0.0.1 only, so a global limit is equivalent
+    /// to a per-IP limit in practice.
+    pub lookup_limiter: Arc<ReloadLimiter>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -487,6 +496,7 @@ pub fn router(state: AppState) -> Router {
         .route("/config",            get(config_handler))
         .route("/reload",            post(reload_handler))
         // DNS CRUD
+        .route("/dns/lookup",        post(dns_lookup_handler))
         .route("/dns",               get(list_dns_handler).post(add_dns_handler))
         .route("/dns/:id",           delete(delete_dns_handler))
         // Blacklist
@@ -1100,6 +1110,119 @@ async fn delete_dns_handler(
     (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id})))
 }
 
+// ── POST /api/dns/lookup ───────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+struct DnsLookupRequest {
+    name: String,
+    #[serde(rename = "type", default = "dns_lookup_default_type")]
+    qtype: String,
+}
+
+fn dns_lookup_default_type() -> String { "A".to_string() }
+
+async fn dns_lookup_handler(
+    State(s): State<AppState>,
+    ApiJson(p): ApiJson<DnsLookupRequest>,
+) -> impl IntoResponse {
+    if !s.lookup_limiter.check() {
+        return (StatusCode::TOO_MANY_REQUESTS, JsonExtract(serde_json::json!({
+            "error": "RATE_LIMITED", "details": "Max 10 req/s"
+        }))).into_response();
+    }
+
+    if let Err(e) = validate_dns_name(&p.name) {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_NAME", "details": e
+        }))).into_response();
+    }
+
+    let qtype: RecordType = match p.qtype.to_uppercase().as_str() {
+        "A"     => RecordType::A,
+        "AAAA"  => RecordType::AAAA,
+        "MX"    => RecordType::MX,
+        "TXT"   => RecordType::TXT,
+        "CNAME" => RecordType::CNAME,
+        "PTR"   => RecordType::PTR,
+        other   => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_TYPE",
+            "details": format!("Unsupported type '{other}'. Use: A, AAAA, MX, TXT, CNAME, PTR")
+        }))).into_response(),
+    };
+
+    let fqdn_str = if p.name.ends_with('.') { p.name.clone() } else { format!("{}.", p.name) };
+    let name = match fqdn_str.parse::<Name>() {
+        Ok(n) => n,
+        Err(_) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
+            "error": "INVALID_NAME", "details": "Could not parse as DNS name"
+        }))).into_response(),
+    };
+    let lower = LowerName::from(&name);
+
+    // Check local zones first
+    {
+        let zones_snap = s.zones.load();
+        match zones_snap.find(&lower) {
+            Some(crate::dns::ZoneAction::Refuse) | Some(crate::dns::ZoneAction::NxDomain) => {
+                return (StatusCode::OK, JsonExtract(serde_json::json!({
+                    "name": p.name, "type": p.qtype,
+                    "answers": [], "status": "BLOCKED",
+                    "elapsed_ms": 0, "from_cache": false
+                }))).into_response();
+            }
+            Some(crate::dns::ZoneAction::Static) | Some(crate::dns::ZoneAction::Redirect) => {
+                let records = zones_snap.local_records(&lower, qtype);
+                let answers: Vec<serde_json::Value> = records.iter().map(|r| {
+                    serde_json::json!({ "ttl": r.ttl, "data": r.data.to_string() })
+                }).collect();
+                return (StatusCode::OK, JsonExtract(serde_json::json!({
+                    "name": p.name, "type": p.qtype,
+                    "answers": answers, "status": "NOERROR",
+                    "elapsed_ms": 0, "from_cache": true
+                }))).into_response();
+            }
+            None => {}
+        }
+    }
+
+    // Resolve upstream
+    let start = std::time::Instant::now();
+    match s.resolver.load().lookup(name, qtype).await {
+        Ok(lookup) => {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let from_cache = elapsed_ms * 1000 < crate::stats::CACHE_HIT_THRESHOLD_US;
+            let answers: Vec<serde_json::Value> = lookup.answers().iter().map(|r| {
+                serde_json::json!({ "ttl": r.ttl, "data": r.data.to_string() })
+            }).collect();
+            (StatusCode::OK, JsonExtract(serde_json::json!({
+                "name": p.name, "type": p.qtype,
+                "answers": answers, "status": "NOERROR",
+                "elapsed_ms": elapsed_ms, "from_cache": from_cache
+            }))).into_response()
+        }
+        Err(e) => {
+            use hickory_resolver::net::{DnsError, NetError, NoRecords};
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let status = match &e {
+                NetError::Dns(DnsError::NoRecordsFound(NoRecords { response_code, .. })) => {
+                    use hickory_proto::op::ResponseCode;
+                    match response_code {
+                        ResponseCode::NXDomain => "NXDOMAIN",
+                        ResponseCode::Refused  => "REFUSED",
+                        _                      => "SERVFAIL",
+                    }
+                }
+                _ => "SERVFAIL",
+            };
+            (StatusCode::OK, JsonExtract(serde_json::json!({
+                "name": p.name, "type": p.qtype,
+                "answers": [], "status": status,
+                "elapsed_ms": elapsed_ms, "from_cache": false
+            }))).into_response()
+        }
+    }
+}
+
 // ── Blacklist ──────────────────────────────────────────────────────────────
 
 async fn list_blacklist_handler(State(_s): State<AppState>) -> impl IntoResponse {
@@ -1220,7 +1343,20 @@ async fn delete_blacklist_handler(
 
 async fn get_feeds_handler(State(_s): State<AppState>) -> impl IntoResponse {
     let config = feeds::load_feeds().unwrap_or_default();
-    (StatusCode::OK, JsonExtract(serde_json::json!({"feeds": config.feeds, "total": config.feeds.len()})))
+    let feeds: Vec<serde_json::Value> = config.feeds.iter().map(|f| {
+        let blocked_count: serde_json::Value = if f.enabled {
+            serde_json::json!(feeds::load_feed_domains(&f.id).len())
+        } else {
+            serde_json::Value::Null
+        };
+        let mut v = serde_json::to_value(f).unwrap_or_default();
+        if let serde_json::Value::Object(ref mut m) = v {
+            m.insert("blocked_count".to_string(), blocked_count);
+        }
+        v
+    }).collect();
+    let total = feeds.len();
+    (StatusCode::OK, JsonExtract(serde_json::json!({"feeds": feeds, "total": total})))
 }
 
 async fn add_feed_handler(
@@ -1946,6 +2082,8 @@ fn render_prometheus_metrics(
     out.push_str(&fmt_counter("runbound_cache_evictions_total",      "Total cache evictions",                           evictions));
     out.push_str(&fmt_gauge(  "runbound_uptime_seconds",             "Service uptime in seconds",                       snap.uptime_secs));
     out.push_str(&fmt_gauge(  "runbound_xdp_active",                 "Whether XDP fast path is active (1=yes, 0=no)",   xdp_active as u8));
+    out.push_str(&fmt_counter("runbound_xdp_cache_hits_total",       "DNS responses served from XDP cache snapshot",
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS.load(std::sync::atomic::Ordering::Relaxed)));
 
     // Per-upstream metrics with labels — omit latency when not yet measured (null → skip, no NaN).
     if !upstreams.is_empty() {
@@ -2139,10 +2277,10 @@ mod tests {
         // Initialise BASE_DIR for store/feeds path resolution (OnceLock — idempotent).
         let _ = crate::runtime::BASE_DIR.set(std::path::PathBuf::from("/tmp/runbound-test"));
 
-        let zones = Arc::new(ArcSwap::new(Arc::new(
-            crate::dns::local::LocalZoneSet::default()
-        )));
         let cfg_arc = Arc::new(cfg);
+        let zones = Arc::new(ArcSwap::new(Arc::new(
+            crate::dns::local::LocalZoneSet::from_config(&cfg_arc.local_zones, &cfg_arc.local_data)
+        )));
         let log_buffer = crate::logbuffer::new_shared(1000, true);
         let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
         let resolver  = crate::dns::server::create_shared_resolver(&cfg_arc)
@@ -2170,6 +2308,7 @@ mod tests {
             resolver,
             last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
             cache_evictions:  Arc::new(AtomicU64::new(0)),
+            lookup_limiter:   Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
         };
         router(state)
     }
@@ -3635,6 +3774,7 @@ mod tests {
             resolver,
             last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
             cache_evictions:  Arc::new(AtomicU64::new(0)),
+            lookup_limiter:   Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
         };
         let app = router(state);
 
@@ -3673,5 +3813,95 @@ mod tests {
         assert_eq!(del2.status(), StatusCode::NOT_FOUND, "re-delete must return 404");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── POST /api/dns/lookup (#75) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dns_lookup_no_auth_rejected() {
+        let app = make_test_app();
+        let body = r#"{"name":"example.com"}"#;
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/dns/lookup")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn dns_lookup_invalid_domain_rejected() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let body = r#"{"name":"-invalid-domain-","type":"A"}"#;
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/dns/lookup")
+                .header(k, v).header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let j = body_json(resp.into_body()).await;
+        assert_eq!(j["error"], "INVALID_NAME");
+    }
+
+    #[tokio::test]
+    async fn dns_lookup_invalid_type_rejected() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let body = r#"{"name":"example.com","type":"SOA"}"#;
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/dns/lookup")
+                .header(k, v).header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let j = body_json(resp.into_body()).await;
+        assert_eq!(j["error"], "INVALID_TYPE");
+    }
+
+    #[tokio::test]
+    async fn dns_lookup_blocked_domain_returns_blocked_status() {
+        // Build app with a blocked zone
+        let mut cfg = crate::config::parser::UnboundConfig::default();
+        cfg.local_zones.push(crate::config::parser::LocalZone {
+            name: "blocked.test.".to_string(),
+            zone_type: "refuse".to_string(),
+        });
+        let app = make_test_app_with_cfg(cfg);
+        let (k, v) = auth_header();
+        let body = r#"{"name":"blocked.test","type":"A"}"#;
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/dns/lookup")
+                .header(k, v).header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp.into_body()).await;
+        assert_eq!(j["status"], "BLOCKED");
+        assert_eq!(j["answers"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_lookup_missing_name_rejected() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let body = r#"{"type":"A"}"#;
+        let resp = app.oneshot(
+            Request::builder()
+                .method("POST").uri("/api/dns/lookup")
+                .header(k, v).header("Content-Type", "application/json")
+                .header("Content-Length", body.len().to_string())
+                .body(Body::from(body)).unwrap()
+        ).await.unwrap();
+        // Missing required field → unprocessable entity from ApiJson
+        assert!(resp.status().is_client_error());
     }
 }

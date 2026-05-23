@@ -80,6 +80,18 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
     let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker) =
         build_and_launch(&cfg, base_dir, cfg_path).await?;
 
+    // #60: XDP cache snapshot — create only when XDP is enabled and configured.
+    let mut xdp_cache_snapshot: Option<dns::cache_snapshot::SharedCacheSnapshot> = None;
+    let mut xdp_cache_mutable:  Option<dns::cache_snapshot::MutableCacheMap>     = None;
+    #[cfg(feature = "xdp")]
+    if cfg.xdp && cfg.xdp_cache_snapshot {
+        let mutable  = Arc::new(std::sync::Mutex::new(dns::cache_snapshot::CacheSnapshot::default()));
+        let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(dns::cache_snapshot::CacheSnapshot::default())));
+        tokio::spawn(dns::cache_snapshot::publish_loop(Arc::clone(&snapshot), Arc::clone(&mutable)));
+        xdp_cache_snapshot = Some(snapshot);
+        xdp_cache_mutable  = Some(mutable);
+    }
+
     // ── XDP fast path (optional, feature-gated) ───────────────────────────
     // The handle must stay alive for the entire process lifetime; dropping it
     // would detach the XDP program and destroy the XSKMAP.
@@ -100,7 +112,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
             .or_else(dns::xdp::socket::default_interface);
         match iface {
             Some(ref iface_name) => {
-                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor, cfg.xdp_irq_affinity, cfg.xdp_hugepages) {
+                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor, cfg.xdp_irq_affinity, cfg.xdp_hugepages, xdp_cache_snapshot.clone()) {
                     Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); xdp_mode.store(match h.mode { dns::xdp::XdpMode::Drv => 1, dns::xdp::XdpMode::Skb => 2 }, Ordering::Relaxed); Some(h) }
                     Ok(None)    => None, // virtual interface or self-test — already warned
                     Err(e) => {
@@ -122,7 +134,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         }
     };
 
-    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker).await;
+    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker, xdp_cache_mutable, cfg.xdp_cache_snapshot_size).await;
     audit.send(audit::AuditEvent::Shutdown);
     result
 }
@@ -499,6 +511,7 @@ async fn build_and_launch(
         resolver:         Arc::clone(&resolver),
         last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
         cache_evictions:  Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        lookup_limiter:   Arc::new(api::ReloadLimiter::new_with_params(10.0, 10.0)),
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");

@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use hickory_proto::op::{Metadata, ResponseCode};
+use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
+use hickory_proto::op::Query as DnsQuery;
+use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_resolver::{
     TokioResolver,
@@ -89,28 +91,35 @@ pub struct RunboundHandler {
     dnssec_log_bogus: bool,
     /// Optional prefetch tracker — None when prefetch: no (default).
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
+    /// #60: mutable cache map shared with XDP workers (via publish_loop).
+    /// None when xdp-cache-snapshot: no or XDP feature not compiled.
+    xdp_cache:         Option<super::cache_snapshot::MutableCacheMap>,
+    cache_max_entries: usize,
 }
 
 impl RunboundHandler {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        zones:            Arc<ArcSwap<LocalZoneSet>>,
-        resolver:         Arc<ArcSwap<TokioResolver>>,
-        rate_limiter:     Arc<RateLimiter>,
-        acl:              Arc<Acl>,
-        private_addrs:    Arc<PrivateAddressSet>,
-        cache_max_ttl:    u32,
-        stats:            Arc<Stats>,
-        log_buffer:       SharedLogBuffer,
-        dnssec_enabled:   bool,
-        dnssec_log_bogus: bool,
-        prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
+        zones:             Arc<ArcSwap<LocalZoneSet>>,
+        resolver:          Arc<ArcSwap<TokioResolver>>,
+        rate_limiter:      Arc<RateLimiter>,
+        acl:               Arc<Acl>,
+        private_addrs:     Arc<PrivateAddressSet>,
+        cache_max_ttl:     u32,
+        stats:             Arc<Stats>,
+        log_buffer:        SharedLogBuffer,
+        dnssec_enabled:    bool,
+        dnssec_log_bogus:  bool,
+        prefetch_tracker:  Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
+        xdp_cache:         Option<super::cache_snapshot::MutableCacheMap>,
+        cache_max_entries: usize,
     ) -> Self {
         Self {
             zones, resolver, rate_limiter,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             acl, private_addrs, cache_max_ttl, stats, log_buffer,
             dnssec_enabled, dnssec_log_bogus, prefetch_tracker,
+            xdp_cache, cache_max_entries,
         }
     }
 
@@ -319,6 +328,35 @@ impl RunboundHandler {
                 }
 
                 debug!(name=%sanitize_dns_name(qname), %qtype, count = records.len(), "resolved");
+
+                // #60: populate the XDP cache snapshot with the serialized response.
+                // Stored with QID=0; XDP workers patch bytes [0..2] before sending.
+                if let Some(ref cache) = self.xdp_cache {
+                    if !records.is_empty() {
+                        let min_ttl = records.iter().map(|r| r.ttl).min().unwrap_or(60)
+                            .min(self.cache_max_ttl);
+                        let key = super::cache_snapshot::QuestionKey {
+                            name:  qname.to_string(),
+                            qtype: u16::from(qtype),
+                        };
+                        let mut wire: Vec<u8> = Vec::with_capacity(512);
+                        let mut cache_msg = Message::new(0, MessageType::Response, OpCode::Query);
+                        cache_msg.metadata.recursion_available = true;
+                        cache_msg.metadata.response_code = ResponseCode::NoError;
+                        cache_msg.add_query(DnsQuery::query(Name::from(qname), qtype));
+                        for r in records { cache_msg.add_answer(r.clone()); }
+                        let mut enc = BinEncoder::new(&mut wire);
+                        if cache_msg.emit(&mut enc).is_ok() {
+                            let entry = super::cache_snapshot::CacheEntry {
+                                wire_response: std::sync::Arc::new(wire),
+                                expires_at:    std::time::Instant::now()
+                                    + std::time::Duration::from_secs(min_ttl as u64),
+                            };
+                            super::cache_snapshot::cache_insert(cache, key, entry, self.cache_max_entries);
+                        }
+                    }
+                }
+
                 // Prefetch: count forwarded queries so hot domains can be refreshed before expiry.
                 if let Some(ref tracker) = self.prefetch_tracker {
                     tracker.increment(&qname.to_string());
@@ -1202,6 +1240,8 @@ pub async fn run_dns_server(
     log_buffer:       SharedLogBuffer,
     resolver:         SharedResolver,
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
+    xdp_cache:        Option<super::cache_snapshot::MutableCacheMap>,
+    cache_max_entries: usize,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -1243,6 +1283,7 @@ pub async fn run_dns_server(
     let handler = RunboundHandler::new(
         Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl, stats, log_buffer,
         cfg.dnssec_validation, cfg.dnssec_log_bogus, prefetch_tracker,
+        xdp_cache, cache_max_entries,
     );
     let mut server = Server::new(handler);
 

@@ -61,14 +61,16 @@ const PROTO_UDP:   u8 = 17;
 /// Emergency escape hatch: set `RUNBOUND_DISABLE_XDP=1` in the environment
 /// to skip XDP entirely without editing the config file. Useful when the host
 /// is unreachable after XDP bricks the network and rescue-mode boot is needed.
+#[allow(clippy::too_many_arguments)]
 pub fn start_xdp(
-    iface:         &str,
-    zones:         Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter:  Arc<RateLimiter>,
-    acl:           Arc<Acl>,
-    cpu_governor:  bool,
-    irq_affinity:  bool,
-    hugepages:     bool,
+    iface:           &str,
+    zones:           Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter:    Arc<RateLimiter>,
+    acl:             Arc<Acl>,
+    cpu_governor:    bool,
+    irq_affinity:    bool,
+    hugepages:       bool,
+    cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
 ) -> Result<Option<XdpHandle>, String> {
     if std::env::var("RUNBOUND_DISABLE_XDP").is_ok() {
         tracing::info!("XDP disabled via RUNBOUND_DISABLE_XDP environment variable");
@@ -81,7 +83,7 @@ pub fn start_xdp(
                     virt = %iface, parent = %parent,
                     "XDP: virtual interface detected — retrying on parent"
                 );
-                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages);
+                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot);
                 if result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
                     tracing::info!(parent = %parent, "XDP active on parent interface");
                 }
@@ -97,17 +99,19 @@ pub fn start_xdp(
             }
         }
     }
-    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages)
+    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_xdp_on_iface(
-    iface:         &str,
-    zones:         Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter:  Arc<RateLimiter>,
-    acl:           Arc<Acl>,
-    cpu_governor:  bool,
-    irq_affinity:  bool,
-    hugepages:     bool,
+    iface:           &str,
+    zones:           Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter:    Arc<RateLimiter>,
+    acl:             Arc<Acl>,
+    cpu_governor:    bool,
+    irq_affinity:    bool,
+    hugepages:       bool,
+    cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
 ) -> Result<Option<XdpHandle>, String> {
     let ifidx = iface_index(iface)
         .ok_or_else(|| format!("interface {iface} not found"))?;
@@ -181,6 +185,7 @@ fn start_xdp_on_iface(
         let z       = Arc::clone(&zones);
         let rl      = Arc::clone(&rate_limiter);
         let acl     = Arc::clone(&acl);
+        let cs      = cache_snapshot.clone();
         let core_id = if cores.is_empty() { 0 } else { cores[q as usize % cores.len()] };
         queue_to_core.push((q, core_id));
         // #69: save original governor before the worker switches to "performance"
@@ -191,7 +196,7 @@ fn start_xdp_on_iface(
         }
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
-            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor))
+            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor, cs))
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
@@ -348,12 +353,13 @@ fn build_test_frame(buf: &mut [u8], dst_mac: [u8; 6]) -> usize {
 
 /// Poll loop for one NIC queue. Runs until the socket fd is closed.
 fn xdp_worker(
-    mut sock:     XskSocket,
-    zones:        Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter: Arc<RateLimiter>,
-    acl:          Arc<Acl>,
-    core_id:      usize,
-    cpu_governor: bool,
+    mut sock:        XskSocket,
+    zones:           Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter:    Arc<RateLimiter>,
+    acl:             Arc<Acl>,
+    core_id:         usize,
+    cpu_governor:    bool,
+    cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
 ) {
     use libc::{poll, pollfd, POLLIN};
     use super::umem::RING_SIZE;
@@ -391,6 +397,9 @@ fn xdp_worker(
         }
 
         let snapshot = zones.load();
+        // #60: load the frozen cache snapshot once per batch — zero-lock read.
+        let cache_arc: Option<std::sync::Arc<crate::dns::cache_snapshot::CacheSnapshot>> =
+            cache_snapshot.as_ref().map(|s| s.load_full());
         tx_descs.clear();
         rx_addrs.clear();
 
@@ -462,7 +471,7 @@ fn xdp_worker(
                 }
 
                 dns_scratch.clear();
-                match process_packet(rx_frame, tx_frame, &snapshot, &acl, src_ip, &mut dns_scratch) {
+                match process_packet(rx_frame, tx_frame, &snapshot, &acl, src_ip, &mut dns_scratch, cache_arc.as_deref()) {
                     Some(tx_len) => tx_descs.push(XdpDesc {
                         addr: tx_addr,
                         len:  tx_len as u32,
@@ -536,6 +545,7 @@ fn process_packet(
     acl:         &Acl,
     src_ip:      Option<IpAddr>,
     dns_scratch: &mut Vec<u8>,
+    cache_snap:  Option<&crate::dns::cache_snapshot::CacheSnapshot>,
 ) -> Option<usize> {
     // ── Ethernet ─────────────────────────────────────────────────────────────
     if rx.len() < ETH_HDR { return None; }
@@ -571,8 +581,13 @@ fn process_packet(
     let dns_in = &rx[dns_off..];
 
     // ── DNS ──────────────────────────────────────────────────────────────────
-    if !answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
-        return None; // not a local query or ACL deny — let it fall through / drop
+    // Fast path 1: local zone (refuse/nxdomain/static) — already implemented.
+    // Fast path 2 (#60): XDP cache snapshot — check after local zone miss.
+    let has_answer = answer_dns(dns_in, zones, acl, src_ip, dns_scratch)
+        || cache_snap.map(|snap| answer_from_cache(dns_in, snap, acl, src_ip, dns_scratch))
+            .unwrap_or(false);
+    if !has_answer {
+        return None; // not a local query and cache miss — XDP_PASS to hickory
     }
 
     // ── Build reply frame ────────────────────────────────────────────────────
@@ -634,6 +649,62 @@ fn process_packet(
     tx[dns_off..dns_off + dns_scratch.len()].copy_from_slice(dns_scratch);
 
     Some(reply_len)
+}
+
+/// Look up `query_bytes` in the frozen XDP cache snapshot.
+/// Returns true and writes the wire response into `out` on a cache hit.
+/// Returns false on a miss or if the ACL denies/refuses the client.
+///
+/// ACL semantics mirror `answer_dns`:
+///   Allow  → proceed with cache lookup.
+///   Deny   → silent drop (return false, no TX frame crafted).
+///   Refuse → return false (let hickory send a proper REFUSED response).
+fn answer_from_cache(
+    query_bytes: &[u8],
+    cache_snap:  &crate::dns::cache_snapshot::CacheSnapshot,
+    acl:         &Acl,
+    src_ip:      Option<IpAddr>,
+    out:         &mut Vec<u8>,
+) -> bool {
+    // ACL check first — denied clients must not receive cached data.
+    if let Some(ip) = src_ip {
+        match acl.check(ip) {
+            AclAction::Allow  => {}
+            AclAction::Deny | AclAction::Refuse => return false,
+        }
+    }
+
+    let msg = match Message::from_bytes(query_bytes) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if msg.message_type != MessageType::Query { return false; }
+    if msg.op_code != OpCode::Query { return false; }
+    let q = match msg.queries.first() {
+        Some(q) => q,
+        None    => return false,
+    };
+    if q.query_type() == hickory_proto::rr::RecordType::ANY { return false; }
+
+    let key = crate::dns::cache_snapshot::QuestionKey {
+        name:  LowerName::from(q.name()).to_string(),
+        qtype: u16::from(q.query_type()),
+    };
+
+    let now = std::time::Instant::now();
+    if let Some(entry) = cache_snap.get(&key) {
+        if entry.expires_at > now && entry.wire_response.len() >= 2 {
+            out.extend_from_slice(&entry.wire_response);
+            // Patch QID (bytes [0..2]) with the client's actual QID.
+            let qid = msg.id.to_be_bytes();
+            out[0] = qid[0];
+            out[1] = qid[1];
+            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse `query_bytes` as a DNS query, look it up in `zones`, write the
