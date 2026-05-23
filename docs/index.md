@@ -53,6 +53,7 @@ Complete reference for Runbound v0.6.9+. Each page is self-contained.
 | [security.md](security.md) | Security features — ACL, rate limiting, DNS rebinding, DNSSEC, CHAOS class |
 | [hardening.md](hardening.md) | systemd hardening deep-dive — every directive explained, what breaks if missing |
 | [security-audit.md](security-audit.md) | v0.6.9 audit report — SEC and PERF findings, risk matrix, recommendations |
+| [pentest-2026-05-23.md](pentest-2026-05-23.md) | Black-box pentest v0.6.9 — API + DNS protocol, findings SEC-11 + PERF-11 |
 | [audit.md](audit.md) | Supply-chain audit — dependency scanning, cargo-deny, RUSTSEC cadence |
 | [hsm.md](hsm.md) | HSM / PKCS#11 integration — hardware key storage, HMAC audit log |
 | [gdpr.md](gdpr.md) | GDPR compliance guide — data inventory, `log-client-ip`, retention |
