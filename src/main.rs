@@ -77,7 +77,7 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: String) -> Result<()> {
-    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker) =
+    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams) =
         build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
@@ -99,17 +99,31 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
     let _xdp_handle = if !cfg.xdp {
         info!("XDP fast path disabled (xdp: no / --no-xdp)");
         None
+    } else if cfg.xdp_interface.as_deref() == Some("none") {
+        // #79: xdp-interface: none disables XDP without touching the xdp: directive.
+        info!("XDP fast path disabled (xdp-interface: none)");
+        None
     } else {
-        let iface = cfg.interfaces.first()
-            .and_then(|s| {
-                let s = s.trim();
-                if s == "0.0.0.0" || s == "::" || s.is_empty() { return None; }
-                if s.parse::<std::net::IpAddr>().is_ok() {
-                    return dns::xdp::socket::iface_for_ip(s);
-                }
-                Some(s.to_string())
-            })
-            .or_else(dns::xdp::socket::default_interface);
+        // #79: explicit interface wins; otherwise auto-detect from listen address / default route.
+        let iface = if let Some(ref explicit) = cfg.xdp_interface {
+            info!(iface = %explicit, "XDP interface: explicit config (xdp-interface)");
+            Some(explicit.clone())
+        } else {
+            let detected = cfg.interfaces.first()
+                .and_then(|s| {
+                    let s = s.trim();
+                    if s == "0.0.0.0" || s == "::" || s.is_empty() { return None; }
+                    if s.parse::<std::net::IpAddr>().is_ok() {
+                        return dns::xdp::socket::iface_for_ip(s);
+                    }
+                    Some(s.to_string())
+                })
+                .or_else(dns::xdp::socket::default_interface);
+            if let Some(ref name) = detected {
+                info!(iface = %name, "XDP auto-selected interface (use xdp-interface: to override)");
+            }
+            detected
+        };
         match iface {
             Some(ref iface_name) => {
                 match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor, cfg.xdp_irq_affinity, cfg.xdp_hugepages, xdp_cache_snapshot.clone()) {
@@ -134,7 +148,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         }
     };
 
-    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker, xdp_cache_mutable, cfg.xdp_cache_snapshot_size).await;
+    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker, xdp_cache_mutable, cfg.xdp_cache_snapshot_size, upstreams).await;
     audit.send(audit::AuditEvent::Shutdown);
     result
 }
@@ -282,6 +296,7 @@ async fn build_and_launch(
     Arc<AtomicU8>,
     dns::server::SharedResolver,
     Option<Arc<dns::prefetch::PrefetchTracker>>,
+    upstreams::SharedUpstreams,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -524,7 +539,7 @@ async fn build_and_launch(
     let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200));
     let acl          = Arc::new(Acl::from_config(&cfg.access_control));
 
-    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker))
+    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams))
 }
 
 fn print_help() {
@@ -596,6 +611,12 @@ fn print_help() {
         "    xdp: no             Disable AF/XDP kernel-bypass fast path (default: yes)
 ",
         "                        Equivalent to --no-xdp on the command line
+",
+        "    xdp-interface: eth1 Explicit NIC for XDP (default: auto-detected)
+",
+        "                        Use in dual-NIC setups to pin XDP to the DNS-facing NIC.
+",
+        "                        Set to 'none' to disable XDP without changing xdp: directive.
 ",
         "    cpu-affinity: no    Disable CPU pinning (default: yes)
 ",
@@ -895,14 +916,22 @@ fn check_cfg_xdp_interface(cfg: &config::parser::UnboundConfig, warnings: &mut u
         println!("[OK]   XDP disabled in config — interface check skipped");
         return;
     }
-    let iface = cfg.interfaces.first()
-        .and_then(|s| {
-            let s = s.trim();
-            if s == "0.0.0.0" || s == "::" || s.is_empty() { return None; }
-            if s.parse::<std::net::IpAddr>().is_ok() { return iface_for_ip(s); }
-            Some(s.to_string())
-        })
-        .or_else(default_interface);
+    if cfg.xdp_interface.as_deref() == Some("none") {
+        println!("[OK]   XDP disabled via xdp-interface: none");
+        return;
+    }
+    let iface = if let Some(ref explicit) = cfg.xdp_interface {
+        Some(explicit.clone())
+    } else {
+        cfg.interfaces.first()
+            .and_then(|s| {
+                let s = s.trim();
+                if s == "0.0.0.0" || s == "::" || s.is_empty() { return None; }
+                if s.parse::<std::net::IpAddr>().is_ok() { return iface_for_ip(s); }
+                Some(s.to_string())
+            })
+            .or_else(default_interface)
+    };
     let iface_name = match iface {
         Some(ref i) => i.as_str(),
         None => {

@@ -448,6 +448,42 @@ Use `xdp: no` when:
 
 See [xdp.md](xdp.md) for full requirements and capability configuration.
 
+### XDP interface selection
+
+```
+server:
+    xdp-interface: eth1    # explicit NIC for XDP
+    # xdp-interface: none  # disable XDP via interface override
+```
+
+By default, Runbound auto-selects the first non-loopback interface with an assigned
+IP address. In multi-NIC systems this may silently pick the wrong interface.
+
+Use `xdp-interface:` to pin XDP to a specific NIC:
+
+```
+# Dual-NIC setup: virtio for management, X520 for DNS
+# Without this directive, Runbound may pick the wrong interface
+server:
+    xdp-interface: eth1
+```
+
+Set `xdp-interface: none` to disable XDP via the interface override — equivalent to
+`xdp: no` but leaves the `xdp:` directive unchanged for other hosts sharing the
+same config file:
+
+```
+server:
+    xdp: yes            # kept for other hosts
+    xdp-interface: none # this host: disable XDP (wrong NIC / missing caps)
+```
+
+The auto-select path logs the chosen interface at startup (verbosity ≥ 2):
+
+```
+INFO XDP auto-selected interface: ens18 (use xdp-interface: to override)
+```
+
 ### CPU affinity
 
 ```

@@ -95,6 +95,8 @@ pub struct RunboundHandler {
     /// None when xdp-cache-snapshot: no or XDP feature not compiled.
     xdp_cache:         Option<super::cache_snapshot::MutableCacheMap>,
     cache_max_entries: usize,
+    /// #77: upstream list for transparent pool reconnection on DoT exhaustion.
+    upstreams:         crate::upstreams::SharedUpstreams,
 }
 
 impl RunboundHandler {
@@ -113,13 +115,14 @@ impl RunboundHandler {
         prefetch_tracker:  Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
         xdp_cache:         Option<super::cache_snapshot::MutableCacheMap>,
         cache_max_entries: usize,
+        upstreams:         crate::upstreams::SharedUpstreams,
     ) -> Self {
         Self {
             zones, resolver, rate_limiter,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             acl, private_addrs, cache_max_ttl, stats, log_buffer,
             dnssec_enabled, dnssec_log_bogus, prefetch_tracker,
-            xdp_cache, cache_max_entries,
+            xdp_cache, cache_max_entries, upstreams,
         }
     }
 
@@ -274,7 +277,20 @@ impl RunboundHandler {
         client_ip: IpAddr,
         start: Instant,
     ) -> ResponseInfo {
-        match self.resolver.load().lookup(Name::from(qname), qtype).await {
+        let mut result = self.resolver.load().lookup(Name::from(qname), qtype).await;
+
+        // Level 2: transparent reconnection on DoT pool exhaustion (#77).
+        if let Err(ref e) = result {
+            if is_pool_exhausted(e) {
+                warn!(name=%sanitize_dns_name(qname), "DoT pool exhausted — rebuilding resolver for retry");
+                let addrs = crate::upstreams::upstream_addrs(&self.upstreams);
+                if rebuild_and_swap(&self.resolver, &addrs, self.dnssec_enabled).is_ok() {
+                    result = self.resolver.load().lookup(Name::from(qname), qtype).await;
+                }
+            }
+        }
+
+        match result {
             Ok(lookup) => {
                 // DNS rebinding protection: SERVFAIL if any A/AAAA record falls
                 // within a configured private-address range (Unbound compatible).
@@ -526,6 +542,18 @@ impl RequestHandler for RunboundHandler {
 // Helpers
 // ============================================================
 
+/// Returns true when the hickory error indicates the DoT connection pool is exhausted
+/// or all underlying TCP connections were reset by the peer (#77).
+fn is_pool_exhausted(e: &NetError) -> bool {
+    matches!(e, NetError::NoConnections)
+        || matches!(e, NetError::Io(io) if matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+        ))
+}
+
 /// MED-06: Strip control characters from DNS names before structured log emission.
 /// Prevents log injection via carefully crafted query names containing \n, \r, etc.
 ///
@@ -662,6 +690,68 @@ pub fn rebuild_and_swap(
     let new_res = build_resolver_from_addrs(addrs, size, dnssec)?;
     shared.store(Arc::new(new_res));
     Ok(())
+}
+
+/// Level 1 (#77): proactively warm up DoT TCP connections at startup.
+/// Sends `dot_count` parallel probe queries so the pool has live connections
+/// before the first real query arrives.
+pub async fn warm_up_dot_connections(resolver: &SharedResolver, dot_count: usize) {
+    if dot_count == 0 { return; }
+    let probe = Name::from_str("example.com.").unwrap_or_else(|_| unreachable!("static DNS name"));
+    let mut joins = Vec::with_capacity(dot_count);
+    for _ in 0..dot_count {
+        let res  = Arc::clone(resolver);
+        let name = probe.clone();
+        joins.push(tokio::spawn(async move {
+            let _ = res.load().lookup(name, RecordType::A).await;
+        }));
+    }
+    for j in joins { let _ = j.await; }
+    info!(connections = dot_count, "DoT pool warmed up");
+}
+
+/// Level 3 (#77): periodic keepalive to prevent idle DoT TCP connections from being
+/// closed by the peer.  Fires every 90 s; sends one probe query per DoT upstream.
+/// Rebuilds the resolver transparently if the pool is exhausted.
+pub async fn dot_keepalive_loop(
+    resolver:  SharedResolver,
+    upstreams: crate::upstreams::SharedUpstreams,
+    dnssec:    bool,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(90));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await; // skip the immediate first tick
+    let probe = Name::from_str("example.com.").unwrap_or_else(|_| unreachable!("static DNS name"));
+    loop {
+        interval.tick().await;
+        let dot_count = upstreams.read()
+            .map(|u| u.iter().filter(|s| s.protocol == "dot").count())
+            .unwrap_or(0);
+        if dot_count == 0 { continue; }
+        let mut joins = Vec::with_capacity(dot_count);
+        for _ in 0..dot_count {
+            let res  = Arc::clone(&resolver);
+            let name = probe.clone();
+            joins.push(tokio::spawn(async move {
+                res.load().lookup(name, RecordType::A).await
+            }));
+        }
+        let mut any_exhausted = false;
+        for j in joins {
+            if let Ok(Err(ref e)) = j.await {
+                if is_pool_exhausted(e) { any_exhausted = true; }
+            }
+        }
+        if any_exhausted {
+            let addrs = crate::upstreams::upstream_addrs(&upstreams);
+            match rebuild_and_swap(&resolver, &addrs, dnssec) {
+                Ok(()) => info!("DoT keepalive: pool rebuilt after connection loss"),
+                Err(e) => warn!(err=%e, "DoT keepalive: resolver rebuild failed"),
+            }
+        } else {
+            debug!(connections = dot_count, "DoT keepalive: connections refreshed");
+        }
+    }
 }
 
 /// Build resolver from an explicit (addr, port, use_tls, tls_hostname) list — used for runtime rebuilds.
@@ -1232,16 +1322,17 @@ async fn run_tcp_with_limit(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dns_server(
-    cfg:              &UnboundConfig,
-    zones:            Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter:     Arc<RateLimiter>,
-    acl:              Arc<Acl>,
-    stats:            Arc<Stats>,
-    log_buffer:       SharedLogBuffer,
-    resolver:         SharedResolver,
-    prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
-    xdp_cache:        Option<super::cache_snapshot::MutableCacheMap>,
+    cfg:               &UnboundConfig,
+    zones:             Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter:      Arc<RateLimiter>,
+    acl:               Arc<Acl>,
+    stats:             Arc<Stats>,
+    log_buffer:        SharedLogBuffer,
+    resolver:          SharedResolver,
+    prefetch_tracker:  Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
+    xdp_cache:         Option<super::cache_snapshot::MutableCacheMap>,
     cache_max_entries: usize,
+    upstreams:         crate::upstreams::SharedUpstreams,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -1280,10 +1371,24 @@ pub async fn run_dns_server(
         info!(count = cfg.private_addresses.len(), "private-address: DNS rebinding protection active");
     }
 
+    // Level 1 (#77): warm up DoT connections before accepting queries.
+    let dot_count = upstreams.read()
+        .map(|u| u.iter().filter(|s| s.protocol == "dot").count())
+        .unwrap_or(0);
+    warm_up_dot_connections(&resolver, dot_count).await;
+
+    // Level 3 (#77): spawn keepalive task.
+    {
+        let res_ka  = Arc::clone(&resolver);
+        let ups_ka  = upstreams.clone();
+        let dnssec  = cfg.dnssec_validation;
+        tokio::spawn(dot_keepalive_loop(res_ka, ups_ka, dnssec));
+    }
+
     let handler = RunboundHandler::new(
-        Arc::clone(&zones), resolver, rate_limiter, acl, private_addrs, cache_max_ttl, stats, log_buffer,
-        cfg.dnssec_validation, cfg.dnssec_log_bogus, prefetch_tracker,
-        xdp_cache, cache_max_entries,
+        Arc::clone(&zones), Arc::clone(&resolver), rate_limiter, acl, private_addrs,
+        cache_max_ttl, stats, log_buffer, cfg.dnssec_validation, cfg.dnssec_log_bogus,
+        prefetch_tracker, xdp_cache, cache_max_entries, upstreams,
     );
     let mut server = Server::new(handler);
 
