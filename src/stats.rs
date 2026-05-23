@@ -104,6 +104,11 @@ pub struct Stats {
     pub dnssec_secure:   AtomicU64,
     pub dnssec_bogus:    AtomicU64,
     pub dnssec_insecure: AtomicU64,
+
+    // DoT reconnect metrics (#77 fix) — updated by keepalive, level-2 reconnect, and API endpoint.
+    pub dot_reconnects_total: AtomicU64,
+    /// ISO-8601 timestamp of the last successful resolver rebuild; None until first rebuild.
+    pub last_reconnect_at: std::sync::Mutex<Option<String>>,
 }
 
 impl Stats {
@@ -127,7 +132,23 @@ impl Stats {
             dnssec_secure:   AtomicU64::new(0),
             dnssec_bogus:    AtomicU64::new(0),
             dnssec_insecure: AtomicU64::new(0),
+            dot_reconnects_total: AtomicU64::new(0),
+            last_reconnect_at: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Record a DoT resolver rebuild: increment counter and update timestamp.
+    pub fn record_dot_reconnect(&self) {
+        self.dot_reconnects_total.fetch_add(1, Ordering::Relaxed);
+        let ts = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            crate::logbuffer::format_ts(secs)
+        };
+        if let Ok(mut g) = self.last_reconnect_at.lock() {
+            *g = Some(ts);
+        }
     }
 
     #[inline] pub fn inc_total(&self)           { self.total.fetch_add(1, Ordering::Relaxed); }

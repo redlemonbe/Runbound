@@ -155,6 +155,14 @@ pub struct UnboundConfig {
     pub xdp_cache_snapshot: bool,
     /// Maximum entries in the XDP cache snapshot. Default: 10 000.
     pub xdp_cache_snapshot_size: usize,
+    /// Route DNS queries by question name hash to a dedicated CPU via CPUMAP (#67).
+    /// Improves XDP cache locality for repeated lookups of the same domain.
+    /// Default: false. Falls back silently to RSS if CPUMAP is unavailable.
+    pub xdp_domain_routing: bool,
+    /// NIC ring buffer size for AF_XDP (#80).
+    /// `None` = "auto" — maximize to hardware max via SIOCETHTOOL (default).
+    /// `Some(n)` = set ring to exactly n descriptors (capped at hardware max).
+    pub xdp_ring_size: Option<u32>,
 
     // ── DNS prefetching ───────────────────────────────────────────────────────
     /// Pre-resolve popular domains before their cache entry expires. Default: false.
@@ -181,7 +189,7 @@ impl UnboundConfig {
             mode:          "master".to_string(),
             sync_interval: 30,
             log_retention: 1000,
-            log_client_ip: true,
+            log_client_ip: false,
             cpu_affinity:            true,
             xdp:                     true,
             xdp_hugepages:           true,
@@ -381,6 +389,11 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "xdp-hugepages"            => cfg.xdp_hugepages            = val.trim_matches('"') != "no",
         "xdp-cache-snapshot"       => cfg.xdp_cache_snapshot       = val.trim_matches('"') != "no",
         "xdp-cache-snapshot-size"  => cfg.xdp_cache_snapshot_size  = val.parse().unwrap_or(10_000),
+        "xdp-domain-routing"       => cfg.xdp_domain_routing       = val.trim_matches('"') == "yes",
+        "xdp-ring-size" => {
+            let v = val.trim_matches('"').trim();
+            cfg.xdp_ring_size = if v == "auto" { None } else { v.parse::<u32>().ok() };
+        }
         "prefetch"              => cfg.prefetch              = val.trim_matches('"') == "yes",
         "prefetch-threshold"    => cfg.prefetch_threshold    = val.parse().unwrap_or(5),
         "cache-flush-cooldown"  => cfg.cache_flush_cooldown  = val.parse().unwrap_or(60),

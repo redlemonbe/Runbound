@@ -85,7 +85,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
     let mut xdp_cache_mutable:  Option<dns::cache_snapshot::MutableCacheMap>     = None;
     #[cfg(feature = "xdp")]
     if cfg.xdp && cfg.xdp_cache_snapshot {
-        let mutable  = Arc::new(std::sync::Mutex::new(dns::cache_snapshot::CacheSnapshot::default()));
+        let mutable  = Arc::new(dashmap::DashMap::new());
         let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(dns::cache_snapshot::CacheSnapshot::default())));
         tokio::spawn(dns::cache_snapshot::publish_loop(Arc::clone(&snapshot), Arc::clone(&mutable)));
         xdp_cache_snapshot = Some(snapshot);
@@ -126,7 +126,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         };
         match iface {
             Some(ref iface_name) => {
-                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor, cfg.xdp_irq_affinity, cfg.xdp_hugepages, xdp_cache_snapshot.clone()) {
+                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor, cfg.xdp_irq_affinity, cfg.xdp_hugepages, xdp_cache_snapshot.clone(), cfg.xdp_domain_routing, cfg.xdp_ring_size) {
                     Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); xdp_mode.store(match h.mode { dns::xdp::XdpMode::Drv => 1, dns::xdp::XdpMode::Skb => 2 }, Ordering::Relaxed); Some(h) }
                     Ok(None)    => None, // virtual interface or self-test — already warned
                     Err(e) => {
@@ -372,6 +372,7 @@ async fn build_and_launch(
                 }
             }
         });
+
     }
 
     // ── Background: feed auto-update ───────────────────────────────────────
@@ -400,6 +401,47 @@ async fn build_and_launch(
     let snapshot_cache = stats::new_snapshot_cache(&global_stats);
     tokio::spawn(stats::qps_update_loop(Arc::clone(&global_stats), Arc::clone(&snapshot_cache)));
     let log_buffer = logbuffer::new_shared(cfg.log_retention, cfg.log_client_ip);
+
+    // ── SIGUSR1/SIGUSR2: explicit handlers to prevent accidental kills ────────
+    // The default OS action for SIGUSR1/SIGUSR2 is to terminate the process.
+    // A production DNS server must never die from a monitoring tool or logrotate
+    // script sending these signals.  SIGUSR1 dumps a live stats snapshot to the
+    // log; SIGUSR2 is reserved (ignored).
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let stats_usr1 = Arc::clone(&global_stats);
+        tokio::spawn(async move {
+            let mut usr1 = match signal(SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => { tracing::warn!("Cannot install SIGUSR1 handler: {e}"); return; }
+            };
+            loop {
+                usr1.recv().await;
+                let snap = stats_usr1.snapshot();
+                info!(
+                    total     = snap.total,
+                    forwarded = snap.forwarded,
+                    blocked   = snap.blocked,
+                    servfail  = snap.servfail,
+                    uptime_s  = snap.uptime_secs,
+                    qps_1m    = snap.qps_1m,
+                    hit_rate  = snap.cache_hit_rate,
+                    "SIGUSR1 — live stats dump"
+                );
+            }
+        });
+        tokio::spawn(async move {
+            let mut usr2 = match signal(SignalKind::user_defined2()) {
+                Ok(s) => s,
+                Err(e) => { tracing::warn!("Cannot install SIGUSR2 handler: {e}"); return; }
+            };
+            loop {
+                usr2.recv().await;
+                tracing::debug!("SIGUSR2 received — ignored (reserved for future use)");
+            }
+        });
+    }
 
     // ── Upstream health monitor ────────────────────────────────────────────
     let upstreams = upstreams::init_upstreams(cfg);

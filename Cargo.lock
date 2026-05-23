@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "runbound"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2077,6 +2077,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "sha2",
+ "smallvec",
  "socket2",
  "subtle",
  "tempfile",

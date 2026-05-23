@@ -700,20 +700,60 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         )
     };
 
+    let dot_reconnects_total = s.stats.dot_reconnects_total.load(Ordering::Relaxed);
+    let last_reconnect_at = s.stats.last_reconnect_at.lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
+
+    // XDP wire-format cache stats (#64)
+    let xdp_cache_entries = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_ENTRIES
+        .load(Ordering::Relaxed);
+    let xdp_hits   = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
+        .load(Ordering::Relaxed);
+    let xdp_misses = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+        .load(Ordering::Relaxed);
+    let xdp_cache_hit_rate = if xdp_hits + xdp_misses > 0 {
+        (xdp_hits as f64 / (xdp_hits + xdp_misses) as f64 * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    // #80: NIC ring buffer + drop stats
+    let nic_rx_ring     = crate::dns::xdp::socket::XDP_NIC_RX_RING.load(Ordering::Relaxed);
+    let nic_rx_ring_max = crate::dns::xdp::socket::XDP_NIC_RX_RING_MAX.load(Ordering::Relaxed);
+    let nic_rx_dropped  = crate::dns::xdp::socket::XDP_ACTIVE_IFACE
+        .get()
+        .map(|iface| crate::dns::xdp::socket::read_nic_rx_dropped(iface))
+        .unwrap_or(0);
+
     JsonExtract(serde_json::json!({
-        "version":           env!("CARGO_PKG_VERSION"),
-        "uptime_secs":       snap.uptime_secs,
-        "xdp_active":        xdp_active,
-        "xdp_mode":          xdp_mode,
-        "cpu_cores":         cpu_cores,
-        "cpu_percent":       cpu_percent,
-        "mem_total_mb":      mem_total_mb,
-        "mem_avail_mb":      mem_avail_mb,
-        "cache_entries":     snap.cache_entries,
-        "workers":           cpu_cores,
-        "prefetch_enabled":  s.cfg.prefetch,
-        "upstreams_healthy": upstreams_healthy,
-        "upstreams_total":   upstreams_total,
+        "version":              env!("CARGO_PKG_VERSION"),
+        "uptime_secs":          snap.uptime_secs,
+        "xdp_active":           xdp_active,
+        "xdp_mode":             xdp_mode,
+        "cpu_cores":            cpu_cores,
+        "cpu_percent":          cpu_percent,
+        "mem_total_mb":         mem_total_mb,
+        "mem_avail_mb":         mem_avail_mb,
+        "cache_entries":        snap.cache_entries,
+        "workers":              cpu_cores,
+        "prefetch_enabled":     s.cfg.prefetch,
+        "upstreams_healthy":    upstreams_healthy,
+        "upstreams_total":      upstreams_total,
+        "dot_reconnects_total": dot_reconnects_total,
+        "last_reconnect_at":    last_reconnect_at,
+        "xdp_cache_entries":       xdp_cache_entries,
+        "xdp_cache_hit_rate":      xdp_cache_hit_rate,
+        "xdp_domain_routing":      s.cfg.xdp_domain_routing,
+        "xdp_worker_distribution": crate::dns::cache_snapshot::XDP_WORKER_PKTS
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect::<Vec<u64>>(),
+        "nic_rx_ring":     nic_rx_ring,
+        "nic_rx_ring_max": nic_rx_ring_max,
+        "nic_rx_dropped":  nic_rx_dropped,
     }))
 }
 
@@ -1555,7 +1595,7 @@ async fn add_upstream_handler(
 
     // Rebuild resolver with updated upstream list
     let addrs = upstreams::upstream_addrs(&s.upstreams);
-    if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
+    if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
         warn!(%e, "resolver rebuild after upstream add failed — upstream added but DNS unchanged");
     }
     // FIX #43: persist after successful add
@@ -1608,7 +1648,7 @@ async fn delete_upstream_handler(
     match upstreams::remove_upstream(&s.upstreams, &id) {
         Some(removed) => {
             let addrs = upstreams::upstream_addrs(&s.upstreams);
-            if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
+            if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
                 warn!(%e, "resolver rebuild after upstream delete failed");
             }
             // FIX #43: persist after successful delete
@@ -1677,8 +1717,8 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
 
     let before = s.stats.snapshot().cache_entries;
     let addrs  = upstreams::upstream_addrs(&s.upstreams);
-    match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
-        Ok(()) => {
+    match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
+        Ok(_warmed) => {
             s.stats.reset_cache();
             s.cache_evictions.store(0, Ordering::Relaxed);
             info!(flushed = before, "DNS cache flushed via API");
@@ -1863,12 +1903,17 @@ async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResp
     let start = std::time::Instant::now();
 
     // Rebuild the resolver (resets the entire DoT connection pool).
+    // warm_up() is called inside rebuild_and_swap — it probes before the ArcSwap
+    // so that TCP/TLS connections are live before any query reaches the new resolver.
     let addrs = crate::upstreams::upstream_addrs(&s.upstreams);
-    if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
+    let warm_up = match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
+        Ok(w) => w,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
             "error": "REBUILD_FAILED", "details": e.to_string()
-        }))).into_response();
-    }
+        }))).into_response(),
+    };
+
+    s.stats.record_dot_reconnect();
 
     // Probe every DoT upstream in parallel to report reconnected vs failed.
     // UDP upstreams are ignored.
@@ -1901,6 +1946,7 @@ async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResp
     (StatusCode::OK, JsonExtract(serde_json::json!({
         "reconnected": reconnected,
         "failed":      failed,
+        "warm_up":     warm_up,
         "duration_ms": duration_ms,
     }))).into_response()
 }
@@ -2133,6 +2179,22 @@ fn render_prometheus_metrics(
     out.push_str(&fmt_gauge(  "runbound_xdp_active",                 "Whether XDP fast path is active (1=yes, 0=no)",   xdp_active as u8));
     out.push_str(&fmt_counter("runbound_xdp_cache_hits_total",       "DNS responses served from XDP cache snapshot",
         crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS.load(std::sync::atomic::Ordering::Relaxed)));
+    out.push_str(&fmt_counter("runbound_xdp_cache_misses_total",     "XDP cache lookups that missed",
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES.load(std::sync::atomic::Ordering::Relaxed)));
+    out.push_str(&fmt_gauge(  "runbound_xdp_cache_entries",          "Current live entries in XDP wire-format cache",
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_ENTRIES.load(std::sync::atomic::Ordering::Relaxed)));
+    out.push_str(&fmt_gauge(  "runbound_nic_rx_ring",                "Applied NIC RX ring descriptor count (0=unavailable)",
+        crate::dns::xdp::socket::XDP_NIC_RX_RING.load(std::sync::atomic::Ordering::Relaxed)));
+    out.push_str(&fmt_gauge(  "runbound_nic_rx_ring_max",            "Hardware maximum NIC RX ring descriptor count",
+        crate::dns::xdp::socket::XDP_NIC_RX_RING_MAX.load(std::sync::atomic::Ordering::Relaxed)));
+    {
+        let nic_dropped = crate::dns::xdp::socket::XDP_ACTIVE_IFACE
+            .get()
+            .map(|iface| crate::dns::xdp::socket::read_nic_rx_dropped(iface))
+            .unwrap_or(0);
+        out.push_str(&fmt_counter("runbound_nic_rx_dropped_total",       "NIC RX packets dropped before XDP (hardware FIFO overflow)",
+            nic_dropped));
+    }
 
     // Per-upstream metrics with labels — omit latency when not yet measured (null → skip, no NaN).
     if !upstreams.is_empty() {
