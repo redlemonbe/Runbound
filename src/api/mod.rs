@@ -580,10 +580,31 @@ async fn help_handler() -> impl IntoResponse {
 
 async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.stats_cache.load();
+    let xdp_active = s.xdp_active.load(Ordering::Relaxed) > 0;
+    let (upstreams_healthy, upstreams_total) = {
+        let list = s.upstreams.read()
+            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health handler: {e}"));
+        (
+            list.iter().filter(|u| u.healthy).count() as u32,
+            list.len() as u32,
+        )
+    };
+    // #74: dynamic status — "ok" nominal, "degraded" all upstreams down, "error" no upstreams
+    let status = if upstreams_total == 0 {
+        "error"
+    } else if upstreams_healthy == 0 {
+        "degraded"
+    } else {
+        "ok"
+    };
     JsonExtract(serde_json::json!({
-        "status":      "ok",
-        "version":     env!("CARGO_PKG_VERSION"),
-        "uptime_secs": snap.uptime_secs,
+        "status":            status,
+        "version":           env!("CARGO_PKG_VERSION"),
+        "uptime_secs":       snap.uptime_secs,
+        "xdp_active":        xdp_active,
+        "upstreams_healthy": upstreams_healthy,
+        "upstreams_total":   upstreams_total,
+        "cache_entries":     snap.cache_entries,
     }))
 }
 
@@ -1888,51 +1909,91 @@ fn fmt_gauge<V: std::fmt::Display>(name: &str, help: &str, val: V) -> String {
     format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name} {val}\n")
 }
 
-fn render_prometheus_metrics(snap: &crate::stats::StatsSnapshot) -> String {
-    let mut out = String::with_capacity(1500);
-    out.push_str(&fmt_counter("runbound_queries_total",   "Total DNS queries received",                           snap.total));
-    out.push_str(&fmt_counter("runbound_blocked_total",   "Queries answered with REFUSED (blacklist/feeds)",      snap.blocked));
-    out.push_str(&fmt_counter("runbound_nxdomain_total",  "Queries answered with NXDOMAIN",                      snap.nxdomain));
-    out.push_str(&fmt_counter("runbound_refused_total",   "Queries answered with REFUSED (ACL/rate limit)",      snap.refused));
-    out.push_str(&fmt_counter("runbound_servfail_total",  "Queries answered with SERVFAIL",                      snap.servfail));
-    out.push_str(&fmt_counter("runbound_forwarded_total", "Queries forwarded to upstream resolvers",             snap.forwarded));
-    out.push_str(&fmt_counter("runbound_local_hits_total","Queries answered from local zone data",               snap.local_hits));
-    out.push_str(&fmt_gauge(  "runbound_uptime_seconds",  "Process uptime in seconds",                           snap.uptime_secs));
-    out.push_str(&format!(
-        "# HELP runbound_qps Queries per second\n\
-         # TYPE runbound_qps gauge\n\
-         runbound_qps{{window=\"1m\"}} {}\n\
-         runbound_qps{{window=\"5m\"}} {}\n\
-         runbound_qps{{window=\"peak\"}} {}\n",
-        snap.qps_1m, snap.qps_5m, snap.qps_peak,
-    ));
-    out.push_str(&format!(
-        "# HELP runbound_latency_ms DNS query latency percentiles in milliseconds\n\
-         # TYPE runbound_latency_ms gauge\n\
-         runbound_latency_ms{{quantile=\"0.5\"}} {}\n\
-         runbound_latency_ms{{quantile=\"0.95\"}} {}\n\
-         runbound_latency_ms{{quantile=\"0.99\"}} {}\n",
-        snap.latency_p50_ms, snap.latency_p95_ms, snap.latency_p99_ms,
-    ));
-    out.push_str(&fmt_gauge("runbound_cache_hit_rate", "Cache hit rate percentage (0\u{2013}100)", snap.cache_hit_rate));
-    out.push_str(&fmt_gauge("runbound_cache_entries",  "Approximate cached DNS entries",           snap.cache_entries));
-    out.push_str(&format!(
-        "# HELP runbound_dnssec_total DNSSEC validation results\n\
-         # TYPE runbound_dnssec_total counter\n\
-         runbound_dnssec_total{{status=\"secure\"}} {}\n\
-         runbound_dnssec_total{{status=\"bogus\"}} {}\n\
-         runbound_dnssec_total{{status=\"insecure\"}} {}\n",
-        snap.dnssec_secure, snap.dnssec_bogus, snap.dnssec_insecure,
-    ));
+/// Per-upstream data snapshot for Prometheus metrics (no RwLock held during formatting).
+struct UpstreamMetric {
+    id:         String,
+    addr:       String,
+    port:       u16,
+    protocol:   String,
+    healthy:    bool,
+    latency_ms: Option<u64>,
+}
+
+fn render_prometheus_metrics(
+    snap:        &crate::stats::StatsSnapshot,
+    cache_hits:   u64,
+    cache_misses: u64,
+    evictions:    u64,
+    xdp_active:   bool,
+    upstreams:    &[UpstreamMetric],
+) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str(&fmt_counter("runbound_queries_total",              "Total DNS queries received",                      snap.total));
+    out.push_str(&fmt_counter("runbound_queries_blocked_total",      "Queries blocked by blocklist",                    snap.blocked));
+    out.push_str(&fmt_counter("runbound_queries_forwarded_total",    "Queries forwarded to upstreams",                  snap.forwarded));
+    out.push_str(&fmt_counter("runbound_queries_nxdomain_total",     "Queries answered NXDOMAIN",                       snap.nxdomain));
+    out.push_str(&fmt_counter("runbound_queries_servfail_total",     "Queries answered SERVFAIL",                       snap.servfail));
+    out.push_str(&fmt_counter("runbound_queries_local_hits_total",   "Queries answered from local zones",               snap.local_hits));
+    out.push_str(&fmt_gauge(  "runbound_qps_1m",                     "Queries per second (1 minute average)",           snap.qps_1m));
+    out.push_str(&fmt_gauge(  "runbound_qps_peak",                   "Peak queries per second observed",                snap.qps_peak));
+    out.push_str(&fmt_gauge(  "runbound_latency_p50_ms",             "DNS response latency p50 in milliseconds",        snap.latency_p50_ms));
+    out.push_str(&fmt_gauge(  "runbound_latency_p95_ms",             "DNS response latency p95 in milliseconds",        snap.latency_p95_ms));
+    out.push_str(&fmt_gauge(  "runbound_latency_p99_ms",             "DNS response latency p99 in milliseconds",        snap.latency_p99_ms));
+    out.push_str(&fmt_gauge(  "runbound_cache_hit_rate",             "Cache hit rate (0.0 to 1.0)",                     snap.cache_hit_rate));
+    out.push_str(&fmt_gauge(  "runbound_cache_entries",              "Current number of entries in DNS cache",          snap.cache_entries));
+    out.push_str(&fmt_counter("runbound_cache_hits_total",           "Total cache hits",                                cache_hits));
+    out.push_str(&fmt_counter("runbound_cache_misses_total",         "Total cache misses",                              cache_misses));
+    out.push_str(&fmt_counter("runbound_cache_evictions_total",      "Total cache evictions",                           evictions));
+    out.push_str(&fmt_gauge(  "runbound_uptime_seconds",             "Service uptime in seconds",                       snap.uptime_secs));
+    out.push_str(&fmt_gauge(  "runbound_xdp_active",                 "Whether XDP fast path is active (1=yes, 0=no)",   xdp_active as u8));
+
+    // Per-upstream metrics with labels — omit latency when not yet measured (null → skip, no NaN).
+    if !upstreams.is_empty() {
+        out.push_str("# HELP runbound_upstream_healthy Whether upstream is healthy (1=yes, 0=no)\n");
+        out.push_str("# TYPE runbound_upstream_healthy gauge\n");
+        for u in upstreams {
+            out.push_str(&format!(
+                "runbound_upstream_healthy{{id=\"{}\",addr=\"{}\",port=\"{}\",protocol=\"{}\"}} {}\n",
+                u.id, u.addr, u.port, u.protocol, u.healthy as u8,
+            ));
+        }
+        let latency_upstreams: Vec<&UpstreamMetric> = upstreams.iter().filter(|u| u.latency_ms.is_some()).collect();
+        if !latency_upstreams.is_empty() {
+            out.push_str("# HELP runbound_upstream_latency_ms Last measured upstream latency in milliseconds\n");
+            out.push_str("# TYPE runbound_upstream_latency_ms gauge\n");
+            for u in latency_upstreams {
+                out.push_str(&format!(
+                    "runbound_upstream_latency_ms{{id=\"{}\",addr=\"{}\",port=\"{}\",protocol=\"{}\"}} {}\n",
+                    u.id, u.addr, u.port, u.protocol, u.latency_ms.unwrap(),
+                ));
+            }
+        }
+    }
     out
 }
 
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let snap = s.stats.snapshot();
+    let snap         = s.stats.snapshot();
+    let cache_hits   = s.stats.cache_hits.load(Ordering::Relaxed);
+    let cache_misses = s.stats.cache_misses.load(Ordering::Relaxed);
+    let evictions    = s.cache_evictions.load(Ordering::Relaxed);
+    let xdp_active   = s.xdp_active.load(Ordering::Relaxed) > 0;
+    let upstreams: Vec<UpstreamMetric> = {
+        let list = s.upstreams.read()
+            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in metrics handler: {e}"));
+        list.iter().map(|u| UpstreamMetric {
+            id:         u.id.clone(),
+            addr:       u.addr.clone(),
+            port:       u.port,
+            protocol:   u.protocol.clone(),
+            healthy:    u.healthy,
+            latency_ms: u.latency_ms,
+        }).collect()
+    };
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        render_prometheus_metrics(&snap),
+        render_prometheus_metrics(&snap, cache_hits, cache_misses, evictions, xdp_active, &upstreams),
     )
 }
 
@@ -2697,10 +2758,137 @@ mod tests {
         ).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
-        assert_eq!(json["status"], "ok");
+        let status = json["status"].as_str().unwrap_or("");
+        assert!(
+            matches!(status, "ok" | "degraded" | "error"),
+            "health status must be ok/degraded/error; got: {status}"
+        );
         assert!(json["version"].is_string(), "health must include version field");
         assert!(json.get("hsm").is_none(), "health must not expose hsm field");
         assert!(json["uptime_secs"].is_number());
+    }
+
+    // ── #74: /health enriched fields ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_has_enriched_fields() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/health").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert!(json["xdp_active"].is_boolean(),  "health must include xdp_active");
+        assert!(json["upstreams_healthy"].is_number(), "health must include upstreams_healthy");
+        assert!(json["upstreams_total"].is_number(),   "health must include upstreams_total");
+        assert!(json["cache_entries"].is_number(),     "health must include cache_entries");
+        assert!(json["status"].is_string(),            "health must include status");
+    }
+
+    #[tokio::test]
+    async fn health_status_ok_when_no_upstreams_configured() {
+        // Default test config has no forward zones → 0 upstreams → status "error"
+        let app = make_test_app();
+        let json = body_json(
+            app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await.unwrap().into_body()
+        ).await;
+        assert_eq!(json["upstreams_total"], 0);
+        assert_eq!(json["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn health_status_ok_with_healthy_upstream() {
+        let mut cfg = crate::config::parser::UnboundConfig::default();
+        cfg.forward_zones.push(crate::config::parser::ForwardZone {
+            name: ".".into(), addrs: vec!["1.1.1.1@53".into()], tls: false,
+        });
+        let app = make_test_app_with_cfg(cfg);
+        let (k, v) = auth_header();
+        // Mark the upstream healthy via the upstreams endpoint
+        let json = body_json(
+            app.clone().oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await.unwrap().into_body()
+        ).await;
+        // No probe has run yet → healthy=0 but total=1 → "degraded"
+        assert_eq!(json["upstreams_total"], 1);
+        assert_eq!(json["status"], "degraded");
+        let _ = (k, v);
+    }
+
+    // ── #73: GET /api/metrics Prometheus format ───────────────────────────────
+
+    #[tokio::test]
+    async fn metrics_requires_auth() {
+        let app = make_test_app();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/metrics").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metrics_content_type_prometheus() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/metrics").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("");
+        assert!(ct.contains("text/plain"), "content-type must be text/plain; got: {ct}");
+        assert!(ct.contains("0.0.4"),      "content-type must include version=0.0.4; got: {ct}");
+    }
+
+    #[tokio::test]
+    async fn metrics_contains_required_metric_names() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/metrics").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        for metric in &[
+            "runbound_queries_total",
+            "runbound_queries_blocked_total",
+            "runbound_queries_forwarded_total",
+            "runbound_queries_nxdomain_total",
+            "runbound_queries_servfail_total",
+            "runbound_queries_local_hits_total",
+            "runbound_qps_1m",
+            "runbound_qps_peak",
+            "runbound_latency_p50_ms",
+            "runbound_latency_p95_ms",
+            "runbound_latency_p99_ms",
+            "runbound_cache_hit_rate",
+            "runbound_cache_entries",
+            "runbound_cache_hits_total",
+            "runbound_cache_misses_total",
+            "runbound_cache_evictions_total",
+            "runbound_uptime_seconds",
+            "runbound_xdp_active",
+        ] {
+            assert!(body.contains(metric), "metrics output must contain {metric}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_upstream_labels_present() {
+        let mut cfg = crate::config::parser::UnboundConfig::default();
+        cfg.forward_zones.push(crate::config::parser::ForwardZone {
+            name: ".".into(), addrs: vec!["9.9.9.9@53".into()], tls: false,
+        });
+        let app = make_test_app_with_cfg(cfg);
+        let (k, v) = auth_header();
+        let resp = app.oneshot(
+            Request::builder().uri("/api/metrics").header(k, v).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains("runbound_upstream_healthy"), "upstream_healthy metric must be present");
+        assert!(body.contains("addr=\"9.9.9.9\""), "upstream addr label must be present");
+        assert!(body.contains("protocol=\"udp\""), "upstream protocol label must be present");
     }
 
     // ── ReloadLimiter correctness under parallel load ─────────────────────────

@@ -30,7 +30,7 @@
 // umem.rs:240-311  — volatile read/write of producer/consumer/flags/descs in DescRing
 //                    (same rationale as AddrRing above)
 // umem.rs:336      — sysconf(_SC_PAGESIZE): safe C call, no invariants beyond valid fd
-// umem.rs:347      — mmap(MAP_ANONYMOUS|MAP_SHARED) for UMEM area; checked != MAP_FAILED
+// umem.rs:347      — alloc_umem_area: mmap(MAP_HUGETLB|MAP_ANONYMOUS) for huge pages, falls back to MAP_POPULATE
 // umem.rs:374      — setsockopt(XDP_UMEM_REG): registers mmap'd area with AF_XDP socket
 // umem.rs:386      — munmap on error path: same ptr/len as the mmap above
 // umem.rs:397      — setsockopt(ring sizes): sets fill/completion ring capacities

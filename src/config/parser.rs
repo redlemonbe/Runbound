@@ -140,6 +140,12 @@ pub struct UnboundConfig {
     /// Eliminates frequency-scaling ramp-up jitter on DNS burst traffic.
     /// Silent no-op when /sys/devices/system/cpu/cpuN/cpufreq/ is absent (containers, VMs).
     pub xdp_cpu_governor: bool,
+    /// Pin NIC queue IRQs to their corresponding XDP worker cores. Default: false.
+    /// Silent no-op when /proc/interrupts is unavailable or IRQs not found (VMs, containers).
+    pub xdp_irq_affinity: bool,
+    /// Attempt to allocate UMEM using 2 MiB huge pages. Default: true.
+    /// Falls back silently to standard 4 KiB pages when huge pages are unavailable.
+    pub xdp_hugepages: bool,
 
     // ── DNS prefetching ───────────────────────────────────────────────────────
     /// Pre-resolve popular domains before their cache entry expires. Default: false.
@@ -169,6 +175,7 @@ impl UnboundConfig {
             log_client_ip: true,
             cpu_affinity:       true,
             xdp:                true,
+            xdp_hugepages:      true,
             cache_min_entries:  2048,
             prefetch:             false,
             prefetch_threshold:   5,
@@ -358,6 +365,8 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "cpu-affinity"        => cfg.cpu_affinity        = val.trim_matches('"') != "no",
         "xdp"                 => cfg.xdp                 = val.trim_matches('"') != "no",
         "xdp-cpu-governor"    => cfg.xdp_cpu_governor    = val.trim_matches('"') == "yes",
+        "xdp-irq-affinity"    => cfg.xdp_irq_affinity    = val.trim_matches('"') == "yes",
+        "xdp-hugepages"       => cfg.xdp_hugepages       = val.trim_matches('"') != "no",
         "prefetch"              => cfg.prefetch              = val.trim_matches('"') == "yes",
         "prefetch-threshold"    => cfg.prefetch_threshold    = val.parse().unwrap_or(5),
         "cache-flush-cooldown"  => cfg.cache_flush_cooldown  = val.parse().unwrap_or(60),

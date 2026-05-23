@@ -62,11 +62,13 @@ const PROTO_UDP:   u8 = 17;
 /// to skip XDP entirely without editing the config file. Useful when the host
 /// is unreachable after XDP bricks the network and rescue-mode boot is needed.
 pub fn start_xdp(
-    iface:        &str,
-    zones:        Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter: Arc<RateLimiter>,
-    acl:          Arc<Acl>,
-    cpu_governor: bool,
+    iface:         &str,
+    zones:         Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter:  Arc<RateLimiter>,
+    acl:           Arc<Acl>,
+    cpu_governor:  bool,
+    irq_affinity:  bool,
+    hugepages:     bool,
 ) -> Result<Option<XdpHandle>, String> {
     if std::env::var("RUNBOUND_DISABLE_XDP").is_ok() {
         tracing::info!("XDP disabled via RUNBOUND_DISABLE_XDP environment variable");
@@ -79,7 +81,7 @@ pub fn start_xdp(
                     virt = %iface, parent = %parent,
                     "XDP: virtual interface detected — retrying on parent"
                 );
-                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor);
+                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages);
                 if result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
                     tracing::info!(parent = %parent, "XDP active on parent interface");
                 }
@@ -95,15 +97,17 @@ pub fn start_xdp(
             }
         }
     }
-    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor)
+    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages)
 }
 
 fn start_xdp_on_iface(
-    iface:        &str,
-    zones:        Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter: Arc<RateLimiter>,
-    acl:          Arc<Acl>,
-    cpu_governor: bool,
+    iface:         &str,
+    zones:         Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter:  Arc<RateLimiter>,
+    acl:           Arc<Acl>,
+    cpu_governor:  bool,
+    irq_affinity:  bool,
+    hugepages:     bool,
 ) -> Result<Option<XdpHandle>, String> {
     let ifidx = iface_index(iface)
         .ok_or_else(|| format!("interface {iface} not found"))?;
@@ -156,8 +160,8 @@ fn start_xdp_on_iface(
         // SAFETY: `ifidx` is a valid ifindex returned by `iface_index`. `q` is
         //         in [0, min(queue_count, 64)), which is the valid range of NIC RX
         //         queues. On zero-copy failure we fall back to copy mode.
-        let sock = unsafe { create_xsk_socket(ifidx, q, true) }
-            .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false) })
+        let sock = unsafe { create_xsk_socket(ifidx, q, true, hugepages) }
+            .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false, hugepages) })
             .map_err(|e| format!("AF_XDP socket creation failed: {e}"))?;
         handle.register_socket(q, sock.fd)?;
         sockets.push((q, sock));
@@ -171,11 +175,14 @@ fn start_xdp_on_iface(
         }
     }
 
+    // #68: build queue→core map for IRQ affinity pinning after thread spawn.
+    let mut queue_to_core: Vec<(u32, usize)> = Vec::with_capacity(sockets.len());
     for (q, sock) in sockets {
         let z       = Arc::clone(&zones);
         let rl      = Arc::clone(&rate_limiter);
         let acl     = Arc::clone(&acl);
         let core_id = if cores.is_empty() { 0 } else { cores[q as usize % cores.len()] };
+        queue_to_core.push((q, core_id));
         // #69: save original governor before the worker switches to "performance"
         if cpu_governor {
             if let Some(gov) = crate::cpu::read_governor(core_id) {
@@ -186,6 +193,11 @@ fn start_xdp_on_iface(
             .name(format!("xdp-{iface}-q{q}"))
             .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor))
             .map_err(|e| format!("thread spawn: {e}"))?;
+    }
+
+    // #68: pin NIC queue IRQs to their XDP worker cores to avoid cross-core cache misses.
+    if irq_affinity {
+        crate::cpu::set_irq_affinity(iface, &queue_to_core);
     }
 
     Ok(Some(handle))

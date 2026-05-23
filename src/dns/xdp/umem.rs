@@ -314,6 +314,47 @@ impl DescRing {
 
 // ── UMEM ──────────────────────────────────────────────────────────────────
 
+/// Allocate the UMEM backing memory.
+/// Tries 2 MiB huge pages first (when `hugepages` is true) to reduce TLB pressure
+/// at high packet rates. Falls back to standard 4 KiB pages on any failure.
+fn alloc_umem_area(size: usize, hugepages: bool) -> Result<*mut libc::c_void, String> {
+    #[cfg(target_os = "linux")]
+    if hugepages {
+        // MAP_HUGE_2MB = 21 << MAP_HUGE_SHIFT (MAP_HUGE_SHIFT = 26)
+        // SAFETY: mmap with MAP_HUGETLB|MAP_ANONYMOUS allocates huge pages.
+        //         fd=-1 is required with MAP_ANONYMOUS. size is page-aligned.
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(), size,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_ANONYMOUS | libc::MAP_HUGETLB | (21 << libc::MAP_HUGE_SHIFT),
+                -1, 0,
+            )
+        };
+        if ptr != MAP_FAILED {
+            tracing::info!(size, "UMEM allocated with huge pages");
+            return Ok(ptr);
+        }
+        tracing::debug!("huge pages unavailable, falling back to standard pages");
+    }
+
+    // Standard 4 KiB pages (also used when hugepages=false)
+    // SAFETY: mmap with MAP_ANONYMOUS|MAP_SHARED allocates a new anonymous mapping.
+    //         MAP_POPULATE pre-faults pages to avoid hot-path page faults.
+    let ptr = unsafe {
+        mmap(ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE, -1, 0)
+    };
+    if ptr == MAP_FAILED {
+        return Err(format!("UMEM mmap failed: {}", std::io::Error::last_os_error()));
+    }
+    if hugepages {
+        tracing::info!(size, "UMEM allocated with standard pages (huge pages unavailable)");
+    } else {
+        tracing::debug!(size, "UMEM allocated with standard pages");
+    }
+    Ok(ptr)
+}
+
 pub struct Umem {
     /// Base address of the mmap'd memory region (shared with kernel)
     pub area: *mut u8,
@@ -332,31 +373,15 @@ impl Umem {
     /// Allocate and register a UMEM with the given AF_XDP socket.
     /// On success returns the Umem plus the fill/completion ring maps;
     /// the caller passes `fd` to register_rings() after obtaining RX/TX offsets.
-    pub unsafe fn new(xsk_fd: RawFd) -> Result<Self, String> {
+    pub unsafe fn new(xsk_fd: RawFd, hugepages: bool) -> Result<Self, String> {
         let page = unsafe { sysconf(_SC_PAGESIZE) } as usize;
         let area_len = (FRAME_COUNT * FRAME_SIZE) as usize;
         // Round up to page boundary (should already be page-aligned)
         let area_len = (area_len + page - 1) & !(page - 1);
 
-        // SAFETY: `mmap` with MAP_ANONYMOUS | MAP_SHARED allocates a new anonymous
-        //         mapping. fd=-1 is required with MAP_ANONYMOUS. The mapping is
-        //         page-aligned and `area_len` is a non-zero multiple of the page
-        //         size. PROT_READ|PROT_WRITE gives the kernel permission to DMA
-        //         into this region (required by AF_XDP UMEM). MAP_POPULATE
-        //         pre-faults the pages to avoid page faults on the hot path.
-        let area = unsafe {
-            mmap(
-                ptr::null_mut(),
-                area_len,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
-                -1,
-                0,
-            )
-        };
-        if area == MAP_FAILED {
-            return Err(format!("UMEM mmap failed: {}", std::io::Error::last_os_error()));
-        }
+        // #62: try 2 MiB huge pages first to reduce TLB pressure at high packet rates.
+        // Falls back silently to standard 4 KiB pages when huge pages are unavailable.
+        let area = alloc_umem_area(area_len, hugepages)?;
         let area = area as *mut u8;
 
         // Register this memory region as a UMEM with the XDP socket
