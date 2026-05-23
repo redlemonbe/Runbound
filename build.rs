@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Build script: compiles the eBPF XDP filter when the "xdp" feature is enabled.
 // Requires: clang (apt install clang) + libbpf-dev (apt install libbpf-dev).
 // The compiled object is embedded into the binary with include_bytes!.
