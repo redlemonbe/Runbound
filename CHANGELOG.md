@@ -9,6 +9,78 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.9] — 2026-05-23
+
+### Added
+
+- **#80 — NIC ring auto-sizing** (`src/dns/xdp/socket.rs`)  
+  `maximize_nic_ring()` queries the driver via `SIOCETHTOOL` ioctl (`ETHTOOL_GRINGPARAM`) then applies the hardware maximum (`ETHTOOL_SRINGPARAM`) before XDP attach. Prevents silent hardware FIFO drops at high QPS on Intel ixgbe (default ring 512 → max 4096). Graceful fallback on `EOPNOTSUPP` / `EPERM`.
+
+- **`xdp-ring-size` config directive** — `auto` (default) or explicit integer, capped at driver max.
+
+- **`GET /api/system`**: new fields `nic_rx_ring`, `nic_rx_ring_max`, `nic_rx_dropped`  
+  `nic_rx_dropped` read from `/sys/class/net/<iface>/statistics/rx_dropped`.
+
+- **Prometheus**: `runbound_nic_rx_ring`, `runbound_nic_rx_ring_max`, `runbound_nic_rx_dropped_total`
+
+- **AF_XDP ring constants** split into `FILL/COMP/RX/TX_RING_SIZE = 4096`; `FRAME_COUNT` raised to 8192 (32 MiB/socket).
+
+- **SIGUSR1 handler**: dumps live stats to log (total, forwarded, blocked, 1 m QPS, cache hit rate, uptime). Previously OS-default = terminate.
+
+- **SIGUSR2 handler**: silently ignored. Previously OS-default = terminate.
+
+- **PERF-03 — NUMA-aware UMEM** (`src/dns/xdp/umem.rs`): `rebind_to_local_numa()` called in XDP worker after CPU pinning. Migrates UMEM pages to local NUMA node via `mbind(MPOL_PREFERRED|MPOL_MF_MOVE)`. Fallback on non-NUMA and containers.
+
+### Changed
+
+- **PERF-01 — Cache publish interval**: `100 ms → 10 ms` — XDP workers see new cache entries within 10 ms (was up to 100 ms).
+
+- **PERF-02 — Lock-free cache inserts**: `Mutex<HashMap>` → `DashMap` on `MutableCacheMap`. Concurrent inserts no longer block the publish loop. Scales past 500 K insertions/second.
+
+- **GDPR — `log-client-ip` default**: `yes → no`. Client IPs appear as `[redacted]` by default in `/api/logs` and the logfile. Opt-in: `log-client-ip: yes`. Audit log unaffected.
+
+- **systemd unit hardened**: `LimitNOFILE=131072`, `LimitNPROC=4096`, `LimitMEMLOCK=infinity`, `MemoryDenyWriteExecute=no`, full XDP capability set (`CAP_NET_RAW CAP_NET_ADMIN CAP_BPF`), `RestrictAddressFamilies=AF_XDP`.
+
+### Removed
+
+- **guestdns**: companion service removed — `systemctl stop/disable`, service file and binary deleted.
+
+---
+
+## [0.6.8] — 2026-05-23
+
+### Added
+
+- **#75 — `POST /api/dns/lookup`**: on-demand DNS resolution via API with cache hit indicator.
+
+- **#76 — `blocked_count` in `GET /api/feeds`**: per-feed count of currently active blocked domains.
+
+- **#78 — `POST /api/upstreams/reconnect`**: force DoT pool reconnect without restart. Accepts `{"warm_up": true}` to pre-warm connections (3 × 250 ms probes).
+
+- **#58 — Slave version and zones**: `GET /api/sync/slaves` now includes `version` and `zones_synced` per slave.
+
+- **Web UI — DNS Lookup panel**: live resolve with cache hit indicator (tab DNS Entries).
+
+- **Web UI — Reconnect DoT button**: per-upstream `↺` button in the Upstreams tab.
+
+- **Web UI — `cfg` badge**: upstream entries coming from the config file are marked with a `cfg` badge.
+
+- **Web UI — Feed `blocked_count`** and full `last_error` display (closes #55).
+
+- **Web UI — Slave `version` + `zones_synced`** in the System tab.
+
+### Changed
+
+- **`/health`** enriched (unauthenticated): `version`, `uptime_secs`, `xdp_active`, `upstreams_healthy`, `cache_entries`.
+
+- **`GET /api/upstreams`**: new `source` field (`"config"` or `"runtime"`).
+
+### Fixed
+
+- **#77 — DoT pool exhaustion after idle**: `rebuild_and_swap` now calls `warm_up()` (3 × 250 ms probes) on new resolvers before swapping. Eliminates SERVFAIL burst on first post-idle query.
+
+---
+
 ## [0.6.7] — 2026-05-22
 
 ### Fixed

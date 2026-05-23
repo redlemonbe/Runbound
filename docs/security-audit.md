@@ -198,7 +198,7 @@ Critical path for a DNS query in XDP mode:
 Total estimated: ~1 µs (single-threaded, cache-warm)
 ```
 
-Theoretical throughput: at 1 µs/query on 1 core → 1 M QPS/core. With 8 XDP cores → 8 M QPS. The 5 M QPS target is achievable on 8-queue+ hardware.
+Theoretical throughput: at 1 µs/query on 1 core → 1 M QPS/core. With 8 XDP cores → 8 M QPS.
 
 ### 4.2 AF_XDP Configuration
 
