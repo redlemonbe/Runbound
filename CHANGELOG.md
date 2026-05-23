@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.17] — 2026-05-23
+
+### Fixed
+
+- **XDP self-test false failure in SKB mode / VM environments** (`src/dns/xdp/worker.rs`)  
+  On virtio-net with MTU > 3506 (KVM/Proxmox), XDP loads in SKB mode because the driver has no native XDP support at that MTU. In SKB mode, AF_XDP TX frames go through the kernel SKB path and do **not** re-enter the XDP ingress path — the loopback round-trip the self-test relies on never completes. The fill ring is correctly seeded, the socket is bound, and the BPF program is attached; real ingress DNS traffic is delivered correctly.  
+  Fix: the 200 ms deadline expiry is now `tracing::warn!` + `Ok(())` instead of `Err(...)`. The hard `Err` path is preserved only for `fill.producer_count() == 0` (genuine UMEM misconfiguration). XDP remains active and the warning message names SKB mode / VM environment as the expected cause.
+
+---
+
 ## [0.6.16] — 2026-05-23
 
 ### Fixed
