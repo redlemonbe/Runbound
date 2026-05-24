@@ -379,6 +379,7 @@ pub struct AddBlacklistRequest {
     #[serde(default)]
     pub action: BlacklistAction,
     pub description: Option<String>,
+    pub schedule: Option<store::ScheduleWindow>,
 }
 
 // ── Security middleware ────────────────────────────────────────────────────
@@ -1688,11 +1689,13 @@ async fn add_blacklist_handler(
                 })),
             );
         }
+        let is_scheduled = req.schedule.is_some();
         let entry = BlacklistEntry {
             id: uuid::Uuid::new_v4().to_string(),
             domain: req.domain.clone(),
             action: req.action.clone(),
             description: req.description.clone(),
+            schedule: req.schedule.clone(),
         };
         bl.entries.push(entry.clone());
         if let Err(e) = store::save_blacklist(&bl) {
@@ -1709,7 +1712,10 @@ async fn add_blacklist_handler(
         let mut new_zones = (*current).clone();
         // VUL-09: override_zone so the blacklist entry always takes precedence
         // over any static zone with the same name defined in unbound.conf.
-        new_zones.override_zone(&req.domain, ZoneAction::from(&req.action));
+        // #9: only add to active zone set if schedule is currently active (or no schedule)
+        if !is_scheduled || entry.schedule.as_ref().map_or(true, |s| s.is_active_now()) {
+            new_zones.override_zone(&req.domain, ZoneAction::from(&req.action));
+        }
         s.zones.store(Arc::new(new_zones));
 
         entry

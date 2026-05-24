@@ -217,6 +217,56 @@ pub fn save(store: &DnsStore) -> Result<(), AppError> {
 
 // ── Blacklist store ────────────────────────────────────────────────────────
 
+/// Time window for scheduled DNS blocking (#9).
+/// Times are in UTC HH:MM format. If end < start the window wraps midnight.
+/// days: 0=Sun, 1=Mon ... 6=Sat. Empty vec means all days.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleWindow {
+    #[serde(default)]
+    pub days: Vec<u8>,   // 0–6; empty = every day
+    pub start: String,   // "HH:MM"
+    pub end: String,     // "HH:MM"
+}
+
+impl ScheduleWindow {
+    /// Returns true if the schedule is currently active (UTC clock).
+    pub fn is_active_now(&self) -> bool {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Seconds since midnight UTC
+        let day_secs = secs % 86400;
+        let h = (day_secs / 3600) as u8;
+        let m = ((day_secs % 3600) / 60) as u8;
+        // Day of week: Thu=0 at UNIX epoch (1970-01-01 was Thursday)
+        // Adjust: days_since_epoch mod 7, epoch was Thursday (day 4 in Sun=0 scheme)
+        let days_since_epoch = (secs / 86400) as u64;
+        let dow = ((days_since_epoch + 4) % 7) as u8; // 0=Sun
+
+        if !self.days.is_empty() && !self.days.contains(&dow) {
+            return false;
+        }
+
+        let Ok(sh) = self.start[..2].parse::<u8>() else { return false; };
+        let Ok(sm) = self.start[3..5].parse::<u8>() else { return false; };
+        let Ok(eh) = self.end[..2].parse::<u8>() else { return false; };
+        let Ok(em) = self.end[3..5].parse::<u8>() else { return false; };
+
+        let start_min = sh as u16 * 60 + sm as u16;
+        let end_min = eh as u16 * 60 + em as u16;
+        let now_min = h as u16 * 60 + m as u16;
+
+        if start_min <= end_min {
+            now_min >= start_min && now_min < end_min
+        } else {
+            // Wraps midnight
+            now_min >= start_min || now_min < end_min
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlacklistEntry {
     pub id: String,
@@ -224,6 +274,9 @@ pub struct BlacklistEntry {
     pub action: crate::dns::BlacklistAction,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// #9: optional time window — if absent the rule is always active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
