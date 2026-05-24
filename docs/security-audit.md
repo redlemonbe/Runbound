@@ -99,7 +99,7 @@ Anti-brute-force: 500 ms sleep after 50 consecutive failures, applied before com
 - **Residual risk:** HTTP Authorization header length is observable to a network attacker (see KL-03); negligible in practice as API is bound to 127.0.0.1 by default
 - **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `f9ee716`)
 
-**Verdict: ✅ Compliant with ANSSI secure API guidelines.**
+**Verdict [AI-INTERNAL]:** Implementation consistent with ANSSI RGS API authentication guidelines based on code review. No formal ANSSI evaluation has been conducted; this claim is scoped to [AI-INTERNAL] analysis only.
 
 ### 3.2 Secret Management
 
@@ -127,7 +127,7 @@ HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable �
 - **Residual risk:** Fix is believed complete; no known residual risk under current threat model
 - **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `b85b2cd`)
 
-**Verdict: ✅ HSM-compliant. Zero plaintext secrets in memory.**
+**Verdict [AI-INTERNAL]:** No plaintext secret material detected in memory under code review. HSM integration via `cryptoki` crate verified structurally. No formal HSM certification evaluation conducted; claim is scoped to [AI-INTERNAL] code review only.
 
 ### 3.2b HTTP Body Size Limit
 
