@@ -11,6 +11,7 @@ mod error;
 mod feeds;
 mod firewall;
 mod hsm;
+mod icmp;
 mod integrity;
 mod logbuffer;
 mod runtime;
@@ -36,6 +37,7 @@ use config::parser::UnboundConfig;
 use dns::local::LocalZoneSet;
 use dns::{Acl, RateLimiter};
 use domain_stats::DomainStats;
+use icmp::{IcmpConfig, IcmpStats};
 use stats::Stats;
 
 const API_BIND: &str = "127.0.0.1"; // API must not be exposed externally
@@ -103,6 +105,8 @@ async fn async_main(
         per_upstream_resolvers,
         racing_wins,
         domain_stats,
+        icmp_stats,
+        icmp_cfg,
     ) = build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
@@ -166,7 +170,7 @@ async fn async_main(
     // The handle must stay alive for the entire process lifetime; dropping it
     // would detach the XDP program and destroy the XSKMAP.
     #[cfg(feature = "xdp")]
-    let _xdp_handle = if !cfg.xdp {
+    let mut _xdp_handle = if !cfg.xdp {
         info!("XDP fast path disabled (xdp: no / --no-xdp)");
         None
     } else if cfg.xdp_interface.as_deref() == Some("none") {
@@ -252,6 +256,64 @@ async fn async_main(
             }
         }
     };
+
+    // ── ICMP BPF init + stats poll task (#89) ──────────────────────────────
+    #[cfg(feature = "xdp")]
+    if let Some(ref mut h) = _xdp_handle {
+        // Push initial config to BPF map
+        if let Err(e) = h.icmp_update_config(cfg.icmp_enabled, cfg.icmp_rate_pps, cfg.icmp_burst) {
+            tracing::warn!(err=%e, "ICMP BPF config init failed");
+        } else if cfg.icmp_enabled {
+            info!(
+                "XDP ICMP echo responder active (rate={}/s)",
+                cfg.icmp_rate_pps
+            );
+        }
+    }
+    // Spawn BPF stats poll task — runs every second, updates Rust atomics.
+    // Also pushes Rust config to BPF map so PUT /api/icmp/config takes effect.
+    #[cfg(feature = "xdp")]
+    let _icmp_poll_task = {
+        use std::sync::atomic::Ordering;
+        let icmp_stats_poll = Arc::clone(&icmp_stats);
+        let icmp_cfg_poll = Arc::clone(&icmp_cfg);
+        // Move the XDP handle into the poll task — keeps it alive and accessible.
+        // DNS workers already have raw socket FDs and do not need this handle.
+        let mut xdp_h = _xdp_handle;
+        tokio::spawn(async move {
+            let mut last_rate = 0u32;
+            let mut last_enabled = false;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let Some(ref mut h) = xdp_h else {
+                    break;
+                };
+                // Read stats from BPF per-CPU array
+                if let Ok(vals) = h.icmp_read_stats() {
+                    icmp_stats_poll.handled.store(vals[0], Ordering::Relaxed);
+                    icmp_stats_poll.replied.store(vals[1], Ordering::Relaxed);
+                    icmp_stats_poll.dropped.store(vals[2], Ordering::Relaxed);
+                    icmp_stats_poll
+                        .rate_limited
+                        .store(vals[3], Ordering::Relaxed);
+                }
+                // Push config changes to BPF map
+                let (enabled, rate_pps, burst) = {
+                    let c = icmp_cfg_poll.lock().unwrap_or_else(|e| e.into_inner());
+                    (c.enabled, c.rate_pps, c.burst)
+                };
+                if (enabled != last_enabled || rate_pps != last_rate)
+                    && h.icmp_update_config(enabled, rate_pps, burst).is_ok()
+                {
+                    last_enabled = enabled;
+                    last_rate = rate_pps;
+                }
+            }
+        })
+    };
+    // When xdp feature is off: keep icmp_stats/icmp_cfg alive for API use
+    #[cfg(not(feature = "xdp"))]
+    let (_icmp_stats_keep, _icmp_cfg_keep) = (Arc::clone(&icmp_stats), Arc::clone(&icmp_cfg));
 
     // #93: TTY-only startup banner — not printed under systemd (no TTY on stderr).
     if std::io::stderr().is_terminal() {
@@ -454,6 +516,8 @@ async fn build_and_launch(
     dns::server::SharedResolversVec,
     Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
     Arc<DomainStats>,
+    Arc<crate::icmp::IcmpStats>,
+    Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -888,6 +952,12 @@ async fn build_and_launch(
     let events_tx = sync_journal.as_ref().map(|j| j.events_tx.clone());
 
     let domain_stats = DomainStats::new();
+    let icmp_stats = IcmpStats::new();
+    let icmp_cfg = Arc::new(std::sync::Mutex::new(IcmpConfig {
+        enabled: cfg.icmp_enabled,
+        rate_pps: cfg.icmp_rate_pps,
+        burst: cfg.icmp_burst,
+    }));
 
     let state = AppState {
         zones: Arc::clone(&zones),
@@ -916,8 +986,11 @@ async fn build_and_launch(
         racing_wins: Arc::clone(&racing_wins),
         events_tx,
         domain_stats: Arc::clone(&domain_stats),
+        icmp_stats: Arc::clone(&icmp_stats),
+        icmp_cfg: Arc::clone(&icmp_cfg),
     };
     let app = api::router(state);
+
     let api_addr = format!("{API_BIND}:{api_port}");
     // Bind with std so the fd is runtime-agnostic; convert inside the API runtime.
     let std_listener = std::net::TcpListener::bind(&api_addr)
@@ -995,6 +1068,8 @@ async fn build_and_launch(
         per_upstream_resolvers,
         racing_wins,
         domain_stats,
+        icmp_stats,
+        icmp_cfg,
     ))
 }
 
