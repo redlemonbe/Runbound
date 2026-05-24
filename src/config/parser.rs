@@ -193,6 +193,15 @@ pub struct UnboundConfig {
     /// recovers.  Default: true.
     pub resolv_fallback: bool,
 
+    // ── Serve-stale RFC 8767 (#108) ──────────────────────────────────────────────
+    /// Return stale (expired) cached data when all upstreams return SERVFAIL.
+    /// Default: true. Set to `no` to disable.
+    pub serve_stale: bool,
+    /// TTL (seconds) to advertise for stale answers. Default: 30.
+    pub stale_answer_ttl: u32,
+    /// Maximum age (seconds) of a stale entry that can still be served. Default: 86400.
+    pub stale_max_age: u64,
+
     // ── AF_XDP ring sizes (#96) ───────────────────────────────────────────────
     /// AF_XDP fill ring size (power of 2, 64–65536). Default: 4096.
     pub xdp_fill_ring_size: u32,
@@ -255,6 +264,9 @@ impl UnboundConfig {
             xdp_comp_ring_size: 4096,
             xdp_rx_ring_size: 4096,
             xdp_tx_ring_size: 4096,
+            serve_stale: true,
+            stale_answer_ttl: 30,
+            stale_max_age: 86400,
             ui_enabled: false,
             ui_port: 8090,
             ui_bind: "0.0.0.0".to_owned(),
@@ -526,6 +538,9 @@ fn parse_server_directive(
         "cache-flush-cooldown" => cfg.cache_flush_cooldown = val.parse().unwrap_or(60),
         "upstream-racing" => cfg.upstream_racing = val.trim_matches('"') == "yes",
         "resolv-fallback" => cfg.resolv_fallback = val.trim_matches('"') != "no",
+        "serve-stale" => cfg.serve_stale = val.trim_matches('"') != "no",
+        "stale-answer-ttl" => cfg.stale_answer_ttl = val.parse().unwrap_or(30),
+        "stale-max-age" => cfg.stale_max_age = val.parse().unwrap_or(86400),
         "firewall-manage" => cfg.firewall_manage = val.trim_matches('"') == "yes",
         "firewall-backend" => cfg.firewall_backend = Some(val.trim_matches('"').to_owned()),
         "firewall-tag" => cfg.firewall_tag = val.trim_matches('"').to_owned(),

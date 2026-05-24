@@ -79,6 +79,7 @@ pub struct Stats {
     pub forwarded: AtomicU64,
     pub nxdomain: AtomicU64,
     pub refused: AtomicU64,
+    pub stale_served: AtomicU64,
     pub servfail: AtomicU64,
     pub started_at: Instant,
 
@@ -125,6 +126,7 @@ impl Stats {
             forwarded: AtomicU64::new(0),
             nxdomain: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            stale_served: AtomicU64::new(0),
             servfail: AtomicU64::new(0),
             started_at: Instant::now(),
             lat_hist: (0..HIST_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
@@ -176,6 +178,7 @@ impl Stats {
         self.nxdomain.fetch_add(1, Ordering::Relaxed);
     }
     #[inline]
+    pub fn inc_stale_served(&self) { self.stale_served.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_refused(&self) {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
@@ -313,6 +316,7 @@ impl Stats {
             forwarded: self.forwarded.load(Ordering::Relaxed),
             nxdomain,
             refused: self.refused.load(Ordering::Relaxed),
+            stale_served: self.stale_served.load(Ordering::Relaxed),
             servfail: self.servfail.load(Ordering::Relaxed),
             uptime_secs: self.started_at.elapsed().as_secs(),
             qps_1m,
@@ -337,6 +341,7 @@ pub struct StatsSnapshot {
     pub forwarded: u64,
     pub nxdomain: u64,
     pub refused: u64,
+    pub stale_served: u64,
     pub servfail: u64,
     pub uptime_secs: u64,
     pub qps_1m: f64,
@@ -364,6 +369,7 @@ pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
         "blocked":          snap.blocked,
         "forwarded":        snap.forwarded,
         "nxdomain":         snap.nxdomain,
+        "stale_served":      snap.stale_served,
         "refused":          snap.refused,
         "servfail":         snap.servfail,
         "local_hits":       snap.local_hits,
