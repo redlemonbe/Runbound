@@ -11,6 +11,22 @@ The conventions are non-negotiable and override default tendencies toward over-p
 
 Violations of AUDIT-PRINCIPLES.md must be flagged by you before publication, not after.
 
+## Session state persistence
+
+For any task expected to take more than 30 minutes of continuous work or that involves more than 5 sub-tasks, maintain a session state file at .agent-state/session-current.md with these fields:
+
+- Current task: one-line description of what you're working on
+- Progress: checklist of completed/in-progress/pending sub-tasks
+- Decisions made: list of decisions with rationale
+- Open questions for maintainer: questions requiring human input
+- Files modified this session: list of paths with brief change descriptions
+
+Update this file after each significant action (commit, file creation, test run, decision point). The maintainer reads this file to resume context if a session is interrupted or compacted.
+
+When a task completes, archive the state file to .agent-state/archive/YYYY-MM-DD-task-name.md and create a fresh session-current.md for the next task.
+
+The .agent-state/ directory is gitignored — these notes are operational, not part of the project history.
+
 ## Operational checkpoints — maintainer review required
 
 STOP and wait for explicit maintainer approval before performing ANY of the following actions. Proceed autonomously for everything else.
