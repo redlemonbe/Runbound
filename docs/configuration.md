@@ -617,6 +617,42 @@ where a public domain is made to resolve to an internal IP.
 
 Mirrors Unbound's `private-address` directive.
 
+### Upstream racing
+
+```
+server:
+    upstream-racing: yes    # default: no
+```
+
+When enabled, every forwarded query is sent to **all** configured upstreams
+simultaneously. The first valid response wins; replies from slower upstreams are
+discarded. Reduces tail latency when upstream reliability varies.
+
+Requires at least two upstreams. Falls back silently to single-resolver mode when
+fewer than 2 upstreams are available.
+
+Per-upstream win counters are exposed in `GET /api/system` as
+`upstream_racing_wins: {"ip": count}`.
+
+### resolv.conf emergency fallback
+
+```
+server:
+    resolv-fallback: yes    # default: yes
+```
+
+When **all** configured upstreams become unreachable, Runbound reads
+`/etc/resolv.conf` and injects the listed `nameserver` lines as temporary
+plain-UDP upstreams. These fallback upstreams are:
+
+- Visible in `GET /api/upstreams` with `"source": "resolv.conf"` and `"temporary": true`
+- Automatically removed when any primary upstream recovers (checked every 30 s)
+- Never persisted to `upstreams.json`
+
+Set `resolv-fallback: no` to disable this behaviour entirely. Useful in
+environments where `/etc/resolv.conf` points to a loopback stub resolver
+(e.g. `systemd-resolved`) that would create a forwarding loop.
+
 ---
 
 ## `forward-zone:` directives
@@ -706,6 +742,9 @@ server:
 
     acme-email:  admin@example.com
     acme-domain: dns.example.com
+
+    upstream-racing:  yes          # send to all upstreams, return first response
+    resolv-fallback:  yes          # fallback to /etc/resolv.conf when all upstreams fail
 
     # Replication — master side:
     # mode:      master
