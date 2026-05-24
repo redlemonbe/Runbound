@@ -59,6 +59,10 @@ pub struct UnboundConfig {
     /// DNS rate limit in queries/second per source IP.
     /// Overrides the compiled default (200). Set to 5000+ for shared resolvers.
     pub rate_limit: Option<u64>,
+    /// IPv4 prefix length for rate-limit subnet bucketing. Default: 24 (/24).
+    pub rate_limit_prefix_v4: u8,
+    /// IPv6 prefix length for rate-limit subnet bucketing. Default: 48 (/48).
+    pub rate_limit_prefix_v6: u8,
     /// REST API key. Overridden by RUNBOUND_API_KEY env var if both are set.
     pub api_key: Option<String>,
     /// REST API port. Default: 8081.
@@ -212,8 +216,10 @@ impl UnboundConfig {
             cache_min_entries:  2048,
             prefetch:             false,
             prefetch_threshold:   5,
-            cache_flush_cooldown: 60,
-            resolv_fallback:      true,
+            cache_flush_cooldown:   60,
+            resolv_fallback:        true,
+            rate_limit_prefix_v4:   24,
+            rate_limit_prefix_v6:   48,
             ..Default::default()
         }
     }
@@ -347,6 +353,8 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         // Runbound-specific extensions (not in stock Unbound)
         "rate-limit"    => cfg.rate_limit = val.parse::<u64>().ok()
                                .map(|v| v.min(1_000_000)), // cap at 1M rps — u64::MAX silently disables
+        "rate-limit-prefix-v4" => cfg.rate_limit_prefix_v4 = val.parse::<u8>().unwrap_or(24).min(32),
+        "rate-limit-prefix-v6" => cfg.rate_limit_prefix_v6 = val.parse::<u8>().unwrap_or(48).min(128),
         "api-key"       => {
             warn!(
                 "api-key is set in the config file (plaintext). \
