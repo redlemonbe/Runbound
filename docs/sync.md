@@ -210,6 +210,41 @@ If the slave appears in `GET /api/nodes` but `relay_host` is absent → slave's 
 
 ---
 
+
+## Real-time node health — `GET /api/events`
+
+In addition to polling `GET /api/nodes`, the master exposes a Server-Sent Events
+stream that pushes slave health changes in real time. This is useful for dashboards
+and alerting systems that need sub-minute notification of slave outages.
+
+```bash
+curl -N -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     http://localhost:8080/api/events
+```
+
+```
+data: {"node_id":"1df6dc2c-94a7-485b-bb80-76b7f5aa438d","addr":"192.168.8.11","status":"ok","reason":"last seen 3s ago","ts":1748131200}
+data: {"node_id":"1df6dc2c-94a7-485b-bb80-76b7f5aa438d","addr":"192.168.8.11","status":"warn","reason":"last seen 42s ago","ts":1748131242}
+```
+
+An event is emitted whenever a slave transitions between health categories.
+
+**Health thresholds:**
+
+| Status | `last_seen_secs` | Meaning |
+|---|---|---|
+| `ok` | < 15 s | Slave is syncing normally |
+| `warn` | 15–59 s | One sync cycle missed — may be transient |
+| `error` | ≥ 60 s | Slave likely unreachable |
+
+This endpoint is **master-only** — it returns `404` on slave and standalone nodes.
+Keep-alive comments are sent every 15 s. The broadcast channel holds up to 64 events;
+slow consumers are disconnected if they fall behind.
+
+See [api.md](api.md#get-apievents) for the full endpoint reference.
+
+---
+
 ## Sync-key security
 
 Generate a strong key — never use a short or default string:
