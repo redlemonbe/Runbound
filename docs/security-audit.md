@@ -23,15 +23,27 @@ External human audit: not yet scheduled.
 - **Threat models considered:** unauthenticated remote attacker on LAN/WAN, authenticated API user with valid Bearer token, compromised/malicious upstream DNS resolver, local process with access to config files
 - **Threat models NOT considered:** kernel 0-day exploitation (assumed trusted kernel), physical access to hardware, supply-chain compromise of Rust toolchain, side-channel attacks via CPU cache timing, fault injection, DNS amplification from external perspective
 - **Time estimate:** ~12 hours across multiple sessions
-- **Verification provenance:** Fix authorship and verification performed by same AI model family (claude-sonnet-4-6). Independent re-audit by different model family is pending. Per Rule 10, this means all "fixed" findings are "claimed fixed" until independent verification.
+- **Verification provenance:** Fix authorship and verification for v0.6.9 performed by same AI model family (claude-sonnet-4-6). Per AUDIT-PRINCIPLES.md Rule 10, all "Fixed" findings in this cycle are "claimed fixed, not independently verified" until a different model family or human reviewer re-audits. Partial exception: v0.8.1 adversarial re-audit (`docs/security-audit/v0.8.1-reaudit.md`) was conducted in a separate adversarial session (same model family, Rule 10 partial compliance — Gemini API unavailable).
 
 ---
 
 ## 1. Executive Summary
 
-Runbound is architecturally sound for the surfaces examined. The codebase implements constant-time comparison, memory zeroization (subtle + zeroize crates), and bounds-checked UMEM access on the critical surfaces examined. The 5 M QPS target is achievable on dedicated multi-queue hardware with XDP enabled, pending four corrections.
+This audit cycle [AI-INTERNAL] reviewed Runbound v0.6.9 DNS engine, XDP fast-path, REST API, cache, feed subsystem, ACL, rate limiter, TLS, configuration parser, HSM integration, upstream management, eBPF program, signal handling, and dependency chain on 2026-05-23. Methodology: manual code review by claude-sonnet-4-6 under maintainer direction + cargo-audit [AUTOMATED-TOOL] + cargo-clippy [AUTOMATED-TOOL]; details in §0 Methodology.
 
-**Overall verdict: four blocking items (§6) must be resolved before any deployment decision.**
+**Findings: 11 total** — 0 CRITICAL, 5 HIGH (SEC-02, SEC-03, SEC-07, SEC-08, SEC-09, SEC-10 — 6 findings at HIGH when counted individually; SEC-10 is one finding covering two attack variants), 4 MEDIUM (SEC-01, SEC-04, SEC-05, SEC-06), 1 LOW (SEC-06b), 1 MEDIUM open (SEC-11).
+
+**Status:** 8 fixed (SEC-01, SEC-02, SEC-03 overflow component, SEC-04, SEC-07, SEC-08, SEC-09, SEC-10) — 1 accepted risk component (SEC-03 kernel trust) — 2 open deferred to v1.0 (SEC-05, SEC-06) — 1 open fixed in later cycle (SEC-11 v0.6.11).
+
+**Scope limitations:** Tests directory not evaluated for coverage. eBPF C source reviewed at call-site level only, not full BPF verifier. Tokio fallback path reviewed at lower depth. Side-channel attacks, supply-chain attacks beyond cargo-audit, and fault injection not in scope. See §Known Limitations.
+
+**Notable observations:**
+- Auth bearer constant-time comparison and memory zeroization correctly implemented
+- XDP UMEM bounds check implemented, but kernel trust is an accepted risk (see KL-01)
+- DNSSEC validation disabled by default — operator must explicitly enable; no default-safe configuration (see SEC-05, KL-02)
+- All fixes to date verified by [AI-INTERNAL] review in the same session family that produced the finding; treated as "claimed fixed, not independently verified" until [AI-ADVERSARIAL] or [HUMAN-EXTERNAL] re-audit
+
+This audit is [AI-INTERNAL] and does NOT substitute for external human security review. External human audit: not yet scheduled.
 
 ---
 
@@ -99,7 +111,7 @@ Anti-brute-force: 500 ms sleep after 50 consecutive failures, applied before com
 - **Residual risk:** HTTP Authorization header length is observable to a network attacker (see KL-03); negligible in practice as API is bound to 127.0.0.1 by default
 - **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `f9ee716`)
 
-**Verdict: ✅ Compliant with ANSSI secure API guidelines.**
+**Verdict [AI-INTERNAL]:** Implementation consistent with ANSSI RGS API authentication guidelines based on code review. No formal ANSSI evaluation has been conducted; this claim is scoped to [AI-INTERNAL] analysis only.
 
 ### 3.2 Secret Management
 
@@ -127,7 +139,7 @@ HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable �
 - **Residual risk:** Fix is believed complete; no known residual risk under current threat model
 - **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `b85b2cd`)
 
-**Verdict: ✅ HSM-compliant. Zero plaintext secrets in memory.**
+**Verdict [AI-INTERNAL]:** No plaintext secret material detected in memory under code review. HSM integration via `cryptoki` crate verified structurally. No formal HSM certification evaluation conducted; claim is scoped to [AI-INTERNAL] code review only.
 
 ### 3.2b HTTP Body Size Limit
 
@@ -252,7 +264,7 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 - **Source:** [AI-INTERNAL]
 - **File:** src/config/ (configuration default)
 - **Discovered:** v0.6.9
-- **Status:** ⚠️ Enable in production
+- **Status:** Open — targeted v1.0 (operator configuration; no default-safe option without breaking forwarder use-case)
 - **Threat model:** Compromised upstream DNS resolver or on-path attacker returning spoofed DNS records with the AD bit set; Runbound in forwarder mode trusts the upstream AD bit without local validation
 - **Description:** In forwarder mode (default), Runbound trusts the upstream resolver's DNSSEC validation via the AD bit in responses. An attacker controlling the upstream (via cache poisoning or BGP hijack) can return spoofed records with AD=1, which Runbound forwards to clients without independent DNSSEC signature verification against the root trust anchor.
 - **Exploit path:** 1. Attacker poisons upstream recursive resolver cache for target.example.com; 2. Upstream returns spoofed A record 1.2.3.4 with AD=1; 3. Runbound forwards to client without re-validating signatures; 4. Client resolves to attacker-controlled IP; mitigated by enabling local DNSSEC validation
@@ -260,7 +272,7 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 - **Residual risk:** Risk remains in all deployments until operator enables DNSSEC; see KL-02
 - **Verification:** No automated test; configuration default reviewed manually
 
-**Verdict: ✅ Robust. ⚠️ RECOMMENDATION: enable DNSSEC in production.**
+**Verdict:** DNS rebinding, amplification, and fingerprinting protections verified present. ⚠️ DNSSEC requires explicit operator enablement — see SEC-05.
 
 ### 3.7 Signal Handling
 
@@ -329,7 +341,7 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 - **Source:** [AI-INTERNAL]
 - **File:** [VERIFY — systemd unit file location not confirmed in this audit cycle]
 - **Discovered:** v0.6.9
-- **Status:** ⚠️ Delegate to systemd
+- **Status:** Open — targeted v1.0 (systemd unit hardening; deployment-time configuration item)
 - **Threat model:** Remote attacker achieving code execution via a vulnerability in DNS packet processing; current root execution provides full system compromise upon exploitation
 - **Description:** Runbound must run as root to bind UDP/53, load eBPF programs (CAP_BPF, CAP_NET_ADMIN), and manipulate network interfaces. No internal privilege dropping occurs after initialization. If an attacker achieves code execution via a future DNS processing vulnerability, they obtain root. Delegating privilege restriction to systemd sandboxing limits the blast radius without changing runtime capabilities.
 - **Exploit path:** Theoretical — 1. Attacker sends crafted DNS packet exploiting a memory safety bug in the XDP worker or hickory DNS parser; 2. Code execution achieved in Runbound process context; 3. Process runs as root → full system compromise; with systemd hardening applied: step 3 is limited to User=runbound capabilities, significantly reducing blast radius
@@ -342,7 +354,7 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 - **Source:** [AI-INTERNAL]
 - **File:** src/config/ (configuration default)
 - **Discovered:** v0.6.9
-- **Status:** ⚠️ GDPR consideration — operator action required if applicable
+- **Status:** Won't fix (code-level) — operator configuration responsibility. Default will not change; `log-client-ip: no` is documented as the GDPR-safe option.
 - **Threat model:** Regulatory/compliance risk; DNS query logs with client IPs may constitute personal data under GDPR Article 4(1) if the deployment processes EU persons' data
 - **Description:** `log-client-ip: yes` is the default configuration. In EU deployments, DNS query logs containing IP addresses may constitute personal data requiring a lawful basis for retention, data minimization measures, and data subject rights under GDPR. This is not a technical security vulnerability but a compliance risk that could result in regulatory findings or fines.
 - **Exploit path:** N/A — compliance risk, not a technically exploitable vulnerability
@@ -410,41 +422,19 @@ Buffer margin at 10 M QPS:
 - Ring depth 4,096 × 1 µs/packet = 4 ms buffer
 - Overflow tolerance: 4 ms — sufficient
 
-### 4.3 Bottlenecks Identified (v0.6.9)
+### 4.3 Performance Analysis
 
-> **v0.8.1 update:** PERF-01 through PERF-06 below were identified in v0.6.9 and are all
-> implemented in v0.8.1. See `docs/security-audit/v0.8.1-performance.md` for full
-> verification details.
+Performance findings (PERF-01 through PERF-06) are documented in
+`docs/security-audit/v0.8.1-performance.md` per AUDIT-PRINCIPLES.md Rule 2 —
+performance regressions are not security findings and must be tracked separately.
 
-#### PERF-01 — Cache snapshot interval ✅ Fixed (v0.8.1)
-
-`cache_snapshot.rs:246` — `Duration::from_millis(10)`. Double-buffer design uses
-`DashMap` writer + `ArcSwap<HashMap>` reader; publish loop evicts expired entries before swap.
-
-#### PERF-02 — Mutex on mutable cache ✅ Fixed (v0.8.1)
-
-`cache_snapshot.rs:65` — `MutableCacheMap = Arc<DashMap<QuestionKey, CacheEntry>>`.
-No `Mutex<HashMap>` on the mutable side.
-
-#### PERF-03 — No NUMA awareness ✅ Fixed (v0.8.1)
-
-`umem.rs:538` — `rebind_to_local_numa()` calls `mbind(MPOL_PREFERRED | MPOL_MF_MOVE)`.
-Invoked from `worker.rs:402` after CPU pinning. Silent no-op in containers / single-node.
-
-#### PERF-04 — Hugepages optional ⚠️ Config gap (code correct)
-
-`umem.rs:329` — `alloc_umem_area(size, hugepages: bool)` tries `MAP_HUGETLB` first.
-Operator must set `xdp-hugepages: yes` in config and `vm.nr_hugepages ≥ 512` in sysctl.
-
-#### PERF-05 — No TX batching ✅ Fixed (v0.8.1)
-
-`worker.rs:537` — hot loop accumulates `tx_descs: Vec<XdpDesc>` per poll batch, then calls
-`sock.tx.enqueue_tx(&tx_descs)` once; `sendto()` kick issued at most once per batch.
-
-#### PERF-06 — SO_REUSEPORT on UDP fallback ✅ Verified (v0.8.1)
-
-`server.rs:1389` — `bind_reuseport_udp()` creates one `SO_REUSEPORT` UDP socket per
-physical CPU when XDP is disabled. Kernel load-balances across all sockets.
+Status summary as of v0.8.1:
+- PERF-01: Cache publish interval — fixed v0.8.1
+- PERF-02: Mutex on mutable cache — fixed v0.8.1 (DashMap)
+- PERF-03: NUMA awareness — fixed v0.8.1
+- PERF-04: Hugepages — code correct; operator config required (`xdp-hugepages: yes`)
+- PERF-05: TX batching — fixed v0.8.1
+- PERF-06: SO_REUSEPORT on UDP fallback — verified v0.8.1
 
 ### 4.4 Performance Projection
 
@@ -464,35 +454,18 @@ physical CPU when XDP is disabled. Kernel load-balances across all sockets.
 | ID | Title | Severity | Status |
 |----|-------|----------|--------|
 | SEC-01 | Auth timing oracle | MEDIUM | ✅ Mitigated (commit `f9ee716` — No automated test; verified by manual review) |
-| SEC-02 | Plaintext secrets in memory | HIGH | ✅ Zeroizing (commit `982467f` — No automated test; verified by manual review) |
+| SEC-02 | Plaintext secrets in memory | HIGH | ✅ Zeroizing (commit `b85b2cd` — No automated test; verified by manual review) |
 | SEC-03 | UMEM buffer overflow | HIGH | ✅ Fixed + ⚠️ Accepted risk (kernel trust — see §Known Limitations) (commit `c8ff1b0`) |
 | SEC-04 | HTTP body unbounded | MEDIUM | ✅ Capped 65 KiB (commit `dab1fbd` — No automated test; verified by manual review) |
-| SEC-05 | DNSSEC disabled by default | MEDIUM | ⚠️ Enable in production |
-| SEC-06 | Privilege dropping | MEDIUM | ⚠️ Delegate to systemd |
+| SEC-05 | DNSSEC disabled by default | MEDIUM | Open — targeted v1.0 |
+| SEC-06 | Privilege dropping | MEDIUM | Open — targeted v1.0 |
 | SEC-07 | Dependency CVEs | HIGH | ✅ Patched (commit `f894e55` — cargo-audit confirms clean) |
 | SEC-08 | SIGUSR1/2 kill process | HIGH | ✅ Fixed v0.6.9 (commit `a32005b` — No automated test; verified by manual review) |
 | SEC-09 | DNS rebinding | HIGH | ✅ CIDR guards (commit `a5cba9a` — No automated test; verified by manual review) |
 | SEC-10 | ANY amplification | HIGH | ✅ Blocked (ANY: commit `2aeeab7`; CHAOS: commit `80331be` — No automated test; verified by manual review [AI-INTERNAL]) |
 | SEC-11 | SSRF via upstream 0.0.0.0 | MEDIUM | ⏳ Open in v0.6.9 scope — fixed v0.6.11 (commit `2dedd6f`, two unit tests) |
+| SEC-06b | Client IP logging GDPR risk | LOW | Won't fix (code) — operator config |
 
-## Performance Analysis (Non-Security Annex)
-
-Note: items below are performance risks, not security vulnerabilities. Severity terms (MAJOR/MINOR) use a separate scale from the security findings above.
-
-### Performance
-
-| ID | Title | Impact | Status |
-|----|-------|--------|--------|
-| PERF-01 | Cache publish 10 ms | ~~MAJOR~~ | ✅ Fixed — cache_snapshot.rs:246 |
-| PERF-02 | DashMap on mutable cache | ~~MAJOR~~ | ✅ Fixed — cache_snapshot.rs:65 |
-| PERF-03 | NUMA-aware UMEM | ~~MEDIUM~~ | ✅ Fixed — umem.rs:538, worker.rs:402 |
-| PERF-04 | Hugepages optional | MEDIUM | ⚠️ Config gap — xdp-hugepages: yes + sysctl |
-| PERF-05 | TX batched per poll batch | ~~LOW~~ | ✅ Fixed — worker.rs:537 |
-| PERF-06 | SO_REUSEPORT on UDP fallback | ~~MEDIUM~~ | ✅ Verified — server.rs:1389 |
-| PERF-07 | jemalloc | — | ✅ Configured |
-| PERF-08 | CPU affinity | — | ✅ Physical cores |
-| PERF-09 | IRQ affinity | — | ✅ Optional, recommended |
-| PERF-10 | NIC ring maximized | — | ✅ SIOCETHTOOL auto |
 
 ---
 
@@ -523,7 +496,7 @@ All fix verifications to date were performed by the same AI model family that au
 
 ## 6. Priority Recommendations
 
-### Blocking — required before production deployment
+### Open — targeted v1.0
 
 1. **SEC-06** — systemd unit hardening:
    ```ini
@@ -546,11 +519,11 @@ All fix verifications to date were performed by the same AI model family that au
    ```
    System: `vm.nr_hugepages = 512`
 
-### Post-deployment improvements
+### Operator configuration reminders (not security findings)
 
+- **Hugepages** — `vm.nr_hugepages = 512` + `xdp-hugepages: yes` in config
+  (see `docs/security-audit/v0.8.1-performance.md`, PERF-04)
 - **GDPR** — `log-client-ip: no` if GDPR applies to the deployment
-- **Benchmark refresh** — Re-run `docs/benchmark-2026-05-20.md` methodology against v0.8.1;
-  v0.5.4 numbers in `docs/performance.md` predate PERF-01 through PERF-06 fixes
 
 ---
 
