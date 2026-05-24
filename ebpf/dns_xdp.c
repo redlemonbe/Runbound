@@ -21,6 +21,20 @@
 #include <linux/in.h>
 #include <linux/in6.h>
 #include <linux/udp.h>
+// Inline ICMP definitions — avoid linux/icmp.h which pulls in linux/if.h
+// and triggers stubs-32.h dependency on clang-for-BPF builds.
+#define ICMP_ECHOREPLY  0
+#define ICMP_ECHO       8
+struct icmphdr {
+    __u8   type;
+    __u8   code;
+    __sum16 checksum;
+    union {
+        struct { __be16 id; __be16 sequence; } echo;
+        __be32  gateway;
+        __u8    reserved[4];
+    } un;
+};
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -53,6 +67,57 @@ struct {
 // Number of XDP worker threads — injected by Rust at load time via aya.
 // Used as the modulus for the per-domain hash so each name always maps to
 // the same worker.
+// ── ICMP echo responder (#89) ─────────────────────────────────────────────
+
+// Per-source-IP rate limit state.
+struct icmp_rate_entry {
+    __u64 count;       // requests in current 1-second window
+    __u64 window_ns;   // start of the window (bpf_ktime_get_ns)
+};
+
+// Live config pushed from userspace (Array, 1 entry).
+// Separate from volatile-const globals so it can be updated without reload.
+struct icmp_cfg_entry {
+    __u8  enabled;     // 0 = pass all ICMP, 1 = reply to echo requests
+    __u8  _pad[3];
+    __u32 rate_pps;    // max echo requests per second per source IP
+    __u32 burst;       // allowed burst above rate_pps (reserved, not yet used)
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct icmp_cfg_entry);
+} icmp_cfg SEC(".maps");
+
+// Per-CPU counters — summed in userspace. No atomics needed (each CPU owns its slice).
+// Index 0: handled (echo request reached handler)
+// Index 1: replied  (XDP_TX sent)
+// Index 2: dropped  (not used currently, reserved)
+// Index 3: rate_limited (dropped by rate limiter)
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 4);
+    __type(key, __u32);
+    __type(value, __u64);
+} icmp_stats SEC(".maps");
+
+// Per-source-IP rate limit — LRU evicts oldest entry under pressure.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __be32);
+    __type(value, struct icmp_rate_entry);
+} icmp_rate_limit SEC(".maps");
+
+// One's complement 16-bit add with carry fold (endianness-agnostic).
+static __always_inline __u16 csum16_add(__u16 a, __u16 b)
+{
+    __u32 s = (__u32)a + b;
+    return (__u16)(s + (s >> 16));
+}
+
 volatile const __u32 NB_WORKERS = 1;
 
 // Set to 1 by Rust when xdp-domain-routing: yes is configured.
@@ -112,6 +177,77 @@ int dns_xdp(struct xdp_md *ctx)
         struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
+        if (ip->protocol == IPPROTO_ICMP) {
+            // Parse ICMP header — IHL=5 verified above, so offset is fixed.
+            struct icmphdr *icmp = (struct icmphdr *)((void *)ip + 20);
+            if ((void *)(icmp + 1) > data_end)
+                return XDP_PASS;
+
+            if (icmp->type != ICMP_ECHO)
+                return XDP_PASS; // non-echo ICMP → kernel
+
+            // Check config
+            __u32 cfg_key = 0;
+            struct icmp_cfg_entry *cfg = bpf_map_lookup_elem(&icmp_cfg, &cfg_key);
+            if (!cfg || !cfg->enabled)
+                return XDP_PASS;
+
+            // Stat: handled
+            __u32 sk = 0;
+            __u64 *sv = bpf_map_lookup_elem(&icmp_stats, &sk);
+            if (sv) (*sv)++;
+
+            // Rate limit (1-second sliding window, per source IPv4)
+            __be32 src_ip = ip->saddr;
+            __u64 now = bpf_ktime_get_ns();
+            struct icmp_rate_entry new_r = {};
+            struct icmp_rate_entry *r = bpf_map_lookup_elem(&icmp_rate_limit, &src_ip);
+            if (r) {
+                if (now - r->window_ns < 1000000000ULL) {
+                    if (r->count >= cfg->rate_pps) {
+                        sk = 3; // STAT_RATE_LIMITED
+                        sv = bpf_map_lookup_elem(&icmp_stats, &sk);
+                        if (sv) (*sv)++;
+                        return XDP_DROP;
+                    }
+                    new_r.count      = r->count + 1;
+                    new_r.window_ns  = r->window_ns;
+                } else {
+                    new_r.count      = 1;
+                    new_r.window_ns  = now;
+                }
+            } else {
+                new_r.count     = 1;
+                new_r.window_ns = now;
+            }
+            bpf_map_update_elem(&icmp_rate_limit, &src_ip, &new_r, BPF_ANY);
+
+            // Build echo reply in-place
+            // 1. Swap Ethernet MACs
+            __u8 tmp[ETH_ALEN];
+            __builtin_memcpy(tmp,            eth->h_source, ETH_ALEN);
+            __builtin_memcpy(eth->h_source,  eth->h_dest,   ETH_ALEN);
+            __builtin_memcpy(eth->h_dest,    tmp,           ETH_ALEN);
+
+            // 2. Swap IP src/dst — IP checksum is unchanged (swap preserves sum)
+            __be32 tmp_ip = ip->saddr;
+            ip->saddr = ip->daddr;
+            ip->daddr = tmp_ip;
+
+            // 3. Set type to ECHOREPLY, update checksum incrementally
+            // Type changes 8→0: one's complement sum decreases by 0x0800 (BE),
+            // so checksum must increase by 0x0800.
+            icmp->type     = ICMP_ECHOREPLY;
+            icmp->checksum = csum16_add(icmp->checksum, bpf_htons(ICMP_ECHO << 8));
+
+            // Stat: replied
+            sk = 1;
+            sv = bpf_map_lookup_elem(&icmp_stats, &sk);
+            if (sv) (*sv)++;
+
+            return XDP_TX;
+        }
+
         if (ip->protocol != IPPROTO_UDP)
             return XDP_PASS;
         /* Assume standard IPv4 header (no options). Packets with IP options
