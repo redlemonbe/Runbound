@@ -6,7 +6,7 @@ pub mod relay;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -316,6 +316,9 @@ pub struct AppState {
     pub icmp_stats: Arc<crate::icmp::IcmpStats>,
     /// #89: Current ICMP config — updated via PUT /api/icmp/config.
     pub icmp_cfg: Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
+    /// Runtime DNSSEC validation toggle (#72 perf path). Mirrors cfg.dnssec_validation at startup.
+    /// Updated by PATCH /api/config; all rebuild_and_swap calls read from here.
+    pub dnssec_enabled: Arc<AtomicBool>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -589,7 +592,7 @@ pub fn router(state: AppState) -> Router {
         .route("/stats", get(stats_handler))
         .route("/stats/stream", get(stats_stream_handler))
         .route("/stats/top-domains", get(top_domains_handler))
-        .route("/config", get(config_handler))
+        .route("/config", get(config_handler).patch(patch_config_handler))
         .route("/reload", post(reload_handler))
         // DNS CRUD
         .route("/dns/lookup", post(dns_lookup_handler))
@@ -1084,7 +1087,7 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
         "private_addresses": cfg.private_addresses,
         "rate_limit":        cfg.rate_limit,
         "cache_max_ttl":     cfg.cache_max_ttl,
-        "dnssec_validation": cfg.dnssec_validation,
+        "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
         "log_retention":     cfg.log_retention,
         "log_client_ip":     cfg.log_client_ip,
         "api_port":          cfg.api_port,
@@ -1143,6 +1146,42 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
             )
         }
     }
+}
+
+
+// ── PATCH /api/config ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PatchConfigBody {
+    dnssec_validation: Option<bool>,
+}
+
+async fn patch_config_handler(
+    State(s): State<AppState>,
+    axum::extract::Json(body): axum::extract::Json<PatchConfigBody>,
+) -> impl IntoResponse {
+    if let Some(v) = body.dnssec_validation {
+        s.dnssec_enabled.store(v, Ordering::Relaxed);
+        let addrs = upstreams::upstream_addrs(&s.upstreams);
+        if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, v).await {
+            warn!(%e, "resolver rebuild after DNSSEC toggle — continuing");
+        }
+        s.audit.send(AuditEvent::ConfigReload);
+        info!(dnssec = v, "DNSSEC validation toggled via API");
+        // Propagate DNSSEC toggle to all registered slaves
+        if let Some(ref j) = s.sync_journal {
+            if let Some(ref k) = s.sync_key {
+                let body_bytes = bytes::Bytes::from(
+                    serde_json::json!({"dnssec_validation": v}).to_string()
+                );
+                relay::push_to_slaves(j, k, Method::PATCH, "config".to_string(), body_bytes);
+            }
+        }
+    }
+    JsonExtract(serde_json::json!({
+        "ok": true,
+        "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
+    }))
 }
 
 // ── DNS CRUD ───────────────────────────────────────────────────────────────
@@ -1999,7 +2038,7 @@ fn rebuild_racing_resolvers(s: &AppState) {
         return;
     }
     let addrs = upstreams::upstream_addrs(&s.upstreams);
-    match crate::dns::server::build_per_upstream_resolvers(&addrs, s.cfg.dnssec_validation) {
+    match crate::dns::server::build_per_upstream_resolvers(&addrs, s.dnssec_enabled.load(Ordering::Relaxed)) {
         Ok(vec) => {
             info!(
                 count = vec.len(),
@@ -2171,7 +2210,7 @@ async fn add_upstream_handler(
     // Rebuild resolver with updated upstream list
     let addrs = upstreams::upstream_addrs(&s.upstreams);
     if let Err(e) =
-        crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await
+        crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.dnssec_enabled.load(Ordering::Relaxed)).await
     {
         warn!(%e, "resolver rebuild after upstream add failed — upstream added but DNS unchanged");
     }
@@ -2265,7 +2304,7 @@ async fn delete_upstream_handler(
         Some(removed) => {
             let addrs = upstreams::upstream_addrs(&s.upstreams);
             if let Err(e) =
-                crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation)
+                crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.dnssec_enabled.load(Ordering::Relaxed))
                     .await
             {
                 warn!(%e, "resolver rebuild after upstream delete failed");
@@ -2361,7 +2400,7 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
 
     let before = s.stats.snapshot().cache_entries;
     let addrs = upstreams::upstream_addrs(&s.upstreams);
-    match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
+    match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.dnssec_enabled.load(Ordering::Relaxed)).await {
         Ok(_warmed) => {
             s.stats.reset_cache();
             s.cache_evictions.store(0, Ordering::Relaxed);
@@ -2615,7 +2654,7 @@ async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResp
     // so that TCP/TLS connections are live before any query reaches the new resolver.
     let addrs = crate::upstreams::upstream_addrs(&s.upstreams);
     let warm_up =
-        match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation)
+        match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.dnssec_enabled.load(Ordering::Relaxed))
             .await
         {
             Ok(w) => w,
@@ -3363,7 +3402,7 @@ mod tests {
             node_id: None,
             slave_mode: false,
             base_dir: Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
-            audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
+            audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp"), 0),
             xdp_active: Arc::new(AtomicU8::new(0)),
             resolver,
             last_flush_at: Arc::new(std::sync::Mutex::new(None)),
@@ -3375,6 +3414,7 @@ mod tests {
             domain_stats: crate::domain_stats::DomainStats::new(),
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
+            dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
         };
         router(state)
     }
@@ -5520,7 +5560,7 @@ mod tests {
             node_id: None,
             slave_mode: false,
             base_dir: Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
-            audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
+            audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp"), 0),
             xdp_active: Arc::new(AtomicU8::new(0)),
             resolver,
             last_flush_at: Arc::new(std::sync::Mutex::new(None)),
@@ -5532,6 +5572,7 @@ mod tests {
             domain_stats: crate::domain_stats::DomainStats::new(),
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
+            dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
         };
         let app = router(state);
 
