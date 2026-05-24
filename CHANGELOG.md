@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+---
+
+## [0.8.2] — 2026-05-24
+
 ### Added
 - **Top domains API (#5)** (`src/domain_stats.rs`, `src/api/mod.rs`)
   `GET /api/stats/top-domains?limit=N` returns the most-queried domain names
