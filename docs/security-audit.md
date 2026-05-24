@@ -299,7 +299,7 @@ The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify th
 |----|-------|----------|--------|
 | SEC-01 | Auth timing oracle | MEDIUM | ✅ Mitigated (subtle + sleep) |
 | SEC-02 | Plaintext secrets in memory | HIGH | ✅ Zeroizing |
-| SEC-03 | UMEM buffer overflow | HIGH | ✅ checked_add |
+| SEC-03 | UMEM buffer overflow | HIGH | ✅ Fixed + ⚠️ Accepted risk (kernel trust — see §Known Limitations) |
 | SEC-04 | HTTP body unbounded | MEDIUM | ✅ Capped 65 KiB |
 | SEC-05 | DNSSEC disabled by default | MEDIUM | ⚠️ Enable in production |
 | SEC-06 | Privilege dropping | MEDIUM | ⚠️ Delegate to systemd |
@@ -327,6 +327,31 @@ Note: items below are performance risks, not security vulnerabilities. Severity 
 | PERF-08 | CPU affinity | — | ✅ Physical cores |
 | PERF-09 | IRQ affinity | — | ✅ Optional, recommended |
 | PERF-10 | NIC ring maximized | — | ✅ SIOCETHTOOL auto |
+
+---
+
+## Known Limitations and Accepted Risks
+
+**KL-01 — Kernel trust for UMEM descriptors**
+AF_XDP RX ring descriptors are trusted after bounds-checking. A kernel vulnerability exploiting the UMEM interface could bypass this. Accepted for dedicated-hardware deployments where kernel integrity is assumed.
+
+**KL-02 — DNSSEC validation requires explicit operator action**
+Runbound does not enable DNSSEC validation by default. Deployments without `dnssec-validation: yes` accept the upstream AD bit without local validation. Accepted pending operator education; documented in deployment checklist.
+
+**KL-03 — Authorization header length observable on management interface**
+Even with constant-time comparison, the length of the Bearer token is observable to a network attacker monitoring the management interface. Accepted because the API is bound to 127.0.0.1 by default; risk is low in the intended deployment model.
+
+**KL-04 — IPv6 /48 aggregation may cause false-positive rate limiting**
+The rate limiter aggregates IPv6 /48 prefixes. A large ISP using NAT64 or a shared /48 prefix may be incorrectly throttled. Accepted as an architectural trade-off between DDoS protection and false-positive rate.
+
+**KL-05 — Tokio UDP fallback path audited at lower depth**
+The Tokio-based UDP slow path (non-XDP) was reviewed for configuration correctness (SO_REUSEPORT, buffer sizes) but was not subjected to the same depth of analysis as the XDP fast path. Risk: undetected vulnerabilities in the fallback path. Accepted; XDP is the intended production path and fallback is a degraded mode.
+
+**KL-06 — All audits to date are [AI-INTERNAL]**
+No external human security review has been conducted. The [AI-INTERNAL] methodology cannot substitute for adversarial human expertise. External human audit is not yet scheduled. This is the primary limitation of the current security posture documentation.
+
+**KL-07 — Re-audit independence not maintained (R10)**
+All fix verifications to date were performed by the same AI model family that authored the fixes. Independent re-audit by a different model family or human reviewer is pending. All "Fixed" findings should be read as "Claimed fixed; pending independent verification."
 
 ---
 
