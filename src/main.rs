@@ -1571,6 +1571,35 @@ fn gen_self_signed_cert(hostname: &str) -> anyhow::Result<()> {
 
 /// Build the in-memory zone set from config + persisted store + blacklist + feeds.
 /// Called at startup, on SIGHUP hot-reload, and by POST /reload.
+/// #9: Background loop that re-evaluates scheduled blocking rules every 60 seconds.
+/// When a scheduled entry crosses its time boundary, rebuild the zone set to
+/// activate or deactivate the block.
+pub async fn schedule_enforce_loop(
+    zones: Arc<arc_swap::ArcSwap<dns::local::LocalZoneSet>>,
+    cfg_path: String,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let bl = match store::load_blacklist() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Only do work if any scheduled entries exist
+        if bl.entries.iter().all(|e| e.schedule.is_none()) {
+            continue;
+        }
+        let new_cfg = match crate::config::load(&cfg_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let new_zones = build_zone_set(&new_cfg);
+        zones.store(Arc::new(new_zones));
+        tracing::debug!("schedule_enforce: zone set rebuilt");
+    }
+}
+
 pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
     let mut zone_set = LocalZoneSet::from_config(&cfg.local_zones, &cfg.local_data);
 
@@ -1594,13 +1623,18 @@ pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
     }
 
     // Persisted blacklist (override_zone so blacklist always shadows static zones)
+    // #9: only apply entries whose schedule is currently active (or have no schedule)
     if let Ok(bl) = store::load_blacklist() {
-        for entry in &bl.entries {
+        let active: Vec<_> = bl.entries.iter()
+            .filter(|e| e.schedule.as_ref().map_or(true, |s| s.is_active_now()))
+            .collect();
+        for entry in &active {
             zone_set.override_zone(&entry.domain, dns::ZoneAction::from(&entry.action));
         }
         if !bl.entries.is_empty() {
             tracing::info!(
-                count = bl.entries.len(),
+                total = bl.entries.len(),
+                active = active.len(),
                 "Loaded persisted blacklist entries"
             );
         }

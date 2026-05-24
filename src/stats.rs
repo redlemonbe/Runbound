@@ -79,6 +79,7 @@ pub struct Stats {
     pub forwarded: AtomicU64,
     pub nxdomain: AtomicU64,
     pub refused: AtomicU64,
+    pub stale_served: AtomicU64,
     pub servfail: AtomicU64,
     pub started_at: Instant,
 
@@ -110,6 +111,8 @@ pub struct Stats {
     pub dnssec_secure: AtomicU64,
     pub dnssec_bogus: AtomicU64,
     pub dnssec_insecure: AtomicU64,
+    /// #34: upstream DNSSEC stripping events detected.
+    pub dnssec_strips: AtomicU64,
 
     // DoT reconnect metrics (#77 fix) — updated by keepalive, level-2 reconnect, and API endpoint.
     pub dot_reconnects_total: AtomicU64,
@@ -125,6 +128,7 @@ impl Stats {
             forwarded: AtomicU64::new(0),
             nxdomain: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            stale_served: AtomicU64::new(0),
             servfail: AtomicU64::new(0),
             started_at: Instant::now(),
             lat_hist: (0..HIST_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
@@ -138,6 +142,7 @@ impl Stats {
             dnssec_secure: AtomicU64::new(0),
             dnssec_bogus: AtomicU64::new(0),
             dnssec_insecure: AtomicU64::new(0),
+            dnssec_strips: AtomicU64::new(0),
             dot_reconnects_total: AtomicU64::new(0),
             last_reconnect_at: std::sync::Mutex::new(None),
         })
@@ -176,6 +181,7 @@ impl Stats {
         self.nxdomain.fetch_add(1, Ordering::Relaxed);
     }
     #[inline]
+    pub fn inc_stale_served(&self) { self.stale_served.fetch_add(1, Ordering::Relaxed); }
     pub fn inc_refused(&self) {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
@@ -313,6 +319,7 @@ impl Stats {
             forwarded: self.forwarded.load(Ordering::Relaxed),
             nxdomain,
             refused: self.refused.load(Ordering::Relaxed),
+            stale_served: self.stale_served.load(Ordering::Relaxed),
             servfail: self.servfail.load(Ordering::Relaxed),
             uptime_secs: self.started_at.elapsed().as_secs(),
             qps_1m,
@@ -327,6 +334,7 @@ impl Stats {
             dnssec_secure: self.dnssec_secure.load(Ordering::Relaxed),
             dnssec_bogus: self.dnssec_bogus.load(Ordering::Relaxed),
             dnssec_insecure: self.dnssec_insecure.load(Ordering::Relaxed),
+            dnssec_strips: self.dnssec_strips.load(Ordering::Relaxed),
         }
     }
 }
@@ -337,6 +345,7 @@ pub struct StatsSnapshot {
     pub forwarded: u64,
     pub nxdomain: u64,
     pub refused: u64,
+    pub stale_served: u64,
     pub servfail: u64,
     pub uptime_secs: u64,
     pub qps_1m: f64,
@@ -351,6 +360,7 @@ pub struct StatsSnapshot {
     pub dnssec_secure: u64,
     pub dnssec_bogus: u64,
     pub dnssec_insecure: u64,
+    pub dnssec_strips: u64,
 }
 
 pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
@@ -364,6 +374,7 @@ pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
         "blocked":          snap.blocked,
         "forwarded":        snap.forwarded,
         "nxdomain":         snap.nxdomain,
+        "stale_served":      snap.stale_served,
         "refused":          snap.refused,
         "servfail":         snap.servfail,
         "local_hits":       snap.local_hits,
