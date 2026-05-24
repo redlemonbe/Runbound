@@ -147,11 +147,18 @@ impl Acl {
     #[inline]
     pub fn check(&self, ip: IpAddr) -> AclAction {
         if self.0.is_empty() { return AclAction::Allow; }
-        // Normalise IPv4-mapped IPv6 → plain IPv4 before rule evaluation.
+        // Normalise IPv4-mapped and deprecated IPv4-compatible IPv6 → plain IPv4.
+        // to_ipv4() covers both ::ffff:x.x.x.x and ::x.x.x.x forms (SEC-2026-05-24-05).
+        // Guard: preserve ::1 because to_ipv4() maps it to 0.0.0.1 (not loopback).
         let ip = match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped()
-                .map(IpAddr::V4)
-                .unwrap_or(IpAddr::V6(v6)),
+            IpAddr::V6(v6) => {
+                if v6.is_loopback() {
+                    IpAddr::V6(v6)
+                } else {
+                    #[allow(deprecated)]
+                    v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6))
+                }
+            }
             _ => ip,
         };
         for entry in &self.0 {
@@ -160,5 +167,46 @@ impl Acl {
             }
         }
         AclAction::Refuse  // no rule matched → fail-secure
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_acl(entry: &str) -> Acl {
+        Acl::from_config(&[entry.to_string()])
+    }
+
+    // SEC-2026-05-24-05: ::127.0.0.1 must match a 127.0.0.0/8 deny rule.
+    #[test]
+    fn acl_ipv4_compatible_loopback_matches_ipv4_rule() {
+        let acl = make_acl("127.0.0.0/8 deny");
+        let ip: IpAddr = "::127.0.0.1".parse().unwrap();
+        assert_eq!(acl.check(ip), AclAction::Deny,
+            "::127.0.0.1 must match 127.0.0.0/8 deny rule after normalisation");
+    }
+
+    #[test]
+    fn acl_ipv6_loopback_preserved() {
+        let acl = make_acl("::1/128 deny");
+        let ip: IpAddr = "::1".parse().unwrap();
+        assert_eq!(acl.check(ip), AclAction::Deny,
+            "::1 must match ::1/128 deny rule");
+    }
+
+    #[test]
+    fn acl_ipv4_mapped_matches_ipv4_rule() {
+        let acl = make_acl("127.0.0.0/8 deny");
+        let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert_eq!(acl.check(ip), AclAction::Deny,
+            "::ffff:127.0.0.1 must match 127.0.0.0/8 deny rule");
+    }
+
+    #[test]
+    fn acl_empty_allows_all() {
+        let acl = Acl::from_config(&[]);
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        assert_eq!(acl.check(ip), AclAction::Allow);
     }
 }
