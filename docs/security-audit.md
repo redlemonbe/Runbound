@@ -66,7 +66,7 @@ Architectural strengths: strict separation between XDP OS-threads and Tokio asyn
 
 ## 3. Security Audit
 
-### 3.1 API Authentication — GOOD
+### 3.1 API Authentication
 
 Mechanism: 256-bit Bearer token (CSPRNG), stored at `/etc/runbound/api.key` (chmod 600).
 
@@ -84,11 +84,24 @@ The `subtle` crate prevents compiler optimizations that would create a timing or
 
 Anti-brute-force: 500 ms sleep after 50 consecutive failures, applied before comparison — no timing signal on key content.
 
-Residual risk: HTTP header length is observable (~non-exploitable in practice; API bound to 127.0.0.1 only).
+---
+
+**[SEC-01] — Auth Timing Oracle**
+- **Severity:** MEDIUM
+- **Source:** [AI-INTERNAL]
+- **File:** src/auth.rs (approximate line 40)
+- **Discovered:** v0.6.x
+- **Status:** ✅ Mitigated (subtle + sleep)
+- **Threat model:** Unauthenticated attacker on management network measuring HTTP response time to infer bits of the Bearer token via timing side-channel
+- **Description:** If token comparison short-circuits on the first differing byte, response time varies with the number of matching prefix bytes. A statistical timing attack can recover the token byte-by-byte. The anti-brute-force sleep after 50 failures must also be applied before the comparison, or it leaks timing information on the comparison itself.
+- **Exploit path:** Theoretical — attacker sends repeated requests with controlled token prefixes and measures response time distribution; statistical analysis distinguishes correct vs. incorrect leading bytes; `subtle::ConstantTimeEq` + pre-comparison sleep eliminates the oracle; no concrete exploit demonstrated in this audit cycle
+- **Fix:** `subtle::ConstantTimeEq` for constant-time byte comparison; 500 ms anti-brute-force sleep applied before comparison, not after
+- **Residual risk:** HTTP Authorization header length is observable to a network attacker (see KL-03); negligible in practice as API is bound to 127.0.0.1 by default
+- **Verification:** No automated test; claimed fixed by manual review — pending independent verification (R10)
 
 **Verdict: ✅ Compliant with ANSSI secure API guidelines.**
 
-### 3.2 Secret Management — VERY GOOD
+### 3.2 Secret Management
 
 | Secret | Storage | Protection |
 |--------|---------|------------|
@@ -97,11 +110,41 @@ Residual risk: HTTP header length is observable (~non-exploitable in practice; A
 | HMAC audit | `Zeroizing<Vec<u8>>` | Auto-generated if absent |
 | PKCS#11 | Single session at startup | Explicit cleanup on shutdown |
 
-HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable — correct behavior for production deployment.
+HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable — correct behavior for a security-sensitive service.
+
+---
+
+**[SEC-02] — Plaintext Secrets in Memory**
+- **Severity:** HIGH
+- **Source:** [AI-INTERNAL]
+- **File:** src/auth.rs, src/config/ (approximate)
+- **Discovered:** v0.6.x
+- **Status:** ✅ Zeroizing
+- **Threat model:** Local attacker or crash dump (core file, /proc/pid/mem, hypervisor snapshot) with read access to process memory recovering active secret material
+- **Description:** Secret material stored as ordinary `String` or `Vec<u8>` remains in memory until the allocator reclaims it — potentially surviving into swap space or crash dumps. Rust's `Drop` trait does not guarantee memory zeroing before deallocation. The `zeroize` crate's `Zeroizing<T>` wrapper overrides `Drop` to zero the allocation before freeing.
+- **Exploit path:** Theoretical — 1. Attacker obtains process memory dump via /proc/pid/mem, core file, or hypervisor snapshot; 2. Scans for 256-bit entropy patterns matching Bearer token format; 3. Recovers active API key without brute-force; mitigated by `Zeroizing` zeroing on `Drop`
+- **Fix:** All secret material wrapped in `Zeroizing<String>` / `Zeroizing<Vec<u8>>` from the `zeroize` crate; memory zeroed on `Drop` before deallocation
+- **Residual risk:** Fix is believed complete; no known residual risk under current threat model
+- **Verification:** No automated test; claimed fixed by manual review — pending independent verification (R10)
 
 **Verdict: ✅ HSM-compliant. Zero plaintext secrets in memory.**
 
-### 3.3 Unsafe Code — ACCEPTABLE with reservations
+### 3.2b HTTP Body Size Limit
+
+**[SEC-04] — HTTP Body Unbounded**
+- **Severity:** MEDIUM
+- **Source:** [AI-INTERNAL]
+- **File:** src/api/mod.rs (approximate)
+- **Discovered:** v0.6.9
+- **Status:** ✅ Capped 65 KiB
+- **Threat model:** Unauthenticated attacker (body is read before auth check) or authenticated API user sending an oversized HTTP request body to exhaust server memory and cause OOM termination of the DNS process
+- **Description:** HTTP request bodies accepted by the REST API had no upper size bound. Axum's default body handling buffers the complete request body in memory before routing or authentication. An attacker can send a streaming body with a large Content-Length, exhausting process memory and triggering OOM termination, resulting in DNS service outage.
+- **Exploit path:** 1. Attacker connects to API (no auth required for body to be buffered); 2. Sends POST with `Content-Length: 1073741824` and streaming 1 GiB body; 3. Axum buffers body in memory; 4. OOM kill terminates Runbound; 5. DNS outage until restart
+- **Fix:** Global body size limit enforced at 65,536 bytes (65 KiB) via axum `DefaultBodyLimit` middleware applied before routing
+- **Residual risk:** Fix is believed complete; no known residual risk under current threat model
+- **Verification:** No automated test; claimed fixed by manual review — pending independent verification (R10)
+
+### 3.3 Unsafe Code
 
 The project enforces `#![deny(unsafe_op_in_unsafe_fn)]` in all XDP modules — every unsafe block must be explicitly justified.
 
@@ -114,7 +157,7 @@ The project enforces `#![deny(unsafe_op_in_unsafe_fn)]` in all XDP modules — e
 
 **Verdict: ✅ Dense but correctly documented. No UB detected.**
 
-### 3.4 UMEM Security — POTENTIAL VULNERABILITY
+### 3.4 UMEM Security
 
 Context: RX descriptors arrive from the kernel via the AF_XDP ring. A kernel bug or confused-deputy attack could inject a descriptor with `addr + len` exceeding the UMEM region.
 
@@ -130,9 +173,24 @@ if desc.len as usize > FRAME_SIZE as usize
 
 `checked_add` prevents integer overflow. Each kernel descriptor is validated before memory access.
 
+---
+
+**[SEC-03] — UMEM Buffer Overflow**
+- **Severity:** HIGH
+- **Source:** [AI-INTERNAL]
+- **File:** src/dns/xdp/worker.rs (approximate line 120)
+- **Discovered:** v0.6.x
+- **Status:** ✅ Fixed + ⚠️ Accepted risk (kernel trust — see §Known Limitations)
+- **Threat model:** Kernel vulnerability or confused-deputy attack producing an AF_XDP RX ring descriptor with `addr + len` exceeding the UMEM region bounds, enabling out-of-bounds memory read or write in userspace
+- **Description:** AF_XDP RX ring descriptors are produced by the kernel and consumed by the XDP worker. Without bounds checking, a malicious or buggy kernel descriptor could direct the worker to access memory outside the UMEM allocation, leading to memory corruption or information disclosure. Integer overflow in `addr + len` is also a risk without `checked_add`.
+- **Exploit path:** Theoretical — kernel vulnerability injects descriptor with addr=UMEM_SIZE-4, len=65536; without mitigation, `addr + len` overflows and worker accesses arbitrary memory; with `checked_add` + bounds check in place, descriptor is silently dropped; actual exploit requires a kernel vulnerability (see KL-01)
+- **Fix:** `checked_add` arithmetic overflow protection plus explicit bounds check (`desc.len > FRAME_SIZE || addr + len > area_len`) before any memory access; malformed descriptors silently dropped
+- **Residual risk:** Kernel trust is implicit; a kernel-level vulnerability could inject descriptors before the bounds check is evaluated; see KL-01 for the accepted-risk rationale
+- **Verification:** No automated test; claimed fixed by manual review — pending independent verification (R10)
+
 **Verdict: ✅ Protection in place. Kernel trust is implicit (acceptable for dedicated hardware deployment).**
 
-### 3.5 eBPF Surface — GOOD
+### 3.5 eBPF Surface
 
 eBPF program (`ebpf/dns_xdp.c`, 154 lines):
 
@@ -145,7 +203,7 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 
 **Verdict: ✅ Verifier-compliant. No OOB detected.**
 
-### 3.6 DNS Protection — GOOD
+### 3.6 DNS Protection
 
 **DNS rebinding:** Each upstream response is filtered against configured private CIDR ranges. RFC 1918 + loopback + link-local blocked by default.
 
@@ -161,9 +219,50 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 
 **DNSSEC:** Optional. In forwarder mode (default), the upstream AD bit is accepted without local validation. For a recursive production deployment, `dnssec-validation: yes` is mandatory.
 
+---
+
+**[SEC-09] — DNS Rebinding**
+- **Severity:** HIGH
+- **Source:** [AI-INTERNAL]
+- **File:** src/dns/server.rs (approximate)
+- **Discovered:** v0.6.9
+- **Status:** ✅ CIDR guards
+- **Threat model:** External attacker hosting a domain that resolves to a private RFC 1918 address, enabling browser-based access to internal network services via DNS rebinding
+- **Description:** DNS rebinding exploits the browser same-origin policy by having a domain initially resolve to a public IP (passing any access controls), then rebinding to a private IP on a second resolution. Runbound as a DNS resolver must filter private-space addresses from upstream responses to break the attack at the resolver level.
+- **Exploit path:** 1. Attacker registers attacker.com → 198.51.100.1 (public); 2. Victim browser loads attacker.com — connects to public server; 3. Attacker changes DNS TTL=0, now attacker.com → 192.168.1.1; 4. Browser re-resolves and contacts internal 192.168.1.1; 5. Same-origin context allows CSRF/data exfiltration against internal services; mitigated by Runbound filtering RFC 1918 from upstream answers
+- **Fix:** Upstream response filtering against RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback (127.0.0.0/8), and link-local (169.254.0.0/16); blocked responses returned as SERVFAIL
+- **Residual risk:** Fix is believed complete; no known residual risk under current threat model
+- **Verification:** No automated test; claimed fixed by manual review — pending independent verification (R10)
+
+**[SEC-10] — ANY Amplification**
+- **Severity:** HIGH
+- **Source:** [AI-INTERNAL]
+- **File:** src/dns/server.rs (approximate)
+- **Discovered:** v0.6.9
+- **Status:** ✅ Blocked
+- **Threat model:** Network attacker using Runbound as a DNS amplification reflector with spoofed UDP source IP to direct large DNS ANY responses at a victim (DDoS amplification)
+- **Description:** DNS ANY queries historically return all record types in a single response, often 10–60× the query size. With UDP source spoofing, a small ANY query generates a large response directed at a victim IP. RFC 8482 recommends servers return a minimal response or refuse ANY queries.
+- **Exploit path:** 1. Attacker spoofs victim's IP as UDP source; 2. Sends 40-byte ANY query for example.com to Runbound; 3. Without mitigation, Runbound returns 2 KB+ multi-record response to victim; 4. Amplification factor ~50×; 5. Repeated at volume creates DDoS; mitigated by blocking ANY query type
+- **Fix:** ANY queries blocked per RFC 8482; CHAOS class queries (version.bind, hostname.bind, id.server) also blocked to prevent fingerprinting and reduce amplification surface
+- **Residual risk:** Fix is believed complete; no known residual risk under current threat model
+- **Verification:** No automated test; claimed fixed by manual review — pending independent verification (R10)
+
+**[SEC-05] — DNSSEC Disabled by Default**
+- **Severity:** MEDIUM
+- **Source:** [AI-INTERNAL]
+- **File:** src/config/ (configuration default)
+- **Discovered:** v0.6.9
+- **Status:** ⚠️ Enable in production
+- **Threat model:** Compromised upstream DNS resolver or on-path attacker returning spoofed DNS records with the AD bit set; Runbound in forwarder mode trusts the upstream AD bit without local validation
+- **Description:** In forwarder mode (default), Runbound trusts the upstream resolver's DNSSEC validation via the AD bit in responses. An attacker controlling the upstream (via cache poisoning or BGP hijack) can return spoofed records with AD=1, which Runbound forwards to clients without independent DNSSEC signature verification against the root trust anchor.
+- **Exploit path:** 1. Attacker poisons upstream recursive resolver cache for target.example.com; 2. Upstream returns spoofed A record 1.2.3.4 with AD=1; 3. Runbound forwards to client without re-validating signatures; 4. Client resolves to attacker-controlled IP; mitigated by enabling local DNSSEC validation
+- **Fix:** Enable `dnssec-validation: yes` in production configuration; requires explicit operator action (blocking item — see §6)
+- **Residual risk:** Risk remains in all deployments until operator enables DNSSEC; see KL-02
+- **Verification:** No automated test; configuration default reviewed manually
+
 **Verdict: ✅ Robust. ⚠️ RECOMMENDATION: enable DNSSEC in production.**
 
-### 3.7 Signal Handling — GOOD (fixed in v0.6.9)
+### 3.7 Signal Handling
 
 | Signal | Behavior |
 |--------|----------|
@@ -174,6 +273,21 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 
 Before fix: SIGUSR1/SIGUSR2 → immediate process death (OS default behavior). Fixed in v0.6.9.
 
+---
+
+**[SEC-08] — SIGUSR1/2 Kill Process**
+- **Severity:** HIGH
+- **Source:** [AI-INTERNAL]
+- **File:** src/main.rs (signal handler registration)
+- **Discovered:** v0.6.8 (fixed v0.6.9)
+- **Status:** ✅ Fixed v0.6.9
+- **Threat model:** Monitoring system or local user sending SIGUSR1 (standard stats-request signal) to Runbound, triggering the OS default handler and unintentionally terminating the DNS service
+- **Description:** SIGUSR1 and SIGUSR2 have no Rust default handler — they deliver the OS default action, which is process termination. Monitoring tools (nagios, prometheus node_exporter, custom scripts) commonly send SIGUSR1 to processes to request a stats dump. Without explicit handlers, any SIGUSR1 terminates Runbound immediately without cleanup, causing a DNS outage.
+- **Exploit path:** 1. Monitoring system sends `kill -USR1 $(pidof runbound)` on a routine stats poll; 2. OS delivers SIGUSR1; 3. Unhandled signal → immediate process termination; 4. DNS outage until service is restarted; no deliberate attack required — standard monitoring triggers this accidentally
+- **Fix:** Explicit tokio signal handlers registered: SIGUSR1 triggers live stats dump to tracing log; SIGUSR2 ignored (reserved for future use); SIGHUP triggers hot zone reload; SIGTERM triggers graceful Tokio runtime shutdown
+- **Residual risk:** Fix is believed complete; no known residual risk under current threat model
+- **Verification:** No automated test; claimed fixed by manual review — pending independent verification (R10)
+
 ### 3.8 Dependency Security
 
 | CVE/Advisory | Dependency | Status |
@@ -182,6 +296,21 @@ Before fix: SIGUSR1/SIGUSR2 → immediate process death (OS default behavior). F
 | RUSTSEC-2026-0037 | `quinn` DoS | ✅ Patched via `hickory v0.26` |
 
 TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency chain.
+
+---
+
+**[SEC-07] — Dependency CVEs**
+- **Severity:** HIGH
+- **Source:** AUTOMATED-TOOL: cargo-audit 0.21.x
+- **File:** Cargo.toml
+- **Discovered:** v0.6.9 (cargo-audit scan)
+- **Status:** ✅ Patched
+- **Threat model:** Attacker exploiting a known CVE in a dependency to cause process panic (DoS), bypass TLS validation, or achieve code execution in the DNS server
+- **Description:** Two active security advisories affected the dependency chain at audit time. RUSTSEC-2025-0009: `ring < 0.17.9` contains a panic in the AES-GCM implementation reachable via a crafted TLS ClientHello, causing process termination (DoS). RUSTSEC-2026-0037: `quinn` (pulled in via hickory DNS-over-QUIC support) contains a DoS vulnerability where a malformed QUIC Initial packet causes a panic.
+- **Exploit path:** RUSTSEC-2025-0009: 1. Attacker connects to DoT/DoH listener; 2. Sends crafted TLS ClientHello targeting the ring AES path; 3. Panic in ring < 0.17.9; 4. Process terminates, DNS outage. RUSTSEC-2026-0037: 1. Attacker sends malformed QUIC Initial packet to DoQ listener; 2. Panic in quinn; 3. Process terminates
+- **Fix:** `ring` version pinned to ≥ 0.17.9 in Cargo.toml; `hickory-dns` updated to v0.26 which pulls a patched quinn version
+- **Residual risk:** Fix is believed complete for known advisories; cargo-audit must be re-run on each dependency update
+- **Verification:** cargo-audit 0.21.x [AUTOMATED-TOOL] — confirms no active advisories after patching
 
 **Verdict: ✅ Clean dependency chain.**
 
@@ -192,6 +321,49 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 | R1 | No internal privilege dropping | MEDIUM | Delegate to systemd (`User=`, `CapabilityBoundingSet=`) |
 | R2 | DNSSEC disabled by default | MEDIUM | Enable `dnssec-validation: yes` in production |
 | R3 | `log-client-ip: yes` by default | LOW | Set to `no` if IP retention is not legally justified (GDPR note — see Description) |
+
+---
+
+**[SEC-06] — Privilege Dropping (Checklist R1)**
+- **Severity:** MEDIUM
+- **Source:** [AI-INTERNAL]
+- **File:** [VERIFY — systemd unit file location not confirmed in this audit cycle]
+- **Discovered:** v0.6.9
+- **Status:** ⚠️ Delegate to systemd
+- **Threat model:** Remote attacker achieving code execution via a vulnerability in DNS packet processing; current root execution provides full system compromise upon exploitation
+- **Description:** Runbound must run as root to bind UDP/53, load eBPF programs (CAP_BPF, CAP_NET_ADMIN), and manipulate network interfaces. No internal privilege dropping occurs after initialization. If an attacker achieves code execution via a future DNS processing vulnerability, they obtain root. Delegating privilege restriction to systemd sandboxing limits the blast radius without changing runtime capabilities.
+- **Exploit path:** Theoretical — 1. Attacker sends crafted DNS packet exploiting a memory safety bug in the XDP worker or hickory DNS parser; 2. Code execution achieved in Runbound process context; 3. Process runs as root → full system compromise; with systemd hardening applied: step 3 is limited to User=runbound capabilities, significantly reducing blast radius
+- **Fix:** Operator must configure systemd unit with: `User=runbound`, `CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_BPF`, `NoNewPrivileges=yes`, `MemoryDenyWriteExecute=no` (cannot enable due to JIT); required before deployment (blocking item)
+- **Residual risk:** Risk remains until systemd hardening is applied; this is a deployment-time configuration item, not a code fix
+- **Verification:** No automated test; operator configuration responsibility
+
+**[SEC-06b] — Client IP Logging GDPR Risk (Checklist R3)**
+- **Severity:** LOW
+- **Source:** [AI-INTERNAL]
+- **File:** src/config/ (configuration default)
+- **Discovered:** v0.6.9
+- **Status:** ⚠️ GDPR consideration — operator action required if applicable
+- **Threat model:** Regulatory/compliance risk; DNS query logs with client IPs may constitute personal data under GDPR Article 4(1) if the deployment processes EU persons' data
+- **Description:** `log-client-ip: yes` is the default configuration. In EU deployments, DNS query logs containing IP addresses may constitute personal data requiring a lawful basis for retention, data minimization measures, and data subject rights under GDPR. This is not a technical security vulnerability but a compliance risk that could result in regulatory findings or fines.
+- **Exploit path:** N/A — compliance risk, not a technically exploitable vulnerability
+- **Fix:** Set `log-client-ip: no` in configuration if GDPR applies and IP retention has no lawful basis; document retention purpose and legal basis if `yes` is retained
+- **Residual risk:** Operator decision; compliance risk only in applicable regulatory contexts
+- **Verification:** No automated test; operator configuration responsibility
+
+### 3.10 SSRF via Upstream Address Validation
+
+**[SEC-11] — SSRF via Upstream 0.0.0.0**
+- **Severity:** MEDIUM
+- **Source:** [AI-INTERNAL]
+- **File:** src/api/upstreams.rs (approximate)
+- **Discovered:** v0.6.9
+- **Status:** ⏳ Open in v0.6.9 audit scope — fix implemented in v0.6.11 (outside this cycle)
+- **Threat model:** Authenticated API user (with valid Bearer token) adding an upstream DNS address of 0.0.0.0 or 127.0.0.1 to cause Runbound to establish DoT connections to itself or to loopback services (SSRF)
+- **Description:** The upstream management REST API accepted arbitrary IP addresses as upstream DNS server addresses without validating against reserved or loopback ranges. An authenticated attacker could add 0.0.0.0:853 or 127.0.0.1:853, causing Runbound to attempt DoT connections to itself (loop) or to other services on loopback. In container or multi-tenant environments, 0.0.0.0 may route to the host or adjacent containers.
+- **Exploit path:** 1. Attacker with valid Bearer token calls `POST /api/upstreams` with `{"address": "0.0.0.0", "port": 853}`; 2. Runbound persists upstream to `/etc/runbound/upstreams.json`; 3. Upstream probe initiates DoT handshake to 0.0.0.0:853; 4. Connection may reach loopback services, cause a connection loop, or probe other internal services; potential for SSRF against localhost or self-loop causing resource exhaustion
+- **Fix:** Input validation added in v0.6.11 rejecting 0.0.0.0, 127.0.0.0/8 (loopback), ::1, link-local, and other invalid upstream addresses; validated before persistence to disk
+- **Residual risk:** Open in v0.6.9 audit scope; fix implemented outside this audit cycle (v0.6.11)
+- **Verification:** No automated test; fix implemented outside v0.6.9 audit cycle — pending independent verification
 
 ---
 
