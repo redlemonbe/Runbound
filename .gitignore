@@ -1,6 +1,9 @@
 # Build output
 /target/
 
+# Agent session state notes (operational, not project history)
+.agent-state/
+
 # PGO profiling data
 /tmp/runbound-pgo/
 
