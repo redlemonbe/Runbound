@@ -73,6 +73,8 @@ struct {
 struct icmp_rate_entry {
     __u64 count;       // requests in current 1-second window
     __u64 window_ns;   // start of the window (bpf_ktime_get_ns)
+    __u32 burst_left;  // remaining burst tokens (set from cfg->burst on new entry)
+    __u32 _pad;
 };
 
 // Live config pushed from userspace (Array, 1 entry).
@@ -178,7 +180,9 @@ int dns_xdp(struct xdp_md *ctx)
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
         if (ip->protocol == IPPROTO_ICMP) {
-            // Parse ICMP header — IHL=5 verified above, so offset is fixed.
+            // Reject IP-with-options: only standard 20-byte headers handled.
+            if ((ip->ihl & 0xF) != 5)
+                return XDP_PASS;
             struct icmphdr *icmp = (struct icmphdr *)((void *)ip + 20);
             if ((void *)(icmp + 1) > data_end)
                 return XDP_PASS;
@@ -203,7 +207,12 @@ int dns_xdp(struct xdp_md *ctx)
             struct icmp_rate_entry new_r = {};
             struct icmp_rate_entry *r = bpf_map_lookup_elem(&icmp_rate_limit, &src_ip);
             if (r) {
-                if (now - r->window_ns < 1000000000ULL) {
+                // Consume a burst token if available (bypasses per-second window).
+                if (r->burst_left > 0) {
+                    new_r.count      = r->count;
+                    new_r.window_ns  = r->window_ns;
+                    new_r.burst_left = r->burst_left - 1;
+                } else if (now - r->window_ns < 1000000000ULL) {
                     if (r->count >= cfg->rate_pps) {
                         sk = 3; // STAT_RATE_LIMITED
                         sv = bpf_map_lookup_elem(&icmp_stats, &sk);
@@ -212,13 +221,17 @@ int dns_xdp(struct xdp_md *ctx)
                     }
                     new_r.count      = r->count + 1;
                     new_r.window_ns  = r->window_ns;
+                    new_r.burst_left = 0;
                 } else {
                     new_r.count      = 1;
                     new_r.window_ns  = now;
+                    new_r.burst_left = 0;
                 }
             } else {
-                new_r.count     = 1;
-                new_r.window_ns = now;
+                // New source IP: grant initial burst tokens.
+                new_r.count      = 0;
+                new_r.window_ns  = now;
+                new_r.burst_left = (cfg->burst > 0) ? cfg->burst - 1 : 0;
             }
             bpf_map_update_elem(&icmp_rate_limit, &src_ip, &new_r, BPF_ANY);
 
