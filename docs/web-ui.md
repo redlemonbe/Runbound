@@ -10,7 +10,7 @@ no build step, no framework, no external CDN dependency (Tailwind JS is bundled)
 
 | Tab | What you can do |
 |---|---|
-| **Overview** | Real-time stats: QPS, total queries, cache hit rate, blocked, forwarded, SERVFAIL, avg latency, uptime |
+| **Overview** | Real-time stats: QPS, total queries, cache hit rate, blocked, forwarded, SERVFAIL, avg latency, uptime; live 60-second QPS sparkline; top-10 queried domains table |
 | **DNS Entries** | Add / delete local A, AAAA, CNAME, TXT, MX records; **DNS Lookup** panel (live resolve with cache hit indicator) |
 | **Blacklist** | Add / delete blocked domains (nxdomain or refuse action) |
 | **Feeds** | Add / delete blocklist feed URLs; live entry count, **blocked count**, and full error text when last refresh fails |
