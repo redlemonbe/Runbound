@@ -11,6 +11,32 @@ The conventions are non-negotiable and override default tendencies toward over-p
 
 Violations of AUDIT-PRINCIPLES.md must be flagged by you before publication, not after.
 
+## Benchmark methodology — dual independent measurement
+
+All performance claims for this project are validated through TWO independent measurement runs:
+
+1. Agent-run baseline — the agent prepares and executes the benchmark following documented methodology, producing raw data in docs/bench-runs/agent/YYYY-MM-DD-descriptor/
+2. Maintainer-run validation — the maintainer executes the same benchmark independently, producing raw data in docs/bench-runs/maintainer/YYYY-MM-DD-descriptor/
+
+Both runs MUST include:
+- Exact hardware specification (CPU, NIC, kernel version, boot params)
+- Exact tool versions (dnsmark commit hash, kernel module versions)
+- Raw output captured to file, not just summary
+- ethtool -S counters before and after
+- /proc/net/snmp before and after
+- Verification of sent/received ratio (>99.99% required for valid run)
+
+When publishing performance numbers in README.md, docs/, or release notes:
+- ONLY use numbers where both runs agree within 5%
+- Cite both runs explicitly: "Verified by independent runs by agent (link) and maintainer (link)"
+- Disagreements >5% are documented in docs/bench-runs/discrepancies.md with hypotheses on cause
+- Single-run numbers are NEVER published as performance claims; they may appear in commit messages or development notes only
+
+If a benchmark produces a notable result (record throughput, unexpected plateau, anomaly), the agent MUST:
+1. Save the full raw data
+2. Document the exact configuration
+3. Wait for maintainer independent verification before mentioning the result in any public-facing document
+
 ## Session state persistence
 
 For any task expected to take more than 30 minutes of continuous work or that involves more than 5 sub-tasks, maintain a session state file at .agent-state/session-current.md with these fields:
