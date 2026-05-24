@@ -2531,6 +2531,7 @@ mod tests {
             lookup_limiter:   Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
             per_upstream_resolvers: crate::dns::server::create_shared_resolvers_vec(),
             racing_wins:           Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
+            events_tx:             None,
         };
         router(state)
     }
@@ -4017,6 +4018,7 @@ mod tests {
             lookup_limiter:   Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
             per_upstream_resolvers: crate::dns::server::create_shared_resolvers_vec(),
             racing_wins:           Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
+            events_tx:             None,
         };
         let app = router(state);
 
