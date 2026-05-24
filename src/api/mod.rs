@@ -1601,6 +1601,13 @@ async fn add_upstream_handler(
             "error": "INVALID_ADDR", "details": "addr must be a valid IP address (e.g. 1.1.1.1)"
         }))).into_response(),
     };
+    // SEC-NEW-01: normalize IPv6-mapped IPv4 (e.g. ::ffff:127.0.0.1 → 127.0.0.1) before checks.
+    // Rust's is_loopback() returns false for mapped addresses, allowing SSRF bypass otherwise.
+    let ip = if let IpAddr::V6(v6) = ip {
+        v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6))
+    } else {
+        ip
+    };
     // FIX #40: reject loopback and IPv4 link-local
     if ip.is_loopback() {
         return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
@@ -3391,6 +3398,23 @@ mod tests {
     async fn add_upstream_unspecified_v6_rejected() {
         let app = make_test_app();
         let resp = post_upstream(app, auth_header(), r#"{"addr":"::"}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
+    }
+
+    // ── SEC-NEW-01: IPv6-mapped IPv4 SSRF bypass ──────────────────────────
+    #[tokio::test]
+    async fn add_upstream_ipv6_mapped_loopback_rejected() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"::ffff:127.0.0.1"}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
+    }
+
+    #[tokio::test]
+    async fn add_upstream_ipv6_mapped_unspecified_rejected() {
+        let app = make_test_app();
+        let resp = post_upstream(app, auth_header(), r#"{"addr":"::ffff:0.0.0.0"}"#).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_ADDR");
     }
