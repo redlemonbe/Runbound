@@ -1,12 +1,14 @@
 # Runbound
 
-**Drop-in Unbound replacement — REST API, XDP kernel-bypass, no restart ever.**
+**Unbound-compatible DNS server — REST API, XDP kernel-bypass, no restart ever.**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial License](https://img.shields.io/badge/license-commercial-green.svg)](COMMERCIAL_LICENSE.md)
 [![GitHub release](https://img.shields.io/github/v/release/redlemonbe/Runbound)](https://github.com/redlemonbe/Runbound/releases/latest)
 [![cargo audit](https://img.shields.io/badge/cargo_audit-clean-brightgreen.svg)](docs/audit.md) [![GitHub Sponsors](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor)](https://github.com/sponsors/redlemonbe)
 
-Your existing `unbound.conf` works as-is. Runbound adds a live REST API, AF_XDP kernel-bypass, and a browser dashboard on top — without changing anything in your DNS setup.
+> ⚠️ **Status: Experimental** — Runbound is under active development and has not yet undergone external human security audit. Not yet recommended for production deployments handling sensitive traffic. See [METHODOLOGY.md](METHODOLOGY.md) for the development approach.
+
+Most existing `unbound.conf` files work as-is. Non-standard or exotic directives are ignored gracefully — see [Unbound compatibility](docs/unbound-migration.md). Runbound adds a live REST API, AF_XDP kernel-bypass, and a browser dashboard on top.
 
 ---
 
@@ -18,12 +20,14 @@ Your existing `unbound.conf` works as-is. Runbound adds a live REST API, AF_XDP 
 | UDP / TCP / DoT / DoH | ✅ | ✅ | ✅ |
 | Add / block domains live | ⚠️ | ❌ restart | ✅ API |
 | Block-list feed subscriptions | ⚠️ | ❌ manual | ✅ API |
-| Real-time stats + Prometheus | ⚠️ | ❌ | ✅ |
-| Master/slave replication | ✅ | ❌ | ✅ built-in |
+| Real-time stats + Prometheus | ✅ statistics channel (XML/JSON) | ❌ | ✅ |
+| Master/slave replication | ✅ | ❌ | ✅ built-in*¹ |
 | Automatic TLS (Let's Encrypt) | ❌ | ❌ | ✅ ACME |
 | AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ |
 | Linear scaling (no lock contention) | ❌ | ❌ | ✅ |
 | Static binary, no dependencies | ❌ | ❌ | ✅ musl |
+
+*¹ Runbound's sync mechanism uses a REST API-driven approach, architecturally different from BIND9's AXFR/IXFR (RFC 1995/5936). AXFR/IXFR support is planned for v1.2.
 
 ---
 
@@ -167,14 +171,19 @@ curl -s -X POST http://localhost:8080/api/feeds \
 
 ## Performance
 
-| Hardware | Mode | QPS |
-|----------|------|-----|
-| Any CPU | SO_REUSEPORT (no XDP) | scales linearly with cores |
-| Intel 10 GbE ixgbe | AF_XDP native zero-copy | up to wire speed (~14 M pps) |
+| Hardware | Mode | QPS | Notes |
+|----------|------|-----|-------|
+| Any CPU | SO_REUSEPORT (no XDP) | scales linearly with cores | |
+| Intel 10 GbE ixgbe | AF_XDP kernel-bypass fast path | TBD — benchmark in progress | kernel-bypass fast path, results coming in v0.8 |
 
-Unlike BIND9 and Unbound, Runbound uses `SO_REUSEPORT` with one socket per physical core and lock-free zone reads via `ArcSwap`. Throughput scales linearly — no shared-lock plateau.
+Architecture designed for linear scaling with core count — SO_REUSEPORT, ArcSwap lock-free config, per-core CPU affinity, and adaptive cache. Measured multi-core scaling benchmarks will be published in v0.8 (bare-metal Intel ixgbe setup).
 
-XDP hot path latency: **~1 µs** per query (local zone or cache hit). Full timing breakdown: [docs/internals.md](docs/internals.md).
+| Query path | Latency |
+|------------|---------|
+| XDP fast path (local zone) | **<1 ms** (below dnsmark resolution) |
+| Tokio slow path — upstream forward | RTT + ~50 µs |
+
+Full timing breakdown and theoretical analysis: [docs/internals.md](docs/internals.md).
 
 ---
 

@@ -75,7 +75,7 @@ blacklist, DNSSEC) remain fully active.
 An eBPF XDP program attaches to the NIC at startup. UDP/port-53 packets are
 intercepted at the driver level before reaching the kernel network stack:
 
-- **Local zones** → answered entirely in user space (zero syscalls, 0 ms latency)
+- **Local zones** → answered entirely in user space (zero syscalls, **<1 ms** latency (below dnsmark resolution))
 - **Recursive / forwarded / unknown** → `XDP_PASS` to normal hickory-server path
 - **Rate-limited clients** → silently dropped at NIC level
 - **ACL deny** → silently dropped; ACL refuse → REFUSED response crafted in XDP path
@@ -301,7 +301,7 @@ server:
 
 | Hardware | Mode | Estimated peak |
 |---|---|---|
-| VM virtio (Proxmox/KVM) | copy mode | ~500k–1M QPS |
-| Bare metal Intel 10GbE | native zero-copy | ~14M QPS (wire speed) |
+| VM virtio (Proxmox/KVM) | copy mode | ~500k–1M QPS (theoretical) |
+| Bare metal Intel 10GbE | native zero-copy | TBD — benchmark in progress (results coming in v0.8) |
 
-Wire speed on 10GbE = ~14.88M 64-byte packets/second.
+Wire speed on 10GbE = ~14.88M 64-byte packets/second (physical limit, not yet validated end-to-end).

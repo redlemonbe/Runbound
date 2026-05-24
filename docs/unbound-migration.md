@@ -1,58 +1,113 @@
 # Unbound Migration Guide
 
-Runbound is designed as a drop-in replacement. In most cases, pointing it at your
-existing `unbound.conf` is all you need.
+Runbound is designed as a compatible DNS server for existing Unbound deployments. In most cases, pointing it at your existing `unbound.conf` is all you need. This page documents exactly what is and isn't supported.
 
 ---
 
-## Directive compatibility
+## Compatibility matrix
 
-### `server:` block
+### Fully supported
 
-| Directive | Unbound | Runbound | Notes |
-|---|:---:|:---:|---|
-| `interface` | ✅ | ✅ | |
-| `port` | ✅ | ✅ | |
-| `do-ip4` | ✅ | ✅ | |
-| `do-ip6` | ✅ | ✅ | |
-| `do-udp` | ✅ | ✅ | |
-| `do-tcp` | ✅ | ✅ | |
-| `access-control` | ✅ | ✅ | `allow`, `deny`, `refuse` |
-| `local-zone` | ✅ | ✅ | `static`, `always_nxdomain` |
-| `local-data` | ✅ | ✅ | A, AAAA, PTR, CNAME, MX, TXT |
-| `tls-service-pem` | ✅ | ✅ | DoT port 853 |
-| `tls-service-key` | ✅ | ✅ | |
-| `rate-limit` | ✅ | ✅ | per-source-IP token bucket |
-| `logfile` | ✅ | ✅ | `""` = stdout |
-| `verbosity` | ✅ | ✅ | 0–5 |
-| `num-threads` | ✅ | ⚠️ | Ignored — Runbound uses Tokio async |
-| `cache-max-ttl` | ✅ | ✅ | Since v0.2.2 |
-| `private-address` | ✅ | ✅ | Since v0.2.2 — DNS rebinding protection |
-| `dnssec-validation` | ✅ | ✅ | Since v0.2.5 — enable only for recursive mode |
-| `module-config` | ✅ | ❌ | Unbound modules not supported |
-| `python-script` | ✅ | ❌ | No Python scripting |
-| `dnstap` | ✅ | ❌ | Not planned |
+Directives with identical behavior to Unbound — no changes required.
 
-### `forward-zone:` block
+#### `server:` block
 
-| Directive | Unbound | Runbound | Notes |
-|---|:---:|:---:|---|
-| `name` | ✅ | ✅ | |
-| `forward-addr` | ✅ | ✅ | `ip@port` syntax supported |
-| `forward-tls-upstream` | ✅ | ✅ | Since v0.2.2 — DNS-over-TLS to upstream |
-| `forward-first` | ✅ | ❌ | |
+| Directive | Notes |
+|---|---|
+| `interface` | Bind address(es) |
+| `port` | Listen port (default: 53) |
+| `do-ip4` | Enable/disable IPv4 |
+| `do-ip6` | Enable/disable IPv6 |
+| `do-udp` | Enable/disable UDP |
+| `do-tcp` | Enable/disable TCP |
+| `access-control` | ACL — `allow`, `deny`, `refuse` |
+| `local-zone` | Static zones — `static`, `always_nxdomain`, etc. |
+| `local-data` | Local DNS records — A, AAAA, PTR, CNAME, MX, TXT |
+| `tls-service-pem` | TLS certificate path for DoT/DoH/DoQ |
+| `tls-cert-bundle` | Alias for `tls-service-pem` |
+| `tls-service-key` | TLS private key path |
+| `verbosity` | Log level 0–5 |
+| `logfile` | Log destination (`""` = stdout) |
+| `private-address` | DNS rebinding guard — block CIDR ranges in resolver responses |
+| `cache-max-ttl` | TTL cap for cached records (seconds) |
+| `rate-limit` | Per-IP query rate limit in q/s |
+| `dnssec-validation` | Enable DNSSEC (see caveats below) |
 
-### Runbound-only directives
+#### `forward-zone:` block
+
+| Directive | Notes |
+|---|---|
+| `name` | Zone name |
+| `forward-addr` | Upstream address (`ip@port` syntax supported) |
+| `forward-tls-upstream` | Send queries over DNS-over-TLS to upstream |
+
+---
+
+### Supported with caveats
+
+Directives that work but with noted differences from Unbound's behavior.
+
+| Directive | Caveat |
+|---|---|
+| `dnssec-validation` | Runbound enables DNSSEC in forwarder mode only — it trusts the upstream AD bit rather than performing full RRSIG chain validation. Full recursive DNSSEC is planned for v1.x. |
+| `rate-limit` | Runbound uses a per-IP token bucket compatible with Unbound's semantics. Runbound extends this with per-subnet bucketing via `rate-limit-prefix-v4` / `rate-limit-prefix-v6` (Runbound-specific directives). |
+| `log-client-ip` | Runbound-specific extension. Setting `no` replaces client IPs with `[redacted]` in query logs — useful for GDPR compliance. Unbound does not have this directive and will warn on it. |
+| `tls-cert-bundle` | Accepted as an alias for `tls-service-pem`. Unbound uses `tls-cert-bundle` for the CA bundle, not the server certificate — if you use both, set `tls-service-pem` explicitly. |
+
+---
+
+### Parsed but ignored
+
+Directives accepted without error but with no effect at runtime. Safe to leave in your existing config. Runbound logs a silent no-op — no warning emitted.
+
+| Directive | Why it's a no-op in Runbound |
+|---|---|
+| `num-threads` | Runbound uses a Tokio async runtime with `SO_REUSEPORT` — threads are managed internally, not configurable via this directive |
+| `cache-size` | Cache size is adaptive (pressure-based halving) rather than a fixed allocation |
+| `msg-cache-size` | See `cache-size` |
+| `rrset-cache-size` | See `cache-size` |
+| `so-rcvbuf` / `so-sndbuf` | Socket buffers managed internally |
+| `outgoing-range` | Outgoing port range not applicable to Runbound's upstream pool |
+| `num-queries-per-thread` | See `num-threads` |
+| `infra-cache-slabs` / `key-cache-slabs` / `msg-cache-slabs` / `rrset-cache-slabs` | Runbound uses DashMap sharding, not configurable slab counts |
+| `prefetch-key` | Key prefetching not separately configurable |
+| `use-syslog` | Runbound logs to stdout/journald via `tracing` |
+| `log-queries` / `log-replies` | Use `verbosity: 2` for per-query logging |
+| `hide-identity` / `hide-version` / `identity` / `version` | Runbound returns minimal CHAOS responses |
+| `username` / `chroot` / `directory` | Process isolation handled by systemd (`DynamicUser`, `PrivateTmp`) |
+| `auto-trust-anchor-file` / `val-log-level` | See `dnssec-validation` caveat above |
+| `harden-glue` / `harden-dnssec-stripped` | Security defaults equivalent to Unbound's hardened mode are always on |
+| `unwanted-reply-threshold` / `private-domain` | Not currently implemented |
+| `pidfile` | Parsed but not written — systemd uses `Type=notify`, no PID file needed |
+
+---
+
+### Not yet supported
+
+Directives that generate an `unknown directive` warning and are ignored. Remove these from your config before migrating to avoid confusion.
+
+| Directive | Status |
+|---|---|
+| `module-config` | Unbound modules are not supported — Runbound is not module-extensible |
+| `python-script` | No Python scripting support |
+| `dnstap` | Not planned |
+| `forward-first` | `forward-zone` flag — unimplemented, logged as unknown directive |
+
+---
+
+## Runbound-only directives
+
+Directives accepted by Runbound but not understood by Unbound. Unbound will warn on these; strip them if running the same config on both.
 
 | Directive | Description |
 |---|---|
 | `api-key` | REST API Bearer token (prefer `RUNBOUND_API_KEY` env var) |
 | `api-port` | REST API port (default: 8080) |
-| `rate-limit` | Per-IP DNS rate limit in q/s (default: 200, max: 1,000,000) |
-| `cache-max-ttl` | TTL cap for cached records in seconds (default: 86400) |
-| `dnssec-validation` | Enable local DNSSEC re-validation (default: no) |
+| `rate-limit-prefix-v4` | IPv4 prefix for subnet bucketing (default: /24) |
+| `rate-limit-prefix-v6` | IPv6 prefix for subnet bucketing (default: /48) |
+| `cache-min-entries` | Minimum cache entries after memory pressure halvings (default: 2048) |
 | `dnssec-log-bogus` | Log WARN on DNSSEC failures (default: no) |
-| `log-retention` | In-RAM query log ring buffer size (default: 1000, 0 = disabled) |
+| `log-retention` | In-RAM query log ring buffer size (default: 1000; 0 = disabled) |
 | `log-client-ip` | Include client IPs in `/logs` (default: yes — set `no` for GDPR) |
 | `audit-log` | Enable HMAC-SHA256 chained audit log (default: no) |
 | `audit-log-path` | Path for the audit log file |
@@ -67,13 +122,29 @@ existing `unbound.conf` is all you need.
 | `acme-cache-dir` | Directory for ACME credentials and temp files |
 | `acme-staging` | Use Let's Encrypt Staging (default: no) |
 | `acme-challenge-port` | HTTP-01 challenge port (default: 80) |
-| `tls-service-pem` | TLS certificate path for DoT/DoH/DoQ |
-| `tls-service-key` | TLS private key path |
 | `tls-port` | DNS-over-TLS port (default: 853) |
 | `https-port` | DNS-over-HTTPS port (default: 443) |
 | `quic-port` | DNS-over-QUIC port (default: 853/UDP) |
 | `tls-cert-hostname` | Hostname for TLS SNI and DoH path |
-| `private-address` | CIDR ranges to block in resolver responses (rebinding guard) |
+| `cpu-affinity` | Pin Tokio worker threads to physical cores (default: yes) |
+| `xdp` | Enable AF/XDP kernel-bypass fast path (default: yes) |
+| `xdp-interface` | Explicit XDP network interface (default: auto-detect) |
+| `xdp-cpu-governor` | Set `performance` governor on XDP cores (default: no) |
+| `xdp-irq-affinity` | Pin NIC queue IRQs to XDP worker cores (default: no) |
+| `xdp-hugepages` | Allocate UMEM with 2 MiB huge pages (default: yes) |
+| `xdp-cache-snapshot` | Enable ArcSwap-backed XDP cache (default: yes) |
+| `xdp-cache-snapshot-size` | Max entries in the XDP cache snapshot (default: 10000) |
+| `xdp-domain-routing` | Route queries by QNAME hash to dedicated CPU (default: no) |
+| `xdp-ring-size` | NIC ring buffer size — integer or `auto` (default: auto) |
+| `xdp-rx-ring-size` | AF_XDP RX ring size — power of 2, 64–65536 (default: 4096) |
+| `xdp-tx-ring-size` | AF_XDP TX ring size — power of 2, 64–65536 (default: 4096) |
+| `xdp-fill-ring-size` | AF_XDP fill ring size — power of 2, 64–65536 (default: 4096) |
+| `xdp-comp-ring-size` | AF_XDP completion ring size — power of 2, 64–65536 (default: 4096) |
+| `prefetch` | Pre-resolve popular domains before TTL expiry (default: no) |
+| `prefetch-threshold` | Min query count to qualify for prefetch (default: 5) |
+| `cache-flush-cooldown` | Min seconds between consecutive cache flush calls (default: 60) |
+| `upstream-racing` | Query all upstreams simultaneously, return first valid response (default: no) |
+| `resolv-fallback` | Fall back to `/etc/resolv.conf` when all upstreams are unhealthy (default: yes) |
 
 ---
 
@@ -82,10 +153,9 @@ existing `unbound.conf` is all you need.
 ### 1. Install Runbound
 
 ```bash
-# Replace vX.Y.Z with the latest version tag from the releases page
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-vX.Y.Z-x86_64-linux-musl
-chmod +x runbound-vX.Y.Z-x86_64-linux-musl
-sudo mv runbound-vX.Y.Z-x86_64-linux-musl /usr/local/sbin/runbound
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-linux-x86_64-musl
+chmod +x runbound-linux-x86_64-musl
+sudo mv runbound-linux-x86_64-musl /usr/local/sbin/runbound
 ```
 
 ### 2. Test against your existing config
