@@ -78,7 +78,7 @@ delivered directly from the NIC ring buffer to Runbound's UMEM — bypassing the
 kernel UDP stack entirely.
 
 Benchmark results on be2net (Emulex, no AF_XDP): ceiling 128,000 QPS.
-Expected results on Intel X540 (ixgbe, native AF_XDP): 400,000–600,000+ QPS.
+Expected results on Intel X540 (ixgbe, native AF_XDP): 400,000–600,000+ QPS (theoretical estimate — not yet measured; benchmark planned for v0.8).
 
 BIND9 and Unbound have no AF_XDP implementation. This performance tier is
 exclusive to Runbound.
