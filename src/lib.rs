@@ -29,7 +29,9 @@ pub mod hsm;
 #[cfg(any(test, feature = "fuzz"))]
 pub fn parse_dns_bytes(data: &[u8]) -> Option<()> {
     use hickory_proto::serialize::binary::BinDecodable;
-    hickory_proto::op::Message::from_bytes(data).ok().map(|_| ())
+    hickory_proto::op::Message::from_bytes(data)
+        .ok()
+        .map(|_| ())
 }
 
 /// Parse a string as an Unbound-format config.
@@ -56,7 +58,10 @@ pub fn fuzz_validate_dns_name(name: &str) -> bool {
         if label.starts_with('-') || label.ends_with('-') {
             return false;
         }
-        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
             return false;
         }
     }
@@ -101,7 +106,9 @@ pub mod api_fuzz {
         pub description: Option<String>,
     }
 
-    fn default_ttl() -> i64 { 3600 }
+    fn default_ttl() -> i64 {
+        3600
+    }
 
     #[derive(Debug, Deserialize)]
     pub struct AddFeedRequest {

@@ -18,8 +18,8 @@
 // with a 4-byte magic header b"RBv1" for format detection.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -36,9 +36,9 @@ use smallvec::SmallVec;
 #[derive(Hash, Eq, PartialEq, Clone)]
 pub struct QuestionKey {
     /// Wire-format DNS name, lowercased (matches QNAME bytes from the client).
-    pub name:   SmallVec<[u8; 64]>,
+    pub name: SmallVec<[u8; 64]>,
     /// Wire-format numeric query type (1 = A, 28 = AAAA, …).
-    pub qtype:  u16,
+    pub qtype: u16,
     /// Wire-format query class (1 = IN).
     pub qclass: u16,
 }
@@ -48,26 +48,26 @@ pub struct CacheEntry {
     /// The XDP worker patches bytes [0..2] with the actual QID before sending.
     /// Using `Bytes` enables O(1) clones during the snapshot publish — Arc<[u8]> internally.
     pub wire_payload: Bytes,
-    pub expires_at:   Instant,
+    pub expires_at: Instant,
 }
 
 impl Clone for CacheEntry {
     fn clone(&self) -> Self {
         Self {
             wire_payload: self.wire_payload.clone(), // O(1) — just increments the Arc refcount
-            expires_at:   self.expires_at,
+            expires_at: self.expires_at,
         }
     }
 }
 
-pub type CacheSnapshot       = HashMap<QuestionKey, CacheEntry>;
+pub type CacheSnapshot = HashMap<QuestionKey, CacheEntry>;
 pub type SharedCacheSnapshot = Arc<ArcSwap<CacheSnapshot>>;
-pub type MutableCacheMap     = Arc<DashMap<QuestionKey, CacheEntry>>;
+pub type MutableCacheMap = Arc<DashMap<QuestionKey, CacheEntry>>;
 
 /// Global counter of DNS responses served from the XDP cache snapshot.
 /// Read by the Prometheus metrics handler and GET /api/system.
-pub static XDP_CACHE_SNAPSHOT_HITS:    AtomicU64 = AtomicU64::new(0);
-pub static XDP_CACHE_SNAPSHOT_MISSES:  AtomicU64 = AtomicU64::new(0);
+pub static XDP_CACHE_SNAPSHOT_HITS: AtomicU64 = AtomicU64::new(0);
+pub static XDP_CACHE_SNAPSHOT_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Live entry count, updated by publish_loop after each snapshot swap.
 pub static XDP_CACHE_SNAPSHOT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
@@ -88,19 +88,22 @@ pub static XDP_WORKER_PKTS: [AtomicU64; 64] = {
 /// rather than evicting live entries — better to let the entry be served by
 /// hickory than to purge a still-valid cached response.
 pub fn cache_insert(
-    mutable:     &MutableCacheMap,
-    key:         QuestionKey,
-    entry:       CacheEntry,
+    mutable: &MutableCacheMap,
+    key: QuestionKey,
+    entry: CacheEntry,
     max_entries: usize,
 ) {
     if mutable.len() >= max_entries && !mutable.contains_key(&key) {
         let now = Instant::now();
-        let to_remove = mutable.iter()
+        let to_remove = mutable
+            .iter()
             .find(|kv| kv.value().expires_at <= now)
             .map(|kv| kv.key().clone());
         match to_remove {
-            Some(k) => { mutable.remove(&k); }
-            None    => return, // all entries still live — skip this insert
+            Some(k) => {
+                mutable.remove(&k);
+            }
+            None => return, // all entries still live — skip this insert
         }
     }
     mutable.insert(key, entry);
@@ -120,8 +123,8 @@ const CACHE_MAGIC: &[u8; 4] = b"RBv1";
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
 pub struct PersistKey {
-    pub name:   Vec<u8>,
-    pub qtype:  u16,
+    pub name: Vec<u8>,
+    pub qtype: u16,
     pub qclass: u16,
 }
 
@@ -142,16 +145,19 @@ pub fn save_xdp_cache(cache: &MutableCacheMap, path: &std::path::Path) -> Result
         .as_secs();
     let instant_now = Instant::now();
 
-    let snapshot: Vec<(PersistKey, PersistEntry)> = cache.iter()
+    let snapshot: Vec<(PersistKey, PersistEntry)> = cache
+        .iter()
         .filter(|kv| kv.value().expires_at > instant_now)
         .map(|kv| {
-            let remaining = kv.value().expires_at
+            let remaining = kv
+                .value()
+                .expires_at
                 .saturating_duration_since(instant_now)
                 .as_secs();
             (
                 PersistKey {
-                    name:   kv.key().name.to_vec(),
-                    qtype:  kv.key().qtype,
+                    name: kv.key().name.to_vec(),
+                    qtype: kv.key().qtype,
                     qclass: kv.key().qclass,
                 },
                 PersistEntry {
@@ -171,15 +177,14 @@ pub fn save_xdp_cache(cache: &MutableCacheMap, path: &std::path::Path) -> Result
     let tmp = path.with_extension("tmp");
     {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| format!("create tmp cache file: {e}"))?;
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("create tmp cache file: {e}"))?;
         f.write_all(CACHE_MAGIC)
             .map_err(|e| format!("write magic: {e}"))?;
         f.write_all(&bytes)
             .map_err(|e| format!("write rkyv bytes: {e}"))?;
     }
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("rename cache file: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename cache file: {e}"))?;
 
     Ok(count)
 }
@@ -188,8 +193,8 @@ pub fn save_xdp_cache(cache: &MutableCacheMap, path: &std::path::Path) -> Result
 /// Silently returns 0 if the file is absent or has an invalid magic header.
 /// Logs a warning on corruption.
 pub fn load_xdp_cache(
-    cache:       &MutableCacheMap,
-    path:        &std::path::Path,
+    cache: &MutableCacheMap,
+    path: &std::path::Path,
     max_entries: usize,
 ) -> usize {
     let data = match std::fs::read(path) {
@@ -205,8 +210,10 @@ pub fn load_xdp_cache(
         return 0;
     }
 
-    let snapshot: Vec<(PersistKey, PersistEntry)> = match
-        rkyv::from_bytes::<Vec<(PersistKey, PersistEntry)>, rkyv::rancor::Error>(&data[4..])
+    let snapshot: Vec<(PersistKey, PersistEntry)> = match rkyv::from_bytes::<
+        Vec<(PersistKey, PersistEntry)>,
+        rkyv::rancor::Error,
+    >(&data[4..])
     {
         Ok(v) => v,
         Err(e) => {
@@ -223,16 +230,18 @@ pub fn load_xdp_cache(
     let mut loaded = 0usize;
 
     for (pk, pe) in snapshot {
-        if pe.expires_secs <= now_unix { continue; } // already expired
+        if pe.expires_secs <= now_unix {
+            continue;
+        } // already expired
         let remaining = Duration::from_secs(pe.expires_secs - now_unix);
         let key = QuestionKey {
-            name:   SmallVec::from_vec(pk.name),
-            qtype:  pk.qtype,
+            name: SmallVec::from_vec(pk.name),
+            qtype: pk.qtype,
             qclass: pk.qclass,
         };
         let entry = CacheEntry {
             wire_payload: Bytes::from(pe.wire_payload),
-            expires_at:   instant_now + remaining,
+            expires_at: instant_now + remaining,
         };
         cache_insert(cache, key, entry, max_entries);
         loaded += 1;
@@ -248,7 +257,8 @@ pub async fn publish_loop(snapshot: SharedCacheSnapshot, mutable: MutableCacheMa
     loop {
         interval.tick().await;
         let now = Instant::now();
-        let new_snap: CacheSnapshot = mutable.iter()
+        let new_snap: CacheSnapshot = mutable
+            .iter()
             .filter(|kv| kv.value().expires_at > now)
             .map(|kv| (kv.key().clone(), kv.value().clone()))
             .collect();

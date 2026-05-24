@@ -213,6 +213,31 @@ with an error. There is no silent fallback.
 
 → Full setup guide including SoftHSM2, YubiHSM 2, and production recommendations: [docs/hsm.md](hsm.md)
 
+
+### Web UI (embedded server)
+
+Runbound can serve the management dashboard itself — no nginx required.
+
+```
+server:
+    ui-enabled: yes   # default: no
+    ui-port:    8090  # default: 8090
+    ui-bind:    0.0.0.0   # default: 0.0.0.0 (all interfaces)
+```
+
+| Directive | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ui-enabled` | bool (`yes`/`no`) | `no` | Enable the embedded web UI server |
+| `ui-port` | integer | `8090` | TCP port the UI server binds to |
+| `ui-bind` | string | `0.0.0.0` | Bind address for the UI server |
+
+The embedded server serves `index.html` at `GET /` and transparently proxies
+every `/api/*` request to `http://127.0.0.1:<api-port>` — the REST API remains
+localhost-only. See [web-ui.md](web-ui.md) for setup details.
+
+> **Note:** If `ui-enabled: no` (the default), no UI port is opened and the
+> `ui-port` / `ui-bind` directives are ignored.
+
 ### DNSSEC validation
 
 ```

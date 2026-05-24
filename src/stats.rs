@@ -7,8 +7,8 @@
 // QPS ring buffer: 300 one-second slots (5-minute window), updated by a
 // dedicated background task that reads the total counter each second.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -32,8 +32,7 @@ pub fn new_snapshot_cache(stats: &Stats) -> SharedSnapshot {
 //   [8]  ≤ 250 ms   [9]  ≤ 500 ms  [10]  ≤ 1 s     [11]  ≤ 3 s
 //   [12] > 3 s     (overflow — reported as lower bound, not a fake midpoint)
 pub const HIST_BOUNDS_US: [u64; 12] = [
-    100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000,
-    250_000, 500_000, 1_000_000, 3_000_000,
+    100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 3_000_000,
 ];
 pub const HIST_BUCKETS: usize = 13;
 
@@ -61,49 +60,55 @@ pub struct CachePadded<T>(pub T);
 
 impl<T> std::ops::Deref for CachePadded<T> {
     type Target = T;
-    #[inline] fn deref(&self) -> &T { &self.0 }
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
 }
 impl<T> std::ops::DerefMut for CachePadded<T> {
-    #[inline] fn deref_mut(&mut self) -> &mut T { &mut self.0 }
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
 }
 
 pub struct Stats {
     // Core query counters
-    pub total:     AtomicU64,
-    pub blocked:   AtomicU64,
+    pub total: AtomicU64,
+    pub blocked: AtomicU64,
     pub forwarded: AtomicU64,
-    pub nxdomain:  AtomicU64,
-    pub refused:   AtomicU64,
-    pub servfail:  AtomicU64,
+    pub nxdomain: AtomicU64,
+    pub refused: AtomicU64,
+    pub servfail: AtomicU64,
     pub started_at: Instant,
 
     // Latency histogram — fixed 10 buckets, zero alloc per query
-    pub lat_hist:  Vec<AtomicU64>,
+    pub lat_hist: Vec<AtomicU64>,
 
     // QPS ring buffer — 300 one-second slots
-    pub qps_ring:  Vec<AtomicU64>,
+    pub qps_ring: Vec<AtomicU64>,
     // #70: each field lives on its own 64-byte cache line — qps_update_loop writes
     // these from a background task while DNS handlers write total/blocked/… on other
     // cores.  Without padding both would share a line causing false-sharing evictions.
-    pub qps_head:  CachePadded<AtomicU64>,  // next write slot index
-    pub qps_peak:  CachePadded<AtomicU64>,  // all-time peak (queries in any one second)
+    pub qps_head: CachePadded<AtomicU64>, // next write slot index
+    pub qps_peak: CachePadded<AtomicU64>, // all-time peak (queries in any one second)
 
     // Cache / local resolution metrics
     // cache_hits: forwarded lookups < CACHE_HIT_THRESHOLD_US (likely in-process cache)
     // cache_misses: forwarded lookups ≥ threshold (network round-trip)
     // cache_entries: approximate count of distinct cached domains (0..HICKORY_CACHE_SIZE)
-    pub cache_hits:    AtomicU64,
-    pub cache_misses:  AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
     pub cache_entries: AtomicU64,
     // local_hits: queries answered from local zone data (config + API dns_entries)
-    pub local_hits:    AtomicU64,
+    pub local_hits: AtomicU64,
 
     // DNSSEC counters — only incremented when dnssec-validation is enabled.
     // secure:   resolved with valid DNSSEC signature chain (RRSIG present)
     // bogus:    DNSSEC validation failed (ProtoErrorKind::RrsigsNotPresent)
     // insecure: resolved OK but unsigned (no RRSIG — delegation proven unsigned by parent)
-    pub dnssec_secure:   AtomicU64,
-    pub dnssec_bogus:    AtomicU64,
+    pub dnssec_secure: AtomicU64,
+    pub dnssec_bogus: AtomicU64,
     pub dnssec_insecure: AtomicU64,
 
     // DoT reconnect metrics (#77 fix) — updated by keepalive, level-2 reconnect, and API endpoint.
@@ -115,23 +120,23 @@ pub struct Stats {
 impl Stats {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            total:      AtomicU64::new(0),
-            blocked:    AtomicU64::new(0),
-            forwarded:  AtomicU64::new(0),
-            nxdomain:   AtomicU64::new(0),
-            refused:    AtomicU64::new(0),
-            servfail:   AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
+            forwarded: AtomicU64::new(0),
+            nxdomain: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+            servfail: AtomicU64::new(0),
             started_at: Instant::now(),
-            lat_hist:   (0..HIST_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
-            qps_ring:   (0..QPS_RING_SIZE).map(|_| AtomicU64::new(0)).collect(),
-            qps_head:   CachePadded(AtomicU64::new(0)),
-            qps_peak:   CachePadded(AtomicU64::new(0)),
-            cache_hits:    AtomicU64::new(0),
-            cache_misses:  AtomicU64::new(0),
+            lat_hist: (0..HIST_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+            qps_ring: (0..QPS_RING_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            qps_head: CachePadded(AtomicU64::new(0)),
+            qps_peak: CachePadded(AtomicU64::new(0)),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
             cache_entries: AtomicU64::new(0),
-            local_hits:    AtomicU64::new(0),
-            dnssec_secure:   AtomicU64::new(0),
-            dnssec_bogus:    AtomicU64::new(0),
+            local_hits: AtomicU64::new(0),
+            dnssec_secure: AtomicU64::new(0),
+            dnssec_bogus: AtomicU64::new(0),
             dnssec_insecure: AtomicU64::new(0),
             dot_reconnects_total: AtomicU64::new(0),
             last_reconnect_at: std::sync::Mutex::new(None),
@@ -144,7 +149,9 @@ impl Stats {
         let ts = {
             use std::time::{SystemTime, UNIX_EPOCH};
             let secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             crate::logbuffer::format_ts(secs)
         };
         if let Ok(mut g) = self.last_reconnect_at.lock() {
@@ -152,16 +159,46 @@ impl Stats {
         }
     }
 
-    #[inline] pub fn inc_total(&self)           { self.total.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_blocked(&self)         { self.blocked.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_forwarded(&self)       { self.forwarded.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_nxdomain(&self)        { self.nxdomain.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_refused(&self)         { self.refused.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_servfail(&self)        { self.servfail.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_local_hits(&self)      { self.local_hits.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_dnssec_secure(&self)   { self.dnssec_secure.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_dnssec_bogus(&self)    { self.dnssec_bogus.fetch_add(1, Ordering::Relaxed); }
-    #[inline] pub fn inc_dnssec_insecure(&self) { self.dnssec_insecure.fetch_add(1, Ordering::Relaxed); }
+    #[inline]
+    pub fn inc_total(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_blocked(&self) {
+        self.blocked.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_forwarded(&self) {
+        self.forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_nxdomain(&self) {
+        self.nxdomain.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_servfail(&self) {
+        self.servfail.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_local_hits(&self) {
+        self.local_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_dnssec_secure(&self) {
+        self.dnssec_secure.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_dnssec_bogus(&self) {
+        self.dnssec_bogus.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_dnssec_insecure(&self) {
+        self.dnssec_insecure.fetch_add(1, Ordering::Relaxed);
+    }
 
     /// Record query latency — zero allocation, single atomic increment.
     /// Finds the histogram bucket via binary search on the 9 thresholds.
@@ -184,10 +221,15 @@ impl Stats {
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
             // Approximate cache fill: increment up to hickory's cache size.
             // Saturates at HICKORY_CACHE_SIZE (matching hickory's eviction behaviour).
-            self.cache_entries.fetch_update(
-                Ordering::Relaxed, Ordering::Relaxed,
-                |n| if n < HICKORY_CACHE_SIZE { Some(n + 1) } else { None },
-            ).ok();
+            self.cache_entries
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    if n < HICKORY_CACHE_SIZE {
+                        Some(n + 1)
+                    } else {
+                        None
+                    }
+                })
+                .ok();
         }
     }
 
@@ -201,11 +243,12 @@ impl Stats {
     /// Compute a percentile (0–100) from the current latency histogram.
     /// Returns the result in milliseconds.
     pub fn percentile_ms(&self, pct: f64) -> f64 {
-        let counts: [u64; HIST_BUCKETS] = std::array::from_fn(|i| {
-            self.lat_hist[i].load(Ordering::Relaxed)
-        });
+        let counts: [u64; HIST_BUCKETS] =
+            std::array::from_fn(|i| self.lat_hist[i].load(Ordering::Relaxed));
         let total: u64 = counts.iter().sum();
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
         let target = ((total as f64 * pct / 100.0) as u64).max(1);
         let mut cum = 0u64;
         for (i, &c) in counts.iter().enumerate() {
@@ -220,7 +263,7 @@ impl Stats {
                     let lo = HIST_BOUNDS_US[i - 1];
                     match HIST_BOUNDS_US.get(i) {
                         Some(&hi) => (lo + hi) / 2,
-                        None      => lo,
+                        None => lo,
                     }
                 };
                 return (mid_us as f64 / 1000.0 * 10.0).round() / 10.0;
@@ -239,7 +282,9 @@ impl Stats {
             // Walk backwards from the last written slot
             let slot = (head + QPS_RING_SIZE - 1 - i) % QPS_RING_SIZE;
             let v = self.qps_ring[slot].load(Ordering::Relaxed);
-            if i < 60 { sum_1m += v; }
+            if i < 60 {
+                sum_1m += v;
+            }
             sum_5m += v;
         }
         let qps_peak = self.qps_peak.load(Ordering::Relaxed);
@@ -251,8 +296,8 @@ impl Stats {
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {
-        let total    = self.total.load(Ordering::Relaxed);
-        let blocked  = self.blocked.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        let blocked = self.blocked.load(Ordering::Relaxed);
         let nxdomain = self.nxdomain.load(Ordering::Relaxed);
         let ch = self.cache_hits.load(Ordering::Relaxed);
         let cm = self.cache_misses.load(Ordering::Relaxed);
@@ -265,53 +310,55 @@ impl Stats {
         StatsSnapshot {
             total,
             blocked,
-            forwarded:       self.forwarded.load(Ordering::Relaxed),
+            forwarded: self.forwarded.load(Ordering::Relaxed),
             nxdomain,
-            refused:         self.refused.load(Ordering::Relaxed),
-            servfail:        self.servfail.load(Ordering::Relaxed),
-            uptime_secs:     self.started_at.elapsed().as_secs(),
+            refused: self.refused.load(Ordering::Relaxed),
+            servfail: self.servfail.load(Ordering::Relaxed),
+            uptime_secs: self.started_at.elapsed().as_secs(),
             qps_1m,
             qps_5m,
             qps_peak,
-            latency_p50_ms:  self.percentile_ms(50.0),
-            latency_p95_ms:  self.percentile_ms(95.0),
-            latency_p99_ms:  self.percentile_ms(99.0),
+            latency_p50_ms: self.percentile_ms(50.0),
+            latency_p95_ms: self.percentile_ms(95.0),
+            latency_p99_ms: self.percentile_ms(99.0),
             cache_hit_rate,
-            cache_entries:   self.cache_entries.load(Ordering::Relaxed),
-            local_hits:      self.local_hits.load(Ordering::Relaxed),
-            dnssec_secure:   self.dnssec_secure.load(Ordering::Relaxed),
-            dnssec_bogus:    self.dnssec_bogus.load(Ordering::Relaxed),
+            cache_entries: self.cache_entries.load(Ordering::Relaxed),
+            local_hits: self.local_hits.load(Ordering::Relaxed),
+            dnssec_secure: self.dnssec_secure.load(Ordering::Relaxed),
+            dnssec_bogus: self.dnssec_bogus.load(Ordering::Relaxed),
             dnssec_insecure: self.dnssec_insecure.load(Ordering::Relaxed),
         }
     }
 }
 
 pub struct StatsSnapshot {
-    pub total:          u64,
-    pub blocked:        u64,
-    pub forwarded:      u64,
-    pub nxdomain:       u64,
-    pub refused:        u64,
-    pub servfail:       u64,
-    pub uptime_secs:    u64,
-    pub qps_1m:         f64,
-    pub qps_5m:         f64,
-    pub qps_peak:       u64,
+    pub total: u64,
+    pub blocked: u64,
+    pub forwarded: u64,
+    pub nxdomain: u64,
+    pub refused: u64,
+    pub servfail: u64,
+    pub uptime_secs: u64,
+    pub qps_1m: f64,
+    pub qps_5m: f64,
+    pub qps_peak: u64,
     pub latency_p50_ms: f64,
     pub latency_p95_ms: f64,
     pub latency_p99_ms: f64,
     pub cache_hit_rate: f64,
-    pub cache_entries:  u64,
-    pub local_hits:     u64,
-    pub dnssec_secure:   u64,
-    pub dnssec_bogus:    u64,
+    pub cache_entries: u64,
+    pub local_hits: u64,
+    pub dnssec_secure: u64,
+    pub dnssec_bogus: u64,
     pub dnssec_insecure: u64,
 }
 
 pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
     let pct_blocked = if snap.total > 0 {
         (snap.blocked as f64 / snap.total as f64 * 1000.0).round() / 10.0
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     serde_json::json!({
         "total":            snap.total,
         "blocked":          snap.blocked,
@@ -352,7 +399,7 @@ pub async fn qps_update_loop(stats: Arc<Stats>, snapshot_cache: SharedSnapshot) 
     loop {
         interval.tick().await;
         let total = stats.total.load(Ordering::Relaxed);
-        let qps   = total.saturating_sub(prev_total);
+        let qps = total.saturating_sub(prev_total);
         prev_total = total;
 
         // Write to ring slot and advance head atomically.
