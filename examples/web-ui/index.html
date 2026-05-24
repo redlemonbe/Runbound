@@ -63,16 +63,16 @@
 </div>
 
 <!-- Tabs -->
-<div class="border-b border-gray-800/60 flex gap-1 px-4 text-xs text-gray-500 bg-gray-950/80 sticky top-0 z-10">
-  <button class="py-3 px-3 tab-active transition-colors hover:text-gray-300" onclick="showTab('overview',this)">Overview</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('dns',this)">DNS</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('system',this)">System</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
-</div>
+<nav role="tablist" aria-label="Main navigation" class="border-b border-gray-800/60 flex gap-1 px-4 text-xs text-gray-500 bg-gray-950/80 sticky top-0 z-10">
+  <button role="tab" aria-selected="true"  aria-controls="tab-overview"   class="py-3 px-3 tab-active transition-colors hover:text-gray-300" onclick="showTab('overview',this)">Overview</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-dns"        class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('dns',this)">DNS</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-blacklist"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-feeds"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-upstreams"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-logs"       class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-system"     class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('system',this)">System</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-about"      class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
+</nav>
 
 <div class="p-5 max-w-6xl mx-auto">
 
@@ -151,6 +151,45 @@
           <div class="flex justify-between"><span class="text-gray-500">Insecure</span><span id="ov-dnssec-insecure" class="text-gray-500 tabular-nums">—</span></div>
         </div>
       </div>
+    </div>
+    <!-- Live QPS chart (#7) -->
+    <div class="card mt-4" id="qps-chart-card" aria-label="Live queries per second chart">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">Live QPS <span class="text-gray-800 font-normal normal-case ml-1">60 s</span></span>
+        <span class="text-xs text-gray-700">peak&nbsp;<span id="qps-chart-peak" class="text-cyan-600 tabular-nums">—</span></span>
+      </div>
+      <svg id="qps-sparkline-svg" role="img" aria-label="QPS over last 60 seconds"
+           viewBox="0 0 480 52" width="100%" height="52" xmlns="http://www.w3.org/2000/svg" style="display:block">
+        <defs>
+          <linearGradient id="spk-grad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18"/>
+            <stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <text x="240" y="30" text-anchor="middle" fill="#1e293b" font-size="11" font-family="monospace">connecting…</text>
+      </svg>
+      <div class="flex justify-between text-xs text-gray-800 mt-1" aria-hidden="true">
+        <span>60s ago</span><span>now</span>
+      </div>
+    </div>
+    <!-- Top Domains (#5) -->
+    <div class="card mt-4" id="top-domains-card">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">Top Domains <span class="text-gray-800 font-normal normal-case ml-1">since startup</span></span>
+        <span class="text-xs text-gray-700">tracking <span id="top-domains-tracked" class="text-cyan-600 tabular-nums">—</span> domains</span>
+      </div>
+      <table class="w-full text-sm" aria-label="Top queried domains">
+        <thead>
+          <tr class="text-xs text-gray-600 border-b border-gray-800/40">
+            <th class="text-left pb-1.5 font-normal w-6">#</th>
+            <th class="text-left pb-1.5 font-normal">Domain</th>
+            <th class="text-right pb-1.5 font-normal">Queries</th>
+          </tr>
+        </thead>
+        <tbody id="top-domains-tbody">
+          <tr><td colspan="3" class="text-gray-700 text-xs pt-2">loading…</td></tr>
+        </tbody>
+      </table>
     </div>
     <div class="text-right text-xs text-gray-800 mt-3" id="ov-refreshed">—</div>
   </div>
@@ -431,6 +470,7 @@ async function connect() {
     pollAllSys();
     discoverSlaves();
     toast('Connected');
+    initSparkline();
   } catch(e) { setConn(false, e.message); toast('Connection failed: '+e.message, true); }
 }
 
@@ -463,6 +503,37 @@ async function discoverSlaves() {
 
 async function pollAll() {
   for (const id of Object.keys(nodes)) pollNodeStats(id);
+  pollTopDomains();
+}
+
+async function pollTopDomains() {
+  const id = selectedNode === 'all' ? 'master' : selectedNode;
+  if (!id || !nodes[id]) return;
+  try {
+    const d = await nodeApi(id, 'GET', '/stats/top-domains?limit=10');
+    const tbody = document.getElementById('top-domains-tbody');
+    const tracked = document.getElementById('top-domains-tracked');
+    if (!tbody) return;
+    if (tracked) tracked.textContent = (d.tracked_domains ?? '—').toLocaleString();
+    const rows = (d.top_queried ?? []);
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" class="text-gray-700 text-xs pt-2">no data yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map((r, i) => {
+      const domain = r.domain.replace(/\.$/, '');
+      const count = (r.count ?? 0).toLocaleString();
+      const bar = Math.round((r.count / rows[0].count) * 100);
+      return `<tr class="border-b border-gray-900/50 hover:bg-gray-800/30 transition-colors">
+        <td class="py-1.5 pr-2 text-gray-700 tabular-nums text-xs">${i + 1}</td>
+        <td class="py-1.5 pr-4">
+          <div class="text-gray-300 tabular-nums font-mono text-xs truncate max-w-xs" title="${esc(domain)}">${esc(domain)}</div>
+          <div class="h-0.5 bg-gray-800 rounded mt-1 w-full"><div class="h-0.5 bg-cyan-700 rounded" style="width:${bar}%"></div></div>
+        </td>
+        <td class="py-1.5 text-right text-cyan-400 tabular-nums text-xs">${count}</td>
+      </tr>`;
+    }).join('');
+  } catch(_) { /* silently ignore — endpoint may not exist on older servers */ }
 }
 async function pollAllSys() {
   for (const id of Object.keys(nodes)) pollNodeSys(id);
@@ -930,15 +1001,78 @@ function toast(msg,err=false){const el=document.getElementById('toast');el.textC
 
 function showTab(name,btn){
   ['overview','dns','blacklist','feeds','upstreams','logs','system','about'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
-  document.querySelectorAll('.tab-active').forEach(b=>b.classList.remove('tab-active'));
+  document.querySelectorAll('.tab-active').forEach(b=>{b.classList.remove('tab-active');b.setAttribute('aria-selected','false');});
   const el=document.getElementById('tab-'+name);el.classList.remove('hidden');el.classList.add('fade');
-  btn.classList.add('tab-active');
+  btn.classList.add('tab-active');btn.setAttribute('aria-selected','true');
   if(name==='dns'){loadDns();}
   if(name==='blacklist')loadBlacklist();
   if(name==='feeds'){loadPresets();loadFeeds();}
   if(name==='upstreams'){loadUpstreamPresets();loadUpstreams();}
   if(name==='logs')loadLogs();
   if(name==='system'){loadSystem();loadSlaves();}
+}
+
+// ══════════════════════════════════════════════
+// Live QPS sparkline (#7) — fetch-based SSE reader
+// ══════════════════════════════════════════════
+const QPS_BUF = [];
+const QPS_N   = 60;
+let _spkReader = null, _spkBuf = '';
+
+function initSparkline() {
+  if (_spkReader) { try { _spkReader.cancel(); } catch(_){} _spkReader = null; }
+  _spkBuf = '';
+  QPS_BUF.length = 0;
+  const svg = document.getElementById('qps-sparkline-svg');
+  if (svg) svg.innerHTML = '<text x="240" y="30" text-anchor="middle" fill="#1e293b" font-size="11" font-family="monospace">connecting…</text>';
+  fetch(BASE + '/stats/stream', {headers: {'Authorization': 'Bearer ' + KEY}})
+    .then(r => {
+      if (!r.ok) return;
+      const reader = r.body.getReader();
+      _spkReader = reader;
+      const dec = new TextDecoder();
+      (function pump() {
+        reader.read().then(({done, value}) => {
+          if (done) return;
+          _spkBuf += dec.decode(value, {stream: true});
+          const lines = _spkBuf.split('\n');
+          _spkBuf = lines.pop();
+          for (const ln of lines) {
+            if (!ln.startsWith('data: ')) continue;
+            try {
+              const d = JSON.parse(ln.slice(6));
+              if (d.qps_1m != null) _spkPush(Number(d.qps_1m));
+            } catch(_) {}
+          }
+          pump();
+        }).catch(() => {});
+      })();
+    }).catch(() => {});
+}
+
+function _spkPush(qps) {
+  QPS_BUF.push(qps);
+  if (QPS_BUF.length > QPS_N) QPS_BUF.shift();
+  _spkRender();
+}
+
+function _spkRender() {
+  const el = document.getElementById('qps-sparkline-svg');
+  if (!el || QPS_BUF.length < 2) return;
+  const W=480, H=52, P=4;
+  const max = Math.max(...QPS_BUF, 0.1);
+  const xs = i => (P + (i / (QPS_N - 1)) * (W - P*2)).toFixed(1);
+  const ys = v => (H - P - (v / max) * (H - P*2 - 2)).toFixed(1);
+  const pts = QPS_BUF.map((v, i) => xs(QPS_BUF.length <= 1 ? 0 : i * (QPS_N-1) / (QPS_BUF.length-1)) + ',' + ys(v)).join(' ');
+  const lastX = xs(QPS_N - 1);
+  el.innerHTML =
+    '<defs><linearGradient id="spk-grad" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18"/>' +
+    '<stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/></linearGradient></defs>' +
+    '<polyline fill="url(#spk-grad)" stroke="none" points="' + P + ',' + (H-P) + ' ' + pts + ' ' + lastX + ',' + (H-P) + '"/>' +
+    '<polyline fill="none" stroke="#22d3ee" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/>';
+  const pk = document.getElementById('qps-chart-peak');
+  if (pk) pk.textContent = max >= 1000 ? (max/1000).toFixed(1) + 'k' : max.toFixed(0);
 }
 
 let _modalResolve=null;
