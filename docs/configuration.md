@@ -655,6 +655,43 @@ environments where `/etc/resolv.conf` points to a loopback stub resolver
 
 ---
 
+### Firewall auto-management
+
+Opt-in feature: Runbound can open the ports it needs (DNS, API, sync) in the
+host firewall on startup and close them on clean shutdown. Supports UFW,
+nftables, and iptables. Detected automatically; explicitly selectable.
+
+```
+server:
+    firewall-manage: no      # default: no — opt-in, never changes rules by default
+    firewall-backend: auto   # auto | ufw | nftables | iptables
+    firewall-tag: runbound   # comment tag added to every rule Runbound manages
+```
+
+**Detection order** (when `firewall-backend: auto`):
+1. UFW — if `ufw` binary exists and UFW is active
+2. nftables — if `nft` binary exists
+3. iptables — if `iptables` binary exists
+4. None — feature is a no-op (startup proceeds normally)
+
+**Ports opened** (on startup) and **closed** (on clean shutdown):
+
+| Port | Proto | Condition |
+|------|-------|-----------|
+| `port` (DNS) | UDP + TCP | always |
+| `api-port` | TCP | if API is enabled |
+| `sync-port` | TCP | master only |
+
+Rules are tagged with `firewall-tag` (default `runbound`). Only rules with
+that tag are ever removed. Runbound never flushes chains or modifies unrelated
+rules.
+
+> **Safety:** `firewall-manage: no` (default) means Runbound never touches
+> firewall rules unless explicitly enabled. If the process is killed with
+> SIGKILL the rules remain open until manually removed or next clean start.
+
+---
+
 ## `forward-zone:` directives
 
 ```
