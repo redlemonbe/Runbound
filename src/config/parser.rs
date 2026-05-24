@@ -192,6 +192,16 @@ pub struct UnboundConfig {
     /// in GET /api/upstreams.  Removed automatically when a primary upstream
     /// recovers.  Default: true.
     pub resolv_fallback: bool,
+
+    // ── AF_XDP ring sizes (#96) ───────────────────────────────────────────────
+    /// AF_XDP fill ring size (power of 2, 64–65536). Default: 4096.
+    pub xdp_fill_ring_size: u32,
+    /// AF_XDP completion ring size (power of 2, 64–65536). Default: 4096.
+    pub xdp_comp_ring_size: u32,
+    /// AF_XDP RX ring size (power of 2, 64–65536). Default: 4096.
+    pub xdp_rx_ring_size: u32,
+    /// AF_XDP TX ring size (power of 2, 64–65536). Default: 4096.
+    pub xdp_tx_ring_size: u32,
 }
 
 impl UnboundConfig {
@@ -220,6 +230,10 @@ impl UnboundConfig {
             resolv_fallback:        true,
             rate_limit_prefix_v4:   24,
             rate_limit_prefix_v6:   48,
+            xdp_fill_ring_size:     4096,
+            xdp_comp_ring_size:     4096,
+            xdp_rx_ring_size:       4096,
+            xdp_tx_ring_size:       4096,
             ..Default::default()
         }
     }
@@ -264,7 +278,7 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
         let val = val.trim();
 
         match current_section.as_str() {
-            "server" => parse_server_directive(&mut cfg, key, val, lineno + 1),
+            "server" => parse_server_directive(&mut cfg, key, val, lineno + 1)?,
             "forward-zone" => {
                 let fwd = current_forward.get_or_insert_with(|| ForwardZone {
                     name: String::new(),
@@ -295,7 +309,18 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
 const MAX_LOCAL_ZONES: usize = 1_000_000;
 const MAX_LOCAL_DATA:  usize = 1_000_000;
 
-fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno: usize) {
+/// Parse and validate an AF_XDP ring-size directive (#96).
+/// Accepts a u32 that is a power of 2 in [64, 65536]; returns a config error otherwise.
+fn parse_xdp_ring_size(val: &str, key: &str, lineno: usize) -> anyhow::Result<u32> {
+    let v = val.trim_matches('"').parse::<u32>()
+        .map_err(|_| anyhow::anyhow!("Line {lineno}: {key} must be a positive integer"))?;
+    if !(64..=65536).contains(&v) || !v.is_power_of_two() {
+        anyhow::bail!("Line {lineno}: {key} = {v} is invalid (must be a power of 2 between 64 and 65536)");
+    }
+    Ok(v)
+}
+
+fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno: usize) -> anyhow::Result<()> {
     // Mapping intentionnel 1:1 avec la syntaxe unbound.conf.
     // Volumineux par design — chaque directive Unbound correspond
     // à une assignation. Ne pas refactorer en table générique
@@ -307,7 +332,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "local-zone"     => {
             if cfg.local_zones.len() >= MAX_LOCAL_ZONES {
                 warn!("Line {}: local-zone limit ({MAX_LOCAL_ZONES}) reached — entry ignored", lineno);
-                return;
+                return Ok(());
             }
             // Format: "name." type  OR  name. type  (with or without quotes)
             // Strip optional leading quote, then split name from type
@@ -327,7 +352,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "local-data"     => {
             if cfg.local_data.len() >= MAX_LOCAL_DATA {
                 warn!("Line {}: local-data limit ({MAX_LOCAL_DATA}) reached — entry ignored", lineno);
-                return;
+                return Ok(());
             }
             // Format: "name. TYPE value"  (entire RR is quoted)
             let rr = val.trim_matches('"').trim().to_string();
@@ -422,6 +447,10 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "cache-flush-cooldown"  => cfg.cache_flush_cooldown  = val.parse().unwrap_or(60),
         "upstream-racing"       => cfg.upstream_racing       = val.trim_matches('"') == "yes",
         "resolv-fallback"       => cfg.resolv_fallback       = val.trim_matches('"') != "no",
+        "xdp-rx-ring-size"   => cfg.xdp_rx_ring_size   = parse_xdp_ring_size(val, "xdp-rx-ring-size",   lineno)?,
+        "xdp-tx-ring-size"   => cfg.xdp_tx_ring_size   = parse_xdp_ring_size(val, "xdp-tx-ring-size",   lineno)?,
+        "xdp-fill-ring-size" => cfg.xdp_fill_ring_size = parse_xdp_ring_size(val, "xdp-fill-ring-size", lineno)?,
+        "xdp-comp-ring-size" => cfg.xdp_comp_ring_size = parse_xdp_ring_size(val, "xdp-comp-ring-size", lineno)?,
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"
@@ -436,6 +465,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         => {} // silently accepted
         other => warn!("Line {}: unknown server directive '{}' — ignored", lineno, other),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -473,5 +503,55 @@ mod tests {
     fn prefetch_threshold_invalid_falls_back_to_default() {
         let cfg = parse_str("server:\n  prefetch-threshold: notanumber\n").unwrap();
         assert_eq!(cfg.prefetch_threshold, 5);
+    }
+
+    // ── FEAT #96: AF_XDP ring size config parsing ─────────────────────────
+
+    #[test]
+    fn xdp_ring_sizes_default_to_4096() {
+        let cfg = parse_str("server:\n").unwrap();
+        assert_eq!(cfg.xdp_rx_ring_size,   4096);
+        assert_eq!(cfg.xdp_tx_ring_size,   4096);
+        assert_eq!(cfg.xdp_fill_ring_size, 4096);
+        assert_eq!(cfg.xdp_comp_ring_size, 4096);
+    }
+
+    #[test]
+    fn xdp_ring_sizes_valid_power_of_two() {
+        let cfg = parse_str(
+            "server:\n  xdp-rx-ring-size: 512\n  xdp-tx-ring-size: 1024\n  \
+             xdp-fill-ring-size: 2048\n  xdp-comp-ring-size: 8192\n",
+        ).unwrap();
+        assert_eq!(cfg.xdp_rx_ring_size,   512);
+        assert_eq!(cfg.xdp_tx_ring_size,   1024);
+        assert_eq!(cfg.xdp_fill_ring_size, 2048);
+        assert_eq!(cfg.xdp_comp_ring_size, 8192);
+    }
+
+    #[test]
+    fn xdp_ring_size_not_power_of_two_is_error() {
+        assert!(parse_str("server:\n  xdp-rx-ring-size: 1000\n").is_err());
+    }
+
+    #[test]
+    fn xdp_ring_size_below_min_is_error() {
+        assert!(parse_str("server:\n  xdp-rx-ring-size: 32\n").is_err());
+    }
+
+    #[test]
+    fn xdp_ring_size_above_max_is_error() {
+        assert!(parse_str("server:\n  xdp-rx-ring-size: 131072\n").is_err());
+    }
+
+    #[test]
+    fn xdp_ring_size_boundary_64_is_valid() {
+        let cfg = parse_str("server:\n  xdp-rx-ring-size: 64\n").unwrap();
+        assert_eq!(cfg.xdp_rx_ring_size, 64);
+    }
+
+    #[test]
+    fn xdp_ring_size_boundary_65536_is_valid() {
+        let cfg = parse_str("server:\n  xdp-rx-ring-size: 65536\n").unwrap();
+        assert_eq!(cfg.xdp_rx_ring_size, 65536);
     }
 }

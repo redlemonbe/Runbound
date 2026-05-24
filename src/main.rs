@@ -161,7 +161,13 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         };
         match iface {
             Some(ref iface_name) => {
-                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor, cfg.xdp_irq_affinity, cfg.xdp_hugepages, xdp_cache_snapshot.clone(), cfg.xdp_domain_routing, cfg.xdp_ring_size) {
+                let xdp_ring_sizes = dns::xdp::XdpRingSizes {
+                    rx:   cfg.xdp_rx_ring_size,
+                    tx:   cfg.xdp_tx_ring_size,
+                    fill: cfg.xdp_fill_ring_size,
+                    comp: cfg.xdp_comp_ring_size,
+                };
+                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor, cfg.xdp_irq_affinity, cfg.xdp_hugepages, xdp_cache_snapshot.clone(), cfg.xdp_domain_routing, cfg.xdp_ring_size, xdp_ring_sizes) {
                     Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); xdp_mode.store(match h.mode { dns::xdp::XdpMode::Drv => 1, dns::xdp::XdpMode::Skb => 2 }, Ordering::Relaxed); Some(h) }
                     Ok(None)    => None, // virtual interface or self-test — already warned
                     Err(e) => {
