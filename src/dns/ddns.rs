@@ -2,7 +2,6 @@
 
 use std::{net::IpAddr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use arc_swap::ArcSwap;
-use base64::Engine as _;
 use hickory_proto::{
     op::{Metadata, ResponseCode},
     rr::{rdata::tsig::{signed_bitmessage_to_buf, TsigAlgorithm}, Name, RData, RecordType},
@@ -17,15 +16,15 @@ use tracing::{debug, info, warn};
 use crate::dns::local::{LocalZoneSet, ZoneAction};
 
 /// Verify a TSIG-authenticated DNS UPDATE and apply if valid.
+/// `tsig_keys` are pre-decoded at startup: (name_lower, algorithm, key_bytes).
+/// This avoids base64 decode and algorithm parsing on every UPDATE request (SEC-20).
 pub async fn handle_update<R: ResponseHandler>(
     request: &Request,
-    mut response_handle: R,
+    response_handle: R,
     zones: &Arc<ArcSwap<LocalZoneSet>>,
-    tsig_keys: &[(String, String, String)],
+    tsig_keys: &[(String, TsigAlgorithm, Vec<u8>)],
     client_ip: IpAddr,
 ) -> ResponseInfo {
-    // Request implements Deref<MessageRequest> which implements UpdateRequest.
-    // additionals() and updates() come from the UpdateRequest trait.
     let additional = UpdateRequest::additionals(request.deref());
     let tsig_rec = additional.iter().find(|r| r.record_type() == RecordType::TSIG);
 
@@ -42,27 +41,17 @@ pub async fn handle_update<R: ResponseHandler>(
         return rcode(request, response_handle, ResponseCode::Refused).await;
     };
 
-    // Find key by name
+    // Find pre-decoded key by name
     let key_name = tsig_rec.name.to_ascii().to_ascii_lowercase();
     let key_name = key_name.trim_end_matches('.');
-    let matching = tsig_keys.iter().find(|(n, _, _)| n.to_ascii_lowercase() == key_name);
-    let Some((_, alg_str, secret_b64)) = matching else {
+    let matching = tsig_keys.iter().find(|(n, _, _)| n.as_str() == key_name);
+    let Some((_, alg, key_bytes)) = matching else {
         warn!(%client_ip, key=%key_name, "DNS UPDATE -- unknown TSIG key");
         return rcode(request, response_handle, ResponseCode::Refused).await;
     };
 
-    // Algorithm check
-    let expected_alg = match alg_str.as_str() {
-        "hmac-sha256" | "HMAC-SHA256" => TsigAlgorithm::HmacSha256,
-        "hmac-sha512" | "HMAC-SHA512" => TsigAlgorithm::HmacSha512,
-        "hmac-sha384" | "HMAC-SHA384" => TsigAlgorithm::HmacSha384,
-        "hmac-sha1"   | "HMAC-SHA1"   => TsigAlgorithm::HmacSha1,
-        other => {
-            warn!(%client_ip, alg=%other, "DNS UPDATE -- unsupported algorithm");
-            return rcode(request, response_handle, ResponseCode::Refused).await;
-        }
-    };
-    if tsig.algorithm != expected_alg {
+    // Algorithm check against pre-decoded algorithm
+    if tsig.algorithm != *alg {
         warn!(%client_ip, "DNS UPDATE -- algorithm mismatch");
         return rcode(request, response_handle, ResponseCode::Refused).await;
     }
@@ -74,22 +63,17 @@ pub async fn handle_update<R: ResponseHandler>(
         return rcode(request, response_handle, ResponseCode::Refused).await;
     }
 
-    // Decode key and verify MAC
-    let Ok(key_bytes) = base64::engine::general_purpose::STANDARD.decode(secret_b64) else {
-        warn!(key=%key_name, "DNS UPDATE -- key base64 decode failed");
-        return rcode(request, response_handle, ResponseCode::ServFail).await;
-    };
+    // Verify MAC with pre-decoded key bytes — no base64 decode per request (SEC-20)
     let raw = request.as_slice();
     let Ok((signed_buf, _)) = signed_bitmessage_to_buf(raw, None, true) else {
         warn!(%client_ip, "DNS UPDATE -- signed_bitmessage_to_buf failed");
         return rcode(request, response_handle, ResponseCode::ServFail).await;
     };
-    if tsig.algorithm.verify_mac(&key_bytes, &signed_buf, &tsig.mac).is_err() {
+    if tsig.algorithm.verify_mac(key_bytes, &signed_buf, &tsig.mac).is_err() {
         warn!(%client_ip, key=%key_name, "DNS UPDATE -- MAC verification failed");
         return rcode(request, response_handle, ResponseCode::Refused).await;
     }
 
-    // Apply updates from the authority section (RFC 2136 section 2.5)
     let updates = UpdateRequest::updates(request.deref());
     if updates.is_empty() {
         debug!(%client_ip, key=%key_name, "DNS UPDATE with empty update section");
@@ -97,6 +81,24 @@ pub async fn handle_update<R: ResponseHandler>(
     }
 
     let current = zones.load_full();
+
+    // SEC-AGV-01: reject any UPDATE that attempts to delete a statically configured zone.
+    // Static zones are read-only at runtime; only DDNS-created zones can be deleted.
+    for rr in updates {
+        let name_str = rr.name.to_ascii();
+        let name_str = name_str.trim_end_matches('.');
+        let class_u16 = u16::from(rr.dns_class);
+        if class_u16 == 255 || class_u16 == 254 {
+            if let Ok(n) = Name::from_ascii(name_str) {
+                if current.static_names.contains(&n) {
+                    warn!(%client_ip, key=%key_name, %name_str,
+                        "DNS UPDATE refused — attempted delete of static zone rejected");
+                    return rcode(request, response_handle, ResponseCode::Refused).await;
+                }
+            }
+        }
+    }
+
     let mut new_zones = (*current).clone();
     let mut added = 0usize;
     let mut deleted = 0usize;
