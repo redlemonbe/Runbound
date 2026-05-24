@@ -120,6 +120,7 @@ pub fn init(
     log_path: Option<PathBuf>,
     hmac_key: Option<String>,
     base_dir: PathBuf,
+    checkpoint_every: u64,
 ) -> AuditLogger {
     let (tx, rx) = mpsc::unbounded_channel::<AuditEvent>();
 
@@ -127,7 +128,7 @@ pub fn init(
         let resolved_path = log_path.unwrap_or_else(|| base_dir.join("audit.log"));
         let key_bytes = load_or_generate_hmac_key(hmac_key, &base_dir);
         let seq = load_seq(&base_dir);
-        tokio::spawn(writer_task(rx, resolved_path, key_bytes, seq, base_dir));
+        tokio::spawn(writer_task(rx, resolved_path, key_bytes, seq, base_dir, checkpoint_every));
     } else {
         // Consume events from the channel so it doesn't accumulate.
         tokio::spawn(async move {
@@ -207,6 +208,7 @@ async fn writer_task(
     key: Vec<u8>,
     start_seq: u64,
     base_dir: PathBuf,
+    checkpoint_every: u64,
 ) {
     let _ = fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
 
@@ -221,6 +223,8 @@ async fn writer_task(
     };
 
     let mut seq = start_seq;
+    let mut last_mac = String::new();
+    let mut block_start_seq = start_seq;
 
     while let Some(event) = rx.recv().await {
         let ts = std::time::SystemTime::now()
@@ -233,6 +237,7 @@ async fn writer_task(
 
         // HMAC-SHA256 over: seq (8 bytes LE) || ts (8 bytes LE) || event name || fields JSON
         let mac = compute_mac(&key, seq, ts, event_name, &fields.to_string());
+        last_mac = mac.clone();
 
         let line = serde_json::json!({
             "seq":   seq,
@@ -254,6 +259,11 @@ async fn writer_task(
         if seq.is_multiple_of(100) {
             save_seq(&base_dir, seq);
         }
+        // #28: write HMAC checkpoint every checkpoint_every entries
+        if checkpoint_every > 0 && seq % checkpoint_every == 0 {
+            write_checkpoint(&base_dir, seq, block_start_seq, &last_mac);
+            block_start_seq = seq;
+        }
     }
 
     // Flush on channel close (shutdown).
@@ -269,6 +279,26 @@ fn compute_mac(key: &[u8], seq: u64, ts: u64, event: &str, fields: &str) -> Stri
     mac.update(event.as_bytes());
     mac.update(fields.as_bytes());
     hex::encode(mac.finalize().into_bytes())
+}
+
+// ── #28: Checkpoint writer ────────────────────────────────────────────────────
+
+fn write_checkpoint(base_dir: &std::path::Path, seq_end: u64, seq_start: u64, last_mac: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cp = serde_json::json!({
+        "seq_start": seq_start,
+        "seq_end":   seq_end,
+        "last_mac":  last_mac,
+        "ts":        ts,
+    });
+    let tmp = base_dir.join("audit.checkpoint.tmp");
+    let dst = base_dir.join("audit.checkpoint");
+    if fs::write(&tmp, cp.to_string()).is_ok() {
+        let _ = fs::rename(&tmp, &dst);
+    }
 }
 
 // ── GET /audit/tail endpoint helper ───────────────────────────────────────────
