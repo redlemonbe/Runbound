@@ -170,6 +170,10 @@ pub struct RunboundHandler {
     stale_answer_ttl: u32,
     /// #108: max age of a stale entry (seconds).
     stale_max_age: u64,
+    /// #14: allow DNS UPDATE (RFC 2136). False = refuse all UPDATE messages.
+    allow_update: bool,
+    /// #14: TSIG keys for DNS UPDATE authentication: (name, algorithm, base64-secret).
+    tsig_keys: Vec<(String, String, String)>,
 }
 
 impl RunboundHandler {
@@ -200,6 +204,8 @@ impl RunboundHandler {
         serve_stale: bool,
         stale_answer_ttl: u32,
         stale_max_age: u64,
+        allow_update: bool,
+        tsig_keys: Vec<(String, String, String)>,
     ) -> Self {
         Self {
             zones,
@@ -230,6 +236,8 @@ impl RunboundHandler {
             },
             stale_answer_ttl,
             stale_max_age,
+            allow_update,
+            tsig_keys,
         }
     }
 
@@ -832,6 +840,21 @@ impl RequestHandler for RunboundHandler {
 
         self.stats.inc_total();
         self.domain_stats.inc(&qname.to_string());
+
+        // ── 0a. RFC 2136 DNS UPDATE dispatch ────────────────────────────
+        if request.metadata.op_code == OpCode::Update {
+            if !self.allow_update {
+                debug!(%client_ip, "DNS UPDATE refused — allow-update: no");
+                return send_error(request, response_handle, ResponseCode::Refused).await;
+            }
+            return super::ddns::handle_update(
+                request,
+                response_handle,
+                &self.zones,
+                &self.tsig_keys,
+                client_ip,
+            ).await;
+        }
 
         // ── 0. Access-control list ──────────────────────────────────────
         match self.acl.check(client_ip) {
@@ -2009,6 +2032,8 @@ pub async fn run_dns_server(
         cfg.serve_stale,
         cfg.stale_answer_ttl,
         cfg.stale_max_age,
+        cfg.allow_update,
+        cfg.tsig_keys.clone(),
     );
     let mut server = Server::new(handler);
 

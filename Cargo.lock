@@ -2215,6 +2215,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "aya",
+ "base64",
  "bytes",
  "cryptoki",
  "dashmap",
