@@ -382,17 +382,27 @@ let statsTimer = null, sysTimer = null, syncTimer = null, logsTimer = null;
 
 function nodeApi(nodeId, method, path, body) {
   const n = nodes[nodeId]; if (!n) throw new Error('Unknown node');
-  const headers = {'Authorization': `Bearer ${n.key}`};
-  if (body) headers['Content-Type'] = 'application/json';
-  return fetch(n.url + path, {method, headers, body: body ? JSON.stringify(body) : undefined})
-    .then(async r => {
-      if (!r.ok) {
-        let msg = `HTTP ${r.status}`;
-        try { const j = await r.json(); msg = j.error || j.message || msg; } catch(_) {}
-        throw new Error(msg);
-      }
-      return r.json().catch(() => ({}));
-    });
+  const doFetch = (url, authKey) => {
+    const headers = {'Authorization': `Bearer ${authKey}`};
+    if (body) headers['Content-Type'] = 'application/json';
+    return fetch(url, {method, headers, body: body ? JSON.stringify(body) : undefined})
+      .then(async r => {
+        if (!r.ok) {
+          let msg = `HTTP ${r.status}`;
+          try { const j = await r.json(); msg = j.error || j.message || msg; } catch(_) {}
+          throw new Error(msg);
+        }
+        return r.json().catch(() => ({}));
+      });
+  };
+  const directUrl = (n.url.endsWith('/api') ? n.url : n.url + '/api') + path;
+  const tryRelay = () => {
+    if (!n.relayNodeId) throw new Error('unreachable');
+    const relayUrl = `${nodes['master'].url}/nodes/${n.relayNodeId}/relay${path}`;
+    return doFetch(relayUrl, masterKey);
+  };
+  if (nodeId === 'master') return doFetch(directUrl, n.key);
+  return doFetch(directUrl, n.key).catch(() => tryRelay());
 }
 
 // Current node's API (for tabs other than overview)
@@ -426,20 +436,25 @@ async function connect() {
 
 async function discoverSlaves() {
   try {
-    const d = await api('GET', '/sync/slaves');
+    const [d, relayData] = await Promise.all([
+      api('GET', '/sync/slaves'),
+      api('GET', '/nodes').catch(() => ({nodes:[]}))
+    ]);
     const slaves = d.slaves ?? [];
+    const relayNodes = relayData.nodes ?? [];
     for (const s of slaves) {
       const ip = s.addr.replace(/:\d+$/, '');
+      const relay = relayNodes.find(r => r.addr === ip);
       if (nodes[ip]) {
-        // refresh master-reported sync status for existing nodes
         nodes[ip].syncStatus = s.status;
         nodes[ip].syncLastSeen = s.last_seen_secs ?? 999;
+        if (relay) nodes[ip].relayNodeId = relay.node_id;
         renderNodePills();
         continue;
       }
-      const slaveUrl = `http://${ip}:8080/api`;
+      const slaveUrl = `http://${ip}:8080`;
       const savedKey = localStorage.getItem('rb-slave-key-'+ip) ?? masterKey;
-      nodes[ip] = {url:slaveUrl, key:savedKey, name:`Slave (${ip})`, stats:null, sys:null, cache:null, status:'probing', syncStatus:s.status, syncLastSeen:s.last_seen_secs??999};
+      nodes[ip] = {url:slaveUrl, key:savedKey, name:`Slave (${ip})`, stats:null, sys:null, cache:null, status:'probing', syncStatus:s.status, syncLastSeen:s.last_seen_secs??999, relayNodeId: relay?.node_id ?? null};
       renderNodePills();
       pollNodeStats(ip);
     }
@@ -554,7 +569,7 @@ function updateOverview() {
       const eff2 = nodeEffectiveStatus(n);
       const dot = eff2==='ok'?'bg-green-500':eff2==='error'?'bg-red-600':'bg-yellow-400 blink';
       const qps = n.stats?.qps_1m!=null ? Number(n.stats.qps_1m).toFixed(1)+' qps' : '—';
-      const authWarn = n.status==='error' && eff2==='ok' ? `<div class="text-xs text-yellow-500">no direct API</div>` : n.status==='error' ? `<div class="text-xs text-red-400" title="${esc(n.lastErr??'')}">⚠ unreachable</div>` : '';
+      const authWarn = n.status==='error' && eff2!=='ok' ? `<div class="text-xs text-red-400" title="${esc(n.lastErr??'')}">⚠ unreachable</div>` : '';
       const isSelected = selectedNode === id;
       const borderCls = isSelected ? 'border-cyan-600' : 'border-transparent hover:border-cyan-800';
       return `<div class="card flex items-center gap-3 py-2 px-3 cursor-pointer ${borderCls} transition-all" onclick="selectNode('${id}')">
