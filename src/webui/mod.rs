@@ -2,7 +2,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use argon2::password_hash::{rand_core::OsRng, SaltString};
 use axum::{
     body::Body,
-    extract::{Form, State},
+    extract::{ConnectInfo, Form, State},
     http::{header, HeaderMap, Request, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, get, post},
@@ -17,6 +17,21 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 static INDEX_HTML: &str = include_str!("../../examples/web-ui/index.html");
+
+#[derive(Clone, serde::Serialize)]
+struct AuthEvent {
+    ts: u64,
+    event: &'static str,
+    user: String,
+    ip: String,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 static TAILWIND_JS: &[u8] = include_bytes!("../../examples/web-ui/tailwind.min.js");
 
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
@@ -31,6 +46,7 @@ pub struct WebUiState {
     sessions: Arc<DashMap<String, (Instant, String)>>,
     creds:    Arc<std::sync::Mutex<WebUiCred>>,
     auth_path: PathBuf,
+    auth_events: Arc<std::sync::Mutex<std::collections::VecDeque<AuthEvent>>>,
 }
 
 struct WebUiCred {
@@ -51,6 +67,7 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         sessions: Arc::new(DashMap::new()),
         creds: Arc::new(std::sync::Mutex::new(creds)),
         auth_path,
+        auth_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(100))),
     });
     Router::new()
         .route("/", get(serve_dashboard))
@@ -58,6 +75,7 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         .route("/login",  get(serve_login).post(handle_login))
         .route("/logout", get(handle_logout).post(handle_logout))
         .route("/api/webui/password", post(change_password))
+        .route("/webui/auth-events", get(auth_events_handler))
         .route("/api",       any(proxy_api))
         .route("/api/*path", any(proxy_api))
         .with_state(state)
@@ -136,39 +154,43 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
   <title>Runbound — Sign in</title>
   <script src="/tailwind.js"></script>
   <style>
-    body{font-family:'SF Mono','Fira Code','Consolas',monospace;background:#0a0a0a;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-    .card{background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:32px;width:100%;max-width:360px;box-sizing:border-box;margin:0 16px}
-    input{display:block;width:100%;background:#0a0a0a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:8px 12px;font-size:13px;outline:none;box-sizing:border-box;font-family:inherit;margin:0}
-    input:focus{border-color:#22d3ee}
-    input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus{
-      -webkit-text-fill-color:#e2e8f0;
-      -webkit-box-shadow:0 0 0px 1000px #0a0a0a inset;
-      transition:background-color 5000s ease-in-out 0s
-    }
-    button{display:block;width:100%;background:#0e6680;color:white;border:none;border-radius:6px;padding:9px;cursor:pointer;font-size:13px;font-family:inherit;transition:background .15s;margin-top:4px}
-    button:hover{background:#0891b2}
-    label{display:block;color:#94a3b8;font-size:11px;margin-bottom:6px}
+    @keyframes glow-pulse{0%,100%{opacity:.6}50%{opacity:1}}
+    @keyframes fade-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+    body{font-family:'SF Mono','Fira Code','Consolas',monospace;background-color:#060b14;background-image:radial-gradient(circle at 1px 1px,rgba(34,211,238,.055) 1px,transparent 0);background-size:30px 30px;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;overflow:hidden;position:relative}
+    body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 150% 65% at 50% -20%,rgba(14,102,128,.28) 0%,transparent 62%);pointer-events:none;animation:glow-pulse 6s ease-in-out infinite}
+    body::after{content:'';position:fixed;bottom:-20%;left:50%;transform:translateX(-50%);width:60%;height:40%;background:radial-gradient(ellipse at center,rgba(14,102,128,.08) 0%,transparent 70%);pointer-events:none;animation:glow-pulse 8s ease-in-out infinite reverse}
+    .card{position:relative;z-index:1;background:rgba(6,11,20,.94);backdrop-filter:blur(14px);border:1px solid rgba(34,211,238,.1);border-top:1px solid rgba(34,211,238,.28);border-radius:12px;padding:38px;width:100%;max-width:380px;box-sizing:border-box;margin:0 16px;box-shadow:0 32px 64px rgba(0,0,0,.65),0 0 0 1px rgba(34,211,238,.03);animation:fade-in .35s ease-out}
+    .logo{color:#22d3ee;font-size:20px;font-weight:700;letter-spacing:.14em;display:inline-block}
+    .cursor{display:inline-block;color:#22d3ee;animation:blink 1.1s step-end infinite;margin-left:1px}
+    input{display:block;width:100%;background:#030609;border:1px solid #152030;color:#e2e8f0 !important;border-radius:6px;padding:9px 13px;font-size:13px;outline:none;box-sizing:border-box;font-family:inherit;margin:0;transition:border-color .15s,box-shadow .15s}
+    input:focus{border-color:#22d3ee;box-shadow:0 0 0 2px rgba(34,211,238,.12)}
+    input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus,input:-webkit-autofill:active{-webkit-text-fill-color:#e2e8f0 !important;-webkit-box-shadow:0 0 0px 1000px #030609 inset !important;transition:background-color 5000s ease-in-out 0s;caret-color:#e2e8f0}
+    button{display:block;width:100%;background:#0e4f63;color:#e2e8f0;border:1px solid #0e6680;border-radius:6px;padding:10px 14px;cursor:pointer;font-size:13px;font-family:inherit;transition:background .15s;margin-top:4px}
+    button:hover{background:#0f6b89}
+
+    label{display:block;color:#3d5a6e;font-size:10px;text-transform:uppercase;letter-spacing:.12em;margin-bottom:7px}
   </style>
 </head>
 <body>
   <div class="card">
-    <div style="text-align:center;margin-bottom:28px">
-      <div style="color:#22d3ee;font-size:18px;font-weight:700;letter-spacing:.08em">RUNBOUND</div>
-      <div style="color:#475569;font-size:11px;margin-top:4px">Management Console</div>
+    <div style="text-align:center;margin-bottom:34px">
+      <div><span class="logo">RUNBOUND</span><span class="cursor">_</span></div>
+      <div style="color:#152a38;font-size:10px;margin-top:7px;letter-spacing:.18em">MANAGEMENT CONSOLE</div>
     </div>
     <form method="POST" action="/login">
-      <div style="margin-bottom:14px">
+      <div style="margin-bottom:16px">
         <label for="u">Username</label>
-        <input id="u" name="username" type="text" value="admin" autocomplete="username"/>
+        <input id="u" name="username" type="text" autocomplete="username"/>
       </div>
-      <div style="margin-bottom:20px">
+      <div style="margin-bottom:26px">
         <label for="p">Password</label>
-        <input id="p" name="password" type="password" autocomplete="current-password" placeholder="Enter password"/>
+        <input id="p" name="password" type="password" autocomplete="current-password"/>
       </div>
-      <button type="submit">Sign in</button>
+      <button type="submit">Sign in &#8594;</button>
     </form>
-    <div id="err" style="color:#f87171;font-size:12px;text-align:center;margin-top:14px;min-height:16px"></div>
-    <div style="color:#1e293b;font-size:10px;text-align:center;margin-top:20px">Delete webui-auth.conf to reset credentials</div>
+    <div id="err" style="color:#f87171;font-size:12px;text-align:center;margin-top:16px;min-height:16px"></div>
+    <div style="color:#0c1a24;font-size:10px;text-align:center;margin-top:26px">Delete webui-auth.conf to reset credentials</div>
   </div>
   <script>
     const e=new URLSearchParams(location.search).get('err');
@@ -185,7 +207,12 @@ async fn serve_login() -> Html<&'static str> {
 #[derive(Deserialize)]
 struct LoginForm { username: String, password: String }
 
-async fn handle_login(State(state): State<Arc<WebUiState>>, Form(form): Form<LoginForm>) -> Response {
+async fn handle_login(
+    State(state): State<Arc<WebUiState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let client_ip = addr.ip().to_string();
     let ok = {
         let creds = state.creds.lock().unwrap_or_else(|e| e.into_inner());
         if creds.username != form.username { false }
@@ -197,7 +224,8 @@ async fn handle_login(State(state): State<Arc<WebUiState>>, Form(form): Form<Log
         }
     };
     if !ok {
-        tracing::warn!(user = %form.username, "WebUI login FAILED — invalid credentials");
+        tracing::warn!(user = %form.username, ip = %client_ip, "WebUI login FAILED — invalid credentials");
+        push_auth_event(&state, "login_fail", &form.username, &client_ip);
         return Redirect::to("/login?err=Invalid%20credentials").into_response();
     }
     // Purge expired sessions before adding a new one
@@ -206,7 +234,8 @@ async fn handle_login(State(state): State<Arc<WebUiState>>, Form(form): Form<Log
     // SEC-19: generate CSRF token, stored alongside session expiry.
     let csrf_token = uuid::Uuid::new_v4().to_string().replace('-', "");
     state.sessions.insert(token.clone(), (Instant::now() + SESSION_TTL, csrf_token.clone()));
-    tracing::info!(user = %form.username, "WebUI login successful");
+    tracing::info!(user = %form.username, ip = %client_ip, "WebUI login successful");
+    push_auth_event(&state, "login_ok", &form.username, &client_ip);
     let cookie_session = format!(
         "rb_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
         SESSION_TTL.as_secs()
@@ -216,19 +245,25 @@ async fn handle_login(State(state): State<Arc<WebUiState>>, Form(form): Form<Log
         "rb_csrf={csrf_token}; Path=/; SameSite=Lax; Max-Age={}",
         SESSION_TTL.as_secs()
     );
-    (
-        [
-            (header::SET_COOKIE, cookie_session),
-            (header::SET_COOKIE, cookie_csrf),
-        ],
-        Redirect::to("/"),
-    ).into_response()
+    Response::builder()
+        .status(303)
+        .header(header::LOCATION, "/")
+        .header(header::SET_COOKIE, cookie_session)
+        .header(header::SET_COOKIE, cookie_csrf)
+        .body(Body::empty())
+        .unwrap()
 }
 
-async fn handle_logout(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> Response {
+async fn handle_logout(
+    State(state): State<Arc<WebUiState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    req: Request<Body>,
+) -> Response {
+    let client_ip = addr.ip().to_string();
     if let Some(token) = session_token(req.headers()) {
         state.sessions.remove(&token);
-        tracing::info!("WebUI logout");
+        tracing::info!(ip = %client_ip, "WebUI logout");
+        push_auth_event(&state, "logout", "", &client_ip);
     }
     (
         [(header::SET_COOKIE, "rb_session=; Path=/; HttpOnly; Max-Age=0")],
@@ -271,6 +306,21 @@ async fn change_password(
     // SEC-25: invalidate all sessions on password change
     state.sessions.clear();
     (StatusCode::OK, "{}").into_response()
+}
+
+fn push_auth_event(state: &WebUiState, event: &'static str, user: &str, ip: &str) {
+    let mut q = state.auth_events.lock().unwrap_or_else(|e| e.into_inner());
+    if q.len() >= 100 { q.pop_front(); }
+    q.push_back(AuthEvent { ts: now_unix(), event, user: user.to_string(), ip: ip.to_string() });
+}
+
+async fn auth_events_handler(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> Response {
+    if !is_authenticated(&state, req.headers()) {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    }
+    let q = state.auth_events.lock().unwrap_or_else(|e| e.into_inner());
+    let events: Vec<&AuthEvent> = q.iter().collect();
+    axum::Json(serde_json::json!({"events": events})).into_response()
 }
 
 async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> Response {
