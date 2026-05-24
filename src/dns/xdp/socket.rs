@@ -67,14 +67,18 @@ pub static XDP_NIC_RX_RING:     AtomicU32 = AtomicU32::new(0);
 pub static XDP_NIC_RX_RING_MAX: AtomicU32 = AtomicU32::new(0);
 /// Active XDP interface, set once at startup. Used to read sysfs rx_dropped.
 pub static XDP_ACTIVE_IFACE: OnceLock<String> = OnceLock::new();
+/// Per-queue mode set once after all AF_XDP sockets bind. Each entry is (queue_id, zerocopy).
+pub static XDP_QUEUE_MODES: OnceLock<Vec<(u32, bool)>> = OnceLock::new();
 
 pub const AF_XDP: libc::c_int = 44;
 
 pub struct XskSocket {
-    pub fd:   RawFd,
-    pub umem: Umem,
-    pub rx:   DescRing,
-    pub tx:   DescRing,
+    pub fd:       RawFd,
+    pub umem:     Umem,
+    pub rx:       DescRing,
+    pub tx:       DescRing,
+    /// True when the kernel accepted XDP_ZEROCOPY at bind time.
+    pub zerocopy: bool,
 }
 
 impl Drop for XskSocket {
@@ -188,7 +192,7 @@ pub unsafe fn create_xsk_socket(
         ));
     }
 
-    Ok(XskSocket { fd, umem, rx, tx })
+    Ok(XskSocket { fd, umem, rx, tx, zerocopy: use_zerocopy })
 }
 
 /// Validate a network interface name before using it in sysfs paths.

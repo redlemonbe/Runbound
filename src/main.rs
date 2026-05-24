@@ -23,6 +23,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::io::IsTerminal;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use tracing::{error, info, warn};
@@ -181,6 +182,22 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
             None => { tracing::warn!("XDP: could not determine network interface; fast path disabled"); None }
         }
     };
+
+    // #93: TTY-only startup banner — not printed under systemd (no TTY on stderr).
+    if std::io::stderr().is_terminal() {
+        let xdp_str = match xdp_mode.load(Ordering::Relaxed) {
+            1 => "\x1b[32menabled (DRV)\x1b[0m",
+            2 => "\x1b[32menabled (SKB)\x1b[0m",
+            _ => "disabled",
+        };
+        eprintln!(
+            "\x1b[36mRunbound v{ver}\x1b[0m  —  DNS :{dns}  |  API :{api}  |  XDP: {xdp}",
+            ver = env!("CARGO_PKG_VERSION"),
+            dns = cfg.port,
+            api = cfg.api_port.unwrap_or(8080),
+            xdp = xdp_str,
+        );
+    }
 
     let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker, xdp_cache_mutable, cfg.xdp_cache_snapshot_size, upstreams, per_upstream_resolvers, racing_wins).await;
     audit.send(audit::AuditEvent::Shutdown);

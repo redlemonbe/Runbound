@@ -40,7 +40,7 @@ use super::socket::{
     is_virtual_interface, parent_interface, sanitize_iface_name,
     maximize_nic_ring, XDP_ACTIVE_IFACE,
 };
-use super::umem::{XdpDesc, FRAME_SIZE};
+use super::umem::{XdpDesc, FRAME_SIZE, RX_RING_SIZE, TX_RING_SIZE};
 
 const ETH_HDR: usize = 14;
 const IPV4_HDR_MIN: usize = 20;
@@ -178,9 +178,19 @@ fn start_xdp_on_iface(
         let sock = unsafe { create_xsk_socket(ifidx, q, true, hugepages) }
             .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false, hugepages) })
             .map_err(|e| format!("AF_XDP socket creation failed: {e}"))?;
+        tracing::info!(
+            queue_id = q,
+            mode = if sock.zerocopy { "zerocopy" } else { "copy" },
+            rx_frames = RX_RING_SIZE,
+            tx_frames = TX_RING_SIZE,
+            "XDP queue bound"
+        );
         handle.register_socket(q, sock.fd)?;
         sockets.push((q, sock));
     }
+
+    let queue_modes: Vec<(u32, bool)> = sockets.iter().map(|(q, s)| (*q, s.zerocopy)).collect();
+    super::socket::XDP_QUEUE_MODES.set(queue_modes).ok();
 
     // Self-test on the first socket before committing threads.
     if let Some((_, first_sock)) = sockets.first_mut() {
@@ -383,7 +393,6 @@ fn xdp_worker(
     worker_id:       usize,
 ) {
     use libc::{poll, pollfd, POLLIN};
-    use super::umem::RX_RING_SIZE;
 
     crate::cpu::pin_to_cpu(core_id);
     // Migrate UMEM pages to the local NUMA node now that the thread is pinned.

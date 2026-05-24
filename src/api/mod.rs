@@ -641,7 +641,20 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
 // ── GET /stats ─────────────────────────────────────────────────────────────
 
 async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
-    JsonExtract(crate::stats::snapshot_to_json(&s.stats_cache.load()))
+    let mut json = crate::stats::snapshot_to_json(&s.stats_cache.load());
+    let xdp_queues: Vec<serde_json::Value> = crate::dns::xdp::socket::XDP_QUEUE_MODES
+        .get()
+        .map(|modes| {
+            modes.iter()
+                .map(|(id, zc)| serde_json::json!({
+                    "id":   id,
+                    "mode": if *zc { "zerocopy" } else { "copy" }
+                }))
+                .collect()
+        })
+        .unwrap_or_default();
+    json["xdp_queues"] = serde_json::Value::Array(xdp_queues);
+    JsonExtract(json)
 }
 
 // ── GET /stats/stream ──────────────────────────────────────────────────────
