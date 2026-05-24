@@ -90,6 +90,10 @@ pub struct UpstreamStatus {
     /// Persisted; None for UDP upstreams.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tls_hostname: Option<String>,
+    /// #94: temporary entry injected from /etc/resolv.conf when all configured
+    /// upstreams are unhealthy.  Omitted from JSON when false.  Never persisted.
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub temporary: bool,
     // Internal backoff state — not serialised in API responses.
     #[serde(skip, default)]
     pub consecutive_failures: u32,
@@ -98,6 +102,7 @@ pub struct UpstreamStatus {
 }
 
 fn default_source() -> String { "api".into() }
+fn is_false(b: &bool) -> bool { !b }
 
 /// #57: Deterministic stable UUID-format ID for config-file upstreams.
 /// Same addr+port+protocol always produces the same ID across restarts,
@@ -233,6 +238,7 @@ pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
         dnssec_supported:     None,
         latency_history:      VecDeque::new(),
         last_error:           None,
+        temporary:            false,
         consecutive_failures: 0,
         next_check_at:        Instant::now(),
     }).collect()
@@ -284,6 +290,7 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
                 dnssec_supported:    None,
                 latency_history:     VecDeque::new(),
                 last_error:          None,
+                temporary:           false,
                 consecutive_failures: 0,
                 next_check_at:       Instant::now(),
             });
@@ -328,6 +335,7 @@ pub fn add_upstream(
         latency_history:     VecDeque::new(),
         last_error:          None,
         zone:                ".".into(),
+        temporary:           false,
         consecutive_failures: 0,
         next_check_at:       Instant::now(),
     };
@@ -370,6 +378,89 @@ pub fn upstream_addrs(upstreams: &SharedUpstreams) -> Vec<(String, u16, bool, Op
         .iter()
         .map(|u| (u.addr.clone(), u.port, u.protocol == "dot", u.tls_hostname.clone()))
         .collect()
+}
+
+// ── resolv.conf fallback (#94) ─────────────────────────────────────────────
+
+/// Parse nameserver lines from /etc/resolv.conf.
+pub fn parse_resolv_conf() -> Vec<String> {
+    let content = match std::fs::read_to_string("/etc/resolv.conf") {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    content.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with('#') || line.starts_with(';') { return None; }
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some("nameserver") {
+                if let Some(ip) = parts.next() {
+                    if ip.parse::<std::net::IpAddr>().is_ok() {
+                        return Some(ip.to_string());
+                    }
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// Add /etc/resolv.conf nameservers as temporary plain-UDP upstreams.
+/// Existing temporary entries are replaced (idempotent).
+pub fn add_resolv_fallback(upstreams: &SharedUpstreams) {
+    let addrs = parse_resolv_conf();
+    if addrs.is_empty() { return; }
+    let mut list = upstreams.write()
+        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in add_resolv_fallback: {e}"));
+    list.retain(|u| !u.temporary);
+    for addr in addrs {
+        list.push(UpstreamStatus {
+            id:                  uuid::Uuid::new_v4().to_string(),
+            addr,
+            port:                53,
+            name:                None,
+            protocol:            "udp".into(),
+            source:              "resolv.conf".into(),
+            zone:                ".".into(),
+            tls_hostname:        None,
+            healthy:             true,
+            latency_ms:          None,
+            last_check:          String::new(),
+            dnssec_supported:    None,
+            latency_history:     VecDeque::new(),
+            last_error:          None,
+            temporary:           true,
+            consecutive_failures: 0,
+            next_check_at:       Instant::now(),
+        });
+    }
+}
+
+/// Remove all temporary upstream entries (resolv.conf fallback).
+pub fn remove_resolv_fallback(upstreams: &SharedUpstreams) {
+    upstreams.write()
+        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in remove_resolv_fallback: {e}"))
+        .retain(|u| !u.temporary);
+}
+
+/// True when all non-temporary upstreams exist and are all unhealthy.
+pub fn all_non_temporary_unhealthy(upstreams: &SharedUpstreams) -> bool {
+    let list = upstreams.read()
+        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in all_non_temporary_unhealthy: {e}"));
+    let mut found = false;
+    for u in list.iter().filter(|u| !u.temporary) {
+        found = true;
+        if u.healthy { return false; }
+    }
+    found
+}
+
+/// True when at least one non-temporary upstream is healthy.
+pub fn has_healthy_non_temporary(upstreams: &SharedUpstreams) -> bool {
+    upstreams.read()
+        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in has_healthy_non_temporary: {e}"))
+        .iter()
+        .any(|u| !u.temporary && u.healthy)
 }
 
 /// #57: Remove a `forward-addr: addr@port` line from the config file in-place.
