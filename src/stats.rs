@@ -111,6 +111,8 @@ pub struct Stats {
     pub dnssec_secure: AtomicU64,
     pub dnssec_bogus: AtomicU64,
     pub dnssec_insecure: AtomicU64,
+    /// #34: upstream DNSSEC stripping events detected.
+    pub dnssec_strips: AtomicU64,
 
     // DoT reconnect metrics (#77 fix) — updated by keepalive, level-2 reconnect, and API endpoint.
     pub dot_reconnects_total: AtomicU64,
@@ -140,6 +142,7 @@ impl Stats {
             dnssec_secure: AtomicU64::new(0),
             dnssec_bogus: AtomicU64::new(0),
             dnssec_insecure: AtomicU64::new(0),
+            dnssec_strips: AtomicU64::new(0),
             dot_reconnects_total: AtomicU64::new(0),
             last_reconnect_at: std::sync::Mutex::new(None),
         })
@@ -331,6 +334,7 @@ impl Stats {
             dnssec_secure: self.dnssec_secure.load(Ordering::Relaxed),
             dnssec_bogus: self.dnssec_bogus.load(Ordering::Relaxed),
             dnssec_insecure: self.dnssec_insecure.load(Ordering::Relaxed),
+            dnssec_strips: self.dnssec_strips.load(Ordering::Relaxed),
         }
     }
 }
@@ -356,6 +360,7 @@ pub struct StatsSnapshot {
     pub dnssec_secure: u64,
     pub dnssec_bogus: u64,
     pub dnssec_insecure: u64,
+    pub dnssec_strips: u64,
 }
 
 pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
