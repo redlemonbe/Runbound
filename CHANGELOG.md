@@ -9,6 +9,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.8.0] - 2026-05-24
+
+### Performance
+- fix(#97): rate limiter per-/24 subnet bucketing, reduces DashMap contention by ~256x
+- feat(#96): configurable AF/XDP ring sizes via config (xdp-rx-ring-size etc), power-of-2 validated
+
+### Observability
+- fix(#98): XDP per-queue mode logging at startup, zerocopy vs copy per queue
+- fix(#98): /api/stats now exposes xdp_queues array with per-queue mode
+- fix(#93): ANSI startup banner showing version, ports, XDP mode (TTY only)
+
+### Documentation
+- Fixed unsubstantiated perf claims (0ms latency removed, throughput marked TBD)
+- Added experimental status banner to README
+- Added docs/unbound-migration.md with Unbound config compatibility matrix
+- Corrected BIND9 comparison table and AI-role disclosure in METHODOLOGY.md
+
+---
+
 ## [0.7.0] — 2026-05-24
 
 ### Added
