@@ -249,10 +249,11 @@ impl ScheduleWindow {
             return false;
         }
 
-        let Ok(sh) = self.start[..2].parse::<u8>() else { return false; };
-        let Ok(sm) = self.start[3..5].parse::<u8>() else { return false; };
-        let Ok(eh) = self.end[..2].parse::<u8>() else { return false; };
-        let Ok(em) = self.end[3..5].parse::<u8>() else { return false; };
+        // SEC-AGV-02: use safe get() to avoid panic on malformed strings.
+        let sh: u8 = match self.start.get(..2).and_then(|s| s.parse().ok()) { Some(v) if v <= 23 => v, _ => return false };
+        let sm: u8 = match self.start.get(3..5).and_then(|s| s.parse().ok()) { Some(v) if v <= 59 => v, _ => return false };
+        let eh: u8 = match self.end.get(..2).and_then(|s| s.parse().ok()) { Some(v) if v <= 23 => v, _ => return false };
+        let em: u8 = match self.end.get(3..5).and_then(|s| s.parse().ok()) { Some(v) if v <= 59 => v, _ => return false };
 
         let start_min = sh as u16 * 60 + sm as u16;
         let end_min = eh as u16 * 60 + em as u16;
