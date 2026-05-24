@@ -9,6 +9,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.2] — 2026-05-24
+
+### Security
+- **SEC-12 fix**: XDP ICMP handler now rejects IPv4 packets with options (IHL≠5) instead
+  of parsing the ICMP header at wrong offset. Packets with IP options pass to kernel.
+- **SEC-16 fix**: WebUI reverse proxy body limit aligned to 65536 bytes (matching API
+  `MAX_BODY_BYTES`) — prevents up to 8 MB per-request heap allocation.
+
+### Fixed
+- **SEC-13 fix**: `icmp-rate-limit-burst` config now takes effect. New source IPs receive
+  `burst` initial free tokens before per-second rate limiting applies. Backed by a
+  `burst_left` field in the BPF `icmp_rate_entry` map value.
+
+---
+
 ## [0.9.1] — 2026-05-24
 
 ### Added
