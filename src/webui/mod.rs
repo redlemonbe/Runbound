@@ -27,7 +27,8 @@ pub struct WebUiState {
     api_port: u16,
     api_key:  String,
     client:   reqwest::Client,
-    sessions: Arc<DashMap<String, Instant>>,
+    /// Sessions: session_token → (expiry, csrf_token). SEC-19: csrf stored per session.
+    sessions: Arc<DashMap<String, (Instant, String)>>,
     creds:    Arc<std::sync::Mutex<WebUiCred>>,
     auth_path: PathBuf,
 }
@@ -55,7 +56,7 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         .route("/", get(serve_dashboard))
         .route("/tailwind.js", get(serve_tailwind))
         .route("/login",  get(serve_login).post(handle_login))
-        .route("/logout", get(handle_logout))
+        .route("/logout", get(handle_logout).post(handle_logout))
         .route("/api/webui/password", post(change_password))
         .route("/api",       any(proxy_api))
         .route("/api/*path", any(proxy_api))
@@ -81,6 +82,25 @@ fn load_or_default_creds(path: &PathBuf) -> WebUiCred {
     WebUiCred { username: "admin".to_string(), hash }
 }
 
+/// SEC-19: Extract CSRF token for a validated session.
+fn session_csrf(state: &WebUiState, headers: &HeaderMap) -> Option<String> {
+    let token = session_token(headers)?;
+    let entry = state.sessions.get(&token)?;
+    let (exp, csrf) = entry.value();
+    if Instant::now() < *exp { Some(csrf.clone()) } else { None }
+}
+
+/// SEC-19: Verify X-CSRF-Token header matches the session's stored CSRF token.
+fn verify_csrf(state: &WebUiState, headers: &HeaderMap) -> bool {
+    let expected = match session_csrf(state, headers) {
+        Some(t) => t,
+        None => return false,
+    };
+    headers.get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |actual| expected == actual)
+}
+
 fn session_token(headers: &HeaderMap) -> Option<String> {
     let v = headers.get("cookie")?.to_str().ok()?;
     v.split(';').find_map(|s| s.trim().strip_prefix("rb_session=").map(|t| t.to_string()))
@@ -88,9 +108,10 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
 
 fn is_authenticated(state: &WebUiState, headers: &HeaderMap) -> bool {
     let token = match session_token(headers) { Some(t) => t, None => return false };
-    if let Some(exp) = state.sessions.get(&token) {
+    if let Some(entry) = state.sessions.get(&token) {
+        let (exp, _csrf) = &*entry;
         if Instant::now() < *exp { return true; }
-        drop(exp);
+        drop(entry);
         state.sessions.remove(&token);
     }
     false
@@ -119,6 +140,11 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     .card{background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:32px;width:100%;max-width:360px;box-sizing:border-box;margin:0 16px}
     input{display:block;width:100%;background:#0a0a0a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:8px 12px;font-size:13px;outline:none;box-sizing:border-box;font-family:inherit;margin:0}
     input:focus{border-color:#22d3ee}
+    input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus{
+      -webkit-text-fill-color:#e2e8f0;
+      -webkit-box-shadow:0 0 0px 1000px #0a0a0a inset;
+      transition:background-color 5000s ease-in-out 0s
+    }
     button{display:block;width:100%;background:#0e6680;color:white;border:none;border-radius:6px;padding:9px;cursor:pointer;font-size:13px;font-family:inherit;transition:background .15s;margin-top:4px}
     button:hover{background:#0891b2}
     label{display:block;color:#94a3b8;font-size:11px;margin-bottom:6px}
@@ -171,22 +197,38 @@ async fn handle_login(State(state): State<Arc<WebUiState>>, Form(form): Form<Log
         }
     };
     if !ok {
+        tracing::warn!(user = %form.username, "WebUI login FAILED — invalid credentials");
         return Redirect::to("/login?err=Invalid%20credentials").into_response();
     }
     // Purge expired sessions before adding a new one
-    state.sessions.retain(|_, exp| Instant::now() < *exp);
+    state.sessions.retain(|_, (exp, _)| Instant::now() < *exp);
     let token = uuid::Uuid::new_v4().to_string();
-    state.sessions.insert(token.clone(), Instant::now() + SESSION_TTL);
-    let cookie = format!(
+    // SEC-19: generate CSRF token, stored alongside session expiry.
+    let csrf_token = uuid::Uuid::new_v4().to_string().replace('-', "");
+    state.sessions.insert(token.clone(), (Instant::now() + SESSION_TTL, csrf_token.clone()));
+    tracing::info!(user = %form.username, "WebUI login successful");
+    let cookie_session = format!(
         "rb_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
         SESSION_TTL.as_secs()
     );
-    ([( header::SET_COOKIE, cookie )], Redirect::to("/")).into_response()
+    // rb_csrf is NOT HttpOnly — JS reads it to add X-CSRF-Token header (SEC-19 double-submit).
+    let cookie_csrf = format!(
+        "rb_csrf={csrf_token}; Path=/; SameSite=Lax; Max-Age={}",
+        SESSION_TTL.as_secs()
+    );
+    (
+        [
+            (header::SET_COOKIE, cookie_session),
+            (header::SET_COOKIE, cookie_csrf),
+        ],
+        Redirect::to("/"),
+    ).into_response()
 }
 
 async fn handle_logout(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> Response {
     if let Some(token) = session_token(req.headers()) {
         state.sessions.remove(&token);
+        tracing::info!("WebUI logout");
     }
     (
         [(header::SET_COOKIE, "rb_session=; Path=/; HttpOnly; Max-Age=0")],
@@ -205,6 +247,10 @@ async fn change_password(
 ) -> Response {
     if !is_authenticated(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    }
+    // SEC-19: verify CSRF token on password change.
+    if !verify_csrf(&state, &headers) {
+        return (StatusCode::FORBIDDEN, "CSRF token invalid or missing").into_response();
     }
     if payload.username.trim().is_empty() || payload.password.len() < 4 {
         return (StatusCode::BAD_REQUEST, "username required; password min 4 chars").into_response();

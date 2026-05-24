@@ -57,6 +57,7 @@
     <span id="stat-total" class="tabular-nums hidden sm:block">— queries</span>
     <span id="stat-uptime" class="hidden sm:block">—</span>
     <button onclick="doReload()" title="Reload config" class="border border-gray-700 hover:border-cyan-600 hover:text-cyan-400 text-gray-500 text-xs px-2.5 py-1 rounded transition-colors">↺ Reload</button>
+    <button onclick="doLogout()" title="Logout" class="border border-gray-700 hover:border-red-700 hover:text-red-400 text-gray-600 text-xs px-2.5 py-1 rounded transition-colors">⏏ Logout</button>
   </div>
 </div>
 
@@ -69,6 +70,7 @@
   <button role="tab" aria-selected="false" aria-controls="tab-upstreams"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
   <button role="tab" aria-selected="false" aria-controls="tab-logs"       class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
   <button role="tab" aria-selected="false" aria-controls="tab-system"     class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('system',this)">System</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-settings"   class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('settings',this)">Settings</button>
   <button role="tab" aria-selected="false" aria-controls="tab-about"      class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
 </nav>
 
@@ -390,6 +392,42 @@
 
 </div>
 
+  <!-- ═══ SETTINGS ═══ -->
+  <div id="tab-settings" class="hidden fade max-w-2xl">
+    <div class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-4">Change Password</div>
+      <div class="space-y-3 max-w-sm">
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Username</label>
+          <input id="set-username" type="text" class="input w-full" autocomplete="username" placeholder="admin" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">New password</label>
+          <input id="set-new-pass" type="password" class="input w-full" autocomplete="new-password" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Confirm new password</label>
+          <input id="set-confirm-pass" type="password" class="input w-full" autocomplete="new-password" />
+        </div>
+        <p class="text-xs text-gray-700">Active sessions are invalidated on save.</p>
+        <button onclick="changePassword()" class="btn-primary mt-1">Update credentials</button>
+      </div>
+    </div>
+    <div class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Session</div>
+      <div class="space-y-2 text-sm">
+        <div class="flex justify-between"><span class="text-gray-500">Auto-logout (idle)</span><span class="text-gray-300">30 minutes</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Session duration</span><span class="text-gray-300">8 hours</span></div>
+      </div>
+      <button onclick="doLogout()" class="btn-secondary mt-4 text-xs">Logout now</button>
+    </div>
+    <div class="card">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Auth Events</div>
+      <p class="text-xs text-gray-500 mb-3">Login and logout events are recorded in the system journal with timestamps.</p>
+      <code class="text-xs text-gray-600 bg-gray-900/60 px-3 py-2 rounded block">journalctl -u runbound -g "WebUI"</code>
+    </div>
+  </div>
+
 <!-- Toast -->
 <div id="toast" class="fixed bottom-8 right-6 hidden text-xs px-4 py-2 rounded-lg shadow-xl border"></div>
 <!-- Copyright -->
@@ -444,9 +482,12 @@ function nodeApi(nodeId, method, path, body) {
 
 // Current node's API (for tabs other than overview)
 const BASE = '/api';
-const h = b => { const o = {}; if(b) o['Content-Type']='application/json'; return o; };
+function getCsrf() { const m = document.cookie.match(/(?:^|;\s*)rb_csrf=([^;]*)/); return m ? decodeURIComponent(m[1]) : ''; }
 async function api(method, path, body) {
-  const r = await fetch(BASE+path, {method, headers:h(!!body), body:body?JSON.stringify(body):undefined});
+  const headers = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  if (method !== 'GET' && method !== 'HEAD') headers['X-CSRF-Token'] = getCsrf();
+  const r = await fetch(BASE+path, {method, headers, body:body?JSON.stringify(body):undefined});
   if (r.status === 401) { location.href = '/login'; return {}; }
   if (!r.ok) { let msg=`HTTP ${r.status}`; try{const j=await r.json();msg=j.error||j.message||msg;}catch(_){} throw new Error(msg); }
   return r.json().catch(()=>({}));
@@ -981,6 +1022,25 @@ async function loadSlaves(){
 async function cacheFlush(){const btn=document.getElementById('btn-flush');try{const r=await api('POST','/cache/flush');toast(`Cache flushed — ${r.flushed_entries??0} entries cleared`);if(btn){btn.disabled=true;btn.classList.add('opacity-30','cursor-not-allowed');setTimeout(()=>{btn.disabled=false;btn.classList.remove('opacity-30','cursor-not-allowed');},60000);}loadSystem();}catch(e){toast(e.message.includes('FLUSH_COOLDOWN')||e.message.includes('429')?'Cache flush on cooldown (60 s)':'Flush failed: '+e.message,true);}}
 async function doReload(){try{await api('POST','/reload');toast('Config reloaded');}catch(e){toast('Reload: '+e.message,true);}}
 
+async function doLogout() {
+  try { await fetch('/logout', {method:'POST', headers:{'X-CSRF-Token':getCsrf()}}); } catch(_) {}
+  location.href = '/login';
+}
+
+async function changePassword() {
+  const username = (document.getElementById('set-username')?.value ?? '').trim();
+  const newP = document.getElementById('set-new-pass')?.value ?? '';
+  const conf = document.getElementById('set-confirm-pass')?.value ?? '';
+  if (!username || !newP) return toast('Username and password required', true);
+  if (newP !== conf) return toast('Passwords do not match', true);
+  if (newP.length < 8) return toast('Minimum 8 characters', true);
+  try {
+    await api('POST', '/webui/password', {username, password: newP});
+    toast('Credentials updated — you will be logged out');
+    setTimeout(() => { location.href = '/login'; }, 1500);
+  } catch(e) { toast('Error: '+e.message, true); }
+}
+
 // ══════════════════════════════════════════════
 // Helpers
 // ══════════════════════════════════════════════
@@ -992,7 +1052,7 @@ let toastTimer;
 function toast(msg,err=false){const el=document.getElementById('toast');el.textContent=msg;el.className=`fixed bottom-8 right-6 text-xs px-4 py-2 rounded-lg shadow-xl border ${err?'bg-red-950 border-red-900 text-red-300':'bg-gray-900 border-gray-700 text-gray-200'}`;el.style.animation='none';void el.offsetWidth;el.style.animation='slideUp .2s ease';clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.add('hidden'),3500);}
 
 function showTab(name,btn){
-  ['overview','dns','blacklist','feeds','upstreams','logs','system','about'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
+  ['overview','dns','blacklist','feeds','upstreams','logs','system','about','settings'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
   document.querySelectorAll('.tab-active').forEach(b=>{b.classList.remove('tab-active');b.setAttribute('aria-selected','false');});
   const el=document.getElementById('tab-'+name);el.classList.remove('hidden');el.classList.add('fade');
   btn.classList.add('tab-active');btn.setAttribute('aria-selected','true');
@@ -1009,23 +1069,31 @@ function showTab(name,btn){
 // ══════════════════════════════════════════════
 const QPS_BUF = [];
 const QPS_N   = 60;
-let _spkReader = null, _spkBuf = '';
+let _spkReader = null, _spkBuf = '', _spkBackoff = 1000;
+let _spkLastTotal = null, _spkLastTime = null;
+
+function scheduleSpkReconnect() {
+  setTimeout(initSparkline, _spkBackoff);
+  _spkBackoff = Math.min(_spkBackoff * 2, 30000);
+}
 
 function initSparkline() {
   if (_spkReader) { try { _spkReader.cancel(); } catch(_){} _spkReader = null; }
   _spkBuf = '';
   QPS_BUF.length = 0;
+  _spkLastTotal = null; _spkLastTime = null;
   const svg = document.getElementById('qps-sparkline-svg');
   if (svg) svg.innerHTML = '<text x="240" y="30" text-anchor="middle" fill="#1e293b" font-size="11" font-family="monospace">connecting…</text>';
   fetch(BASE + '/stats/stream')
     .then(r => {
-      if (!r.ok) return;
+      if (!r.ok) { scheduleSpkReconnect(); return; }
+      _spkBackoff = 1000;
       const reader = r.body.getReader();
       _spkReader = reader;
       const dec = new TextDecoder();
       (function pump() {
         reader.read().then(({done, value}) => {
-          if (done) return;
+          if (done) { scheduleSpkReconnect(); return; }
           _spkBuf += dec.decode(value, {stream: true});
           const lines = _spkBuf.split('\n');
           _spkBuf = lines.pop();
@@ -1033,13 +1101,22 @@ function initSparkline() {
             if (!ln.startsWith('data: ')) continue;
             try {
               const d = JSON.parse(ln.slice(6));
-              if (d.qps_1m != null) _spkPush(Number(d.qps_1m));
+              if (d.total != null) {
+                const now = Date.now();
+                if (_spkLastTotal != null && _spkLastTime != null) {
+                  const dt = (now - _spkLastTime) / 1000;
+                  if (dt > 0) _spkPush(Math.max(0, (d.total - _spkLastTotal) / dt));
+                }
+                _spkLastTotal = d.total; _spkLastTime = now;
+              } else if (d.qps_1m != null) {
+                _spkPush(Number(d.qps_1m));
+              }
             } catch(_) {}
           }
           pump();
-        }).catch(() => {});
+        }).catch(() => { scheduleSpkReconnect(); });
       })();
-    }).catch(() => {});
+    }).catch(() => { scheduleSpkReconnect(); });
 }
 
 function _spkPush(qps) {
@@ -1072,7 +1149,18 @@ function showInputModal(title,hint,value){document.getElementById('modal-title')
 function modalConfirm(){const val=document.getElementById('modal-input').value;document.getElementById('modal-overlay').classList.add('hidden');if(_modalResolve){_modalResolve(val);_modalResolve=null;}}
 function modalCancel(){document.getElementById('modal-overlay').classList.add('hidden');if(_modalResolve){_modalResolve(null);_modalResolve=null;}}
 
-window.onload=()=>{ loadAll(); };
+// Auto-logout after 30 minutes idle
+let _idleTimer = null;
+function resetIdleTimer() {
+  clearTimeout(_idleTimer);
+  _idleTimer = setTimeout(async () => {
+    try { await fetch('/logout', {method:'POST', headers:{'X-CSRF-Token':getCsrf()}}); } catch(_) {}
+    location.href = '/login';
+  }, 30 * 60 * 1000);
+}
+['click','keydown','mousemove','touchstart'].forEach(ev => document.addEventListener(ev, resetIdleTimer, {passive:true}));
+
+window.onload=()=>{ loadAll(); resetIdleTimer(); };
 </script>
 
 <!-- Input modal -->
