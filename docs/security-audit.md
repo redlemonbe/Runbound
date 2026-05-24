@@ -191,8 +191,7 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 |----|------|----------|----------------|
 | R1 | No internal privilege dropping | MEDIUM | Delegate to systemd (`User=`, `CapabilityBoundingSet=`) |
 | R2 | DNSSEC disabled by default | MEDIUM | Enable `dnssec-validation: yes` in production |
-| R3 | `log-client-ip: yes` by default | LOW/GDPR | Set to `no` if IP retention is not legally justified |
-| R4 | No NUMA awareness | LOW | On NUMA servers (multi-socket), XDP workers may cross memory banks |
+| R3 | `log-client-ip: yes` by default | LOW | Set to `no` if IP retention is not legally justified (GDPR note — see Description) |
 
 ---
 
@@ -309,6 +308,10 @@ The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify th
 | SEC-09 | DNS rebinding | HIGH | ✅ CIDR guards |
 | SEC-10 | ANY amplification | HIGH | ✅ Blocked |
 | SEC-11 | SSRF via upstream 0.0.0.0 | MEDIUM | ✅ Fixed v0.6.11 |
+
+## Performance Analysis (Non-Security Annex)
+
+Note: items below are performance risks, not security vulnerabilities. Severity terms (MAJOR/MINOR) use a separate scale from the security findings above.
 
 ### Performance
 
