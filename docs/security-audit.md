@@ -8,9 +8,9 @@
 
 ## 1. Executive Summary
 
-Runbound is architecturally sound for production deployment. The codebase presents strong security guarantees on critical surfaces (auth, memory, eBPF). The 5 M QPS target is achievable on dedicated multi-queue hardware with XDP enabled, pending four corrections before production deployment.
+Runbound is architecturally sound for the surfaces examined. The codebase implements constant-time comparison, memory zeroization (subtle + zeroize crates), and bounds-checked UMEM access on the critical surfaces examined. The 5 M QPS target is achievable on dedicated multi-queue hardware with XDP enabled, pending four corrections.
 
-**Overall verdict: production-ready with four blocking items (listed in §6).**
+**Overall verdict: four blocking items (§6) must be resolved before any deployment decision.**
 
 ---
 
@@ -344,4 +344,4 @@ The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify th
 
 ## 7. Conclusion
 
-Runbound v0.6.9 is production-ready pending the four blocking items above. The XDP kernel-bypass architecture is correct, memory guarantees are solid, and the dependency chain is clean. The 5 M QPS target is realistic on a 1U server with a 10G 8-queue NIC with hugepages enabled and the publish interval fix applied.
+Runbound v0.6.9 meets the documented design constraints for the surfaces reviewed, with four items (§6) blocking any deployment decision. The XDP kernel-bypass architecture is correct, memory guarantees are solid, and the dependency chain is clean. The 5 M QPS target is realistic on a 1U server with a 10G 8-queue NIC with hugepages enabled and the publish interval fix applied.
