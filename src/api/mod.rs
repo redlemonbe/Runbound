@@ -4,44 +4,48 @@
 
 pub mod relay;
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::time::Instant;
 use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
 
 use std::convert::Infallible;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::{
-    extract::{Path, Query, State, rejection::QueryRejection},
+    extract::{rejection::QueryRejection, Path, Query, State},
     http::{HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
     response::sse::{Event, KeepAlive, Sse},
-    Json as JsonExtract,
-    Router,
+    response::{IntoResponse, Response},
     routing::{any, delete, get, post},
+    Json as JsonExtract, Router,
 };
-use arc_swap::ArcSwap;
 use futures_util::stream;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use hickory_proto::rr::{LowerName, Name, RecordType};
-use crate::dns::{BlacklistAction, ZoneAction, local::{LocalZoneSet, parse_local_data}};
-use crate::dns::server::{SharedResolver, SharedResolversVec};
-use crate::feeds::{self, FeedFormat, add_feed, builtin_presets, remove_feed, update_all_feeds, update_one_feed};
-use crate::logbuffer::{LogAction, LogQuery, SharedLogBuffer};
-use crate::store::{self, DnsEntry, DnsType, BlacklistEntry};
-use crate::config::parser::{TlsConfig, UnboundConfig};
-use crate::stats::Stats;
 use crate::audit::{AuditEvent, AuditLogger};
+use crate::config::parser::{TlsConfig, UnboundConfig};
+use crate::dns::server::{SharedResolver, SharedResolversVec};
+use crate::dns::{
+    local::{parse_local_data, LocalZoneSet},
+    BlacklistAction, ZoneAction,
+};
+use crate::feeds::{
+    self, add_feed, builtin_presets, remove_feed, update_all_feeds, update_one_feed, FeedFormat,
+};
+use crate::logbuffer::{LogAction, LogQuery, SharedLogBuffer};
+use crate::stats::Stats;
+use crate::store::{self, BlacklistEntry, DnsEntry, DnsType};
 use crate::sync::{SyncJournal, SyncOp};
 use crate::upstreams::{self, SharedUpstreams};
+use hickory_proto::rr::{LowerName, Name, RecordType};
 
 /// Max TTL for API-created DNS entries (86400 s = 24 h).
 /// Prevents TTL-based cache persistence attacks and operator mistakes.
@@ -58,10 +62,10 @@ const MAX_API_TTL: u32 = 86_400;
 /// acquisition — no TOCTOU possible. `last_refill` is always updated on every
 /// call so that elapsed time is never double-counted across concurrent callers.
 struct ReloadLimiterInner {
-    tokens:      f64,
+    tokens: f64,
     last_refill: Instant,
-    rate:        f64,  // tokens per second
-    burst:       f64,  // maximum token capacity
+    rate: f64,  // tokens per second
+    burst: f64, // maximum token capacity
 }
 
 pub struct ReloadLimiter {
@@ -76,7 +80,7 @@ impl ReloadLimiter {
     pub fn new_with_params(rate: f64, burst: f64) -> Self {
         Self {
             inner: std::sync::Mutex::new(ReloadLimiterInner {
-                tokens:      burst,
+                tokens: burst,
                 last_refill: Instant::now(),
                 rate,
                 burst,
@@ -86,11 +90,11 @@ impl ReloadLimiter {
 
     pub fn check(&self) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let now     = Instant::now();
+        let now = Instant::now();
         let elapsed = now.duration_since(inner.last_refill).as_secs_f64();
         // Refill and update timestamp unconditionally — no conditional branch that
         // could cause elapsed time to accumulate across multiple callers.
-        inner.tokens      = (inner.tokens + elapsed * inner.rate).min(inner.burst);
+        inner.tokens = (inner.tokens + elapsed * inner.rate).min(inner.burst);
         inner.last_refill = now;
         if inner.tokens >= 1.0 {
             inner.tokens -= 1.0;
@@ -123,15 +127,22 @@ where
             Err(rejection) => {
                 use axum::extract::rejection::JsonRejection;
                 let (status, msg) = match rejection {
-                    JsonRejection::JsonDataError(e)        => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
-                    JsonRejection::JsonSyntaxError(e)      => (StatusCode::BAD_REQUEST,          e.to_string()),
-                    JsonRejection::MissingJsonContentType(e) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()),
-                    e                                      => (StatusCode::BAD_REQUEST,          e.to_string()),
+                    JsonRejection::JsonDataError(e) => {
+                        (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+                    }
+                    JsonRejection::JsonSyntaxError(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+                    JsonRejection::MissingJsonContentType(e) => {
+                        (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string())
+                    }
+                    e => (StatusCode::BAD_REQUEST, e.to_string()),
                 };
-                Err((status, axum::Json(serde_json::json!({
-                    "error":   "INVALID_REQUEST",
-                    "details": msg
-                }))))
+                Err((
+                    status,
+                    axum::Json(serde_json::json!({
+                        "error":   "INVALID_REQUEST",
+                        "details": msg
+                    })),
+                ))
             }
         }
     }
@@ -164,15 +175,18 @@ const MAX_FEEDS: usize = 100;
 /// Priority: HSM > RUNBOUND_API_KEY env var > api-key in unbound.conf > auto-generate.
 /// Auto-generated keys are 256-bit CSPRNG (2× UUID v4, backed by getrandom).
 pub fn init_api_key(config_key: Option<String>) -> String {
-    let key = crate::hsm::api_key().map(|k| k.to_string())
+    let key = crate::hsm::api_key()
+        .map(|k| k.to_string())
         .or_else(|| std::env::var("RUNBOUND_API_KEY").ok())
         .or(config_key)
         .unwrap_or_else(|| {
             // 256 bits from OS CSPRNG — two UUID v4s = 64 hex chars.
             // Previous implementation used PID+timestamp (deterministic → weak).
-            format!("{}{}",
+            format!(
+                "{}{}",
                 uuid::Uuid::new_v4().simple(),
-                uuid::Uuid::new_v4().simple())
+                uuid::Uuid::new_v4().simple()
+            )
         });
     API_KEY.get_or_init(|| ArcSwap::from(Arc::new(key.clone())));
     key
@@ -180,7 +194,8 @@ pub fn init_api_key(config_key: Option<String>) -> String {
 
 /// Returns the current API key as an owned Arc — zero-copy for the common read path.
 pub fn get_api_key() -> Arc<String> {
-    API_KEY.get()
+    API_KEY
+        .get()
         .map(|s| s.load_full())
         .unwrap_or_else(|| Arc::new(String::new()))
 }
@@ -194,7 +209,10 @@ pub fn rotate_api_key(new_key: String) {
 
 // ── API rate limiter ───────────────────────────────────────────────────────
 
-struct ApiBucket { tokens: u64, last: Instant }
+struct ApiBucket {
+    tokens: u64,
+    last: Instant,
+}
 
 // DashMap: each shard has its own RwLock — no global lock, parallel IPs don't
 // contend. check() is sync (no .await), keeping the hot middleware path lean.
@@ -204,21 +222,37 @@ pub struct ApiRateLimiter(Arc<DashMap<IpAddr, ApiBucket, ahash::RandomState>>);
 
 impl ApiRateLimiter {
     fn new() -> Self {
-        Self(Arc::new(DashMap::with_hasher(ahash::RandomState::default())))
+        Self(Arc::new(
+            DashMap::with_hasher(ahash::RandomState::default()),
+        ))
     }
-    pub fn new_public() -> Self { Self::new() }
+    pub fn new_public() -> Self {
+        Self::new()
+    }
     #[inline]
     fn check(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let mut b = self.0.entry(ip).or_insert(ApiBucket { tokens: API_RATE_BURST, last: now });
+        let mut b = self.0.entry(ip).or_insert(ApiBucket {
+            tokens: API_RATE_BURST,
+            last: now,
+        });
         let elapsed_ms = now.duration_since(b.last).as_millis() as u64;
         if elapsed_ms >= 1000 {
-            b.tokens = API_RATE_BURST; b.last = now;
+            b.tokens = API_RATE_BURST;
+            b.last = now;
         } else {
             let new = (API_RATE_LIMIT_RPS * elapsed_ms) / 1000;
-            if new > 0 { b.tokens = (b.tokens + new).min(API_RATE_BURST); b.last = now; }
+            if new > 0 {
+                b.tokens = (b.tokens + new).min(API_RATE_BURST);
+                b.last = now;
+            }
         }
-        if b.tokens > 0 { b.tokens -= 1; true } else { false }
+        if b.tokens > 0 {
+            b.tokens -= 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -226,40 +260,40 @@ impl ApiRateLimiter {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub zones:        Arc<ArcSwap<LocalZoneSet>>,
+    pub zones: Arc<ArcSwap<LocalZoneSet>>,
     // Serialises concurrent API writes: load-clone-modify-store is not atomic,
     // so two simultaneous POST /dns would race without this guard.
     // DNS reads (every query) never touch this mutex — zero read overhead.
-    pub zones_mutex:  Arc<Mutex<()>>,
-    pub tls_cfg:      Arc<TlsConfig>,
-    pub rate_limiter:   ApiRateLimiter,
+    pub zones_mutex: Arc<Mutex<()>>,
+    pub tls_cfg: Arc<TlsConfig>,
+    pub rate_limiter: ApiRateLimiter,
     pub reload_limiter: Arc<ReloadLimiter>,
-    pub stats:          Arc<Stats>,
+    pub stats: Arc<Stats>,
     /// Pre-computed snapshot refreshed every second by `qps_update_loop`.
     /// API handlers load this instead of calling `stats.snapshot()` on every
     /// request, avoiding ~360 atomic loads per call under monitoring load.
-    pub stats_cache:    crate::stats::SharedSnapshot,
-    pub cfg:          Arc<UnboundConfig>,
-    pub cfg_path:     String,
-    pub log_buffer:   SharedLogBuffer,
-    pub upstreams:    SharedUpstreams,
+    pub stats_cache: crate::stats::SharedSnapshot,
+    pub cfg: Arc<UnboundConfig>,
+    pub cfg_path: String,
+    pub log_buffer: SharedLogBuffer,
+    pub upstreams: SharedUpstreams,
     /// Master: Some(journal) to record write events for slave replication.
     /// Slave / standalone: None.
     pub sync_journal: Option<Arc<SyncJournal>>,
     /// Sync/relay HMAC key — used to sign relay requests (#85/#87).
-    pub sync_key:     Option<String>,
+    pub sync_key: Option<String>,
     /// This node's stable UUID — set on slave for identification (#88).
-    pub node_id:      Option<String>,
+    pub node_id: Option<String>,
     /// True when running as slave — all write operations are blocked (503).
-    pub slave_mode:   bool,
+    pub slave_mode: bool,
     /// Directory where runtime files (api.key, dns_entries.json, …) are stored.
-    pub base_dir:     Arc<PathBuf>,
+    pub base_dir: Arc<PathBuf>,
     /// Immutable audit log sender. No-op when audit is disabled.
-    pub audit:        AuditLogger,
+    pub audit: AuditLogger,
     /// XDP mode set by main: 0=disabled, 1=drv, 2=skb.
-    pub xdp_active:   Arc<AtomicU8>,
+    pub xdp_active: Arc<AtomicU8>,
     /// Shared DNS resolver — allows cache flush and upstream rebuild from API handlers.
-    pub resolver:     SharedResolver,
+    pub resolver: SharedResolver,
     /// FEAT #46: tracks when the last successful cache flush was requested.
     /// Guarded by a Mutex so the read-check-write is atomic without await.
     pub last_flush_at: Arc<std::sync::Mutex<Option<Instant>>>,
@@ -276,6 +310,8 @@ pub struct AppState {
     pub racing_wins: Arc<DashMap<String, Arc<AtomicU64>, ahash::RandomState>>,
     /// #86: broadcast sender for SSE node-status events.  None on slave/standalone.
     pub events_tx: Option<tokio::sync::broadcast::Sender<crate::sync::NodeStatusEvent>>,
+    /// #5: per-domain query counter — top-domains endpoint.
+    pub domain_stats: Arc<crate::domain_stats::DomainStats>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -318,7 +354,9 @@ pub struct AddDnsRequest {
     pub description: Option<String>,
 }
 
-fn default_ttl_i64() -> i64 { 3600 }
+fn default_ttl_i64() -> i64 {
+    3600
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AddFeedRequest {
@@ -358,7 +396,8 @@ async fn security_middleware(
     // the client receives a connection drop instead of 413.
     // Fix: require Content-Length on JSON-body requests. Non-JSON POST
     // endpoints (/reload, /feeds/update, etc.) are unaffected.
-    let has_content_type_json = req.headers()
+    let has_content_type_json = req
+        .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.starts_with("application/json"))
@@ -367,24 +406,38 @@ async fn security_middleware(
     if let Some(cl) = req.headers().get(axum::http::header::CONTENT_LENGTH) {
         let len: usize = match cl.to_str().ok().and_then(|s| s.parse().ok()) {
             Some(n) => n,
-            None => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
-                "error": "BAD_REQUEST",
-                "details": "Malformed Content-Length header"
-            }))).into_response(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": "BAD_REQUEST",
+                        "details": "Malformed Content-Length header"
+                    })),
+                )
+                    .into_response()
+            }
         };
         if len > MAX_BODY_BYTES {
-            return (StatusCode::PAYLOAD_TOO_LARGE, axum::Json(serde_json::json!({
-                "error": "REQUEST_TOO_LARGE",
-                "details": format!("Body exceeds {} bytes", MAX_BODY_BYTES)
-            }))).into_response();
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                axum::Json(serde_json::json!({
+                    "error": "REQUEST_TOO_LARGE",
+                    "details": format!("Body exceeds {} bytes", MAX_BODY_BYTES)
+                })),
+            )
+                .into_response();
         }
     } else if has_content_type_json {
         // JSON body without Content-Length → 411 Length Required.
         // Eliminates the chunked-body drop-without-413 behaviour (SEC-04).
-        return (StatusCode::LENGTH_REQUIRED, axum::Json(serde_json::json!({
-            "error": "LENGTH_REQUIRED",
-            "details": "Content-Length header is required for JSON requests"
-        }))).into_response();
+        return (
+            StatusCode::LENGTH_REQUIRED,
+            axum::Json(serde_json::json!({
+                "error": "LENGTH_REQUIRED",
+                "details": "Content-Length header is required for JSON requests"
+            })),
+        )
+            .into_response();
     }
 
     // ── 1. Rate limiting ──────────────────────────────────────────────
@@ -395,9 +448,12 @@ async fn security_middleware(
 
     if !state.rate_limiter.check(client_ip) {
         warn!(%client_ip, "API rate limited");
-        return (StatusCode::TOO_MANY_REQUESTS,
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
             [(axum::http::header::RETRY_AFTER, "1")],
-            "Rate limit exceeded").into_response();
+            "Rate limit exceeded",
+        )
+            .into_response();
     }
 
     // ── 2. API key authentication (Bearer token) ──────────────────────
@@ -415,7 +471,8 @@ async fn security_middleware(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        let auth = req.headers()
+        let auth = req
+            .headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
@@ -431,12 +488,21 @@ async fn security_middleware(
             tokio::spawn(async move {
                 audit.send(AuditEvent::AuthFailure { path: path_owned });
                 if failures.is_multiple_of(10) {
-                    warn!(failures, "Repeated API authentication failures — check RUNBOUND_API_KEY");
+                    warn!(
+                        failures,
+                        "Repeated API authentication failures — check RUNBOUND_API_KEY"
+                    );
                 }
             });
-            return (StatusCode::UNAUTHORIZED,
-                [(axum::http::header::WWW_AUTHENTICATE, "Bearer realm=\"runbound\"")],
-                "Unauthorized").into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    "Bearer realm=\"runbound\"",
+                )],
+                "Unauthorized",
+            )
+                .into_response();
         }
         // Successful auth resets the failure counter.
         AUTH_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -445,14 +511,23 @@ async fn security_middleware(
     // ── 3. Security response headers ──────────────────────────────────
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
-    headers.insert("x-content-type-options",    HeaderValue::from_static("nosniff"));
-    headers.insert("x-frame-options",           HeaderValue::from_static("DENY"));
-    headers.insert("x-xss-protection",          HeaderValue::from_static("1; mode=block"));
-    headers.insert("referrer-policy",           HeaderValue::from_static("no-referrer"));
-    headers.insert("content-security-policy",   HeaderValue::from_static("default-src 'none'"));
-    headers.insert("cache-control",             HeaderValue::from_static("no-store"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "x-xss-protection",
+        HeaderValue::from_static("1; mode=block"),
+    );
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static("default-src 'none'"),
+    );
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
     // Disable nginx response buffering so SSE events reach the client immediately.
-    headers.insert("x-accel-buffering",         HeaderValue::from_static("no"));
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
 }
 
@@ -468,10 +543,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // Then XOR every byte of b against the corresponding byte of a
     // (using 0x00 padding when a is shorter). No early exit anywhere.
     let len_mismatch = u8::from(a.len() != b.len());
-    let diff: u8 = b.iter().enumerate()
-        .fold(len_mismatch, |acc, (i, &bi)| {
-            acc | (a.get(i).copied().unwrap_or(0) ^ bi)
-        });
+    let diff: u8 = b.iter().enumerate().fold(len_mismatch, |acc, (i, &bi)| {
+        acc | (a.get(i).copied().unwrap_or(0) ^ bi)
+    });
     diff.ct_eq(&0u8).into()
 }
 
@@ -483,10 +557,14 @@ async fn slave_guard_middleware(
     next: Next,
 ) -> Response {
     if state.slave_mode && req.method() != axum::http::Method::GET {
-        return (StatusCode::SERVICE_UNAVAILABLE, JsonExtract(serde_json::json!({
-            "error":   "READ_ONLY",
-            "details": "This node is a slave replica — write operations are disabled",
-        }))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            JsonExtract(serde_json::json!({
+                "error":   "READ_ONLY",
+                "details": "This node is a slave replica — write operations are disabled",
+            })),
+        )
+            .into_response();
     }
     next.run(req).await
 }
@@ -501,60 +579,77 @@ pub fn router(state: AppState) -> Router {
 
     let api_routes = Router::new()
         // Info
-        .route("/help",              get(help_handler))
+        .route("/help", get(help_handler))
         // Operations
-        .route("/stats",             get(stats_handler))
-        .route("/stats/stream",      get(stats_stream_handler))
-        .route("/config",            get(config_handler))
-        .route("/reload",            post(reload_handler))
+        .route("/stats", get(stats_handler))
+        .route("/stats/stream", get(stats_stream_handler))
+        .route("/stats/top-domains", get(top_domains_handler))
+        .route("/config", get(config_handler))
+        .route("/reload", post(reload_handler))
         // DNS CRUD
-        .route("/dns/lookup",        post(dns_lookup_handler))
-        .route("/dns",               get(list_dns_handler).post(add_dns_handler))
-        .route("/dns/:id",           delete(delete_dns_handler))
+        .route("/dns/lookup", post(dns_lookup_handler))
+        .route("/dns", get(list_dns_handler).post(add_dns_handler))
+        .route("/dns/:id", delete(delete_dns_handler))
         // Blacklist
-        .route("/blacklist",         get(list_blacklist_handler).post(add_blacklist_handler))
-        .route("/blacklist/:id",     delete(delete_blacklist_handler))
+        .route(
+            "/blacklist",
+            get(list_blacklist_handler).post(add_blacklist_handler),
+        )
+        .route("/blacklist/:id", delete(delete_blacklist_handler))
         // Feeds
-        .route("/feeds",             get(get_feeds_handler).post(add_feed_handler))
-        .route("/feeds/presets",     get(feed_presets_handler))
-        .route("/feeds/update",      post(update_feeds_handler))
-        .route("/feeds/:id",         delete(delete_feed_handler))
-        .route("/feeds/:id/update",  post(update_one_feed_handler))
+        .route("/feeds", get(get_feeds_handler).post(add_feed_handler))
+        .route("/feeds/presets", get(feed_presets_handler))
+        .route("/feeds/update", post(update_feeds_handler))
+        .route("/feeds/:id", delete(delete_feed_handler))
+        .route("/feeds/:id/update", post(update_one_feed_handler))
         // System
-        .route("/system",            get(system_handler))
-        .route("/cache/flush",       post(cache_flush_handler))
+        .route("/system", get(system_handler))
+        .route("/cache/flush", post(cache_flush_handler))
         // TLS / Protocol status
-        .route("/tls",               get(tls_status_handler))
+        .route("/tls", get(tls_status_handler))
         // Monitoring
-        .route("/upstreams",         get(upstreams_handler).post(add_upstream_handler))
-        .route("/upstreams/presets",    get(upstream_presets_handler))
-        .route("/upstreams/reconnect",  post(reconnect_upstreams_handler))
-        .route("/upstreams/:id",        delete(delete_upstream_handler).patch(patch_upstream_handler))
-        .route("/upstreams/:id/probe",  post(probe_upstream_handler))
-        .route("/cache/stats",       get(cache_stats_handler))
-        .route("/logs",              get(logs_handler).delete(clear_logs_handler))
-        .route("/audit/tail",        get(audit_tail_handler))
-        .route("/metrics",           get(metrics_handler))
+        .route(
+            "/upstreams",
+            get(upstreams_handler).post(add_upstream_handler),
+        )
+        .route("/upstreams/presets", get(upstream_presets_handler))
+        .route("/upstreams/reconnect", post(reconnect_upstreams_handler))
+        .route(
+            "/upstreams/:id",
+            delete(delete_upstream_handler).patch(patch_upstream_handler),
+        )
+        .route("/upstreams/:id/probe", post(probe_upstream_handler))
+        .route("/cache/stats", get(cache_stats_handler))
+        .route("/logs", get(logs_handler).delete(clear_logs_handler))
+        .route("/audit/tail", get(audit_tail_handler))
+        .route("/metrics", get(metrics_handler))
         // Sync
-        .route("/sync/slaves",       get(sync_slaves_handler))
+        .route("/sync/slaves", get(sync_slaves_handler))
         // #86: SSE node-status stream
-        .route("/events",            get(events_handler))
+        .route("/events", get(events_handler))
         // Node relay (#85/#87/#88) — master side
-        .route("/nodes",                          get(relay::list_nodes_handler))
-        .route("/nodes/:node_id/relay/*path",     any(relay::relay_forward_handler))
+        .route("/nodes", get(relay::list_nodes_handler))
+        .route(
+            "/nodes/:node_id/relay/*path",
+            any(relay::relay_forward_handler),
+        )
         // Administration
-        .route("/rotate-key",        post(rotate_key_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), slave_guard_middleware))
-        .layer(middleware::from_fn_with_state(state.clone(), security_middleware))
+        .route("/rotate-key", post(rotate_key_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            slave_guard_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_middleware,
+        ))
         // axum DefaultBodyLimit returns HTTP 413 before reading the body into RAM,
         // regardless of payload size. tower_http::RequestBodyLimitLayer drops the
         // TCP connection for very large payloads (> ~512 KB) instead of 413.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state);
 
-    Router::new()
-        .merge(health_route)
-        .nest("/api", api_routes)
+    Router::new().merge(health_route).nest("/api", api_routes)
 }
 
 // ── GET /help ──────────────────────────────────────────────────────────────
@@ -570,6 +665,7 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/api/help",             "description":"API documentation"},
             {"method":"GET",    "path":"/api/stats",            "description":"Query statistics snapshot"},
             {"method":"GET",    "path":"/api/stats/stream",     "description":"Live stats as Server-Sent Events (1-second interval)"},
+            {"method":"GET",    "path":"/api/stats/top-domains", "description":"Top queried domains since startup (query param: limit=N, default 10, max 100)"},
             {"method":"GET",    "path":"/api/config",           "description":"Running configuration"},
             {"method":"POST",   "path":"/api/reload",           "description":"Hot-reload zones and blacklist from disk"},
             {"method":"GET",    "path":"/api/dns",              "description":"List all local DNS entries"},
@@ -612,7 +708,9 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.stats_cache.load();
     let xdp_active = s.xdp_active.load(Ordering::Relaxed) > 0;
     let (upstreams_healthy, upstreams_total) = {
-        let list = s.upstreams.read()
+        let list = s
+            .upstreams
+            .read()
             .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health handler: {e}"));
         (
             list.iter().filter(|u| u.healthy).count() as u32,
@@ -638,6 +736,28 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+// ── GET /stats/top-domains ─────────────────────────────────────────────────
+#[derive(serde::Deserialize)]
+struct TopDomainsParams {
+    limit: Option<usize>,
+}
+
+async fn top_domains_handler(
+    State(s): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<TopDomainsParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(10).clamp(1, 100);
+    let top = s.domain_stats.top(limit);
+    let entries: Vec<serde_json::Value> = top
+        .into_iter()
+        .map(|(domain, count)| serde_json::json!({"domain": domain, "count": count}))
+        .collect();
+    axum::Json(serde_json::json!({
+        "top_queried": entries,
+        "tracked_domains": s.domain_stats.len(),
+    }))
+}
+
 // ── GET /stats ─────────────────────────────────────────────────────────────
 
 async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
@@ -645,11 +765,14 @@ async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
     let xdp_queues: Vec<serde_json::Value> = crate::dns::xdp::socket::XDP_QUEUE_MODES
         .get()
         .map(|modes| {
-            modes.iter()
-                .map(|(id, zc)| serde_json::json!({
-                    "id":   id,
-                    "mode": if *zc { "zerocopy" } else { "copy" }
-                }))
+            modes
+                .iter()
+                .map(|(id, zc)| {
+                    serde_json::json!({
+                        "id":   id,
+                        "mode": if *zc { "zerocopy" } else { "copy" }
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -694,7 +817,9 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
 
     // FEAT #47: upstream health counts
     let (upstreams_healthy, upstreams_total) = {
-        let list = s.upstreams.read()
+        let list = s
+            .upstreams
+            .read()
             .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in system handler: {e}"));
         (
             list.iter().filter(|u| u.healthy).count() as u32,
@@ -703,19 +828,20 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
     };
 
     let dot_reconnects_total = s.stats.dot_reconnects_total.load(Ordering::Relaxed);
-    let last_reconnect_at = s.stats.last_reconnect_at.lock()
+    let last_reconnect_at = s
+        .stats
+        .last_reconnect_at
+        .lock()
         .ok()
         .and_then(|g| g.clone())
         .map(serde_json::Value::String)
         .unwrap_or(serde_json::Value::Null);
 
     // XDP wire-format cache stats (#64)
-    let xdp_cache_entries = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_ENTRIES
-        .load(Ordering::Relaxed);
-    let xdp_hits   = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
-        .load(Ordering::Relaxed);
-    let xdp_misses = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
-        .load(Ordering::Relaxed);
+    let xdp_cache_entries =
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_ENTRIES.load(Ordering::Relaxed);
+    let xdp_hits = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS.load(Ordering::Relaxed);
+    let xdp_misses = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES.load(Ordering::Relaxed);
     let xdp_cache_hit_rate = if xdp_hits + xdp_misses > 0 {
         (xdp_hits as f64 / (xdp_hits + xdp_misses) as f64 * 1000.0).round() / 10.0
     } else {
@@ -723,19 +849,25 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
     };
 
     // #80: NIC ring buffer + drop stats
-    let nic_rx_ring     = crate::dns::xdp::socket::XDP_NIC_RX_RING.load(Ordering::Relaxed);
+    let nic_rx_ring = crate::dns::xdp::socket::XDP_NIC_RX_RING.load(Ordering::Relaxed);
     let nic_rx_ring_max = crate::dns::xdp::socket::XDP_NIC_RX_RING_MAX.load(Ordering::Relaxed);
-    let nic_rx_dropped  = crate::dns::xdp::socket::XDP_ACTIVE_IFACE
+    let nic_rx_dropped = crate::dns::xdp::socket::XDP_ACTIVE_IFACE
         .get()
         .map(|iface| crate::dns::xdp::socket::read_nic_rx_dropped(iface))
         .unwrap_or(0);
 
     // #33: upstream racing wins per upstream.
-    let upstream_racing_wins: serde_json::Map<String, serde_json::Value> = s.racing_wins
+    let upstream_racing_wins: serde_json::Map<String, serde_json::Value> = s
+        .racing_wins
         .iter()
-        .map(|kv| (kv.key().clone(), serde_json::Value::Number(
-            serde_json::Number::from(kv.value().load(Ordering::Relaxed))
-        )))
+        .map(|kv| {
+            (
+                kv.key().clone(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    kv.value().load(Ordering::Relaxed),
+                )),
+            )
+        })
         .collect();
 
     JsonExtract(serde_json::json!({
@@ -783,8 +915,20 @@ fn system_memory_mb() -> (u64, u64) {
     if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
         let (mut total_kb, mut avail_kb) = (0u64, 0u64);
         for line in text.lines() {
-            if line.starts_with("MemTotal:")     { total_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
-            if line.starts_with("MemAvailable:") { avail_kb = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
+            if line.starts_with("MemTotal:") {
+                total_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+            if line.starts_with("MemAvailable:") {
+                avail_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
         }
         return (avail_kb / 1024, total_kb / 1024);
     }
@@ -795,36 +939,46 @@ fn system_memory_mb() -> (u64, u64) {
 fn cgroup_memory_max_bytes() -> Option<u64> {
     let s = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
     let s = s.trim();
-    if s == "max" { return None; }
+    if s == "max" {
+        return None;
+    }
     s.parse().ok()
 }
 
 /// Read the cgroup v2 current memory usage in bytes.
 fn cgroup_memory_current_bytes() -> Option<u64> {
     std::fs::read_to_string("/sys/fs/cgroup/memory.current")
-        .ok()?.trim().parse().ok()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Compute average CPU% for this process since it started.
 /// Reads /proc/self/stat (utime+stime) and /proc/uptime.
 fn process_cpu_percent() -> f64 {
     let stat = match std::fs::read_to_string("/proc/self/stat") {
-        Ok(s) => s, Err(_) => return 0.0,
+        Ok(s) => s,
+        Err(_) => return 0.0,
     };
     // Skip past the comm field "(name)" which may contain spaces.
     let after_comm = match stat.find(')') {
-        Some(p) => p + 2, None => return 0.0,
+        Some(p) => p + 2,
+        None => return 0.0,
     };
     let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
-    let utime:     u64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let stime:     u64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let utime: u64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let stime: u64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
     let starttime: u64 = fields.get(19).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let uptime_s: f64 = std::fs::read_to_string("/proc/uptime").ok()
+    let uptime_s: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()
         .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
         .unwrap_or(0.0);
     const CLK_TCK: f64 = 100.0; // sysconf(_SC_CLK_TCK) on all supported Linux targets
     let proc_uptime = uptime_s - (starttime as f64 / CLK_TCK);
-    if proc_uptime <= 0.0 { return 0.0; }
+    if proc_uptime <= 0.0 {
+        return 0.0;
+    }
     ((utime + stime) as f64 / CLK_TCK / proc_uptime * 1000.0).round() / 10.0
 }
 
@@ -833,9 +987,13 @@ fn process_cpu_percent() -> f64 {
 async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
     let cfg = s.cfg.as_ref();
     // Live counts include both config-file entries and API-managed entries.
-    let api_dns   = store::load().map(|st| st.entries.len()).unwrap_or(0);
-    let api_bl    = store::load_blacklist().map(|bl| bl.entries.len()).unwrap_or(0);
-    let api_feeds = crate::feeds::load_feeds().map(|f| f.feeds.len()).unwrap_or(0);
+    let api_dns = store::load().map(|st| st.entries.len()).unwrap_or(0);
+    let api_bl = store::load_blacklist()
+        .map(|bl| bl.entries.len())
+        .unwrap_or(0);
+    let api_feeds = crate::feeds::load_feeds()
+        .map(|f| f.feeds.len())
+        .unwrap_or(0);
     JsonExtract(serde_json::json!({
         "port":              cfg.port,
         "interfaces":        cfg.interfaces,
@@ -877,10 +1035,13 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
 async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
     // FIX 3.2: independent 2 RPS cap — prevents authenticated DoS via rapid reloads.
     if !s.reload_limiter.check() {
-        return (StatusCode::TOO_MANY_REQUESTS, JsonExtract(serde_json::json!({
-            "error":   "RATE_LIMITED",
-            "details": "reload endpoint is limited to 2 requests per second",
-        })));
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            JsonExtract(serde_json::json!({
+                "error":   "RATE_LIMITED",
+                "details": "reload endpoint is limited to 2 requests per second",
+            })),
+        );
     }
     match crate::config::load(&s.cfg_path) {
         Ok(new_cfg) => {
@@ -888,20 +1049,26 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
             s.zones.store(std::sync::Arc::new(new_zones));
             info!(cfg_path = %s.cfg_path, "API hot-reload complete");
             s.audit.send(AuditEvent::ConfigReload);
-            (StatusCode::OK, JsonExtract(serde_json::json!({
-                "status":      "ok",
-                "cfg_path":    s.cfg_path,
-                "local_zones": new_cfg.local_zones.len(),
-                "local_data":  new_cfg.local_data.len(),
-            })))
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "status":      "ok",
+                    "cfg_path":    s.cfg_path,
+                    "local_zones": new_cfg.local_zones.len(),
+                    "local_data":  new_cfg.local_data.len(),
+                })),
+            )
         }
         Err(e) => {
             // FIX 3.4: full error already in the WARN log; sanitize the HTTP body.
             warn!(err = %e, "API reload failed — keeping current zones");
-            (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error":   "RELOAD_FAILED",
-                "details": sanitize_error(&e),
-            })))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error":   "RELOAD_FAILED",
+                    "details": sanitize_error(&e),
+                })),
+            )
         }
     }
 }
@@ -910,15 +1077,21 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn list_dns_handler(State(_s): State<AppState>) -> impl IntoResponse {
     match store::load() {
-        Ok(st) => (StatusCode::OK, JsonExtract(serde_json::json!({
-            "entries": st.entries,
-            "total": st.entries.len()
-        }))),
+        Ok(st) => (
+            StatusCode::OK,
+            JsonExtract(serde_json::json!({
+                "entries": st.entries,
+                "total": st.entries.len()
+            })),
+        ),
         Err(e) => {
             warn!(err = %e, "store load failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": sanitize_error(&e)
-            })))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": sanitize_error(&e)
+                })),
+            )
         }
     }
 }
@@ -927,29 +1100,37 @@ type ApiError = (StatusCode, JsonExtract<serde_json::Value>);
 
 /// Validate all fields of an AddDnsRequest and build the DnsEntry + RR + Record.
 /// Returns the triple on success, or a (StatusCode, JSON error) ready to return.
-fn validate_dns_entry(req: &AddDnsRequest) -> Result<(DnsEntry, String, hickory_proto::rr::Record), ApiError> {
+fn validate_dns_entry(
+    req: &AddDnsRequest,
+) -> Result<(DnsEntry, String, hickory_proto::rr::Record), ApiError> {
     // VUL-05: Reject malformed or dangerous names before any parsing.
     if let Err(e) = validate_dns_name(&req.name) {
-        return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_NAME", "details": e
-        }))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_NAME", "details": e
+            })),
+        ));
     }
     // Reject control characters in free-text fields (CRLF injection prevention).
     for (field, val) in [
-        ("value",       req.value.as_deref().unwrap_or("")),
-        ("tag",         req.tag.as_deref().unwrap_or("")),
+        ("value", req.value.as_deref().unwrap_or("")),
+        ("tag", req.tag.as_deref().unwrap_or("")),
         ("description", req.description.as_deref().unwrap_or("")),
         ("fingerprint", req.fingerprint.as_deref().unwrap_or("")),
-        ("cert_data",   req.cert_data.as_deref().unwrap_or("")),
-        ("services",    req.services.as_deref().unwrap_or("")),
-        ("regexp",      req.regexp.as_deref().unwrap_or("")),
+        ("cert_data", req.cert_data.as_deref().unwrap_or("")),
+        ("services", req.services.as_deref().unwrap_or("")),
+        ("regexp", req.regexp.as_deref().unwrap_or("")),
         ("replacement", req.replacement.as_deref().unwrap_or("")),
         ("flags_naptr", req.flags_naptr.as_deref().unwrap_or("")),
     ] {
         if let Err(e) = validate_no_control_chars(val, field) {
-            return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                "error": "INVALID_FIELD", "details": e
-            }))));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error": "INVALID_FIELD", "details": e
+                })),
+            ));
         }
     }
     // S-10: for record types where value is a domain name, validate it as such.
@@ -958,9 +1139,12 @@ fn validate_dns_entry(req: &AddDnsRequest) -> Result<(DnsEntry, String, hickory_
         DnsType::CNAME | DnsType::NS | DnsType::PTR | DnsType::MX | DnsType::SRV => {
             if let Some(ref v) = req.value {
                 if let Err(e) = validate_dns_name(v) {
-                    return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                        "error": "INVALID_VALUE", "details": e
-                    }))));
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        JsonExtract(serde_json::json!({
+                            "error": "INVALID_VALUE", "details": e
+                        })),
+                    ));
                 }
             }
         }
@@ -969,9 +1153,12 @@ fn validate_dns_entry(req: &AddDnsRequest) -> Result<(DnsEntry, String, hickory_
             if let Some(ref r) = req.replacement {
                 if r != "." {
                     if let Err(e) = validate_dns_name(r) {
-                        return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                            "error": "INVALID_REPLACEMENT", "details": e
-                        }))));
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            JsonExtract(serde_json::json!({
+                                "error": "INVALID_REPLACEMENT", "details": e
+                            })),
+                        ));
                     }
                 }
             }
@@ -982,44 +1169,52 @@ fn validate_dns_entry(req: &AddDnsRequest) -> Result<(DnsEntry, String, hickory_
     // [0, 2^31-1] must be rejected with a uniform JSON error.
     const RFC2181_MAX_TTL: i64 = 2_147_483_647;
     if req.ttl < 0 || req.ttl > RFC2181_MAX_TTL {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
-            "error": "INVALID_TTL",
-            "details": "TTL must be between 0 and 2147483647"
-        }))));
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_TTL",
+                "details": "TTL must be between 0 and 2147483647"
+            })),
+        ));
     }
     let ttl = req.ttl as u32;
     let entry = DnsEntry {
-        id:               DnsEntry::new_id(),
-        name:             ensure_dot(&req.name),
-        entry_type:       req.entry_type.clone(),
-        ttl:              ttl.min(MAX_API_TTL),
-        value:            req.value.clone(),
-        priority:         req.priority,
-        weight:           req.weight,
-        port:             req.port,
-        flags:            req.flags,
-        tag:              req.tag.clone(),
-        order:            req.order,
+        id: DnsEntry::new_id(),
+        name: ensure_dot(&req.name),
+        entry_type: req.entry_type.clone(),
+        ttl: ttl.min(MAX_API_TTL),
+        value: req.value.clone(),
+        priority: req.priority,
+        weight: req.weight,
+        port: req.port,
+        flags: req.flags,
+        tag: req.tag.clone(),
+        order: req.order,
         preference_naptr: req.preference_naptr,
-        flags_naptr:      req.flags_naptr.clone(),
-        services:         req.services.clone(),
-        regexp:           req.regexp.clone(),
-        replacement:      req.replacement.clone(),
-        algorithm:        req.algorithm,
-        fp_type:          req.fp_type,
-        fingerprint:      req.fingerprint.clone(),
-        cert_usage:       req.cert_usage,
-        selector:         req.selector,
-        matching_type:    req.matching_type,
-        cert_data:        req.cert_data.clone(),
-        description:      req.description.clone(),
+        flags_naptr: req.flags_naptr.clone(),
+        services: req.services.clone(),
+        regexp: req.regexp.clone(),
+        replacement: req.replacement.clone(),
+        algorithm: req.algorithm,
+        fp_type: req.fp_type,
+        fingerprint: req.fingerprint.clone(),
+        cert_usage: req.cert_usage,
+        selector: req.selector,
+        matching_type: req.matching_type,
+        cert_data: req.cert_data.clone(),
+        description: req.description.clone(),
     };
     let rr = match entry.to_rr_string() {
         Some(r) => r,
-        None => return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_ENTRY",
-            "details": "Missing required fields for this record type"
-        })))),
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error": "INVALID_ENTRY",
+                    "details": "Missing required fields for this record type"
+                })),
+            ))
+        }
     };
     let record = match parse_local_data(&rr) {
         Some(r) => r,
@@ -1027,10 +1222,13 @@ fn validate_dns_entry(req: &AddDnsRequest) -> Result<(DnsEntry, String, hickory_
             // FIX 6 (VUL-NEW-07): do not reflect the internal RR string in the HTTP response;
             // log it server-side so operators can diagnose but clients see no filesystem/config detail.
             warn!(rr = %rr, "RR parse failed for input");
-            return Err((StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                "error": "PARSE_FAILED",
-                "details": "Record validation failed"
-            }))));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error": "PARSE_FAILED",
+                    "details": "Record validation failed"
+                })),
+            ));
         }
     };
     Ok((entry, rr, record))
@@ -1051,34 +1249,45 @@ async fn persist_and_swap(
 
         let mut st = store::load().unwrap_or_default();
         if st.entries.len() >= MAX_DNS_ENTRIES {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
-                "error": "LIMIT_EXCEEDED",
-                "details": format!("Maximum {} DNS entries reached", MAX_DNS_ENTRIES)
-            }))));
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                JsonExtract(serde_json::json!({
+                    "error": "LIMIT_EXCEEDED",
+                    "details": format!("Maximum {} DNS entries reached", MAX_DNS_ENTRIES)
+                })),
+            ));
         }
         st.entries.push(entry.clone());
         if let Err(e) = store::save(&st) {
             warn!(err = %e, "store save failed");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": sanitize_error(&e)
-            }))));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": sanitize_error(&e)
+                })),
+            ));
         }
 
         let current = s.zones.load_full();
         let mut new_zones = (*current).clone();
         let name = record.name.clone();
-        new_zones.zones.entry(name.clone()).or_insert(ZoneAction::Static);
+        new_zones
+            .zones
+            .entry(name.clone())
+            .or_insert(ZoneAction::Static);
         new_zones.records.entry(name).or_default().push(record);
         s.zones.store(Arc::new(new_zones));
     }
     info!(id=%entry.id, name=%entry.name, r#type=?entry.entry_type, "DNS entry added");
     s.audit.send(AuditEvent::DnsAdd {
-        name:  entry.name.clone(),
+        name: entry.name.clone(),
         rtype: format!("{:?}", entry.entry_type),
         value: entry.value.clone().unwrap_or_default(),
     });
     if let Some(ref j) = s.sync_journal {
-        j.push(SyncOp::AddDns { entry: entry.clone() });
+        j.push(SyncOp::AddDns {
+            entry: entry.clone(),
+        });
         if let Some(ref k) = s.sync_key {
             if let Ok(b) = serde_json::to_vec(&entry) {
                 relay::push_to_slaves(j, k, Method::POST, "dns".to_string(), bytes::Bytes::from(b));
@@ -1093,17 +1302,20 @@ async fn add_dns_handler(
     ApiJson(req): ApiJson<AddDnsRequest>,
 ) -> impl IntoResponse {
     let (entry, rr, record) = match validate_dns_entry(&req) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(e) => return e,
     };
     if let Err(e) = persist_and_swap(&entry, record, &s).await {
         return e;
     }
-    (StatusCode::CREATED, JsonExtract(serde_json::json!({
-        "status": "ok",
-        "entry": entry,
-        "rr": rr
-    })))
+    (
+        StatusCode::CREATED,
+        JsonExtract(serde_json::json!({
+            "status": "ok",
+            "entry": entry,
+            "rr": rr
+        })),
+    )
 }
 
 async fn delete_dns_handler(
@@ -1116,19 +1328,28 @@ async fn delete_dns_handler(
         Ok(s) => s,
         Err(e) => {
             warn!(err = %e, "store load failed in delete_dns");
-            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": sanitize_error(&e)})));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({"error": sanitize_error(&e)})),
+            );
         }
     };
 
     let pos = st.entries.iter().position(|e| e.id == id);
     let Some(pos) = pos else {
-        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"NOT_FOUND","id":id})));
+        return (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({"error":"NOT_FOUND","id":id})),
+        );
     };
 
     let entry = st.entries.remove(pos);
     if let Err(e) = store::save(&st) {
         warn!(err = %e, "store save failed in delete_dns");
-        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": sanitize_error(&e)})));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({"error": sanitize_error(&e)})),
+        );
     }
 
     // Remove from live zone set — ArcSwap write
@@ -1165,10 +1386,19 @@ async fn delete_dns_handler(
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::DeleteDns { id: id.clone() });
         if let Some(ref k) = s.sync_key {
-            relay::push_to_slaves(j, k, Method::DELETE, format!("dns/{id}"), bytes::Bytes::new());
+            relay::push_to_slaves(
+                j,
+                k,
+                Method::DELETE,
+                format!("dns/{id}"),
+                bytes::Bytes::new(),
+            );
         }
     }
-    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id})))
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({"status":"ok","deleted_id":id})),
+    )
 }
 
 // ── POST /api/dns/lookup ───────────────────────────────────────────────────
@@ -1180,43 +1410,67 @@ struct DnsLookupRequest {
     qtype: String,
 }
 
-fn dns_lookup_default_type() -> String { "A".to_string() }
+fn dns_lookup_default_type() -> String {
+    "A".to_string()
+}
 
 async fn dns_lookup_handler(
     State(s): State<AppState>,
     ApiJson(p): ApiJson<DnsLookupRequest>,
 ) -> impl IntoResponse {
     if !s.lookup_limiter.check() {
-        return (StatusCode::TOO_MANY_REQUESTS, JsonExtract(serde_json::json!({
-            "error": "RATE_LIMITED", "details": "Max 10 req/s"
-        }))).into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            JsonExtract(serde_json::json!({
+                "error": "RATE_LIMITED", "details": "Max 10 req/s"
+            })),
+        )
+            .into_response();
     }
 
     if let Err(e) = validate_dns_name(&p.name) {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_NAME", "details": e
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_NAME", "details": e
+            })),
+        )
+            .into_response();
     }
 
     let qtype: RecordType = match p.qtype.to_uppercase().as_str() {
-        "A"     => RecordType::A,
-        "AAAA"  => RecordType::AAAA,
-        "MX"    => RecordType::MX,
-        "TXT"   => RecordType::TXT,
+        "A" => RecordType::A,
+        "AAAA" => RecordType::AAAA,
+        "MX" => RecordType::MX,
+        "TXT" => RecordType::TXT,
         "CNAME" => RecordType::CNAME,
-        "PTR"   => RecordType::PTR,
-        other   => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_TYPE",
-            "details": format!("Unsupported type '{other}'. Use: A, AAAA, MX, TXT, CNAME, PTR")
-        }))).into_response(),
+        "PTR" => RecordType::PTR,
+        other => return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_TYPE",
+                "details": format!("Unsupported type '{other}'. Use: A, AAAA, MX, TXT, CNAME, PTR")
+            })),
+        )
+            .into_response(),
     };
 
-    let fqdn_str = if p.name.ends_with('.') { p.name.clone() } else { format!("{}.", p.name) };
+    let fqdn_str = if p.name.ends_with('.') {
+        p.name.clone()
+    } else {
+        format!("{}.", p.name)
+    };
     let name = match fqdn_str.parse::<Name>() {
         Ok(n) => n,
-        Err(_) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_NAME", "details": "Could not parse as DNS name"
-        }))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error": "INVALID_NAME", "details": "Could not parse as DNS name"
+                })),
+            )
+                .into_response()
+        }
     };
     let lower = LowerName::from(&name);
 
@@ -1225,22 +1479,31 @@ async fn dns_lookup_handler(
         let zones_snap = s.zones.load();
         match zones_snap.find(&lower) {
             Some(crate::dns::ZoneAction::Refuse) | Some(crate::dns::ZoneAction::NxDomain) => {
-                return (StatusCode::OK, JsonExtract(serde_json::json!({
-                    "name": p.name, "type": p.qtype,
-                    "answers": [], "status": "BLOCKED",
-                    "elapsed_ms": 0, "from_cache": false
-                }))).into_response();
+                return (
+                    StatusCode::OK,
+                    JsonExtract(serde_json::json!({
+                        "name": p.name, "type": p.qtype,
+                        "answers": [], "status": "BLOCKED",
+                        "elapsed_ms": 0, "from_cache": false
+                    })),
+                )
+                    .into_response();
             }
             Some(crate::dns::ZoneAction::Static) | Some(crate::dns::ZoneAction::Redirect) => {
                 let records = zones_snap.local_records(&lower, qtype);
-                let answers: Vec<serde_json::Value> = records.iter().map(|r| {
-                    serde_json::json!({ "ttl": r.ttl, "data": r.data.to_string() })
-                }).collect();
-                return (StatusCode::OK, JsonExtract(serde_json::json!({
-                    "name": p.name, "type": p.qtype,
-                    "answers": answers, "status": "NOERROR",
-                    "elapsed_ms": 0, "from_cache": true
-                }))).into_response();
+                let answers: Vec<serde_json::Value> = records
+                    .iter()
+                    .map(|r| serde_json::json!({ "ttl": r.ttl, "data": r.data.to_string() }))
+                    .collect();
+                return (
+                    StatusCode::OK,
+                    JsonExtract(serde_json::json!({
+                        "name": p.name, "type": p.qtype,
+                        "answers": answers, "status": "NOERROR",
+                        "elapsed_ms": 0, "from_cache": true
+                    })),
+                )
+                    .into_response();
             }
             None => {}
         }
@@ -1252,14 +1515,20 @@ async fn dns_lookup_handler(
         Ok(lookup) => {
             let elapsed_ms = start.elapsed().as_millis() as u64;
             let from_cache = elapsed_ms * 1000 < crate::stats::CACHE_HIT_THRESHOLD_US;
-            let answers: Vec<serde_json::Value> = lookup.answers().iter().map(|r| {
-                serde_json::json!({ "ttl": r.ttl, "data": r.data.to_string() })
-            }).collect();
-            (StatusCode::OK, JsonExtract(serde_json::json!({
-                "name": p.name, "type": p.qtype,
-                "answers": answers, "status": "NOERROR",
-                "elapsed_ms": elapsed_ms, "from_cache": from_cache
-            }))).into_response()
+            let answers: Vec<serde_json::Value> = lookup
+                .answers()
+                .iter()
+                .map(|r| serde_json::json!({ "ttl": r.ttl, "data": r.data.to_string() }))
+                .collect();
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "name": p.name, "type": p.qtype,
+                    "answers": answers, "status": "NOERROR",
+                    "elapsed_ms": elapsed_ms, "from_cache": from_cache
+                })),
+            )
+                .into_response()
         }
         Err(e) => {
             use hickory_resolver::net::{DnsError, NetError, NoRecords};
@@ -1269,17 +1538,21 @@ async fn dns_lookup_handler(
                     use hickory_proto::op::ResponseCode;
                     match response_code {
                         ResponseCode::NXDomain => "NXDOMAIN",
-                        ResponseCode::Refused  => "REFUSED",
-                        _                      => "SERVFAIL",
+                        ResponseCode::Refused => "REFUSED",
+                        _ => "SERVFAIL",
                     }
                 }
                 _ => "SERVFAIL",
             };
-            (StatusCode::OK, JsonExtract(serde_json::json!({
-                "name": p.name, "type": p.qtype,
-                "answers": [], "status": status,
-                "elapsed_ms": elapsed_ms, "from_cache": false
-            }))).into_response()
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "name": p.name, "type": p.qtype,
+                    "answers": [], "status": status,
+                    "elapsed_ms": elapsed_ms, "from_cache": false
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -1288,15 +1561,21 @@ async fn dns_lookup_handler(
 
 async fn list_blacklist_handler(State(_s): State<AppState>) -> impl IntoResponse {
     match store::load_blacklist() {
-        Ok(bl) => (StatusCode::OK, JsonExtract(serde_json::json!({
-            "blacklist": bl.entries,
-            "total": bl.entries.len()
-        }))),
+        Ok(bl) => (
+            StatusCode::OK,
+            JsonExtract(serde_json::json!({
+                "blacklist": bl.entries,
+                "total": bl.entries.len()
+            })),
+        ),
         Err(e) => {
             warn!(err = %e, "blacklist load failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": sanitize_error(&e)
-            })))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": sanitize_error(&e)
+                })),
+            )
         }
     }
 }
@@ -1307,15 +1586,21 @@ async fn add_blacklist_handler(
 ) -> impl IntoResponse {
     // VUL-05: Reject invalid domain names (empty, root zone, Unicode, etc.)
     if let Err(e) = validate_dns_name(&req.domain) {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_NAME", "details": e
-        })));
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_NAME", "details": e
+            })),
+        );
     }
     if let Some(ref desc) = req.description {
         if let Err(e) = validate_no_control_chars(desc, "description") {
-            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                "error": "INVALID_FIELD", "details": e
-            })));
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error": "INVALID_FIELD", "details": e
+                })),
+            );
         }
     }
     // Persist + inject atomically under zones_mutex (same race-fix as add_dns).
@@ -1324,23 +1609,29 @@ async fn add_blacklist_handler(
 
         let mut bl = store::load_blacklist().unwrap_or_default();
         if bl.entries.len() >= MAX_BLACKLIST_ENTRIES {
-            return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
-                "error": "LIMIT_EXCEEDED",
-                "details": format!("Maximum {} blacklist entries reached", MAX_BLACKLIST_ENTRIES)
-            })));
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                JsonExtract(serde_json::json!({
+                    "error": "LIMIT_EXCEEDED",
+                    "details": format!("Maximum {} blacklist entries reached", MAX_BLACKLIST_ENTRIES)
+                })),
+            );
         }
         let entry = BlacklistEntry {
-            id:          uuid::Uuid::new_v4().to_string(),
-            domain:      req.domain.clone(),
-            action:      req.action.clone(),
+            id: uuid::Uuid::new_v4().to_string(),
+            domain: req.domain.clone(),
+            action: req.action.clone(),
             description: req.description.clone(),
         };
         bl.entries.push(entry.clone());
         if let Err(e) = store::save_blacklist(&bl) {
             warn!(err = %e, "blacklist save failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": sanitize_error(&e)
-            })));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": sanitize_error(&e)
+                })),
+            );
         }
 
         let current = s.zones.load_full();
@@ -1354,19 +1645,32 @@ async fn add_blacklist_handler(
     };
 
     info!(domain=%req.domain, action=?req.action, "Blacklist entry added");
-    s.audit.send(AuditEvent::BlacklistAdd { domain: entry.domain.clone() });
+    s.audit.send(AuditEvent::BlacklistAdd {
+        domain: entry.domain.clone(),
+    });
     if let Some(ref j) = s.sync_journal {
-        j.push(SyncOp::AddBlacklist { entry: entry.clone() });
+        j.push(SyncOp::AddBlacklist {
+            entry: entry.clone(),
+        });
         if let Some(ref k) = s.sync_key {
             if let Ok(b) = serde_json::to_vec(&entry) {
-                relay::push_to_slaves(j, k, Method::POST, "blacklist".to_string(), bytes::Bytes::from(b));
+                relay::push_to_slaves(
+                    j,
+                    k,
+                    Method::POST,
+                    "blacklist".to_string(),
+                    bytes::Bytes::from(b),
+                );
             }
         }
     }
-    (StatusCode::CREATED, JsonExtract(serde_json::json!({
-        "status": "ok",
-        "entry": entry
-    })))
+    (
+        StatusCode::CREATED,
+        JsonExtract(serde_json::json!({
+            "status": "ok",
+            "entry": entry
+        })),
+    )
 }
 
 async fn delete_blacklist_handler(
@@ -1379,17 +1683,26 @@ async fn delete_blacklist_handler(
         Ok(b) => b,
         Err(e) => {
             warn!(err = %e, "blacklist load failed in delete");
-            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": sanitize_error(&e)})));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({"error": sanitize_error(&e)})),
+            );
         }
     };
     let pos = bl.entries.iter().position(|e| e.id == id);
     let Some(pos) = pos else {
-        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"NOT_FOUND","id":id})));
+        return (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({"error":"NOT_FOUND","id":id})),
+        );
     };
     let removed = bl.entries.remove(pos);
     if let Err(e) = store::save_blacklist(&bl) {
         warn!(err = %e, "blacklist save failed in delete");
-        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error": sanitize_error(&e)})));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({"error": sanitize_error(&e)})),
+        );
     }
 
     let current = s.zones.load_full();
@@ -1402,30 +1715,46 @@ async fn delete_blacklist_handler(
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::DeleteBlacklist { id: id.clone() });
         if let Some(ref k) = s.sync_key {
-            relay::push_to_slaves(j, k, Method::DELETE, format!("blacklist/{id}"), bytes::Bytes::new());
+            relay::push_to_slaves(
+                j,
+                k,
+                Method::DELETE,
+                format!("blacklist/{id}"),
+                bytes::Bytes::new(),
+            );
         }
     }
-    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id,"domain":removed.domain})))
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({"status":"ok","deleted_id":id,"domain":removed.domain})),
+    )
 }
 
 // ── Feeds ──────────────────────────────────────────────────────────────────
 
 async fn get_feeds_handler(State(_s): State<AppState>) -> impl IntoResponse {
     let config = feeds::load_feeds().unwrap_or_default();
-    let feeds: Vec<serde_json::Value> = config.feeds.iter().map(|f| {
-        let blocked_count: serde_json::Value = if f.enabled {
-            serde_json::json!(feeds::load_feed_domains(&f.id).len())
-        } else {
-            serde_json::Value::Null
-        };
-        let mut v = serde_json::to_value(f).unwrap_or_default();
-        if let serde_json::Value::Object(ref mut m) = v {
-            m.insert("blocked_count".to_string(), blocked_count);
-        }
-        v
-    }).collect();
+    let feeds: Vec<serde_json::Value> = config
+        .feeds
+        .iter()
+        .map(|f| {
+            let blocked_count: serde_json::Value = if f.enabled {
+                serde_json::json!(feeds::load_feed_domains(&f.id).len())
+            } else {
+                serde_json::Value::Null
+            };
+            let mut v = serde_json::to_value(f).unwrap_or_default();
+            if let serde_json::Value::Object(ref mut m) = v {
+                m.insert("blocked_count".to_string(), blocked_count);
+            }
+            v
+        })
+        .collect();
     let total = feeds.len();
-    (StatusCode::OK, JsonExtract(serde_json::json!({"feeds": feeds, "total": total})))
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({"feeds": feeds, "total": total})),
+    )
 }
 
 async fn add_feed_handler(
@@ -1435,32 +1764,42 @@ async fn add_feed_handler(
     // Enforce subscription cap before attempting download/validation.
     let current = feeds::load_feeds().unwrap_or_default();
     if current.feeds.len() >= MAX_FEEDS {
-        return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
-            "error": "LIMIT_EXCEEDED",
-            "details": format!("Maximum {} feed subscriptions reached", MAX_FEEDS)
-        })));
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            JsonExtract(serde_json::json!({
+                "error": "LIMIT_EXCEEDED",
+                "details": format!("Maximum {} feed subscriptions reached", MAX_FEEDS)
+            })),
+        );
     }
     match add_feed(p.name, p.url, p.format, p.action, p.description).await {
         Ok(feed) => {
             info!("Feed added: {} ({})", feed.name, feed.url);
             s.audit.send(AuditEvent::FeedAdd {
-                id:   feed.id.clone(),
+                id: feed.id.clone(),
                 name: feed.name.clone(),
-                url:  feed.url.clone(),
+                url: feed.url.clone(),
             });
             if let Some(ref j) = s.sync_journal {
                 j.push(SyncOp::AddFeed { feed: feed.clone() });
             }
-            (StatusCode::CREATED, JsonExtract(serde_json::json!({
-                "status": "ok", "feed": feed,
-                "message": "Run POST /feeds/:id/update to fetch domains."
-            })))
+            (
+                StatusCode::CREATED,
+                JsonExtract(serde_json::json!({
+                    "status": "ok", "feed": feed,
+                    "message": "Run POST /feeds/:id/update to fetch domains."
+                })),
+            )
         }
         Err(e) => {
-            let code = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (code, JsonExtract(serde_json::json!({
-                "error": "FEED_ERROR", "details": e.to_string()
-            })))
+            let code =
+                StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (
+                code,
+                JsonExtract(serde_json::json!({
+                    "error": "FEED_ERROR", "details": e.to_string()
+                })),
+            )
         }
     }
 }
@@ -1475,10 +1814,19 @@ async fn delete_feed_handler(
             if let Some(ref j) = s.sync_journal {
                 j.push(SyncOp::DeleteFeed { id: id.clone() });
             }
-            (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","deleted_id":id})))
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({"status":"ok","deleted_id":id})),
+            )
         }
-        Err(crate::error::AppError::BadRequest(msg)) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"BAD_REQUEST","details":msg}))),
-        Err(e) => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"FEED_NOT_FOUND","details":e.to_string()}))),
+        Err(crate::error::AppError::BadRequest(msg)) => (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error":"BAD_REQUEST","details":msg})),
+        ),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({"error":"FEED_NOT_FOUND","details":e.to_string()})),
+        ),
     }
 }
 
@@ -1486,17 +1834,23 @@ async fn update_feeds_handler(State(s): State<AppState>) -> impl IntoResponse {
     match update_all_feeds().await {
         Ok(results) => {
             let updated = results.iter().filter(|r| r.status == "updated").count();
-            let errors  = results.iter().filter(|r| r.status == "error").count();
+            let errors = results.iter().filter(|r| r.status == "error").count();
             // Rebuild zone set so newly downloaded feed domains are immediately active.
             let new_zones = crate::build_zone_set(&s.cfg);
             s.zones.store(std::sync::Arc::new(new_zones));
             info!(updated, errors, "Feed update complete — zones rebuilt");
-            (StatusCode::OK, JsonExtract(serde_json::json!({
-                "status": "ok", "results": results,
-                "summary": {"updated": updated, "errors": errors}
-            })))
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "status": "ok", "results": results,
+                    "summary": {"updated": updated, "errors": errors}
+                })),
+            )
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error":e.to_string()}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({"error":e.to_string()})),
+        ),
     }
 }
 
@@ -1517,14 +1871,27 @@ async fn update_one_feed_handler(
             s.zones.store(std::sync::Arc::new(new_zones));
             if result.error.is_none() {
                 if let (Some(j), Some(url)) = (s.sync_journal.as_ref(), feed_url) {
-                    j.push(SyncOp::UpdateFeed { id: id.clone(), url });
+                    j.push(SyncOp::UpdateFeed {
+                        id: id.clone(),
+                        url,
+                    });
                 }
             }
-            let code = if result.error.is_some() { StatusCode::INTERNAL_SERVER_ERROR } else { StatusCode::OK };
+            let code = if result.error.is_some() {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::OK
+            };
             (code, JsonExtract(serde_json::json!({"result": result})))
         }
-        Err(crate::error::AppError::BadRequest(msg)) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"BAD_REQUEST","details":msg}))),
-        Err(e) => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":e.to_string()}))),
+        Err(crate::error::AppError::BadRequest(msg)) => (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error":"BAD_REQUEST","details":msg})),
+        ),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({"error":e.to_string()})),
+        ),
     }
 }
 
@@ -1536,11 +1903,16 @@ async fn feed_presets_handler() -> impl IntoResponse {
 /// #33: rebuild per-upstream resolvers if racing is enabled.
 /// Called after any upstream list change (add, delete, reconnect).
 fn rebuild_racing_resolvers(s: &AppState) {
-    if !s.cfg.upstream_racing { return; }
+    if !s.cfg.upstream_racing {
+        return;
+    }
     let addrs = upstreams::upstream_addrs(&s.upstreams);
     match crate::dns::server::build_per_upstream_resolvers(&addrs, s.cfg.dnssec_validation) {
         Ok(vec) => {
-            info!(count = vec.len(), "upstream-racing: per-upstream resolvers rebuilt");
+            info!(
+                count = vec.len(),
+                "upstream-racing: per-upstream resolvers rebuilt"
+            );
             s.per_upstream_resolvers.store(Arc::new(vec));
         }
         Err(e) => warn!(err = %e, "upstream-racing: rebuild failed — racing resolvers unchanged"),
@@ -1551,38 +1923,48 @@ fn rebuild_racing_resolvers(s: &AppState) {
 
 async fn upstreams_handler(State(s): State<AppState>) -> impl IntoResponse {
     let statuses = match s.upstreams.read() {
-        Ok(g)  => g.clone(),
+        Ok(g) => g.clone(),
         Err(e) => {
             error!(err = %e, "upstreams RwLock poisoned");
-            return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": "INTERNAL", "details": "upstream state unavailable"
-            }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": "INTERNAL", "details": "upstream state unavailable"
+                })),
+            )
+                .into_response();
         }
     };
-    let total   = statuses.len();
+    let total = statuses.len();
     let healthy = statuses.iter().filter(|u| u.healthy).count();
-    (StatusCode::OK, JsonExtract(serde_json::json!({
-        "upstreams": statuses,
-        "total":     total,
-        "healthy":   healthy,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({
+            "upstreams": statuses,
+            "total":     total,
+            "healthy":   healthy,
+        })),
+    )
+        .into_response()
 }
 
 // ── POST /api/upstreams ────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct AddUpstreamRequest {
-    addr:         String,
+    addr: String,
     #[serde(default = "default_protocol")]
-    protocol:     String,
-    name:         Option<String>,
+    protocol: String,
+    name: Option<String>,
     /// Explicit port. Defaults to 53 (UDP) or 853 (DoT) if omitted.
-    port:         Option<u16>,
+    port: Option<u16>,
     /// #56: TLS SNI hostname for DoT upstreams. If absent, derived automatically
     /// from well-known IPs (Cloudflare, Google, Quad9, OpenDNS).
     tls_hostname: Option<String>,
 }
-fn default_protocol() -> String { "udp".into() }
+fn default_protocol() -> String {
+    "udp".into()
+}
 
 async fn add_upstream_handler(
     State(s): State<AppState>,
@@ -1590,16 +1972,24 @@ async fn add_upstream_handler(
 ) -> impl IntoResponse {
     // Validate protocol
     if req.protocol != "udp" && req.protocol != "dot" {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_PROTOCOL", "details": "protocol must be 'udp' or 'dot'"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_PROTOCOL", "details": "protocol must be 'udp' or 'dot'"
+            })),
+        )
+            .into_response();
     }
     // Validate addr is a valid IP (no @ syntax — port is a separate field now)
     let ip: IpAddr = match req.addr.parse() {
         Ok(ip) => ip,
-        Err(_) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_ADDR", "details": "addr must be a valid IP address (e.g. 1.1.1.1)"
-        }))).into_response(),
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_ADDR", "details": "addr must be a valid IP address (e.g. 1.1.1.1)"
+            })),
+        )
+            .into_response(),
     };
     // SEC-NEW-01: normalize IPv6-mapped/compatible IPv4 (::ffff:x.x.x.x and ::x.x.x.x) before
     // checks. to_ipv4() covers both mapped and deprecated IPv4-compatible forms; to_ipv4_mapped()
@@ -1618,48 +2008,79 @@ async fn add_upstream_handler(
     };
     // FIX #40: reject loopback and IPv4 link-local
     if ip.is_loopback() {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_ADDR",
-            "details": "loopback addresses cannot be used as upstream resolvers"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_ADDR",
+                "details": "loopback addresses cannot be used as upstream resolvers"
+            })),
+        )
+            .into_response();
     }
     if let IpAddr::V4(v4) = ip {
         if v4.is_link_local() {
-            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                "error": "INVALID_ADDR",
-                "details": "link-local addresses cannot be used as upstream resolvers"
-            }))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error": "INVALID_ADDR",
+                    "details": "link-local addresses cannot be used as upstream resolvers"
+                })),
+            )
+                .into_response();
         }
     }
     // SEC-11: reject unspecified (0.0.0.0 / ::) — routes to loopback on Linux (SSRF)
     if ip.is_unspecified() {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_ADDR",
-            "details": "unspecified addresses cannot be used as upstream resolvers"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_ADDR",
+                "details": "unspecified addresses cannot be used as upstream resolvers"
+            })),
+        )
+            .into_response();
     }
     // FIX #44: resolve port with sensible defaults; reject port 0
     let default_port: u16 = if req.protocol == "dot" { 853 } else { 53 };
     let port = req.port.unwrap_or(default_port);
     if port == 0 {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_PORT", "details": "port must be between 1 and 65535"
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_PORT", "details": "port must be between 1 and 65535"
+            })),
+        )
+            .into_response();
     }
 
     // #56: validate optional tls_hostname
     let tls_hostname = match validate_tls_hostname(req.tls_hostname.as_deref()) {
         Ok(h) => h,
-        Err(e) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_FIELD", "details": e
-        }))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error": "INVALID_FIELD", "details": e
+                })),
+            )
+                .into_response()
+        }
     };
 
-    let entry = upstreams::add_upstream(&s.upstreams, req.addr, port, req.protocol, req.name, tls_hostname);
+    let entry = upstreams::add_upstream(
+        &s.upstreams,
+        req.addr,
+        port,
+        req.protocol,
+        req.name,
+        tls_hostname,
+    );
 
     // Rebuild resolver with updated upstream list
     let addrs = upstreams::upstream_addrs(&s.upstreams);
-    if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
+    if let Err(e) =
+        crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await
+    {
         warn!(%e, "resolver rebuild after upstream add failed — upstream added but DNS unchanged");
     }
     rebuild_racing_resolvers(&s);
@@ -1669,8 +2090,10 @@ async fn add_upstream_handler(
     info!(id = %entry.id, addr = %entry.addr, port = entry.port, protocol = %entry.protocol, "upstream added via API");
     if let (Some(ref j), Some(ref k)) = (&s.sync_journal, &s.sync_key) {
         j.push(SyncOp::AddUpstream {
-            addr: entry.addr.clone(), port: entry.port,
-            protocol: entry.protocol.clone(), name: entry.name.clone(),
+            addr: entry.addr.clone(),
+            port: entry.port,
+            protocol: entry.protocol.clone(),
+            name: entry.name.clone(),
             tls_hostname: entry.tls_hostname.clone(),
         });
         let body = serde_json::json!({
@@ -1678,12 +2101,22 @@ async fn add_upstream_handler(
             "protocol": entry.protocol, "name": entry.name, "tls_hostname": entry.tls_hostname,
         });
         if let Ok(b) = serde_json::to_vec(&body) {
-            relay::push_to_slaves(j, k, Method::POST, "upstreams".to_string(), bytes::Bytes::from(b));
+            relay::push_to_slaves(
+                j,
+                k,
+                Method::POST,
+                "upstreams".to_string(),
+                bytes::Bytes::from(b),
+            );
         }
     }
-    (StatusCode::CREATED, JsonExtract(serde_json::json!({
-        "status": "ok", "upstream": entry
-    }))).into_response()
+    (
+        StatusCode::CREATED,
+        JsonExtract(serde_json::json!({
+            "status": "ok", "upstream": entry
+        })),
+    )
+        .into_response()
 }
 
 // ── DELETE /api/upstreams/:id ──────────────────────────────────────────────
@@ -1694,31 +2127,43 @@ async fn delete_upstream_handler(
 ) -> impl IntoResponse {
     // FIX #41: refuse to delete the last upstream — resolver would be empty.
     {
-        let list = s.upstreams.read()
+        let list = s
+            .upstreams
+            .read()
             .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in delete handler: {e}"));
         let target_exists = list.iter().any(|u| u.id == id);
         if target_exists && list.len() == 1 {
-            return (StatusCode::CONFLICT, JsonExtract(serde_json::json!({
-                "error":   "LAST_UPSTREAM",
-                "details": "cannot delete the last upstream resolver"
-            }))).into_response();
+            return (
+                StatusCode::CONFLICT,
+                JsonExtract(serde_json::json!({
+                    "error":   "LAST_UPSTREAM",
+                    "details": "cannot delete the last upstream resolver"
+                })),
+            )
+                .into_response();
         }
     }
 
     // #57: if this is a config-file upstream, remove its forward-addr from unbound.conf.
     {
-        let list = s.upstreams.read()
+        let list = s
+            .upstreams
+            .read()
             .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in delete handler: {e}"));
         if let Some(u) = list.iter().find(|u| u.id == id) {
             if u.source == "config" {
-                let addr  = u.addr.clone();
-                let port  = u.port;
-                let path  = s.cfg_path.clone();
+                let addr = u.addr.clone();
+                let port = u.port;
+                let path = s.cfg_path.clone();
                 drop(list);
                 match upstreams::remove_forward_addr_from_config(&path, &addr, port) {
-                    Ok(true)  => info!(id = %id, addr = %addr, cfg = %path, "config upstream removed from unbound.conf"),
-                    Ok(false) => warn!(id = %id, addr = %addr, "forward-addr line not found in config"),
-                    Err(e)    => warn!(%e, id = %id, addr = %addr, "failed to edit unbound.conf"),
+                    Ok(true) => {
+                        info!(id = %id, addr = %addr, cfg = %path, "config upstream removed from unbound.conf")
+                    }
+                    Ok(false) => {
+                        warn!(id = %id, addr = %addr, "forward-addr line not found in config")
+                    }
+                    Err(e) => warn!(%e, id = %id, addr = %addr, "failed to edit unbound.conf"),
                 }
             }
         }
@@ -1727,7 +2172,10 @@ async fn delete_upstream_handler(
     match upstreams::remove_upstream(&s.upstreams, &id) {
         Some(removed) => {
             let addrs = upstreams::upstream_addrs(&s.upstreams);
-            if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
+            if let Err(e) =
+                crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation)
+                    .await
+            {
                 warn!(%e, "resolver rebuild after upstream delete failed");
             }
             rebuild_racing_resolvers(&s);
@@ -1736,15 +2184,29 @@ async fn delete_upstream_handler(
             info!(id = %id, addr = %removed.addr, "upstream deleted via API");
             if let (Some(ref j), Some(ref k)) = (&s.sync_journal, &s.sync_key) {
                 j.push(SyncOp::DeleteUpstream { id: id.clone() });
-                relay::push_to_slaves(j, k, Method::DELETE, format!("upstreams/{id}"), bytes::Bytes::new());
+                relay::push_to_slaves(
+                    j,
+                    k,
+                    Method::DELETE,
+                    format!("upstreams/{id}"),
+                    bytes::Bytes::new(),
+                );
             }
-            (StatusCode::OK, JsonExtract(serde_json::json!({
-                "status": "ok", "deleted_id": id, "addr": removed.addr
-            }))).into_response()
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "status": "ok", "deleted_id": id, "addr": removed.addr
+                })),
+            )
+                .into_response()
         }
-        None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
-            "error": "NOT_FOUND", "id": id
-        }))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({
+                "error": "NOT_FOUND", "id": id
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1777,16 +2239,22 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
     // FEAT #46: cooldown guard — reject if called too soon after the last flush.
     let cooldown = s.cfg.cache_flush_cooldown;
     if cooldown > 0 {
-        let mut last = s.last_flush_at.lock()
+        let mut last = s
+            .last_flush_at
+            .lock()
             .unwrap_or_else(|e| panic!("last_flush_at poisoned: {e}"));
         if let Some(t) = *last {
             let elapsed = t.elapsed().as_secs();
             if elapsed < cooldown {
                 let retry_after = cooldown - elapsed;
-                let mut resp = (StatusCode::TOO_MANY_REQUESTS, JsonExtract(serde_json::json!({
-                    "error": "FLUSH_COOLDOWN",
-                    "retry_after_secs": retry_after
-                }))).into_response();
+                let mut resp = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    JsonExtract(serde_json::json!({
+                        "error": "FLUSH_COOLDOWN",
+                        "retry_after_secs": retry_after
+                    })),
+                )
+                    .into_response();
                 resp.headers_mut().insert(
                     axum::http::header::RETRY_AFTER,
                     axum::http::HeaderValue::from_str(&retry_after.to_string())
@@ -1800,22 +2268,30 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
     }
 
     let before = s.stats.snapshot().cache_entries;
-    let addrs  = upstreams::upstream_addrs(&s.upstreams);
+    let addrs = upstreams::upstream_addrs(&s.upstreams);
     match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
         Ok(_warmed) => {
             s.stats.reset_cache();
             s.cache_evictions.store(0, Ordering::Relaxed);
             info!(flushed = before, "DNS cache flushed via API");
             s.audit.send(AuditEvent::ConfigReload);
-            (StatusCode::OK, JsonExtract(serde_json::json!({
-                "status": "ok", "flushed_entries": before
-            }))).into_response()
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "status": "ok", "flushed_entries": before
+                })),
+            )
+                .into_response()
         }
         Err(e) => {
             warn!(%e, "cache flush: resolver rebuild failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-                "error": "FLUSH_FAILED", "details": sanitize_error(&e)
-            }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": "FLUSH_FAILED", "details": sanitize_error(&e)
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -1846,23 +2322,37 @@ async fn patch_upstream_handler(
         Some(serde_json::Value::String(s)) if s.is_empty() => Some(None),
         Some(serde_json::Value::String(s)) => {
             if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
-                return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                    "error":   "INVALID_FIELD",
-                    "details": "name must not contain control characters"
-                }))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    JsonExtract(serde_json::json!({
+                        "error":   "INVALID_FIELD",
+                        "details": "name must not contain control characters"
+                    })),
+                )
+                    .into_response();
             }
             if s.len() > 64 {
-                return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                    "error":   "INVALID_FIELD",
-                    "details": "name must not exceed 64 characters"
-                }))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    JsonExtract(serde_json::json!({
+                        "error":   "INVALID_FIELD",
+                        "details": "name must not exceed 64 characters"
+                    })),
+                )
+                    .into_response();
             }
             Some(Some(s.clone()))
         }
-        _ => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error":   "INVALID_FIELD",
-            "details": "field 'name' must be a string or null"
-        }))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error":   "INVALID_FIELD",
+                    "details": "field 'name' must be a string or null"
+                })),
+            )
+                .into_response()
+        }
     };
 
     // Resolve tls_hostname: absent → skip; null or "" → None (clear); non-empty → Some(s).
@@ -1870,27 +2360,43 @@ async fn patch_upstream_handler(
         None => None,
         Some(serde_json::Value::Null) => Some(None),
         Some(serde_json::Value::String(s)) if s.trim().is_empty() => Some(None),
-        Some(serde_json::Value::String(s)) => {
-            match validate_tls_hostname(Some(s.as_str())) {
-                Ok(h)  => Some(h),
-                Err(e) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                    "error": "INVALID_FIELD", "details": e
-                }))).into_response(),
+        Some(serde_json::Value::String(s)) => match validate_tls_hostname(Some(s.as_str())) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    JsonExtract(serde_json::json!({
+                        "error": "INVALID_FIELD", "details": e
+                    })),
+                )
+                    .into_response()
             }
+        },
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error":   "INVALID_FIELD",
+                    "details": "field 'tls_hostname' must be a string or null"
+                })),
+            )
+                .into_response()
         }
-        _ => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error":   "INVALID_FIELD",
-            "details": "field 'tls_hostname' must be a string or null"
-        }))).into_response(),
     };
 
     // Apply both patches in a single write-lock acquisition.
     let updated = {
-        let mut list = s.upstreams.write()
+        let mut list = s
+            .upstreams
+            .write()
             .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in patch handler: {e}"));
         if let Some(u) = list.iter_mut().find(|u| u.id == id) {
-            if let Some(n) = name_patch        { u.name         = n; }
-            if let Some(h) = tls_patch         { u.tls_hostname = h; }
+            if let Some(n) = name_patch {
+                u.name = n;
+            }
+            if let Some(h) = tls_patch {
+                u.tls_hostname = h;
+            }
             Some(u.clone())
         } else {
             None
@@ -1901,13 +2407,21 @@ async fn patch_upstream_handler(
         Some(u) => {
             upstreams::save_upstreams(&s.upstreams, &s.base_dir);
             info!(id = %id, "upstream patched via PATCH");
-            (StatusCode::OK, JsonExtract(serde_json::json!({
-                "status": "ok", "upstream": u
-            }))).into_response()
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "status": "ok", "upstream": u
+                })),
+            )
+                .into_response()
         }
-        None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
-            "error": "NOT_FOUND", "id": id
-        }))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({
+                "error": "NOT_FOUND", "id": id
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1919,29 +2433,40 @@ async fn probe_upstream_handler(
 ) -> impl IntoResponse {
     // a. Find upstream by id (read lock) — 404 if not found
     let probe_target = {
-        let list = s.upstreams.read()
-            .unwrap_or_else(|e| e.into_inner());
+        let list = s.upstreams.read().unwrap_or_else(|e| e.into_inner());
         list.iter()
             .find(|u| u.id == id)
             .map(|u| (u.addr.clone(), u.port, u.protocol.clone()))
     };
     let (addr, port, protocol) = match probe_target {
         Some(t) => t,
-        None => return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
-            "error": "NOT_FOUND", "id": id
-        }))).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                JsonExtract(serde_json::json!({
+                    "error": "NOT_FOUND", "id": id
+                })),
+            )
+                .into_response()
+        }
     };
 
     // b. Run probe in spawn_blocking (blocking I/O)
-    let result = tokio::task::spawn_blocking(move || {
-        upstreams::probe_upstream(&addr, port, &protocol)
-    }).await;
+    let result =
+        tokio::task::spawn_blocking(move || upstreams::probe_upstream(&addr, port, &protocol))
+            .await;
 
     let (healthy, latency_ms, dnssec_supported, last_error) = match result {
         Ok(r) => r,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-            "error": "PROBE_FAILED"
-        }))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": "PROBE_FAILED"
+                })),
+            )
+                .into_response()
+        }
     };
 
     // c. Write result back (write lock, find by id)
@@ -1952,14 +2477,13 @@ async fn probe_upstream_handler(
             .as_secs(),
     );
     let updated = {
-        let mut list = s.upstreams.write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut list = s.upstreams.write().unwrap_or_else(|e| e.into_inner());
         if let Some(u) = list.iter_mut().find(|u| u.id == id) {
-            u.healthy          = healthy;
-            u.latency_ms       = latency_ms;
+            u.healthy = healthy;
+            u.latency_ms = latency_ms;
             u.dnssec_supported = if healthy { dnssec_supported } else { None };
-            u.last_error       = if healthy { None } else { last_error };
-            u.last_check       = now_str;
+            u.last_error = if healthy { None } else { last_error };
+            u.last_check = now_str;
             if healthy {
                 if let Some(lat) = latency_ms {
                     upstreams::push_latency(&mut u.latency_history, lat);
@@ -1972,12 +2496,20 @@ async fn probe_upstream_handler(
     };
 
     match updated {
-        Some(u) => (StatusCode::OK, JsonExtract(serde_json::json!({
-            "status": "ok", "upstream": u
-        }))).into_response(),
-        None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
-            "error": "NOT_FOUND", "id": id
-        }))).into_response(),
+        Some(u) => (
+            StatusCode::OK,
+            JsonExtract(serde_json::json!({
+                "status": "ok", "upstream": u
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({
+                "error": "NOT_FOUND", "id": id
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1990,12 +2522,21 @@ async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResp
     // warm_up() is called inside rebuild_and_swap — it probes before the ArcSwap
     // so that TCP/TLS connections are live before any query reaches the new resolver.
     let addrs = crate::upstreams::upstream_addrs(&s.upstreams);
-    let warm_up = match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation).await {
-        Ok(w) => w,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({
-            "error": "REBUILD_FAILED", "details": e.to_string()
-        }))).into_response(),
-    };
+    let warm_up =
+        match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.cfg.dnssec_validation)
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonExtract(serde_json::json!({
+                        "error": "REBUILD_FAILED", "details": e.to_string()
+                    })),
+                )
+                    .into_response()
+            }
+        };
 
     s.stats.record_dot_reconnect();
     rebuild_racing_resolvers(&s);
@@ -2003,7 +2544,8 @@ async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResp
     // Probe every DoT upstream in parallel to report reconnected vs failed.
     // UDP upstreams are ignored.
     let dot_targets: Vec<(String, u16)> = {
-        s.upstreams.read()
+        s.upstreams
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|u| u.protocol == "dot")
@@ -2019,44 +2561,60 @@ async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResp
     }
 
     let mut reconnected = 0u32;
-    let mut failed      = 0u32;
+    let mut failed = 0u32;
     for task in probe_tasks {
         match task.await {
-            Ok((healthy, _, _, _)) => if healthy { reconnected += 1; } else { failed += 1; },
-            Err(_)                 => { failed += 1; }
+            Ok((healthy, _, _, _)) => {
+                if healthy {
+                    reconnected += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            Err(_) => {
+                failed += 1;
+            }
         }
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    (StatusCode::OK, JsonExtract(serde_json::json!({
-        "reconnected": reconnected,
-        "failed":      failed,
-        "warm_up":     warm_up,
-        "duration_ms": duration_ms,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({
+            "reconnected": reconnected,
+            "failed":      failed,
+            "warm_up":     warm_up,
+            "duration_ms": duration_ms,
+        })),
+    )
+        .into_response()
 }
 
 // ── GET /api/cache/stats ───────────────────────────────────────────────────
 
 async fn cache_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let hits      = s.stats.cache_hits.load(Ordering::Relaxed);
-    let misses    = s.stats.cache_misses.load(Ordering::Relaxed);
+    let hits = s.stats.cache_hits.load(Ordering::Relaxed);
+    let misses = s.stats.cache_misses.load(Ordering::Relaxed);
     let evictions = s.cache_evictions.load(Ordering::Relaxed);
-    let entries   = s.stats.cache_entries.load(Ordering::Relaxed);
-    let total     = hits + misses;
+    let entries = s.stats.cache_entries.load(Ordering::Relaxed);
+    let total = hits + misses;
     let hit_rate_pct = if total == 0 {
         serde_json::Value::Null
     } else {
         let pct = (hits as f64 / total as f64 * 1000.0).round() / 10.0;
         serde_json::json!(pct)
     };
-    (StatusCode::OK, JsonExtract(serde_json::json!({
-        "entries":      entries,
-        "hits":         hits,
-        "misses":       misses,
-        "evictions":    evictions,
-        "hit_rate_pct": hit_rate_pct,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({
+            "entries":      entries,
+            "hits":         hits,
+            "misses":       misses,
+            "evictions":    evictions,
+            "hit_rate_pct": hit_rate_pct,
+        })),
+    )
+        .into_response()
 }
 
 // ── GET /api/sync/slaves ───────────────────────────────────────────────────
@@ -2065,23 +2623,29 @@ async fn sync_slaves_handler(State(s): State<AppState>) -> impl IntoResponse {
     match &s.sync_journal {
         Some(journal) => {
             let slaves = journal.connected_slaves();
-            let total  = slaves.len();
-            (StatusCode::OK, JsonExtract(serde_json::json!({
-                "slaves": slaves, "total": total
-            }))).into_response()
+            let total = slaves.len();
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "slaves": slaves, "total": total
+                })),
+            )
+                .into_response()
         }
-        None => (StatusCode::OK, JsonExtract(serde_json::json!({
-            "slaves": [], "total": 0,
-            "note": "this node is not configured as master (no sync-port directive)"
-        }))).into_response(),
+        None => (
+            StatusCode::OK,
+            JsonExtract(serde_json::json!({
+                "slaves": [], "total": 0,
+                "note": "this node is not configured as master (no sync-port directive)"
+            })),
+        )
+            .into_response(),
     }
 }
 
 // ── GET /events — SSE node-status stream (#86) ────────────────────────────
 
-async fn events_handler(
-    State(s): State<AppState>,
-) -> impl IntoResponse {
+async fn events_handler(State(s): State<AppState>) -> impl IntoResponse {
     let Some(ref tx) = s.events_tx else {
         return (
             StatusCode::NOT_FOUND,
@@ -2089,18 +2653,17 @@ async fn events_handler(
                 "error": "NOT_FOUND",
                 "detail": "this node is not a master or has no sync-port configured"
             })),
-        ).into_response();
+        )
+            .into_response();
     };
     let rx = tx.subscribe();
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
-                Ok(event) => {
-                    match Event::default().json_data(&event) {
-                        Ok(e)  => return Some((Ok::<_, Infallible>(e), rx)),
-                        Err(_) => continue,
-                    }
-                }
+                Ok(event) => match Event::default().json_data(&event) {
+                    Ok(e) => return Some((Ok::<_, Infallible>(e), rx)),
+                    Err(_) => continue,
+                },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     let e = Event::default().comment(format!("lagged: {n} events dropped"));
                     return Some((Ok(e), rx));
@@ -2122,33 +2685,45 @@ const LOG_LIMIT_DEFAULT: usize = 100;
 #[derive(Deserialize)]
 struct LogsParams {
     #[serde(default = "default_log_limit")]
-    limit:  usize,
+    limit: usize,
     #[serde(default)]
-    page:   usize,
+    page: usize,
     action: Option<String>,
     client: Option<String>,
-    since:  Option<u64>,
+    since: Option<u64>,
 }
 
-fn default_log_limit() -> usize { LOG_LIMIT_DEFAULT }
+fn default_log_limit() -> usize {
+    LOG_LIMIT_DEFAULT
+}
 
 async fn logs_handler(
-    State(s):      State<AppState>,
+    State(s): State<AppState>,
     params_result: Result<Query<LogsParams>, QueryRejection>,
 ) -> Response {
     let Query(params) = match params_result {
         Ok(q) => q,
-        Err(e) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error":   "INVALID_PARAM",
-            "details": e.to_string()
-        }))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error":   "INVALID_PARAM",
+                    "details": e.to_string()
+                })),
+            )
+                .into_response()
+        }
     };
 
     if params.limit > LOG_LIMIT_MAX {
-        return (StatusCode::UNPROCESSABLE_ENTITY, JsonExtract(serde_json::json!({
-            "error":   "INVALID_PARAM",
-            "details": format!("limit must be ≤ {}", LOG_LIMIT_MAX),
-        }))).into_response();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            JsonExtract(serde_json::json!({
+                "error":   "INVALID_PARAM",
+                "details": format!("limit must be ≤ {}", LOG_LIMIT_MAX),
+            })),
+        )
+            .into_response();
     }
 
     let action = match params.action.as_deref() {
@@ -2165,17 +2740,23 @@ async fn logs_handler(
     let client = match params.client.as_deref() {
         Some(s) => match s.parse::<std::net::IpAddr>() {
             Ok(ip) => Some(ip),
-            Err(_) => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-                "error":   "INVALID_PARAM",
-                "details": format!("client '{}' is not a valid IP address", s),
-            }))).into_response(),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    JsonExtract(serde_json::json!({
+                        "error":   "INVALID_PARAM",
+                        "details": format!("client '{}' is not a valid IP address", s),
+                    })),
+                )
+                    .into_response()
+            }
         },
         None => None,
     };
 
     let q = LogQuery {
-        limit:      params.limit,
-        page:       params.page,
+        limit: params.limit,
+        page: params.page,
         action,
         client,
         since_secs: params.since,
@@ -2187,21 +2768,24 @@ async fn logs_handler(
         "total":   total,
         "page":    params.page,
         "limit":   params.limit,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 // ── DELETE /logs ───────────────────────────────────────────────────────────
 
-async fn clear_logs_handler(
-    State(s): State<AppState>,
-) -> impl IntoResponse {
+async fn clear_logs_handler(State(s): State<AppState>) -> impl IntoResponse {
     let deleted = s.log_buffer.clear();
     s.audit.send(AuditEvent::LogsClear { count: deleted });
-    info!(entries_deleted = deleted, "log buffer cleared via DELETE /logs");
+    info!(
+        entries_deleted = deleted,
+        "log buffer cleared via DELETE /logs"
+    );
     JsonExtract(serde_json::json!({
         "message":         "log buffer cleared",
         "entries_deleted": deleted,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 // ── TLS status ─────────────────────────────────────────────────────────────
@@ -2232,7 +2816,9 @@ async fn tls_status_handler(State(s): State<AppState>) -> impl IntoResponse {
 // ── GET /audit/tail ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct AuditTailQuery { n: Option<usize> }
+struct AuditTailQuery {
+    n: Option<usize>,
+}
 
 async fn audit_tail_handler(
     State(s): State<AppState>,
@@ -2241,14 +2827,20 @@ async fn audit_tail_handler(
     let n = q.n.unwrap_or(100).min(1000);
     let log_path = s.base_dir.join("audit.log");
     match crate::audit::tail_audit_log(&log_path, n) {
-        Ok(lines) => (StatusCode::OK, JsonExtract(serde_json::json!({
-            "lines": lines,
-            "count": lines.len(),
-        }))),
-        Err(e) => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({
-            "error": "AUDIT_LOG_UNAVAILABLE",
-            "details": e,
-        }))),
+        Ok(lines) => (
+            StatusCode::OK,
+            JsonExtract(serde_json::json!({
+                "lines": lines,
+                "count": lines.len(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({
+                "error": "AUDIT_LOG_UNAVAILABLE",
+                "details": e,
+            })),
+        ),
     }
 }
 
@@ -2264,63 +2856,158 @@ fn fmt_gauge<V: std::fmt::Display>(name: &str, help: &str, val: V) -> String {
 
 /// Per-upstream data snapshot for Prometheus metrics (no RwLock held during formatting).
 struct UpstreamMetric {
-    id:         String,
-    addr:       String,
-    port:       u16,
-    protocol:   String,
-    healthy:    bool,
+    id: String,
+    addr: String,
+    port: u16,
+    protocol: String,
+    healthy: bool,
     latency_ms: Option<u64>,
 }
 
 fn render_prometheus_metrics(
-    snap:        &crate::stats::StatsSnapshot,
-    cache_hits:   u64,
+    snap: &crate::stats::StatsSnapshot,
+    cache_hits: u64,
     cache_misses: u64,
-    evictions:    u64,
-    xdp_active:   bool,
-    upstreams:    &[UpstreamMetric],
+    evictions: u64,
+    xdp_active: bool,
+    upstreams: &[UpstreamMetric],
 ) -> String {
     let mut out = String::with_capacity(2048);
-    out.push_str(&fmt_counter("runbound_queries_total",              "Total DNS queries received",                      snap.total));
-    out.push_str(&fmt_counter("runbound_queries_blocked_total",      "Queries blocked by blocklist",                    snap.blocked));
-    out.push_str(&fmt_counter("runbound_queries_forwarded_total",    "Queries forwarded to upstreams",                  snap.forwarded));
-    out.push_str(&fmt_counter("runbound_queries_nxdomain_total",     "Queries answered NXDOMAIN",                       snap.nxdomain));
-    out.push_str(&fmt_counter("runbound_queries_servfail_total",     "Queries answered SERVFAIL",                       snap.servfail));
-    out.push_str(&fmt_counter("runbound_queries_local_hits_total",   "Queries answered from local zones",               snap.local_hits));
-    out.push_str(&fmt_gauge(  "runbound_qps_1m",                     "Queries per second (1 minute average)",           snap.qps_1m));
-    out.push_str(&fmt_gauge(  "runbound_qps_peak",                   "Peak queries per second observed",                snap.qps_peak));
-    out.push_str(&fmt_gauge(  "runbound_latency_p50_ms",             "DNS response latency p50 in milliseconds",        snap.latency_p50_ms));
-    out.push_str(&fmt_gauge(  "runbound_latency_p95_ms",             "DNS response latency p95 in milliseconds",        snap.latency_p95_ms));
-    out.push_str(&fmt_gauge(  "runbound_latency_p99_ms",             "DNS response latency p99 in milliseconds",        snap.latency_p99_ms));
-    out.push_str(&fmt_gauge(  "runbound_cache_hit_rate",             "Cache hit rate (0.0 to 1.0)",                     snap.cache_hit_rate));
-    out.push_str(&fmt_gauge(  "runbound_cache_entries",              "Current number of entries in DNS cache",          snap.cache_entries));
-    out.push_str(&fmt_counter("runbound_cache_hits_total",           "Total cache hits",                                cache_hits));
-    out.push_str(&fmt_counter("runbound_cache_misses_total",         "Total cache misses",                              cache_misses));
-    out.push_str(&fmt_counter("runbound_cache_evictions_total",      "Total cache evictions",                           evictions));
-    out.push_str(&fmt_gauge(  "runbound_uptime_seconds",             "Service uptime in seconds",                       snap.uptime_secs));
-    out.push_str(&fmt_gauge(  "runbound_xdp_active",                 "Whether XDP fast path is active (1=yes, 0=no)",   xdp_active as u8));
-    out.push_str(&fmt_counter("runbound_xdp_cache_hits_total",       "DNS responses served from XDP cache snapshot",
-        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS.load(std::sync::atomic::Ordering::Relaxed)));
-    out.push_str(&fmt_counter("runbound_xdp_cache_misses_total",     "XDP cache lookups that missed",
-        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES.load(std::sync::atomic::Ordering::Relaxed)));
-    out.push_str(&fmt_gauge(  "runbound_xdp_cache_entries",          "Current live entries in XDP wire-format cache",
-        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_ENTRIES.load(std::sync::atomic::Ordering::Relaxed)));
-    out.push_str(&fmt_gauge(  "runbound_nic_rx_ring",                "Applied NIC RX ring descriptor count (0=unavailable)",
-        crate::dns::xdp::socket::XDP_NIC_RX_RING.load(std::sync::atomic::Ordering::Relaxed)));
-    out.push_str(&fmt_gauge(  "runbound_nic_rx_ring_max",            "Hardware maximum NIC RX ring descriptor count",
-        crate::dns::xdp::socket::XDP_NIC_RX_RING_MAX.load(std::sync::atomic::Ordering::Relaxed)));
+    out.push_str(&fmt_counter(
+        "runbound_queries_total",
+        "Total DNS queries received",
+        snap.total,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_queries_blocked_total",
+        "Queries blocked by blocklist",
+        snap.blocked,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_queries_forwarded_total",
+        "Queries forwarded to upstreams",
+        snap.forwarded,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_queries_nxdomain_total",
+        "Queries answered NXDOMAIN",
+        snap.nxdomain,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_queries_servfail_total",
+        "Queries answered SERVFAIL",
+        snap.servfail,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_queries_local_hits_total",
+        "Queries answered from local zones",
+        snap.local_hits,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_qps_1m",
+        "Queries per second (1 minute average)",
+        snap.qps_1m,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_qps_peak",
+        "Peak queries per second observed",
+        snap.qps_peak,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_latency_p50_ms",
+        "DNS response latency p50 in milliseconds",
+        snap.latency_p50_ms,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_latency_p95_ms",
+        "DNS response latency p95 in milliseconds",
+        snap.latency_p95_ms,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_latency_p99_ms",
+        "DNS response latency p99 in milliseconds",
+        snap.latency_p99_ms,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_cache_hit_rate",
+        "Cache hit rate (0.0 to 1.0)",
+        snap.cache_hit_rate,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_cache_entries",
+        "Current number of entries in DNS cache",
+        snap.cache_entries,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_cache_hits_total",
+        "Total cache hits",
+        cache_hits,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_cache_misses_total",
+        "Total cache misses",
+        cache_misses,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_cache_evictions_total",
+        "Total cache evictions",
+        evictions,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_uptime_seconds",
+        "Service uptime in seconds",
+        snap.uptime_secs,
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_xdp_active",
+        "Whether XDP fast path is active (1=yes, 0=no)",
+        xdp_active as u8,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_xdp_cache_hits_total",
+        "DNS responses served from XDP cache snapshot",
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_xdp_cache_misses_total",
+        "XDP cache lookups that missed",
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_xdp_cache_entries",
+        "Current live entries in XDP wire-format cache",
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_ENTRIES
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_nic_rx_ring",
+        "Applied NIC RX ring descriptor count (0=unavailable)",
+        crate::dns::xdp::socket::XDP_NIC_RX_RING.load(std::sync::atomic::Ordering::Relaxed),
+    ));
+    out.push_str(&fmt_gauge(
+        "runbound_nic_rx_ring_max",
+        "Hardware maximum NIC RX ring descriptor count",
+        crate::dns::xdp::socket::XDP_NIC_RX_RING_MAX.load(std::sync::atomic::Ordering::Relaxed),
+    ));
     {
         let nic_dropped = crate::dns::xdp::socket::XDP_ACTIVE_IFACE
             .get()
             .map(|iface| crate::dns::xdp::socket::read_nic_rx_dropped(iface))
             .unwrap_or(0);
-        out.push_str(&fmt_counter("runbound_nic_rx_dropped_total",       "NIC RX packets dropped before XDP (hardware FIFO overflow)",
-            nic_dropped));
+        out.push_str(&fmt_counter(
+            "runbound_nic_rx_dropped_total",
+            "NIC RX packets dropped before XDP (hardware FIFO overflow)",
+            nic_dropped,
+        ));
     }
 
     // Per-upstream metrics with labels — omit latency when not yet measured (null → skip, no NaN).
     if !upstreams.is_empty() {
-        out.push_str("# HELP runbound_upstream_healthy Whether upstream is healthy (1=yes, 0=no)\n");
+        out.push_str(
+            "# HELP runbound_upstream_healthy Whether upstream is healthy (1=yes, 0=no)\n",
+        );
         out.push_str("# TYPE runbound_upstream_healthy gauge\n");
         for u in upstreams {
             out.push_str(&format!(
@@ -2328,7 +3015,10 @@ fn render_prometheus_metrics(
                 u.id, u.addr, u.port, u.protocol, u.healthy as u8,
             ));
         }
-        let latency_upstreams: Vec<&UpstreamMetric> = upstreams.iter().filter(|u| u.latency_ms.is_some()).collect();
+        let latency_upstreams: Vec<&UpstreamMetric> = upstreams
+            .iter()
+            .filter(|u| u.latency_ms.is_some())
+            .collect();
         if !latency_upstreams.is_empty() {
             out.push_str("# HELP runbound_upstream_latency_ms Last measured upstream latency in milliseconds\n");
             out.push_str("# TYPE runbound_upstream_latency_ms gauge\n");
@@ -2344,27 +3034,41 @@ fn render_prometheus_metrics(
 }
 
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let snap         = s.stats.snapshot();
-    let cache_hits   = s.stats.cache_hits.load(Ordering::Relaxed);
+    let snap = s.stats.snapshot();
+    let cache_hits = s.stats.cache_hits.load(Ordering::Relaxed);
     let cache_misses = s.stats.cache_misses.load(Ordering::Relaxed);
-    let evictions    = s.cache_evictions.load(Ordering::Relaxed);
-    let xdp_active   = s.xdp_active.load(Ordering::Relaxed) > 0;
+    let evictions = s.cache_evictions.load(Ordering::Relaxed);
+    let xdp_active = s.xdp_active.load(Ordering::Relaxed) > 0;
     let upstreams: Vec<UpstreamMetric> = {
-        let list = s.upstreams.read()
+        let list = s
+            .upstreams
+            .read()
             .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in metrics handler: {e}"));
-        list.iter().map(|u| UpstreamMetric {
-            id:         u.id.clone(),
-            addr:       u.addr.clone(),
-            port:       u.port,
-            protocol:   u.protocol.clone(),
-            healthy:    u.healthy,
-            latency_ms: u.latency_ms,
-        }).collect()
+        list.iter()
+            .map(|u| UpstreamMetric {
+                id: u.id.clone(),
+                addr: u.addr.clone(),
+                port: u.port,
+                protocol: u.protocol.clone(),
+                healthy: u.healthy,
+                latency_ms: u.latency_ms,
+            })
+            .collect()
     };
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        render_prometheus_metrics(&snap, cache_hits, cache_misses, evictions, xdp_active, &upstreams),
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_prometheus_metrics(
+            &snap,
+            cache_hits,
+            cache_misses,
+            evictions,
+            xdp_active,
+            &upstreams,
+        ),
     )
 }
 
@@ -2382,17 +3086,25 @@ async fn rotate_key_handler(
     // Require at least 32 bytes of entropy (64 hex chars) — shorter keys are
     // statistically weak and likely copy-paste mistakes.
     if req.new_key.len() < 32 {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "WEAK_KEY",
-            "details": "new_key must be at least 32 characters",
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "WEAK_KEY",
+                "details": "new_key must be at least 32 characters",
+            })),
+        )
+            .into_response();
     }
     // Reject control characters (CRLF injection, log injection).
     if req.new_key.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({
-            "error": "INVALID_KEY",
-            "details": "new_key must not contain control characters",
-        }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_KEY",
+                "details": "new_key must not contain control characters",
+            })),
+        )
+            .into_response();
     }
     rotate_api_key(req.new_key.clone());
     // Persist to base_dir/api.key so the key survives a restart.
@@ -2411,10 +3123,14 @@ async fn rotate_key_handler(
     }
     s.audit.send(AuditEvent::ConfigReload);
     info!("API key rotated via POST /rotate-key");
-    (StatusCode::OK, JsonExtract(serde_json::json!({
-        "status": "ok",
-        "message": "API key rotated — old token is immediately invalid",
-    }))).into_response()
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({
+            "status": "ok",
+            "message": "API key rotated — old token is immediately invalid",
+        })),
+    )
+        .into_response()
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -2424,11 +3140,19 @@ async fn rotate_key_handler(
 /// so operators retain visibility; clients receive only a generic message.
 fn sanitize_error(e: &impl std::fmt::Display) -> String {
     let s = e.to_string();
-    if s.contains('/') { "internal error".to_string() } else { s }
+    if s.contains('/') {
+        "internal error".to_string()
+    } else {
+        s
+    }
 }
 
 fn ensure_dot(name: &str) -> String {
-    if name.ends_with('.') { name.to_string() } else { format!("{}.", name) }
+    if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{}.", name)
+    }
 }
 
 /// Reject any string that contains ASCII control characters (0x00–0x1f, 0x7f).
@@ -2436,7 +3160,10 @@ fn ensure_dot(name: &str) -> String {
 /// CRLF injection into logs, stored JSON, or HTTP response bodies.
 fn validate_no_control_chars(s: &str, field: &'static str) -> Result<(), String> {
     if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err(format!("Field '{}' must not contain control characters (\r, \n, etc.)", field));
+        return Err(format!(
+            "Field '{}' must not contain control characters (\r, \n, etc.)",
+            field
+        ));
     }
     Ok(())
 }
@@ -2446,9 +3173,13 @@ fn validate_no_control_chars(s: &str, field: &'static str) -> Result<(), String>
 /// - Non-empty, valid → `Ok(Some(trimmed))`
 /// - Too long or containing control characters → `Err(message)`
 fn validate_tls_hostname(raw: Option<&str>) -> Result<Option<String>, String> {
-    let Some(h) = raw else { return Ok(None); };
+    let Some(h) = raw else {
+        return Ok(None);
+    };
     let h = h.trim();
-    if h.is_empty() { return Ok(None); }
+    if h.is_empty() {
+        return Ok(None);
+    }
     if h.len() > 253 {
         return Err("tls_hostname must not exceed 253 characters".into());
     }
@@ -2480,7 +3211,10 @@ fn validate_dns_name(name: &str) -> Result<(), &'static str> {
         if label.starts_with('-') || label.ends_with('-') {
             return Err("Domain label cannot start or end with a hyphen");
         }
-        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
             return Err("Domain label contains invalid characters \
                         (ASCII alphanumeric, hyphens, underscores only)");
         }
@@ -2512,41 +3246,41 @@ mod tests {
 
         let cfg_arc = Arc::new(cfg);
         let zones = Arc::new(ArcSwap::new(Arc::new(
-            crate::dns::local::LocalZoneSet::from_config(&cfg_arc.local_zones, &cfg_arc.local_data)
+            crate::dns::local::LocalZoneSet::from_config(&cfg_arc.local_zones, &cfg_arc.local_data),
         )));
         let log_buffer = crate::logbuffer::new_shared(1000, true);
         let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
-        let resolver  = crate::dns::server::create_shared_resolver(&cfg_arc)
-            .expect("test resolver");
+        let resolver = crate::dns::server::create_shared_resolver(&cfg_arc).expect("test resolver");
 
         let stats = crate::stats::Stats::new();
         let stats_cache = crate::stats::new_snapshot_cache(&stats);
         let state = AppState {
-            zones:            Arc::clone(&zones),
-            zones_mutex:      Arc::new(tokio::sync::Mutex::new(())),
-            tls_cfg:          Arc::new(crate::config::parser::TlsConfig::default()),
-            rate_limiter:     ApiRateLimiter::new_public(),
-            reload_limiter:   Arc::new(ReloadLimiter::new()),
+            zones: Arc::clone(&zones),
+            zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
+            rate_limiter: ApiRateLimiter::new_public(),
+            reload_limiter: Arc::new(ReloadLimiter::new()),
             stats,
             stats_cache,
-            cfg:              Arc::clone(&cfg_arc),
-            cfg_path:         "/dev/null".to_string(),
+            cfg: Arc::clone(&cfg_arc),
+            cfg_path: "/dev/null".to_string(),
             log_buffer,
             upstreams,
-            sync_journal:     None,
-            sync_key:         None,
-            node_id:          None,
-            slave_mode:       false,
-            base_dir:         Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
-            audit:            crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
-            xdp_active:       Arc::new(AtomicU8::new(0)),
+            sync_journal: None,
+            sync_key: None,
+            node_id: None,
+            slave_mode: false,
+            base_dir: Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
+            audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
+            xdp_active: Arc::new(AtomicU8::new(0)),
             resolver,
-            last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
-            cache_evictions:  Arc::new(AtomicU64::new(0)),
-            lookup_limiter:   Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
+            last_flush_at: Arc::new(std::sync::Mutex::new(None)),
+            cache_evictions: Arc::new(AtomicU64::new(0)),
+            lookup_limiter: Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
             per_upstream_resolvers: crate::dns::server::create_shared_resolvers_vec(),
-            racing_wins:           Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
-            events_tx:             None,
+            racing_wins: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
+            events_tx: None,
+            domain_stats: crate::domain_stats::DomainStats::new(),
         };
         router(state)
     }
@@ -2565,9 +3299,15 @@ mod tests {
     #[tokio::test]
     async fn health_no_auth_required() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/health").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -2576,9 +3316,15 @@ mod tests {
     #[tokio::test]
     async fn stats_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/stats").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2586,13 +3332,28 @@ mod tests {
     async fn stats_schema() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/stats").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
-        for field in &["total", "blocked", "forwarded", "qps_1m", "qps_5m",
-                       "latency_p50_ms", "cache_hit_rate", "local_hits"] {
+        for field in &[
+            "total",
+            "blocked",
+            "forwarded",
+            "qps_1m",
+            "qps_5m",
+            "latency_p50_ms",
+            "cache_hit_rate",
+            "local_hits",
+        ] {
             assert!(json.get(field).is_some(), "missing field: {field}");
         }
     }
@@ -2602,9 +3363,15 @@ mod tests {
     #[tokio::test]
     async fn stats_stream_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/stats/stream").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2612,12 +3379,26 @@ mod tests {
     async fn stats_stream_content_type() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/stats/stream").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats/stream")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
-        assert!(ct.contains("text/event-stream"), "unexpected Content-Type: {ct}");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream"),
+            "unexpected Content-Type: {ct}"
+        );
     }
 
     // ── /api/upstreams ────────────────────────────────────────────────────
@@ -2625,9 +3406,15 @@ mod tests {
     #[tokio::test]
     async fn upstreams_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/upstreams").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2635,9 +3422,16 @@ mod tests {
     async fn upstreams_schema() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/upstreams").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
         assert!(json.get("upstreams").is_some());
@@ -2650,9 +3444,15 @@ mod tests {
     #[tokio::test]
     async fn logs_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/logs").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2660,9 +3460,16 @@ mod tests {
     async fn logs_schema() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/logs").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/logs")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
         assert!(json.get("entries").is_some());
@@ -2673,9 +3480,16 @@ mod tests {
     async fn logs_limit_too_large() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/logs?limit=2000").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/logs?limit=2000")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -2683,9 +3497,16 @@ mod tests {
     async fn logs_invalid_action() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/logs?action=invalid").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/logs?action=invalid")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2693,9 +3514,16 @@ mod tests {
     async fn logs_invalid_client_ip() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/logs?client=notanip").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/logs?client=notanip")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2704,8 +3532,13 @@ mod tests {
     #[test]
     fn test_validate_dns_name_253_chars_accepted() {
         // 63+1+63+1+63+1+61 = 253 chars — exactly at RFC 1035 §2.3.4 limit
-        let name = format!("{}.{}.{}.{}",
-            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        let name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
         assert_eq!(name.len(), 253);
         assert!(validate_dns_name(&name).is_ok());
     }
@@ -2713,8 +3546,13 @@ mod tests {
     #[test]
     fn test_validate_dns_name_254_chars_rejected() {
         // 63+1+63+1+63+1+62 = 254 chars — one over the RFC limit
-        let name = format!("{}.{}.{}.{}",
-            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(62));
+        let name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
         assert_eq!(name.len(), 254);
         assert!(validate_dns_name(&name).is_err());
     }
@@ -2722,16 +3560,26 @@ mod tests {
     #[test]
     fn test_validate_dns_name_253_with_trailing_dot_accepted() {
         // trailing dot is stripped before length check
-        let name = format!("{}.{}.{}.{}.",
-            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        let name = format!(
+            "{}.{}.{}.{}.",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
         assert_eq!(name.trim_end_matches('.').len(), 253);
         assert!(validate_dns_name(&name).is_ok());
     }
 
     #[test]
     fn test_validate_dns_name_254_with_trailing_dot_rejected() {
-        let name = format!("{}.{}.{}.{}.",
-            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(62));
+        let name = format!(
+            "{}.{}.{}.{}.",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
         assert_eq!(name.trim_end_matches('.').len(), 254);
         assert!(validate_dns_name(&name).is_err());
     }
@@ -2761,22 +3609,36 @@ mod tests {
         let (k, v) = auth_header();
         // 254-char name (no trailing dot): 63+1+63+1+63+1+62 = 254.
         // validate_dns_name must reject this → 400.
-        let name: String = format!("{}.{}.{}.{}",
-            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(62));
+        let name: String = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
         assert_eq!(name.len(), 254);
         let body = serde_json::json!({
             "name": name, "type": "A", "value": "1.2.3.4"
-        }).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/dns")
-                .header(k, v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
-            "254-char domain name must be rejected with 400");
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "254-char domain name must be rejected with 400"
+        );
     }
 
     #[tokio::test]
@@ -2786,42 +3648,69 @@ mod tests {
         // 253-char name (no trailing dot) — valid per RFC 1035 §2.3.4.
         // validate_dns_name must accept this. The handler may fail at store
         // level (test dir), but must NOT return 400 for the name itself.
-        let name: String = format!("{}.{}.{}.{}",
-            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+        let name: String = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
         assert_eq!(name.len(), 253);
         let body = serde_json::json!({
             "name": name, "type": "A", "value": "1.2.3.4"
-        }).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/dns")
-                .header(k, v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
-        assert_ne!(resp.status(), StatusCode::BAD_REQUEST,
-            "253-char domain name must not be rejected by name validation");
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "253-char domain name must not be rejected by name validation"
+        );
     }
 
     #[tokio::test]
     async fn blacklist_name_254_chars_is_rejected() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let name: String = format!("{}.{}.{}.{}",
-            "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(62));
+        let name: String = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
         assert_eq!(name.len(), 254);
         let body = serde_json::json!({"domain": name}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/blacklist")
-                .header(k, v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
-            "254-char blacklist domain must be rejected with 400");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/blacklist")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "254-char blacklist domain must be rejected with 400"
+        );
     }
 
     // ── SEC-04 body limit integration tests ───────────────────────────────────
@@ -2831,17 +3720,26 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         // JSON Content-Type but no Content-Length → 411 (SEC-04 fix).
-        let body = serde_json::json!({"name": "example.com", "type": "A", "value": "1.2.3.4"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/dns")
-                .header(k, v)
-                .header("Content-Type", "application/json")
-                // Deliberately omit Content-Length
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::LENGTH_REQUIRED,
-            "JSON POST without Content-Length must return 411");
+        let body =
+            serde_json::json!({"name": "example.com", "type": "A", "value": "1.2.3.4"}).to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    // Deliberately omit Content-Length
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::LENGTH_REQUIRED,
+            "JSON POST without Content-Length must return 411"
+        );
     }
 
     #[tokio::test]
@@ -2849,14 +3747,22 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         // Bodyless POST (/reload) has no Content-Type → must not get 411.
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/reload")
-                .header(k, v)
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
-        assert_ne!(resp.status(), StatusCode::LENGTH_REQUIRED,
-            "Bodyless POST must not get 411");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/reload")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::LENGTH_REQUIRED,
+            "Bodyless POST must not get 411"
+        );
     }
 
     // ── POST /api/upstreams ───────────────────────────────────────────────────
@@ -2865,13 +3771,18 @@ mod tests {
     async fn add_upstream_requires_auth() {
         let app = make_test_app();
         let body = serde_json::json!({"addr":"1.1.1.1","protocol":"udp"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams")
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams")
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2880,14 +3791,19 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let body = serde_json::json!({"addr":"1.1.1.1","protocol":"tcp"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams")
-                .header(k, v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2896,14 +3812,19 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let body = serde_json::json!({"addr":"not-an-ip","protocol":"udp"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams")
-                .header(k, v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -2911,15 +3832,21 @@ mod tests {
     async fn add_upstream_happy_path() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"udp","name":"Quad9"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams")
-                .header(k, v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let body =
+            serde_json::json!({"addr":"9.9.9.9","protocol":"udp","name":"Quad9"}).to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         let json = body_json(resp.into_body()).await;
         assert_eq!(json["status"], "ok");
@@ -2931,11 +3858,16 @@ mod tests {
     #[tokio::test]
     async fn delete_upstream_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("DELETE").uri("/api/upstreams/some-id")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/upstreams/some-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2943,12 +3875,17 @@ mod tests {
     async fn delete_upstream_not_found() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("DELETE").uri("/api/upstreams/nonexistent-uuid")
-                .header(k, v)
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/upstreams/nonexistent-uuid")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2957,9 +3894,15 @@ mod tests {
     #[tokio::test]
     async fn upstream_presets_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/upstreams/presets").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams/presets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2967,13 +3910,23 @@ mod tests {
     async fn upstream_presets_schema() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/upstreams/presets").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams/presets")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
         assert!(json["presets"].is_array());
-        assert!(json["presets"].as_array().map(|a| a.len() >= 4).unwrap_or(false));
+        assert!(json["presets"]
+            .as_array()
+            .map(|a| a.len() >= 4)
+            .unwrap_or(false));
     }
 
     // ── POST /api/cache/flush ─────────────────────────────────────────────────
@@ -2981,9 +3934,16 @@ mod tests {
     #[tokio::test]
     async fn cache_flush_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().method("POST").uri("/api/cache/flush").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/flush")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -2991,12 +3951,17 @@ mod tests {
     async fn cache_flush_happy_path() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/cache/flush")
-                .header(k, v)
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/flush")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
         assert_eq!(json["status"], "ok");
@@ -3016,16 +3981,32 @@ mod tests {
         let app = make_flush_app(60);
         let (k, v) = auth_header();
 
-        let r1 = app.clone().oneshot(
-            Request::builder().method("POST").uri("/api/cache/flush")
-                .header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/flush")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
 
-        let r2 = app.clone().oneshot(
-            Request::builder().method("POST").uri("/api/cache/flush")
-                .header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let r2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/flush")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
         let j = body_json(r2.into_body()).await;
         assert_eq!(j["error"], "FLUSH_COOLDOWN");
@@ -3037,16 +4018,31 @@ mod tests {
         let app = make_flush_app(0);
         let (k, v) = auth_header();
 
-        let r1 = app.clone().oneshot(
-            Request::builder().method("POST").uri("/api/cache/flush")
-                .header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/flush")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
 
-        let r2 = app.oneshot(
-            Request::builder().method("POST").uri("/api/cache/flush")
-                .header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/flush")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(r2.status(), StatusCode::OK);
     }
 
@@ -3056,9 +4052,16 @@ mod tests {
     async fn system_has_prefetch_fields() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/system").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
         // Default config has prefetch: false (derived Default)
@@ -3073,9 +4076,16 @@ mod tests {
         cfg.prefetch = true;
         let app = make_test_app_with_cfg(cfg);
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/system").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp.into_body()).await["prefetch_enabled"], true);
     }
@@ -3086,19 +4096,36 @@ mod tests {
         let (k, v) = auth_header();
 
         let sys = body_json(
-            app.clone().oneshot(
-                Request::builder().uri("/api/system").header(k, &v).body(Body::empty()).unwrap()
-            ).await.unwrap().into_body()
-        ).await;
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/system")
+                        .header(k, &v)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body(),
+        )
+        .await;
 
         let ups = body_json(
             app.oneshot(
-                Request::builder().uri("/api/upstreams").header(k, &v).body(Body::empty()).unwrap()
-            ).await.unwrap().into_body()
-        ).await;
+                Request::builder()
+                    .uri("/api/upstreams")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+        )
+        .await;
 
         assert_eq!(sys["upstreams_healthy"], ups["healthy"]);
-        assert_eq!(sys["upstreams_total"],   ups["total"]);
+        assert_eq!(sys["upstreams_total"], ups["total"]);
     }
 
     // ── GET /api/sync/slaves ──────────────────────────────────────────────────
@@ -3106,9 +4133,15 @@ mod tests {
     #[tokio::test]
     async fn sync_slaves_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/sync/slaves").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sync/slaves")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3116,13 +4149,23 @@ mod tests {
     async fn sync_slaves_standalone_returns_empty() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/sync/slaves").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sync/slaves")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
         assert_eq!(json["total"], 0);
-        assert!(json["slaves"].as_array().map(|a| a.is_empty()).unwrap_or(false));
+        assert!(json["slaves"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false));
     }
 
     // ── GET /health schema (no auth, version field present) ───────────────────
@@ -3130,9 +4173,15 @@ mod tests {
     #[tokio::test]
     async fn health_schema() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/health").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
         let status = json["status"].as_str().unwrap_or("");
@@ -3140,8 +4189,14 @@ mod tests {
             matches!(status, "ok" | "degraded" | "error"),
             "health status must be ok/degraded/error; got: {status}"
         );
-        assert!(json["version"].is_string(), "health must include version field");
-        assert!(json.get("hsm").is_none(), "health must not expose hsm field");
+        assert!(
+            json["version"].is_string(),
+            "health must include version field"
+        );
+        assert!(
+            json.get("hsm").is_none(),
+            "health must not expose hsm field"
+        );
         assert!(json["uptime_secs"].is_number());
     }
 
@@ -3150,16 +4205,34 @@ mod tests {
     #[tokio::test]
     async fn health_has_enriched_fields() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/health").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
-        assert!(json["xdp_active"].is_boolean(),  "health must include xdp_active");
-        assert!(json["upstreams_healthy"].is_number(), "health must include upstreams_healthy");
-        assert!(json["upstreams_total"].is_number(),   "health must include upstreams_total");
-        assert!(json["cache_entries"].is_number(),     "health must include cache_entries");
-        assert!(json["status"].is_string(),            "health must include status");
+        assert!(
+            json["xdp_active"].is_boolean(),
+            "health must include xdp_active"
+        );
+        assert!(
+            json["upstreams_healthy"].is_number(),
+            "health must include upstreams_healthy"
+        );
+        assert!(
+            json["upstreams_total"].is_number(),
+            "health must include upstreams_total"
+        );
+        assert!(
+            json["cache_entries"].is_number(),
+            "health must include cache_entries"
+        );
+        assert!(json["status"].is_string(), "health must include status");
     }
 
     #[tokio::test]
@@ -3167,9 +4240,17 @@ mod tests {
         // Default test config has no forward zones → 0 upstreams → status "error"
         let app = make_test_app();
         let json = body_json(
-            app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-                .await.unwrap().into_body()
-        ).await;
+            app.oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+        )
+        .await;
         assert_eq!(json["upstreams_total"], 0);
         assert_eq!(json["status"], "error");
     }
@@ -3178,15 +4259,26 @@ mod tests {
     async fn health_status_ok_with_healthy_upstream() {
         let mut cfg = crate::config::parser::UnboundConfig::default();
         cfg.forward_zones.push(crate::config::parser::ForwardZone {
-            name: ".".into(), addrs: vec!["1.1.1.1@53".into()], tls: false,
+            name: ".".into(),
+            addrs: vec!["1.1.1.1@53".into()],
+            tls: false,
         });
         let app = make_test_app_with_cfg(cfg);
         let (k, v) = auth_header();
         // Mark the upstream healthy via the upstreams endpoint
         let json = body_json(
-            app.clone().oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-                .await.unwrap().into_body()
-        ).await;
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .into_body(),
+        )
+        .await;
         // No probe has run yet → healthy=0 but total=1 → "degraded"
         assert_eq!(json["upstreams_total"], 1);
         assert_eq!(json["status"], "degraded");
@@ -3198,9 +4290,15 @@ mod tests {
     #[tokio::test]
     async fn metrics_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/metrics").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3208,22 +4306,46 @@ mod tests {
     async fn metrics_content_type_prometheus() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/metrics").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("");
-        assert!(ct.contains("text/plain"), "content-type must be text/plain; got: {ct}");
-        assert!(ct.contains("0.0.4"),      "content-type must include version=0.0.4; got: {ct}");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/plain"),
+            "content-type must be text/plain; got: {ct}"
+        );
+        assert!(
+            ct.contains("0.0.4"),
+            "content-type must include version=0.0.4; got: {ct}"
+        );
     }
 
     #[tokio::test]
     async fn metrics_contains_required_metric_names() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/metrics").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&bytes).unwrap();
         for metric in &[
@@ -3246,7 +4368,10 @@ mod tests {
             "runbound_uptime_seconds",
             "runbound_xdp_active",
         ] {
-            assert!(body.contains(metric), "metrics output must contain {metric}");
+            assert!(
+                body.contains(metric),
+                "metrics output must contain {metric}"
+            );
         }
     }
 
@@ -3254,18 +4379,36 @@ mod tests {
     async fn metrics_upstream_labels_present() {
         let mut cfg = crate::config::parser::UnboundConfig::default();
         cfg.forward_zones.push(crate::config::parser::ForwardZone {
-            name: ".".into(), addrs: vec!["9.9.9.9@53".into()], tls: false,
+            name: ".".into(),
+            addrs: vec!["9.9.9.9@53".into()],
+            tls: false,
         });
         let app = make_test_app_with_cfg(cfg);
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/metrics").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&bytes).unwrap();
-        assert!(body.contains("runbound_upstream_healthy"), "upstream_healthy metric must be present");
-        assert!(body.contains("addr=\"9.9.9.9\""), "upstream addr label must be present");
-        assert!(body.contains("protocol=\"udp\""), "upstream protocol label must be present");
+        assert!(
+            body.contains("runbound_upstream_healthy"),
+            "upstream_healthy metric must be present"
+        );
+        assert!(
+            body.contains("addr=\"9.9.9.9\""),
+            "upstream addr label must be present"
+        );
+        assert!(
+            body.contains("protocol=\"udp\""),
+            "upstream protocol label must be present"
+        );
     }
 
     // ── ReloadLimiter correctness under parallel load ─────────────────────────
@@ -3280,21 +4423,23 @@ mod tests {
         let limiter = Arc::new(ReloadLimiter::new());
         let barrier = Arc::new(std::sync::Barrier::new(20));
 
-        let handles: Vec<_> = (0..20).map(|_| {
-            let l = Arc::clone(&limiter);
-            let b = Arc::clone(&barrier);
-            thread::spawn(move || {
-                b.wait(); // all threads start at the same instant
-                l.check()
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let l = Arc::clone(&limiter);
+                let b = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    b.wait(); // all threads start at the same instant
+                    l.check()
+                })
             })
-        }).collect();
+            .collect();
 
         let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let allowed = results.iter().filter(|&&r|  r).count();
-        let denied  = results.iter().filter(|&&r| !r).count();
+        let allowed = results.iter().filter(|&&r| r).count();
+        let denied = results.iter().filter(|&&r| !r).count();
 
         assert!(allowed <= 2, "allowed={allowed} but burst=2");
-        assert!(denied  >= 18, "denied={denied} but expected ≥18");
+        assert!(denied >= 18, "denied={denied} but expected ≥18");
     }
 
     // ── HTTP-level concurrent test: 20 concurrent POST /reload sharing ONE AppState ──
@@ -3342,22 +4487,28 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
 
-        let ok   = statuses.iter().filter(|&&s| s == StatusCode::OK).count();
-        let r429 = statuses.iter().filter(|&&s| s == StatusCode::TOO_MANY_REQUESTS).count();
-        let other: Vec<_> = statuses.iter()
+        let ok = statuses.iter().filter(|&&s| s == StatusCode::OK).count();
+        let r429 = statuses
+            .iter()
+            .filter(|&&s| s == StatusCode::TOO_MANY_REQUESTS)
+            .count();
+        let other: Vec<_> = statuses
+            .iter()
             .filter(|&&s| s != StatusCode::OK && s != StatusCode::TOO_MANY_REQUESTS)
             .collect();
 
         eprintln!("[HTTP_TEST] 200={ok} 429={r429} other={other:?}");
-        assert!(ok <= 2,  "burst=2 but {ok} requests got 200");
+        assert!(ok <= 2, "burst=2 but {ok} requests got 200");
         assert!(r429 >= 18, "expected ≥18 requests to get 429, got {r429}");
     }
 
     // ── FIX #40: loopback and IPv4 link-local are rejected ────────────────
 
-    fn post_upstream(app: axum::Router, auth: (&'static str, String), body_str: &'static str)
-        -> impl std::future::Future<Output = axum::response::Response>
-    {
+    fn post_upstream(
+        app: axum::Router,
+        auth: (&'static str, String),
+        body_str: &'static str,
+    ) -> impl std::future::Future<Output = axum::response::Response> {
         use tower::ServiceExt;
         let req = Request::builder()
             .method("POST")
@@ -3464,25 +4615,35 @@ mod tests {
         let id = j["upstream"]["id"].as_str().unwrap().to_string();
 
         // Attempt to delete it — only one present, must return 409
-        let del_resp = app.clone().oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/api/upstreams/{id}"))
-                .header(k, &v)
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let del_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/upstreams/{id}"))
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(del_resp.status(), StatusCode::CONFLICT);
-        assert_eq!(body_json(del_resp.into_body()).await["error"], "LAST_UPSTREAM");
+        assert_eq!(
+            body_json(del_resp.into_body()).await["error"],
+            "LAST_UPSTREAM"
+        );
 
         // Upstream must still be present after 409
-        let list_resp = app.oneshot(
-            Request::builder()
-                .uri("/api/upstreams")
-                .header(k, &v)
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let list_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(body_json(list_resp.into_body()).await["total"], 1);
     }
 
@@ -3494,20 +4655,25 @@ mod tests {
         let add1 = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"1.1.1.1"}"#).await;
         assert_eq!(add1.status(), StatusCode::CREATED);
         let id1 = body_json(add1.into_body()).await["upstream"]["id"]
-            .as_str().unwrap().to_string();
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let add2 = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"8.8.8.8"}"#).await;
         assert_eq!(add2.status(), StatusCode::CREATED);
 
         // Delete first — two upstreams present, must return 200
-        let del_resp = app.oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/api/upstreams/{id1}"))
-                .header(k, &v)
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let del_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/upstreams/{id1}"))
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(del_resp.status(), StatusCode::OK);
     }
 
@@ -3517,20 +4683,26 @@ mod tests {
     async fn upstream_presets_dot_no_at_port() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder()
-                .uri("/api/upstreams/presets")
-                .header(k, v)
-                .body(Body::empty())
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams/presets")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
         let presets = json["presets"].as_array().unwrap();
         assert!(!presets.is_empty());
         for preset in presets {
             let addr = preset["addr"].as_str().unwrap();
-            assert!(!addr.contains('@'), "preset addr must not contain @port: {addr}");
+            assert!(
+                !addr.contains('@'),
+                "preset addr must not contain @port: {addr}"
+            );
             if preset["protocol"] == "dot" {
                 assert_eq!(preset["port"], 853, "DoT preset must have port 853");
             }
@@ -3542,7 +4714,8 @@ mod tests {
     #[tokio::test]
     async fn add_upstream_default_port_udp() {
         let app = make_test_app();
-        let resp = post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","protocol":"udp"}"#).await;
+        let resp =
+            post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","protocol":"udp"}"#).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(body_json(resp.into_body()).await["upstream"]["port"], 53);
     }
@@ -3550,7 +4723,8 @@ mod tests {
     #[tokio::test]
     async fn add_upstream_default_port_dot() {
         let app = make_test_app();
-        let resp = post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","protocol":"dot"}"#).await;
+        let resp =
+            post_upstream(app, auth_header(), r#"{"addr":"1.1.1.1","protocol":"dot"}"#).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(body_json(resp.into_body()).await["upstream"]["port"], 853);
     }
@@ -3580,16 +4754,28 @@ mod tests {
         let add_body = r#"{"addr":"9.9.9.9","protocol":"udp"}"#;
         post_upstream(app.clone(), (k, v.clone()), add_body).await;
 
-        let resp = app.oneshot(
-            Request::builder().uri("/api/upstreams").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
-        let upstreams = json["upstreams"].as_array().expect("upstreams must be array");
+        let upstreams = json["upstreams"]
+            .as_array()
+            .expect("upstreams must be array");
         assert!(!upstreams.is_empty());
         for u in upstreams {
-            assert!(u["latency_history"].is_array(),
-                "latency_history must be a JSON array; got: {:?}", u["latency_history"]);
+            assert!(
+                u["latency_history"].is_array(),
+                "latency_history must be a JSON array; got: {:?}",
+                u["latency_history"]
+            );
         }
     }
 
@@ -3601,8 +4787,13 @@ mod tests {
         let add_resp = post_upstream(app.clone(), (k, v.clone()), add_body).await;
         assert_eq!(add_resp.status(), StatusCode::CREATED);
         let upstream = body_json(add_resp.into_body()).await;
-        assert_eq!(upstream["upstream"]["latency_history"].as_array().map(|a| a.len()), Some(0),
-            "newly added upstream must have empty latency_history");
+        assert_eq!(
+            upstream["upstream"]["latency_history"]
+                .as_array()
+                .map(|a| a.len()),
+            Some(0),
+            "newly added upstream must have empty latency_history"
+        );
     }
 
     #[tokio::test]
@@ -3612,14 +4803,24 @@ mod tests {
         let add_body = r#"{"addr":"9.9.9.9","protocol":"udp"}"#;
         post_upstream(app.clone(), (k, v.clone()), add_body).await;
 
-        let resp = app.oneshot(
-            Request::builder().uri("/api/upstreams").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let json = body_json(resp.into_body()).await;
         let ups = json["upstreams"].as_array().unwrap();
         for u in ups {
-            assert!(u.get("dnssec_supported").is_none(),
-                "dnssec_supported must be absent (None) before first probe; got: {:?}", u);
+            assert!(
+                u.get("dnssec_supported").is_none(),
+                "dnssec_supported must be absent (None) before first probe; got: {:?}",
+                u
+            );
         }
     }
 
@@ -3629,13 +4830,18 @@ mod tests {
     async fn patch_upstream_requires_auth() {
         let app = make_test_app();
         let body = serde_json::json!({"name":"Test"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("PATCH").uri("/api/upstreams/some-id")
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/upstreams/some-id")
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3646,17 +4852,25 @@ mod tests {
         let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"9.9.9.9"}"#).await;
         assert_eq!(add_resp.status(), StatusCode::CREATED);
         let id = body_json(add_resp.into_body()).await["upstream"]["id"]
-            .as_str().unwrap().to_string();
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let patch_body = serde_json::json!({"name":"Quad9 renamed"}).to_string();
-        let resp = app.clone().oneshot(
-            Request::builder()
-                .method("PATCH").uri(format!("/api/upstreams/{id}"))
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", patch_body.len().to_string())
-                .body(Body::from(patch_body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/upstreams/{id}"))
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", patch_body.len().to_string())
+                    .body(Body::from(patch_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
         assert_eq!(j["status"], "ok");
@@ -3667,24 +4881,38 @@ mod tests {
     async fn patch_upstream_empty_name_clears() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let add_resp = post_upstream(app.clone(), (k, v.clone()),
-            r#"{"addr":"9.9.9.9","name":"Old Name"}"#).await;
+        let add_resp = post_upstream(
+            app.clone(),
+            (k, v.clone()),
+            r#"{"addr":"9.9.9.9","name":"Old Name"}"#,
+        )
+        .await;
         assert_eq!(add_resp.status(), StatusCode::CREATED);
         let id = body_json(add_resp.into_body()).await["upstream"]["id"]
-            .as_str().unwrap().to_string();
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let patch_body = serde_json::json!({"name":""}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("PATCH").uri(format!("/api/upstreams/{id}"))
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", patch_body.len().to_string())
-                .body(Body::from(patch_body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/upstreams/{id}"))
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", patch_body.len().to_string())
+                    .body(Body::from(patch_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
-        assert!(j["upstream"]["name"].is_null(), "empty name must become null");
+        assert!(
+            j["upstream"]["name"].is_null(),
+            "empty name must become null"
+        );
     }
 
     #[tokio::test]
@@ -3693,17 +4921,24 @@ mod tests {
         let (k, v) = auth_header();
         let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"9.9.9.9"}"#).await;
         let id = body_json(add_resp.into_body()).await["upstream"]["id"]
-            .as_str().unwrap().to_string();
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let patch_body = serde_json::json!({"addr":"1.2.3.4"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("PATCH").uri(format!("/api/upstreams/{id}"))
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", patch_body.len().to_string())
-                .body(Body::from(patch_body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/upstreams/{id}"))
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", patch_body.len().to_string())
+                    .body(Body::from(patch_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_FIELD");
     }
@@ -3713,14 +4948,19 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let patch_body = serde_json::json!({"name":"x"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("PATCH").uri("/api/upstreams/nonexistent-uuid")
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", patch_body.len().to_string())
-                .body(Body::from(patch_body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/upstreams/nonexistent-uuid")
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", patch_body.len().to_string())
+                    .body(Body::from(patch_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -3729,9 +4969,15 @@ mod tests {
     #[tokio::test]
     async fn cache_stats_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/cache/stats").body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cache/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3739,16 +4985,26 @@ mod tests {
     async fn cache_stats_schema_initial_zeros() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/cache/stats").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cache/stats")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
-        assert_eq!(j["hits"],      0);
-        assert_eq!(j["misses"],    0);
+        assert_eq!(j["hits"], 0);
+        assert_eq!(j["misses"], 0);
         assert_eq!(j["evictions"], 0);
         assert!(j["entries"].is_number(), "entries must be a number");
-        assert!(j["hit_rate_pct"].is_null(), "hit_rate_pct must be null when both are 0");
+        assert!(
+            j["hit_rate_pct"].is_null(),
+            "hit_rate_pct must be null when both are 0"
+        );
     }
 
     // ── #54: POST /api/upstreams/:id/probe ───────────────────────────────
@@ -3756,11 +5012,16 @@ mod tests {
     #[tokio::test]
     async fn probe_upstream_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams/any-id/probe")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams/any-id/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3768,12 +5029,17 @@ mod tests {
     async fn probe_upstream_not_found() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams/nonexistent-uuid/probe")
-                .header(k, &v)
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams/nonexistent-uuid/probe")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -3786,20 +5052,33 @@ mod tests {
         let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"192.0.2.1"}"#).await;
         assert_eq!(add_resp.status(), StatusCode::CREATED);
         let id = body_json(add_resp.into_body()).await["upstream"]["id"]
-            .as_str().unwrap_or_default().to_string();
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         // Trigger immediate probe
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri(format!("/api/upstreams/{id}/probe"))
-                .header(k, &v)
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/upstreams/{id}/probe"))
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
         assert_eq!(j["status"], "ok");
-        assert_eq!(j["upstream"]["healthy"], false, "TEST-NET-1 must be unhealthy");
-        assert!(j["upstream"]["last_error"].is_string(), "last_error must be set on failure");
+        assert_eq!(
+            j["upstream"]["healthy"], false,
+            "TEST-NET-1 must be unhealthy"
+        );
+        assert!(
+            j["upstream"]["last_error"].is_string(),
+            "last_error must be set on failure"
+        );
     }
 
     // ── #53: last_error field on upstream failures ────────────────────────────
@@ -3813,19 +5092,31 @@ mod tests {
         let add_resp = post_upstream(app.clone(), (k, v.clone()), r#"{"addr":"192.0.2.1"}"#).await;
         assert_eq!(add_resp.status(), StatusCode::CREATED);
         let id = body_json(add_resp.into_body()).await["upstream"]["id"]
-            .as_str().unwrap_or_default().to_string();
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         // Trigger immediate probe — should fail
-        let probe_resp = app.clone().oneshot(
-            Request::builder()
-                .method("POST").uri(format!("/api/upstreams/{id}/probe"))
-                .header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let probe_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/upstreams/{id}/probe"))
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(probe_resp.status(), StatusCode::OK);
         let j = body_json(probe_resp.into_body()).await;
         assert_eq!(j["upstream"]["healthy"], false);
-        assert!(j["upstream"]["last_error"].is_string(),
-            "last_error must be present after a failed probe; got: {:?}", j["upstream"]);
+        assert!(
+            j["upstream"]["last_error"].is_string(),
+            "last_error must be present after a failed probe; got: {:?}",
+            j["upstream"]
+        );
     }
 
     #[tokio::test]
@@ -3841,7 +5132,9 @@ mod tests {
         // Inject a prior error
         {
             let mut list = shared.write().unwrap_or_else(|e| e.into_inner());
-            let s = list.iter_mut().find(|u| u.id == entry.id)
+            let s = list
+                .iter_mut()
+                .find(|u| u.id == entry.id)
                 .unwrap_or_else(|| panic!("entry not found"));
             s.last_error = Some("timeout".into());
             s.healthy = false;
@@ -3849,15 +5142,22 @@ mod tests {
         // Simulate successful write-back
         {
             let mut list = shared.write().unwrap_or_else(|e| e.into_inner());
-            let s = list.iter_mut().find(|u| u.id == entry.id)
+            let s = list
+                .iter_mut()
+                .find(|u| u.id == entry.id)
                 .unwrap_or_else(|| panic!("entry not found"));
-            s.healthy    = true;
+            s.healthy = true;
             s.last_error = None;
         }
         let list = shared.read().unwrap_or_else(|e| e.into_inner());
-        let s = list.iter().find(|u| u.id == entry.id)
+        let s = list
+            .iter()
+            .find(|u| u.id == entry.id)
             .unwrap_or_else(|| panic!("entry not found"));
-        assert!(s.last_error.is_none(), "last_error must be None after a successful probe");
+        assert!(
+            s.last_error.is_none(),
+            "last_error must be None after a successful probe"
+        );
         assert!(s.healthy);
     }
 
@@ -3867,21 +5167,33 @@ mod tests {
     async fn patch_upstream_tls_hostname_sets_value() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let add_resp = post_upstream(app.clone(), (k, v.clone()),
-            r#"{"addr":"9.9.9.9","protocol":"dot"}"#).await;
+        let add_resp = post_upstream(
+            app.clone(),
+            (k, v.clone()),
+            r#"{"addr":"9.9.9.9","protocol":"dot"}"#,
+        )
+        .await;
         assert_eq!(add_resp.status(), StatusCode::CREATED);
         let id = body_json(add_resp.into_body()).await["upstream"]["id"]
-            .as_str().unwrap().to_string();
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let patch_body = serde_json::json!({"tls_hostname":"custom.example.com"}).to_string();
-        let resp = app.clone().oneshot(
-            Request::builder()
-                .method("PATCH").uri(format!("/api/upstreams/{id}"))
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", patch_body.len().to_string())
-                .body(Body::from(patch_body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/upstreams/{id}"))
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", patch_body.len().to_string())
+                    .body(Body::from(patch_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
         assert_eq!(j["upstream"]["tls_hostname"], "custom.example.com");
@@ -3892,34 +5204,52 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         // Add DoT upstream with tls_hostname set
-        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname":"dns.quad9.net"}).to_string();
-        let add_resp = app.clone().oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams")
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let body =
+            serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname":"dns.quad9.net"})
+                .to_string();
+        let add_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams")
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(add_resp.status(), StatusCode::CREATED);
         let id = body_json(add_resp.into_body()).await["upstream"]["id"]
-            .as_str().unwrap().to_string();
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Clear tls_hostname by patching with ""
         let patch_body = serde_json::json!({"tls_hostname":""}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("PATCH").uri(format!("/api/upstreams/{id}"))
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", patch_body.len().to_string())
-                .body(Body::from(patch_body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/upstreams/{id}"))
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", patch_body.len().to_string())
+                    .body(Body::from(patch_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
         // tls_hostname absent from JSON when None (skip_serializing_if)
-        assert!(j["upstream"].get("tls_hostname").is_none() || j["upstream"]["tls_hostname"].is_null(),
-            "tls_hostname must be absent or null after clearing; got: {:?}", j["upstream"]);
+        assert!(
+            j["upstream"].get("tls_hostname").is_none() || j["upstream"]["tls_hostname"].is_null(),
+            "tls_hostname must be absent or null after clearing; got: {:?}",
+            j["upstream"]
+        );
     }
 
     #[tokio::test]
@@ -3927,15 +5257,22 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         // tls_hostname with control character must return 400
-        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname":"bad\x01host"}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams")
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let body =
+            serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname":"bad\x01host"})
+                .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams")
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_FIELD");
     }
@@ -3946,15 +5283,21 @@ mod tests {
         let (k, v) = auth_header();
         // 254-char tls_hostname must return 400
         let long_host = "a".repeat(254);
-        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname": long_host}).to_string();
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/upstreams")
-                .header(k, &v)
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let body = serde_json::json!({"addr":"9.9.9.9","protocol":"dot","tls_hostname": long_host})
+            .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams")
+                    .header(k, &v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(resp.into_body()).await["error"], "INVALID_FIELD");
     }
@@ -3965,20 +5308,35 @@ mod tests {
         let (k, v) = auth_header();
 
         // Flush the cache (resets counters)
-        let flush_resp = app.clone().oneshot(
-            Request::builder().method("POST").uri("/api/cache/flush")
-                .header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let flush_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cache/flush")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(flush_resp.status(), StatusCode::OK);
 
         // Counters must be zero after reset
-        let resp = app.oneshot(
-            Request::builder().uri("/api/cache/stats").header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cache/stats")
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
-        assert_eq!(j["hits"],      0);
-        assert_eq!(j["misses"],    0);
+        assert_eq!(j["hits"], 0);
+        assert_eq!(j["misses"], 0);
         assert_eq!(j["evictions"], 0);
     }
 
@@ -3994,14 +5352,29 @@ mod tests {
         });
         let app = make_test_app_with_cfg(cfg);
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().uri("/api/upstreams").header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/upstreams")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
-        let ups = json["upstreams"].as_array().expect("upstreams must be array");
-        let config_up = ups.iter().find(|u| u["addr"] == "1.1.1.1").expect("1.1.1.1 must be present");
-        assert_eq!(config_up["source"], "config", "config-file upstream must have source=config");
+        let ups = json["upstreams"]
+            .as_array()
+            .expect("upstreams must be array");
+        let config_up = ups
+            .iter()
+            .find(|u| u["addr"] == "1.1.1.1")
+            .expect("1.1.1.1 must be present");
+        assert_eq!(
+            config_up["source"], "config",
+            "config-file upstream must have source=config"
+        );
     }
 
     #[tokio::test]
@@ -4027,39 +5400,42 @@ mod tests {
             tls: false,
         });
 
-        let zones = Arc::new(ArcSwap::new(Arc::new(crate::dns::local::LocalZoneSet::default())));
+        let zones = Arc::new(ArcSwap::new(Arc::new(
+            crate::dns::local::LocalZoneSet::default(),
+        )));
         let cfg_arc = Arc::new(cfg);
         let log_buffer = crate::logbuffer::new_shared(1000, true);
         let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
-        let resolver  = crate::dns::server::create_shared_resolver(&cfg_arc).expect("test resolver");
+        let resolver = crate::dns::server::create_shared_resolver(&cfg_arc).expect("test resolver");
         let stats = crate::stats::Stats::new();
         let stats_cache = crate::stats::new_snapshot_cache(&stats);
         let state = AppState {
-            zones:            Arc::clone(&zones),
-            zones_mutex:      Arc::new(tokio::sync::Mutex::new(())),
-            tls_cfg:          Arc::new(crate::config::parser::TlsConfig::default()),
-            rate_limiter:     ApiRateLimiter::new_public(),
-            reload_limiter:   Arc::new(ReloadLimiter::new()),
+            zones: Arc::clone(&zones),
+            zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
+            rate_limiter: ApiRateLimiter::new_public(),
+            reload_limiter: Arc::new(ReloadLimiter::new()),
             stats,
             stats_cache,
-            cfg:              Arc::clone(&cfg_arc),
-            cfg_path:         tmp.to_string_lossy().to_string(),
+            cfg: Arc::clone(&cfg_arc),
+            cfg_path: tmp.to_string_lossy().to_string(),
             log_buffer,
             upstreams,
-            sync_journal:     None,
-            sync_key:         None,
-            node_id:          None,
-            slave_mode:       false,
-            base_dir:         Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
-            audit:            crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
-            xdp_active:       Arc::new(AtomicU8::new(0)),
+            sync_journal: None,
+            sync_key: None,
+            node_id: None,
+            slave_mode: false,
+            base_dir: Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
+            audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp")),
+            xdp_active: Arc::new(AtomicU8::new(0)),
             resolver,
-            last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
-            cache_evictions:  Arc::new(AtomicU64::new(0)),
-            lookup_limiter:   Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
+            last_flush_at: Arc::new(std::sync::Mutex::new(None)),
+            cache_evictions: Arc::new(AtomicU64::new(0)),
+            lookup_limiter: Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
             per_upstream_resolvers: crate::dns::server::create_shared_resolvers_vec(),
-            racing_wins:           Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
-            events_tx:             None,
+            racing_wins: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
+            events_tx: None,
+            domain_stats: crate::domain_stats::DomainStats::new(),
         };
         let app = router(state);
 
@@ -4078,24 +5454,48 @@ mod tests {
         let (k, v) = auth_header();
 
         // First DELETE — must succeed
-        let del1 = app.clone().oneshot(
-            Request::builder()
-                .method("DELETE").uri(format!("/api/upstreams/{id}"))
-                .header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
-        assert_eq!(del1.status(), StatusCode::OK, "first delete must return 200");
+        let del1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/upstreams/{id}"))
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            del1.status(),
+            StatusCode::OK,
+            "first delete must return 200"
+        );
 
         // Config file must no longer contain forward-addr: 9.9.9.9@53
         let after = std::fs::read_to_string(&tmp).expect("read temp conf after delete");
-        assert!(!after.contains("9.9.9.9"), "forward-addr must be removed from config file");
+        assert!(
+            !after.contains("9.9.9.9"),
+            "forward-addr must be removed from config file"
+        );
 
         // Second DELETE — must return 404 (idempotent)
-        let del2 = app.oneshot(
-            Request::builder()
-                .method("DELETE").uri(format!("/api/upstreams/{id}"))
-                .header(k, &v).body(Body::empty()).unwrap()
-        ).await.unwrap();
-        assert_eq!(del2.status(), StatusCode::NOT_FOUND, "re-delete must return 404");
+        let del2 = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/upstreams/{id}"))
+                    .header(k, &v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            del2.status(),
+            StatusCode::NOT_FOUND,
+            "re-delete must return 404"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -4106,13 +5506,18 @@ mod tests {
     async fn dns_lookup_no_auth_rejected() {
         let app = make_test_app();
         let body = r#"{"name":"example.com"}"#;
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/dns/lookup")
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns/lookup")
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -4121,13 +5526,19 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let body = r#"{"name":"-invalid-domain-","type":"A"}"#;
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/dns/lookup")
-                .header(k, v).header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns/lookup")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let j = body_json(resp.into_body()).await;
         assert_eq!(j["error"], "INVALID_NAME");
@@ -4138,13 +5549,19 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let body = r#"{"name":"example.com","type":"SOA"}"#;
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/dns/lookup")
-                .header(k, v).header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns/lookup")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let j = body_json(resp.into_body()).await;
         assert_eq!(j["error"], "INVALID_TYPE");
@@ -4161,13 +5578,19 @@ mod tests {
         let app = make_test_app_with_cfg(cfg);
         let (k, v) = auth_header();
         let body = r#"{"name":"blocked.test","type":"A"}"#;
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/dns/lookup")
-                .header(k, v).header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns/lookup")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp.into_body()).await;
         assert_eq!(j["status"], "BLOCKED");
@@ -4179,13 +5602,19 @@ mod tests {
         let app = make_test_app();
         let (k, v) = auth_header();
         let body = r#"{"type":"A"}"#;
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST").uri("/api/dns/lookup")
-                .header(k, v).header("Content-Type", "application/json")
-                .header("Content-Length", body.len().to_string())
-                .body(Body::from(body)).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dns/lookup")
+                    .header(k, v)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         // Missing required field → unprocessable entity from ApiJson
         assert!(resp.status().is_client_error());
     }
@@ -4195,10 +5624,16 @@ mod tests {
     #[tokio::test]
     async fn upstreams_reconnect_requires_auth() {
         let app = make_test_app();
-        let resp = app.oneshot(
-            Request::builder().method("POST").uri("/api/upstreams/reconnect")
-                .body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams/reconnect")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -4206,10 +5641,17 @@ mod tests {
     async fn upstreams_reconnect_get_not_allowed() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().method("GET").uri("/api/upstreams/reconnect")
-                .header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/upstreams/reconnect")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
@@ -4217,10 +5659,17 @@ mod tests {
     async fn upstreams_reconnect_returns_schema() {
         let app = make_test_app();
         let (k, v) = auth_header();
-        let resp = app.oneshot(
-            Request::builder().method("POST").uri("/api/upstreams/reconnect")
-                .header(k, v).body(Body::empty()).unwrap()
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/upstreams/reconnect")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp.into_body()).await;
         for field in &["reconnected", "failed", "duration_ms"] {
