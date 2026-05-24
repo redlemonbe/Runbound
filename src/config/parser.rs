@@ -210,6 +210,14 @@ pub struct UnboundConfig {
     pub firewall_backend: Option<String>,
     /// Tag added to every rule opened by Runbound. Default: "runbound".
     pub firewall_tag: String,
+
+    // ── Embedded web UI (#4/#91) ──────────────────────────────────────────────
+    /// Serve the built-in web UI. Default: false.
+    pub ui_enabled: bool,
+    /// Port for the web UI listener. Default: 8090.
+    pub ui_port: u16,
+    /// Bind address for the web UI listener. Default: 0.0.0.0.
+    pub ui_bind: String,
 }
 
 impl UnboundConfig {
@@ -242,6 +250,9 @@ impl UnboundConfig {
             xdp_comp_ring_size: 4096,
             xdp_rx_ring_size: 4096,
             xdp_tx_ring_size: 4096,
+            ui_enabled: false,
+            ui_port: 8090,
+            ui_bind: "0.0.0.0".to_owned(),
             ..Default::default()
         }
     }
@@ -496,6 +507,9 @@ fn parse_server_directive(
         "firewall-manage" => cfg.firewall_manage = val.trim_matches('"') == "yes",
         "firewall-backend" => cfg.firewall_backend = Some(val.trim_matches('"').to_owned()),
         "firewall-tag" => cfg.firewall_tag = val.trim_matches('"').to_owned(),
+        "ui-enabled" => cfg.ui_enabled = val.trim_matches('"') == "yes",
+        "ui-port" => cfg.ui_port = val.parse().unwrap_or(8090),
+        "ui-bind" => cfg.ui_bind = val.trim_matches('"').to_owned(),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }
