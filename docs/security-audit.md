@@ -29,9 +29,21 @@ External human audit: not yet scheduled.
 
 ## 1. Executive Summary
 
-Runbound is architecturally sound for the surfaces examined. The codebase implements constant-time comparison, memory zeroization (subtle + zeroize crates), and bounds-checked UMEM access on the critical surfaces examined. The 5 M QPS target is achievable on dedicated multi-queue hardware with XDP enabled, pending four corrections.
+This audit cycle [AI-INTERNAL] reviewed Runbound v0.6.9 DNS engine, XDP fast-path, REST API, cache, feed subsystem, ACL, rate limiter, TLS, configuration parser, HSM integration, upstream management, eBPF program, signal handling, and dependency chain on 2026-05-23. Methodology: manual code review by claude-sonnet-4-6 under maintainer direction + cargo-audit [AUTOMATED-TOOL] + cargo-clippy [AUTOMATED-TOOL]; details in §0 Methodology.
 
-**Overall verdict: four blocking items (§6) must be resolved before any deployment decision.**
+**Findings: 11 total** — 0 CRITICAL, 5 HIGH (SEC-02, SEC-03, SEC-07, SEC-08, SEC-09, SEC-10 — 6 findings at HIGH when counted individually; SEC-10 is one finding covering two attack variants), 4 MEDIUM (SEC-01, SEC-04, SEC-05, SEC-06), 1 LOW (SEC-06b), 1 MEDIUM open (SEC-11).
+
+**Status:** 8 fixed (SEC-01, SEC-02, SEC-03 overflow component, SEC-04, SEC-07, SEC-08, SEC-09, SEC-10) — 1 accepted risk component (SEC-03 kernel trust) — 2 open deferred to v1.0 (SEC-05, SEC-06) — 1 open fixed in later cycle (SEC-11 v0.6.11).
+
+**Scope limitations:** Tests directory not evaluated for coverage. eBPF C source reviewed at call-site level only, not full BPF verifier. Tokio fallback path reviewed at lower depth. Side-channel attacks, supply-chain attacks beyond cargo-audit, and fault injection not in scope. See §Known Limitations.
+
+**Notable observations:**
+- Auth bearer constant-time comparison and memory zeroization correctly implemented
+- XDP UMEM bounds check implemented, but kernel trust is an accepted risk (see KL-01)
+- DNSSEC validation disabled by default — operator must explicitly enable; no default-safe configuration (see SEC-05, KL-02)
+- All fixes to date verified by [AI-INTERNAL] review in the same session family that produced the finding; treated as "claimed fixed, not independently verified" until [AI-ADVERSARIAL] or [HUMAN-EXTERNAL] re-audit
+
+This audit is [AI-INTERNAL] and does NOT substitute for external human security review. External human audit: not yet scheduled.
 
 ---
 
@@ -260,7 +272,7 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 - **Residual risk:** Risk remains in all deployments until operator enables DNSSEC; see KL-02
 - **Verification:** No automated test; configuration default reviewed manually
 
-**Verdict: ✅ Robust. ⚠️ RECOMMENDATION: enable DNSSEC in production.**
+**Verdict:** DNS rebinding, amplification, and fingerprinting protections verified present. ⚠️ DNSSEC requires explicit operator enablement — see SEC-05.
 
 ### 3.7 Signal Handling
 
