@@ -17,12 +17,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
+use base64::Engine as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::future::select_ok;
 use hickory_proto::op::Query as DnsQuery;
 use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use hickory_resolver::{
@@ -173,7 +175,8 @@ pub struct RunboundHandler {
     /// #14: allow DNS UPDATE (RFC 2136). False = refuse all UPDATE messages.
     allow_update: bool,
     /// #14: TSIG keys for DNS UPDATE authentication: (name, algorithm, base64-secret).
-    tsig_keys: Vec<(String, String, String)>,
+    /// SEC-20: pre-decoded TSIG keys (name_lower, algorithm, key_bytes) — decoded once at startup.
+    tsig_keys: Vec<(String, TsigAlgorithm, Vec<u8>)>,
 }
 
 impl RunboundHandler {
@@ -205,7 +208,7 @@ impl RunboundHandler {
         stale_answer_ttl: u32,
         stale_max_age: u64,
         allow_update: bool,
-        tsig_keys: Vec<(String, String, String)>,
+        tsig_keys_raw: Vec<(String, String, String)>,
     ) -> Self {
         Self {
             zones,
@@ -237,7 +240,26 @@ impl RunboundHandler {
             stale_answer_ttl,
             stale_max_age,
             allow_update,
-            tsig_keys,
+            // SEC-20: decode TSIG keys once at startup instead of per-request.
+            tsig_keys: tsig_keys_raw.into_iter().filter_map(|(name, alg_str, secret_b64)| {
+                let alg = match alg_str.as_str() {
+                    "hmac-sha256" | "HMAC-SHA256" => TsigAlgorithm::HmacSha256,
+                    "hmac-sha512" | "HMAC-SHA512" => TsigAlgorithm::HmacSha512,
+                    "hmac-sha384" | "HMAC-SHA384" => TsigAlgorithm::HmacSha384,
+                    "hmac-sha1"   | "HMAC-SHA1"   => TsigAlgorithm::HmacSha1,
+                    other => {
+                        tracing::warn!(alg=%other, key=%name, "TSIG: unsupported algorithm, key ignored");
+                        return None;
+                    }
+                };
+                match base64::engine::general_purpose::STANDARD.decode(&secret_b64) {
+                    Ok(bytes) => Some((name.to_ascii_lowercase(), alg, bytes)),
+                    Err(e) => {
+                        tracing::warn!(key=%name, err=%e, "TSIG: base64 decode failed at startup, key ignored");
+                        None
+                    }
+                }
+            }).collect(),
         }
     }
 
@@ -700,9 +722,15 @@ impl RunboundHandler {
                 }
 
                 // #108: Update stale cache with fresh records.
+                // SEC-21: evict oldest entry if at capacity (simple LRU approximation).
                 if let Some(ref sc) = self.stale_cache {
                     if !records.is_empty() {
                         let stale_key = (qname.clone(), qtype);
+                        if sc.len() >= self.cache_max_entries {
+                            if let Some(old_key) = sc.iter().next().map(|e| e.key().clone()) {
+                                sc.remove(&old_key);
+                            }
+                        }
                         sc.insert(stale_key, (records.to_vec(), std::time::Instant::now()));
                     }
                 }

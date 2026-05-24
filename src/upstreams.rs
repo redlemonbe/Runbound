@@ -105,6 +105,9 @@ pub struct UpstreamStatus {
     // Internal backoff state — not serialised in API responses.
     #[serde(skip, default)]
     pub consecutive_failures: u32,
+    /// SEC-24: consecutive probes returning AD=0 after AD=1. Must reach 2 before flagging.
+    #[serde(skip, default)]
+    pub consecutive_strip_count: u32,
     #[serde(skip, default = "Instant::now")]
     pub next_check_at: Instant,
 }
@@ -265,6 +268,7 @@ pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
             last_error: None,
             temporary: false,
             consecutive_failures: 0,
+            consecutive_strip_count: 0,
             next_check_at: Instant::now(),
         })
         .collect()
@@ -319,6 +323,7 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
                 last_error: None,
                 temporary: false,
                 consecutive_failures: 0,
+            consecutive_strip_count: 0,
                 next_check_at: Instant::now(),
             });
         }
@@ -368,6 +373,7 @@ pub fn add_upstream(
         zone: ".".into(),
         temporary: false,
         consecutive_failures: 0,
+        consecutive_strip_count: 0,
         next_check_at: Instant::now(),
     };
     upstreams
@@ -482,6 +488,7 @@ pub fn add_resolv_fallback(upstreams: &SharedUpstreams) {
             last_error: None,
             temporary: true,
             consecutive_failures: 0,
+            consecutive_strip_count: 0,
             next_check_at: Instant::now(),
         });
     }
@@ -628,10 +635,19 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 let was_dnssec = s.dnssec_supported;
                 s.dnssec_supported = dnssec_supported;
                 if was_dnssec == Some(true) && dnssec_supported == Some(false) {
-                    s.dnssec_stripping = true;
-                    warn!(upstream = %s.addr, "DNSSEC stripping detected — upstream no longer sets AD bit");
+                    s.consecutive_strip_count += 1;
+                    if s.consecutive_strip_count >= 2 {
+                        s.dnssec_stripping = true;
+                        warn!(upstream = %s.addr, count = s.consecutive_strip_count,
+                            "DNSSEC stripping confirmed — upstream no longer sets AD bit (SEC-24 hysteresis)");
+                    } else {
+                        warn!(upstream = %s.addr, count = s.consecutive_strip_count,
+                            "DNSSEC stripping probe {}/{} — waiting for confirmation (SEC-24)",
+                            s.consecutive_strip_count, 2);
+                    }
                 } else if dnssec_supported == Some(true) {
                     s.dnssec_stripping = false;
+                    s.consecutive_strip_count = 0;
                 }
                 // #53: clear last_error on success
                 s.last_error = None;
