@@ -492,9 +492,9 @@ async function pollNodeSys(id) {
 
 function selectNode(id) {
   selectedNode = id;
-  // Switch BASE/KEY for other tabs
-  if (id === 'all' || id === 'master') { BASE = nodes.master?.url??'/api'; KEY = nodes.master?.key??masterKey; }
-  else if (nodes[id]) { BASE = nodes[id].url; KEY = nodes[id].key; }
+  // BASE/KEY always point to master — DNS, Blacklist, Feeds, Upstreams, Logs are master-only
+  BASE = nodes.master?.url ?? '/api';
+  KEY  = nodes.master?.key ?? masterKey;
   renderNodePills();
   updateOverview();
 }
@@ -861,7 +861,7 @@ function toggleAutoLogs(el){clearInterval(logsTimer);if(el.checked){loadLogs();l
 // System
 // ══════════════════════════════════════════════
 async function loadSystem(){
-  const nId = selectedNode==='all'?'master':selectedNode;
+  const nId = 'master';
   const n = nodes[nId]; if(!n) return;
   try{
     const s = n.sys ?? await nodeApi(nId,'GET','/system');
@@ -904,7 +904,15 @@ async function loadSlaves(){
     const connStatus=s=>{const e=elapsed(s);return e<30?'synced':e<120?'stale':'offline';};
     const syncTime=s=>{if(!s.last_seen_secs)return'—';return new Date(s.last_seen_secs*1000).toLocaleTimeString('fr-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});};
     const badge=st=>st==='synced'?'<span class="text-xs font-semibold text-green-400">✓ synced</span>':st==='stale'?'<span class="text-xs font-semibold text-yellow-400">● stale</span>':'<span class="text-xs font-semibold text-red-400">✗ offline</span>';
-    el.innerHTML=deduped.map(s=>{const st=s.status==='connected'?'synced':s.status??connStatus(s),ip=s.addr.replace(/:\d+$/,'');const ver=s.version?`<span class="text-gray-700 text-xs font-mono">${esc(s.version)}</span>`:'';const zones=s.zones_synced!=null?`<span class="text-gray-600 text-xs">${s.zones_synced} zones</span>`:'';return`<div class="flex items-center gap-3 py-1.5 border-b border-gray-800/40"><span class="text-cyan-300 font-mono text-xs flex-1">${esc(ip)}</span>${ver}${zones}<span class="w-24 text-right">${badge(st)}</span><span class="text-gray-600 text-xs w-20 text-right font-mono">${syncTime(s)}</span></div>`;}).join('');
+    // Fetch system info for each slave via relay (best-effort)
+    const slaveSystemData = {};
+    await Promise.all(deduped.map(async s => {
+      const ip = s.addr.replace(/:\d+$/, '');
+      const nid = Object.keys(nodes).find(k => k === ip);
+      if (!nid || !nodes[nid]) return;
+      try { slaveSystemData[ip] = await nodeApi(nid, 'GET', '/system'); } catch(_) {}
+    }));
+    el.innerHTML=deduped.map(s=>{const st=s.status==='connected'?'synced':s.status??connStatus(s),ip=s.addr.replace(/:\d+$/,'');const sys=slaveSystemData[ip];const ver=(sys?.version??s.version)?`<span class="text-gray-700 text-xs font-mono">${esc(sys?.version??s.version)}</span>`:'';const zones=s.zones_synced!=null?`<span class="text-gray-600 text-xs">${s.zones_synced} zones</span>`:'';const xdp=sys?`<span class="text-gray-600 text-xs">${sys.xdp_active?'XDP '+esc(sys.xdp_mode??'on'):'XDP off'}</span>`:'';const cpu=sys?.cpu_percent!=null?`<span class="text-gray-600 text-xs">CPU ${sys.cpu_percent.toFixed(1)}%</span>`:'';const mem=sys?.mem_avail_mb!=null?`<span class="text-gray-600 text-xs">${sys.mem_avail_mb.toLocaleString()} MB free</span>`:'';return`<div class="flex items-center gap-3 py-1.5 border-b border-gray-800/40"><span class="text-cyan-300 font-mono text-xs w-32 shrink-0">${esc(ip)}</span>${ver}${zones}${xdp}${cpu}${mem}<span class="flex-1"></span><span class="w-24 text-right">${badge(st)}</span><span class="text-gray-600 text-xs w-20 text-right font-mono">${syncTime(s)}</span></div>`;}).join('');
   }catch(_){if(el)el.innerHTML='<span class="text-gray-700 italic">Slave info unavailable.</span>';}
 }
 async function cacheFlush(){const btn=document.getElementById('btn-flush');try{const r=await api('POST','/cache/flush');toast(`Cache flushed — ${r.flushed_entries??0} entries cleared`);if(btn){btn.disabled=true;btn.classList.add('opacity-30','cursor-not-allowed');setTimeout(()=>{btn.disabled=false;btn.classList.remove('opacity-30','cursor-not-allowed');},60000);}loadSystem();}catch(e){toast(e.message.includes('FLUSH_COOLDOWN')||e.message.includes('429')?'Cache flush on cooldown (60 s)':'Flush failed: '+e.message,true);}}
