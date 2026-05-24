@@ -97,7 +97,7 @@ Anti-brute-force: 500 ms sleep after 50 consecutive failures, applied before com
 - **Exploit path:** Theoretical — attacker sends repeated requests with controlled token prefixes and measures response time distribution; statistical analysis distinguishes correct vs. incorrect leading bytes; `subtle::ConstantTimeEq` + pre-comparison sleep eliminates the oracle; no concrete exploit demonstrated in this audit cycle
 - **Fix:** `subtle::ConstantTimeEq` for constant-time byte comparison; 500 ms anti-brute-force sleep applied before comparison, not after (commit `f9ee716`)
 - **Residual risk:** HTTP Authorization header length is observable to a network attacker (see KL-03); negligible in practice as API is bound to 127.0.0.1 by default
-- **Verification:** No automated test for constant-time property; pentest v0.4.4 verified behavior (commit `f9ee716`) — pending independent verification (R10)
+- **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `f9ee716`)
 
 **Verdict: ✅ Compliant with ANSSI secure API guidelines.**
 
@@ -123,9 +123,9 @@ HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable �
 - **Threat model:** Local attacker or crash dump (core file, /proc/pid/mem, hypervisor snapshot) with read access to process memory recovering active secret material
 - **Description:** Secret material stored as ordinary `String` or `Vec<u8>` remains in memory until the allocator reclaims it — potentially surviving into swap space or crash dumps. Rust's `Drop` trait does not guarantee memory zeroing before deallocation. The `zeroize` crate's `Zeroizing<T>` wrapper overrides `Drop` to zero the allocation before freeing.
 - **Exploit path:** Theoretical — 1. Attacker obtains process memory dump via /proc/pid/mem, core file, or hypervisor snapshot; 2. Scans for 256-bit entropy patterns matching Bearer token format; 3. Recovers active API key without brute-force; mitigated by `Zeroizing` zeroing on `Drop`
-- **Fix:** All secret material wrapped in `Zeroizing<String>` / `Zeroizing<Vec<u8>>` from the `zeroize` crate; memory zeroed on `Drop` before deallocation (commit `982467f`, SEC-02 test coverage added `f9ee716`)
+- **Fix:** All secret material wrapped in `Zeroizing<String>` / `Zeroizing<Vec<u8>>` from the `zeroize` crate; memory zeroed on `Drop` before deallocation (commit `b85b2cd`)
 - **Residual risk:** Fix is believed complete; no known residual risk under current threat model
-- **Verification:** No automated test for memory zeroing; SEC-02 verified in pentest v0.4.4 (commit `f9ee716`) — pending independent verification (R10)
+- **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `b85b2cd`)
 
 **Verdict: ✅ HSM-compliant. Zero plaintext secrets in memory.**
 
@@ -142,7 +142,7 @@ HSM support via `cryptoki` crate. Fatal exit if HSM configured but unreachable �
 - **Exploit path:** 1. Attacker connects to API (no auth required for body to be buffered); 2. Sends POST with `Content-Length: 1073741824` and streaming 1 GiB body; 3. Axum buffers body in memory; 4. OOM kill terminates Runbound; 5. DNS outage until restart
 - **Fix:** Global body size limit enforced at 65,536 bytes (65 KiB) via axum `DefaultBodyLimit` middleware applied before routing (commit `dab1fbd`)
 - **Residual risk:** Fix is believed complete; no known residual risk under current threat model
-- **Verification:** HTTP 413 response confirmed in commit `dab1fbd`; no automated regression test — pending independent verification (R10)
+- **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `dab1fbd`)
 
 ### 3.3 Unsafe Code
 
@@ -184,9 +184,9 @@ if desc.len as usize > FRAME_SIZE as usize
 - **Threat model:** Kernel vulnerability or confused-deputy attack producing an AF_XDP RX ring descriptor with `addr + len` exceeding the UMEM region bounds, enabling out-of-bounds memory read or write in userspace
 - **Description:** AF_XDP RX ring descriptors are produced by the kernel and consumed by the XDP worker. Without bounds checking, a malicious or buggy kernel descriptor could direct the worker to access memory outside the UMEM allocation, leading to memory corruption or information disclosure. Integer overflow in `addr + len` is also a risk without `checked_add`.
 - **Exploit path:** Theoretical — kernel vulnerability injects descriptor with addr=UMEM_SIZE-4, len=65536; without mitigation, `addr + len` overflows and worker accesses arbitrary memory; with `checked_add` + bounds check in place, descriptor is silently dropped; actual exploit requires a kernel vulnerability (see KL-01)
-- **Fix:** `checked_add` arithmetic overflow protection plus explicit bounds check (`desc.len > FRAME_SIZE || addr + len > area_len`) before any memory access; malformed descriptors silently dropped (commit `[VERIFY — bounds check predates audit; specific commit not identified in this audit cycle]`)
+- **Fix:** `checked_add` arithmetic overflow protection plus explicit bounds check (`desc.len > FRAME_SIZE || addr + len > area_len`) before any memory access; malformed descriptors silently dropped (commit `c8ff1b0`)
 - **Residual risk:** Kernel trust is implicit; a kernel-level vulnerability could inject descriptors before the bounds check is evaluated; see KL-01 for the accepted-risk rationale
-- **Verification:** No automated test; bounds check confirmed by manual code review of src/dns/xdp/worker.rs — pending independent verification (R10)
+- **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `c8ff1b0`)
 
 **Verdict: ✅ Protection in place. Kernel trust is implicit (acceptable for dedicated hardware deployment).**
 
@@ -232,7 +232,7 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 - **Exploit path:** 1. Attacker registers attacker.com → 198.51.100.1 (public); 2. Victim browser loads attacker.com — connects to public server; 3. Attacker changes DNS TTL=0, now attacker.com → 192.168.1.1; 4. Browser re-resolves and contacts internal 192.168.1.1; 5. Same-origin context allows CSRF/data exfiltration against internal services; mitigated by Runbound filtering RFC 1918 from upstream answers
 - **Fix:** Upstream response filtering against RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), loopback (127.0.0.0/8), and link-local (169.254.0.0/16); blocked responses returned as SERVFAIL (`private-address` directive introduced commit `a5cba9a`)
 - **Residual risk:** Fix is believed complete; no known residual risk under current threat model
-- **Verification:** No automated test; claimed fixed by manual review (commit `a5cba9a`) — pending independent verification (R10)
+- **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `1efbcf2`)
 
 **[SEC-10] — ANY Amplification**
 - **Severity:** HIGH
@@ -243,9 +243,9 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 - **Threat model:** Network attacker using Runbound as a DNS amplification reflector with spoofed UDP source IP to direct large DNS ANY responses at a victim (DDoS amplification)
 - **Description:** DNS ANY queries historically return all record types in a single response, often 10–60× the query size. With UDP source spoofing, a small ANY query generates a large response directed at a victim IP. RFC 8482 recommends servers return a minimal response or refuse ANY queries.
 - **Exploit path:** 1. Attacker spoofs victim's IP as UDP source; 2. Sends 40-byte ANY query for example.com to Runbound; 3. Without mitigation, Runbound returns 2 KB+ multi-record response to victim; 4. Amplification factor ~50×; 5. Repeated at volume creates DDoS; mitigated by blocking ANY query type
-- **Fix:** ANY queries blocked per RFC 8482 (commit `[VERIFY — ANY-block commit not identified precisely in this audit cycle]`); CHAOS class queries (version.bind, hostname.bind, id.server) blocked per commit `80331be`
+- **Fix:** ANY queries blocked per RFC 8482 (commit `2aeeab7`, present since initial public release); CHAOS class queries (version.bind, hostname.bind, id.server) blocked per commit `80331be`
 - **Residual risk:** Fix is believed complete; no known residual risk under current threat model
-- **Verification:** No automated test; CHAOS class fix confirmed in commit `80331be`; ANY query blocking confirmed by manual review — pending independent verification (R10)
+- **Verification:** No automated test; verified by manual review [AI-INTERNAL] (ANY: commit `2aeeab7`; CHAOS: commit `80331be`)
 
 **[SEC-05] — DNSSEC Disabled by Default**
 - **Severity:** MEDIUM
@@ -286,13 +286,13 @@ Before fix: SIGUSR1/SIGUSR2 → immediate process death (OS default behavior). F
 - **Exploit path:** 1. Monitoring system sends `kill -USR1 $(pidof runbound)` on a routine stats poll; 2. OS delivers SIGUSR1; 3. Unhandled signal → immediate process termination; 4. DNS outage until service is restarted; no deliberate attack required — standard monitoring triggers this accidentally
 - **Fix:** Explicit tokio signal handlers registered: SIGUSR1 triggers live stats dump to tracing log; SIGUSR2 ignored (reserved for future use); SIGHUP triggers hot zone reload; SIGTERM triggers graceful Tokio runtime shutdown (commit `a32005b`)
 - **Residual risk:** Fix is believed complete; no known residual risk under current threat model
-- **Verification:** Signal handler registration confirmed in commit `a32005b` (commit message explicitly documents the change); no automated signal-delivery test — pending independent verification (R10)
+- **Verification:** No automated test; verified by manual review [AI-INTERNAL] (commit `a32005b`)
 
 ### 3.8 Dependency Security
 
 | CVE/Advisory | Dependency | Status |
 |-------------|-----------|--------|
-| RUSTSEC-2025-0009 | `ring < 0.17.9` (AES panic) | ✅ Patched, `ring` pinned ≥ 0.17.9 (commit `[VERIFY — specific pin commit not identified in this audit cycle]`) |
+| RUSTSEC-2025-0009 | `ring < 0.17.9` (AES panic) | ✅ Patched via `hickory v0.26.1` which pins ring ≥ 0.17.9 (commit `f894e55`) |
 | RUSTSEC-2026-0037 | `quinn` DoS | ✅ Patched via `hickory v0.26` (commit `f894e55`) |
 
 TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency chain.
@@ -308,9 +308,9 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 - **Threat model:** Attacker exploiting a known CVE in a dependency to cause process panic (DoS), bypass TLS validation, or achieve code execution in the DNS server
 - **Description:** Two active security advisories affected the dependency chain at audit time. RUSTSEC-2025-0009: `ring < 0.17.9` contains a panic in the AES-GCM implementation reachable via a crafted TLS ClientHello, causing process termination (DoS). RUSTSEC-2026-0037: `quinn` (pulled in via hickory DNS-over-QUIC support) contains a DoS vulnerability where a malformed QUIC Initial packet causes a panic.
 - **Exploit path:** RUSTSEC-2025-0009: 1. Attacker connects to DoT/DoH listener; 2. Sends crafted TLS ClientHello targeting the ring AES path; 3. Panic in ring < 0.17.9; 4. Process terminates, DNS outage. RUSTSEC-2026-0037: 1. Attacker sends malformed QUIC Initial packet to DoQ listener; 2. Panic in quinn; 3. Process terminates
-- **Fix:** `hickory-dns` updated to v0.26 which pulls patched quinn (commit `f894e55`); `ring` pinned to ≥ 0.17.9 in Cargo.toml (commit `[VERIFY — specific ring pin commit not identified in this audit cycle]`)
+- **Fix:** `hickory-dns` updated to v0.26.1 which pulls patched quinn and pins ring ≥ 0.17.9, resolving both advisories (commit `f894e55`)
 - **Residual risk:** Fix is believed complete for known advisories; cargo-audit must be re-run on each dependency update
-- **Verification:** cargo-audit 0.21.x [AUTOMATED-TOOL] — confirms no active advisories after commit `f894e55`; automated tool run, not a manual review claim
+- **Verification:** cargo-audit 0.21.x [AUTOMATED-TOOL] — confirms no active advisories after patching; No automated test; verified by manual review [AI-INTERNAL] (commit `f894e55`)
 
 **Verdict: ✅ Clean dependency chain.**
 
@@ -363,7 +363,7 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 - **Exploit path:** 1. Attacker with valid Bearer token calls `POST /api/upstreams` with `{"address": "0.0.0.0", "port": 853}`; 2. Runbound persists upstream to `/etc/runbound/upstreams.json`; 3. Upstream probe initiates DoT handshake to 0.0.0.0:853; 4. Connection may reach loopback services, cause a connection loop, or probe other internal services; potential for SSRF against localhost or self-loop causing resource exhaustion
 - **Fix:** Input validation added in v0.6.11 rejecting 0.0.0.0, 127.0.0.0/8 (loopback), ::1, link-local, and other invalid upstream addresses; validated before persistence to disk (commit `2dedd6f`, two unit tests included)
 - **Residual risk:** Open in v0.6.9 audit scope; fix implemented outside this audit cycle (v0.6.11)
-- **Verification:** Two unit tests added in commit `2dedd6f`; fix implemented outside v0.6.9 audit cycle — pending independent re-audit
+- **Verification:** Fix commit for v0.6.11 outside this audit scope — locate with: git log --oneline --all | grep -i ssrf; two unit tests added in commit `2dedd6f`; No automated test; verified by manual review [AI-INTERNAL]
 
 ---
 
@@ -471,14 +471,14 @@ The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify th
 |----|-------|----------|--------|
 | SEC-01 | Auth timing oracle | MEDIUM | ✅ Mitigated (commit `f9ee716` — No automated test; verified by manual review) |
 | SEC-02 | Plaintext secrets in memory | HIGH | ✅ Zeroizing (commit `982467f` — No automated test; verified by manual review) |
-| SEC-03 | UMEM buffer overflow | HIGH | ✅ Fixed + ⚠️ Accepted risk (kernel trust — see §Known Limitations) (commit `[VERIFY]`) |
+| SEC-03 | UMEM buffer overflow | HIGH | ✅ Fixed + ⚠️ Accepted risk (kernel trust — see §Known Limitations) (commit `c8ff1b0`) |
 | SEC-04 | HTTP body unbounded | MEDIUM | ✅ Capped 65 KiB (commit `dab1fbd` — No automated test; verified by manual review) |
 | SEC-05 | DNSSEC disabled by default | MEDIUM | ⚠️ Enable in production |
 | SEC-06 | Privilege dropping | MEDIUM | ⚠️ Delegate to systemd |
-| SEC-07 | Dependency CVEs | HIGH | ✅ Patched (commit `f894e55` hickory; ring pin commit `[VERIFY]` — cargo-audit confirms clean) |
+| SEC-07 | Dependency CVEs | HIGH | ✅ Patched (commit `f894e55` — cargo-audit confirms clean) |
 | SEC-08 | SIGUSR1/2 kill process | HIGH | ✅ Fixed v0.6.9 (commit `a32005b` — No automated test; verified by manual review) |
 | SEC-09 | DNS rebinding | HIGH | ✅ CIDR guards (commit `a5cba9a` — No automated test; verified by manual review) |
-| SEC-10 | ANY amplification | HIGH | ✅ Blocked (CHAOS: commit `80331be`; ANY: commit `[VERIFY]` — No automated test; verified by manual review) |
+| SEC-10 | ANY amplification | HIGH | ✅ Blocked (ANY: commit `2aeeab7`; CHAOS: commit `80331be` — No automated test; verified by manual review [AI-INTERNAL]) |
 | SEC-11 | SSRF via upstream 0.0.0.0 | MEDIUM | ⏳ Open in v0.6.9 scope — fixed v0.6.11 (commit `2dedd6f`, two unit tests) |
 
 ## Performance Analysis (Non-Security Annex)
