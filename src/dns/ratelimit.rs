@@ -4,13 +4,13 @@
 // (server.rs) and the XDP fast-path (xdp/worker.rs).
 
 use std::net::{IpAddr, Ipv6Addr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
 
-const RATE_LIMIT_WINDOW_MS:   u64 = 1_000;
+const RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
 
 /// Mask a source IP to the configured prefix before DashMap lookup.
@@ -23,19 +23,27 @@ fn normalize_ip(ip: IpAddr, prefix_v4: u8, prefix_v6: u8) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => {
             let bits = u32::from(v4);
-            let mask = if prefix_v4 >= 32 { u32::MAX } else { !((1u32 << (32 - prefix_v4)) - 1) };
+            let mask = if prefix_v4 >= 32 {
+                u32::MAX
+            } else {
+                !((1u32 << (32 - prefix_v4)) - 1)
+            };
             IpAddr::V4((bits & mask).into())
         }
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();
             let keep_bytes = (prefix_v6 as usize) / 8;
-            let keep_bits  = (prefix_v6 as usize) % 8;
+            let keep_bits = (prefix_v6 as usize) % 8;
             if keep_bytes < 16 {
                 if keep_bits > 0 {
                     octets[keep_bytes] &= 0xFF_u8 << (8 - keep_bits);
-                    for b in &mut octets[keep_bytes + 1..] { *b = 0; }
+                    for b in &mut octets[keep_bytes + 1..] {
+                        *b = 0;
+                    }
                 } else {
-                    for b in &mut octets[keep_bytes..] { *b = 0; }
+                    for b in &mut octets[keep_bytes..] {
+                        *b = 0;
+                    }
                 }
             }
             IpAddr::V6(Ipv6Addr::from(octets))
@@ -44,18 +52,18 @@ fn normalize_ip(ip: IpAddr, prefix_v4: u8, prefix_v6: u8) -> IpAddr {
 }
 
 struct IpBucket {
-    tokens:      u64,
+    tokens: u64,
     last_refill: Instant,
 }
 
 pub struct RateLimiter {
-    buckets:    DashMap<IpAddr, IpBucket, ahash::RandomState>,
-    start:      Instant,    // base for nanosecond GC clock
+    buckets: DashMap<IpAddr, IpBucket, ahash::RandomState>,
+    start: Instant,        // base for nanosecond GC clock
     next_gc_ns: AtomicU64, // nanos since `start` at which to next run retain()
-    rps:        u64,
-    burst:      u64,
-    prefix_v4:  u8,
-    prefix_v6:  u8,
+    rps: u64,
+    burst: u64,
+    prefix_v4: u8,
+    prefix_v6: u8,
 }
 
 impl RateLimiter {
@@ -83,14 +91,20 @@ impl RateLimiter {
         // Time-based GC: hot path is a single load (no write, no cache-line contention).
         // One thread per 10-second window runs retain() via a CAS.
         let now_ns = now.duration_since(self.start).as_nanos() as u64;
-        let gc_at  = self.next_gc_ns.load(Ordering::Relaxed);
+        let gc_at = self.next_gc_ns.load(Ordering::Relaxed);
         if now_ns >= gc_at
-            && self.next_gc_ns
-                .compare_exchange(gc_at, gc_at.saturating_add(10_000_000_000),
-                    Ordering::Relaxed, Ordering::Relaxed)
+            && self
+                .next_gc_ns
+                .compare_exchange(
+                    gc_at,
+                    gc_at.saturating_add(10_000_000_000),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
         {
-            self.buckets.retain(|_, b| now.duration_since(b.last_refill).as_secs() < 60);
+            self.buckets
+                .retain(|_, b| now.duration_since(b.last_refill).as_secs() < 60);
         }
 
         if self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS && !self.buckets.contains_key(&ip) {
@@ -98,7 +112,8 @@ impl RateLimiter {
             // silently dropping the new IP. This prevents a bucket-exhaustion attack
             // where an attacker floods from N distinct IPs to fill the table and
             // cause all subsequent IPs (including legitimate clients) to be refused.
-            self.buckets.retain(|_, b| now.duration_since(b.last_refill).as_secs() < 10);
+            self.buckets
+                .retain(|_, b| now.duration_since(b.last_refill).as_secs() < 10);
             if self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
                 // Still full after eviction — table is under active flood; drop.
                 return false;
@@ -106,7 +121,7 @@ impl RateLimiter {
         }
 
         let mut bucket = self.buckets.entry(ip).or_insert_with(|| IpBucket {
-            tokens:      self.burst,
+            tokens: self.burst,
             last_refill: now,
         });
 

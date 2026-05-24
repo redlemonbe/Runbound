@@ -8,12 +8,12 @@
 
 use std::os::fd::RawFd;
 
+use aya::programs::xdp::XdpLinkId;
 use aya::{
-    Ebpf, EbpfLoader,
     maps::{CpuMap, XskMap},
     programs::{Xdp, XdpFlags},
+    Ebpf, EbpfLoader,
 };
-use aya::programs::xdp::XdpLinkId;
 
 /// Full XDP binary — includes BPF_MAP_TYPE_CPUMAP for domain-affinity routing.
 /// `include_bytes!` aligns to 1 byte, but aya's ELF64 parser (via the `object`
@@ -29,7 +29,10 @@ static XDP_PROG_MINIMAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns_x
 
 /// XDP attachment mode — reported by GET /api/system as `xdp_mode`.
 #[derive(Clone, Copy, Debug)]
-pub enum XdpMode { Drv, Skb }
+pub enum XdpMode {
+    Drv,
+    Skb,
+}
 
 /// RAII handle for the loaded XDP program.
 ///
@@ -37,7 +40,7 @@ pub enum XdpMode { Drv, Skb }
 /// all BPF maps. Without explicit detach the program would remain attached
 /// after process exit (prevents NIC hot-unplug and re-attach on restart).
 pub struct XdpHandle {
-    bpf:     Ebpf,
+    bpf: Ebpf,
     link_id: Option<XdpLinkId>,
     pub mode: XdpMode,
     /// #69: (core_id, original_governor) pairs saved before switching to "performance".
@@ -74,8 +77,8 @@ impl XdpHandle {
     /// Tries native (DRV) mode first for lowest latency; falls back to
     /// generic (SKB) mode if the driver does not support native XDP.
     pub fn load(iface: &str, nb_workers: u32, domain_routing: bool) -> Result<Self, String> {
-        let routing_flag: u32  = if domain_routing { 1 } else { 0 };
-        let effective_workers  = nb_workers.max(1);
+        let routing_flag: u32 = if domain_routing { 1 } else { 0 };
+        let effective_workers = nb_workers.max(1);
 
         // Try full binary (with CPUMAP).
         let bpf_result = load_ebpf_bytes(XDP_PROG, effective_workers, routing_flag);
@@ -101,7 +104,8 @@ impl XdpHandle {
             .try_into()
             .map_err(|e| format!("program type mismatch: {e}"))?;
 
-        program.load()
+        program
+            .load()
             .map_err(|e| format!("XDP prog load failed: {e}"))?;
 
         // Try DRV mode (zero-copy capable drivers). Fall back to SKB mode
@@ -109,7 +113,11 @@ impl XdpHandle {
         let (link_id, mode) = program
             .attach(iface, XdpFlags::DRV_MODE)
             .map(|id| (id, XdpMode::Drv))
-            .or_else(|_| program.attach(iface, XdpFlags::SKB_MODE).map(|id| (id, XdpMode::Skb)))
+            .or_else(|_| {
+                program
+                    .attach(iface, XdpFlags::SKB_MODE)
+                    .map(|id| (id, XdpMode::Skb))
+            })
             .map_err(|e| format!("XDP attach to {iface} failed: {e}"))?;
 
         tracing::info!(
@@ -119,7 +127,12 @@ impl XdpHandle {
             "XDP program attached"
         );
 
-        let mut handle = XdpHandle { bpf, link_id: Some(link_id), mode, governor_backups: Vec::new() };
+        let mut handle = XdpHandle {
+            bpf,
+            link_id: Some(link_id),
+            mode,
+            governor_backups: Vec::new(),
+        };
 
         // Init CPUMAP entries when domain routing is enabled.
         // Silently skip on any error so the XDP path still works via XSKMAP fallback.
@@ -139,11 +152,12 @@ impl XdpHandle {
     /// Each entry is initialised with `queue_size=192` packets (enough headroom
     /// for burst traffic) and no chained BPF program.
     fn init_cpumap(&mut self, nb_workers: u32) -> Result<(), String> {
-        let map = self.bpf
+        let map = self
+            .bpf
             .map_mut("CPUMAP")
             .ok_or_else(|| "CPUMAP map not found in BPF object".to_string())?;
-        let mut cpu_map = CpuMap::try_from(map)
-            .map_err(|e| format!("CPUMAP is not a CpuMap: {e}"))?;
+        let mut cpu_map =
+            CpuMap::try_from(map).map_err(|e| format!("CPUMAP is not a CpuMap: {e}"))?;
         for cpu_idx in 0..nb_workers {
             cpu_map
                 .set(cpu_idx, 192, None, 0)
@@ -157,12 +171,13 @@ impl XdpHandle {
     /// Must be called after `create_xsk_socket` so the kernel can redirect
     /// frames for that queue directly into the AF_XDP ring buffer.
     pub fn register_socket(&mut self, queue_id: u32, sock_fd: RawFd) -> Result<(), String> {
-        let map = self.bpf
+        let map = self
+            .bpf
             .map_mut("XSKS")
             .ok_or_else(|| "XSKS map not found in BPF object".to_string())?;
 
-        let mut xsk_map = XskMap::try_from(map)
-            .map_err(|e| format!("XSKS is not an XskMap: {e}"))?;
+        let mut xsk_map =
+            XskMap::try_from(map).map_err(|e| format!("XSKS is not an XskMap: {e}"))?;
 
         xsk_map
             .set(queue_id, sock_fd, 0)
@@ -179,18 +194,12 @@ fn load_ebpf_bytes(bytes: &[u8], nb_workers: u32, routing_flag: u32) -> Result<E
     let mut storage: Vec<u64> = vec![0u64; words];
     // SAFETY: storage has len=words*8 ≥ bytes.len(), u64 → u8 cast is valid.
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            storage.as_mut_ptr() as *mut u8,
-            bytes.len(),
-        );
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), storage.as_mut_ptr() as *mut u8, bytes.len());
     }
-    let aligned = unsafe {
-        std::slice::from_raw_parts(storage.as_ptr() as *const u8, bytes.len())
-    };
+    let aligned = unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, bytes.len()) };
 
     EbpfLoader::new()
-        .set_global("NB_WORKERS",            &nb_workers,   false)
+        .set_global("NB_WORKERS", &nb_workers, false)
         .set_global("DOMAIN_ROUTING_ENABLED", &routing_flag, false)
         .load(aligned)
         .map_err(|e| format!("BPF ELF load failed: {e}"))

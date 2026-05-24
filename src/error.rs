@@ -15,8 +15,8 @@ pub enum AppError {
 impl AppError {
     pub fn status_code(&self) -> u16 {
         match self {
-            AppError::Internal(_)   => 500,
-            AppError::NotFound(_)   => 404,
+            AppError::Internal(_) => 500,
+            AppError::NotFound(_) => 404,
             AppError::BadRequest(_) => 400,
         }
     }
