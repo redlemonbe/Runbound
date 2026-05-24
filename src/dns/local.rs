@@ -3,7 +3,7 @@
 // Local zone authority — in-memory, instant updates, O(1) lookup.
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use hickory_proto::rr::{
@@ -42,6 +42,9 @@ impl From<&str> for ZoneAction {
 pub struct LocalZoneSet {
     pub zones: HashMap<Name, ZoneAction>,
     pub records: HashMap<Name, Vec<Record>>,
+    /// SEC-AGV-01: names that were statically configured at startup.
+    /// DDNS DELETE operations on these names are rejected.
+    pub static_names: HashSet<Name>,
 }
 
 impl LocalZoneSet {
@@ -68,9 +71,19 @@ impl LocalZoneSet {
             }
         }
 
+        // SEC-AGV-01: track all statically configured names so DDNS cannot delete them.
+        let static_names: HashSet<Name> = zones.iter()
+            .filter_map(|z| {
+                let n = if z.name.ends_with('.') { z.name.clone() } else { format!("{}.", z.name) };
+                Name::from_str(&n).ok()
+            })
+            .chain(data.iter().filter_map(|d| parse_local_data(&d.rr).map(|r| r.name)))
+            .collect();
+
         Self {
             zones: map,
             records: record_map,
+            static_names,
         }
     }
 
