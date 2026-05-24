@@ -565,10 +565,11 @@ async fn build_and_launch(
                             Ok((cert_pem, key_pem)) => {
                                 // Start relay TLS server.
                                 let relay_state = std::sync::Arc::new(sync::NodeRelay {
-                                    zones:       Arc::clone(&zones),
-                                    zones_mutex: Arc::clone(&zones_mutex),
-                                    cfg:         Arc::clone(&cfg_arc),
-                                    upstreams:   Arc::clone(&upstreams),
+                                    zones:        Arc::clone(&zones),
+                                    zones_mutex:  Arc::clone(&zones_mutex),
+                                    cfg:          Arc::clone(&cfg_arc),
+                                    upstreams:    Arc::clone(&upstreams),
+                                    stats_cache:  Arc::clone(&snapshot_cache),
                                 });
                                 let sk = key.clone();
                                 let cp = cert_pem.clone();

@@ -9,6 +9,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.6.24] — 2026-05-24
+
+### Fixed
+
+- **Relay forwarding NOT_FOUND (#95 round 3)** (`src/sync.rs`, `src/stats.rs`, `src/api/mod.rs`)
+
+  `GET /relay/stats` et `GET /relay/upstreams` retournaient 404 `{"error":"NOT_FOUND"}` : le handler du serveur relay slave ne couvrait que les opérations d'écriture (dns/blacklist/upstreams POST/DELETE + snapshot). Les requêtes en lecture tombaient dans le `_ => 404`.
+
+  Fix : deux nouveaux arms dans `handle_relay_request` :
+  - `("GET", "stats")` → retourne le snapshot live de stats (qps, cache, DNSSEC, latences).
+  - `("GET", "upstreams")` → retourne la liste des upstreams avec état de santé.
+
+  `stats_json` extrait de `api/mod.rs` vers `stats::snapshot_to_json` (pub) pour éviter la duplication et la dépendance circulaire.
+
+---
+
 ## [0.6.23] — 2026-05-23
 
 ### Fixed
