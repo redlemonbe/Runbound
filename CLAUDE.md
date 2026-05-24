@@ -11,6 +11,25 @@ The conventions are non-negotiable and override default tendencies toward over-p
 
 Violations of AUDIT-PRINCIPLES.md must be flagged by you before publication, not after.
 
+## Operational checkpoints — maintainer review required
+
+STOP and wait for explicit maintainer approval before performing ANY of the following actions. Proceed autonomously for everything else.
+
+- Modifying CLAUDE.md, AUDIT-PRINCIPLES.md, or any *-PRINCIPLES.md file
+- Modifying any file under src/dns/xdp/ (kernel bypass path — safety-critical)
+- Modifying TLS or crypto configuration (rustls, ring, HMAC key handling, auth)
+- Creating a release tag or publishing a binary
+- Opening a public GitHub issue or pull request
+- Any operation involving secrets, API keys, or signing material
+- Any single commit that modifies more than 20 files
+- Force-pushing to any branch, or rewriting git history on any branch
+- Modifying CI/CD workflows under .github/workflows/
+- Changing the project license, license headers, or commercial terms
+
+For these actions, prepare a detailed plan with exact commands or diffs, present it to the maintainer, and wait for explicit "go ahead" before executing.
+
+For all other tasks (writing code, running tests, drafting documentation, preparing benchmark scripts), proceed autonomously and report results.
+
 ---
 
 ## Role
