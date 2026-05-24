@@ -637,37 +637,7 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
 // ── GET /stats ─────────────────────────────────────────────────────────────
 
 async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
-    JsonExtract(stats_json(&s.stats_cache.load()))
-}
-
-fn stats_json(snap: &crate::stats::StatsSnapshot) -> serde_json::Value {
-    let pct_blocked = if snap.total > 0 {
-        (snap.blocked as f64 / snap.total as f64 * 1000.0).round() / 10.0
-    } else { 0.0 };
-    serde_json::json!({
-        "total":            snap.total,
-        "blocked":          snap.blocked,
-        "forwarded":        snap.forwarded,
-        "nxdomain":         snap.nxdomain,
-        "refused":          snap.refused,
-        "servfail":         snap.servfail,
-        "local_hits":       snap.local_hits,
-        "blocked_percent":  pct_blocked,
-        "uptime_secs":      snap.uptime_secs,
-        "qps_1m":           snap.qps_1m,
-        "qps_5m":           snap.qps_5m,
-        "qps_peak":         snap.qps_peak,
-        "latency_p50_ms":   snap.latency_p50_ms,
-        "latency_p95_ms":   snap.latency_p95_ms,
-        "latency_p99_ms":   snap.latency_p99_ms,
-        "cache_hit_rate":   snap.cache_hit_rate,
-        "cache_entries":    snap.cache_entries,
-        "dnssec": {
-            "secure":   snap.dnssec_secure,
-            "bogus":    snap.dnssec_bogus,
-            "insecure": snap.dnssec_insecure,
-        },
-    })
+    JsonExtract(crate::stats::snapshot_to_json(&s.stats_cache.load()))
 }
 
 // ── GET /stats/stream ──────────────────────────────────────────────────────
@@ -677,7 +647,7 @@ async fn stats_stream_handler(
 ) -> Sse<impl stream::Stream<Item = Result<Event, Infallible>>> {
     let sse_stream = stream::unfold(s.stats_cache, |cache| async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let data = stats_json(&cache.load()).to_string();
+        let data = crate::stats::snapshot_to_json(&cache.load()).to_string();
         let event = Event::default().data(data);
         Some((Ok::<Event, Infallible>(event), cache))
     });
