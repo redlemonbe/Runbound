@@ -312,6 +312,10 @@ pub struct AppState {
     pub events_tx: Option<tokio::sync::broadcast::Sender<crate::sync::NodeStatusEvent>>,
     /// #5: per-domain query counter — top-domains endpoint.
     pub domain_stats: Arc<crate::domain_stats::DomainStats>,
+    /// #89: ICMP echo responder statistics (polled from BPF per-CPU array).
+    pub icmp_stats: Arc<crate::icmp::IcmpStats>,
+    /// #89: Current ICMP config — updated via PUT /api/icmp/config.
+    pub icmp_cfg: Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -633,6 +637,12 @@ pub fn router(state: AppState) -> Router {
             "/nodes/:node_id/relay/*path",
             any(relay::relay_forward_handler),
         )
+        // ICMP echo responder (#89)
+        .route("/icmp/stats", get(icmp_stats_handler))
+        .route(
+            "/icmp/config",
+            get(icmp_config_get_handler).put(icmp_config_put_handler),
+        )
         // Administration
         .route("/rotate-key", post(rotate_key_handler))
         .layer(middleware::from_fn_with_state(
@@ -665,6 +675,9 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/api/help",             "description":"API documentation"},
             {"method":"GET",    "path":"/api/stats",            "description":"Query statistics snapshot"},
             {"method":"GET",    "path":"/api/stats/stream",     "description":"Live stats as Server-Sent Events (1-second interval)"},
+            {"method":"GET",    "path":"/api/icmp/stats",          "description":"ICMP echo responder counters: handled, replied, dropped, rate_limited"},
+            {"method":"GET",    "path":"/api/icmp/config",         "description":"Current ICMP echo responder config"},
+            {"method":"PUT",    "path":"/api/icmp/config",         "description":"Update ICMP echo responder config live (enable, rate_limit, burst)"},
             {"method":"GET",    "path":"/api/stats/top-domains", "description":"Top queried domains since startup (query param: limit=N, default 10, max 100)"},
             {"method":"GET",    "path":"/api/config",           "description":"Running configuration"},
             {"method":"POST",   "path":"/api/reload",           "description":"Hot-reload zones and blacklist from disk"},
@@ -733,6 +746,64 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
         "upstreams_healthy": upstreams_healthy,
         "upstreams_total":   upstreams_total,
         "cache_entries":     snap.cache_entries,
+    }))
+}
+
+// ── GET /api/icmp/stats (#89) ─────────────────────────────────────────────
+async fn icmp_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
+    use axum::Json;
+    use std::sync::atomic::Ordering;
+    Json(serde_json::json!({
+        "handled":      s.icmp_stats.handled.load(Ordering::Relaxed),
+        "replied":      s.icmp_stats.replied.load(Ordering::Relaxed),
+        "dropped":      s.icmp_stats.dropped.load(Ordering::Relaxed),
+        "rate_limited": s.icmp_stats.rate_limited.load(Ordering::Relaxed),
+    }))
+}
+
+// ── GET /api/icmp/config (#89) ────────────────────────────────────────────
+async fn icmp_config_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    use axum::Json;
+    let cfg = s.icmp_cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Json(serde_json::json!({
+        "enable":     cfg.enabled,
+        "rate_limit": cfg.rate_pps,
+        "burst":      cfg.burst,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct IcmpConfigRequest {
+    enable: Option<bool>,
+    rate_limit: Option<u32>,
+    burst: Option<u32>,
+}
+
+// ── PUT /api/icmp/config (#89) ────────────────────────────────────────────
+async fn icmp_config_put_handler(
+    State(s): State<AppState>,
+    axum::extract::Json(body): axum::extract::Json<IcmpConfigRequest>,
+) -> impl IntoResponse {
+    use axum::Json;
+    let mut cfg = s.icmp_cfg.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = body.enable {
+        cfg.enabled = v;
+    }
+    if let Some(v) = body.rate_limit {
+        cfg.rate_pps = v;
+    }
+    if let Some(v) = body.burst {
+        cfg.burst = v;
+    }
+    let enabled = cfg.enabled;
+    let rate_pps = cfg.rate_pps;
+    let burst = cfg.burst;
+    drop(cfg);
+
+    Json(serde_json::json!({
+        "enable":     enabled,
+        "rate_limit": rate_pps,
+        "burst":      burst,
     }))
 }
 
@@ -3281,6 +3352,8 @@ mod tests {
             racing_wins: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
             events_tx: None,
             domain_stats: crate::domain_stats::DomainStats::new(),
+            icmp_stats: crate::icmp::IcmpStats::new(),
+            icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
         };
         router(state)
     }
@@ -5436,6 +5509,8 @@ mod tests {
             racing_wins: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
             events_tx: None,
             domain_stats: crate::domain_stats::DomainStats::new(),
+            icmp_stats: crate::icmp::IcmpStats::new(),
+            icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
         };
         let app = router(state);
 
@@ -5675,5 +5750,114 @@ mod tests {
         for field in &["reconnected", "failed", "duration_ms"] {
             assert!(json.get(field).is_some(), "missing field: {field}");
         }
+    }
+
+    // ── ICMP API tests (#89) ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn icmp_stats_returns_counters() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/icmp/stats")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        for field in &["handled", "replied", "dropped", "rate_limited"] {
+            assert!(json.get(field).is_some(), "missing field: {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn icmp_config_get_returns_defaults() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/icmp/config")
+                    .header(k, v)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["enable"], false);
+        assert!(json["rate_limit"].is_number());
+        assert!(json["burst"].is_number());
+    }
+
+    #[tokio::test]
+    async fn icmp_config_put_updates_and_reflects() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/icmp/config")
+                    .header(k, v)
+                    .header("content-type", "application/json")
+                    .header("Content-Length", "42")
+                    .body(Body::from(r#"{"enable":true,"rate_limit":50,"burst":10}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["enable"], true);
+        assert_eq!(json["rate_limit"], 50);
+        assert_eq!(json["burst"], 10);
+    }
+
+    #[tokio::test]
+    async fn icmp_config_put_partial_update() {
+        let app = make_test_app();
+        let (k, v) = auth_header();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/icmp/config")
+                    .header(k, v)
+                    .header("content-type", "application/json")
+                    .header("Content-Length", "18")
+                    .body(Body::from(r#"{"rate_limit":100}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp.into_body()).await;
+        assert_eq!(json["enable"], false);
+        assert_eq!(json["rate_limit"], 100);
+    }
+
+    #[tokio::test]
+    async fn icmp_stats_requires_auth() {
+        let app = make_test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/icmp/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

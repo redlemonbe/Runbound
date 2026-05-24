@@ -218,6 +218,11 @@ pub struct UnboundConfig {
     pub ui_port: u16,
     /// Bind address for the web UI listener. Default: 0.0.0.0.
     pub ui_bind: String,
+
+    // ── ICMP echo responder (#89) ──────────────────────────────────────────
+    pub icmp_enabled: bool,
+    pub icmp_rate_pps: u32,
+    pub icmp_burst: u32,
 }
 
 impl UnboundConfig {
@@ -253,6 +258,9 @@ impl UnboundConfig {
             ui_enabled: false,
             ui_port: 8090,
             ui_bind: "0.0.0.0".to_owned(),
+            icmp_enabled: false,
+            icmp_rate_pps: 10,
+            icmp_burst: 5,
             ..Default::default()
         }
     }
@@ -319,6 +327,20 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                     ),
                 }
             }
+            "icmp" => match key {
+                "enable" => cfg.icmp_enabled = val.trim_matches('"') == "yes",
+                "rate-limit" => {
+                    cfg.icmp_rate_pps = val.trim_matches('"').parse().unwrap_or(10);
+                }
+                "rate-limit-burst" => {
+                    cfg.icmp_burst = val.trim_matches('"').parse().unwrap_or(5);
+                }
+                other => warn!(
+                    "Line {}: unknown icmp directive '{}' — ignored",
+                    lineno + 1,
+                    other
+                ),
+            },
             other => {
                 warn!("Line {}: unknown section '{}' — ignored", lineno + 1, other);
             }
