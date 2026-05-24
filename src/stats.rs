@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use serde_json::Value as JsonValue;
 
 /// Shared, lock-free snapshot cache.
 /// Updated every second by `qps_update_loop`; API handlers read it
@@ -305,6 +306,36 @@ pub struct StatsSnapshot {
     pub dnssec_secure:   u64,
     pub dnssec_bogus:    u64,
     pub dnssec_insecure: u64,
+}
+
+pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
+    let pct_blocked = if snap.total > 0 {
+        (snap.blocked as f64 / snap.total as f64 * 1000.0).round() / 10.0
+    } else { 0.0 };
+    serde_json::json!({
+        "total":            snap.total,
+        "blocked":          snap.blocked,
+        "forwarded":        snap.forwarded,
+        "nxdomain":         snap.nxdomain,
+        "refused":          snap.refused,
+        "servfail":         snap.servfail,
+        "local_hits":       snap.local_hits,
+        "blocked_percent":  pct_blocked,
+        "uptime_secs":      snap.uptime_secs,
+        "qps_1m":           snap.qps_1m,
+        "qps_5m":           snap.qps_5m,
+        "qps_peak":         snap.qps_peak,
+        "latency_p50_ms":   snap.latency_p50_ms,
+        "latency_p95_ms":   snap.latency_p95_ms,
+        "latency_p99_ms":   snap.latency_p99_ms,
+        "cache_hit_rate":   snap.cache_hit_rate,
+        "cache_entries":    snap.cache_entries,
+        "dnssec": {
+            "secure":   snap.dnssec_secure,
+            "bogus":    snap.dnssec_bogus,
+            "insecure": snap.dnssec_insecure,
+        },
+    })
 }
 
 // ── QPS + snapshot background task ────────────────────────────────────────

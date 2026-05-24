@@ -1179,10 +1179,11 @@ impl SlaveClient {
 
 /// State passed to the slave relay server for executing relayed operations.
 pub struct NodeRelay {
-    pub zones:       Arc<ArcSwap<LocalZoneSet>>,
-    pub zones_mutex: Arc<tokio::sync::Mutex<()>>,
-    pub cfg:         Arc<UnboundConfig>,
-    pub upstreams:   SharedUpstreams,
+    pub zones:        Arc<ArcSwap<LocalZoneSet>>,
+    pub zones_mutex:  Arc<tokio::sync::Mutex<()>>,
+    pub cfg:          Arc<UnboundConfig>,
+    pub upstreams:    SharedUpstreams,
+    pub stats_cache:  crate::stats::SharedSnapshot,
 }
 
 /// Slave relay TLS server — listens on sync_port, handles /relay/* paths.
@@ -1361,6 +1362,21 @@ async fn handle_relay_request(
             let feeds     = load_feeds().unwrap_or_default().feeds;
             Ok(json_ok(serde_json::json!({
                 "dns": dns, "blacklist": blacklist, "feeds": feeds,
+            })))
+        }
+        // ── Read-only queries forwarded from master ───────────────────────────
+        ("GET", "stats") => {
+            let snap = relay.stats_cache.load();
+            Ok(json_ok(crate::stats::snapshot_to_json(&snap)))
+        }
+        ("GET", "upstreams") => {
+            let statuses = relay.upstreams.read().map(|g| g.clone()).unwrap_or_default();
+            let total   = statuses.len();
+            let healthy = statuses.iter().filter(|u| u.healthy).count();
+            Ok(json_ok(serde_json::json!({
+                "upstreams": statuses,
+                "total":     total,
+                "healthy":   healthy,
             })))
         }
         _ => Ok(json_resp(404, serde_json::json!({ "error": "NOT_FOUND" }))),
