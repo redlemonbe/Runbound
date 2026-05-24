@@ -222,6 +222,8 @@ async fn change_password(
     *state.creds.lock().unwrap_or_else(|e| e.into_inner()) = WebUiCred {
         username: payload.username, hash,
     };
+    // SEC-25: invalidate all sessions on password change
+    state.sessions.clear();
     (StatusCode::OK, "{}").into_response()
 }
 
