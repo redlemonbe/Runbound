@@ -274,6 +274,8 @@ pub struct AppState {
     pub per_upstream_resolvers: SharedResolversVec,
     /// #33: per-upstream win counters — how many times each upstream answered first.
     pub racing_wins: Arc<DashMap<String, Arc<AtomicU64>, ahash::RandomState>>,
+    /// #86: broadcast sender for SSE node-status events.  None on slave/standalone.
+    pub events_tx: Option<tokio::sync::broadcast::Sender<crate::sync::NodeStatusEvent>>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -535,6 +537,8 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics",           get(metrics_handler))
         // Sync
         .route("/sync/slaves",       get(sync_slaves_handler))
+        // #86: SSE node-status stream
+        .route("/events",            get(events_handler))
         // Node relay (#85/#87/#88) — master side
         .route("/nodes",                          get(relay::list_nodes_handler))
         .route("/nodes/:node_id/relay/*path",     any(relay::relay_forward_handler))
@@ -2043,6 +2047,43 @@ async fn sync_slaves_handler(State(s): State<AppState>) -> impl IntoResponse {
             "note": "this node is not configured as master (no sync-port directive)"
         }))).into_response(),
     }
+}
+
+// ── GET /events — SSE node-status stream (#86) ────────────────────────────
+
+async fn events_handler(
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let Some(ref tx) = s.events_tx else {
+        return (
+            StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({
+                "error": "NOT_FOUND",
+                "detail": "this node is not a master or has no sync-port configured"
+            })),
+        ).into_response();
+    };
+    let rx = tx.subscribe();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    match Event::default().json_data(&event) {
+                        Ok(e)  => return Some((Ok::<_, Infallible>(e), rx)),
+                        Err(_) => continue,
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let e = Event::default().comment(format!("lagged: {n} events dropped"));
+                    return Some((Ok(e), rx));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 // ── GET /logs ──────────────────────────────────────────────────────────────
