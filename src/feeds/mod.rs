@@ -399,6 +399,10 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
             // IPv4-mapped: ::ffff:0:0/96
             || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0
                 && s[4] == 0 && s[5] == 0xffff)
+            // IPv4-compatible: ::0:0/96 (deprecated RFC 4291 §2.5.5.1, e.g. ::127.0.0.1)
+            // Blocked regardless of embedded IPv4 — deprecated form, no legitimate feed URL use.
+            || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0
+                && s[4] == 0 && s[5] == 0)
             // Discard/NAT64 well-known: 100::/64
             || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
         }
@@ -882,5 +886,41 @@ pub async fn feed_update_loop(interval_secs: u64) {
             }
             Err(e) => error!("Feed auto-update failed: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SEC-2026-05-24-03: IPv4-compatible ::x.x.x.x must be treated as private.
+    #[test]
+    fn is_private_ip_ipv4_compatible_loopback() {
+        let ip: std::net::IpAddr = "::127.0.0.1".parse().unwrap();
+        assert!(is_private_ip(&ip), "::127.0.0.1 must be treated as private (IPv4-compatible loopback)");
+    }
+
+    #[test]
+    fn is_private_ip_ipv4_compatible_rfc1918() {
+        let ip: std::net::IpAddr = "::10.0.0.1".parse().unwrap();
+        assert!(is_private_ip(&ip), "::10.0.0.1 must be treated as private (IPv4-compatible RFC1918)");
+    }
+
+    #[test]
+    fn is_private_ip_ipv4_mapped_loopback() {
+        let ip: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_private_ip(&ip), "::ffff:127.0.0.1 must be treated as private (IPv4-mapped loopback)");
+    }
+
+    #[test]
+    fn is_private_ip_public_v4_allowed() {
+        let ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!is_private_ip(&ip), "8.8.8.8 must not be treated as private");
+    }
+
+    #[test]
+    fn is_private_ip_public_v6_allowed() {
+        let ip: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(!is_private_ip(&ip), "2001:db8::1 must not be treated as private");
     }
 }
