@@ -410,47 +410,41 @@ Buffer margin at 10 M QPS:
 - Ring depth 4,096 × 1 µs/packet = 4 ms buffer
 - Overflow tolerance: 4 ms — sufficient
 
-### 4.3 Bottlenecks Identified
+### 4.3 Bottlenecks Identified (v0.6.9)
 
-#### PERF-01 — MAJOR: Cache snapshot publish interval 100 ms ⚠️
+> **v0.8.1 update:** PERF-01 through PERF-06 below were identified in v0.6.9 and are all
+> implemented in v0.8.1. See `docs/security-audit/v0.8.1-performance.md` for full
+> verification details.
 
-```rust
-// cache_snapshot.rs, line 107
-let mut interval = tokio::time::interval(Duration::from_millis(100));
-```
+#### PERF-01 — Cache snapshot interval ✅ Fixed (v0.8.1)
 
-Impact: New cache entries are visible to XDP workers with up to 100 ms latency. At 1 M QPS on a popular domain, the first 100 ms pass through the slow path (hickory) — ~100,000 unnecessarily forwarded queries per popularity burst.
+`cache_snapshot.rs:246` — `Duration::from_millis(10)`. Double-buffer design uses
+`DashMap` writer + `ArcSwap<HashMap>` reader; publish loop evicts expired entries before swap.
 
-**Fix: Reduce to 10 ms** (still non-blocking, negligible CPU cost).
+#### PERF-02 — Mutex on mutable cache ✅ Fixed (v0.8.1)
 
-#### PERF-02 — MAJOR: Mutex on mutable cache ⚠️
+`cache_snapshot.rs:65` — `MutableCacheMap = Arc<DashMap<QuestionKey, CacheEntry>>`.
+No `Mutex<HashMap>` on the mutable side.
 
-```rust
-// cache_snapshot.rs, line 90
-let mut map = mutable.lock().unwrap_or_else(|e| e.into_inner());
-```
+#### PERF-03 — No NUMA awareness ✅ Fixed (v0.8.1)
 
-The `Mutex<MutableCacheMap>` is contended by the DNS insertion thread (Tokio) AND the publish loop every 100 ms. Above 500 K insertions/second, this mutex becomes a bottleneck.
+`umem.rs:538` — `rebind_to_local_numa()` calls `mbind(MPOL_PREFERRED | MPOL_MF_MOVE)`.
+Invoked from `worker.rs:402` after CPU pinning. Silent no-op in containers / single-node.
 
-**Fix: Replace with `DashMap`** (sharded RwLock) or `crossbeam::SkipMap`.
+#### PERF-04 — Hugepages optional ⚠️ Config gap (code correct)
 
-#### PERF-03 — MEDIUM: No NUMA awareness ⚠️
+`umem.rs:329` — `alloc_umem_area(size, hugepages: bool)` tries `MAP_HUGETLB` first.
+Operator must set `xdp-hugepages: yes` in config and `vm.nr_hugepages ≥ 512` in sysctl.
 
-On dual-socket servers (2× EPYC or 2× Xeon), XDP workers for socket-0 queues potentially access UMEM allocated on socket-1 — 3× memory latency.
+#### PERF-05 — No TX batching ✅ Fixed (v0.8.1)
 
-**Fix: Allocate UMEM with `mbind()` or `numactl --cpunodebind` consistent with worker affinity.**
+`worker.rs:537` — hot loop accumulates `tx_descs: Vec<XdpDesc>` per poll batch, then calls
+`sock.tx.enqueue_tx(&tx_descs)` once; `sendto()` kick issued at most once per batch.
 
-#### PERF-04 — MEDIUM: Hugepages optional ⚠️
+#### PERF-06 — SO_REUSEPORT on UDP fallback ✅ Verified (v0.8.1)
 
-**Fix: Enable in production config and set `vm.nr_hugepages = 8192` in sysctl.**
-
-#### PERF-05 — LOW: No explicit TX batching
-
-Responses are sent individually via `sock.tx.enqueue_tx(&[desc])`. Batching 16–64 responses per `sendto()`/kick call would reduce syscalls. Estimated impact: +10–15% throughput.
-
-#### PERF-06 — MEDIUM: SO_REUSEPORT on UDP fallback
-
-The Tokio path uses 32 UDP sockets, but if XDP is disabled (fallback), verify that `SO_REUSEPORT` is active on all UDP listeners — otherwise single-threaded bottleneck.
+`server.rs:1389` — `bind_reuseport_udp()` creates one `SO_REUSEPORT` UDP socket per
+physical CPU when XDP is disabled. Kernel load-balances across all sockets.
 
 ### 4.4 Performance Projection
 
@@ -489,12 +483,12 @@ Note: items below are performance risks, not security vulnerabilities. Severity 
 
 | ID | Title | Impact | Status |
 |----|-------|--------|--------|
-| PERF-01 | Cache publish 100 ms | MAJOR | ⚠️ Reduce to 10 ms |
-| PERF-02 | Mutex on mutable cache | MAJOR | ⚠️ Replace with DashMap |
-| PERF-03 | No NUMA awareness | MEDIUM | ⚠️ Enable in production |
-| PERF-04 | Hugepages optional | MEDIUM | ⚠️ Enable in production |
-| PERF-05 | TX not batched | LOW | Post-5M optimization |
-| PERF-06 | SO_REUSEPORT fallback | MEDIUM | Verify |
+| PERF-01 | Cache publish 10 ms | ~~MAJOR~~ | ✅ Fixed — cache_snapshot.rs:246 |
+| PERF-02 | DashMap on mutable cache | ~~MAJOR~~ | ✅ Fixed — cache_snapshot.rs:65 |
+| PERF-03 | NUMA-aware UMEM | ~~MEDIUM~~ | ✅ Fixed — umem.rs:538, worker.rs:402 |
+| PERF-04 | Hugepages optional | MEDIUM | ⚠️ Config gap — xdp-hugepages: yes + sysctl |
+| PERF-05 | TX batched per poll batch | ~~LOW~~ | ✅ Fixed — worker.rs:537 |
+| PERF-06 | SO_REUSEPORT on UDP fallback | ~~MEDIUM~~ | ✅ Verified — server.rs:1389 |
 | PERF-07 | jemalloc | — | ✅ Configured |
 | PERF-08 | CPU affinity | — | ✅ Physical cores |
 | PERF-09 | IRQ affinity | — | ✅ Optional, recommended |
@@ -545,21 +539,18 @@ All fix verifications to date were performed by the same AI model family that au
        dnssec-validation: yes
    ```
 
-3. **PERF-01** — `cache_snapshot.rs` line 107: `Duration::from_millis(100)` → `Duration::from_millis(10)`
-
-4. **PERF-04** — Production config:
+3. **PERF-04** — Production config (hugepages — code correct, operator action required):
    ```
    server:
        xdp-hugepages: yes
    ```
-   System: `vm.nr_hugepages = 8192`
+   System: `vm.nr_hugepages = 512`
 
 ### Post-deployment improvements
 
-- **PERF-02** — Replace `Mutex<HashMap>` with `DashMap` on mutable cache to exceed 1 M insertions/s
-- **PERF-03** — Topology-aware UMEM allocation on dual-socket servers
-- **PERF-05** — TX batching: group 32 responses per `sendto()` kick
 - **GDPR** — `log-client-ip: no` if GDPR applies to the deployment
+- **Benchmark refresh** — Re-run `docs/benchmark-2026-05-20.md` methodology against v0.8.1;
+  v0.5.4 numbers in `docs/performance.md` predate PERF-01 through PERF-06 fixes
 
 ---
 
