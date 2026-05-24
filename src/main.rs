@@ -764,7 +764,7 @@ async fn build_and_launch(
     Box::leak(Box::new(api_rt));
 
     // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
-    let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200));
+    let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200), cfg.rate_limit_prefix_v4, cfg.rate_limit_prefix_v6);
     let acl          = Arc::new(Acl::from_config(&cfg.access_control));
 
     Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams, per_upstream_resolvers, racing_wins))

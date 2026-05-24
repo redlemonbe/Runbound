@@ -13,15 +13,31 @@ use dashmap::DashMap;
 const RATE_LIMIT_WINDOW_MS:   u64 = 1_000;
 const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
 
-/// Truncate an IPv6 address to its /48 prefix before rate-limit table lookup.
-/// A /48 flood from a single routed block fills at most one bucket instead of
-/// 65 536 distinct /128 buckets.  IPv4 is unchanged (full /32 per address).
-fn normalize_ip(ip: IpAddr) -> IpAddr {
+/// Mask a source IP to the configured prefix before DashMap lookup.
+/// IPv4: zero host bits beyond `prefix_v4` (e.g. /24 → x.x.x.0).
+/// IPv6: zero host bits beyond `prefix_v6` (e.g. /48 → keep first 6 bytes).
+/// Grouping flood traffic to a subnet bucket reduces shard-lock contention at
+/// high QPS and prevents bucket-exhaustion attacks from many distinct IPs in
+/// the same routed block.
+fn normalize_ip(ip: IpAddr, prefix_v4: u8, prefix_v6: u8) -> IpAddr {
     match ip {
-        IpAddr::V4(_) => ip,
+        IpAddr::V4(v4) => {
+            let bits = u32::from(v4);
+            let mask = if prefix_v4 >= 32 { u32::MAX } else { !((1u32 << (32 - prefix_v4)) - 1) };
+            IpAddr::V4((bits & mask).into())
+        }
         IpAddr::V6(v6) => {
             let mut octets = v6.octets();
-            octets[6..].fill(0); // zero bytes 7–16, keep the /48 prefix
+            let keep_bytes = (prefix_v6 as usize) / 8;
+            let keep_bits  = (prefix_v6 as usize) % 8;
+            if keep_bytes < 16 {
+                if keep_bits > 0 {
+                    octets[keep_bytes] &= 0xFF_u8 << (8 - keep_bits);
+                    for b in &mut octets[keep_bytes + 1..] { *b = 0; }
+                } else {
+                    for b in &mut octets[keep_bytes..] { *b = 0; }
+                }
+            }
             IpAddr::V6(Ipv6Addr::from(octets))
         }
     }
@@ -38,16 +54,20 @@ pub struct RateLimiter {
     next_gc_ns: AtomicU64, // nanos since `start` at which to next run retain()
     rps:        u64,
     burst:      u64,
+    prefix_v4:  u8,
+    prefix_v6:  u8,
 }
 
 impl RateLimiter {
-    pub fn new(rps: u64) -> Arc<Self> {
+    pub fn new(rps: u64, prefix_v4: u8, prefix_v6: u8) -> Arc<Self> {
         Arc::new(Self {
             buckets: DashMap::with_hasher(ahash::RandomState::default()),
             start: Instant::now(),
             next_gc_ns: AtomicU64::new(10_000_000_000), // first GC at 10 s
             rps,
             burst: rps.saturating_mul(2),
+            prefix_v4,
+            prefix_v6,
         })
     }
 
@@ -57,9 +77,7 @@ impl RateLimiter {
             return true;
         }
 
-        // FIX 6.1: aggregate IPv6 sources at the /48 prefix boundary so that a
-        // flood from one routed block does not exhaust all 65 536 buckets.
-        let ip = normalize_ip(ip);
+        let ip = normalize_ip(ip, self.prefix_v4, self.prefix_v6);
         let now = Instant::now();
 
         // Time-based GC: hot path is a single load (no write, no cache-line contention).
