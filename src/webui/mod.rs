@@ -43,7 +43,7 @@ async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> 
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 65_536).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "request too large").into_response(),
     };
