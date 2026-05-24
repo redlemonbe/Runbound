@@ -106,4 +106,4 @@ Same underlying benchmark data as above — summary view.
 | [UNVERIFIED — pending v0.8 benchmark] — annotated | 3 values |
 
 All `[UNVERIFIED]` annotations were added in commit `docs: audit numerical performance claims across docs/`.  
-Tracked in GitHub issue: [Benchmark] Bare-metal AF/XDP performance measurement plan — v0.8.
+Tracked in GitHub issue [#101](https://github.com/redlemonbe/Runbound/issues/101): Bare-metal AF/XDP performance measurement plan — v0.8.
