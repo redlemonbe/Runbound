@@ -975,7 +975,7 @@ async fn build_and_launch(
         sync_key: sync_key_resolved,
         node_id,
         slave_mode: cfg.is_slave(),
-        base_dir: Arc::new(base_dir),
+        base_dir: Arc::new(base_dir.clone()),
         audit: audit.clone(),
         xdp_active: Arc::clone(&xdp_mode),
         resolver: Arc::clone(&resolver),
@@ -1028,7 +1028,7 @@ async fn build_and_launch(
             Ok(ui_std_listener) => {
                 ui_std_listener.set_nonblocking(true).ok();
                 let api_port = cfg.api_port.unwrap_or(8080);
-                let ui_app = webui::router(api_port);
+                let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone());
                 let ui_rt = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
                     .thread_name("runbound-ui")
