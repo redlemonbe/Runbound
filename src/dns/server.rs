@@ -144,6 +144,10 @@ pub struct RunboundHandler {
     upstream_racing:   bool,
     /// #33: per-upstream win counters — how many times each upstream answered first.
     pub racing_wins: Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
+    /// #94: enable /etc/resolv.conf fallback when all configured upstreams are down.
+    resolv_fallback: bool,
+    /// #94: true while resolv.conf fallback is active.
+    pub fallback_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunboundHandler {
@@ -166,6 +170,8 @@ impl RunboundHandler {
         per_upstream_resolvers:  SharedResolversVec,
         upstream_racing:         bool,
         racing_wins:             Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
+        resolv_fallback:         bool,
+        fallback_active:         Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             zones, resolver, rate_limiter,
@@ -174,6 +180,7 @@ impl RunboundHandler {
             dnssec_enabled, dnssec_log_bogus, prefetch_tracker,
             xdp_cache, cache_max_entries, upstreams,
             per_upstream_resolvers, upstream_racing, racing_wins,
+            resolv_fallback, fallback_active,
         }
     }
 
@@ -401,6 +408,25 @@ impl RunboundHandler {
                     });
                     // This query returns SERVFAIL; the next query will find the rebuilt resolver.
                 }
+            }
+
+            // #94: resolv.conf fallback — activate when all real upstreams are unhealthy.
+            if self.resolv_fallback
+                && !self.fallback_active.load(Ordering::Relaxed)
+                && crate::upstreams::all_non_temporary_unhealthy(&self.upstreams)
+                && self.fallback_active
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let ups      = Arc::clone(&self.upstreams);
+                let res      = Arc::clone(&self.resolver);
+                let dnssec   = self.dnssec_enabled;
+                tokio::spawn(async move {
+                    crate::upstreams::add_resolv_fallback(&ups);
+                    let addrs = crate::upstreams::upstream_addrs(&ups);
+                    let _ = rebuild_and_swap(&res, &addrs, dnssec).await;
+                    warn!("resolv.conf fallback activated — all configured upstreams are down");
+                });
             }
         }
 
@@ -1574,11 +1600,38 @@ pub async fn run_dns_server(
         tokio::spawn(dot_keepalive_loop(res_ka, ups_ka, stats_ka, dnssec));
     }
 
+    let fallback_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // #94: resolv.conf fallback recovery — check every 30s whether a primary upstream
+    // has recovered so the temporary fallback entries can be removed.
+    if cfg.resolv_fallback {
+        let ups_r = Arc::clone(&upstreams);
+        let res_r = Arc::clone(&resolver);
+        let fa_r  = Arc::clone(&fallback_active);
+        let dnssec = cfg.dnssec_validation;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !fa_r.load(Ordering::Relaxed) { continue; }
+                if crate::upstreams::has_healthy_non_temporary(&ups_r) {
+                    crate::upstreams::remove_resolv_fallback(&ups_r);
+                    fa_r.store(false, Ordering::Relaxed);
+                    let addrs = crate::upstreams::upstream_addrs(&ups_r);
+                    let _ = rebuild_and_swap(&res_r, &addrs, dnssec).await;
+                    info!("resolv.conf fallback deactivated — primary upstream recovered");
+                }
+            }
+        });
+    }
+
     let handler = RunboundHandler::new(
         Arc::clone(&zones), Arc::clone(&resolver), rate_limiter, acl, private_addrs,
         cache_max_ttl, stats, log_buffer, cfg.dnssec_validation, cfg.dnssec_log_bogus,
         prefetch_tracker, xdp_cache, cache_max_entries, upstreams,
         per_upstream_resolvers, cfg.upstream_racing, racing_wins,
+        cfg.resolv_fallback, fallback_active,
     );
     let mut server = Server::new(handler);
 
