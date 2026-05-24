@@ -760,8 +760,10 @@ async fn handle_sync_request(
     if path == "/sync/cert" {
         let now = Instant::now();
         let allowed = {
+            // Key by IP (not IP:port) so rate limit applies per host, not per connection.
+            let cert_rl_key = slave_ip(&peer_addr);
             let mut entry = journal.cert_rl
-                .entry(peer_addr.clone())
+                .entry(cert_rl_key)
                 .or_insert((0u32, now));
             if entry.1.elapsed().as_secs() >= 60 {
                 *entry = (1, now);
@@ -809,6 +811,40 @@ async fn handle_sync_request(
         // Validate node_id is a non-empty string (no UUID format enforcement — flexible)
         if reg.node_id.is_empty() || reg.relay_host.is_empty() || reg.cert_fingerprint.is_empty() {
             return Ok(json_resp(400, serde_json::json!({ "error": "MISSING_FIELDS" })));
+        }
+        // SEC-2026-05-24-06: validate relay_host is a valid IP:port, reject loopback/
+        // unspecified/link-local to prevent SSRF via relay forward from master.
+        if reg.relay_host.len() > 64 {
+            return Ok(json_resp(400, serde_json::json!({
+                "error": "INVALID_RELAY_HOST", "details": "relay_host too long"
+            })));
+        }
+        let relay_ip_str = if reg.relay_host.starts_with('[') {
+            reg.relay_host.trim_start_matches('[').split(']').next().unwrap_or("")
+        } else {
+            reg.relay_host.rsplitn(2, ':').nth(1).unwrap_or("")
+        };
+        match relay_ip_str.parse::<std::net::IpAddr>() {
+            Err(_) => return Ok(json_resp(400, serde_json::json!({
+                "error": "INVALID_RELAY_HOST",
+                "details": "relay_host must be a valid IP:port (e.g. 192.168.1.2:8082)"
+            }))),
+            Ok(ip) => {
+                if ip.is_loopback() || ip.is_unspecified() {
+                    return Ok(json_resp(400, serde_json::json!({
+                        "error": "INVALID_RELAY_HOST",
+                        "details": "loopback/unspecified not allowed as relay_host"
+                    })));
+                }
+                if let std::net::IpAddr::V4(v4) = ip {
+                    if v4.is_link_local() {
+                        return Ok(json_resp(400, serde_json::json!({
+                            "error": "INVALID_RELAY_HOST",
+                            "details": "link-local not allowed as relay_host"
+                        })));
+                    }
+                }
+            }
         }
         let peer_ip = slave_ip(&peer_addr);
         info!(node_id = %reg.node_id, relay_host = %reg.relay_host, peer = %peer_ip, "Node registered");
