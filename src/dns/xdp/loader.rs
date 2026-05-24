@@ -10,7 +10,7 @@ use std::os::fd::RawFd;
 
 use aya::programs::xdp::XdpLinkId;
 use aya::{
-    maps::{CpuMap, XskMap},
+    maps::{Array, CpuMap, PerCpuArray, XskMap},
     programs::{Xdp, XdpFlags},
     Ebpf, EbpfLoader,
 };
@@ -26,6 +26,20 @@ static XDP_PROG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns_xdp.o"));
 /// (slave VM, restricted CAP_BPF, or kernel < 4.15 without CPUMAP support).
 /// Domain routing is disabled when this binary is active; XSKMAP (RSS) is used.
 static XDP_PROG_MINIMAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dns_xdp_minimal.o"));
+
+/// BPF map entry mirroring `struct icmp_cfg_entry` in dns_xdp.c.
+/// Must match the C struct layout exactly (repr(C), same padding).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct IcmpCfgEntry {
+    pub enabled: u8,
+    pub _pad: [u8; 3],
+    pub rate_pps: u32,
+    pub burst: u32,
+}
+
+// SAFETY: IcmpCfgEntry is a plain C struct with no pointers.
+unsafe impl aya::Pod for IcmpCfgEntry {}
 
 /// XDP attachment mode — reported by GET /api/system as `xdp_mode`.
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +159,42 @@ impl XdpHandle {
         }
 
         Ok(handle)
+    }
+
+    /// Update the ICMP config BPF map live — no reload required (#89).
+    pub fn icmp_update_config(
+        &mut self,
+        enabled: bool,
+        rate_pps: u32,
+        burst: u32,
+    ) -> Result<(), String> {
+        let map = self
+            .bpf
+            .map_mut("icmp_cfg")
+            .ok_or_else(|| "icmp_cfg map not found".to_string())?;
+        let mut arr = Array::<_, IcmpCfgEntry>::try_from(map).map_err(|e| e.to_string())?;
+        let entry = IcmpCfgEntry {
+            enabled: enabled as u8,
+            _pad: [0; 3],
+            rate_pps,
+            burst,
+        };
+        arr.set(0, entry, 0).map_err(|e| e.to_string())
+    }
+
+    /// Read the ICMP per-CPU stat counters and return `[handled, replied, dropped, rate_limited]`.
+    pub fn icmp_read_stats(&mut self) -> Result<[u64; 4], String> {
+        let map = self
+            .bpf
+            .map_mut("icmp_stats")
+            .ok_or_else(|| "icmp_stats map not found".to_string())?;
+        let arr = PerCpuArray::<_, u64>::try_from(map).map_err(|e| e.to_string())?;
+        let mut out = [0u64; 4];
+        for i in 0u32..4 {
+            let vals = arr.get(&i, 0).map_err(|e| e.to_string())?;
+            out[i as usize] = vals.iter().sum();
+        }
+        Ok(out)
     }
 
     /// Initialise CPUMAP entries for `nb_workers` CPUs.
