@@ -8,6 +8,7 @@ pub mod prefetch;
 pub mod ratelimit;
 pub mod server;
 pub mod xdp;
+pub mod hash;
 
 pub use acl::Acl;
 pub use local::ZoneAction;
