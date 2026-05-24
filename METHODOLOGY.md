@@ -22,7 +22,7 @@ Three specialized AI agents, each with a single role:
 
 **My role: orchestra conductor.** I hold the vision, ask the right questions, validate the results, and decide what gets shipped.
 
-AI tools are used at multiple stages: implementation, adversarial review, and test generation. All security findings are triaged by the maintainer. External human review is planned before v1.0.
+AI tools are used at multiple stages: implementation, adversarial review, and test generation. All security-critical findings are triaged by the maintainer. External human security review is planned before v1.0.
 
 ---
 

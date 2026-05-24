@@ -24,7 +24,6 @@ Directives with identical behavior to Unbound — no changes required.
 | `local-zone` | Static zones — `static`, `always_nxdomain`, etc. |
 | `local-data` | Local DNS records — A, AAAA, PTR, CNAME, MX, TXT |
 | `tls-service-pem` | TLS certificate path for DoT/DoH/DoQ |
-| `tls-cert-bundle` | Alias for `tls-service-pem` |
 | `tls-service-key` | TLS private key path |
 | `verbosity` | Log level 0–5 |
 | `logfile` | Log destination (`""` = stdout) |
@@ -51,7 +50,6 @@ Directives that work but with noted differences from Unbound's behavior.
 |---|---|
 | `dnssec-validation` | Runbound enables DNSSEC in forwarder mode only — it trusts the upstream AD bit rather than performing full RRSIG chain validation. Full recursive DNSSEC is planned for v1.x. |
 | `rate-limit` | Runbound uses a per-IP token bucket compatible with Unbound's semantics. Runbound extends this with per-subnet bucketing via `rate-limit-prefix-v4` / `rate-limit-prefix-v6` (Runbound-specific directives). |
-| `log-client-ip` | Runbound-specific extension. Setting `no` replaces client IPs with `[redacted]` in query logs — useful for GDPR compliance. Unbound does not have this directive and will warn on it. |
 | `tls-cert-bundle` | Accepted as an alias for `tls-service-pem`. Unbound uses `tls-cert-bundle` for the CA bundle, not the server certificate — if you use both, set `tls-service-pem` explicitly. |
 
 ---
@@ -125,7 +123,13 @@ Directives accepted by Runbound but not understood by Unbound. Unbound will warn
 | `tls-port` | DNS-over-TLS port (default: 853) |
 | `https-port` | DNS-over-HTTPS port (default: 443) |
 | `quic-port` | DNS-over-QUIC port (default: 853/UDP) |
-| `tls-cert-hostname` | Hostname for TLS SNI and DoH path |
+| `tls-cert-hostname` | Hostname for TLS SNI and DoH path. Also accepted as `server-hostname` (alias parsed identically) |
+| `dot-client-auth-ca` | Path to CA certificate PEM for DoT mutual TLS client authentication. When set, DoT clients must present a certificate signed by this CA. DoH and DoQ unaffected |
+| `hsm-pkcs11-lib` | Path to PKCS#11 shared library (.so) for HSM integration — HSM disabled when absent |
+| `hsm-slot` | PKCS#11 slot index (0-based, default: 0) |
+| `hsm-pin` | PKCS#11 PIN — prefer `HSM_PIN` environment variable (chmod 640) |
+| `hsm-api-key-label` | Label of the `CKO_SECRET_KEY` object used as the REST API Bearer token |
+| `hsm-store-key-label` | Label of the `CKO_SECRET_KEY` object used as the JSON store HMAC key |
 | `cpu-affinity` | Pin Tokio worker threads to physical cores (default: yes) |
 | `xdp` | Enable AF/XDP kernel-bypass fast path (default: yes) |
 | `xdp-interface` | Explicit XDP network interface (default: auto-detect) |
