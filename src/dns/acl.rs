@@ -31,7 +31,7 @@ pub enum AclAction {
 }
 
 struct CidrBlock {
-    prefix:     IpAddr,
+    prefix: IpAddr,
     prefix_len: u8,
 }
 
@@ -42,7 +42,10 @@ impl CidrBlock {
             (&s[..pos], len)
         } else {
             let ip: IpAddr = s.parse().ok()?;
-            let len = match ip { IpAddr::V4(_) => 32, IpAddr::V6(_) => 128 };
+            let len = match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
             (s, len)
         };
         let prefix: IpAddr = ip_str.parse().ok()?;
@@ -53,15 +56,19 @@ impl CidrBlock {
     fn contains(&self, ip: IpAddr) -> bool {
         match (self.prefix, ip) {
             (IpAddr::V4(net), IpAddr::V4(addr)) => {
-                if self.prefix_len == 0 { return true; }
+                if self.prefix_len == 0 {
+                    return true;
+                }
                 let shift = 32u8.saturating_sub(self.prefix_len);
-                let mask  = !0u32 << shift;
+                let mask = !0u32 << shift;
                 u32::from(net) & mask == u32::from(addr) & mask
             }
             (IpAddr::V6(net), IpAddr::V6(addr)) => {
-                if self.prefix_len == 0 { return true; }
+                if self.prefix_len == 0 {
+                    return true;
+                }
                 let shift = 128u8.saturating_sub(self.prefix_len);
-                let mask  = !0u128 << shift;
+                let mask = !0u128 << shift;
                 u128::from(net) & mask == u128::from(addr) & mask
             }
             _ => false,
@@ -76,7 +83,8 @@ pub struct PrivateAddressSet(Vec<CidrBlock>);
 
 impl PrivateAddressSet {
     pub fn from_config(cidrs: &[String]) -> Self {
-        let parsed = cidrs.iter()
+        let parsed = cidrs
+            .iter()
             .filter_map(|s| {
                 CidrBlock::parse(s.trim()).or_else(|| {
                     warn!(cidr=%s, "private-address: parse error — ignored");
@@ -87,7 +95,9 @@ impl PrivateAddressSet {
         Self(parsed)
     }
 
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
     #[inline]
     pub fn contains(&self, ip: IpAddr) -> bool {
@@ -96,27 +106,29 @@ impl PrivateAddressSet {
 }
 
 struct AclEntry {
-    cidr:   CidrBlock,
+    cidr: CidrBlock,
     action: AclAction,
 }
 
 impl AclEntry {
     fn parse(s: &str) -> Option<Self> {
         let mut parts = s.split_whitespace();
-        let net_str    = parts.next()?;
+        let net_str = parts.next()?;
         let action_str = parts.next()?;
         let action = match action_str {
             "allow" | "allow_snoop" | "allow_setrd" => AclAction::Allow,
-            "deny"  | "deny_non_local"              => AclAction::Deny,
-            "refuse"| "refuse_non_local"             => AclAction::Refuse,
-            _                                        => return None,
+            "deny" | "deny_non_local" => AclAction::Deny,
+            "refuse" | "refuse_non_local" => AclAction::Refuse,
+            _ => return None,
         };
         let cidr = CidrBlock::parse(net_str)?;
         Some(AclEntry { cidr, action })
     }
 
     #[inline]
-    fn matches(&self, ip: IpAddr) -> bool { self.cidr.contains(ip) }
+    fn matches(&self, ip: IpAddr) -> bool {
+        self.cidr.contains(ip)
+    }
 }
 
 /// Compiled access-control list.  Build once from config, share via `Arc`.
@@ -124,7 +136,8 @@ pub struct Acl(Vec<AclEntry>);
 
 impl Acl {
     pub fn from_config(entries: &[String]) -> Self {
-        let parsed = entries.iter()
+        let parsed = entries
+            .iter()
             .filter_map(|s| {
                 AclEntry::parse(s).or_else(|| {
                     warn!(entry=%s, "access-control: parse error — ignored");
@@ -135,8 +148,12 @@ impl Acl {
         Self(parsed)
     }
 
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
-    pub fn len(&self)      -> usize { self.0.len() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 
     /// Evaluate the ACL for `ip`.
     ///
@@ -146,7 +163,9 @@ impl Acl {
     /// as an IPv6 address on a dual-stack socket.
     #[inline]
     pub fn check(&self, ip: IpAddr) -> AclAction {
-        if self.0.is_empty() { return AclAction::Allow; }
+        if self.0.is_empty() {
+            return AclAction::Allow;
+        }
         // Normalise IPv4-mapped and deprecated IPv4-compatible IPv6 → plain IPv4.
         // to_ipv4() covers both ::ffff:x.x.x.x and ::x.x.x.x forms (SEC-2026-05-24-05).
         // Guard: preserve ::1 because to_ipv4() maps it to 0.0.0.1 (not loopback).
@@ -166,7 +185,7 @@ impl Acl {
                 return entry.action.clone();
             }
         }
-        AclAction::Refuse  // no rule matched → fail-secure
+        AclAction::Refuse // no rule matched → fail-secure
     }
 }
 
@@ -183,24 +202,33 @@ mod tests {
     fn acl_ipv4_compatible_loopback_matches_ipv4_rule() {
         let acl = make_acl("127.0.0.0/8 deny");
         let ip: IpAddr = "::127.0.0.1".parse().unwrap();
-        assert_eq!(acl.check(ip), AclAction::Deny,
-            "::127.0.0.1 must match 127.0.0.0/8 deny rule after normalisation");
+        assert_eq!(
+            acl.check(ip),
+            AclAction::Deny,
+            "::127.0.0.1 must match 127.0.0.0/8 deny rule after normalisation"
+        );
     }
 
     #[test]
     fn acl_ipv6_loopback_preserved() {
         let acl = make_acl("::1/128 deny");
         let ip: IpAddr = "::1".parse().unwrap();
-        assert_eq!(acl.check(ip), AclAction::Deny,
-            "::1 must match ::1/128 deny rule");
+        assert_eq!(
+            acl.check(ip),
+            AclAction::Deny,
+            "::1 must match ::1/128 deny rule"
+        );
     }
 
     #[test]
     fn acl_ipv4_mapped_matches_ipv4_rule() {
         let acl = make_acl("127.0.0.0/8 deny");
         let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
-        assert_eq!(acl.check(ip), AclAction::Deny,
-            "::ffff:127.0.0.1 must match 127.0.0.0/8 deny rule");
+        assert_eq!(
+            acl.check(ip),
+            AclAction::Deny,
+            "::ffff:127.0.0.1 must match 127.0.0.0/8 deny rule"
+        );
     }
 
     #[test]

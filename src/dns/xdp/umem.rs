@@ -19,8 +19,8 @@ use std::sync::atomic::{fence, Ordering};
 use std::{ptr, slice};
 
 use libc::{
-    MAP_ANONYMOUS, MAP_FAILED, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE,
-    mmap, munmap, sysconf, _SC_PAGESIZE,
+    mmap, munmap, sysconf, _SC_PAGESIZE, MAP_ANONYMOUS, MAP_FAILED, MAP_POPULATE, MAP_SHARED,
+    PROT_READ, PROT_WRITE,
 };
 
 // ── Frame configuration ────────────────────────────────────────────────────
@@ -46,7 +46,12 @@ pub struct XdpRingSizes {
 
 impl Default for XdpRingSizes {
     fn default() -> Self {
-        Self { fill: 4096, comp: 4096, rx: 4096, tx: 4096 }
+        Self {
+            fill: 4096,
+            comp: 4096,
+            rx: 4096,
+            tx: 4096,
+        }
     }
 }
 
@@ -121,12 +126,12 @@ pub struct SockaddrXdp {
 
 /// A fill or completion ring (descriptors are plain u64 UMEM offsets).
 pub struct AddrRing {
-    _map:     *mut u8,
+    _map: *mut u8,
     _mapsize: usize,
     producer: *mut u32,
     consumer: *mut u32,
-    flags:    *mut u32,
-    descs:    *mut u64,
+    flags: *mut u32,
+    descs: *mut u64,
     pub size: u32,
     pub mask: u32,
 }
@@ -150,13 +155,17 @@ impl AddrRing {
             let idx = (prod.wrapping_add(i as u32)) & self.mask;
             // SAFETY: `idx` is masked to [0, size), so `self.descs.add(idx)` is
             //         within the mmap'd descriptor array whose length is `size`.
-            unsafe { ptr::write_volatile(self.descs.add(idx as usize), a); }
+            unsafe {
+                ptr::write_volatile(self.descs.add(idx as usize), a);
+            }
         }
         fence(Ordering::Release);
         // SAFETY: `self.producer` is valid (see above); we publish the updated
         //         producer index after the release fence so the kernel sees the
         //         descriptor writes before the counter increment.
-        unsafe { ptr::write_volatile(self.producer, prod.wrapping_add(n as u32)); }
+        unsafe {
+            ptr::write_volatile(self.producer, prod.wrapping_add(n as u32));
+        }
         n
     }
 
@@ -181,7 +190,9 @@ impl AddrRing {
         if available > 0 {
             // SAFETY: `self.consumer` is valid; we advance the consumer index to
             //         release the slots back to the kernel.
-            unsafe { ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32)); }
+            unsafe {
+                ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32));
+            }
         }
         out
     }
@@ -204,7 +215,9 @@ impl AddrRing {
         }
         if available > 0 {
             // SAFETY: `self.consumer` is valid; advances consumer to release slots.
-            unsafe { ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32)); }
+            unsafe {
+                ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32));
+            }
         }
     }
 
@@ -227,12 +240,12 @@ impl AddrRing {
 
 /// An RX or TX ring (descriptors are XdpDesc).
 pub struct DescRing {
-    _map:     *mut u8,
+    _map: *mut u8,
     _mapsize: usize,
     producer: *mut u32,
     consumer: *mut u32,
     pub flags: *mut u32,
-    descs:    *mut XdpDesc,
+    descs: *mut XdpDesc,
     pub size: u32,
     pub mask: u32,
 }
@@ -261,7 +274,9 @@ impl DescRing {
             out.push(unsafe { ptr::read_volatile(self.descs.add(idx as usize)) });
         }
         // SAFETY: `self.consumer` is valid; advances consumer to release slots.
-        unsafe { ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32)); }
+        unsafe {
+            ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32));
+        }
         out
     }
 
@@ -286,7 +301,9 @@ impl DescRing {
             out.push(unsafe { ptr::read_volatile(self.descs.add(idx as usize)) });
         }
         // SAFETY: `self.consumer` is valid; advances consumer to release slots.
-        unsafe { ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32)); }
+        unsafe {
+            ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32));
+        }
         available
     }
 
@@ -303,12 +320,16 @@ impl DescRing {
         for (i, d) in descs[..n].iter().enumerate() {
             let idx = (prod.wrapping_add(i as u32)) & self.mask;
             // SAFETY: `idx` is masked to [0, size), within the mmap'd XdpDesc array.
-            unsafe { ptr::write_volatile(self.descs.add(idx as usize), *d); }
+            unsafe {
+                ptr::write_volatile(self.descs.add(idx as usize), *d);
+            }
         }
         fence(Ordering::Release);
         // SAFETY: Publishes updated producer index after the release fence so the
         //         kernel sees all descriptor writes before the counter increment.
-        unsafe { ptr::write_volatile(self.producer, prod.wrapping_add(n as u32)); }
+        unsafe {
+            ptr::write_volatile(self.producer, prod.wrapping_add(n as u32));
+        }
         n
     }
 
@@ -334,10 +355,12 @@ fn alloc_umem_area(size: usize, hugepages: bool) -> Result<*mut libc::c_void, St
         //         fd=-1 is required with MAP_ANONYMOUS. size is page-aligned.
         let ptr = unsafe {
             libc::mmap(
-                ptr::null_mut(), size,
+                ptr::null_mut(),
+                size,
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED | MAP_ANONYMOUS | libc::MAP_HUGETLB | (21 << libc::MAP_HUGE_SHIFT),
-                -1, 0,
+                -1,
+                0,
             )
         };
         if ptr != MAP_FAILED {
@@ -351,13 +374,26 @@ fn alloc_umem_area(size: usize, hugepages: bool) -> Result<*mut libc::c_void, St
     // SAFETY: mmap with MAP_ANONYMOUS|MAP_SHARED allocates a new anonymous mapping.
     //         MAP_POPULATE pre-faults pages to avoid hot-path page faults.
     let ptr = unsafe {
-        mmap(ptr::null_mut(), size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE, -1, 0)
+        mmap(
+            ptr::null_mut(),
+            size,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE,
+            -1,
+            0,
+        )
     };
     if ptr == MAP_FAILED {
-        return Err(format!("UMEM mmap failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "UMEM mmap failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     if hugepages {
-        tracing::info!(size, "UMEM allocated with standard pages (huge pages unavailable)");
+        tracing::info!(
+            size,
+            "UMEM allocated with standard pages (huge pages unavailable)"
+        );
     } else {
         tracing::debug!(size, "UMEM allocated with standard pages");
     }
@@ -382,7 +418,11 @@ impl Umem {
     /// Allocate and register a UMEM with the given AF_XDP socket.
     /// On success returns the Umem plus the fill/completion ring maps;
     /// the caller passes `fd` to register_rings() after obtaining RX/TX offsets.
-    pub unsafe fn new(xsk_fd: RawFd, hugepages: bool, sizes: &XdpRingSizes) -> Result<Self, String> {
+    pub unsafe fn new(
+        xsk_fd: RawFd,
+        hugepages: bool,
+        sizes: &XdpRingSizes,
+    ) -> Result<Self, String> {
         let page = unsafe { sysconf(_SC_PAGESIZE) } as usize;
         let frame_count = sizes.rx + sizes.tx;
         let area_len = (frame_count * FRAME_SIZE) as usize;
@@ -419,19 +459,24 @@ impl Umem {
             // SAFETY: `area` is the non-null pointer returned by `mmap` above,
             //         and `area_len` is the exact length passed to that call.
             unsafe { munmap(area as *mut libc::c_void, area_len) };
-            return Err(format!("XDP_UMEM_REG failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "XDP_UMEM_REG failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         // Set ring sizes
         for (opt, sz) in [
-            (XDP_UMEM_FILL_RING,        sizes.fill),
-            (XDP_UMEM_COMPLETION_RING,  sizes.comp),
+            (XDP_UMEM_FILL_RING, sizes.fill),
+            (XDP_UMEM_COMPLETION_RING, sizes.comp),
         ] {
             // SAFETY: `xsk_fd` is a valid AF_XDP socket fd. `&sz` is a valid
             //         pointer to an initialised u32. The socklen matches sizeof(u32).
             let rc = unsafe {
                 libc::setsockopt(
-                    xsk_fd, SOL_XDP, opt,
+                    xsk_fd,
+                    SOL_XDP,
+                    opt,
                     &sz as *const _ as *const libc::c_void,
                     std::mem::size_of::<u32>() as libc::socklen_t,
                 )
@@ -439,7 +484,10 @@ impl Umem {
             if rc != 0 {
                 // SAFETY: Same as the munmap above — area is valid and non-null.
                 unsafe { munmap(area as *mut libc::c_void, area_len) };
-                return Err(format!("setsockopt ring size ({opt}): {}", std::io::Error::last_os_error()));
+                return Err(format!(
+                    "setsockopt ring size ({opt}): {}",
+                    std::io::Error::last_os_error()
+                ));
             }
         }
 
@@ -447,14 +495,8 @@ impl Umem {
         let offsets = unsafe { get_mmap_offsets(xsk_fd) }?;
 
         // mmap fill ring
-        let fill = unsafe {
-            mmap_addr_ring(
-                xsk_fd,
-                XDP_UMEM_PGOFF_FILL_RING,
-                &offsets.fr,
-                sizes.fill,
-            )
-        }?;
+        let fill =
+            unsafe { mmap_addr_ring(xsk_fd, XDP_UMEM_PGOFF_FILL_RING, &offsets.fr, sizes.fill) }?;
         // mmap completion ring
         let comp = unsafe {
             mmap_addr_ring(
@@ -466,9 +508,7 @@ impl Umem {
         }?;
 
         // Pre-populate fill ring with RX frame offsets (give them to the kernel)
-        let rx_addrs: Vec<u64> = (0..sizes.rx)
-            .map(|i| (i * FRAME_SIZE) as u64)
-            .collect();
+        let rx_addrs: Vec<u64> = (0..sizes.rx).map(|i| (i * FRAME_SIZE) as u64).collect();
         fill.enqueue_batch(&rx_addrs);
 
         // TX free pool = frames after the RX region
@@ -476,7 +516,13 @@ impl Umem {
             .map(|i| (i * FRAME_SIZE) as u64)
             .collect();
 
-        Ok(Umem { area, area_len, tx_free, fill, comp })
+        Ok(Umem {
+            area,
+            area_len,
+            tx_free,
+            fill,
+            comp,
+        })
     }
 
     /// Get a mutable slice for the frame at the given UMEM offset.
@@ -523,7 +569,9 @@ impl Drop for Umem {
         //         `Umem::new`, and `self.area_len` is the exact length passed to
         //         that call. `Drop` is called exactly once, so there is no
         //         double-unmap.
-        unsafe { munmap(self.area as *mut libc::c_void, self.area_len); }
+        unsafe {
+            munmap(self.area as *mut libc::c_void, self.area_len);
+        }
     }
 }
 
@@ -547,12 +595,14 @@ pub fn rebind_to_local_numa(area: *mut u8, area_len: usize) {
             std::ptr::null::<libc::c_void>(),
         )
     };
-    if rc != 0 || node >= 64 { return; }
+    if rc != 0 || node >= 64 {
+        return;
+    }
 
     // nodemask: one bit per NUMA node; node < 64 is always true in practice.
     let nodemask: u64 = 1u64 << node;
     // max_node must be strictly greater than the highest set bit index.
-    let max_node:  u64 = node as u64 + 2;
+    let max_node: u64 = node as u64 + 2;
 
     // MPOL_PREFERRED=1: prefer node but fall back on exhaustion (non-strict).
     // MPOL_MF_MOVE=2:   migrate already-allocated pages to the preferred node.
@@ -564,10 +614,10 @@ pub fn rebind_to_local_numa(area: *mut u8, area_len: usize) {
             libc::SYS_mbind,
             area as *mut libc::c_void,
             area_len,
-            1i64,                      // MPOL_PREFERRED
+            1i64, // MPOL_PREFERRED
             &nodemask as *const u64,
             max_node,
-            2u64,                      // MPOL_MF_MOVE
+            2u64, // MPOL_MF_MOVE
         );
     }
 }
@@ -589,13 +639,18 @@ pub unsafe fn get_mmap_offsets(fd: RawFd) -> Result<XdpMmapOffsets, String> {
     //         on success, after which `assume_init()` is safe.
     let rc = unsafe {
         libc::getsockopt(
-            fd, SOL_XDP, XDP_MMAP_OFFSETS,
+            fd,
+            SOL_XDP,
+            XDP_MMAP_OFFSETS,
             offsets.as_mut_ptr() as *mut libc::c_void,
             &mut optlen,
         )
     };
     if rc != 0 {
-        return Err(format!("XDP_MMAP_OFFSETS: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "XDP_MMAP_OFFSETS: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: `getsockopt` returned 0, so the kernel has initialised the struct.
     Ok(unsafe { offsets.assume_init() })
@@ -625,7 +680,10 @@ unsafe fn mmap_addr_ring(
         )
     };
     if map == MAP_FAILED {
-        return Err(format!("ring mmap (pgoff={pgoff:#x}): {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "ring mmap (pgoff={pgoff:#x}): {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let map = map as *mut u8;
     // SAFETY: All pointer arithmetic below uses offsets supplied by the kernel via
@@ -638,8 +696,8 @@ unsafe fn mmap_addr_ring(
         _mapsize: mapsize,
         producer: unsafe { map.add(off.producer as usize) } as *mut u32,
         consumer: unsafe { map.add(off.consumer as usize) } as *mut u32,
-        flags:    unsafe { map.add(off.flags    as usize) } as *mut u32,
-        descs:    unsafe { map.add(off.desc     as usize) } as *mut u64,
+        flags: unsafe { map.add(off.flags as usize) } as *mut u32,
+        descs: unsafe { map.add(off.desc as usize) } as *mut u64,
         size,
         mask: size - 1,
     })
@@ -668,7 +726,10 @@ pub unsafe fn mmap_desc_ring(
         )
     };
     if map == MAP_FAILED {
-        return Err(format!("desc ring mmap (pgoff={pgoff:#x}): {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "desc ring mmap (pgoff={pgoff:#x}): {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let map = map as *mut u8;
     // SAFETY: Offsets come from XDP_MMAP_OFFSETS (kernel ABI). The mapping is
@@ -679,8 +740,8 @@ pub unsafe fn mmap_desc_ring(
         _mapsize: mapsize,
         producer: unsafe { map.add(off.producer as usize) } as *mut u32,
         consumer: unsafe { map.add(off.consumer as usize) } as *mut u32,
-        flags:    unsafe { map.add(off.flags    as usize) } as *mut u32,
-        descs:    unsafe { map.add(off.desc     as usize) } as *mut XdpDesc,
+        flags: unsafe { map.add(off.flags as usize) } as *mut u32,
+        descs: unsafe { map.add(off.desc as usize) } as *mut XdpDesc,
         size,
         mask: size - 1,
     })

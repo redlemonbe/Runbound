@@ -9,6 +9,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.0] — 2026-05-24
+
+### Added
+- **Embedded web UI server (#4/#91)** (`src/webui/mod.rs`, `src/config/parser.rs`, `src/main.rs`)
+  Runbound now serves the management dashboard directly — no nginx required.
+  Enable with `ui-enabled: yes` in `runbound.conf`; configure port (`ui-port`, default 8090)
+  and bind address (`ui-bind`, default `0.0.0.0`). The embedded server proxies every
+  `/api/*` request to the local API (127.0.0.1), keeping the REST endpoint off the
+  network. Supports streaming responses (SSE live-events) through the proxy (PR #121).
+
+---
+
 ## [0.8.2] — 2026-05-24
 
 ### Added

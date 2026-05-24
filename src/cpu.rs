@@ -33,9 +33,7 @@ fn parse_cpu_list(s: &str) -> Vec<usize> {
 pub fn physical_cores() -> Vec<usize> {
     let mut physical = Vec::new();
     for cpu_id in 0..4096 {
-        let path = format!(
-            "/sys/devices/system/cpu/cpu{cpu_id}/topology/thread_siblings_list"
-        );
+        let path = format!("/sys/devices/system/cpu/cpu{cpu_id}/topology/thread_siblings_list");
         match std::fs::read_to_string(&path) {
             Ok(s) => {
                 let siblings = parse_cpu_list(&s);
@@ -48,7 +46,9 @@ pub fn physical_cores() -> Vec<usize> {
         }
     }
     if physical.is_empty() {
-        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         (0..n).collect()
     } else {
         physical
@@ -59,7 +59,9 @@ pub fn physical_cores() -> Vec<usize> {
 /// Returns None when /sys/…/cpufreq/ is absent (containers, VMs, non-Linux).
 pub fn read_governor(core_id: usize) -> Option<String> {
     let path = format!("/sys/devices/system/cpu/cpu{core_id}/cpufreq/scaling_governor");
-    std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Set the scaling governor to 'performance' for `core_id`.
@@ -122,7 +124,9 @@ fn find_irq_for_queue(proc_interrupts: &str, iface: &str, queue_id: u32) -> Opti
 /// Silent no-op on failure or on non-Linux targets.
 pub fn pin_to_cpu(cpu_id: usize) {
     // FIX 4 (VUL-NEW-05): cpu_set_t is 128 bytes = 1024 bits; CPU_SET is UB for cpu_id >= 1024.
-    if cpu_id >= 1024 { return; }
+    if cpu_id >= 1024 {
+        return;
+    }
     #[cfg(target_os = "linux")]
     unsafe {
         let mut set = std::mem::zeroed::<libc::cpu_set_t>();

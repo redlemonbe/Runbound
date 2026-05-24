@@ -10,8 +10,8 @@
 // only — allocations there are fine (REST API, not DNS hot path).
 
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -32,37 +32,37 @@ const CLIENT_CAP: usize = 45;
 #[repr(u8)]
 pub enum LogAction {
     Forwarded = 0,
-    Cached    = 1,
-    Local     = 2,
-    Blocked   = 3,
-    Nxdomain  = 4,
-    Refused   = 5,
-    Servfail  = 6,
+    Cached = 1,
+    Local = 2,
+    Blocked = 3,
+    Nxdomain = 4,
+    Refused = 5,
+    Servfail = 6,
 }
 
 impl LogAction {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Forwarded => "forwarded",
-            Self::Cached    => "cached",
-            Self::Local     => "local",
-            Self::Blocked   => "blocked",
-            Self::Nxdomain  => "nxdomain",
-            Self::Refused   => "refused",
-            Self::Servfail  => "servfail",
+            Self::Cached => "cached",
+            Self::Local => "local",
+            Self::Blocked => "blocked",
+            Self::Nxdomain => "nxdomain",
+            Self::Refused => "refused",
+            Self::Servfail => "servfail",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "forwarded" => Some(Self::Forwarded),
-            "cached"    => Some(Self::Cached),
-            "local"     => Some(Self::Local),
-            "blocked"   => Some(Self::Blocked),
-            "nxdomain"  => Some(Self::Nxdomain),
-            "refused"   => Some(Self::Refused),
-            "servfail"  => Some(Self::Servfail),
-            _           => None,
+            "cached" => Some(Self::Cached),
+            "local" => Some(Self::Local),
+            "blocked" => Some(Self::Blocked),
+            "nxdomain" => Some(Self::Nxdomain),
+            "refused" => Some(Self::Refused),
+            "servfail" => Some(Self::Servfail),
+            _ => None,
         }
     }
 }
@@ -70,29 +70,23 @@ impl LogAction {
 // ── Fixed-size log entry — zero heap allocation ────────────────────────────
 pub struct LogEntry {
     // Unix timestamp in seconds (enough precision for log browsing)
-    pub ts_secs:    u64,
+    pub ts_secs: u64,
     // DNS name, UTF-8 bytes, length in name_len, zero-padded
-    pub name_buf:   [u8; NAME_CAP],
-    pub name_len:   u8,  // 253 fits in u8
+    pub name_buf: [u8; NAME_CAP],
+    pub name_len: u8, // 253 fits in u8
     // Client IP as text (no port), length in client_len
     pub client_buf: [u8; CLIENT_CAP],
     pub client_len: u8,
     // DNS record type (qtype), e.g. 1=A, 28=AAAA, 15=MX
-    pub qtype:      u16,
+    pub qtype: u16,
     // Resolution action
-    pub action:     LogAction,
+    pub action: LogAction,
     // Round-trip in milliseconds (capped at u32::MAX ≈ 49 days)
     pub elapsed_ms: u32,
 }
 
 impl LogEntry {
-    pub fn new(
-        name:       &str,
-        client:     &str,
-        qtype:      u16,
-        action:     LogAction,
-        elapsed_ms: u32,
-    ) -> Self {
+    pub fn new(name: &str, client: &str, qtype: u16, action: LogAction, elapsed_ms: u32) -> Self {
         let ts_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -108,7 +102,16 @@ impl LogEntry {
         let client_len = client_bytes.len().min(CLIENT_CAP) as u8;
         client_buf[..client_len as usize].copy_from_slice(&client_bytes[..client_len as usize]);
 
-        Self { ts_secs, name_buf, name_len, client_buf, client_len, qtype, action, elapsed_ms }
+        Self {
+            ts_secs,
+            name_buf,
+            name_len,
+            client_buf,
+            client_len,
+            qtype,
+            action,
+            elapsed_ms,
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -123,31 +126,31 @@ impl LogEntry {
 // ── Serializable view — produced only on read path ─────────────────────────
 #[derive(Serialize)]
 pub struct LogEntryView {
-    pub ts:         String,
-    pub name:       String,
-    pub client:     String,
-    pub qtype:      u16,
-    pub action:     &'static str,
+    pub ts: String,
+    pub name: String,
+    pub client: String,
+    pub qtype: u16,
+    pub action: &'static str,
     pub elapsed_ms: u32,
 }
 
 // ── Query filters ─────────────────────────────────────────────────────────
 pub struct LogQuery {
-    pub limit:      usize,      // max entries to return (default 100, max 1000)
-    pub page:       usize,      // 0-based page number
-    pub action:     Option<LogAction>,
-    pub client:     Option<IpAddr>,
+    pub limit: usize, // max entries to return (default 100, max 1000)
+    pub page: usize,  // 0-based page number
+    pub action: Option<LogAction>,
+    pub client: Option<IpAddr>,
     pub since_secs: Option<u64>,
 }
 
 // ── Ring buffer ───────────────────────────────────────────────────────────
 pub struct LogBuffer {
-    slots:      Vec<Option<LogEntry>>,
-    head:       usize,  // next write position
-    count:      usize,  // total entries written (saturates at capacity)
+    slots: Vec<Option<LogEntry>>,
+    head: usize,  // next write position
+    count: usize, // total entries written (saturates at capacity)
     /// Runtime capacity (set from log-retention config, default 1000).
     /// 0 = disabled: push() is a no-op and query() returns empty.
-    capacity:   usize,
+    capacity: usize,
     /// When false, client IPs are stored as "[redacted]" (log-client-ip: no).
     log_client_ip: bool,
 }
@@ -156,27 +159,39 @@ impl LogBuffer {
     fn new_with(capacity: usize, log_client_ip: bool) -> Self {
         let cap = capacity.min(LOG_CAP);
         let mut slots = Vec::with_capacity(cap);
-        for _ in 0..cap { slots.push(None); }
-        Self { slots, head: 0, count: 0, capacity: cap, log_client_ip }
+        for _ in 0..cap {
+            slots.push(None);
+        }
+        Self {
+            slots,
+            head: 0,
+            count: 0,
+            capacity: cap,
+            log_client_ip,
+        }
     }
 
     /// Push a log entry — O(1), overwrites oldest when full.
     /// No-op when capacity is 0 (log-retention: 0).
     pub fn push(&mut self, entry: LogEntry) {
-        if self.capacity == 0 { return; }
+        if self.capacity == 0 {
+            return;
+        }
         self.slots[self.head] = Some(entry);
         self.head = (self.head + 1) % self.capacity;
-        if self.count < self.capacity { self.count += 1; }
+        if self.count < self.capacity {
+            self.count += 1;
+        }
     }
 
     /// High-level push used by the DNS server: applies IP redaction automatically.
     /// Returns the client string actually stored (for use in tracing logs).
     pub fn push_query(
         &mut self,
-        name:       &str,
-        client_ip:  &std::net::IpAddr,
-        qtype:      u16,
-        action:     LogAction,
+        name: &str,
+        client_ip: &std::net::IpAddr,
+        qtype: u16,
+        action: LogAction,
         elapsed_ms: u32,
     ) -> String {
         let client_str = if self.log_client_ip {
@@ -188,12 +203,13 @@ impl LogBuffer {
         client_str
     }
 
-
     /// Clear all entries. Returns the number of entries deleted.
     pub fn clear(&mut self) -> usize {
         let deleted = self.count;
-        for slot in &mut self.slots { *slot = None; }
-        self.head  = 0;
+        for slot in &mut self.slots {
+            *slot = None;
+        }
+        self.head = 0;
         self.count = 0;
         deleted
     }
@@ -202,7 +218,9 @@ impl LogBuffer {
     /// Allocates only on the read path.
     pub fn query(&self, q: &LogQuery) -> (Vec<LogEntryView>, usize) {
         let filled = self.count.min(self.capacity);
-        if filled == 0 { return (vec![], 0); }
+        if filled == 0 {
+            return (vec![], 0);
+        }
 
         // Pre-format the client IP filter once to avoid N allocations inside the loop.
         let client_filter: Option<String> = q.client.as_ref().map(|c| c.to_string());
@@ -213,33 +231,39 @@ impl LogBuffer {
             let idx = (self.head + self.capacity - 1 - i) % self.capacity;
             let entry = match &self.slots[idx] {
                 Some(e) => e,
-                None    => continue,
+                None => continue,
             };
 
             if let Some(a) = q.action {
-                if entry.action != a { continue; }
+                if entry.action != a {
+                    continue;
+                }
             }
             if let Some(ref cs) = client_filter {
                 // Filter on raw stored value: redacted entries never match an IP filter.
-                if entry.client() != cs.as_str() { continue; }
+                if entry.client() != cs.as_str() {
+                    continue;
+                }
             }
             if let Some(since) = q.since_secs {
-                if entry.ts_secs < since { continue; }
+                if entry.ts_secs < since {
+                    continue;
+                }
             }
 
             matched.push(LogEntryView {
-                ts:         format_ts(entry.ts_secs),
-                name:       entry.name().to_owned(),
-                client:     entry.client().to_owned(),
-                qtype:      entry.qtype,
-                action:     entry.action.as_str(),
+                ts: format_ts(entry.ts_secs),
+                name: entry.name().to_owned(),
+                client: entry.client().to_owned(),
+                qtype: entry.qtype,
+                action: entry.action.as_str(),
                 elapsed_ms: entry.elapsed_ms,
             });
         }
 
         let total = matched.len();
         let start = (q.page * q.limit).min(total);
-        let end   = (start + q.limit).min(total);
+        let end = (start + q.limit).min(total);
         (matched.drain(start..end).collect(), total)
     }
 }
@@ -254,8 +278,8 @@ impl LogBuffer {
 const LOG_SHARDS: usize = 16;
 
 pub struct ShardedLogBuffer {
-    shards:         Vec<Mutex<LogBuffer>>,
-    counter:        AtomicU64,
+    shards: Vec<Mutex<LogBuffer>>,
+    counter: AtomicU64,
     total_capacity: usize,
 }
 
@@ -265,7 +289,11 @@ impl ShardedLogBuffer {
         let shards = (0..LOG_SHARDS)
             .map(|_| Mutex::new(LogBuffer::new_with(per_shard, log_client_ip)))
             .collect();
-        Self { shards, counter: AtomicU64::new(0), total_capacity: capacity }
+        Self {
+            shards,
+            counter: AtomicU64::new(0),
+            total_capacity: capacity,
+        }
     }
 
     /// Returns false when log-retention is 0 — used to skip hot-path allocations.
@@ -277,10 +305,10 @@ impl ShardedLogBuffer {
     /// Returns the client string actually stored (for tracing).
     pub fn push_query(
         &self,
-        name:       &str,
-        client_ip:  &IpAddr,
-        qtype:      u16,
-        action:     LogAction,
+        name: &str,
+        client_ip: &IpAddr,
+        qtype: u16,
+        action: LogAction,
         elapsed_ms: u32,
     ) -> String {
         let idx = (self.counter.fetch_add(1, Ordering::Relaxed) % LOG_SHARDS as u64) as usize;
@@ -293,7 +321,13 @@ impl ShardedLogBuffer {
 
     /// Query log entries across all shards: merge, sort newest-first, filter, paginate.
     pub fn query(&self, q: &LogQuery) -> (Vec<LogEntryView>, usize) {
-        let fetch_all = LogQuery { limit: LOG_CAP, page: 0, action: q.action, client: q.client, since_secs: q.since_secs };
+        let fetch_all = LogQuery {
+            limit: LOG_CAP,
+            page: 0,
+            action: q.action,
+            client: q.client,
+            since_secs: q.since_secs,
+        };
         let mut merged: Vec<LogEntryView> = Vec::new();
         for shard in &self.shards {
             if let Ok(buf) = shard.lock() {
@@ -304,13 +338,17 @@ impl ShardedLogBuffer {
         merged.sort_unstable_by(|a, b| b.ts.cmp(&a.ts));
         let total = merged.len();
         let start = (q.page * q.limit).min(total);
-        let end   = (start + q.limit).min(total);
+        let end = (start + q.limit).min(total);
         (merged.drain(start..end).collect(), total)
     }
 
     /// Clear all shards. Returns total entries deleted.
     pub fn clear(&self) -> usize {
-        self.shards.iter().filter_map(|s| s.lock().ok()).map(|mut b| b.clear()).sum()
+        self.shards
+            .iter()
+            .filter_map(|s| s.lock().ok())
+            .map(|mut b| b.clear())
+            .sum()
     }
 }
 
@@ -325,23 +363,23 @@ pub fn new_shared(capacity: usize, log_client_ip: bool) -> SharedLogBuffer {
 // Formats Unix seconds as RFC 3339 / ISO 8601 UTC without external crates.
 pub fn format_ts(secs: u64) -> String {
     // Days since Unix epoch → Gregorian date via Rata Die algorithm.
-    let s     = secs % 86400;
-    let days  = secs / 86400;
-    let hh    = s / 3600;
-    let mm    = (s % 3600) / 60;
-    let ss    = s % 60;
+    let s = secs % 86400;
+    let days = secs / 86400;
+    let hh = s / 3600;
+    let mm = (s % 3600) / 60;
+    let ss = s % 60;
 
     // Civil date from epoch days (algorithm from Howard Hinnant)
-    let z     = days as i64 + 719468;
-    let era   = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe   = z - era * 146097;
-    let yoe   = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y     = yoe + era * 400;
-    let doy   = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp    = (5 * doy + 2) / 153;
-    let d     = doy - (153 * mp + 2) / 5 + 1;
-    let m     = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y     = if m <= 2 { y + 1 } else { y };
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
 
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
 }
