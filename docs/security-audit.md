@@ -23,7 +23,7 @@ External human audit: not yet scheduled.
 - **Threat models considered:** unauthenticated remote attacker on LAN/WAN, authenticated API user with valid Bearer token, compromised/malicious upstream DNS resolver, local process with access to config files
 - **Threat models NOT considered:** kernel 0-day exploitation (assumed trusted kernel), physical access to hardware, supply-chain compromise of Rust toolchain, side-channel attacks via CPU cache timing, fault injection, DNS amplification from external perspective
 - **Time estimate:** ~12 hours across multiple sessions
-- **Verification provenance:** Fix authorship and verification performed by same AI model family (claude-sonnet-4-6). Independent re-audit by different model family is pending. Per Rule 10, this means all "fixed" findings are "claimed fixed" until independent verification.
+- **Verification provenance:** Fix authorship and verification for v0.6.9 performed by same AI model family (claude-sonnet-4-6). Per AUDIT-PRINCIPLES.md Rule 10, all "Fixed" findings in this cycle are "claimed fixed, not independently verified" until a different model family or human reviewer re-audits. Partial exception: v0.8.1 adversarial re-audit (`docs/security-audit/v0.8.1-reaudit.md`) was conducted in a separate adversarial session (same model family, Rule 10 partial compliance — Gemini API unavailable).
 
 ---
 
@@ -454,7 +454,7 @@ Status summary as of v0.8.1:
 | ID | Title | Severity | Status |
 |----|-------|----------|--------|
 | SEC-01 | Auth timing oracle | MEDIUM | ✅ Mitigated (commit `f9ee716` — No automated test; verified by manual review) |
-| SEC-02 | Plaintext secrets in memory | HIGH | ✅ Zeroizing (commit `982467f` — No automated test; verified by manual review) |
+| SEC-02 | Plaintext secrets in memory | HIGH | ✅ Zeroizing (commit `b85b2cd` — No automated test; verified by manual review) |
 | SEC-03 | UMEM buffer overflow | HIGH | ✅ Fixed + ⚠️ Accepted risk (kernel trust — see §Known Limitations) (commit `c8ff1b0`) |
 | SEC-04 | HTTP body unbounded | MEDIUM | ✅ Capped 65 KiB (commit `dab1fbd` — No automated test; verified by manual review) |
 | SEC-05 | DNSSEC disabled by default | MEDIUM | Open — targeted v1.0 |
