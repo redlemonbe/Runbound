@@ -9,6 +9,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.4] — 2026-05-25
+
+### Security
+
+- **SEC-19** [HIGH]: CSRF double-submit cookie on WebUI. Login now sets a non-HttpOnly
+  `rb_csrf` cookie; `POST /api/webui/password` and `POST /logout` verify the
+  `X-CSRF-Token` request header matches the session-stored token.
+  (`src/webui/mod.rs`)
+
+- **SEC-AGV-01** [HIGH]: DDNS UPDATE handler rejects DELETE operations targeting
+  statically configured zone names. `LocalZoneSet` now carries a `static_names:
+  HashSet<Name>` populated from `unbound.conf` at startup; any DELETE with a matching
+  name returns `REFUSED`. Prevents TSIG-authenticated zone hijacking.
+  (`src/dns/ddns.rs`, `src/dns/local.rs`)
+
+- **SEC-20** [MEDIUM]: TSIG key material decoded once at startup instead of
+  base64-decoding on every UPDATE request. Stored as
+  `Vec<(String, TsigAlgorithm, Vec<u8>)>`.
+  (`src/dns/server.rs`)
+
+- **SEC-21** [MEDIUM]: Stale cache capped at `cache_max_entries` with simple eviction
+  to prevent OOM growth under high-cardinality domain traffic.
+  (`src/dns/server.rs`)
+
+- **SEC-AGV-02** [MEDIUM]: Schedule window validation in blacklist API handler — rejects
+  non-HH:MM values before storage. `is_active_now()` uses safe `.get(..2)` / `.get(3..5)`
+  slice access to prevent panics on short strings.
+  (`src/api/mod.rs`, `src/store.rs`)
+
+- **SEC-24** [LOW]: DNSSEC stripping detection now requires 2 consecutive AD=0 probe
+  results before setting `dnssec_stripping = true` — eliminates false positives from
+  upstream oscillation.
+  (`src/upstreams.rs`)
+
+- **SEC-26** [INFO]: SSE sparkline reconnect uses exponential backoff (1 s → 30 s max)
+  instead of silently dropping on stream close.
+  (`examples/web-ui/index.html`)
+
+### Added
+
+- **WebUI: logout button** in the management console header bar.
+- **WebUI: auto-logout** after 30 minutes of user inactivity (idle timer reset on
+  click/keydown/mousemove/touchstart).
+- **WebUI: Settings tab** — change username and password via `POST /api/webui/password`.
+  Active sessions are invalidated on credential change (SEC-25 fix from v0.9.3).
+- **WebUI: POST /logout** route alongside existing GET — required for CSRF-protected
+  logout from the embedded WebUI server.
+- **WebUI: CSRF in all API calls** — `api()` helper reads `rb_csrf` cookie and injects
+  `X-CSRF-Token` header on every non-GET request.
+
+### Fixed
+
+- **WebUI: QPS sparkline** always showed 0 on low-traffic servers because `qps_1m` is
+  an exponentially smoothed average that takes time to accumulate. Fixed to compute
+  instantaneous QPS from the delta of the `total` counter between SSE frames.
+
+---
 ## [0.9.2] — 2026-05-24
 
 ### Security
