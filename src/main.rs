@@ -9,6 +9,7 @@ mod dns;
 mod domain_stats;
 mod error;
 mod feeds;
+mod firewall;
 mod hsm;
 mod integrity;
 mod logbuffer;
@@ -267,6 +268,14 @@ async fn async_main(
         );
     }
 
+    let fw_ports = firewall::PortSet::from_config(&cfg);
+    let fw_manager = std::sync::Arc::new(firewall::FirewallManager::new(
+        cfg.firewall_manage,
+        cfg.firewall_backend.as_deref(),
+        &cfg.firewall_tag,
+    ));
+    fw_manager.open(&fw_ports);
+    let fw_cleanup = Arc::clone(&fw_manager);
     let result = dns::run_dns_server(
         &cfg,
         zones,
@@ -284,6 +293,7 @@ async fn async_main(
         domain_stats,
     )
     .await;
+    fw_cleanup.close();
     audit.send(audit::AuditEvent::Shutdown);
     result
 }
