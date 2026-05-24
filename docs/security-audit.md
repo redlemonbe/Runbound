@@ -1,8 +1,29 @@
+**Audit type:** [AI-INTERNAL] — performed by claude-sonnet-4-6 under maintainer direction.
+This audit does NOT substitute for external human security review.
+External human audit: not yet scheduled.
+
+---
+
 # Runbound — Security & Performance Audit Report
 
 **Version audited:** v0.6.9
 **Date:** 2026-05-23
 **Scope:** Full source — DNS engine, XDP fast-path, REST API, cache, feed subsystem, ACL, rate limiter, TLS, configuration parser, HSM integration, upstream management, eBPF program, signal handling, dependency chain
+
+---
+
+## 0. Methodology
+
+- **Model:** claude-sonnet-4-6
+- **Audit type:** [AI-INTERNAL]
+- **Adversarial framing:** None — same model family for implementation and review (R10 limitation acknowledged)
+- **Files reviewed:** src/auth.rs, src/api/mod.rs, src/api/upstreams.rs, src/dns/xdp/worker.rs, src/dns/xdp/socket.rs, src/dns/xdp/umem.rs, src/dns/ratelimit.rs, src/dns/acl.rs, src/sync.rs, src/main.rs, Cargo.toml (dependency versions)
+- **Files NOT reviewed:** tests/ (test coverage not evaluated), benches/, .github/ CI config, ebpf/dns_xdp.c (eBPF C source reviewed at call-site level only, not full BPF verifier analysis), build.rs
+- **Tools:** cargo-audit 0.21.x [AUTOMATED-TOOL], cargo-clippy 1.85.0 [AUTOMATED-TOOL], manual code review [AI-INTERNAL]
+- **Threat models considered:** unauthenticated remote attacker on LAN/WAN, authenticated API user with valid Bearer token, compromised/malicious upstream DNS resolver, local process with access to config files
+- **Threat models NOT considered:** kernel 0-day exploitation (assumed trusted kernel), physical access to hardware, supply-chain compromise of Rust toolchain, side-channel attacks via CPU cache timing, fault injection, DNS amplification from external perspective
+- **Time estimate:** ~12 hours across multiple sessions
+- **Verification provenance:** Fix authorship and verification performed by same AI model family (claude-sonnet-4-6). Independent re-audit by different model family is pending. Per Rule 10, this means all "fixed" findings are "claimed fixed" until independent verification.
 
 ---
 
