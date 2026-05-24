@@ -365,6 +365,36 @@ The stream is a standard SSE event stream (`Content-Type: text/event-stream`). E
 
 ---
 
+### `GET /api/stats/top-domains`
+
+Most-queried domain names since process start, sorted by query count descending.
+Tracks up to 10,000 distinct domains. Counter is cumulative (not windowed).
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | 10 | Number of results (1–100) |
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     "http://localhost:8080/api/stats/top-domains?limit=20"
+```
+
+```json
+{
+  "top_queried": [
+    { "domain": "google.com.", "count": 4821 },
+    { "domain": "cloudflare.com.", "count": 3102 },
+    { "domain": "github.com.", "count": 1844 }
+  ],
+  "tracked_domains": 312
+}
+```
+
+`tracked_domains` is the current number of distinct domains in the in-memory map (max 10,000).
+Once the cap is reached, new domains are silently ignored until the process restarts.
+
+---
+
 ### `GET /api/logs`
 
 Recent DNS query log, newest first. Entries are kept in a fixed-size ring buffer pre-allocated at startup (zero allocation per query). The buffer size is controlled by `log-retention` in `runbound.conf` (default: **1,000**, compile-time max: 10,000). Set to `0` to disable the buffer entirely.

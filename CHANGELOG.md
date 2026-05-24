@@ -7,6 +7,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+- **Top domains API (#5)** (`src/domain_stats.rs`, `src/api/mod.rs`)
+  `GET /api/stats/top-domains?limit=N` returns the most-queried domain names
+  since process start. Backed by a lock-free `DashMap<Box<str>, AtomicU64>` capped
+  at 10,000 domains. Overview tab shows a top-10 table with inline progress bars
+  (PR #117).
+
+- **Auto firewall management (#90)** (`src/firewall/`, `src/config/parser.rs`, `src/main.rs`)
+  Opt-in (`firewall-manage: yes`): on startup Runbound opens required ports
+  (DNS UDP+TCP, API, sync) in the host firewall; closes them on clean shutdown.
+  Detects UFW, nftables, iptables automatically or via `firewall-backend:`.
+  Tagged rules only — never flushes chains (PR #118).
+
+### Fixed
+- **SEC-2026-05-24-03 (#110)**: `is_private_ip()` accepted `::ffff:127.0.0.1` and
+  other IPv4-compatible IPv6 addresses as public, enabling SSRF via feed registration
+  (PR #115).
+- **SEC-2026-05-24-04 (#111)**: `cert_rl` rate-limit map keyed on `IP:port` rather
+  than IP alone; attacker could bypass per-IP cert-request limit by rotating ephemeral
+  source ports (PR #115).
+- **SEC-2026-05-24-05 (#112)**: `Acl::check()` called `to_ipv4_mapped()` on the
+  client address before matching, so `::ffff:192.168.1.1` could bypass IPv6 ACL rules
+  (PR #115).
+- **SEC-2026-05-24-06 (#113)**: `relay_host` was not validated at slave registration;
+  a malicious slave could register an internal address and cause SSRF from master relay
+  calls (PR #115).
+
+---
+
+## [0.8.1] — 2026-05-24
+
+### Security
+- **SEC-2026-05-24-01**: `is_private_ip()` did not canonicalise IPv4-in-IPv6 addresses
+  before the private-range check; `::127.0.0.1` bypassed SSRF protection on feed
+  registration (MEDIUM).
+- **SEC-2026-05-24-02**: Relay registration allowed registering slave addresses in
+  RFC-1918 ranges other than the relay host's own subnet, enabling internal-network
+  SSRF (MEDIUM).
+
 ---
 
 ## [0.8.0] - 2026-05-24
