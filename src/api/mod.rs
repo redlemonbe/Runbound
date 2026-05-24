@@ -1689,6 +1689,21 @@ async fn add_blacklist_handler(
                 })),
             );
         }
+        // SEC-AGV-02: validate schedule format to prevent silent bypass.
+        if let Some(ref sched) = req.schedule {
+            fn valid_hhmm(t: &str) -> bool {
+                t.len() == 5
+                    && t.as_bytes().get(2) == Some(&b':')
+                    && t.get(..2).and_then(|h| h.parse::<u8>().ok()).map_or(false, |h| h <= 23)
+                    && t.get(3..5).and_then(|m| m.parse::<u8>().ok()).map_or(false, |m| m <= 59)
+            }
+            if !valid_hhmm(&sched.start) || !valid_hhmm(&sched.end) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    JsonExtract(serde_json::json!({"error": "invalid schedule: use HH:MM format (00:00-23:59)"})),
+                );
+            }
+        }
         let is_scheduled = req.schedule.is_some();
         let entry = BlacklistEntry {
             id: uuid::Uuid::new_v4().to_string(),
