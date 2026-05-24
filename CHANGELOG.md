@@ -13,30 +13,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Added
 
-- **resolv.conf fallback (#94)** (`src/config/parser.rs`, `src/upstreams.rs`, `src/dns/server.rs`)
+- **resolv.conf emergency fallback (#94)** (`src/config/parser.rs`, `src/upstreams.rs`, `src/dns/server.rs`)
 
-  Quand tous les upstreams configurés deviennent injoignables, Runbound lit automatiquement `/etc/resolv.conf` et injecte les serveurs `nameserver` comme upstreams plain-UDP temporaires. Le fallback est retiré dès qu'un upstream primaire redevient sain (vérifié toutes les 30 s).
+  When all configured upstreams become unreachable, Runbound automatically reads
+  `/etc/resolv.conf` and injects the listed `nameserver` entries as temporary
+  plain-UDP upstreams. The fallback is removed as soon as any primary upstream
+  recovers (checked every 30 s).
 
-  - Nouveaux upstreams temporaires visibles dans `GET /api/upstreams` avec `"source": "resolv.conf"` et `"temporary": true`.
-  - Config : `resolv-fallback: no` pour désactiver (défaut : `yes`).
-  - Les entrées temporaires ne sont jamais persistées dans `upstreams.json`.
+  - Temporary upstreams are visible in `GET /api/upstreams` with `"source": "resolv.conf"` and `"temporary": true`.
+  - Config directive: `resolv-fallback: no` to disable (default: `yes`).
+  - Temporary entries are never persisted to `upstreams.json`.
 
 - **SSE node-status push (#86)** (`src/sync.rs`, `src/api/mod.rs`, `src/main.rs`)
 
-  Nouveau endpoint `GET /api/events` (Server-Sent Events) : stream en temps réel des changements d'état des slaves. Un événement est émis quand un slave change de catégorie de santé.
+  New endpoint `GET /api/events` (Server-Sent Events): real-time stream of slave
+  health state changes. An event is emitted whenever a slave transitions between
+  health categories.
 
-  Seuils (`last_seen_secs`) :
-  - `ok` : < 15 s (slave actif)
-  - `warn` : < 60 s (un cycle manqué, peut être transitoire)
-  - `error` : ≥ 60 s (slave probablement injoignable)
+  Thresholds (`last_seen_secs`):
+  - `ok`: < 15 s (slave actively syncing)
+  - `warn`: 15–59 s (one sync cycle missed, may be transient)
+  - `error`: ≥ 60 s (slave likely unreachable)
 
-  Format JSON de chaque événement :
+  Event JSON format:
   ```json
-  { "node_id": "…", "addr": "…", "status": "warn", "reason": "last seen 42s ago", "ts": 1748131200 }
+  {"node_id":"…","addr":"…","status":"warn","reason":"last seen 42s ago","ts":1748131200}
   ```
 
-  Endpoint disponible sur master seulement (404 sur slave/standalone).  
-  Keep-alive toutes les 15 s. Capacité du channel broadcast : 64 événements.
+  Master only — returns `404` on slave and standalone nodes.  
+  Keep-alive every 15 s. Broadcast channel capacity: 64 events.
 
 ---
 
