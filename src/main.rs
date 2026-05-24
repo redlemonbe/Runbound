@@ -690,6 +690,8 @@ async fn build_and_launch(
     let racing_wins: Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>> =
         Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
+    let events_tx = sync_journal.as_ref().map(|j| j.events_tx.clone());
+
     let state = AppState {
         zones:            Arc::clone(&zones),
         tls_cfg:          Arc::clone(&tls_cfg),
@@ -715,6 +717,7 @@ async fn build_and_launch(
         lookup_limiter:   Arc::new(api::ReloadLimiter::new_with_params(10.0, 10.0)),
         per_upstream_resolvers: Arc::clone(&per_upstream_resolvers),
         racing_wins:            Arc::clone(&racing_wins),
+        events_tx,
     };
     let app      = api::router(state);
     let api_addr = format!("{API_BIND}:{api_port}");

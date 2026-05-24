@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -178,6 +178,19 @@ pub struct SyncEvent {
     pub op:  SyncOp,
 }
 
+/// #86: SSE event pushed to GET /api/events subscribers when a slave's health
+/// status changes.  Status thresholds: ok (<15s), warn (15-60s), error (>60s).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeStatusEvent {
+    pub node_id: String,
+    pub addr:    String,
+    /// "ok" | "warn" | "error"
+    pub status:  String,
+    pub reason:  String,
+    /// Unix timestamp (seconds) when the event was generated.
+    pub ts:      u64,
+}
+
 /// Snapshot of a connected slave returned by GET /api/sync/slaves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaveInfo {
@@ -219,18 +232,26 @@ pub struct SyncJournal {
     /// Per-peer rate-limit for the public /sync/cert endpoint:
     /// maps peer-addr → (request_count_in_window, window_start).
     cert_rl:           dashmap::DashMap<String, (u32, Instant), ahash::RandomState>,
+    /// #86: broadcast channel for SSE node-status events.
+    pub events_tx:     tokio::sync::broadcast::Sender<NodeStatusEvent>,
 }
 
 impl SyncJournal {
     pub fn new() -> Arc<Self> {
+        let (events_tx, _) = tokio::sync::broadcast::channel::<NodeStatusEvent>(64);
         let j = Arc::new(Self {
             events:           Mutex::new(VecDeque::with_capacity(JOURNAL_CAPACITY)),
             seq:              AtomicU64::new(0),
             connected_slaves: Mutex::new(HashMap::new()),
             registered_nodes: Mutex::new(HashMap::new()),
             cert_rl:          dashmap::DashMap::with_hasher(ahash::RandomState::default()),
+            events_tx,
         });
         j.load_nodes();
+        // #86: spawn slave-status watcher
+        let weak = Arc::downgrade(&j);
+        let tx   = j.events_tx.clone();
+        tokio::spawn(slave_status_watcher(weak, tx));
         j
     }
 
@@ -1395,5 +1416,64 @@ impl std::fmt::Display for SyncError {
             SyncError::TooFarBehind => write!(f, "too far behind (410 Gone)"),
             SyncError::Request(s)   => write!(f, "request error: {s}"),
         }
+    }
+}
+
+// ── #86: slave-status watcher ──────────────────────────────────────────────
+//
+// Polls all_slaves_snapshot() every 5 s and emits a NodeStatusEvent on the
+// broadcast channel whenever a node's health category changes.
+//
+// Status thresholds (last_seen_secs):
+//   ok    < 15 s  — node is actively syncing
+//   warn  < 60 s  — missed one sync cycle, may be transient
+//   error ≥ 60 s  — node appears unreachable
+async fn slave_status_watcher(
+    journal: std::sync::Weak<SyncJournal>,
+    tx:      tokio::sync::broadcast::Sender<NodeStatusEvent>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prev: HashMap<String, String> = HashMap::new();
+
+    loop {
+        interval.tick().await;
+        let Some(journal) = journal.upgrade() else { break; };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let slaves = journal.all_slaves_snapshot();
+        let mut current_keys: Vec<String> = Vec::with_capacity(slaves.len());
+
+        for slave in &slaves {
+            let secs = slave.last_seen_secs;
+            let new_status = if secs < 15 { "ok" } else if secs < 60 { "warn" } else { "error" };
+            let key = slave.node_id.as_deref().unwrap_or(&slave.addr).to_string();
+            current_keys.push(key.clone());
+
+            let changed = prev.get(&key).map_or(true, |s| s != new_status);
+            if changed {
+                let reason = if secs < 15 {
+                    "connected".to_string()
+                } else {
+                    format!("last seen {}s ago", secs)
+                };
+                let event = NodeStatusEvent {
+                    node_id: slave.node_id.clone().unwrap_or_else(|| slave.addr.clone()),
+                    addr:    slave.addr.clone(),
+                    status:  new_status.to_string(),
+                    reason,
+                    ts:      now,
+                };
+                let _ = tx.send(event);
+                prev.insert(key, new_status.to_string());
+            }
+        }
+
+        // Remove stale keys (nodes that left the snapshot).
+        prev.retain(|k, _| current_keys.contains(k));
     }
 }
