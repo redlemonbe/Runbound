@@ -181,6 +181,13 @@ pub struct UnboundConfig {
     /// Reduces p99 latency to the fastest upstream when 2+ are configured.
     /// Default: false (backward-compatible round-robin/failover via hickory).
     pub upstream_racing: bool,
+
+    // ── resolv.conf fallback (#94) ────────────────────────────────────────────
+    /// Fall back to /etc/resolv.conf nameservers when all configured upstreams
+    /// are unhealthy.  Entries appear with source="resolv.conf" and temporary=true
+    /// in GET /api/upstreams.  Removed automatically when a primary upstream
+    /// recovers.  Default: true.
+    pub resolv_fallback: bool,
 }
 
 impl UnboundConfig {
@@ -206,6 +213,7 @@ impl UnboundConfig {
             prefetch:             false,
             prefetch_threshold:   5,
             cache_flush_cooldown: 60,
+            resolv_fallback:      true,
             ..Default::default()
         }
     }
@@ -405,6 +413,7 @@ fn parse_server_directive(cfg: &mut UnboundConfig, key: &str, val: &str, lineno:
         "prefetch-threshold"    => cfg.prefetch_threshold    = val.parse().unwrap_or(5),
         "cache-flush-cooldown"  => cfg.cache_flush_cooldown  = val.parse().unwrap_or(60),
         "upstream-racing"       => cfg.upstream_racing       = val.trim_matches('"') == "yes",
+        "resolv-fallback"       => cfg.resolv_fallback       = val.trim_matches('"') != "no",
         // Accepted but unused — common Unbound tuning directives
         "num-threads" | "cache-size" | "msg-cache-size" | "rrset-cache-size"
         | "so-rcvbuf" | "so-sndbuf" | "outgoing-range" | "num-queries-per-thread"

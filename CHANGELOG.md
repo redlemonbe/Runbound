@@ -9,6 +9,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.7.0] — 2026-05-24
+
+### Added
+
+- **resolv.conf fallback (#94)** (`src/config/parser.rs`, `src/upstreams.rs`, `src/dns/server.rs`)
+
+  Quand tous les upstreams configurés deviennent injoignables, Runbound lit automatiquement `/etc/resolv.conf` et injecte les serveurs `nameserver` comme upstreams plain-UDP temporaires. Le fallback est retiré dès qu'un upstream primaire redevient sain (vérifié toutes les 30 s).
+
+  - Nouveaux upstreams temporaires visibles dans `GET /api/upstreams` avec `"source": "resolv.conf"` et `"temporary": true`.
+  - Config : `resolv-fallback: no` pour désactiver (défaut : `yes`).
+  - Les entrées temporaires ne sont jamais persistées dans `upstreams.json`.
+
+- **SSE node-status push (#86)** (`src/sync.rs`, `src/api/mod.rs`, `src/main.rs`)
+
+  Nouveau endpoint `GET /api/events` (Server-Sent Events) : stream en temps réel des changements d'état des slaves. Un événement est émis quand un slave change de catégorie de santé.
+
+  Seuils (`last_seen_secs`) :
+  - `ok` : < 15 s (slave actif)
+  - `warn` : < 60 s (un cycle manqué, peut être transitoire)
+  - `error` : ≥ 60 s (slave probablement injoignable)
+
+  Format JSON de chaque événement :
+  ```json
+  { "node_id": "…", "addr": "…", "status": "warn", "reason": "last seen 42s ago", "ts": 1748131200 }
+  ```
+
+  Endpoint disponible sur master seulement (404 sur slave/standalone).  
+  Keep-alive toutes les 15 s. Capacité du channel broadcast : 64 événements.
+
+---
+
 ## [0.6.24] — 2026-05-24
 
 ### Fixed
