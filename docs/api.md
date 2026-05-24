@@ -767,7 +767,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
       "last_check": "2026-05-22T15:00:00Z",
       "last_error": null,
       "zone": ".",
-      "latency_history": [11, 12, 14, 11, 13]
+      "latency_history": [11, 12, 14, 11, 13],
+      "source": "runtime",
+      "temporary": false
     }
   ],
   "total": 1,
@@ -777,7 +779,8 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `source` | `"runtime"` or `"config"` | `"config"` for upstreams loaded from `forward-zone` in `runbound.conf`; `"runtime"` for upstreams added via API. Config upstreams persist only via the config file; deleting them removes the `forward-addr` line and reloads. |
+| `source` | `"runtime"`, `"config"`, or `"resolv.conf"` | `"config"` for upstreams loaded from `forward-zone` in `runbound.conf`; `"runtime"` for upstreams added via API; `"resolv.conf"` for temporary emergency fallback upstreams injected from `/etc/resolv.conf`. |
+| `temporary` | bool | `true` for upstreams injected as emergency fallback from `/etc/resolv.conf`. These upstreams are never persisted to `upstreams.json` and are automatically removed when a primary upstream recovers. Always `false` for normal upstreams. |
 | `tls_hostname` | `string` or absent | DoT only. TLS SNI hostname used for certificate validation. Absent when not set (auto-detected from well-known IPs). |
 | `last_error` | `string` or `null` | Short description of the last probe failure (`"connection timeout"`, `"tls handshake failed"`, etc.). `null` when the last probe succeeded. |
 | `dnssec_supported` | `bool` or absent | `true` if the upstream sets the AD bit in probe responses. Absent when unhealthy or not yet probed. DoT upstreams always omit this field. |
@@ -1004,6 +1007,54 @@ curl -X POST \
 | `422 UNPROCESSABLE_ENTITY` | `NODE_NO_RELAY` | Node registered but has no `relay_host` (slave's `sync-port` not set). |
 | `400 BAD_REQUEST` | `RELAY_RECURSION` | Attempted relay to `/relay/*` — forbidden to prevent loops. |
 | `502 BAD_GATEWAY` | `RELAY_ERROR` | Connection to the slave failed (timeout, TLS error, etc.). |
+
+---
+
+
+### `GET /api/events`
+
+Real-time node-status push via Server-Sent Events. Available on the **master only**
+(returns `404` on slave and standalone nodes).
+
+```bash
+curl -N -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     http://localhost:8080/api/events
+```
+
+```
+data: {"node_id":"1df6dc2c-94a7-485b-bb80-76b7f5aa438d","addr":"192.168.8.11","status":"ok","reason":"last seen 3s ago","ts":1748131200}
+
+data: {"node_id":"1df6dc2c-94a7-485b-bb80-76b7f5aa438d","addr":"192.168.8.11","status":"warn","reason":"last seen 42s ago","ts":1748131242}
+```
+
+An event is emitted whenever a slave node transitions between health categories.
+
+**Health thresholds** (based on `last_seen_secs`):
+
+| Status | Condition | Meaning |
+|---|---|---|
+| `ok` | < 15 s | Slave is actively syncing |
+| `warn` | 15–59 s | One sync cycle missed — may be transient |
+| `error` | ≥ 60 s | Slave likely unreachable |
+
+**Event fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `node_id` | string | Stable UUID of the slave node (from `/etc/runbound/node-id` on the slave) |
+| `addr` | string | Source IP of the slave's last registration |
+| `status` | string | `"ok"`, `"warn"`, or `"error"` |
+| `reason` | string | Human-readable explanation (e.g. `"last seen 42s ago"`) |
+| `ts` | integer | Unix timestamp (seconds) of the status change |
+
+**Keep-alive:** a `: keep-alive` comment line is sent every 15 seconds to prevent
+proxy and load-balancer timeouts. These are not data events and should be ignored
+by SSE clients.
+
+**Broadcast channel capacity:** 64 events. Slow consumers that fall behind are
+disconnected when the channel is full.
+
+> The `-N` flag disables curl's output buffering — required to see events in real time.
 
 ---
 
