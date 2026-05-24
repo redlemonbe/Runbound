@@ -87,6 +87,6 @@ mod worker;
 pub use umem::XdpRingSizes;
 
 #[cfg(feature = "xdp")]
-pub use worker::start_xdp;
-#[cfg(feature = "xdp")]
 pub use loader::XdpMode;
+#[cfg(feature = "xdp")]
+pub use worker::start_xdp;

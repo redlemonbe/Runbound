@@ -20,32 +20,29 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use crate::dns::xdp::umem::{
-    mmap_desc_ring, get_rx_tx_offsets,
-    Umem, DescRing,
-    SOL_XDP, XDP_RX_RING, XDP_TX_RING,
-    XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING,
-    XdpRingSizes, SockaddrXdp,
-    XDP_ZEROCOPY, XDP_COPY, XDP_USE_NEED_WAKEUP,
+    get_rx_tx_offsets, mmap_desc_ring, DescRing, SockaddrXdp, Umem, XdpRingSizes, SOL_XDP,
+    XDP_COPY, XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING, XDP_RX_RING, XDP_TX_RING, XDP_USE_NEED_WAKEUP,
+    XDP_ZEROCOPY,
 };
 
 // ── SIOCETHTOOL constants (linux/sockios.h + linux/ethtool.h) ─────────────
 
-const SIOCETHTOOL:        libc::c_ulong = 0x8946;
-const ETHTOOL_GRINGPARAM: u32           = 0x0000_0010;
-const ETHTOOL_SRINGPARAM: u32           = 0x0000_0011;
+const SIOCETHTOOL: libc::c_ulong = 0x8946;
+const ETHTOOL_GRINGPARAM: u32 = 0x0000_0010;
+const ETHTOOL_SRINGPARAM: u32 = 0x0000_0011;
 
 /// Matches `struct ethtool_ringparam` in <linux/ethtool.h>.
 #[repr(C)]
 struct EthtoolRingParam {
-    cmd:                  u32,
-    rx_max_pending:       u32,
-    rx_mini_max_pending:  u32,
+    cmd: u32,
+    rx_max_pending: u32,
+    rx_mini_max_pending: u32,
     rx_jumbo_max_pending: u32,
-    tx_max_pending:       u32,
-    rx_pending:           u32,
-    rx_mini_pending:      u32,
-    rx_jumbo_pending:     u32,
-    tx_pending:           u32,
+    tx_max_pending: u32,
+    rx_pending: u32,
+    rx_mini_pending: u32,
+    rx_jumbo_pending: u32,
+    tx_pending: u32,
 }
 
 /// Minimal `ifreq` layout for SIOCETHTOOL.
@@ -56,13 +53,13 @@ struct EthtoolRingParam {
 struct IfReqEthtool {
     ifr_name: [u8; 16],
     ifr_data: *mut libc::c_void,
-    _pad:     [u8; 16],
+    _pad: [u8; 16],
 }
 
 // ── NIC ring-buffer stats, populated by maximize_nic_ring ─────────────────
 
 /// Applied NIC RX ring size (0 = ethtool unavailable or not yet called).
-pub static XDP_NIC_RX_RING:     AtomicU32 = AtomicU32::new(0);
+pub static XDP_NIC_RX_RING: AtomicU32 = AtomicU32::new(0);
 /// Hardware maximum NIC RX ring size (0 = unavailable).
 pub static XDP_NIC_RX_RING_MAX: AtomicU32 = AtomicU32::new(0);
 /// Active XDP interface, set once at startup. Used to read sysfs rx_dropped.
@@ -73,10 +70,10 @@ pub static XDP_QUEUE_MODES: OnceLock<Vec<(u32, bool)>> = OnceLock::new();
 pub const AF_XDP: libc::c_int = 44;
 
 pub struct XskSocket {
-    pub fd:       RawFd,
-    pub umem:     Umem,
-    pub rx:       DescRing,
-    pub tx:       DescRing,
+    pub fd: RawFd,
+    pub umem: Umem,
+    pub rx: DescRing,
+    pub tx: DescRing,
     /// True when the kernel accepted XDP_ZEROCOPY at bind time.
     pub zerocopy: bool,
 }
@@ -87,7 +84,9 @@ impl Drop for XskSocket {
         //         in `create_xsk_socket`. It has not been closed elsewhere (the
         //         `XskSocket` owns it exclusively). `Drop` is called exactly once,
         //         so there is no double-close.
-        unsafe { libc::close(self.fd); }
+        unsafe {
+            libc::close(self.fd);
+        }
     }
 }
 
@@ -97,11 +96,11 @@ impl Drop for XskSocket {
 /// does not support zero-copy. Returns an error only if even copy mode fails,
 /// which indicates the NIC does not support AF_XDP at all.
 pub unsafe fn create_xsk_socket(
-    ifindex:      u32,
-    queue_id:     u32,
+    ifindex: u32,
+    queue_id: u32,
     use_zerocopy: bool,
-    hugepages:    bool,
-    sizes:        &XdpRingSizes,
+    hugepages: bool,
+    sizes: &XdpRingSizes,
 ) -> Result<XskSocket, String> {
     // 1. Create the socket
     // SAFETY: `socket(2)` is safe to call with valid constants. AF_XDP=44,
@@ -128,7 +127,9 @@ pub unsafe fn create_xsk_socket(
         //         initialised u32 on the stack. The socklen matches sizeof(u32).
         let rc = unsafe {
             libc::setsockopt(
-                fd, SOL_XDP, opt,
+                fd,
+                SOL_XDP,
+                opt,
                 &sz as *const _ as *const libc::c_void,
                 std::mem::size_of::<u32>() as libc::socklen_t,
             )
@@ -148,14 +149,14 @@ pub unsafe fn create_xsk_socket(
     // SAFETY: `fd` is a valid AF_XDP socket fd with ring sizes already configured.
     let (rx_off, tx_off) = unsafe { get_rx_tx_offsets(fd) }?;
     // SAFETY: `fd` is valid; `rx_off` contains the offsets returned by the kernel.
-    let rx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, sizes.rx) }
-        .inspect_err(|_| {
+    let rx =
+        unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, sizes.rx) }.inspect_err(|_| {
             // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
             unsafe { libc::close(fd) };
         })?;
     // SAFETY: `fd` is valid; `tx_off` contains the offsets returned by the kernel.
-    let tx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, sizes.tx) }
-        .inspect_err(|_| {
+    let tx =
+        unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, sizes.tx) }.inspect_err(|_| {
             // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
             unsafe { libc::close(fd) };
         })?;
@@ -164,14 +165,13 @@ pub unsafe fn create_xsk_socket(
     //    XDP_USE_NEED_WAKEUP: when set, we must call poll()/sendto() to kick
     //    the driver when the NEED_WAKEUP flag appears in the ring flags field.
     //    This saves CPU cycles when the driver can sleep between batches.
-    let bind_flags = XDP_USE_NEED_WAKEUP
-        | if use_zerocopy { XDP_ZEROCOPY } else { XDP_COPY };
+    let bind_flags = XDP_USE_NEED_WAKEUP | if use_zerocopy { XDP_ZEROCOPY } else { XDP_COPY };
 
     let sa = SockaddrXdp {
-        sxdp_family:         AF_XDP as u16,
-        sxdp_flags:          bind_flags,
-        sxdp_ifindex:        ifindex,
-        sxdp_queue_id:       queue_id,
+        sxdp_family: AF_XDP as u16,
+        sxdp_flags: bind_flags,
+        sxdp_ifindex: ifindex,
+        sxdp_queue_id: queue_id,
         sxdp_shared_umem_fd: 0,
     };
     // SAFETY: `fd` is a valid AF_XDP socket fd. `&sa` is a valid pointer to a
@@ -193,7 +193,13 @@ pub unsafe fn create_xsk_socket(
         ));
     }
 
-    Ok(XskSocket { fd, umem, rx, tx, zerocopy: use_zerocopy })
+    Ok(XskSocket {
+        fd,
+        umem,
+        rx,
+        tx,
+        zerocopy: use_zerocopy,
+    })
 }
 
 /// Validate a network interface name before using it in sysfs paths.
@@ -202,7 +208,9 @@ pub unsafe fn create_xsk_socket(
 pub(super) fn sanitize_iface_name(name: &str) -> Option<&str> {
     if !name.is_empty()
         && name.len() <= 15
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
     {
         Some(name)
     } else {
@@ -215,7 +223,9 @@ pub(super) fn sanitize_iface_name(name: &str) -> Option<&str> {
 pub(super) fn read_iface_mac(iface: &str) -> Option<[u8; 6]> {
     let iface = sanitize_iface_name(iface)?;
     let content = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")).ok()?;
-    let parts: Vec<u8> = content.trim().split(':')
+    let parts: Vec<u8> = content
+        .trim()
+        .split(':')
         .filter_map(|s| u8::from_str_radix(s, 16).ok())
         .collect();
     if parts.len() == 6 {
@@ -230,17 +240,13 @@ pub(super) fn read_iface_mac(iface: &str) -> Option<[u8; 6]> {
 pub fn get_rx_queue_count(iface: &str) -> u32 {
     let iface = match sanitize_iface_name(iface) {
         Some(n) => n,
-        None    => return 1,
+        None => return 1,
     };
     let path = format!("/sys/class/net/{iface}/queues");
     std::fs::read_dir(&path)
         .map(|dir| {
             dir.filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with("rx-")
-                })
+                .filter(|e| e.file_name().to_string_lossy().starts_with("rx-"))
                 .count() as u32
         })
         .unwrap_or(1)
@@ -253,7 +259,11 @@ pub fn iface_index(name: &str) -> Option<u32> {
     // SAFETY: `cname.as_ptr()` is a valid NUL-terminated C string whose lifetime
     //         covers the call. `if_nametoindex(3)` returns 0 on error.
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-    if idx == 0 { None } else { Some(idx) }
+    if idx == 0 {
+        None
+    } else {
+        Some(idx)
+    }
 }
 
 /// Find which network interface carries the given IP address using `getifaddrs()`.
@@ -275,7 +285,9 @@ pub fn iface_for_ip(ip: &str) -> Option<String> {
         //         `getifaddrs`. Each node is valid until `freeifaddrs` is called.
         let ifa = unsafe { &*cur };
         cur = ifa.ifa_next;
-        if ifa.ifa_addr.is_null() { continue; }
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
 
         let matched = unsafe {
             // SAFETY: `ifa.ifa_addr` is non-null (checked above). Reading
@@ -312,7 +324,9 @@ pub fn iface_for_ip(ip: &str) -> Option<String> {
     }
     // SAFETY: `ifap` is the pointer returned by `getifaddrs` above (non-null on
     //         success). Called exactly once, after we are done traversing the list.
-    unsafe { libc::freeifaddrs(ifap); }
+    unsafe {
+        libc::freeifaddrs(ifap);
+    }
     result
 }
 
@@ -342,13 +356,13 @@ pub fn default_interface() -> Option<String> {
 pub fn is_virtual_interface(iface: &str) -> bool {
     let iface = match sanitize_iface_name(iface) {
         Some(n) => n,
-        None    => return true,
+        None => return true,
     };
     if std::path::Path::new(&format!("/sys/class/net/{iface}/device")).exists() {
         return false;
     }
-    let uevent = std::fs::read_to_string(format!("/sys/class/net/{iface}/uevent"))
-        .unwrap_or_default();
+    let uevent =
+        std::fs::read_to_string(format!("/sys/class/net/{iface}/uevent")).unwrap_or_default();
     if uevent.lines().any(|l| l.trim() == "DEVTYPE=vlan") {
         return false;
     }
@@ -367,7 +381,7 @@ pub fn parent_interface(iface: &str) -> Option<String> {
     if let Ok(entries) = std::fs::read_dir(&sysfs) {
         for entry in entries.flatten() {
             let fname = entry.file_name();
-            let name  = fname.to_string_lossy();
+            let name = fname.to_string_lossy();
             if let Some(lower) = name.strip_prefix("lower_") {
                 if !lower.is_empty() {
                     return Some(lower.to_string());
@@ -437,7 +451,9 @@ fn maximize_nic_ring_inner(iface: &str, target: Option<u32>) -> std::io::Result<
     impl Drop for AutoClose {
         fn drop(&mut self) {
             // SAFETY: self.0 is the fd returned by socket(2) below; closed exactly once.
-            unsafe { libc::close(self.0); }
+            unsafe {
+                libc::close(self.0);
+            }
         }
     }
 
@@ -460,7 +476,14 @@ fn maximize_nic_ring_inner(iface: &str, target: Option<u32>) -> std::io::Result<
 
     // SAFETY: `fd` is a valid socket fd. `ifr` is fully initialised with a
     //         valid `ifr_data` pointer. The ioctl writes results back into `ring`.
-    if unsafe { libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>()) } < 0 {
+    if unsafe {
+        libc::ioctl(
+            fd,
+            SIOCETHTOOL as _,
+            (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -475,13 +498,20 @@ fn maximize_nic_ring_inner(iface: &str, target: Option<u32>) -> std::io::Result<
     // ── SET ring sizes ────────────────────────────────────────────────────
     // SAFETY: zeroed() valid for this plain C struct.
     let mut ring_s: EthtoolRingParam = unsafe { std::mem::zeroed() };
-    ring_s.cmd        = ETHTOOL_SRINGPARAM;
+    ring_s.cmd = ETHTOOL_SRINGPARAM;
     ring_s.rx_pending = rx_set;
     ring_s.tx_pending = tx_set;
     let mut ifr_s = build_ifreq(iface_safe, (&mut ring_s as *mut EthtoolRingParam).cast());
 
     // SAFETY: same as the GET call above.
-    if unsafe { libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr_s as *mut IfReqEthtool).cast::<libc::c_void>()) } < 0 {
+    if unsafe {
+        libc::ioctl(
+            fd,
+            SIOCETHTOOL as _,
+            (&mut ifr_s as *mut IfReqEthtool).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -497,7 +527,11 @@ fn maximize_nic_ring_inner(iface: &str, target: Option<u32>) -> std::io::Result<
 }
 
 fn build_ifreq(iface: &str, data: *mut libc::c_void) -> IfReqEthtool {
-    let mut ifr = IfReqEthtool { ifr_name: [0u8; 16], ifr_data: data, _pad: [0u8; 16] };
+    let mut ifr = IfReqEthtool {
+        ifr_name: [0u8; 16],
+        ifr_data: data,
+        _pad: [0u8; 16],
+    };
     for (i, &b) in iface.as_bytes().iter().take(15).enumerate() {
         ifr.ifr_name[i] = b;
     }
@@ -509,7 +543,7 @@ fn build_ifreq(iface: &str, data: *mut libc::c_void) -> IfReqEthtool {
 pub fn read_nic_rx_dropped(iface: &str) -> u64 {
     let iface = match sanitize_iface_name(iface) {
         Some(n) => n,
-        None    => return 0,
+        None => return 0,
     };
     std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/rx_dropped"))
         .ok()

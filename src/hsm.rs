@@ -13,8 +13,8 @@
 // immediately — there is no silent fallback to avoid running without HSM protection
 // after the operator explicitly opted in.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -25,12 +25,14 @@ use crate::config::parser::UnboundConfig;
 // ── Process-global key storage ────────────────────────────────────────────────
 // Populated once at startup by load_and_store(). Never updated after that.
 
-static HSM_API_KEY:   OnceLock<Zeroizing<String>>  = OnceLock::new();
+static HSM_API_KEY: OnceLock<Zeroizing<String>> = OnceLock::new();
 static HSM_STORE_KEY: OnceLock<Zeroizing<Vec<u8>>> = OnceLock::new();
-static HSM_ACTIVE:    AtomicBool                   = AtomicBool::new(false);
+static HSM_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Returns true if keys were successfully loaded from an HSM at startup.
-pub fn is_active() -> bool { HSM_ACTIVE.load(Ordering::Relaxed) }
+pub fn is_active() -> bool {
+    HSM_ACTIVE.load(Ordering::Relaxed)
+}
 
 /// Returns the HSM-loaded API key, if any.
 /// Checked by `init_api_key()` before env vars and config file.
@@ -47,10 +49,10 @@ pub fn store_key() -> Option<&'static [u8]> {
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 pub struct HsmConfig {
-    pub pkcs11_lib:      String,
-    pub slot:            u64,
-    pub pin:             Zeroizing<String>,
-    pub api_key_label:   Option<String>,
+    pub pkcs11_lib: String,
+    pub slot: u64,
+    pub pin: Zeroizing<String>,
+    pub api_key_label: Option<String>,
     pub store_key_label: Option<String>,
 }
 
@@ -65,10 +67,10 @@ impl HsmConfig {
             .or_else(|| cfg.hsm_pin.clone())
             .unwrap_or_default();
         Some(Self {
-            pkcs11_lib:      lib,
-            slot:            cfg.hsm_slot,
-            pin:             Zeroizing::new(pin),
-            api_key_label:   cfg.hsm_api_key_label.clone(),
+            pkcs11_lib: lib,
+            slot: cfg.hsm_slot,
+            pin: Zeroizing::new(pin),
+            api_key_label: cfg.hsm_api_key_label.clone(),
             store_key_label: cfg.hsm_store_key_label.clone(),
         })
     }
@@ -90,22 +92,28 @@ pub fn load_and_store(config: &HsmConfig) -> Result<()> {
 
     let pkcs11 = Pkcs11::new(&config.pkcs11_lib)
         .with_context(|| format!("Cannot load PKCS#11 library '{}'", config.pkcs11_lib))?;
-    pkcs11.initialize(CInitializeArgs::OsThreads)
+    pkcs11
+        .initialize(CInitializeArgs::OsThreads)
         .context("PKCS#11 C_Initialize failed")?;
 
-    let slots = pkcs11.get_slots_with_initialized_token()
+    let slots = pkcs11
+        .get_slots_with_initialized_token()
         .context("PKCS#11 C_GetSlotList failed")?;
-    let &slot = slots.get(config.slot as usize)
-        .ok_or_else(|| anyhow::anyhow!(
+    let &slot = slots.get(config.slot as usize).ok_or_else(|| {
+        anyhow::anyhow!(
             "HSM slot {} not found ({} slots with initialised tokens visible)",
-            config.slot, slots.len()
-        ))?;
+            config.slot,
+            slots.len()
+        )
+    })?;
 
-    let session = pkcs11.open_rw_session(slot)
+    let session = pkcs11
+        .open_rw_session(slot)
         .context("PKCS#11 C_OpenSession failed")?;
 
     let pin = AuthPin::new(config.pin.as_str().to_string());
-    session.login(UserType::User, Some(&pin))
+    session
+        .login(UserType::User, Some(&pin))
         .context("PKCS#11 C_Login failed — check HSM_PIN / hsm-pin and slot number")?;
 
     if let Some(ref label) = config.api_key_label {
@@ -129,7 +137,10 @@ pub fn load_and_store(config: &HsmConfig) -> Result<()> {
     // pkcs11 drops here → C_Finalize. Safe: all key bytes are now in the OnceLocks.
 
     HSM_ACTIVE.store(true, Ordering::Relaxed);
-    info!(slot = config.slot, "HSM session closed — keys held in process memory");
+    info!(
+        slot = config.slot,
+        "HSM session closed — keys held in process memory"
+    );
     Ok(())
 }
 
@@ -141,19 +152,22 @@ fn extract_key(session: &cryptoki::session::Session, label: &str) -> Result<Vec<
         Attribute::Class(ObjectClass::SECRET_KEY),
         Attribute::Label(label.as_bytes().to_vec()),
     ];
-    let handles = session.find_objects(&template)
+    let handles = session
+        .find_objects(&template)
         .with_context(|| format!("C_FindObjects failed (label '{label}')"))?;
-    let handle = *handles.first()
-        .ok_or_else(|| anyhow::anyhow!(
-            "Key '{label}' not found in HSM — check label and CKA_EXTRACTABLE=true"
-        ))?;
+    let handle = *handles.first().ok_or_else(|| {
+        anyhow::anyhow!("Key '{label}' not found in HSM — check label and CKA_EXTRACTABLE=true")
+    })?;
 
-    let attrs = session.get_attributes(handle, &[AttributeType::Value])
+    let attrs = session
+        .get_attributes(handle, &[AttributeType::Value])
         .with_context(|| format!("C_GetAttributeValue failed for '{label}'"))?;
     for attr in attrs {
         if let Attribute::Value(v) = attr {
             return Ok(v);
         }
     }
-    anyhow::bail!("CKA_VALUE attribute missing for '{label}' — set CKA_EXTRACTABLE=true on the key object")
+    anyhow::bail!(
+        "CKA_VALUE attribute missing for '{label}' — set CKA_EXTRACTABLE=true on the key object"
+    )
 }

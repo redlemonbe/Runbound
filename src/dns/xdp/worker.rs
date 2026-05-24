@@ -31,26 +31,24 @@ use hickory_proto::{
 };
 use smallvec::SmallVec;
 
+use super::loader::XdpHandle;
+use super::socket::{
+    create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface, maximize_nic_ring,
+    parent_interface, sanitize_iface_name, XskSocket, XDP_ACTIVE_IFACE,
+};
+use super::umem::{XdpDesc, XdpRingSizes, FRAME_SIZE};
 use crate::dns::acl::{Acl, AclAction};
 use crate::dns::local::{LocalZoneSet, ZoneAction};
 use crate::dns::RateLimiter;
-use super::loader::XdpHandle;
-use super::socket::{
-    XskSocket, create_xsk_socket, get_rx_queue_count, iface_index,
-    is_virtual_interface, parent_interface, sanitize_iface_name,
-    maximize_nic_ring, XDP_ACTIVE_IFACE,
-};
-use super::umem::{XdpDesc, FRAME_SIZE, XdpRingSizes};
 
 const ETH_HDR: usize = 14;
 const IPV4_HDR_MIN: usize = 20;
 const IPV6_HDR: usize = 40;
 const UDP_HDR: usize = 8;
 
-const ETH_P_IP:   u16 = 0x0800;
+const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
-const PROTO_UDP:   u8 = 17;
-
+const PROTO_UDP: u8 = 17;
 
 /// Load the XDP program onto `iface`, open one AF_XDP socket per RX queue,
 /// and spawn a dedicated OS thread for each.  Returns `Ok(Some(handle))` when
@@ -66,17 +64,17 @@ const PROTO_UDP:   u8 = 17;
 /// is unreachable after XDP bricks the network and rescue-mode boot is needed.
 #[allow(clippy::too_many_arguments)]
 pub fn start_xdp(
-    iface:           &str,
-    zones:           Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter:    Arc<RateLimiter>,
-    acl:             Arc<Acl>,
-    cpu_governor:    bool,
-    irq_affinity:    bool,
-    hugepages:       bool,
-    cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
-    domain_routing:  bool,
-    ring_size:       Option<u32>,
-    xdp_ring_sizes:  XdpRingSizes,
+    iface: &str,
+    zones: Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter: Arc<RateLimiter>,
+    acl: Arc<Acl>,
+    cpu_governor: bool,
+    irq_affinity: bool,
+    hugepages: bool,
+    cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
+    domain_routing: bool,
+    ring_size: Option<u32>,
+    xdp_ring_sizes: XdpRingSizes,
 ) -> Result<Option<XdpHandle>, String> {
     if std::env::var("RUNBOUND_DISABLE_XDP").is_ok() {
         tracing::info!("XDP disabled via RUNBOUND_DISABLE_XDP environment variable");
@@ -89,7 +87,19 @@ pub fn start_xdp(
                     virt = %iface, parent = %parent,
                     "XDP: virtual interface detected — retrying on parent"
                 );
-                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot, domain_routing, ring_size, xdp_ring_sizes);
+                let result = start_xdp_on_iface(
+                    parent,
+                    zones,
+                    rate_limiter,
+                    acl,
+                    cpu_governor,
+                    irq_affinity,
+                    hugepages,
+                    cache_snapshot,
+                    domain_routing,
+                    ring_size,
+                    xdp_ring_sizes,
+                );
                 if result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
                     tracing::info!(parent = %parent, "XDP active on parent interface");
                 }
@@ -105,25 +115,36 @@ pub fn start_xdp(
             }
         }
     }
-    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot, domain_routing, ring_size, xdp_ring_sizes)
+    start_xdp_on_iface(
+        iface,
+        zones,
+        rate_limiter,
+        acl,
+        cpu_governor,
+        irq_affinity,
+        hugepages,
+        cache_snapshot,
+        domain_routing,
+        ring_size,
+        xdp_ring_sizes,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn start_xdp_on_iface(
-    iface:           &str,
-    zones:           Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter:    Arc<RateLimiter>,
-    acl:             Arc<Acl>,
-    cpu_governor:    bool,
-    irq_affinity:    bool,
-    hugepages:       bool,
-    cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
-    domain_routing:  bool,
-    ring_size:       Option<u32>,
-    xdp_ring_sizes:  XdpRingSizes,
+    iface: &str,
+    zones: Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter: Arc<RateLimiter>,
+    acl: Arc<Acl>,
+    cpu_governor: bool,
+    irq_affinity: bool,
+    hugepages: bool,
+    cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
+    domain_routing: bool,
+    ring_size: Option<u32>,
+    xdp_ring_sizes: XdpRingSizes,
 ) -> Result<Option<XdpHandle>, String> {
-    let ifidx = iface_index(iface)
-        .ok_or_else(|| format!("interface {iface} not found"))?;
+    let ifidx = iface_index(iface).ok_or_else(|| format!("interface {iface} not found"))?;
 
     // #80: maximize NIC ring buffers before attaching XDP to prevent hardware
     // FIFO overflow at ≥10M QPS. Silent fallback on EOPNOTSUPP / EPERM.
@@ -205,11 +226,15 @@ fn start_xdp_on_iface(
     // #68: build queue→core map for IRQ affinity pinning after thread spawn.
     let mut queue_to_core: Vec<(u32, usize)> = Vec::with_capacity(sockets.len());
     for (q, sock) in sockets {
-        let z       = Arc::clone(&zones);
-        let rl      = Arc::clone(&rate_limiter);
-        let acl     = Arc::clone(&acl);
-        let cs      = cache_snapshot.clone();
-        let core_id = if cores.is_empty() { 0 } else { cores[q as usize % cores.len()] };
+        let z = Arc::clone(&zones);
+        let rl = Arc::clone(&rate_limiter);
+        let acl = Arc::clone(&acl);
+        let cs = cache_snapshot.clone();
+        let core_id = if cores.is_empty() {
+            0
+        } else {
+            cores[q as usize % cores.len()]
+        };
         queue_to_core.push((q, core_id));
         // #69: save original governor before the worker switches to "performance"
         if cpu_governor {
@@ -238,7 +263,7 @@ fn start_xdp_on_iface(
 /// 200 ms deadline expires without loopback (expected in SKB mode / VM envs).
 /// Returns `Err` only if the fill ring was never seeded (UMEM misconfiguration).
 fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), String> {
-    use libc::{POLLIN, poll, pollfd};
+    use libc::{poll, pollfd, POLLIN};
 
     // Emergency bypass for validation/debugging environments where XDP traffic
     // cannot loop back (isolated VMs, CI, Proxmox virtio-net). Set
@@ -258,8 +283,8 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
 
     // S5: use the interface's own unicast MAC as dst to avoid ARP storms.
     // Fall back to broadcast only if the address cannot be read.
-    let dst_mac = super::socket::read_iface_mac(iface)
-        .unwrap_or([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    let dst_mac =
+        super::socket::read_iface_mac(iface).unwrap_or([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
 
     // Inject up to 3 synthetic DNS frames into the TX ring.
     let mut injected = 0u32;
@@ -272,7 +297,11 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
             if let Some(frame) = unsafe { sock.umem.frame_mut(tx_addr, FRAME_SIZE as usize) } {
                 let len = build_test_frame(frame, dst_mac);
                 if len > 0 {
-                    sock.tx.enqueue_tx(&[XdpDesc { addr: tx_addr, len: len as u32, options: 0 }]);
+                    sock.tx.enqueue_tx(&[XdpDesc {
+                        addr: tx_addr,
+                        len: len as u32,
+                        options: 0,
+                    }]);
                     injected += 1;
                 } else {
                     sock.umem.tx_free.push_back(tx_addr);
@@ -288,8 +317,14 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
         //         Passing null pointers with length 0 and MSG_DONTWAIT is the
         //         documented way to kick the TX driver without sending data.
         unsafe {
-            libc::sendto(sock.fd, std::ptr::null(), 0, libc::MSG_DONTWAIT,
-                         std::ptr::null(), 0);
+            libc::sendto(
+                sock.fd,
+                std::ptr::null(),
+                0,
+                libc::MSG_DONTWAIT,
+                std::ptr::null(),
+                0,
+            );
         }
     }
     // If TX pool was exhausted we can't inject — skip loopback check.
@@ -302,8 +337,14 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
     let mut rx_descs: Vec<XdpDesc> = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() { break; }
-        let mut pfd = pollfd { fd: sock.fd, events: POLLIN, revents: 0 };
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pfd = pollfd {
+            fd: sock.fd,
+            events: POLLIN,
+            revents: 0,
+        };
         let timeout_ms = (remaining.as_millis() as i32).clamp(1, 20);
         // SAFETY: `&mut pfd` is a valid pointer to a single `pollfd` struct.
         //         nfds=1 matches the array length. `timeout_ms` is a valid
@@ -318,7 +359,9 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
                 return Ok(());
             }
         }
-        if ret < 0 { break; }
+        if ret < 0 {
+            break;
+        }
     }
     // No loopback frames received in 200 ms.
     // In SKB mode (virtio-net, KVM/Proxmox with MTU > 3506), AF_XDP TX frames
@@ -340,15 +383,16 @@ fn xdp_fill_ring_self_test(iface: &str, sock: &mut XskSocket) -> Result<(), Stri
 fn build_test_frame(buf: &mut [u8], dst_mac: [u8; 6]) -> usize {
     // DNS query: A record for "xdp.test." (ID=0xDEAD)
     const DNS: &[u8] = &[
-        0xDE, 0xAD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        3, b'x', b'd', b'p', 4, b't', b'e', b's', b't', 0,
-        0x00, 0x01, 0x00, 0x01,
+        0xDE, 0xAD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 3, b'x', b'd',
+        b'p', 4, b't', b'e', b's', b't', 0, 0x00, 0x01, 0x00, 0x01,
     ];
     const ETH: usize = 14;
-    const IP:  usize = 20;
+    const IP: usize = 20;
     const UDP: usize = 8;
     let total = ETH + IP + UDP + DNS.len();
-    if buf.len() < total { return 0; }
+    if buf.len() < total {
+        return 0;
+    }
 
     // Ethernet: unicast dst (interface's own MAC), fake src, EtherType=IPv4
     buf[0..6].copy_from_slice(&dst_mac);
@@ -357,13 +401,13 @@ fn build_test_frame(buf: &mut [u8], dst_mac: [u8; 6]) -> usize {
 
     // IPv4: src=192.0.2.1, dst=192.0.2.2, proto=UDP
     let ip_total = (IP + UDP + DNS.len()) as u16;
-    buf[ETH]     = 0x45; // version=4, IHL=5
+    buf[ETH] = 0x45; // version=4, IHL=5
     buf[ETH + 1] = 0;
     buf[ETH + 2..ETH + 4].copy_from_slice(&ip_total.to_be_bytes());
     buf[ETH + 4..ETH + 6].copy_from_slice(&[0xDE, 0xAD]); // ID
     buf[ETH + 6..ETH + 8].copy_from_slice(&[0x40, 0x00]); // DF
-    buf[ETH + 8]  = 64; // TTL
-    buf[ETH + 9]  = 17; // UDP
+    buf[ETH + 8] = 64; // TTL
+    buf[ETH + 9] = 17; // UDP
     buf[ETH + 10..ETH + 12].fill(0); // checksum placeholder
     buf[ETH + 12..ETH + 16].copy_from_slice(&[192, 0, 2, 1]); // src
     buf[ETH + 16..ETH + 20].copy_from_slice(&[192, 0, 2, 2]); // dst
@@ -385,14 +429,14 @@ fn build_test_frame(buf: &mut [u8], dst_mac: [u8; 6]) -> usize {
 /// Poll loop for one NIC queue. Runs until the socket fd is closed.
 #[allow(clippy::too_many_arguments)]
 fn xdp_worker(
-    mut sock:        XskSocket,
-    zones:           Arc<ArcSwap<LocalZoneSet>>,
-    rate_limiter:    Arc<RateLimiter>,
-    acl:             Arc<Acl>,
-    core_id:         usize,
-    cpu_governor:    bool,
-    cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
-    worker_id:       usize,
+    mut sock: XskSocket,
+    zones: Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter: Arc<RateLimiter>,
+    acl: Arc<Acl>,
+    core_id: usize,
+    cpu_governor: bool,
+    cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
+    worker_id: usize,
 ) {
     use libc::{poll, pollfd, POLLIN};
 
@@ -408,19 +452,25 @@ fn xdp_worker(
     // Pre-allocate scratch buffers outside the hot loop to avoid per-batch
     // heap allocations.  Each Vec retains its capacity across iterations;
     // clear() resets length without releasing memory.
-    let mut rxds:       Vec<XdpDesc> = Vec::with_capacity(sock.rx.size as usize);
-    let mut tx_descs:   Vec<XdpDesc> = Vec::with_capacity(sock.rx.size as usize);
-    let mut rx_addrs:   Vec<u64>     = Vec::with_capacity(sock.rx.size as usize);
-    let mut dns_scratch: Vec<u8>     = Vec::with_capacity(512);
+    let mut rxds: Vec<XdpDesc> = Vec::with_capacity(sock.rx.size as usize);
+    let mut tx_descs: Vec<XdpDesc> = Vec::with_capacity(sock.rx.size as usize);
+    let mut rx_addrs: Vec<u64> = Vec::with_capacity(sock.rx.size as usize);
+    let mut dns_scratch: Vec<u8> = Vec::with_capacity(512);
 
     loop {
         sock.umem.reclaim_tx();
 
-        let mut pfd = pollfd { fd: sock.fd, events: POLLIN, revents: 0 };
+        let mut pfd = pollfd {
+            fd: sock.fd,
+            events: POLLIN,
+            revents: 0,
+        };
         // SAFETY: `&mut pfd` is a valid pointer to a single `pollfd`.
         //         nfds=1 matches the array length. timeout=1 ms is a valid
         //         non-negative timeout.
-        let ret = unsafe { poll(&mut pfd, 1, 1 /* ms timeout */) };
+        let ret = unsafe {
+            poll(&mut pfd, 1, 1 /* ms timeout */)
+        };
         if ret < 0 {
             break;
         }
@@ -510,7 +560,15 @@ fn xdp_worker(
                 }
 
                 dns_scratch.clear();
-                match process_packet(rx_frame, tx_frame, &snapshot, &acl, src_ip, &mut dns_scratch, cache_arc.as_deref()) {
+                match process_packet(
+                    rx_frame,
+                    tx_frame,
+                    &snapshot,
+                    &acl,
+                    src_ip,
+                    &mut dns_scratch,
+                    cache_arc.as_deref(),
+                ) {
                     Some(tx_len) => {
                         // Track per-worker packet distribution (#67)
                         if worker_id < crate::dns::cache_snapshot::XDP_WORKER_PKTS.len() {
@@ -519,7 +577,7 @@ fn xdp_worker(
                         }
                         tx_descs.push(XdpDesc {
                             addr: tx_addr,
-                            len:  tx_len as u32,
+                            len: tx_len as u32,
                             options: 0,
                         });
                     }
@@ -560,16 +618,22 @@ fn xdp_worker(
 /// Returns None for non-IP frames or frames that are too short.
 #[inline]
 fn extract_src_ip(rx: &[u8]) -> Option<IpAddr> {
-    if rx.len() < ETH_HDR { return None; }
+    if rx.len() < ETH_HDR {
+        return None;
+    }
     let ethertype = u16::from_be_bytes([rx[12], rx[13]]);
     match ethertype {
         ETH_P_IP => {
-            if rx.len() < ETH_HDR + 20 { return None; }
+            if rx.len() < ETH_HDR + 20 {
+                return None;
+            }
             let src: [u8; 4] = rx[ETH_HDR + 12..ETH_HDR + 16].try_into().ok()?;
             Some(IpAddr::V4(std::net::Ipv4Addr::from(src)))
         }
         ETH_P_IPV6 => {
-            if rx.len() < ETH_HDR + 40 { return None; }
+            if rx.len() < ETH_HDR + 40 {
+                return None;
+            }
             let src: [u8; 16] = rx[ETH_HDR + 8..ETH_HDR + 24].try_into().ok()?;
             Some(IpAddr::V6(std::net::Ipv6Addr::from(src)))
         }
@@ -585,45 +649,69 @@ fn extract_src_ip(rx: &[u8]) -> Option<IpAddr> {
 /// for DNS response serialisation.  Passing a pre-allocated Vec avoids a heap
 /// allocation on every packet.
 fn process_packet(
-    rx:          &[u8],
-    tx:          &mut [u8],
-    zones:       &LocalZoneSet,
-    acl:         &Acl,
-    src_ip:      Option<IpAddr>,
+    rx: &[u8],
+    tx: &mut [u8],
+    zones: &LocalZoneSet,
+    acl: &Acl,
+    src_ip: Option<IpAddr>,
     dns_scratch: &mut Vec<u8>,
-    cache_snap:  Option<&crate::dns::cache_snapshot::CacheSnapshot>,
+    cache_snap: Option<&crate::dns::cache_snapshot::CacheSnapshot>,
 ) -> Option<usize> {
     // ── Ethernet ─────────────────────────────────────────────────────────────
-    if rx.len() < ETH_HDR { return None; }
+    if rx.len() < ETH_HDR {
+        return None;
+    }
     let ethertype = u16::from_be_bytes([rx[12], rx[13]]);
 
     let (ip_off, is_v6) = match ethertype {
-        ETH_P_IP   => (ETH_HDR, false),
+        ETH_P_IP => (ETH_HDR, false),
         ETH_P_IPV6 => (ETH_HDR, true),
-        _          => return None,
+        _ => return None,
     };
 
     // ── IP ───────────────────────────────────────────────────────────────────
     let (udp_off, ip_hdr_len, src_ip_off, dst_ip_off, ip_len_off) = if !is_v6 {
-        if rx.len() < ip_off + IPV4_HDR_MIN { return None; }
-        if rx[ip_off + 9] != PROTO_UDP { return None; }
+        if rx.len() < ip_off + IPV4_HDR_MIN {
+            return None;
+        }
+        if rx[ip_off + 9] != PROTO_UDP {
+            return None;
+        }
         let ihl = (rx[ip_off] & 0x0F) as usize * 4;
-        if !(20..=60).contains(&ihl) { return None; }
+        if !(20..=60).contains(&ihl) {
+            return None;
+        }
         (ip_off + ihl, ihl, ip_off + 12, ip_off + 16, ip_off + 2)
     } else {
-        if rx.len() < ip_off + IPV6_HDR { return None; }
-        if rx[ip_off + 6] != PROTO_UDP { return None; }
-        (ip_off + IPV6_HDR, IPV6_HDR, ip_off + 8, ip_off + 24, ip_off + 4)
+        if rx.len() < ip_off + IPV6_HDR {
+            return None;
+        }
+        if rx[ip_off + 6] != PROTO_UDP {
+            return None;
+        }
+        (
+            ip_off + IPV6_HDR,
+            IPV6_HDR,
+            ip_off + 8,
+            ip_off + 24,
+            ip_off + 4,
+        )
     };
 
     // ── UDP ──────────────────────────────────────────────────────────────────
-    if rx.len() < udp_off + UDP_HDR { return None; }
-    let src_port = u16::from_be_bytes([rx[udp_off],     rx[udp_off + 1]]);
+    if rx.len() < udp_off + UDP_HDR {
+        return None;
+    }
+    let src_port = u16::from_be_bytes([rx[udp_off], rx[udp_off + 1]]);
     let dst_port = u16::from_be_bytes([rx[udp_off + 2], rx[udp_off + 3]]);
-    if dst_port != 53 { return None; }
+    if dst_port != 53 {
+        return None;
+    }
 
     let dns_off = udp_off + UDP_HDR;
-    if rx.len() <= dns_off { return None; }
+    if rx.len() <= dns_off {
+        return None;
+    }
     let dns_in = &rx[dns_off..];
 
     // ── DNS ──────────────────────────────────────────────────────────────────
@@ -636,7 +724,9 @@ fn process_packet(
     let dns_len = if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
         // Local zone hit — copy dns_scratch into tx first.
         let len = dns_scratch.len();
-        if dns_off + len > tx.len() { return None; }
+        if dns_off + len > tx.len() {
+            return None;
+        }
         tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
         len
     } else if let Some(snap) = cache_snap {
@@ -651,7 +741,9 @@ fn process_packet(
 
     // ── Build reply frame ────────────────────────────────────────────────────
     let reply_len = dns_off + dns_len;
-    if reply_len > tx.len() { return None; }
+    if reply_len > tx.len() {
+        return None;
+    }
 
     // Ethernet: swap src ↔ dst MAC
     tx[0..6].copy_from_slice(&rx[6..12]);
@@ -723,15 +815,15 @@ fn process_packet(
 ///   Refuse → return None (let hickory send a proper REFUSED response).
 fn answer_from_cache(
     query_bytes: &[u8],
-    cache_snap:  &crate::dns::cache_snapshot::CacheSnapshot,
-    acl:         &Acl,
-    src_ip:      Option<IpAddr>,
-    tx_dns:      &mut [u8],
+    cache_snap: &crate::dns::cache_snapshot::CacheSnapshot,
+    acl: &Acl,
+    src_ip: Option<IpAddr>,
+    tx_dns: &mut [u8],
 ) -> Option<usize> {
     // ACL check first — denied clients must not receive cached data.
     if let Some(ip) = src_ip {
         match acl.check(ip) {
-            AclAction::Allow  => {}
+            AclAction::Allow => {}
             AclAction::Deny | AclAction::Refuse => return None,
         }
     }
@@ -739,17 +831,25 @@ fn answer_from_cache(
     // ── Zero-copy DNS header parse ────────────────────────────────────────
     // Header layout: ID(2) FLAGS(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
     // Minimum useful message: 12-byte header + 1-byte QNAME start.
-    if query_bytes.len() < 13 { return None; }
+    if query_bytes.len() < 13 {
+        return None;
+    }
 
     // QR bit (bit 15): 0 = query, 1 = response.
     // OPCODE (bits 14–11): 0 = standard query.
     let flags = u16::from_be_bytes([query_bytes[2], query_bytes[3]]);
-    if flags & 0x8000 != 0 { return None; } // response — skip
-    if flags & 0x7800 != 0 { return None; } // non-standard opcode
+    if flags & 0x8000 != 0 {
+        return None;
+    } // response — skip
+    if flags & 0x7800 != 0 {
+        return None;
+    } // non-standard opcode
 
     // Exactly one question section entry expected.
     let qdcount = u16::from_be_bytes([query_bytes[4], query_bytes[5]]);
-    if qdcount != 1 { return None; }
+    if qdcount != 1 {
+        return None;
+    }
 
     let qid = [query_bytes[0], query_bytes[1]];
 
@@ -775,7 +875,9 @@ fn answer_from_cache(
         }
         name_buf.push(query_bytes[pos]); // length byte — copy verbatim
         pos += 1;
-        if label_len == 0 { break; } // root label = QNAME end
+        if label_len == 0 {
+            break;
+        } // root label = QNAME end
         if pos + label_len > query_bytes.len() {
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -793,14 +895,20 @@ fn answer_from_cache(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
-    let qtype  = u16::from_be_bytes([query_bytes[pos],     query_bytes[pos + 1]]);
+    let qtype = u16::from_be_bytes([query_bytes[pos], query_bytes[pos + 1]]);
     let qclass = u16::from_be_bytes([query_bytes[pos + 2], query_bytes[pos + 3]]);
 
     // ANY queries are not cached (hickory returns NOTIMP per RFC 8482).
     const QTYPE_ANY: u16 = 255;
-    if qtype == QTYPE_ANY { return None; }
+    if qtype == QTYPE_ANY {
+        return None;
+    }
 
-    let key = crate::dns::cache_snapshot::QuestionKey { name: name_buf, qtype, qclass };
+    let key = crate::dns::cache_snapshot::QuestionKey {
+        name: name_buf,
+        qtype,
+        qclass,
+    };
 
     let now = std::time::Instant::now();
     if let Some(entry) = cache_snap.get(&key) {
@@ -830,17 +938,25 @@ fn answer_from_cache(
 #[cfg(test)]
 mod cache_tests {
     use super::*;
-    use std::time::{Duration, Instant};
-    use bytes::Bytes;
     use crate::dns::cache_snapshot::{CacheEntry, CacheSnapshot, QuestionKey};
+    use bytes::Bytes;
+    use std::time::{Duration, Instant};
 
     fn make_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
         // Build minimal DNS query wire bytes.
         let mut pkt = vec![
-            (id >> 8) as u8, id as u8, // ID
-            0x01, 0x00,                 // flags: RD=1, QR=0
-            0x00, 0x01,                 // QDCOUNT=1
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN/NS/AR = 0
+            (id >> 8) as u8,
+            id as u8, // ID
+            0x01,
+            0x00, // flags: RD=1, QR=0
+            0x00,
+            0x01, // QDCOUNT=1
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00, // AN/NS/AR = 0
         ];
         // Encode name as wire-format labels
         for label in name.trim_end_matches('.').split('.') {
@@ -849,7 +965,7 @@ mod cache_tests {
         }
         pkt.push(0x00); // root label
         pkt.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
-        pkt.extend_from_slice(&1u16.to_be_bytes());  // QCLASS = IN
+        pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
         pkt
     }
 
@@ -860,22 +976,45 @@ mod cache_tests {
             name_buf.extend_from_slice(label.to_ascii_lowercase().as_bytes());
         }
         name_buf.push(0); // root
-        QuestionKey { name: name_buf, qtype, qclass: 1 }
+        QuestionKey {
+            name: name_buf,
+            qtype,
+            qclass: 1,
+        }
     }
 
     fn make_wire_response(id: u16) -> Vec<u8> {
         // Minimal DNS response: id + flags=QR|AA + QDCOUNT=1 + ANCOUNT=1
         vec![
-            (id >> 8) as u8, id as u8,
-            0x84, 0x00, // QR=1 AA=1 NOERROR
-            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            (id >> 8) as u8,
+            id as u8,
+            0x84,
+            0x00, // QR=1 AA=1 NOERROR
+            0x00,
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
             // minimal payload to pass length check
         ]
     }
 
-    fn make_snap_with_entry(key: QuestionKey, payload: Vec<u8>, expires_at: Instant) -> CacheSnapshot {
+    fn make_snap_with_entry(
+        key: QuestionKey,
+        payload: Vec<u8>,
+        expires_at: Instant,
+    ) -> CacheSnapshot {
         let mut snap = CacheSnapshot::default();
-        snap.insert(key, CacheEntry { wire_payload: Bytes::from(payload), expires_at });
+        snap.insert(
+            key,
+            CacheEntry {
+                wire_payload: Bytes::from(payload),
+                expires_at,
+            },
+        );
         snap
     }
 
@@ -885,11 +1024,7 @@ mod cache_tests {
         // Store with QID=0
         let mut stored = make_wire_response(0);
         stored.extend_from_slice(&[0u8; 4]); // padding so len > 2
-        let snap = make_snap_with_entry(
-            key,
-            stored,
-            Instant::now() + Duration::from_secs(300),
-        );
+        let snap = make_snap_with_entry(key, stored, Instant::now() + Duration::from_secs(300));
         let acl = crate::dns::acl::Acl::from_config(&[]);
         let query = make_query(0xBEEF, "example.com", 1);
         let mut tx_dns = vec![0u8; 512];
@@ -942,7 +1077,10 @@ mod cache_tests {
         let query = make_query(1, "example.com", 255); // QTYPE=ANY
         let mut tx_dns = vec![0u8; 512];
         let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
-        assert!(result.is_none(), "ANY queries must not be served from cache");
+        assert!(
+            result.is_none(),
+            "ANY queries must not be served from cache"
+        );
     }
 }
 
@@ -956,21 +1094,25 @@ mod cache_tests {
 ///   Refuse → craft a REFUSED response and return true so the TX path sends it.
 fn answer_dns(
     query_bytes: &[u8],
-    zones:       &LocalZoneSet,
-    acl:         &Acl,
-    src_ip:      Option<IpAddr>,
-    out:         &mut Vec<u8>,
+    zones: &LocalZoneSet,
+    acl: &Acl,
+    src_ip: Option<IpAddr>,
+    out: &mut Vec<u8>,
 ) -> bool {
     let msg = match Message::from_bytes(query_bytes) {
         Ok(m) => m,
         Err(_) => return false,
     };
-    if msg.message_type != MessageType::Query { return false; }
-    if msg.op_code != OpCode::Query { return false; }
+    if msg.message_type != MessageType::Query {
+        return false;
+    }
+    if msg.op_code != OpCode::Query {
+        return false;
+    }
 
     let q = match msg.queries.first() {
         Some(q) => q,
-        None    => return false,
+        None => return false,
     };
 
     // ── ACL check ─────────────────────────────────────────────────────────
@@ -978,8 +1120,8 @@ fn answer_dns(
     // local zone membership even in the XDP fast path.
     if let Some(ip) = src_ip {
         match acl.check(ip) {
-            AclAction::Allow  => {}
-            AclAction::Deny   => return false, // silent drop — no response
+            AclAction::Allow => {}
+            AclAction::Deny => return false, // silent drop — no response
             AclAction::Refuse => {
                 // Craft a minimal REFUSED response and send it.
                 let mut refused = Message::new(msg.id, MessageType::Response, OpCode::Query);
@@ -992,11 +1134,13 @@ fn answer_dns(
         }
     }
 
-    let name  = LowerName::from(q.name());
+    let name = LowerName::from(q.name());
     let rtype = q.query_type();
 
     // ANY queries go to the normal server (which returns NOTIMP per RFC 8482)
-    if rtype == hickory_proto::rr::RecordType::ANY { return false; }
+    if rtype == hickory_proto::rr::RecordType::ANY {
+        return false;
+    }
 
     let mut resp = Message::new(msg.id, MessageType::Response, OpCode::Query);
     resp.metadata.recursion_desired = msg.recursion_desired;
@@ -1046,9 +1190,9 @@ fn ones_complement_sum(data: &[u8]) -> u64 {
     let mut chunks = data.chunks_exact(8);
     for chunk in chunks.by_ref() {
         acc += u16::from_be_bytes([chunk[0], chunk[1]]) as u64
-             + u16::from_be_bytes([chunk[2], chunk[3]]) as u64
-             + u16::from_be_bytes([chunk[4], chunk[5]]) as u64
-             + u16::from_be_bytes([chunk[6], chunk[7]]) as u64;
+            + u16::from_be_bytes([chunk[2], chunk[3]]) as u64
+            + u16::from_be_bytes([chunk[4], chunk[5]]) as u64
+            + u16::from_be_bytes([chunk[6], chunk[7]]) as u64;
     }
     let rem = chunks.remainder();
     let mut i = 0;
@@ -1067,7 +1211,11 @@ fn fold_checksum(mut s: u64) -> u16 {
         s = (s & 0xFFFF) + (s >> 16);
     }
     let r = !(s as u16);
-    if r == 0 { 0xFFFF } else { r } // RFC 768: 0 is transmitted as all-ones
+    if r == 0 {
+        0xFFFF
+    } else {
+        r
+    } // RFC 768: 0 is transmitted as all-ones
 }
 
 fn ipv4_checksum(header: &[u8]) -> u16 {
@@ -1077,10 +1225,10 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 fn udp_checksum_v4(src: &[u8; 4], dst: &[u8; 4], udp: &[u8]) -> u16 {
     let udp_len = udp.len() as u64;
     let s = ones_complement_sum(src)
-          + ones_complement_sum(dst)
-          + PROTO_UDP as u64
-          + udp_len
-          + ones_complement_sum(udp);
+        + ones_complement_sum(dst)
+        + PROTO_UDP as u64
+        + udp_len
+        + ones_complement_sum(udp);
     fold_checksum(s)
 }
 
@@ -1089,10 +1237,10 @@ fn udp_checksum_v6(src: &[u8; 16], dst: &[u8; 16], udp: &[u8]) -> u16 {
     let udp_len = udp.len() as u32;
     let udp_len_bytes = udp_len.to_be_bytes();
     let s = ones_complement_sum(src)
-          + ones_complement_sum(dst)
-          + ones_complement_sum(&udp_len_bytes)
-          + PROTO_UDP as u64
-          + ones_complement_sum(udp);
+        + ones_complement_sum(dst)
+        + ones_complement_sum(&udp_len_bytes)
+        + PROTO_UDP as u64
+        + ones_complement_sum(udp);
     fold_checksum(s)
 }
 
@@ -1119,21 +1267,41 @@ mod tests {
 
         // 64-byte payload (8 full chunks, no remainder)
         let data64: Vec<u8> = (0u8..64).collect();
-        assert_eq!(ones_complement_sum(&data64), reference_sum(&data64), "64-byte payload");
+        assert_eq!(
+            ones_complement_sum(&data64),
+            reference_sum(&data64),
+            "64-byte payload"
+        );
 
         // 65-byte payload (8 full chunks + 1 odd byte)
         let data65: Vec<u8> = (0u8..65).collect();
-        assert_eq!(ones_complement_sum(&data65), reference_sum(&data65), "65-byte payload");
+        assert_eq!(
+            ones_complement_sum(&data65),
+            reference_sum(&data65),
+            "65-byte payload"
+        );
 
         // 6-byte payload (no full 8-byte chunk, pure remainder path)
         let data6 = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        assert_eq!(ones_complement_sum(&data6), reference_sum(&data6), "6-byte payload");
+        assert_eq!(
+            ones_complement_sum(&data6),
+            reference_sum(&data6),
+            "6-byte payload"
+        );
 
         // 1-byte payload (odd byte only)
         let data1 = [0x42u8];
-        assert_eq!(ones_complement_sum(&data1), reference_sum(&data1), "1-byte payload");
+        assert_eq!(
+            ones_complement_sum(&data1),
+            reference_sum(&data1),
+            "1-byte payload"
+        );
 
         // Empty payload
-        assert_eq!(ones_complement_sum(&[]), reference_sum(&[]), "empty payload");
+        assert_eq!(
+            ones_complement_sum(&[]),
+            reference_sum(&[]),
+            "empty payload"
+        );
     }
 }
