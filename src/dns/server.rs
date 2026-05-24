@@ -164,6 +164,16 @@ pub struct RunboundHandler {
     resolv_fallback: bool,
     /// #94: true while resolv.conf fallback is active.
     pub fallback_active: Arc<std::sync::atomic::AtomicBool>,
+    /// #108: serve-stale cache — stores last successful records per (name, qtype).
+    stale_cache: Option<Arc<dashmap::DashMap<(hickory_proto::rr::LowerName, hickory_proto::rr::RecordType), (Vec<hickory_proto::rr::Record>, std::time::Instant), ahash::RandomState>>>,
+    /// #108: TTL to advertise for stale answers (seconds).
+    stale_answer_ttl: u32,
+    /// #108: max age of a stale entry (seconds).
+    stale_max_age: u64,
+    /// #14: allow DNS UPDATE (RFC 2136). False = refuse all UPDATE messages.
+    allow_update: bool,
+    /// #14: TSIG keys for DNS UPDATE authentication: (name, algorithm, base64-secret).
+    tsig_keys: Vec<(String, String, String)>,
 }
 
 impl RunboundHandler {
@@ -191,6 +201,11 @@ impl RunboundHandler {
         resolv_fallback: bool,
         fallback_active: Arc<std::sync::atomic::AtomicBool>,
         domain_stats: Arc<crate::domain_stats::DomainStats>,
+        serve_stale: bool,
+        stale_answer_ttl: u32,
+        stale_max_age: u64,
+        allow_update: bool,
+        tsig_keys: Vec<(String, String, String)>,
     ) -> Self {
         Self {
             zones,
@@ -214,6 +229,15 @@ impl RunboundHandler {
             domain_stats,
             resolv_fallback,
             fallback_active,
+            stale_cache: if serve_stale {
+                Some(Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default())))
+            } else {
+                None
+            },
+            stale_answer_ttl,
+            stale_max_age,
+            allow_update,
+            tsig_keys,
         }
     }
 
@@ -675,6 +699,14 @@ impl RunboundHandler {
                     }
                 }
 
+                // #108: Update stale cache with fresh records.
+                if let Some(ref sc) = self.stale_cache {
+                    if !records.is_empty() {
+                        let stale_key = (qname.clone(), qtype);
+                        sc.insert(stale_key, (records.to_vec(), std::time::Instant::now()));
+                    }
+                }
+
                 // Prefetch: count forwarded queries so hot domains can be refreshed before expiry.
                 if let Some(ref tracker) = self.prefetch_tracker {
                     tracker.increment(&qname.to_string());
@@ -754,6 +786,33 @@ impl RunboundHandler {
                     }
                     _ => LogAction::Servfail,
                 };
+                // #108: serve-stale — if SERVFAIL and we have a cached entry, serve it.
+                if rcode == ResponseCode::ServFail {
+                    if let Some(ref sc) = self.stale_cache {
+                        let stale_key = (qname.clone(), qtype);
+                        if let Some(entry) = sc.get(&stale_key) {
+                            let (ref stale_records, stored_at) = *entry;
+                            let age = stored_at.elapsed().as_secs();
+                            if age <= self.stale_max_age && !stale_records.is_empty() {
+                                let stale_ttl = self.stale_answer_ttl;
+                                let capped: Vec<hickory_proto::rr::Record> = stale_records
+                                    .iter()
+                                    .map(|r| { let mut rc = r.clone(); rc.ttl = stale_ttl; rc })
+                                    .collect();
+                                drop(entry);
+                                info!(name=%sanitize_dns_name(qname), age_secs=age, ttl=stale_ttl, "serve-stale");
+                                self.stats.inc_stale_served();
+                                self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Cached, start);
+                                let mut metadata = Metadata::response_from_request(&request.metadata);
+                                metadata.recursion_available = true;
+                                let builder = MessageResponseBuilder::from_message_request(request);
+                                let response = builder.build(metadata, capped.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
+                                return response_handle.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
+                            }
+                        }
+                    }
+                }
+
                 self.record_query(client_ip, qname, qtype, rcode, err_action, start);
                 send_error(request, response_handle, rcode).await
             }
@@ -781,6 +840,21 @@ impl RequestHandler for RunboundHandler {
 
         self.stats.inc_total();
         self.domain_stats.inc(&qname.to_string());
+
+        // ── 0a. RFC 2136 DNS UPDATE dispatch ────────────────────────────
+        if request.metadata.op_code == OpCode::Update {
+            if !self.allow_update {
+                debug!(%client_ip, "DNS UPDATE refused — allow-update: no");
+                return send_error(request, response_handle, ResponseCode::Refused).await;
+            }
+            return super::ddns::handle_update(
+                request,
+                response_handle,
+                &self.zones,
+                &self.tsig_keys,
+                client_ip,
+            ).await;
+        }
 
         // ── 0. Access-control list ──────────────────────────────────────
         match self.acl.check(client_ip) {
@@ -1955,6 +2029,11 @@ pub async fn run_dns_server(
         cfg.resolv_fallback,
         fallback_active,
         domain_stats,
+        cfg.serve_stale,
+        cfg.stale_answer_ttl,
+        cfg.stale_max_age,
+        cfg.allow_update,
+        cfg.tsig_keys.clone(),
     );
     let mut server = Server::new(handler);
 

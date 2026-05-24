@@ -77,6 +77,10 @@ pub struct UpstreamStatus {
     /// Omitted from JSON when None; not persisted (runtime only).
     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing, default)]
     pub dnssec_supported: Option<bool>,
+    /// #34: true when upstream previously had DNSSEC (AD bit) but now no longer does.
+    /// Indicates active DNSSEC stripping. Cleared when DNSSEC support is restored.
+    #[serde(skip_deserializing, default)]
+    pub dnssec_stripping: bool,
     /// #49: rolling buffer of the last 5 latency measurements (ms).
     /// Not persisted; serialised as a JSON array.
     #[serde(
@@ -256,6 +260,7 @@ pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
             latency_ms: None,
             last_check: String::new(),
             dnssec_supported: None,
+            dnssec_stripping: false,
             latency_history: VecDeque::new(),
             last_error: None,
             temporary: false,
@@ -309,6 +314,7 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
                 latency_ms: None,
                 last_check: String::new(),
                 dnssec_supported: None,
+                dnssec_stripping: false,
                 latency_history: VecDeque::new(),
                 last_error: None,
                 temporary: false,
@@ -356,6 +362,7 @@ pub fn add_upstream(
         latency_ms: None,
         last_check: String::new(),
         dnssec_supported: None,
+        dnssec_stripping: false,
         latency_history: VecDeque::new(),
         last_error: None,
         zone: ".".into(),
@@ -470,6 +477,7 @@ pub fn add_resolv_fallback(upstreams: &SharedUpstreams) {
             latency_ms: None,
             last_check: String::new(),
             dnssec_supported: None,
+            dnssec_stripping: false,
             latency_history: VecDeque::new(),
             last_error: None,
             temporary: true,
@@ -616,8 +624,15 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 if let Some(lat) = latency_ms {
                     push_latency(&mut s.latency_history, lat);
                 }
-                // #48: update DNSSEC detection result
+                // #48/#34: update DNSSEC detection; detect stripping transition
+                let was_dnssec = s.dnssec_supported;
                 s.dnssec_supported = dnssec_supported;
+                if was_dnssec == Some(true) && dnssec_supported == Some(false) {
+                    s.dnssec_stripping = true;
+                    warn!(upstream = %s.addr, "DNSSEC stripping detected — upstream no longer sets AD bit");
+                } else if dnssec_supported == Some(true) {
+                    s.dnssec_stripping = false;
+                }
                 // #53: clear last_error on success
                 s.last_error = None;
             } else {
