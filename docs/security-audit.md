@@ -264,7 +264,7 @@ Potential vector: A malformed DNS packet reaches the XDP worker. Protection is i
 - **Source:** [AI-INTERNAL]
 - **File:** src/config/ (configuration default)
 - **Discovered:** v0.6.9
-- **Status:** ⚠️ Enable in production
+- **Status:** Open — targeted v1.0 (operator configuration; no default-safe option without breaking forwarder use-case)
 - **Threat model:** Compromised upstream DNS resolver or on-path attacker returning spoofed DNS records with the AD bit set; Runbound in forwarder mode trusts the upstream AD bit without local validation
 - **Description:** In forwarder mode (default), Runbound trusts the upstream resolver's DNSSEC validation via the AD bit in responses. An attacker controlling the upstream (via cache poisoning or BGP hijack) can return spoofed records with AD=1, which Runbound forwards to clients without independent DNSSEC signature verification against the root trust anchor.
 - **Exploit path:** 1. Attacker poisons upstream recursive resolver cache for target.example.com; 2. Upstream returns spoofed A record 1.2.3.4 with AD=1; 3. Runbound forwards to client without re-validating signatures; 4. Client resolves to attacker-controlled IP; mitigated by enabling local DNSSEC validation
@@ -341,7 +341,7 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 - **Source:** [AI-INTERNAL]
 - **File:** [VERIFY — systemd unit file location not confirmed in this audit cycle]
 - **Discovered:** v0.6.9
-- **Status:** ⚠️ Delegate to systemd
+- **Status:** Open — targeted v1.0 (systemd unit hardening; deployment-time configuration item)
 - **Threat model:** Remote attacker achieving code execution via a vulnerability in DNS packet processing; current root execution provides full system compromise upon exploitation
 - **Description:** Runbound must run as root to bind UDP/53, load eBPF programs (CAP_BPF, CAP_NET_ADMIN), and manipulate network interfaces. No internal privilege dropping occurs after initialization. If an attacker achieves code execution via a future DNS processing vulnerability, they obtain root. Delegating privilege restriction to systemd sandboxing limits the blast radius without changing runtime capabilities.
 - **Exploit path:** Theoretical — 1. Attacker sends crafted DNS packet exploiting a memory safety bug in the XDP worker or hickory DNS parser; 2. Code execution achieved in Runbound process context; 3. Process runs as root → full system compromise; with systemd hardening applied: step 3 is limited to User=runbound capabilities, significantly reducing blast radius
