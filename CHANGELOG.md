@@ -9,6 +9,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.1] — 2026-05-24
+
+### Added
+- **XDP ICMP echo responder (#89)** (`ebpf/dns_xdp.c`, `src/icmp.rs`, `src/dns/xdp/loader.rs`)
+  Runbound now responds to ICMP echo requests at the XDP driver layer — zero kernel-
+  stack overhead. Per-source-IP token bucket rate limiting (configurable pps and burst)
+  drops excess pings with a BPF counter increment, no reply generated.
+
+  Configure via `runbound.conf`:
+  ```
+  icmp {
+      enable: yes
+      rate-limit: 20        # pings/s per source IP (default: 10)
+      rate-limit-burst: 8   # burst capacity (default: 5)
+  }
+  ```
+
+  Live config updates: `PUT /api/icmp/config` — applied to BPF within 1 second.
+  Stats: `GET /api/icmp/stats` returns `handled`, `replied`, `dropped`, `rate_limited`
+  counters from BPF per-CPU arrays (PR #122).
+
+---
+
 ## [0.9.0] — 2026-05-24
 
 ### Added
