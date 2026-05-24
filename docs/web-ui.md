@@ -26,9 +26,35 @@ that sends `POST /reload` to apply config changes without restarting the service
 
 ## Serving the dashboard
 
-The Runbound API only listens on `127.0.0.1` (localhost). To reach it from a browser
-on another machine you need a small reverse proxy in front — nginx is the recommended
-option because it also serves the static file on the same origin (no CORS issues).
+Choose one of two approaches:
+
+### Option A — Embedded server (recommended)
+
+Add these lines inside the `server:` section of your `runbound.conf`:
+
+```
+server:
+    ui-enabled: yes
+    ui-port:    8090
+    # ui-bind:  0.0.0.0   # default — all interfaces
+```
+
+Restart the service (`sudo systemctl restart runbound`). The dashboard is then
+available at `http://<server-ip>:8090`.
+
+The embedded server binds on the specified port, serves the dashboard, and
+transparently proxies every `/api/*` request to `http://127.0.0.1:<api-port>` —
+the REST API stays localhost-only. No nginx, no extra packages.
+
+> **First connection:** Open `http://<server-ip>:8090`, enter your API key
+> (find it with `sudo grep RUNBOUND_API_KEY /etc/runbound/environment`), and click
+> **Connect**. The key is saved in `localStorage` automatically.
+
+---
+
+### Option B — nginx reverse proxy
+
+Use nginx if you need HTTPS/TLS termination or already run nginx on the server.
 
 ### 1. Install nginx
 
@@ -90,9 +116,10 @@ the dashboard forwards your API Bearer token with every request.
 
 ## First connection
 
-Open `http://<server-ip>:8090` in your browser.
+Open `http://<server-ip>:8090` in your browser (or the port you configured).
 
-- **API URL** is pre-filled to `/api` (the nginx proxy path) — leave it as-is.
+- **API URL** is pre-filled to `/api` — leave it as-is for both the embedded server
+  and the nginx proxy setup.
 - **API key** — find it in `/etc/runbound/environment`:
 
   ```bash
