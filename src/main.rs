@@ -18,6 +18,7 @@ mod stats;
 mod store;
 mod sync;
 mod upstreams;
+mod webui;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -943,6 +944,34 @@ async fn build_and_launch(
         axum::serve(listener, app).await.ok()
     });
     Box::leak(Box::new(api_rt));
+
+    // ── Embedded web UI server (#4/#91) ───────────────────────────────────────
+    if cfg.ui_enabled {
+        let ui_addr = format!("{}:{}", cfg.ui_bind, cfg.ui_port);
+        match std::net::TcpListener::bind(&ui_addr) {
+            Err(e) => {
+                error!(addr=%ui_addr, err=%e, "Web UI bind failed — continuing without UI");
+            }
+            Ok(ui_std_listener) => {
+                ui_std_listener.set_nonblocking(true).ok();
+                let api_port = cfg.api_port.unwrap_or(8080);
+                let ui_app = webui::router(api_port);
+                let ui_rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("runbound-ui")
+                    .enable_all()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Web UI runtime: {e}"))?;
+                ui_rt.spawn(async move {
+                    let listener = tokio::net::TcpListener::from_std(ui_std_listener)
+                        .expect("ui TcpListener::from_std failed");
+                    axum::serve(listener, ui_app).await.ok()
+                });
+                Box::leak(Box::new(ui_rt));
+                info!(addr=%ui_addr, "Web UI listening");
+            }
+        }
+    }
 
     // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
     let rate_limiter = RateLimiter::new(

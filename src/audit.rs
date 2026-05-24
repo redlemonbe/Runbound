@@ -27,31 +27,51 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum AuditEvent {
     Startup,
     Shutdown,
-    DnsAdd     { name: String, rtype: String, value: String },
-    DnsDelete  { id: String },
-    FeedAdd    { id: String, name: String, url: String },
-    FeedDelete { id: String },
-    BlacklistAdd    { domain: String },
-    BlacklistDelete { id: String },
-    AuthFailure { path: String },
+    DnsAdd {
+        name: String,
+        rtype: String,
+        value: String,
+    },
+    DnsDelete {
+        id: String,
+    },
+    FeedAdd {
+        id: String,
+        name: String,
+        url: String,
+    },
+    FeedDelete {
+        id: String,
+    },
+    BlacklistAdd {
+        domain: String,
+    },
+    BlacklistDelete {
+        id: String,
+    },
+    AuthFailure {
+        path: String,
+    },
     ConfigReload,
-    LogsClear   { count: usize },
+    LogsClear {
+        count: usize,
+    },
 }
 
 impl AuditEvent {
     fn event_name(&self) -> &'static str {
         match self {
-            Self::Startup           => "startup",
-            Self::Shutdown          => "shutdown",
-            Self::DnsAdd { .. }     => "dns_add",
-            Self::DnsDelete { .. }  => "dns_delete",
-            Self::FeedAdd { .. }    => "feed_add",
+            Self::Startup => "startup",
+            Self::Shutdown => "shutdown",
+            Self::DnsAdd { .. } => "dns_add",
+            Self::DnsDelete { .. } => "dns_delete",
+            Self::FeedAdd { .. } => "feed_add",
             Self::FeedDelete { .. } => "feed_delete",
-            Self::BlacklistAdd { .. }    => "blacklist_add",
+            Self::BlacklistAdd { .. } => "blacklist_add",
             Self::BlacklistDelete { .. } => "blacklist_delete",
             Self::AuthFailure { .. } => "auth_failure",
-            Self::ConfigReload       => "config_reload",
-            Self::LogsClear { .. }   => "logs_clear",
+            Self::ConfigReload => "config_reload",
+            Self::LogsClear { .. } => "logs_clear",
         }
     }
 
@@ -62,14 +82,14 @@ impl AuditEvent {
             Self::DnsAdd { name, rtype, value } => serde_json::json!({
                 "name": name, "type": rtype, "value": value,
             }),
-            Self::DnsDelete  { id }  => serde_json::json!({ "id": id }),
-            Self::FeedAdd    { id, name, url } => serde_json::json!({
+            Self::DnsDelete { id } => serde_json::json!({ "id": id }),
+            Self::FeedAdd { id, name, url } => serde_json::json!({
                 "id": id, "name": name, "url": url,
             }),
-            Self::FeedDelete { id }  => serde_json::json!({ "id": id }),
-            Self::BlacklistAdd    { domain } => serde_json::json!({ "domain": domain }),
-            Self::BlacklistDelete { id }     => serde_json::json!({ "id": id }),
-            Self::AuthFailure { path }       => serde_json::json!({ "path": path }),
+            Self::FeedDelete { id } => serde_json::json!({ "id": id }),
+            Self::BlacklistAdd { domain } => serde_json::json!({ "domain": domain }),
+            Self::BlacklistDelete { id } => serde_json::json!({ "id": id }),
+            Self::AuthFailure { path } => serde_json::json!({ "path": path }),
         }
     }
 }
@@ -96,10 +116,10 @@ impl AuditLogger {
 ///
 /// If `enabled` is false, returns a logger whose sends are silently discarded.
 pub fn init(
-    enabled:    bool,
-    log_path:   Option<PathBuf>,
-    hmac_key:   Option<String>,
-    base_dir:   PathBuf,
+    enabled: bool,
+    log_path: Option<PathBuf>,
+    hmac_key: Option<String>,
+    base_dir: PathBuf,
 ) -> AuditLogger {
     let (tx, rx) = mpsc::unbounded_channel::<AuditEvent>();
 
@@ -182,21 +202,17 @@ fn rand_byte() -> u8 {
 // ── Writer task ────────────────────────────────────────────────────────────────
 
 async fn writer_task(
-    mut rx:      mpsc::UnboundedReceiver<AuditEvent>,
-    log_path:    PathBuf,
-    key:         Vec<u8>,
-    start_seq:   u64,
-    base_dir:    PathBuf,
+    mut rx: mpsc::UnboundedReceiver<AuditEvent>,
+    log_path: PathBuf,
+    key: Vec<u8>,
+    start_seq: u64,
+    base_dir: PathBuf,
 ) {
     let _ = fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
 
     // O_APPEND: each write() is atomic at the OS level (POSIX guarantee for O_APPEND).
     // We never truncate or seek — the log is append-only by construction.
-    let mut file = match OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&log_path)
-    {
+    let mut file = match OpenOptions::new().append(true).create(true).open(&log_path) {
         Ok(f) => f,
         Err(e) => {
             error!(path = %log_path.display(), err = %e, "Cannot open audit log — audit disabled");
@@ -213,7 +229,7 @@ async fn writer_task(
             .as_secs();
 
         let event_name = event.event_name();
-        let fields     = event.fields();
+        let fields = event.fields();
 
         // HMAC-SHA256 over: seq (8 bytes LE) || ts (8 bytes LE) || event name || fields JSON
         let mac = compute_mac(&key, seq, ts, event_name, &fields.to_string());
@@ -259,11 +275,13 @@ fn compute_mac(key: &[u8], seq: u64, ts: u64, event: &str, fields: &str) -> Stri
 
 /// Read the last `n` lines (max 1000) from the audit log file.
 /// Reads from EOF backwards using a simple reverse-line scan.
-pub fn tail_audit_log(log_path: &std::path::Path, n: usize) -> Result<Vec<serde_json::Value>, String> {
+pub fn tail_audit_log(
+    log_path: &std::path::Path,
+    n: usize,
+) -> Result<Vec<serde_json::Value>, String> {
     let n = n.min(1000);
 
-    let content = fs::read_to_string(log_path)
-        .map_err(|e| format!("read audit log: {e}"))?;
+    let content = fs::read_to_string(log_path).map_err(|e| format!("read audit log: {e}"))?;
 
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);

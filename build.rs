@@ -22,20 +22,22 @@ fn main() {
 fn compile_ebpf() {
     use std::{env, path::PathBuf};
 
-    let out_dir      = PathBuf::from(env::var("OUT_DIR")
-        .unwrap_or_else(|_| panic!("OUT_DIR not set by cargo")));
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| panic!("CARGO_MANIFEST_DIR not set by cargo")));
+    let out_dir =
+        PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| panic!("OUT_DIR not set by cargo")));
+    let manifest_dir = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR")
+            .unwrap_or_else(|_| panic!("CARGO_MANIFEST_DIR not set by cargo")),
+    );
 
     // Target architecture → BPF define expected by kernel headers
     let bpf_arch_flag = match env::var("CARGO_CFG_TARGET_ARCH")
         .unwrap_or_else(|_| "x86_64".into())
         .as_str()
     {
-        "x86_64"  => "-D__TARGET_ARCH_x86",
+        "x86_64" => "-D__TARGET_ARCH_x86",
         "aarch64" => "-D__TARGET_ARCH_arm64",
-        "arm"     => "-D__TARGET_ARCH_arm",
-        other     => panic!("unsupported target architecture for XDP eBPF: {other}"),
+        "arm" => "-D__TARGET_ARCH_arm",
+        other => panic!("unsupported target architecture for XDP eBPF: {other}"),
     };
 
     let src = manifest_dir.join("ebpf/dns_xdp.c");
@@ -74,7 +76,8 @@ fn compile_ebpf() {
         // -g on -target bpf generates BTF (.BTF/.BTF.ext sections), not DWARF.
         // aya-obj requires BTF for BTF-style map definitions (SEC(".maps")).
         "-g".into(),
-        "-target".into(), "bpf".into(),
+        "-target".into(),
+        "bpf".into(),
         bpf_arch_flag.into(),
         "-Wall".into(),
         "-Wno-missing-prototypes".into(),
@@ -101,9 +104,9 @@ fn compile_ebpf() {
 
 #[cfg(feature = "xdp")]
 fn run_clang_compile(
-    base_flags:  &[String],
-    src:         &std::path::Path,
-    dst:         &std::path::Path,
+    base_flags: &[String],
+    src: &std::path::Path,
+    dst: &std::path::Path,
     extra_flags: &[&str],
 ) {
     use std::process::Command;
@@ -111,9 +114,17 @@ fn run_clang_compile(
     let mut args: Vec<String> = base_flags.to_vec();
     args.extend(extra_flags.iter().map(|s| s.to_string()));
     args.push("-c".into());
-    args.push(src.to_str().unwrap_or_else(|| panic!("src path not UTF-8")).into());
+    args.push(
+        src.to_str()
+            .unwrap_or_else(|| panic!("src path not UTF-8"))
+            .into(),
+    );
     args.push("-o".into());
-    args.push(dst.to_str().unwrap_or_else(|| panic!("dst path not UTF-8")).into());
+    args.push(
+        dst.to_str()
+            .unwrap_or_else(|| panic!("dst path not UTF-8"))
+            .into(),
+    );
 
     let out = Command::new("clang")
         .args(&args)
