@@ -40,7 +40,7 @@ use super::socket::{
     is_virtual_interface, parent_interface, sanitize_iface_name,
     maximize_nic_ring, XDP_ACTIVE_IFACE,
 };
-use super::umem::{XdpDesc, FRAME_SIZE, RX_RING_SIZE, TX_RING_SIZE};
+use super::umem::{XdpDesc, FRAME_SIZE, XdpRingSizes};
 
 const ETH_HDR: usize = 14;
 const IPV4_HDR_MIN: usize = 20;
@@ -76,6 +76,7 @@ pub fn start_xdp(
     cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
     domain_routing:  bool,
     ring_size:       Option<u32>,
+    xdp_ring_sizes:  XdpRingSizes,
 ) -> Result<Option<XdpHandle>, String> {
     if std::env::var("RUNBOUND_DISABLE_XDP").is_ok() {
         tracing::info!("XDP disabled via RUNBOUND_DISABLE_XDP environment variable");
@@ -88,7 +89,7 @@ pub fn start_xdp(
                     virt = %iface, parent = %parent,
                     "XDP: virtual interface detected — retrying on parent"
                 );
-                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot, domain_routing, ring_size);
+                let result = start_xdp_on_iface(parent, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot, domain_routing, ring_size, xdp_ring_sizes);
                 if result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
                     tracing::info!(parent = %parent, "XDP active on parent interface");
                 }
@@ -104,7 +105,7 @@ pub fn start_xdp(
             }
         }
     }
-    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot, domain_routing, ring_size)
+    start_xdp_on_iface(iface, zones, rate_limiter, acl, cpu_governor, irq_affinity, hugepages, cache_snapshot, domain_routing, ring_size, xdp_ring_sizes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -119,6 +120,7 @@ fn start_xdp_on_iface(
     cache_snapshot:  Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
     domain_routing:  bool,
     ring_size:       Option<u32>,
+    xdp_ring_sizes:  XdpRingSizes,
 ) -> Result<Option<XdpHandle>, String> {
     let ifidx = iface_index(iface)
         .ok_or_else(|| format!("interface {iface} not found"))?;
@@ -175,14 +177,14 @@ fn start_xdp_on_iface(
         // SAFETY: `ifidx` is a valid ifindex returned by `iface_index`. `q` is
         //         in [0, min(queue_count, 64)), which is the valid range of NIC RX
         //         queues. On zero-copy failure we fall back to copy mode.
-        let sock = unsafe { create_xsk_socket(ifidx, q, true, hugepages) }
-            .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false, hugepages) })
+        let sock = unsafe { create_xsk_socket(ifidx, q, true, hugepages, &xdp_ring_sizes) }
+            .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false, hugepages, &xdp_ring_sizes) })
             .map_err(|e| format!("AF_XDP socket creation failed: {e}"))?;
         tracing::info!(
             queue_id = q,
             mode = if sock.zerocopy { "zerocopy" } else { "copy" },
-            rx_frames = RX_RING_SIZE,
-            tx_frames = TX_RING_SIZE,
+            rx_frames = xdp_ring_sizes.rx,
+            tx_frames = xdp_ring_sizes.tx,
             "XDP queue bound"
         );
         handle.register_socket(q, sock.fd)?;
@@ -406,9 +408,9 @@ fn xdp_worker(
     // Pre-allocate scratch buffers outside the hot loop to avoid per-batch
     // heap allocations.  Each Vec retains its capacity across iterations;
     // clear() resets length without releasing memory.
-    let mut rxds:       Vec<XdpDesc> = Vec::with_capacity(RX_RING_SIZE as usize);
-    let mut tx_descs:   Vec<XdpDesc> = Vec::with_capacity(RX_RING_SIZE as usize);
-    let mut rx_addrs:   Vec<u64>     = Vec::with_capacity(RX_RING_SIZE as usize);
+    let mut rxds:       Vec<XdpDesc> = Vec::with_capacity(sock.rx.size as usize);
+    let mut tx_descs:   Vec<XdpDesc> = Vec::with_capacity(sock.rx.size as usize);
+    let mut rx_addrs:   Vec<u64>     = Vec::with_capacity(sock.rx.size as usize);
     let mut dns_scratch: Vec<u8>     = Vec::with_capacity(512);
 
     loop {

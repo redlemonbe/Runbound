@@ -29,20 +29,26 @@ use libc::{
 /// DNS packets are ≤ 4096 bytes (EDNS0 UDP), so one frame = one packet.
 pub const FRAME_SIZE: u32 = 4096;
 
-/// Total frames in the UMEM. 8192 × 4096 = 32 MiB per socket.
-pub const FRAME_COUNT: u32 = 8192;
+/// Configurable AF_XDP ring sizes (powers of 2, each in [64, 65536]).
+/// UMEM frame count = rx + tx; fill/comp are independent metadata rings.
+/// Defaults match the previous hard-coded 4096 (no breaking change).
+#[derive(Debug, Clone, Copy)]
+pub struct XdpRingSizes {
+    /// Fill ring size (user→kernel, free RX frames). Default: 4096.
+    pub fill: u32,
+    /// Completion ring size (kernel→user, TX reclaim). Default: 4096.
+    pub comp: u32,
+    /// RX descriptor ring size. Default: 4096.
+    pub rx: u32,
+    /// TX descriptor ring size. Default: 4096.
+    pub tx: u32,
+}
 
-/// AF_XDP ring capacities (must be powers of 2, each ≤ FRAME_COUNT/2 = 4096).
-pub const FILL_RING_SIZE: u32 = 4096;
-pub const COMP_RING_SIZE: u32 = 4096;
-pub const RX_RING_SIZE:   u32 = 4096;
-pub const TX_RING_SIZE:   u32 = 4096;
-
-/// Number of frames reserved for RX (seeded into fill ring at startup).
-pub const RX_FRAME_COUNT: u32 = RX_RING_SIZE;
-
-/// Number of frames reserved for TX (managed by the handler free pool).
-pub const TX_FRAME_COUNT: u32 = TX_RING_SIZE;
+impl Default for XdpRingSizes {
+    fn default() -> Self {
+        Self { fill: 4096, comp: 4096, rx: 4096, tx: 4096 }
+    }
+}
 
 // ── Kernel structures (from <linux/if_xdp.h>) ─────────────────────────────
 
@@ -376,9 +382,10 @@ impl Umem {
     /// Allocate and register a UMEM with the given AF_XDP socket.
     /// On success returns the Umem plus the fill/completion ring maps;
     /// the caller passes `fd` to register_rings() after obtaining RX/TX offsets.
-    pub unsafe fn new(xsk_fd: RawFd, hugepages: bool) -> Result<Self, String> {
+    pub unsafe fn new(xsk_fd: RawFd, hugepages: bool, sizes: &XdpRingSizes) -> Result<Self, String> {
         let page = unsafe { sysconf(_SC_PAGESIZE) } as usize;
-        let area_len = (FRAME_COUNT * FRAME_SIZE) as usize;
+        let frame_count = sizes.rx + sizes.tx;
+        let area_len = (frame_count * FRAME_SIZE) as usize;
         // Round up to page boundary (should already be page-aligned)
         let area_len = (area_len + page - 1) & !(page - 1);
 
@@ -417,8 +424,8 @@ impl Umem {
 
         // Set ring sizes
         for (opt, sz) in [
-            (XDP_UMEM_FILL_RING,        FILL_RING_SIZE),
-            (XDP_UMEM_COMPLETION_RING,  COMP_RING_SIZE),
+            (XDP_UMEM_FILL_RING,        sizes.fill),
+            (XDP_UMEM_COMPLETION_RING,  sizes.comp),
         ] {
             // SAFETY: `xsk_fd` is a valid AF_XDP socket fd. `&sz` is a valid
             //         pointer to an initialised u32. The socklen matches sizeof(u32).
@@ -445,7 +452,7 @@ impl Umem {
                 xsk_fd,
                 XDP_UMEM_PGOFF_FILL_RING,
                 &offsets.fr,
-                FILL_RING_SIZE,
+                sizes.fill,
             )
         }?;
         // mmap completion ring
@@ -454,18 +461,18 @@ impl Umem {
                 xsk_fd,
                 XDP_UMEM_PGOFF_COMPLETION_RING,
                 &offsets.cr,
-                COMP_RING_SIZE,
+                sizes.comp,
             )
         }?;
 
         // Pre-populate fill ring with RX frame offsets (give them to the kernel)
-        let rx_addrs: Vec<u64> = (0..RX_FRAME_COUNT)
+        let rx_addrs: Vec<u64> = (0..sizes.rx)
             .map(|i| (i * FRAME_SIZE) as u64)
             .collect();
         fill.enqueue_batch(&rx_addrs);
 
         // TX free pool = frames after the RX region
-        let tx_free: VecDeque<u64> = (RX_FRAME_COUNT..RX_FRAME_COUNT + TX_FRAME_COUNT)
+        let tx_free: VecDeque<u64> = (sizes.rx..sizes.rx + sizes.tx)
             .map(|i| (i * FRAME_SIZE) as u64)
             .collect();
 

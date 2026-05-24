@@ -24,7 +24,7 @@ use crate::dns::xdp::umem::{
     Umem, DescRing,
     SOL_XDP, XDP_RX_RING, XDP_TX_RING,
     XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING,
-    RX_RING_SIZE, TX_RING_SIZE, SockaddrXdp,
+    XdpRingSizes, SockaddrXdp,
     XDP_ZEROCOPY, XDP_COPY, XDP_USE_NEED_WAKEUP,
 };
 
@@ -101,6 +101,7 @@ pub unsafe fn create_xsk_socket(
     queue_id:     u32,
     use_zerocopy: bool,
     hugepages:    bool,
+    sizes:        &XdpRingSizes,
 ) -> Result<XskSocket, String> {
     // 1. Create the socket
     // SAFETY: `socket(2)` is safe to call with valid constants. AF_XDP=44,
@@ -115,14 +116,14 @@ pub unsafe fn create_xsk_socket(
 
     // 2. Allocate and register UMEM (also maps fill + completion rings)
     // SAFETY: `fd` is a valid AF_XDP socket fd returned by `socket(2)` above.
-    let umem = unsafe { Umem::new(fd, hugepages) }.inspect_err(|_| {
+    let umem = unsafe { Umem::new(fd, hugepages, sizes) }.inspect_err(|_| {
         // SAFETY: `fd` is a valid open file descriptor not yet transferred
         //         to any owner. We close it here on the error path only.
         unsafe { libc::close(fd) };
     })?;
 
     // 3. Set RX and TX ring sizes
-    for (opt, sz) in [(XDP_RX_RING, RX_RING_SIZE), (XDP_TX_RING, TX_RING_SIZE)] {
+    for (opt, sz) in [(XDP_RX_RING, sizes.rx), (XDP_TX_RING, sizes.tx)] {
         // SAFETY: `fd` is a valid AF_XDP socket fd. `&sz` points to an
         //         initialised u32 on the stack. The socklen matches sizeof(u32).
         let rc = unsafe {
@@ -147,13 +148,13 @@ pub unsafe fn create_xsk_socket(
     // SAFETY: `fd` is a valid AF_XDP socket fd with ring sizes already configured.
     let (rx_off, tx_off) = unsafe { get_rx_tx_offsets(fd) }?;
     // SAFETY: `fd` is valid; `rx_off` contains the offsets returned by the kernel.
-    let rx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, RX_RING_SIZE) }
+    let rx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, sizes.rx) }
         .inspect_err(|_| {
             // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
             unsafe { libc::close(fd) };
         })?;
     // SAFETY: `fd` is valid; `tx_off` contains the offsets returned by the kernel.
-    let tx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, TX_RING_SIZE) }
+    let tx = unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, sizes.tx) }
         .inspect_err(|_| {
             // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
             unsafe { libc::close(fd) };
