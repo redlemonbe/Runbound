@@ -42,6 +42,16 @@
     .dns-row{display:grid;grid-template-columns:minmax(100px,1.5fr) 60px minmax(120px,2fr) 55px 32px;gap:6px;align-items:center;padding:6px 12px;border-bottom:1px solid #0f172a;font-size:12px}
     .dns-row:hover{background:#0d1a2e}
     .dns-row-hdr{display:grid;grid-template-columns:minmax(100px,1.5fr) 60px minmax(120px,2fr) 55px 32px;gap:6px;padding:5px 12px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#374151;background:#080f1a;border-bottom:1px solid #1e293b}
+  /* SEC-19 / UX: prevent browser autofill overriding dark theme colors */
+  input:-webkit-autofill,
+  input:-webkit-autofill:hover,
+  input:-webkit-autofill:focus,
+  input:-webkit-autofill:active {
+    -webkit-text-fill-color:#e2e8f0 !important;
+    -webkit-box-shadow:0 0 0px 1000px #0f172a inset !important;
+    transition:background-color 5000s ease-in-out 0s;
+    caret-color:#e2e8f0;
+  }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-200 min-h-screen pb-8">
@@ -396,7 +406,7 @@
   <div id="tab-settings" class="hidden fade max-w-2xl">
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-4">Change Password</div>
-      <div class="space-y-3 max-w-sm">
+      <div class="space-y-3 max-w-sm" style="padding-left:3px">
         <div>
           <label class="text-xs text-gray-500 block mb-1">Username</label>
           <input id="set-username" type="text" class="input w-full" autocomplete="username" placeholder="admin" />
