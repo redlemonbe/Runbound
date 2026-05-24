@@ -397,7 +397,7 @@ with zero packet loss. The hardware matters more than the software at this scale
 Expected configuration:
 - Client: Intel X540-T2 (ixgbe, AF/XDP supported)
 - Server: Intel X540 (ixgbe, native XDP zero-copy)
-- Expected range: 500 000 – 14 000 000 QPS
+- Expected range: 500 000 – 14 000 000 QPS [UNVERIFIED — pending v0.8 benchmark]
 - BIND9 / Unbound: no XDP — comparison becomes one-sided above ~500k QPS
 
 Results: [docs/benchmark-xdp.md](benchmark-xdp.md) when available.
