@@ -150,7 +150,7 @@ The current client (Emulex be2net) does not support AF/XDP.
 A follow-up benchmark with an Intel X540-T2 client will test:
 
 - Runbound XDP native path on ixgbe (both ends)
-- Expected range: 500 000 – 14 000 000 QPS
+- Expected range: 500 000 – 14 000 000 QPS [UNVERIFIED — pending v0.8 benchmark]
 - Both BIND9 and Unbound lack XDP support — comparison becomes one-sided
 
 Results will be published in a dedicated benchmark report when available (pending Intel X520 hardware — see issue #84).

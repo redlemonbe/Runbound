@@ -71,7 +71,7 @@ server:
     xdp-irq-affinity: auto    # default: off
 ```
 
-Effect: eliminates cross-core IRQ delivery. Without pinning, the kernel may wake a different core to handle the interrupt, causing guaranteed L1/L2 cache misses when the XDP worker reads the packet. Gain: 1–3% throughput, −1–5 µs latency variance.
+Effect: eliminates cross-core IRQ delivery. Without pinning, the kernel may wake a different core to handle the interrupt, causing guaranteed L1/L2 cache misses when the XDP worker reads the packet. Gain: 1–3% throughput, −1–5 µs latency variance (theoretical).
 
 ---
 
@@ -162,7 +162,7 @@ SYS_getcpu  (vDSO, ~3 ns)    →  get current NUMA node
 mbind(MPOL_PREFERRED|MF_MOVE) →  migrate UMEM pages to local node
 ```
 
-Gain: −30–40 ns/packet on dual-socket servers (eliminates cross-node DRAM access at ~120 ns vs local ~40 ns). Silent fallback on single-socket and containers.
+Gain: −30–40 ns/packet on dual-socket servers (theoretical — derived from ~120 ns cross-node vs ~40 ns local DRAM latency). Silent fallback on single-socket and containers.
 
 ---
 
@@ -210,7 +210,7 @@ frame[10..12].copy_from_slice(&query_id.to_be_bytes());  // patch QueryID
 
 ### TX batching
 
-**Implemented v0.6.8.** All TX descriptors from the current RX batch are enqueued in a single `enqueue_tx(&tx_descs[..n])` call before kicking the TX ring. Reduces syscalls from 1/packet to 1/batch (~32 packets). Gain: +10–15% throughput.
+**Implemented v0.6.8.** All TX descriptors from the current RX batch are enqueued in a single `enqueue_tx(&tx_descs[..n])` call before kicking the TX ring. Reduces syscalls from 1/packet to 1/batch (~32 packets). Gain: +10–15% throughput (theoretical).
 
 ### Descriptor safety
 
