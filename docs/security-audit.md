@@ -354,7 +354,7 @@ TLS: `rustls 0.23` (TLS 1.3 by default) + AWS-LC. No OpenSSL in the dependency c
 - **Source:** [AI-INTERNAL]
 - **File:** src/config/ (configuration default)
 - **Discovered:** v0.6.9
-- **Status:** ⚠️ GDPR consideration — operator action required if applicable
+- **Status:** Won't fix (code-level) — operator configuration responsibility. Default will not change; `log-client-ip: no` is documented as the GDPR-safe option.
 - **Threat model:** Regulatory/compliance risk; DNS query logs with client IPs may constitute personal data under GDPR Article 4(1) if the deployment processes EU persons' data
 - **Description:** `log-client-ip: yes` is the default configuration. In EU deployments, DNS query logs containing IP addresses may constitute personal data requiring a lawful basis for retention, data minimization measures, and data subject rights under GDPR. This is not a technical security vulnerability but a compliance risk that could result in regulatory findings or fines.
 - **Exploit path:** N/A — compliance risk, not a technically exploitable vulnerability
@@ -464,6 +464,7 @@ Status summary as of v0.8.1:
 | SEC-09 | DNS rebinding | HIGH | ✅ CIDR guards (commit `a5cba9a` — No automated test; verified by manual review) |
 | SEC-10 | ANY amplification | HIGH | ✅ Blocked (ANY: commit `2aeeab7`; CHAOS: commit `80331be` — No automated test; verified by manual review [AI-INTERNAL]) |
 | SEC-11 | SSRF via upstream 0.0.0.0 | MEDIUM | ⏳ Open in v0.6.9 scope — fixed v0.6.11 (commit `2dedd6f`, two unit tests) |
+| SEC-06b | Client IP logging GDPR risk | LOW | Won't fix (code) — operator config |
 
 
 ---
