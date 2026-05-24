@@ -253,6 +253,8 @@ DNS responses from upstream are inserted into `DashMap<QuestionKey, CacheEntry>`
 
 ## 6. Timing budget summary
 
+> Latency estimates below are **theoretical** (derived from instruction counts and hardware data sheets). See [docs/performance.md](performance.md) for measured results.
+
 | Stage | Implemented | Latency |
 |-------|-------------|---------|
 | NIC DMA → UMEM | v0.4.14 | ~0 ns |
@@ -276,10 +278,12 @@ DNS responses from upstream are inserted into `DashMap<QuestionKey, CacheEntry>`
 
 ## 7. Throughput model
 
+> All numbers in this section are **theoretical** estimates derived from the per-stage timing budget above. Measured AF/XDP throughput on bare-metal Intel ixgbe will be published in v0.8.
+
 ```
 QPS per core = 1 / hot_path_latency
              = 1 / 1 µs
-             = 1 M QPS/core
+             = 1 M QPS/core   (theoretical)
 
 Total XDP QPS = QPS/core × nb_xdp_workers × cache_hit_rate
 ```
@@ -287,7 +291,7 @@ Total XDP QPS = QPS/core × nb_xdp_workers × cache_hit_rate
 With 8 XDP workers and 95% cache hit rate (typical for a resolver with hot domains):
 
 ```
-8 × 1 M × 0.95 = 7.6 M QPS
+8 × 1 M × 0.95 = 7.6 M QPS   (theoretical)
 ```
 
 With wire format cache (#64, planned):

@@ -22,6 +22,8 @@ Three specialized AI agents, each with a single role:
 
 **My role: orchestra conductor.** I hold the vision, ask the right questions, validate the results, and decide what gets shipped.
 
+AI tools are used at multiple stages: implementation, adversarial review, and test generation. All security findings are triaged by the maintainer. External human review is planned before v1.0.
+
 ---
 
 This is not "AI wrote my code." This is a new way to build — where domain expertise and system intuition drive the architecture, and AI handles the translation into syntax.
