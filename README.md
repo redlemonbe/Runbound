@@ -24,6 +24,8 @@ Most existing `unbound.conf` files work as-is. Non-standard or exotic directives
 | Master/slave replication | ✅ | ❌ | ✅ built-in*¹ |
 | Automatic TLS (Let's Encrypt) | ❌ | ❌ | ✅ ACME |
 | AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ |
+| XDP ICMP echo responder (rate-limited) | ❌ | ❌ | ✅ |
+| Embedded browser dashboard | ❌ | ❌ | ✅ no nginx needed |
 | Linear scaling (no lock contention) | ❌ | ❌ | ✅ |
 | Static binary, no dependencies | ❌ | ❌ | ✅ musl |
 
@@ -58,7 +60,7 @@ At the end you'll see:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Version:  runbound 0.6.x
+ Version:  runbound 0.9.2
  API key:  a1b2c3d4...   ← save this
  Config:   /etc/runbound/runbound.conf
  Logs:     journalctl -u runbound -f
@@ -174,7 +176,7 @@ curl -s -X POST http://localhost:8080/api/feeds \
 | Hardware | Mode | QPS | Notes |
 |----------|------|-----|-------|
 | Any CPU | SO_REUSEPORT (no XDP) | scales linearly with cores | |
-| Intel 10 GbE ixgbe | AF_XDP kernel-bypass fast path | TBD — benchmark in progress | kernel-bypass fast path, results coming in v0.8 |
+| Intel 10 GbE ixgbe | AF_XDP kernel-bypass fast path | TBD — benchmark in progress | kernel-bypass fast path, results coming (benchmark in progress) |
 
 Architecture designed for linear scaling with core count — SO_REUSEPORT, ArcSwap lock-free config, per-core CPU affinity, and adaptive cache. Measured multi-core scaling benchmarks will be published in v0.8 (bare-metal Intel ixgbe setup).
 
