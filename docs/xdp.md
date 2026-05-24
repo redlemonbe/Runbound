@@ -305,3 +305,47 @@ server:
 | Bare metal Intel 10GbE | native zero-copy | TBD — benchmark in progress (results coming in v0.8) |
 
 Wire speed on 10GbE = ~14.88M 64-byte packets/second (physical limit, not yet validated end-to-end).
+
+---
+
+## ICMP echo responder
+
+When XDP is active, Runbound can respond to ICMP echo requests (ping) at the driver layer —
+before the packet reaches the kernel network stack. This is controlled by the `icmp` block
+in `runbound.conf`.
+
+### How it works
+
+```
+NIC → XDP program → ICMP echo? → rate limit check → swap MACs/IPs → XDP_TX
+                                                    ↓ (over limit)
+                                                  XDP_DROP
+```
+
+The XDP program intercepts IPv4 ICMP echo requests (type 8). It:
+1. Validates IP header (IHL=5, no options — packets with IP options pass to kernel)
+2. Looks up the source IP in a per-CPU LRU rate-limit map
+3. If under burst/rate limit: modifies the packet in-place (swap MACs/IPs, set type=0, update checksum) and returns `XDP_TX`
+4. If over limit: drops with `XDP_DROP`, increments `rate_limited` counter
+
+No system calls, no kernel IP stack, no userspace context switches.
+
+### Configuration
+
+```
+icmp {
+    enable:           yes
+    rate-limit:       20     # pings/s per source IP
+    rate-limit-burst: 8      # initial burst tokens for new IPs
+}
+```
+
+### BPF maps
+
+| Map | Type | Max entries | Purpose |
+|---|---|---|---|
+| `icmp_cfg` | ARRAY (1 entry) | 1 | Live config: enabled, rate_pps, burst |
+| `icmp_stats` | PERCPU_ARRAY | 4 counters | handled/replied/dropped/rate_limited |
+| `icmp_rate_limit` | LRU_HASH | 65536 | Per-source-IP token bucket state |
+
+Stats and config are accessible via REST API (see [api.md](api.md)).

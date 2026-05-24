@@ -1088,6 +1088,79 @@ disconnected when the channel is full.
 
 ---
 
+---
+
+### ICMP echo responder
+
+> Requires XDP (`--features xdp`) compiled binary and `icmp { enable: yes }` in `runbound.conf`.
+> When XDP is inactive, endpoints are still available but counters stay at zero.
+
+#### `GET /api/icmp/stats`
+
+Returns cumulative counters polled from the BPF per-CPU array.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/icmp/stats
+```
+
+```json
+{"dropped":0,"handled":42,"rate_limited":7,"replied":35}
+```
+
+| Field | Description |
+|---|---|
+| `handled` | Echo requests that reached the XDP handler |
+| `replied` | Requests answered with XDP_TX (echo reply sent) |
+| `dropped` | Requests dropped before reply (reserved, currently unused) |
+| `rate_limited` | Requests dropped by per-source-IP rate limiter |
+
+Counters are updated by the background BPF poll task every second.
+
+---
+
+#### `GET /api/icmp/config`
+
+Returns the current ICMP responder configuration.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/icmp/config
+```
+
+```json
+{"burst":8,"enable":true,"rate_limit":20}
+```
+
+---
+
+#### `PUT /api/icmp/config`
+
+Live-update the ICMP responder config. Changes are applied to the BPF map within 1 second
+(next background poll tick).
+
+```bash
+curl -X PUT -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     -H "Content-Type: application/json" \
+     -H "Content-Length: 41" \
+     -d '{"enable":true,"rate_limit":20,"burst":8}' \
+     http://localhost:8080/api/icmp/config
+```
+
+**Request body** (all fields optional — omitted fields keep their current value):
+
+| Field | Type | Description |
+|---|---|---|
+| `enable` | bool | Enable/disable the ICMP echo responder |
+| `rate_limit` | integer | Max echo requests per second per source IP |
+| `burst` | integer | Initial burst tokens granted to new source IPs |
+
+Returns the updated config:
+
+```json
+{"burst":8,"enable":true,"rate_limit":20}
+```
+
+---
+
 ## Slave mode — read-only
 
 When Runbound runs as a slave replica (`mode: slave` in `runbound.conf`), all write
