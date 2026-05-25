@@ -1,6 +1,6 @@
 # Documentation Index
 
-Complete reference for Runbound v0.9.16+. Each page is self-contained.
+Complete reference for Runbound. Each page covers the current stable release.. Each page is self-contained.
 
 ---
 

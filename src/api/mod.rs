@@ -4659,7 +4659,6 @@ mod tests {
             .filter(|&&s| s != StatusCode::OK && s != StatusCode::TOO_MANY_REQUESTS)
             .collect();
 
-        eprintln!("[HTTP_TEST] 200={ok} 429={r429} other={other:?}");
         assert!(ok <= 2, "burst=2 but {ok} requests got 200");
         assert!(r429 >= 18, "expected ≥18 requests to get 429, got {r429}");
     }
