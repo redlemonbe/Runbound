@@ -137,6 +137,7 @@ pub struct RunboundHandler {
     pub zones: Arc<ArcSwap<LocalZoneSet>>,
     resolver: Arc<ArcSwap<TokioResolver>>,
     rate_limiter: Arc<RateLimiter>,
+    alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
     inflight: Arc<Semaphore>,
     acl: Arc<Acl>,
     private_addrs: Arc<PrivateAddressSet>,
@@ -209,11 +210,13 @@ impl RunboundHandler {
         stale_max_age: u64,
         allow_update: bool,
         tsig_keys_raw: Vec<(String, String, String)>,
+        alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
     ) -> Self {
         Self {
             zones,
             resolver,
             rate_limiter,
+            alert_tracker,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             acl,
             private_addrs,
@@ -931,6 +934,14 @@ impl RequestHandler for RunboundHandler {
                 start,
             );
             return send_error(request, response_handle, ResponseCode::Refused).await;
+        }
+
+        // ── 1b. Alert threshold check (#12) ────────────────────────────
+        if let Some(at) = &self.alert_tracker {
+            if at.record(client_ip) {
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
+                return send_error(request, response_handle, ResponseCode::Refused).await;
+            }
         }
 
         // ── 2. Concurrency cap (anti-OOM) ──────────────────────────────
@@ -1977,6 +1988,7 @@ pub async fn run_dns_server(
     per_upstream_resolvers: SharedResolversVec,
     racing_wins: Arc<DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
+    alert_tracker: Arc<crate::alerts::AlertTracker>,
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
@@ -2094,6 +2106,7 @@ pub async fn run_dns_server(
         cfg.stale_max_age,
         cfg.allow_update,
         cfg.tsig_keys.clone(),
+        Some(Arc::clone(&alert_tracker)),
     );
     let mut server = Server::new(handler);
 

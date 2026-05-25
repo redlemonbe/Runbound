@@ -310,6 +310,7 @@ pub struct AppState {
     pub events_tx: Option<tokio::sync::broadcast::Sender<crate::sync::NodeStatusEvent>>,
     /// #5: per-domain query counter — top-domains endpoint.
     pub domain_stats: Arc<crate::domain_stats::DomainStats>,
+    pub alert_tracker: Arc<crate::alerts::AlertTracker>,
     /// #89: ICMP echo responder statistics (polled from BPF per-CPU array).
     pub icmp_stats: Arc<crate::icmp::IcmpStats>,
     /// #89: Current ICMP config — updated via PUT /api/icmp/config.
@@ -645,6 +646,9 @@ pub fn router(state: AppState) -> Router {
             "/icmp/config",
             get(icmp_config_get_handler).put(icmp_config_put_handler),
         )
+        // Alert thresholds (#12)
+        .route("/alerts", get(get_alerts))
+        .route("/alerts/blocked/:ip", delete(delete_blocked_ip))
         // Administration
         .route("/rotate-key", post(rotate_key_handler))
         .layer(middleware::from_fn_with_state(
@@ -5918,5 +5922,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+
+// GET /api/alerts — alert rules, blocked clients, recent events (#12)
+// Auth handled by security_middleware.
+async fn get_alerts(State(state): State<AppState>) -> impl IntoResponse {
+    JsonExtract(state.alert_tracker.api_snapshot())
+}
+
+// DELETE /api/alerts/blocked/:ip — unblock a specific IP (#12)
+async fn delete_blocked_ip(
+    State(state): State<AppState>,
+    axum::extract::Path(ip_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match ip_str.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            let removed = state.alert_tracker.unblock(ip);
+            (StatusCode::OK, JsonExtract(serde_json::json!({"unblocked": removed, "ip": ip_str}))).into_response()
+        }
+        Err(_) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error": "invalid IP"}))).into_response(),
     }
 }
