@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.43] — 2026-05-26
+
+### Added
+
+- **Advanced Bot Defense with Auto-Deban**:
+  - **Honeypot**: WebUI login form renames real fields to `rb_user`/`rb_pass`; hidden `username`/`password` fields trap form-filling bots — ban on any honeypot field filled (requires `bot-honeypot-enabled: yes` in config).
+  - **Scanner detection**: catch-all handler for 19 known scanner paths (`/wp-admin`, `/.env`, `/.git/*`, `/phpmyadmin`, `/xmlrpc.php`, `/actuator/*`, etc.) — instant ban on access.
+  - **Behavioral burst**: ban after 10 failed login attempts in a 5-second sliding window (`bot-burst` rule).
+  - **XDP enforcement**: bot bans inject into the eBPF `icmp_banned` BPF map (IPv4) for zero-syscall drop, same path as ICMP flood bans.
+  - **Auto-deban**: background task evicts expired bans every 60s, sends `IcmpBanCmd::Unban` to XDP, and pushes `SyncOp::DeleteGlobalBan` to slaves.
+  - **Cross-cluster sync**: `SyncOp::AddGlobalBan` / `SyncOp::DeleteGlobalBan` propagated to all slaves via the sync journal; slaves apply bot bans to their own XDP map.
+  - **Audit trail**: all bot bans visible in `GET /api/alerts` and WebUI alert log with rule name (`bot-honeypot`, `bot-scanner`, `bot-burst`).
+  - **Config**: `bot-ban-duration-secs` (default: 86400), `bot-honeypot-enabled` (default: no).
+
 ## [0.9.42] — 2026-05-25
 
 ### Added

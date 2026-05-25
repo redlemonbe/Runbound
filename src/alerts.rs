@@ -316,6 +316,52 @@ impl AlertTracker {
             q.push_back(event);
         }
     }
+
+    /// Block an IP for a fixed duration (used by bot defense). Emits an AlertEvent.
+    pub fn block_bot(&self, ip: std::net::IpAddr, rule: &str, duration_secs: u64) {
+        let expires = if duration_secs == 0 {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_secs(duration_secs))
+        };
+        self.blocked.insert(ip, BlockEntry { expires, rule: rule.to_string() });
+        self.persist_blocks();
+        let event = AlertEvent {
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            rule: rule.to_string(),
+            client_ip: ip.to_string(),
+            count: 1,
+            action: "block".to_string(),
+        };
+        let _ = self.notify_tx.send(("bot_ban".to_string(), event.clone()));
+        if let Ok(mut q) = self.recent.lock() {
+            if q.len() >= RECENT_ALERTS_CAP { q.pop_front(); }
+            q.push_back(event);
+        }
+        tracing::warn!(ip = %ip, rule = rule, "bot defense: IP banned via block_bot");
+    }
+
+    /// Remove all expired blocks from the tracker. Returns the list of evicted IPs.
+    pub fn evict_expired(&self) -> Vec<std::net::IpAddr> {
+        let now = Instant::now();
+        let expired: Vec<std::net::IpAddr> = self.blocked
+            .iter()
+            .filter_map(|e| match e.value().expires {
+                Some(exp) if now >= exp => Some(*e.key()),
+                _ => None,
+            })
+            .collect();
+        for ip in &expired {
+            self.blocked.remove(ip);
+        }
+        if !expired.is_empty() {
+            self.persist_blocks();
+        }
+        expired
+    }
 }
 
 async fn webhook_sender(

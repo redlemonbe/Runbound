@@ -906,6 +906,8 @@ async fn build_and_launch(
                     Arc::clone(&zones_mutex),
                     Arc::clone(&cfg_arc),
                     Arc::clone(&upstreams),
+                    Arc::clone(&alert_tracker),
+                    Arc::clone(&icmp_stats),
                 );
                 tokio::spawn(async move { client.run().await });
                 info!("Slave sync started → master {master}");
@@ -1121,7 +1123,7 @@ async fn build_and_launch(
         cfg_path,
         log_buffer: Arc::clone(&log_buffer),
         upstreams: Arc::clone(&upstreams),
-        sync_journal,
+        sync_journal: sync_journal.clone(),
         sync_key: sync_key_resolved,
         slave_mode: cfg.is_slave(),
         base_dir: Arc::new(base_dir.clone()),
@@ -1228,7 +1230,14 @@ async fn build_and_launch(
                     let cert_pem = std::fs::read_to_string(&acme_cert)?;
                     let key_pem  = std::fs::read_to_string(&acme_key)?;
                     // No local CA — domain cert is trusted everywhere
-                    let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone(), String::new());
+                    let ui_app = webui::router(
+                        api_port, api_key.clone(), base_dir.clone(), String::new(),
+                        Arc::clone(&alert_tracker),
+                        icmp_stats.ban_cmd_tx.clone(),
+                        sync_journal.as_ref().map(Arc::clone),
+                        cfg.bot_ban_duration_secs,
+                        cfg.bot_honeypot_enabled,
+                    );
                     let initial_cfg = Arc::new(crate::sync::server_tls_config(&cert_pem, &key_pem)?);
                     let tls_state: Arc<tokio::sync::RwLock<Arc<rustls::ServerConfig>>> =
                         Arc::new(tokio::sync::RwLock::new(initial_cfg));
@@ -1287,7 +1296,14 @@ async fn build_and_launch(
                     // ── Local CA path ─────────────────────────────────────────
                     let (ca_cert_pem, ca_key_pem) =
                         webui::ensure_webui_ca(&cfg.ui_ca_cert, &cfg.ui_ca_key, &base_dir)?;
-                    let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone(), ca_cert_pem.clone());
+                    let ui_app = webui::router(
+                        api_port, api_key.clone(), base_dir.clone(), ca_cert_pem.clone(),
+                        Arc::clone(&alert_tracker),
+                        icmp_stats.ban_cmd_tx.clone(),
+                        sync_journal.as_ref().map(Arc::clone),
+                        cfg.bot_ban_duration_secs,
+                        cfg.bot_honeypot_enabled,
+                    );
                     let (cert_pem, key_pem, cert_expires) =
                         webui::ensure_webui_cert(&cfg.ui_cert, &cfg.ui_key, &ca_cert_pem, &ca_key_pem, &base_dir)?;
                     let initial_cfg = Arc::new(crate::sync::server_tls_config(&cert_pem, &key_pem)?);
@@ -1423,7 +1439,14 @@ async fn build_and_launch(
                     info!(addr=%ui_addr, "Web UI listening (HTTPS)");
                 } else {
                     // Plain HTTP
-                    let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone(), String::new());
+                    let ui_app = webui::router(
+                        api_port, api_key.clone(), base_dir.clone(), String::new(),
+                        Arc::clone(&alert_tracker),
+                        icmp_stats.ban_cmd_tx.clone(),
+                        sync_journal.as_ref().map(Arc::clone),
+                        cfg.bot_ban_duration_secs,
+                        cfg.bot_honeypot_enabled,
+                    );
                     ui_rt.spawn(async move {
                         let listener = tokio::net::TcpListener::from_std(ui_std_listener)
                             .expect("ui TcpListener::from_std failed");
@@ -1434,6 +1457,30 @@ async fn build_and_launch(
                 }
             }
         }
+    }
+
+
+    // ── Bot defense: background ban eviction task ────────────────────────────
+    {
+        let eviction_tracker = Arc::clone(&alert_tracker);
+        let eviction_ban_tx = icmp_stats.ban_cmd_tx.clone();
+        let eviction_journal = if cfg.is_master() { sync_journal.as_ref().map(Arc::clone) } else { None };
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let expired = eviction_tracker.evict_expired();
+                for ip in expired {
+                    if let std::net::IpAddr::V4(ipv4) = ip {
+                        let _ = eviction_ban_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+                    }
+                    if let Some(journal) = &eviction_journal {
+                        journal.push(crate::sync::SyncOp::DeleteGlobalBan { ip: ip.to_string() });
+                    }
+                    tracing::info!(ip = %ip, "bot defense: ban expired, IP unblocked");
+                }
+            }
+        });
     }
 
     // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
