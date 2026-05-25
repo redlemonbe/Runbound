@@ -49,6 +49,8 @@ pub struct WebUiState {
     auth_events: Arc<std::sync::Mutex<std::collections::VecDeque<AuthEvent>>>,
     /// SEC-A1: per-IP login failure tracker — (failure_count, window_start).
     login_rl: Arc<DashMap<std::net::IpAddr, (u32, Instant)>>,
+    /// Local CA cert PEM served at /webui/ca.crt. Empty when TLS disabled.
+    ca_cert_pem: Arc<String>,
 }
 
 struct WebUiCred {
@@ -56,7 +58,7 @@ struct WebUiCred {
     hash:     String, // argon2id encoded string
 }
 
-pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
+pub fn router(api_port: u16, api_key: String, base_dir: PathBuf, ca_cert_pem: String) -> Router {
     let auth_path = base_dir.join(CRED_FILE);
     let creds = load_or_default_creds(&auth_path);
     let state = Arc::new(WebUiState {
@@ -71,6 +73,7 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         auth_path,
         auth_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(100))),
         login_rl: Arc::new(DashMap::new()),
+        ca_cert_pem: Arc::new(ca_cert_pem),
     });
     // SEC-B10: periodic cleanup of expired sessions (every 5 minutes).
     {
@@ -93,6 +96,7 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         .route("/favicon.ico", get(serve_favicon))
         .route("/webui/auth-events", get(auth_events_handler))
         .route("/api/webui/auth-events", get(auth_events_handler))
+        .route("/webui/ca.crt", get(serve_ca_cert))
         .route("/api",       any(proxy_api))
         .route("/api/*path", any(proxy_api))
         .with_state(state)
@@ -230,6 +234,18 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
 async fn serve_favicon() -> impl axum::response::IntoResponse {
     static FAVICON: &[u8] = include_bytes!("../../examples/web-ui/favicon.ico");
     ([(axum::http::header::CONTENT_TYPE, "image/x-icon")], FAVICON)
+}
+
+async fn serve_ca_cert(State(state): State<Arc<WebUiState>>) -> Response {
+    if state.ca_cert_pem.is_empty() {
+        return (StatusCode::NOT_FOUND, "TLS not enabled").into_response();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-pem-file")
+        .header(header::CONTENT_DISPOSITION, r#"attachment; filename="runbound-ca.pem""#)
+        .body(Body::from(state.ca_cert_pem.as_ref().clone()))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response())
 }
 
 async fn serve_login() -> Html<&'static str> {
@@ -439,35 +455,112 @@ async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> 
 
 // ── WebUI TLS cert management ────────────────────────────────────────────────
 
-/// Load cert+key from configured paths, or auto-generate a self-signed cert.
+/// Generate or load the local CA certificate.
+/// The CA is NEVER auto-renewed — regenerating it would invalidate all client trust stores.
+/// Returns (ca_cert_pem, ca_key_pem).
+pub fn ensure_webui_ca(
+    ca_cert_path: &str,
+    ca_key_path: &str,
+    base_dir: &std::path::Path,
+) -> anyhow::Result<(String, String)> {
+    let cert_file = if !ca_cert_path.is_empty() {
+        std::path::PathBuf::from(ca_cert_path)
+    } else {
+        base_dir.join("webui-ca.pem")
+    };
+    let key_file = if !ca_key_path.is_empty() {
+        std::path::PathBuf::from(ca_key_path)
+    } else {
+        base_dir.join("webui-ca-key.pem")
+    };
+    if cert_file.exists() && key_file.exists() {
+        if let (Ok(cert), Ok(key)) = (
+            std::fs::read_to_string(&cert_file),
+            std::fs::read_to_string(&key_file),
+        ) {
+            tracing::info!(path=%cert_file.display(), "WebUI CA: loaded from disk");
+            return Ok((cert, key));
+        }
+    }
+    gen_webui_ca(&cert_file, &key_file)
+}
+
+fn gen_webui_ca(
+    cert_file: &std::path::Path,
+    key_file: &std::path::Path,
+) -> anyhow::Result<(String, String)> {
+    tracing::info!("WebUI CA: generating local CA certificate (10 years)");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let not_before = rcgen::date_time_ymd(1970, 1, 1)
+        + std::time::Duration::from_secs(now.saturating_sub(60));
+    let not_after = not_before + std::time::Duration::from_secs(10 * 365 * 24 * 3600);
+
+    let mut params = rcgen::CertificateParams::new(vec![])
+        .map_err(|e| anyhow::anyhow!("CA params: {e}"))?;
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.not_before = not_before;
+    params.not_after  = not_after;
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Runbound Local CA");
+    params.distinguished_name.push(rcgen::DnType::OrganizationName, "Runbound");
+
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| anyhow::anyhow!("CA key gen: {e}"))?;
+    let cert = params.self_signed(&key_pair)
+        .map_err(|e| anyhow::anyhow!("CA self-sign: {e}"))?;
+
+    let cert_pem = cert.pem();
+    let key_pem  = key_pair.serialize_pem();
+
+    let _ = std::fs::create_dir_all(
+        cert_file.parent().unwrap_or_else(|| std::path::Path::new("/etc/runbound"))
+    );
+    std::fs::write(cert_file, &cert_pem)
+        .map_err(|e| anyhow::anyhow!("save CA cert: {e}"))?;
+    std::fs::write(key_file, &key_pem)
+        .map_err(|e| anyhow::anyhow!("save CA key: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(key_file, std::fs::Permissions::from_mode(0o600));
+    }
+    tracing::info!(cert=%cert_file.display(), "WebUI CA certificate saved (install once per client)");
+    Ok((cert_pem, key_pem))
+}
+
+/// Load server cert+key, or auto-generate one signed by the local CA.
 /// Returns (cert_pem, key_pem, expires_at).
 pub fn ensure_webui_cert(
     cert_path: &str,
     key_path: &str,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
     base_dir: &std::path::Path,
 ) -> anyhow::Result<(String, String, std::time::SystemTime)> {
-    // File mode: both paths configured and files exist → load
     if !cert_path.is_empty() && !key_path.is_empty() {
         if let (Ok(cert), Ok(key)) = (
             std::fs::read_to_string(cert_path),
             std::fs::read_to_string(key_path),
         ) {
-            // Conservative expiry estimate for file-mode certs (renewal triggered by mtime change)
             let expires = std::time::SystemTime::now()
                 + std::time::Duration::from_secs(90 * 24 * 3600);
             tracing::info!(cert=%cert_path, "WebUI TLS: loaded cert from file");
             return Ok((cert, key, expires));
         }
     }
-    gen_webui_cert(cert_path, key_path, base_dir)
+    gen_webui_cert(cert_path, key_path, ca_cert_pem, ca_key_pem, base_dir)
 }
 
 fn gen_webui_cert(
     cert_path: &str,
     key_path: &str,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
     base_dir: &std::path::Path,
 ) -> anyhow::Result<(String, String, std::time::SystemTime)> {
-    tracing::info!("WebUI TLS: generating self-signed certificate (365 days)");
+    tracing::info!("WebUI TLS: generating certificate signed by local CA (366 days)");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -475,19 +568,30 @@ fn gen_webui_cert(
     let not_before = rcgen::date_time_ymd(1970, 1, 1)
         + std::time::Duration::from_secs(now.saturating_sub(60));
     let not_after  = not_before + std::time::Duration::from_secs(366 * 24 * 3600);
+
+    // Load CA for signing
+    let ca_key = rcgen::KeyPair::from_pem(ca_key_pem)
+        .map_err(|e| anyhow::anyhow!("load CA key: {e}"))?;
+    let ca_params = rcgen::CertificateParams::from_ca_cert_pem(ca_cert_pem)
+        .map_err(|e| anyhow::anyhow!("load CA cert params: {e}"))?;
+    let ca_cert = ca_params.self_signed(&ca_key)
+        .map_err(|e| anyhow::anyhow!("CA re-sign: {e}"))?;
+
+    // Generate server cert with IP SANs for LAN access
     let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .map_err(|e| anyhow::anyhow!("webui cert params: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("server cert params: {e}"))?;
     params.not_before = not_before;
     params.not_after  = not_after;
-    let key_pair = rcgen::KeyPair::generate()
-        .map_err(|e| anyhow::anyhow!("webui key gen: {e}"))?;
-    let cert = params.self_signed(&key_pair)
-        .map_err(|e| anyhow::anyhow!("webui cert sign: {e}"))?;
-    let rcgen::CertifiedKey { cert, key_pair } = rcgen::CertifiedKey { cert, key_pair };
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Runbound WebUI");
 
-    // Save to configured paths, or default base_dir locations
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| anyhow::anyhow!("server key gen: {e}"))?;
+    let cert = params.signed_by(&key_pair, &ca_cert, &ca_key)
+        .map_err(|e| anyhow::anyhow!("server cert sign: {e}"))?;
+
+    let cert_pem = cert.pem();
+    let key_pem  = key_pair.serialize_pem();
+
     let save_cert = if !cert_path.is_empty() {
         std::path::PathBuf::from(cert_path)
     } else {
@@ -511,13 +615,11 @@ fn gen_webui_cert(
             let _ = std::fs::set_permissions(&save_key, std::fs::Permissions::from_mode(0o600));
         }
     }
-
-    let expires = std::time::SystemTime::now()
-        + std::time::Duration::from_secs(365 * 24 * 3600);
+    let expires = std::time::SystemTime::now() + std::time::Duration::from_secs(365 * 24 * 3600);
     tracing::info!(
         cert=%save_cert.display(),
         key=%save_key.display(),
-        "WebUI TLS certificate saved"
+        "WebUI TLS certificate saved (CA-signed)"
     );
     Ok((cert_pem, key_pem, expires))
 }

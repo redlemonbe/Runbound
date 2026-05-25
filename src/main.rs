@@ -1059,7 +1059,6 @@ async fn build_and_launch(
             Ok(ui_std_listener) => {
                 ui_std_listener.set_nonblocking(true).ok();
                 let api_port = cfg.api_port.unwrap_or(8080);
-                let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone());
                 let ui_rt = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(1)
                     .thread_name("runbound-ui")
@@ -1067,9 +1066,12 @@ async fn build_and_launch(
                     .build()
                     .map_err(|e| anyhow::anyhow!("Web UI runtime: {e}"))?;
                 if cfg.ui_tls {
-                    // TLS path: cert gen/load + auto-renewal loop + manual accept loop
+                    // TLS path: generate CA first, then server cert signed by CA
+                    let (ca_cert_pem, ca_key_pem) =
+                        webui::ensure_webui_ca(&cfg.ui_ca_cert, &cfg.ui_ca_key, &base_dir)?;
+                    let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone(), ca_cert_pem.clone());
                     let (cert_pem, key_pem, cert_expires) =
-                        webui::ensure_webui_cert(&cfg.ui_cert, &cfg.ui_key, &base_dir)?;
+                        webui::ensure_webui_cert(&cfg.ui_cert, &cfg.ui_key, &ca_cert_pem, &ca_key_pem, &base_dir)?;
                     let initial_cfg = Arc::new(crate::sync::server_tls_config(&cert_pem, &key_pem)?);
                     let tls_state: Arc<tokio::sync::RwLock<Arc<rustls::ServerConfig>>> =
                         Arc::new(tokio::sync::RwLock::new(initial_cfg));
@@ -1079,6 +1081,8 @@ async fn build_and_launch(
                         let tls_state2    = Arc::clone(&tls_state);
                         let cert_path_r   = cfg.ui_cert.clone();
                         let key_path_r    = cfg.ui_key.clone();
+                        let ca_cert_pem_r = ca_cert_pem.clone();
+                        let ca_key_pem_r  = ca_key_pem.clone();
                         let base_dir_r    = base_dir.clone();
                         ui_rt.spawn(async move {
                             let mut interval = tokio::time::interval(
@@ -1105,7 +1109,7 @@ async fn build_and_launch(
                                     changed
                                 };
                                 if !need { continue; }
-                                match webui::ensure_webui_cert(&cert_path_r, &key_path_r, &base_dir_r) {
+                                match webui::ensure_webui_cert(&cert_path_r, &key_path_r, &ca_cert_pem_r, &ca_key_pem_r, &base_dir_r) {
                                     Ok((c, k, new_exp)) => {
                                         match crate::sync::server_tls_config(&c, &k) {
                                             Ok(cfg2) => {
@@ -1201,6 +1205,7 @@ async fn build_and_launch(
                     info!(addr=%ui_addr, "Web UI listening (HTTPS)");
                 } else {
                     // Plain HTTP
+                    let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone(), String::new());
                     ui_rt.spawn(async move {
                         let listener = tokio::net::TcpListener::from_std(ui_std_listener)
                             .expect("ui TcpListener::from_std failed");
