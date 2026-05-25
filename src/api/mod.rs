@@ -5971,6 +5971,12 @@ async fn put_blocked_ip(
             if let std::net::IpAddr::V4(ipv4) = ip {
                 let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
             }
+            if let (Some(ref j), Some(ref k)) = (&state.sync_journal, &state.sync_key) {
+                crate::api::relay::push_to_slaves(
+                    j, k, axum::http::Method::PUT,
+                    format!("alerts/blocked/{ip_str}"), bytes::Bytes::new(),
+                );
+            }
             (StatusCode::OK, JsonExtract(serde_json::json!({"blocked": true, "ip": ip_str}))).into_response()
         }
         Err(_) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error": "invalid IP"}))).into_response(),
@@ -5988,6 +5994,12 @@ async fn delete_blocked_ip(
             state.icmp_stats.unban(ip);
             if let std::net::IpAddr::V4(ipv4) = ip {
                 let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+            }
+            if let (Some(ref j), Some(ref k)) = (&state.sync_journal, &state.sync_key) {
+                crate::api::relay::push_to_slaves(
+                    j, k, axum::http::Method::DELETE,
+                    format!("alerts/blocked/{ip_str}"), bytes::Bytes::new(),
+                );
             }
             (StatusCode::OK, JsonExtract(serde_json::json!({"unblocked": removed, "ip": ip_str}))).into_response()
         }
