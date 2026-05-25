@@ -266,6 +266,20 @@ pub struct UnboundConfig {
     /// Path to the local CA private key PEM. Empty = auto-generated in base_dir.
     pub ui_ca_key: String,
 
+    // ── WebUI TLS — Option B: ACME / Let's Encrypt ──────────────────────────
+    /// Set ui-tls to "acme" to use DNS-01 Let's Encrypt instead of local CA.
+    pub ui_tls_acme: bool,
+    /// Domain to obtain a Let's Encrypt certificate for (e.g. runbound.example.com).
+    pub ui_acme_domain: String,
+    /// Contact email for the Let's Encrypt account.
+    pub ui_acme_email: String,
+    /// DNS provider for DNS-01 challenge: "cloudflare" or "hook".
+    pub ui_acme_dns: String,
+    /// Cloudflare API token with Zone:DNS:Edit permission (when ui-acme-dns: cloudflare).
+    pub ui_acme_cf_token: String,
+    /// Path to hook script called as: script add|del NAME VALUE (when ui-acme-dns: hook).
+    pub ui_acme_hook: String,
+
     // ── UDP socket options (#20) ─────────────────────────────────────────────
     /// Enable SO_BUSY_POLL + SO_PREFER_BUSY_POLL on UDP sockets. Default: false.
     /// Spins in kernel context instead of sleeping between packets.
@@ -331,6 +345,12 @@ impl UnboundConfig {
             ui_key: String::new(),
             ui_ca_cert: String::new(),
             ui_ca_key: String::new(),
+            ui_tls_acme: false,
+            ui_acme_domain: String::new(),
+            ui_acme_email: String::new(),
+            ui_acme_dns: String::new(),
+            ui_acme_cf_token: String::new(),
+            ui_acme_hook: String::new(),
             icmp_enabled: false,
             icmp_rate_pps: 10,
             icmp_burst: 5,
@@ -662,11 +682,20 @@ fn parse_server_directive(
         "ui-enabled" => cfg.ui_enabled = val.trim_matches('"') == "yes",
         "ui-port" => cfg.ui_port = val.parse().unwrap_or(8090),
         "ui-bind" => cfg.ui_bind = val.trim_matches('"').to_owned(),
-        "ui-tls"  => cfg.ui_tls = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
+        "ui-tls"  => match val.trim().trim_matches('"') {
+            "acme" => { cfg.ui_tls = true;  cfg.ui_tls_acme = true; }
+            "no" | "false" | "0" => cfg.ui_tls = false,
+            _ => { cfg.ui_tls = true; cfg.ui_tls_acme = false; } // yes/true/1/ca
+        },
         "ui-cert"    => cfg.ui_cert    = val.trim().trim_matches('"').to_owned(),
         "ui-key"     => cfg.ui_key     = val.trim().trim_matches('"').to_owned(),
-        "ui-ca-cert" => cfg.ui_ca_cert = val.trim().trim_matches('"').to_owned(),
-        "ui-ca-key"  => cfg.ui_ca_key  = val.trim().trim_matches('"').to_owned(),
+        "ui-ca-cert"      => cfg.ui_ca_cert      = val.trim().trim_matches('"').to_owned(),
+        "ui-ca-key"       => cfg.ui_ca_key       = val.trim().trim_matches('"').to_owned(),
+        "ui-acme-domain"  => cfg.ui_acme_domain  = val.trim().trim_matches('"').to_owned(),
+        "ui-acme-email"   => cfg.ui_acme_email   = val.trim().trim_matches('"').to_owned(),
+        "ui-acme-dns"     => cfg.ui_acme_dns     = val.trim().trim_matches('"').to_owned(),
+        "ui-acme-cf-token"=> cfg.ui_acme_cf_token= val.trim().trim_matches('"').to_owned(),
+        "ui-acme-hook"    => cfg.ui_acme_hook    = val.trim().trim_matches('"').to_owned(),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }
