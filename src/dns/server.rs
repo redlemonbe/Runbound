@@ -175,6 +175,7 @@ pub struct RunboundHandler {
     stale_max_age: u64,
     /// #14: allow DNS UPDATE (RFC 2136). False = refuse all UPDATE messages.
     allow_update: bool,
+    block_https_record: bool,
     /// #14: TSIG keys for DNS UPDATE authentication: (name, algorithm, base64-secret).
     /// SEC-20: pre-decoded TSIG keys (name_lower, algorithm, key_bytes) — decoded once at startup.
     tsig_keys: Vec<(String, TsigAlgorithm, Vec<u8>)>,
@@ -210,6 +211,7 @@ impl RunboundHandler {
         stale_answer_ttl: u32,
         stale_max_age: u64,
         allow_update: bool,
+        block_https_record: bool,
         tsig_keys_raw: Vec<(String, String, String)>,
         alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
         axfr_allow: Vec<String>,
@@ -246,6 +248,7 @@ impl RunboundHandler {
             stale_answer_ttl,
             stale_max_age,
             allow_update,
+            block_https_record,
             // SEC-20: decode TSIG keys once at startup instead of per-request.
             tsig_keys: tsig_keys_raw.into_iter().filter_map(|(name, alg_str, secret_b64)| {
                 let alg = match alg_str.as_str() {
@@ -1031,6 +1034,17 @@ impl RequestHandler for RunboundHandler {
                 start,
             );
             return send_error(request, response_handle, ResponseCode::NotImp).await;
+        }
+
+        // ── 3d. block-https-record: suppress HTTPS type-65 hints (QUIC/HTTP3 guard) ──
+        if self.block_https_record && qtype == RecordType::HTTPS {
+            self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
+            let mut rh = response_handle;
+            let mut metadata = Metadata::response_from_request(&request.metadata);
+            metadata.authoritative = false;
+            let builder = MessageResponseBuilder::from_message_request(request);
+            let response = builder.build(metadata, std::iter::empty::<&Record>(), std::iter::empty(), std::iter::empty(), std::iter::empty());
+            return rh.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
         }
 
         debug!(%client_ip, name=%sanitize_dns_name(qname), type=%qtype, "DNS query");
@@ -2180,6 +2194,7 @@ pub async fn run_dns_server(
         cfg.stale_answer_ttl,
         cfg.stale_max_age,
         cfg.allow_update,
+        cfg.block_https_record,
         cfg.tsig_keys.clone(),
         Some(Arc::clone(&alert_tracker)),
         cfg.axfr_allow.clone(),
