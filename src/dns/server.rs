@@ -254,14 +254,14 @@ impl RunboundHandler {
                     "hmac-sha384" | "HMAC-SHA384" => TsigAlgorithm::HmacSha384,
                     "hmac-sha1"   | "HMAC-SHA1"   => TsigAlgorithm::HmacSha1,
                     other => {
-                        tracing::warn!(alg=%other, key=%name, "TSIG: unsupported algorithm, key ignored");
+                        tracing::error!(alg=%other, key=%name, "TSIG: unsupported algorithm — key will NOT be loaded, DDNS may be unprotected");
                         return None;
                     }
                 };
                 match base64::engine::general_purpose::STANDARD.decode(&secret_b64) {
                     Ok(bytes) => Some((name.to_ascii_lowercase(), alg, bytes)),
                     Err(e) => {
-                        tracing::warn!(key=%name, err=%e, "TSIG: base64 decode failed at startup, key ignored");
+                        tracing::error!(key=%name, err=%e, "TSIG: base64 decode failed — key will NOT be loaded, DDNS may be unprotected");
                         None
                     }
                 }

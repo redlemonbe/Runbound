@@ -225,7 +225,8 @@ async fn handle_login(
 ) -> Response {
     let client_ip_addr = addr.ip();
     let client_ip = client_ip_addr.to_string();
-    // SEC-A1: rate-limit login failures — 5 failures per 60s per IP.
+    // SEC-A1/SEC-B5: atomic rate-limit — pre-increment inside the shard lock to prevent
+    // concurrent-request bypass. On success, entry is removed (reset). On failure, count stays.
     {
         let now = Instant::now();
         let mut entry = state.login_rl.entry(client_ip_addr).or_insert((0u32, now));
@@ -235,6 +236,7 @@ async fn handle_login(
             tracing::warn!(ip = %client_ip, "WebUI login rate-limited");
             return (StatusCode::TOO_MANY_REQUESTS, Html("<h1>Too many attempts. Try again in a minute.</h1>")).into_response();
         }
+        *count += 1; // Pre-increment atomically — prevents concurrent bypass
     }
     let ok = {
         let creds = state.creds.lock().unwrap_or_else(|e| e.into_inner());
@@ -247,14 +249,12 @@ async fn handle_login(
         }
     };
     if !ok {
-        // SEC-A1: increment failure counter on bad credentials.
-        if let Some(mut entry) = state.login_rl.get_mut(&client_ip_addr) {
-            entry.value_mut().0 += 1;
-        }
         tracing::warn!(user = %form.username, ip = %client_ip, "WebUI login FAILED — invalid credentials");
         push_auth_event(&state, "login_fail", &form.username, &client_ip);
         return Redirect::to("/login?err=Invalid%20credentials").into_response();
     }
+    // Success — reset rate limit
+    state.login_rl.remove(&client_ip_addr);
     // Purge expired sessions before adding a new one
     state.sessions.retain(|_, (exp, _)| Instant::now() < *exp);
     let token = uuid::Uuid::new_v4().to_string();
@@ -361,6 +361,12 @@ async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> 
         return (StatusCode::UNAUTHORIZED, r#"{"error":"not authenticated"}"#).into_response();
     }
     let method  = req.method().clone();
+    // SEC-B14: require CSRF token for all state-changing methods forwarded to the API.
+    if matches!(method, axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE | axum::http::Method::PATCH) {
+        if !verify_csrf(&state, req.headers()) {
+            return (StatusCode::FORBIDDEN, r#"{"error":"invalid CSRF token"}"#).into_response();
+        }
+    }
     let uri     = req.uri().clone();
     let headers = req.headers().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), 65_536).await {
