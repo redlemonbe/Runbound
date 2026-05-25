@@ -573,10 +573,10 @@ curl -X POST http://localhost:8080/api/reload \
 ```
 
 ```json
-{"status": "ok", "cfg_path": "/etc/runbound/unbound.conf", "local_zones": 5, "local_data": 12}
+{"status": "ok", "cfg_path": "/etc/runbound/runbound.conf", "local_zones": 5, "local_data": 12, "alert_rules": 2}
 ```
 
-**Note:** ACL rules, forward-zone upstreams, alert rules, and privacy settings (`log-retention`, `log-client-ip`) require a full restart.
+**Note:** ACL rules, forward-zone upstreams, and privacy settings (`log-retention`, `log-client-ip`) require a full restart. As of v0.9.44, alert rules **are** reloaded by `POST /api/reload` without a restart.
 
 ---
 
@@ -1195,7 +1195,7 @@ Returns the updated config:
 
 Monitor client query rates and automatically block abusive sources.
 Alert rules are defined in `runbound.conf` (see [Configuration](configuration.md#alert-thresholds)).
-Rules are loaded at startup; changing them in the config file requires a restart (not just `POST /api/reload`).
+As of v0.9.44, alert rules are reloaded by `POST /api/reload` — a full restart is no longer required to update them.
 
 ### `GET /api/alerts`
 
@@ -1243,6 +1243,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/aler
 | `blocked_clients` | IPs currently blocked; `permanent: true` means no expiry (blocked until restart or manual unblock) |
 | `recent_alerts` | Last 100 alert events (ring buffer) |
 | `expires_in_s` | Seconds until the block expires; absent for permanent blocks |
+
+> Bot defense bans appear in `blocked_clients` with `rule` values of `bot-honeypot`, `bot-scanner`,
+> or `bot-burst`. They are subject to the configured `bot-ban-duration-secs` expiry.
 
 ---
 
