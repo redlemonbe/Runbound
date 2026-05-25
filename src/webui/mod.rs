@@ -183,11 +183,11 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     <form method="POST" action="/login">
       <div style="margin-bottom:16px">
         <label for="u">Username</label>
-        <input id="u" name="username" type="text" autocomplete="username" class="input w-full" placeholder="admin"/>
+        <input id="u" name="username" type="text" autocomplete="username" class="input w-full"/>
       </div>
       <div style="margin-bottom:26px">
         <label for="p">Password</label>
-        <input id="p" name="password" type="password" autocomplete="current-password" class="input w-full" placeholder="········"/>
+        <input id="p" name="password" type="password" autocomplete="current-password" class="input w-full"/>
       </div>
       <button type="submit" class="btn-primary w-full mt-2">Sign in →</button>
     </form>

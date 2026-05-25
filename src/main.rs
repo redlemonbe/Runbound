@@ -755,6 +755,8 @@ async fn build_and_launch(
 
     // Hoisted so both SlaveClient and AppState share the same mutex instance.
     let zones_mutex = Arc::new(tokio::sync::Mutex::new(()));
+    // Hoisted so both NodeRelay (slave relay) and DNS handler share the same instance.
+    let domain_stats = DomainStats::new();
 
     // Slave node UUID — generated once, persisted to disk (#88).
     let node_id: Option<String> = if cfg.is_slave() {
@@ -800,6 +802,7 @@ async fn build_and_launch(
                                     cfg: Arc::clone(&cfg_arc),
                                     upstreams: Arc::clone(&upstreams),
                                     stats_cache: Arc::clone(&snapshot_cache),
+                                    domain_stats: Arc::clone(&domain_stats),
                                     dnssec_enabled: Arc::clone(&dnssec_enabled),
                                     resolver: Arc::clone(&resolver),
                                 });
@@ -958,7 +961,6 @@ async fn build_and_launch(
 
     let events_tx = sync_journal.as_ref().map(|j| j.events_tx.clone());
 
-    let domain_stats = DomainStats::new();
     let icmp_stats = IcmpStats::new();
     let icmp_cfg = Arc::new(std::sync::Mutex::new(IcmpConfig {
         enabled: cfg.icmp_enabled,
