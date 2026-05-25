@@ -25,10 +25,10 @@ fn compress_webui() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir      = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    println!("cargo:rerun-if-changed=examples/web-ui/index.html");
+    println!("cargo:rerun-if-changed=src/webui/index.html");
 
-    let html = fs::read(manifest_dir.join("examples/web-ui/index.html"))
-        .expect("examples/web-ui/index.html not found");
+    let html = fs::read(manifest_dir.join("src/webui/index.html"))
+        .expect("src/webui/index.html not found");
 
     let mut enc = GzEncoder::new(Vec::new(), Compression::best());
     enc.write_all(&html).expect("gzip write");
