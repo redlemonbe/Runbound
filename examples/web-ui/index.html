@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Runbound — Management Console</title>
-  <link rel="icon" href="/favicon.ico"/>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2322d3ee' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cline x1='2' y1='12' x2='22' y2='12'/%3E%3Cpath d='M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z'/%3E%3C/svg%3E"/>
   <style>
     body { font-family: 'SF Mono','Fira Code','Consolas',monospace; }
     .tab-active { border-bottom:2px solid #22d3ee; color:#22d3ee; }
@@ -234,7 +234,7 @@
 
 <!-- Banner -->
 <div class="bg-gray-950 border-b border-gray-800/60 px-5 py-2.5 flex flex-wrap items-center gap-3 shadow-lg shadow-black/40">
-  <span class="text-cyan-400 font-bold text-sm tracking-widest shrink-0" style="text-shadow:0 0 18px #22d3ee55">RUNBOUND</span>
+  <div class="flex items-center gap-2 shrink-0"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:block;flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg><span class="text-cyan-400 font-bold text-sm tracking-widest" style="text-shadow:0 0 18px #22d3ee55">RUNBOUND</span></div>
   <span id="conn-dot" class="w-1.5 h-1.5 rounded-full bg-gray-700 shrink-0"></span>
   <span id="conn-status" class="text-xs text-gray-600 shrink-0">not connected</span>
   <div id="node-pills" class="flex items-center gap-1.5 ml-1 flex-wrap"></div>
