@@ -847,10 +847,22 @@ async fn build_and_launch(
     let zones_mutex = Arc::new(tokio::sync::Mutex::new(()));
     // Hoisted so both NodeRelay (slave relay) and DNS handler share the same instance.
     let domain_stats = DomainStats::new();
-    let alert_tracker = crate::alerts::AlertTracker::new(cfg.alerts.clone());
+    let alert_tracker = crate::alerts::AlertTracker::new(cfg.alerts.clone(), Some(base_dir.clone()));
 
     // icmp state hoisted here so NodeRelay (slave relay) can reference it
     let icmp_stats = IcmpStats::new();
+
+    // SEC-C3: periodic cleanup of expired ICMP ban entries (24h TTL, runs hourly).
+    {
+        let icmp_cleanup = Arc::clone(&icmp_stats);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                icmp_cleanup.cleanup_expired_bans(86_400);
+            }
+        });
+    }
     let (icmp_en, icmp_rate, icmp_burst_val, icmp_ban_thr) = {
         let p = base_dir.join("icmp.json");
         std::fs::read_to_string(&p).ok()

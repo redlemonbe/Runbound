@@ -118,7 +118,7 @@ struct {
 // Userspace sums all CPU slots then deletes the entry to reset.
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-    __uint(max_entries, 8192);
+    __uint(max_entries, 65536);
     __type(key, __be32);
     __type(value, __u64);
 } icmp_rl_counts SEC(".maps");

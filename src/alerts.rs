@@ -4,8 +4,9 @@
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use serde::Serialize;
@@ -30,7 +31,7 @@ struct ClientBucket {
 }
 
 struct BlockEntry {
-    expires: Option<Instant>, // None = permanent until restart
+    expires: Option<Instant>, // None = permanent
     rule: String,
 }
 
@@ -40,19 +41,89 @@ pub struct AlertTracker {
     blocked: DashMap<IpAddr, BlockEntry, ahash::RandomState>,
     recent: Mutex<VecDeque<AlertEvent>>,
     notify_tx: tokio::sync::mpsc::UnboundedSender<(String, AlertEvent)>,
+    base_dir: Option<Arc<PathBuf>>,
 }
 
 impl AlertTracker {
-    pub fn new(rules: Vec<AlertRule>) -> std::sync::Arc<Self> {
+    pub fn new(rules: Vec<AlertRule>, base_dir: Option<PathBuf>) -> std::sync::Arc<Self> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(String, AlertEvent)>();
         tokio::spawn(webhook_sender(rx));
-        std::sync::Arc::new(Self {
+        let base_dir_arc = base_dir.map(Arc::new);
+        let tracker = std::sync::Arc::new(Self {
             rules,
             client_counts: DashMap::with_hasher(ahash::RandomState::default()),
             blocked: DashMap::with_hasher(ahash::RandomState::default()),
             recent: Mutex::new(VecDeque::new()),
             notify_tx: tx,
-        })
+            base_dir: base_dir_arc,
+        });
+        tracker.load_blocks();
+        tracker
+    }
+
+    fn blocks_path(&self) -> Option<PathBuf> {
+        self.base_dir.as_ref().map(|d| d.join("alert-blocks.json"))
+    }
+
+    // SEC-B7: persist current block set to disk so bans survive restarts.
+    fn persist_blocks(&self) {
+        let Some(path) = self.blocks_path() else { return };
+        let now = Instant::now();
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entries: Vec<serde_json::Value> = self.blocked.iter()
+            .filter_map(|e| {
+                let ip = e.key();
+                let entry = e.value();
+                let expires_epoch = match entry.expires {
+                    None => serde_json::Value::Null,
+                    Some(exp) => {
+                        let remaining = exp.saturating_duration_since(now).as_secs();
+                        serde_json::json!(now_epoch + remaining)
+                    }
+                };
+                Some(serde_json::json!({
+                    "ip": ip.to_string(),
+                    "rule": &entry.rule,
+                    "expires_epoch": expires_epoch,
+                }))
+            })
+            .collect();
+        if let Ok(data) = serde_json::to_vec(&entries) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
+
+    // SEC-B7: load block set from disk on startup.
+    fn load_blocks(&self) {
+        let Some(path) = self.blocks_path() else { return };
+        let Ok(data) = std::fs::read_to_string(&path) else { return };
+        let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&data) else { return };
+        let now = Instant::now();
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut count = 0usize;
+        for entry in entries {
+            let ip_str = entry["ip"].as_str().unwrap_or("");
+            let Ok(ip) = ip_str.parse::<IpAddr>() else { continue };
+            let rule = entry["rule"].as_str().unwrap_or("unknown").to_string();
+            let expires = match entry["expires_epoch"].as_u64() {
+                None => None, // permanent
+                Some(epoch) => {
+                    if epoch <= now_epoch { continue } // already expired
+                    Some(now + Duration::from_secs(epoch - now_epoch))
+                }
+            };
+            self.blocked.insert(ip, BlockEntry { expires, rule });
+            count += 1;
+        }
+        if count > 0 {
+            tracing::info!(count, "Alert blocks loaded from disk");
+        }
     }
 
     /// Returns true if this IP is currently blocked by an alert rule.
@@ -153,6 +224,7 @@ impl AlertTracker {
                     Some(now + std::time::Duration::from_secs(rule.block_duration_s))
                 };
                 self.blocked.insert(ip, BlockEntry { expires, rule: rule.name.clone() });
+                self.persist_blocks();
             }
             "notify" => {
                 if let Some(url) = &rule.notify_url {
@@ -213,7 +285,9 @@ impl AlertTracker {
 
     /// Unblock an IP (API: DELETE /api/alerts/blocked/{ip}).
     pub fn unblock(&self, ip: IpAddr) -> bool {
-        self.blocked.remove(&ip).is_some()
+        let removed = self.blocked.remove(&ip).is_some();
+        if removed { self.persist_blocks(); }
+        removed
     }
 
     /// Immediately block an IP without going through a rule threshold.
@@ -223,6 +297,7 @@ impl AlertTracker {
             return;
         }
         self.blocked.insert(ip, BlockEntry { expires: None, rule: rule.clone() });
+        self.persist_blocks();
         let event = AlertEvent {
             ts: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

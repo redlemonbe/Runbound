@@ -95,6 +95,26 @@ impl IcmpStats {
         self.banned.remove(&ip);
     }
 
+    /// Remove ban entries older than  and unban from XDP fast path.
+    /// Called periodically by a background task (default: every hour, 24h TTL).
+    pub fn cleanup_expired_bans(&self, ttl_secs: u64) {
+        let now = std::time::Instant::now();
+        let mut to_unban: Vec<IpAddr> = Vec::new();
+        self.banned.retain(|ip, entry| {
+            if now.duration_since(entry.ts).as_secs() < ttl_secs {
+                true
+            } else {
+                to_unban.push(*ip);
+                false
+            }
+        });
+        for ip in to_unban {
+            if let IpAddr::V4(ipv4) = ip {
+                let _ = self.ban_cmd_tx.send(IcmpBanCmd::Unban(ipv4));
+            }
+        }
+    }
+
     pub fn banned_snapshot(&self) -> Vec<serde_json::Value> {
         let now = Instant::now();
         self.banned.iter().map(|e| {
