@@ -1,7 +1,7 @@
 # Runbound Internals — Packet Lifecycle & Architecture
 
 Audience: kernel/network engineers, performance analysts, contributors.  
-Version: v0.6.9. Planned items are marked **[planned]**.
+Version: v0.9.37. Planned items are marked **[planned]**.
 
 ---
 
@@ -123,6 +123,40 @@ Effect: L1/L2 cache stays warm for each domain on its dedicated core. Cross-core
 
 `XSKMAP max_entries = 64` — architectural limit. Runbound rejects `queue_id >= 64` at load time. On cards with > 64 queues, excess queues fall back to XDP_PASS.
 
+### ICMP kernel-bypass responder (v0.9.1)
+
+Runbound handles ICMP echo requests (ping) entirely inside the eBPF program — no packet
+ever reaches the kernel IP stack for ICMP, eliminating per-packet softirq cost.
+
+**BPF maps:**
+
+| Map | Type | Purpose |
+|-----|------|---------|
+| `icmp_cfg` | `BPF_MAP_TYPE_ARRAY` | Config flags: enabled/disabled |
+| `icmp_rate_limit` | `BPF_MAP_TYPE_LRU_HASH` | Per-source IP token bucket (tokens remaining, last_ts) |
+| `icmp_banned` | `BPF_MAP_TYPE_LRU_HASH` | Temporarily banned IPs (flood detection) |
+
+**Per-packet logic:**
+
+```
+ICMP echo request received
+    ↓
+icmp_cfg[0].enabled == 0 ?  →  XDP_PASS (kernel handles normally)
+    ↓
+icmp_banned[src_ip] present ?  →  XDP_DROP (ban still active)
+    ↓
+icmp_rate_limit[src_ip]: tokens > 0 ?
+    no  →  insert icmp_banned[src_ip]  →  XDP_DROP
+    yes →  decrement token, continue
+    ↓
+swap src/dst MAC + IP, set type=ECHO_REPLY, recompute checksum
+    ↓
+XDP_TX (transmit directly from driver, zero kernel involvement)
+```
+
+Rate limit and ban thresholds are configurable via `POST /api/icmp`. Values are written
+to BPF maps via `aya` map handles — no XDP detach/reattach needed.
+
 ---
 
 ## 3. AF_XDP socket and UMEM
@@ -190,10 +224,18 @@ total (cache hit)      ~930 ns   ≈ 1 µs/query
 
 **Implemented.** `ArcSwap<HashMap<QuestionKey, CacheEntry>>` in `src/dns/cache_snapshot.rs`.
 
-- Publish loop runs every **10 ms** (reduced from 100 ms in v0.6.9)
 - XDP worker calls `cache.load()` — atomic pointer load, no lock, no syscall
 - Cache insertions go through `DashMap<QuestionKey, CacheEntry>` (16-shard RwLock, no global contention)
-- Publish loop snapshots the DashMap via shard iteration and stores a new `Arc<HashMap>` atomically
+- Publish loop stores a new `Arc<HashMap>` atomically
+
+**Generation-skipping publish (v0.9.17, PERF-1/#135):** the publish loop no longer
+clones the DashMap unconditionally every 10 ms. A `CACHE_WRITE_GEN` atomic counter
+is incremented only on `cache_insert`. The publish loop compares it to the last
+published generation and skips the O(n) clone when no writes occurred. A forced
+eviction pass runs every 256 ticks (~2.56 s) to drop TTL-expired entries regardless.
+
+Effect: at steady-state (warm cache, no new upstream responses), CPU usage of the
+publish loop drops to near zero. Under heavy ingest the full clone still runs.
 
 **Planned (#64 — wire format cache):** pre-serialize the DNS response payload at insert time. XDP worker skips DNS parsing entirely — just `memcpy` the pre-built UDP payload into the TX frame and patch the QueryID (2 bytes). Expected hot path: **< 300 ns** total.
 
@@ -233,6 +275,24 @@ if desc.len > FRAME_SIZE || end.map(|e| e > umem.area_len).unwrap_or(true) {
 
 32 `SO_REUSEPORT` UDP sockets, one per physical core. The kernel distributes incoming packets across sockets by 4-tuple hash. Each Tokio worker owns one socket — no cross-thread contention on the receive path.
 
+**SO_BUSY_POLL (v0.9.17):** when XDP is unavailable (containers, cloud VMs), Runbound
+applies `SO_BUSY_POLL` to each socket:
+
+```rust
+setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &50u32)  // 50 µs kernel spin-poll
+```
+
+The kernel spins on the driver RX queue for up to 50 µs before sleeping, eliminating
+the scheduler wakeup for high-QPS bursts. Configurable via config:
+
+```
+server:
+    busy-poll-us: 50    # default: 50 (0 = disabled)
+```
+
+Effect: −20–60 µs p50 latency on the slow path at the cost of one pinned CPU. Disabled
+automatically when XDP is active (XDP workers spin-poll AF_XDP rings natively).
+
 ### Resolver
 
 `hickory-server` with `hickory-resolver` for upstream forwarding.
@@ -248,6 +308,123 @@ if desc.len > FRAME_SIZE || end.map(|e| e > umem.area_len).unwrap_or(true) {
 ### Cache insertion
 
 DNS responses from upstream are inserted into `DashMap<QuestionKey, CacheEntry>` (lock-free at entry level). The XDP cache snapshot picks them up within 10 ms.
+
+### Cgroup v2 memory awareness (v0.9.28)
+
+At startup, Runbound inspects its own cgroup to determine available memory before
+sizing the DNS cache:
+
+```
+/proc/self/cgroup  →  parse v2 path  →  /sys/fs/cgroup/<path>/memory.max
+                                         /sys/fs/cgroup/<path>/memory.current
+```
+
+Cache size formula:
+
+```
+available = memory.max - memory.current
+cache_size = min(available × 0.60, 1 GiB)
+```
+
+If `memory.max` is `max` (unlimited), falls back to `MemAvailable` from `/proc/meminfo`.
+The `MemoryMax=2G` directive in the systemd unit sets the cgroup limit. With a fresh
+start (~80 MiB RSS), Runbound allocates ~(2048−80)×0.60 ≈ 1.18 GiB → rounded to 1 GiB.
+
+Logged at startup: `INFO runbound::dns::server: cache size auto-sized from MemAvailable cache_size=N`
+
+### Serve-stale (RFC 8767, v0.9.3)
+
+When all upstreams are unreachable, Runbound answers from expired cache entries rather
+than returning SERVFAIL (`src/dns/serve_stale.rs`):
+
+```
+upstream timeout / all upstreams unreachable
+    ↓
+cache lookup (expired entries included)
+    found  →  answer with TTL clamped to serve-stale-ttl + EDE code 3 (Stale Answer)
+    missing →  SERVFAIL
+```
+
+```
+server:
+    serve-stale: yes              # default: no
+    serve-stale-ttl: 30           # TTL reported for stale answers (seconds)
+    serve-stale-max-age: 86400    # refuse entries expired longer than this
+```
+
+Stale entries are replaced by fresh upstream responses as soon as connectivity recovers.
+
+### Per-client alert thresholds (v0.9.12)
+
+`src/alerts.rs` implements configurable per-client-IP alert rules. Each rule watches
+one metric (query rate, NXDOMAIN rate, or blocked-query rate) and fires an action (log,
+webhook, or auto-block):
+
+```
+IncomingQuery { src_ip, qtype, blocked, nxdomain }
+    ↓
+AlertSet::check(&src_ip, &event)
+    → TokenBucket per (rule_id, src_ip) in DashMap
+    → threshold exceeded? → log / POST webhook / add to blacklist
+```
+
+```
+alert:
+    name:    "flood detector"
+    metric:  qps          # qps | nxdomain-rate | blocked-rate
+    limit:   500
+    window:  10           # seconds
+    action:  log          # log | webhook | block
+    webhook: "http://..."
+```
+
+Multiple `alert:` blocks supported. Managed via `GET/POST/DELETE /api/alerts`.
+
+### Zone transfer — AXFR / IXFR (v0.9.13)
+
+`src/dns/axfr.rs` implements outgoing zone transfers (RFC 5936 AXFR, RFC 1995 IXFR)
+for secondary nameservers.
+
+**AXFR (TCP only):** SOA serial checked, `allow-axfr` ACL enforced, records streamed in
+batches of 64 to avoid holding the zone lock across the full transfer. TSIG
+(HMAC-SHA256 or HMAC-SHA512) supported.
+
+**IXFR (incremental):** Runbound keeps a per-zone journal (ring buffer, last 10 changes).
+If the client's SOA serial is within the journal window → incremental diff; otherwise
+falls back to full AXFR.
+
+```
+zone "home." {
+    type master;
+    allow-axfr: 192.168.8.0/24;
+    tsig-key-name: "axfr-key";
+}
+tsig-key "axfr-key" {
+    algorithm: hmac-sha256;
+    secret: "base64==";
+}
+```
+
+### RFC 2136 DDNS + TSIG (v0.9.3)
+
+`src/dns/ddns.rs` implements RFC 2136 dynamic DNS updates. Clients (`nsupdate`, DHCP
+servers, router firmware) send DNS UPDATE messages to add, modify, or delete records
+without a Runbound restart.
+
+All UPDATE messages must carry a valid TSIG RR (RFC 2845). Unsigned updates are refused.
+Anti-replay: `|now − ts| > 300 s` → RCODE=BADTIME.
+
+```
+DNS UPDATE (TCP/UDP port 53)
+    ↓
+parse + TSIG verify  →  fail → RCODE=BADSIG
+    ↓
+prerequisite check   →  fail → RCODE=NXRRSET / YXRRSET
+    ↓
+apply to LocalZoneSet → ArcSwap swap → persist to dns_entries.json (async)
+    ↓
+RCODE=NOERROR
+```
 
 ---
 
@@ -308,8 +485,6 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 
 ### #65 — io_uring slow path
 
-### #65 — io_uring slow path
-
 Replace `recvmsg`/`sendmsg` syscalls on the Tokio UDP path with `io_uring` submission queues. Reduces syscall overhead on the slow path. Useful when XDP is unavailable (containers, cloud VMs).
 
 ### #29 — rkyv zero-copy cache persistence
@@ -329,12 +504,17 @@ Full recursive DNSSEC validation — chain of trust from root, NSEC/NSEC3 negati
 | `ArcSwap<LocalZoneSet>` | `src/dns/zones.rs` | Local DNS records — zero-lock reads |
 | `ArcSwap<BlacklistSet>` | `src/dns/blacklist.rs` | Blocked domains — zero-lock reads |
 | `ArcSwap<SharedResolver>` | `src/dns/resolver.rs` | Upstream forwarder — atomic swap on change |
-| `ArcSwap<CacheSnapshot>` | `src/dns/cache_snapshot.rs` | XDP-readable cache — refreshed every 10 ms |
+| `ArcSwap<CacheSnapshot>` | `src/dns/cache_snapshot.rs` | XDP-readable cache — generation-skipping publish |
 | `DashMap<QuestionKey, CacheEntry>` | `src/dns/cache_snapshot.rs` | Mutable cache — lock-free inserts |
 | `DashMap<IpAddr, TokenBucket>` | `src/dns/xdp/worker.rs` | Per-IP rate limiter |
+| `DashMap<(RuleId, IpAddr), TokenBucket>` | `src/alerts.rs` | Per-client alert thresholds |
 | `XSKMAP` (BPF map) | `ebpf/dns_xdp.c` | XDP → AF_XDP socket redirect, max 64 entries |
-| `CPUMAP` (BPF map) | `ebpf/dns_xdp.c` | XDP → CPU redirect (QNAME-aware, planned) |
+| `CPUMAP` (BPF map) | `ebpf/dns_xdp.c` | XDP → CPU redirect (QNAME-aware) |
+| `icmp_cfg` (BPF array) | `ebpf/dns_xdp.c` | ICMP responder enable/disable flag |
+| `icmp_rate_limit` (BPF LRU hash) | `ebpf/dns_xdp.c` | Per-IP ICMP token bucket |
+| `icmp_banned` (BPF LRU hash) | `ebpf/dns_xdp.c` | ICMP flood ban list |
 | `OnceLock<String>` | `src/dns/xdp/socket.rs` | Active interface name — read by API without lock |
+| `AtomicU64` — `CACHE_WRITE_GEN` | `src/dns/cache_snapshot.rs` | Generation counter for publish-loop skip |
 | `AtomicU32` × 2 | `src/dns/xdp/socket.rs` | `nic_rx_ring`, `nic_rx_ring_max` — read by API |
 
 ---
