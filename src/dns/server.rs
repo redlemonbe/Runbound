@@ -1496,10 +1496,28 @@ const MEM_LOW_WATERMARK: f64 = 0.60; // below → scale up if cache was reduced
 const MEM_MOD_WATERMARK: f64 = 0.70; // [0.70, 0.80) → halve cache
 const MEM_HIGH_WATERMARK: f64 = 0.80; // ≥ 0.80 → recalc + flush rate limiter
 
+/// Resolve the process own cgroup v2 base directory from /proc/self/cgroup.
+/// Returns /sys/fs/cgroup/<rel> or /sys/fs/cgroup as fallback.
+fn cgroup_base() -> std::path::PathBuf {
+    if let Ok(text) = std::fs::read_to_string("/proc/self/cgroup") {
+        if let Some(rel) = text.lines()
+            .find(|l| l.starts_with("0::"))
+            .and_then(|l| l.strip_prefix("0::"))
+        {
+            let p = std::path::PathBuf::from("/sys/fs/cgroup")
+                .join(rel.trim().trim_start_matches('/'));
+            if p.exists() {
+                return p;
+            }
+        }
+    }
+    std::path::PathBuf::from("/sys/fs/cgroup")
+}
+
 /// Read the cgroup v2 hard memory limit in bytes.
 /// Returns None when the limit is "max" (unrestricted) or the file is absent.
 fn cgroup_memory_max_bytes() -> Option<u64> {
-    let s = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    let s = std::fs::read_to_string(cgroup_base().join("memory.max")).ok()?;
     let s = s.trim();
     if s == "max" {
         return None;
@@ -1509,7 +1527,7 @@ fn cgroup_memory_max_bytes() -> Option<u64> {
 
 /// Read the cgroup v2 current memory usage in bytes.
 fn cgroup_memory_current_bytes() -> Option<u64> {
-    std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+    std::fs::read_to_string(cgroup_base().join("memory.current"))
         .ok()?
         .trim()
         .parse()
