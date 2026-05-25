@@ -235,8 +235,6 @@
 <!-- Banner -->
 <div class="bg-gray-950 border-b border-gray-800/60 px-5 py-2.5 flex flex-wrap items-center gap-3 shadow-lg shadow-black/40">
   <div class="flex items-center gap-2 shrink-0"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:block;flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg><span class="text-cyan-400 font-bold text-sm tracking-widest" style="text-shadow:0 0 18px #22d3ee55">RUNBOUND</span></div>
-  <span id="conn-dot" class="w-1.5 h-1.5 rounded-full bg-gray-700 shrink-0"></span>
-  <span id="conn-status" class="text-xs text-gray-600 shrink-0">not connected</span>
   <div id="node-pills" class="flex items-center gap-1.5 ml-1 flex-wrap"></div>
   <div class="ml-auto flex items-center gap-3 text-xs text-gray-500">
     <span id="stat-qps" class="tabular-nums">— qps</span>
@@ -630,12 +628,12 @@
 
     <!-- ASCII logo -->
     <div class="card mb-4 mt-5 text-center" style="background:#050d18;border-color:#0f1e33">
-      <pre class="text-xs leading-tight select-all text-left" style="color:#1e4d6b;font-family:'Courier New',monospace;overflow-x:auto;display:inline-block"> ____  _   _ _   _ ____   ___  _   _ _   _ ____
+      <pre class="text-xs leading-tight select-all text-left" style="color:#2d7ab5;font-family:'Courier New',monospace;overflow-x:auto;display:inline-block"> ____  _   _ _   _ ____   ___  _   _ _   _ ____
 |  _ \| | | | \ | | __ ) / _ \| | | | \ | |  _ \
 | |_) | | | |  \| |  _ \| | | | | | |  \| | | | |
 |  _ &lt;| |_| | |\  | |_) | |_| | |_| | |\  | |_| |
 |_| \_\\___/|_| \_|____/ \___/ \___/|_| \_|____/</pre>
-      <p class="text-xs mt-2" style="color:#1e4d6b;letter-spacing:.12em">DNS · XDP · API — no restart ever</p>
+      <p class="text-xs mt-2" style="color:#2d7ab5;letter-spacing:.12em">DNS · XDP · API — no restart ever</p>
     </div>
 
     <!-- Credits -->
@@ -664,6 +662,17 @@
 
   <!-- ═══ SETTINGS ═══ -->
   <div id="tab-settings" class="hidden fade max-w-2xl mx-auto">
+    <div class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DNSSEC Validation</div>
+      <div class="flex items-start justify-between gap-4 mb-3">
+        <div>
+          <p class="text-sm text-gray-300">Validate DNSSEC signatures</p>
+          <p class="text-xs text-gray-600 mt-1">When enabled, cryptographic signatures are validated on all responses. When disabled, the upstream AD bit is trusted.</p>
+        </div>
+        <button id="dnssec-toggle-btn" onclick="toggleDnssec()" class="btn-secondary text-xs w-16 shrink-0">—</button>
+      </div>
+      <p id="dnssec-status-note" class="text-xs text-gray-700"></p>
+    </div>
     <div id="settings-ca-card" class="card mb-4 hidden">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Local CA Certificate</div>
       <p class="text-xs text-gray-400 mb-3">Install this CA certificate once on each device to get a trusted HTTPS connection without browser warnings.</p>
@@ -695,17 +704,6 @@
         <p class="text-xs text-gray-700">Active sessions are invalidated on save.</p>
         <button onclick="changePassword()" class="btn-primary mt-1">Update credentials</button>
       </div>
-    </div>
-    <div class="card mb-4">
-      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DNSSEC Validation</div>
-      <div class="flex items-start justify-between gap-4 mb-3">
-        <div>
-          <p class="text-sm text-gray-300">Validate DNSSEC signatures</p>
-          <p class="text-xs text-gray-600 mt-1">When enabled, cryptographic signatures are validated on all responses. When disabled, the upstream AD bit is trusted.</p>
-        </div>
-        <button id="dnssec-toggle-btn" onclick="toggleDnssec()" class="btn-secondary text-xs w-16 shrink-0">—</button>
-      </div>
-      <p id="dnssec-status-note" class="text-xs text-gray-700"></p>
     </div>
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Session</div>
@@ -1376,7 +1374,7 @@ async function changePassword() {
 // ══════════════════════════════════════════════
 // Helpers
 // ══════════════════════════════════════════════
-function setConn(ok,msg){const dot=document.getElementById('conn-dot'),lbl=document.getElementById('conn-status');dot.className=ok?'w-1.5 h-1.5 rounded-full bg-green-500 blink':'w-1.5 h-1.5 rounded-full bg-red-500';lbl.textContent=ok?'connected':(msg||'error');lbl.className=ok?'text-xs text-green-500':'text-xs text-red-500';}
+function setConn(ok,msg){const dot=document.getElementById('conn-dot'),lbl=document.getElementById('conn-status');if(dot)dot.className=ok?'w-1.5 h-1.5 rounded-full bg-green-500 blink':'w-1.5 h-1.5 rounded-full bg-red-500';if(lbl){lbl.textContent=ok?'connected':(msg||'error');lbl.className=ok?'text-xs text-green-500':'text-xs text-red-500';}}
 function set(id,v){const el=document.getElementById(id);if(el)el.textContent=v;}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;').replace(/"/g,'&quot;');}
 function empty(msg){return`<p class="text-gray-700 text-sm py-2">${msg}</p>`;}
