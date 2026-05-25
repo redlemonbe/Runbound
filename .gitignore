@@ -46,3 +46,7 @@ CLAUDE.md
 # Patch scripts (local tooling)
 /tmp/*.py
 /tmp/*.sh
+
+# Internal work files
+AUDIT_SECURITE.txt
+RAPPORT_*.txt

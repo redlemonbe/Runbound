@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-static INDEX_HTML: &str = include_str!("../../examples/web-ui/index.html");
+static INDEX_HTML: &str = include_str!("index.html");
 static INDEX_HTML_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
 
 #[derive(Clone, serde::Serialize)]
@@ -238,7 +238,7 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
 </html>"#;
 
 async fn serve_favicon() -> impl axum::response::IntoResponse {
-    static FAVICON: &[u8] = include_bytes!("../../examples/web-ui/favicon.ico");
+    static FAVICON: &[u8] = include_bytes!("favicon.ico");
     ([(axum::http::header::CONTENT_TYPE, "image/x-icon")], FAVICON)
 }
 
