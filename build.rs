@@ -13,10 +13,36 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=ebpf/dns_xdp.c");
+    compress_webui();
 
     #[cfg(feature = "xdp")]
     compile_ebpf();
 }
+fn compress_webui() {
+    use std::{env, fs, io::Write, path::PathBuf};
+    use flate2::{write::GzEncoder, Compression};
+
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out_dir      = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+
+    println!("cargo:rerun-if-changed=examples/web-ui/index.html");
+
+    let html = fs::read(manifest_dir.join("examples/web-ui/index.html"))
+        .expect("examples/web-ui/index.html not found");
+
+    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(&html).expect("gzip write");
+    let gz = enc.finish().expect("gzip finish");
+
+    fs::write(out_dir.join("index.html.gz"), &gz).expect("write index.html.gz");
+
+    println!(
+        "cargo:warning=WebUI gzip: {}B → {}B ({:.0}% of original)",
+        html.len(), gz.len(),
+        gz.len() as f64 / html.len() as f64 * 100.0
+    );
+}
+
 
 #[cfg(feature = "xdp")]
 fn compile_ebpf() {
