@@ -1742,22 +1742,52 @@ async fn handle_relay_request(
         // ── System info (for WebUI node overview) ───────────────────────────
         ("GET", "system") => {
             let snap = relay.stats_cache.load();
-            let mem_avail_mb: Option<u64> = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
-                s.lines().find(|l| l.starts_with("MemAvailable:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|kb| kb / 1024)
-            });
-            let workers = crate::cpu::physical_cores().len().max(1) as u32;
+            let cpu_cores = crate::cpu::physical_cores().len().max(1);
+
+            // Memory: cgroup v2 if available, else /proc/meminfo
+            let (mem_avail_mb, mem_total_mb): (u64, u64) = {
+                let cg_max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()
+                    .and_then(|s| if s.trim() == "max" { None } else { s.trim().parse::<u64>().ok() });
+                if let Some(max_b) = cg_max {
+                    let cur = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+                        .ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+                    (max_b.saturating_sub(cur) / (1024 * 1024), max_b / (1024 * 1024))
+                } else if let Ok(txt) = std::fs::read_to_string("/proc/meminfo") {
+                    let (mut tot, mut avail) = (0u64, 0u64);
+                    for l in txt.lines() {
+                        if l.starts_with("MemTotal:")     { tot   = l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
+                        if l.starts_with("MemAvailable:") { avail = l.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
+                    }
+                    (avail / 1024, tot / 1024)
+                } else { (0, 0) }
+            };
+
+            // CPU%: (utime + stime) / proc_uptime since process start
+            let cpu_percent: f64 = (|| -> Option<f64> {
+                let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+                let ac = stat.find(')')? + 2;
+                let f: Vec<&str> = stat[ac..].split_whitespace().collect();
+                let ut: u64 = f.get(11).and_then(|v| v.parse().ok())?;
+                let st: u64 = f.get(12).and_then(|v| v.parse().ok())?;
+                let ss: u64 = f.get(19).and_then(|v| v.parse().ok())?;
+                let up: f64 = std::fs::read_to_string("/proc/uptime").ok()
+                    .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))?;
+                let pu = up - (ss as f64 / 100.0);
+                if pu <= 0.0 { return Some(0.0); }
+                Some(((ut + st) as f64 / 100.0 / pu * 1000.0).round() / 10.0)
+            })().unwrap_or(0.0);
+
             Ok(json_ok(serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "uptime_secs": snap.uptime_secs,
-                "xdp_active": false,
-                "xdp_mode": serde_json::Value::Null,
-                "cpu_percent": serde_json::Value::Null,
-                "mem_avail_mb": mem_avail_mb,
-                "workers": workers,
-                "prefetch_enabled": relay.cfg.prefetch,
+                "version":           env!("CARGO_PKG_VERSION"),
+                "uptime_secs":       snap.uptime_secs,
+                "xdp_active":        false,
+                "xdp_mode":          "disabled",
+                "cpu_cores":         cpu_cores,
+                "cpu_percent":       cpu_percent,
+                "mem_total_mb":      mem_total_mb,
+                "mem_avail_mb":      mem_avail_mb,
+                "workers":           cpu_cores,
+                "prefetch_enabled":  relay.cfg.prefetch,
                 "dnssec_validation": relay.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed),
             })))
         }
