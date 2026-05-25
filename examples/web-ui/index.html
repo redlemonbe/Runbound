@@ -1284,13 +1284,15 @@ function initSparkline() {
                 const now = Date.now();
                 if (_spkLastTotal != null && _spkLastTime != null) {
                   const dt = (now - _spkLastTime) / 1000;
-                  const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
-                  if (dt > 0) _spkPush(Math.max(0, (d.total - _spkLastTotal) / dt) + extra);
+                  if (selectedNode === 'master' || selectedNode === 'all') {
+                    const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
+                    if (dt > 0) _spkPush(Math.max(0, (d.total - _spkLastTotal) / dt) + extra);
+                  }
                 }
                 _spkLastTotal = d.total; _spkLastTime = now;
               } else if (d.qps_1m != null) {
-                const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
-                _spkPush(Number(d.qps_1m) + extra);
+                if (selectedNode === 'master') _spkPush(Number(d.qps_1m));
+                else if (selectedNode === 'all') _spkPush(Number(d.qps_1m) + _spkSlaveQps);
               }
             } catch(_) {}
           }
