@@ -59,6 +59,8 @@ Open `https://<server-ip>:8091` and enter your credentials.
 Default username is `admin`. The password is set during install or changed via
 Settings → Change Password. Sessions expire after 8 hours (30-minute idle timeout).
 
+Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
+
 ---
 
 ## Features
@@ -143,6 +145,18 @@ server:
 Bans are enforced via the same pipeline as alert blocks: XDP BPF map injection (IPv4) or
 userspace block (IPv6). They persist across restarts in `alert-blocks.json` and are
 automatically purged by a background task when they expire.
+
+---
+
+## Security audit document
+
+The consolidated security audit (all cycles) is available without internet access at:
+
+```
+https://<host>:<ui-port>/webui/security-audit
+```
+
+This page is served directly by Runbound from the embedded binary (no CDN). A link is also available in the **About** tab → Links card.
 
 ---
 

@@ -293,6 +293,27 @@ When enabled, every DNSSEC validation failure emits a `WARN` log line with the q
 name, record type, and reason (`bogus`). Useful for diagnosing misconfigured zones
 without enabling full `verbosity: 2` noise.
 
+### Serve-stale (RFC 8767)
+
+Return expired cache entries while fetching a fresh answer in the background. Prevents NXDOMAIN or SERVFAIL from hitting clients when an upstream is momentarily unreachable.
+
+```
+server:
+    serve-expired: yes             # Serve stale entries. Default: no.
+    serve-expired-ttl: 86400       # Max age of stale entries in seconds. 0 = unlimited.
+    serve-expired-reply-ttl: 30    # TTL returned to clients for stale answers.
+```
+
+### Prefetch
+
+Proactively refresh cache entries that are about to expire when they are queried. Reduces latency for frequently-requested domains.
+
+```
+server:
+    prefetch: yes                  # Enable prefetch. Default: no.
+    prefetch-threshold: 10         # Only prefetch entries queried at least N times. Default: 0.
+```
+
 ### HTTP/3 guard
 
 ```
