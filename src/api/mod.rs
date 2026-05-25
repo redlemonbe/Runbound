@@ -3440,7 +3440,7 @@ mod tests {
             racing_wins: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
             events_tx: None,
             domain_stats: crate::domain_stats::DomainStats::new(),
-            alert_tracker: crate::alerts::AlertTracker::new(vec![]),
+            alert_tracker: crate::alerts::AlertTracker::new(vec![], None),
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
@@ -4425,6 +4425,7 @@ mod tests {
             name: ".".into(),
             addrs: vec!["1.1.1.1@53".into()],
             tls: false,
+            tls_hostname: None,
         });
         let app = make_test_app_with_cfg(cfg);
         let (k, v) = auth_header();
@@ -4545,6 +4546,7 @@ mod tests {
             name: ".".into(),
             addrs: vec!["9.9.9.9@53".into()],
             tls: false,
+            tls_hostname: None,
         });
         let app = make_test_app_with_cfg(cfg);
         let (k, v) = auth_header();
@@ -5511,6 +5513,7 @@ mod tests {
             name: ".".into(),
             addrs: vec!["1.1.1.1@53".into()],
             tls: false,
+            tls_hostname: None,
         });
         let app = make_test_app_with_cfg(cfg);
         let (k, v) = auth_header();
@@ -5554,12 +5557,14 @@ mod tests {
             name: ".".into(),
             addrs: vec!["9.9.9.9@53".into()],
             tls: false,
+            tls_hostname: None,
         });
         // Add a second upstream so the first can be deleted (FIX #41)
         cfg.forward_zones.push(crate::config::parser::ForwardZone {
             name: ".".into(),
             addrs: vec!["8.8.8.8@53".into()],
             tls: false,
+            tls_hostname: None,
         });
 
         let zones = Arc::new(ArcSwap::new(Arc::new(
@@ -5597,7 +5602,7 @@ mod tests {
             racing_wins: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
             events_tx: None,
             domain_stats: crate::domain_stats::DomainStats::new(),
-            alert_tracker: crate::alerts::AlertTracker::new(vec![]),
+            alert_tracker: crate::alerts::AlertTracker::new(vec![], None),
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),

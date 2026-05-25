@@ -722,8 +722,13 @@ async fn sync_get(
         .await
         .map_err(|e| anyhow::anyhow!("TCP connect {host_port}: {e}"))?;
 
-    let server_name = rustls::pki_types::ServerName::try_from("runbound-sync")
-        .map_err(|e| anyhow::anyhow!("invalid SNI: {e}"))?;
+    let sni_host = host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port);
+    let server_name = if let Ok(ip) = sni_host.parse::<std::net::IpAddr>() {
+        rustls::pki_types::ServerName::IpAddress(ip.into())
+    } else {
+        rustls::pki_types::ServerName::try_from(sni_host.to_owned())
+            .map_err(|e| anyhow::anyhow!("invalid SNI: {e}"))?
+    };
     let connector = tokio_rustls::TlsConnector::from(tls_config);
     let tls = connector
         .connect(server_name, tcp)
