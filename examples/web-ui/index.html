@@ -191,6 +191,10 @@
   .edit-btn:hover{color:#94a3b8;border-color:#374151}
   /* ── Slave cards grid ── */
   .slave-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+  .prot-nodes{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+  .prot-node-card{background:#0c1525;border:1px solid #1e293b;border-radius:8px;padding:14px}
+  .prot-node-card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid rgba(31,41,55,.55)}
+  .prot-stat{display:flex;justify-content:space-between;align-items:center;font-size:.8125rem;padding:3px 0}
   .slave-card{background:#0c1525;border:1px solid #1e293b;border-radius:8px;padding:14px}
   .slave-card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid rgba(31,41,55,.55)}
   .slave-metrics{display:flex;flex-direction:column;gap:7px;font-size:.8125rem}
@@ -539,49 +543,45 @@
   </div>
 
   <!-- ═══ PROTECTION ═══ -->
-  <div id="tab-protection" class="hidden fade max-w-4xl mx-auto">
+  <div id="tab-protection" class="hidden fade max-w-5xl mx-auto">
 
-    <!-- ICMP XDP Responder -->
+    <!-- Config globale ICMP (s'applique à tous les nœuds) -->
     <div class="card mb-4">
-      <div class="flex items-center justify-between mb-4">
-        <span class="text-xs text-gray-600 uppercase tracking-wide">ICMP XDP Responder</span>
-        <div class="flex items-center gap-3">
-          <span id="prot-icmp-status" class="badge" style="background:#1a1a1a;color:#6b7280;border:1px solid #374151">—</span>
-          <button id="prot-icmp-toggle" onclick="toggleIcmp()" class="btn-primary text-xs">—</button>
-        </div>
-      </div>
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-        <div class="card icmp-metric-card"><div class="text-xs text-gray-600">Handled</div><div id="prot-icmp-handled" class="text-xl tabular-nums text-white metric-value">—</div></div>
-        <div class="card icmp-metric-card"><div class="text-xs text-gray-600">Replied</div><div id="prot-icmp-replied" class="text-xl tabular-nums text-green-400 metric-value">—</div></div>
-        <div class="card icmp-metric-card"><div class="text-xs text-gray-600">Rate limited</div><div id="prot-icmp-rl" class="text-xl tabular-nums text-yellow-500 metric-value">—</div></div>
-        <div class="card icmp-metric-card"><div class="text-xs text-gray-600">Dropped</div><div id="prot-icmp-dropped" class="text-xl tabular-nums text-red-400 metric-value">—</div></div>
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">ICMP XDP Responder — Global Config</span>
+        <span id="prot-icmp-status" class="badge" style="background:#1a1a1a;color:#6b7280;border:1px solid #374151">—</span>
       </div>
       <div class="icmp-config-row">
         <div class="icmp-config-field">
-          <span class="field-label">Rate limit (pps)</span>
-          <input type="number" id="prot-icmp-rate" min="1" max="10000" class="input w-28"/>
+          <span class="field-label">Rate (pps)</span>
+          <input type="number" id="prot-icmp-rate" min="1" max="10000" class="input w-24"/>
         </div>
         <div class="icmp-config-field">
           <span class="field-label">Burst</span>
-          <input type="number" id="prot-icmp-burst" min="1" max="500" class="input w-24"/>
+          <input type="number" id="prot-icmp-burst" min="1" max="500" class="input w-20"/>
         </div>
-        <button onclick="saveIcmpConfig()" class="btn-primary text-xs">Save config</button>
+        <div class="icmp-config-field">
+          <span class="field-label">Ban after (pkts)</span>
+          <input type="number" id="prot-icmp-banthr" min="1" max="10000" class="input w-24"/>
+        </div>
+        <button id="prot-icmp-toggle" onclick="toggleIcmp()" class="btn-primary text-xs">—</button>
+        <button onclick="saveIcmpConfig()" class="btn-secondary text-xs">Apply to all</button>
         <span id="prot-icmp-msg" class="text-xs self-center"></span>
       </div>
     </div>
 
+    <!-- Stats par nœud -->
+    <div id="prot-nodes-grid" class="mb-4"></div>
+
     <!-- DDoS Alerts -->
     <div class="card">
-      <div class="flex items-center justify-between mb-4">
-        <span class="text-xs text-gray-600 uppercase tracking-wide">DDoS Alerts</span>
-        <button onclick="loadProtection()" class="btn-secondary text-xs">↻ Refresh</button>
-      </div>
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DDoS Alerts</div>
       <div class="mb-4">
-        <div class="text-xs text-gray-600 mb-2">Blocked IPs</div>
+        <div class="text-xs text-gray-500 mb-2">Blocked IPs</div>
         <div id="prot-blocked"><span class="text-gray-700 italic text-sm">—</span></div>
       </div>
       <div>
-        <div class="text-xs text-gray-600 mb-2">Recent alerts</div>
+        <div class="text-xs text-gray-500 mb-2">Recent alerts</div>
         <div id="prot-alerts" class="space-y-0.5" style="max-height:280px;overflow-y:auto"><span class="text-gray-700 italic text-sm">—</span></div>
       </div>
     </div>
@@ -708,7 +708,7 @@
 let nodes = {}; // id -> {url, key, name, stats, sys, cache, status, lastErr, syncStatus, syncLastSeen}
 let masterKey = '';
 let selectedNode = 'all'; // 'all' | node id
-let statsTimer = null, sysTimer = null, syncTimer = null, logsTimer = null;
+let statsTimer = null, sysTimer = null, syncTimer = null, logsTimer = null, protectionTimer = null;
 
 function nodeApi(nodeId, method, path, body) {
   const n = nodes[nodeId]; if (!n) throw new Error('Unknown node');
@@ -732,7 +732,7 @@ function nodeApi(nodeId, method, path, body) {
     const relayUrl = `${nodes['master'].url}/nodes/${n.relayNodeId}/relay${path}`;
     return doFetch(relayUrl, masterKey);
   };
-  if (nodeId === 'master') return doFetch(directUrl, n.key);
+  if (nodeId === 'master') return api(method, path, body);
   // Use relay when available — avoids cross-origin requests from embedded WebUI
   if (n.relayNodeId) return tryRelay();
   return doFetch(directUrl, n.key);
@@ -1353,6 +1353,7 @@ function toast(msg,err=false){const el=document.getElementById('toast');el.textC
 
 function showTab(name,btn){
   if(name!=='logs'){clearInterval(logsTimer);logsTimer=null;const cb=document.getElementById('logs-auto');if(cb)cb.checked=false;}
+  if(name!=='protection'){clearInterval(protectionTimer);protectionTimer=null;}
   ['overview','dns','blacklist','feeds','upstreams','logs','system','protection','about','settings'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
   document.querySelectorAll('.tab-active').forEach(b=>{b.classList.remove('tab-active');b.setAttribute('aria-selected','false');});
   const el=document.getElementById('tab-'+name);el.classList.remove('hidden');el.classList.add('fade');
@@ -1363,25 +1364,31 @@ function showTab(name,btn){
   if(name==='upstreams'){loadUpstreamPresets();loadUpstreams();}
   if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
-  if(name==='protection'){loadProtection();}
+  if(name==='protection'){loadProtection();protectionTimer=setInterval(loadProtection,4000);}
   if(name==='settings'){initDnssecToggle();loadAuthEvents();initCaCard();}
 }
 
 
 // ══════════════════════════════════════════════
-// Protection tab — ICMP + DDoS alerts
+// Protection tab — ICMP multi-node + DDoS alerts
 // ══════════════════════════════════════════════
+function fmtN(n) { return n == null ? '—' : Number(n).toLocaleString(); }
+
+function protNodeList() {
+  // Returns [{nodeId, label, ip}] for master + all connected slaves
+  const list = [{nodeId:'master', label:'Master', ip: (nodes['master']?.url||'').replace(/^.*\/\//,'').replace(/:\d+.*/,'')||'master'}];
+  Object.entries(nodes).forEach(([id,n]) => {
+    if (id === 'master') return;
+    const ip = (n.addr||n.url||id).replace(/:\d+$/,'');
+    list.push({nodeId: id, label: ip, ip});
+  });
+  return list;
+}
+
 async function loadProtection() {
-  const nodeId = selectedNode === 'all' ? 'master' : selectedNode;
+  // Load master config (global)
   try {
-    const s = await nodeApi(nodeId, 'GET', '/icmp/stats');
-    document.getElementById('prot-icmp-handled').textContent = fmt(s.handled ?? 0);
-    document.getElementById('prot-icmp-replied').textContent  = fmt(s.replied ?? 0);
-    document.getElementById('prot-icmp-rl').textContent       = fmt(s.rate_limited ?? 0);
-    document.getElementById('prot-icmp-dropped').textContent  = fmt(s.dropped ?? 0);
-  } catch(_) {}
-  try {
-    const c = await nodeApi(nodeId, 'GET', '/icmp/config');
+    const c = await api('GET', '/icmp/config');
     const en = c.enable ?? false;
     const badge  = document.getElementById('prot-icmp-status');
     const toggle = document.getElementById('prot-icmp-toggle');
@@ -1391,11 +1398,46 @@ async function loadProtection() {
       : 'background:#1a1a1a;color:#6b7280;border:1px solid #374151';
     toggle.textContent = en ? 'Disable' : 'Enable';
     toggle._icmpEnabled = en;
-    document.getElementById('prot-icmp-rate').value  = c.rate_limit ?? 10;
-    document.getElementById('prot-icmp-burst').value = c.burst ?? 5;
+    document.getElementById('prot-icmp-rate').value   = c.rate_limit    ?? 10;
+    document.getElementById('prot-icmp-burst').value  = c.burst         ?? 5;
+    document.getElementById('prot-icmp-banthr').value = c.ban_threshold ?? 100;
   } catch(_) {}
+
+  // Per-node ICMP stats grid
+  const nodeList = protNodeList();
+  const grid = document.getElementById('prot-nodes-grid');
+  if (!grid._rendered) {
+    grid.innerHTML = '<div class="prot-nodes">' + nodeList.map(({nodeId, label}) =>
+      `<div class="prot-node-card">
+        <div class="prot-node-card-hdr">
+          <span class="text-cyan-300 font-mono text-xs">${esc(label)}</span>
+          <span id="prot-badge-${nodeId}" class="badge badge-xdp-off">—</span>
+        </div>
+        <div class="prot-stat"><span class="text-gray-500">Handled</span><span id="prot-h-${nodeId}" class="text-white tabular-nums">—</span></div>
+        <div class="prot-stat"><span class="text-gray-500">Replied</span><span id="prot-r-${nodeId}" class="text-green-400 tabular-nums">—</span></div>
+        <div class="prot-stat"><span class="text-gray-500">Rate-limited</span><span id="prot-b-${nodeId}" class="text-yellow-500 tabular-nums">—</span></div>
+        <div class="prot-stat"><span class="text-gray-500">XDP-banned</span><span id="prot-d-${nodeId}" class="text-red-500 tabular-nums">—</span></div>
+      </div>`
+    ).join('') + '</div>';
+    grid._rendered = true;
+  }
+  await Promise.all(nodeList.map(async ({nodeId}) => {
+    try {
+      const s = await nodeApi(nodeId, 'GET', '/icmp/stats');
+      const h = s.handled??0, r = s.replied??0, rl = s.rate_limited??0, dr = s.dropped??0;
+      const el = id => document.getElementById(id);
+      if(el(`prot-h-${nodeId}`)) el(`prot-h-${nodeId}`).textContent = fmtN(h);
+      if(el(`prot-r-${nodeId}`)) el(`prot-r-${nodeId}`).textContent = fmtN(r);
+      if(el(`prot-b-${nodeId}`)) el(`prot-b-${nodeId}`).textContent = fmtN(rl);
+      if(el(`prot-d-${nodeId}`)) el(`prot-d-${nodeId}`).textContent = fmtN(dr);
+      const badge = el(`prot-badge-${nodeId}`);
+      if(badge){ badge.textContent = dr > 0 ? 'banned' : rl > 0 ? 'flooding' : 'ok'; badge.className = (dr>0||rl>0) ? 'badge' : 'badge badge-xdp-on'; if(dr>0) badge.style.cssText='background:#2d1a1a;color:#f87171;border:1px solid #7f1d1d'; else if(rl>0) badge.style.cssText='background:#2d2010;color:#fbbf24;border:1px solid #92400e'; else badge.style.cssText=''; }
+    } catch(_) {}
+  }));
+
+  // Alerts (master only)
   try {
-    const a = await nodeApi('master', 'GET', '/alerts');
+    const a = await api('GET', '/alerts');
     renderBlockedIps(a.blocked_clients ?? []);
     renderAlertsList(a.recent_alerts ?? []);
   } catch(_) {}
@@ -1406,23 +1448,23 @@ async function toggleIcmp() {
   const en   = !toggle._icmpEnabled;
   const rate = parseInt(document.getElementById('prot-icmp-rate').value)  || 10;
   const burst= parseInt(document.getElementById('prot-icmp-burst').value) || 5;
-  const nodeId = selectedNode === 'all' ? 'master' : selectedNode;
   try {
-    await nodeApi(nodeId, 'PUT', '/icmp/config', {enable: en, rate_limit: rate, burst});
-    showProtMsg(en ? 'ICMP responder enabled' : 'ICMP responder disabled');
+    await api('PUT', '/icmp/config', {enable: en, rate_limit: rate, burst});
+    showProtMsg(en ? 'ICMP enabled on all nodes' : 'ICMP disabled on all nodes');
+    document.getElementById('prot-nodes-grid')._rendered = false;
     loadProtection();
   } catch(e) { showProtMsg('Error: ' + e.message, true); }
 }
 
 async function saveIcmpConfig() {
   const toggle = document.getElementById('prot-icmp-toggle');
-  const en   = toggle._icmpEnabled ?? false;
-  const rate = parseInt(document.getElementById('prot-icmp-rate').value)  || 10;
-  const burst= parseInt(document.getElementById('prot-icmp-burst').value) || 5;
-  const nodeId = selectedNode === 'all' ? 'master' : selectedNode;
+  const en  = toggle._icmpEnabled ?? false;
+  const rate = parseInt(document.getElementById('prot-icmp-rate').value)   || 10;
+  const burst= parseInt(document.getElementById('prot-icmp-burst').value)  || 5;
+  const thr  = parseInt(document.getElementById('prot-icmp-banthr').value) || 100;
   try {
-    await nodeApi(nodeId, 'PUT', '/icmp/config', {enable: en, rate_limit: rate, burst});
-    showProtMsg('Config saved');
+    await api('PUT', '/icmp/config', {enable: en, rate_limit: rate, burst, ban_threshold: thr});
+    showProtMsg('Config applied to all nodes');
   } catch(e) { showProtMsg('Error: ' + e.message, true); }
 }
 
@@ -1444,25 +1486,29 @@ function showProtMsg(msg, err=false) {
 function renderBlockedIps(list) {
   const el = document.getElementById('prot-blocked');
   if (!list.length) { el.innerHTML = '<span class="text-gray-700 italic text-sm">No blocked IPs</span>'; return; }
-  el.innerHTML = list.map(ip => `<div class="flex items-center justify-between py-1.5 border-b border-gray-800/40 text-sm">
-    <span class="font-mono text-red-400">${esc(ip)}</span>
-    <button onclick="unblockIp(${JSON.stringify(ip)})" class="btn-secondary text-xs">Unblock</button>
-  </div>`).join('');
+  el.innerHTML = list.map(b => {
+    const ip  = b.ip ?? b;
+    const rule = b.rule ?? '';
+    const exp  = b.expires_in_s != null ? `${b.expires_in_s}s` : '∞';
+    return `<div class="flex items-center justify-between py-1.5 border-b border-gray-800/40 text-sm">
+      <span class="font-mono text-red-400">${esc(ip)}</span>
+      <span class="text-xs text-gray-600 mx-3">${esc(rule)} · ${exp}</span>
+      <button onclick="unblockIp(${JSON.stringify(ip)})" class="btn-secondary text-xs">Unblock</button>
+    </div>`;
+  }).join('');
 }
 
 function renderAlertsList(list) {
   const el = document.getElementById('prot-alerts');
   if (!list.length) { el.innerHTML = '<span class="text-gray-700 italic text-sm">No recent alerts</span>'; return; }
   el.innerHTML = list.slice().reverse().map(a => {
-    const ts = a.ts ? new Date(a.ts*1000).toLocaleTimeString() : '?';
-    const kind = esc(a.kind ?? a.alert_type ?? '?');
-    const src  = esc(a.src ?? a.source_ip ?? '?');
-    const msg  = esc(a.detail ?? a.message ?? '');
+    const ts   = a.ts ? new Date(a.ts*1000).toLocaleTimeString() : '?';
+    const rule = esc(a.rule ?? a.kind ?? '?');
+    const ip   = esc(a.client_ip ?? a.source_ip ?? '?');
     return `<div class="flex items-center gap-3 py-1 border-b border-gray-800/30 text-xs">
       <span class="text-gray-700 shrink-0 tabular-nums w-20">${ts}</span>
-      <span class="badge shrink-0" style="background:#2a1010;color:#f87171;border:1px solid #7f1d1d">${kind}</span>
-      <span class="font-mono text-gray-400 shrink-0">${src}</span>
-      <span class="text-gray-600 truncate">${msg}</span>
+      <span class="badge shrink-0" style="background:#2a1010;color:#f87171;border:1px solid #7f1d1d">${rule}</span>
+      <span class="font-mono text-gray-400">${ip}</span>
     </div>`;
   }).join('');
 }

@@ -94,9 +94,9 @@ struct {
 } icmp_cfg SEC(".maps");
 
 // Per-CPU counters — summed in userspace. No atomics needed (each CPU owns its slice).
-// Index 0: handled (echo request reached handler)
-// Index 1: replied  (XDP_TX sent)
-// Index 2: dropped  (not used currently, reserved)
+// Index 0: handled     (echo request reached rate-limit check)
+// Index 1: replied     (XDP_TX sent)
+// Index 2: banned_drop (source IP in icmp_banned — dropped before rate-limit check)
 // Index 3: rate_limited (dropped by rate limiter)
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -112,6 +112,25 @@ struct {
     __type(key, __be32);
     __type(value, struct icmp_rate_entry);
 } icmp_rate_limit SEC(".maps");
+
+// Per-IP rate-limited hit counter — polled and reset by userspace every second.
+// PERCPU: each CPU increments its own slot (no SMP contention).
+// Userspace sums all CPU slots then deletes the entry to reset.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __be32);
+    __type(value, __u64);
+} icmp_rl_counts SEC(".maps");
+
+// IPs banned by userspace flood detector — XDP_DROP before rate-limit check.
+// Written by userspace; LRU evicts oldest ban under memory pressure.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __be32);  // source IPv4 in network byte order
+    __type(value, __u8);  // 1 = banned
+} icmp_banned SEC(".maps");
 
 // One's complement 16-bit add with carry fold (endianness-agnostic).
 static __always_inline __u16 csum16_add(__u16 a, __u16 b)
@@ -196,13 +215,25 @@ int dns_xdp(struct xdp_md *ctx)
             if (!cfg || !cfg->enabled)
                 return XDP_PASS;
 
-            // Stat: handled
+            __be32 src_ip = ip->saddr;
+
+            // Drop packets from IPs banned by userspace flood detector
+            {
+                __u8 *ban = bpf_map_lookup_elem(&icmp_banned, &src_ip);
+                if (ban && *ban) {
+                    __u32 bk = 2; // STAT_BANNED_DROP
+                    __u64 *bv = bpf_map_lookup_elem(&icmp_stats, &bk);
+                    if (bv) (*bv)++;
+                    return XDP_DROP;
+                }
+            }
+
+            // Stat: handled (reached rate-limit check)
             __u32 sk = 0;
             __u64 *sv = bpf_map_lookup_elem(&icmp_stats, &sk);
             if (sv) (*sv)++;
 
             // Rate limit (1-second sliding window, per source IPv4)
-            __be32 src_ip = ip->saddr;
             __u64 now = bpf_ktime_get_ns();
             struct icmp_rate_entry new_r = {};
             struct icmp_rate_entry *r = bpf_map_lookup_elem(&icmp_rate_limit, &src_ip);
@@ -217,6 +248,13 @@ int dns_xdp(struct xdp_md *ctx)
                         sk = 3; // STAT_RATE_LIMITED
                         sv = bpf_map_lookup_elem(&icmp_stats, &sk);
                         if (sv) (*sv)++;
+                        // Accumulate per-IP counter for userspace flood detection
+                        {
+                            __u64 one = 1;
+                            __u64 *rl = bpf_map_lookup_elem(&icmp_rl_counts, &src_ip);
+                            if (rl) (*rl)++;
+                            else bpf_map_update_elem(&icmp_rl_counts, &src_ip, &one, BPF_ANY);
+                        }
                         return XDP_DROP;
                     }
                     new_r.count      = r->count + 1;
