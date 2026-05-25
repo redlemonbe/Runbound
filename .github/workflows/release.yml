@@ -91,15 +91,15 @@ jobs:
       # ── Package ──────────────────────────────────────────────────────────
       - name: Package binaries
         run: |
-          cp target/x86_64-unknown-linux-gnu/release/runbound  runbound-linux-x86_64
-          cp target/x86_64-unknown-linux-musl/release/runbound runbound-linux-x86_64-musl
-          cp target/aarch64-unknown-linux-gnu/release/runbound  runbound-linux-aarch64
-          cp target/aarch64-unknown-linux-musl/release/runbound runbound-linux-aarch64-musl
+          cp target/x86_64-unknown-linux-gnu/release/runbound  runbound-x86_64-linux-gnu
+          cp target/x86_64-unknown-linux-musl/release/runbound runbound-x86_64-linux-musl
+          cp target/aarch64-unknown-linux-gnu/release/runbound  runbound-aarch64-linux-gnu
+          cp target/aarch64-unknown-linux-musl/release/runbound runbound-aarch64-linux-musl
           sha256sum \
-            runbound-linux-x86_64 \
-            runbound-linux-x86_64-musl \
-            runbound-linux-aarch64 \
-            runbound-linux-aarch64-musl \
+            runbound-x86_64-linux-gnu \
+            runbound-x86_64-linux-musl \
+            runbound-aarch64-linux-gnu \
+            runbound-aarch64-linux-musl \
             > SHA256SUMS
 
       # ── Changelog fragment ───────────────────────────────────────────────
@@ -114,22 +114,30 @@ jobs:
 
       # ── Publish release then upload assets ───────────────────────────────
       # Two-step: create published release first, then upload.
-      # This ensures stable browser_download_url for all assets.
-      - name: Create release
+      # If the release already exists (e.g. created manually), edit it instead.
+      # --clobber on upload overwrites existing assets with the same name.
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file CHANGELOG_FRAGMENT.md
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG_FRAGMENT.md
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG_FRAGMENT.md
+          fi
 
       - name: Upload assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${GITHUB_REF_NAME}" \
-            runbound-linux-x86_64 \
-            runbound-linux-x86_64-musl \
-            runbound-linux-aarch64 \
-            runbound-linux-aarch64-musl \
+            --clobber \
+            runbound-x86_64-linux-gnu \
+            runbound-x86_64-linux-musl \
+            runbound-aarch64-linux-gnu \
+            runbound-aarch64-linux-musl \
             SHA256SUMS
