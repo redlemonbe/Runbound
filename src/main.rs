@@ -1065,8 +1065,106 @@ async fn build_and_launch(
                     .enable_all()
                     .build()
                     .map_err(|e| anyhow::anyhow!("Web UI runtime: {e}"))?;
-                if cfg.ui_tls {
-                    // TLS path: generate CA first, then server cert signed by CA
+                if cfg.ui_tls && cfg.ui_tls_acme {
+                    // ── ACME DNS-01 path ──────────────────────────────────────
+                    if cfg.ui_acme_domain.is_empty() || cfg.ui_acme_email.is_empty() {
+                        error!("ui-tls: acme requires ui-acme-domain and ui-acme-email");
+                        return Err(anyhow::anyhow!("ACME config incomplete"));
+                    }
+                    let provider = match cfg.ui_acme_dns.as_str() {
+                        "cloudflare" => {
+                            if cfg.ui_acme_cf_token.is_empty() {
+                                return Err(anyhow::anyhow!("ui-acme-dns: cloudflare requires ui-acme-cf-token"));
+                            }
+                            acme::DnsProvider::Cloudflare { api_token: cfg.ui_acme_cf_token.clone() }
+                        }
+                        "hook" => {
+                            if cfg.ui_acme_hook.is_empty() {
+                                return Err(anyhow::anyhow!("ui-acme-dns: hook requires ui-acme-hook"));
+                            }
+                            acme::DnsProvider::Hook { script: cfg.ui_acme_hook.clone() }
+                        }
+                        other => return Err(anyhow::anyhow!("Unknown ui-acme-dns provider: {other} (use cloudflare or hook)")),
+                    };
+                    let acme_cache = base_dir.join("acme-webui");
+                    let acme_cert = if cfg.ui_cert.is_empty() { base_dir.join("webui-acme-cert.pem") }
+                                   else { std::path::PathBuf::from(&cfg.ui_cert) };
+                    let acme_key  = if cfg.ui_key.is_empty()  { base_dir.join("webui-acme-key.pem")  }
+                                   else { std::path::PathBuf::from(&cfg.ui_key)  };
+                    let acme_cfg = acme::AcmeDns01Config {
+                        email:     cfg.ui_acme_email.clone(),
+                        domain:    cfg.ui_acme_domain.clone(),
+                        cert_path: acme_cert.clone(),
+                        key_path:  acme_key.clone(),
+                        cache_dir: acme_cache,
+                        provider,
+                    };
+                    // Provision cert on startup if missing or expiring
+                    if acme::needs_renewal(&acme_cert) {
+                        info!(domain=%cfg.ui_acme_domain, "ACME DNS-01: provisioning WebUI certificate");
+                        acme::ensure_certificate_dns01(&acme_cfg).await
+                            .map_err(|e| anyhow::anyhow!("ACME DNS-01 failed: {e}"))?;
+                    }
+                    let cert_pem = std::fs::read_to_string(&acme_cert)?;
+                    let key_pem  = std::fs::read_to_string(&acme_key)?;
+                    // No local CA — domain cert is trusted everywhere
+                    let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone(), String::new());
+                    let initial_cfg = Arc::new(crate::sync::server_tls_config(&cert_pem, &key_pem)?);
+                    let tls_state: Arc<tokio::sync::RwLock<Arc<rustls::ServerConfig>>> =
+                        Arc::new(tokio::sync::RwLock::new(initial_cfg));
+                    // Renewal loop with hot-swap
+                    ui_rt.spawn(acme::renewal_loop_dns01(acme_cfg, Arc::clone(&tls_state)));
+                    // TLS accept loop (same as CA path — reused below)
+                    let ui_port_tls = cfg.ui_port;
+                    ui_rt.spawn(async move {
+                        use hyper_util::rt::{TokioExecutor, TokioIo};
+                        use hyper_util::server::conn::auto::Builder as HyperBuilder;
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        use tower::Service as _;
+                        let listener = tokio::net::TcpListener::from_std(ui_std_listener)
+                            .expect("ui TcpListener::from_std");
+                        let make_svc = ui_app
+                            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+                        loop {
+                            let (tcp, addr) = match listener.accept().await {
+                                Ok(x) => x,
+                                Err(e) => { warn!("WebUI accept: {e}"); continue; }
+                            };
+                            let server_cfg = Arc::clone(&*tls_state.read().await);
+                            let acceptor   = tokio_rustls::TlsAcceptor::from(server_cfg);
+                            let mut ms     = make_svc.clone();
+                            tokio::spawn(async move {
+                                let mut tcp = tcp;
+                                let mut peek = [0u8; 1];
+                                if tcp.peek(&mut peek).await.unwrap_or(0) == 1 && peek[0].is_ascii_uppercase() {
+                                    let mut buf = vec![0u8; 4096];
+                                    let n = tcp.read(&mut buf).await.unwrap_or(0);
+                                    let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                                    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/").to_owned();
+                                    let host_hdr = req.lines().find(|l| l.to_ascii_lowercase().starts_with("host:")).and_then(|l| l.splitn(2, ':').nth(1)).map(|h| h.trim().to_owned());
+                                    let location = match host_hdr {
+                                        Some(h) if h.contains(':') => format!("https://{h}{path}"),
+                                        Some(h) => format!("https://{h}:{ui_port_tls}{path}"),
+                                        None => format!("https://{}:{ui_port_tls}{path}", addr.ip()),
+                                    };
+                                    let body = format!("<a href=\"{location}\">HTTPS required</a>");
+                                    let resp = format!("HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                    tcp.write_all(resp.as_bytes()).await.ok();
+                                    return;
+                                }
+                                let svc = match ms.call(addr).await { Ok(s) => s, Err(_) => return };
+                                let svc = hyper_util::service::TowerToHyperService::new(svc);
+                                match acceptor.accept(tcp).await {
+                                    Ok(tls) => { HyperBuilder::new(TokioExecutor::new()).serve_connection_with_upgrades(TokioIo::new(tls), svc).await.ok(); }
+                                    Err(e) => { tracing::debug!(peer=%addr, "WebUI TLS: {e}"); }
+                                }
+                            });
+                        }
+                    });
+                    Box::leak(Box::new(ui_rt));
+                    info!(addr=%ui_addr, domain=%cfg.ui_acme_domain, "Web UI listening (HTTPS/ACME)");
+                } else if cfg.ui_tls {
+                    // ── Local CA path ─────────────────────────────────────────
                     let (ca_cert_pem, ca_key_pem) =
                         webui::ensure_webui_ca(&cfg.ui_ca_cert, &cfg.ui_ca_key, &base_dir)?;
                     let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone(), ca_cert_pem.clone());
