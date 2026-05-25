@@ -517,7 +517,7 @@
         <span class="text-xs text-gray-600 uppercase tracking-wide">ICMP XDP Responder</span>
         <div class="flex items-center gap-3">
           <span id="prot-icmp-status" class="badge" style="background:#1a1a1a;color:#6b7280;border:1px solid #374151">—</span>
-          <button id="prot-icmp-toggle" onclick="toggleIcmp()" class="btn-secondary text-xs">—</button>
+          <button id="prot-icmp-toggle" onclick="toggleIcmp()" class="btn-primary text-xs">—</button>
         </div>
       </div>
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
@@ -535,7 +535,7 @@
           <div class="text-xs text-gray-600 mb-1.5">Burst</div>
           <input type="number" id="prot-icmp-burst" min="1" max="500" class="input w-24"/>
         </div>
-        <button onclick="saveIcmpConfig()" class="btn-secondary text-xs">Save config</button>
+        <button onclick="saveIcmpConfig()" class="btn-primary text-xs">Save config</button>
         <span id="prot-icmp-msg" class="text-xs"></span>
       </div>
     </div>
@@ -672,6 +672,7 @@ function nodeApi(nodeId, method, path, body) {
   const doFetch = (url, authKey) => {
     const headers = {'Authorization': `Bearer ${authKey}`};
     if (body) headers['Content-Type'] = 'application/json';
+    if (method !== 'GET' && method !== 'HEAD') headers['X-CSRF-Token'] = getCsrf();
     return fetch(url, {method, headers, body: body ? JSON.stringify(body) : undefined})
       .then(async r => {
         if (!r.ok) {
