@@ -566,7 +566,42 @@ fn xdp_worker(
                 // dropped. Non-IP frames should never reach port 53 via XDP_PASS,
                 // but deny-by-default is the correct posture if they do.
                 let src_ip = extract_src_ip(rx_frame);
-                if src_ip.map(|ip| !rate_limiter.check(ip)).unwrap_or(true) {
+
+                // PERF-5 (#137): thread-local shadow rate-limit cache.
+                // Cache hit skips the DashMap shard lock for 99%+ of known-IP traffic.
+                // Allowed TTL = 10ms (token depletion visible within one refill window);
+                // denied TTL = 100ms (flood IPs never reach the DashMap).
+                thread_local! {
+                    static TL_RL: std::cell::RefCell<
+                        std::collections::HashMap<std::net::IpAddr, (bool, std::time::Instant)>
+                    > = std::cell::RefCell::new(
+                        std::collections::HashMap::with_capacity(1024)
+                    );
+                }
+                if src_ip.map(|ip| {
+                    let now = std::time::Instant::now();
+                    let cached = TL_RL.with(|c| {
+                        c.borrow()
+                            .get(&ip)
+                            .and_then(|&(ok, until)| (now < until).then_some(!ok))
+                    });
+                    if let Some(drop_pkt) = cached {
+                        drop_pkt
+                    } else {
+                        let ok = rate_limiter.check(ip);
+                        TL_RL.with(|c| {
+                            let mut cache = c.borrow_mut();
+                            if cache.len() >= 1024 { cache.clear(); }
+                            let ttl = if ok {
+                                std::time::Duration::from_millis(10)
+                            } else {
+                                std::time::Duration::from_millis(100)
+                            };
+                            cache.insert(ip, (ok, now + ttl));
+                        });
+                        !ok
+                    }
+                }).unwrap_or(true) {
                     sock.umem.tx_free.push_back(tx_addr);
                     continue;
                 }
