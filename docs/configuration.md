@@ -1113,6 +1113,36 @@ dig @192.168.1.10 home. AXFR
 
 ---
 
+## WebUI TLS certificate SANs
+
+### Adding IP/hostname SANs to the auto-generated certificate
+
+By default, the auto-generated WebUI certificate includes `localhost`, `127.0.0.1`, and `::1`
+as Subject Alternative Names (as of v0.9.44).
+
+To add your server's LAN IP or a custom hostname (required for browser access by IP without a
+certificate warning):
+
+```
+server:
+    ui-tls-san: 192.168.1.10
+    ui-tls-san: myserver.local
+```
+
+The directive may appear multiple times — each value adds one SAN.
+
+After adding SANs, delete the existing cert and restart to regenerate:
+
+```bash
+sudo rm /etc/runbound/webui-cert.pem /etc/runbound/webui-key.pem
+sudo systemctl restart runbound
+```
+
+> **Note:** The cert is cached on disk. The fix only takes effect when the cert is regenerated.
+> Existing installs must delete the cached cert files and restart.
+
+---
+
 ## `alert:` directives
 
 Alert rules trigger automated responses when a DNS metric exceeds a threshold
@@ -1151,6 +1181,8 @@ alert {
 | `notify-url` | URL | — | Webhook URL for `action: notify`. POST with JSON payload (see below). |
 | `block-duration-s` | integer | `300` | Seconds to block the source IP for `action: block`. `0` = permanent until restart. |
 
+> **Note:** `name:` must be the first directive in each `alert:` block. If other directives appear before `name:`, a warning is logged and a rule is auto-created with a generated name — but this is not reliable. Always place `name:` first.
+
 **Actions:**
 
 | Action | Behaviour |
@@ -1188,8 +1220,10 @@ curl -s -X DELETE http://localhost:8080/api/alerts/blocked/1.2.3.4   -H "Authori
 
 > **Note:** Alert blocks are persisted to `alert-blocks.json` in the config directory and survive
 > restarts. Blocks with an expiry time that has already passed are dropped on load.
-> Alert *rules* (the `alert:` blocks in `runbound.conf`) are loaded at startup only —
-> changes to rules require a full restart; `POST /api/reload` does not update them.
+> A background task runs every 60 seconds to remove expired blocks from both the in-memory tracker
+> and the XDP map. Bot bans from the bot defense system also appear here with rules
+> `bot-honeypot`, `bot-scanner`, or `bot-burst`.
+> As of v0.9.44, alert *rules* **are** reloaded by `POST /api/reload` without a restart.
 
 **Example — multi-layer protection:**
 
@@ -1219,6 +1253,36 @@ alert {
 }
 ```
 
+
+## Bot defense
+
+Runbound includes a multi-layer bot defense system for the WebUI. All bot bans are integrated
+into the alert system and visible in `GET /api/alerts`.
+
+```
+server:
+    bot-ban-duration-secs: 86400   # Max ban duration in seconds. Default: 86400 (24h). 0 = permanent.
+    bot-honeypot-enabled:  yes     # Enable honeypot on login form. Default: no.
+```
+
+**Detection layers:**
+
+- **Honeypot** (`bot-honeypot-enabled: yes`): Hidden fake fields in the login form trap bots that
+  auto-fill forms. First hit → immediate ban (rule: `bot-honeypot`).
+- **Scanner detection**: Requests to known vulnerability scanner paths (`/wp-admin`, `/.env`,
+  `/.git/*`, `/phpmyadmin`, `/xmlrpc.php`, etc.) → immediate ban (rule: `bot-scanner`).
+- **Behavioral burst**: 10 failed requests within 5 seconds from the same IP → ban (rule: `bot-burst`).
+
+**Enforcement**: Bans use the same pipeline as alert blocks — XDP BPF map injection (IPv4) or
+userspace block (IPv6). Bans persist to `alert-blocks.json` and survive restarts.
+
+**Auto-deban**: A background task runs every 60 seconds and removes expired bans from both the
+userspace tracker and the XDP map.
+
+**Cross-cluster**: Master propagates bot bans to all slaves via `SyncOp::AddGlobalBan`. Expired
+bans or manual unbans propagate via `SyncOp::DeleteGlobalBan`.
+
+---
 
 ## Environment variables
 

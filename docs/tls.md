@@ -171,6 +171,49 @@ list of `acme-*` directives.
 
 ---
 
+## WebUI TLS — auto-generated certificate SANs
+
+### Default SANs (as of v0.9.44)
+
+When Runbound generates a WebUI TLS certificate automatically (the default when no
+`ui-cert`/`ui-key` is configured), the certificate always includes the following
+Subject Alternative Names:
+
+- `localhost` (DNS)
+- `127.0.0.1` (IP)
+- `::1` (IP)
+
+This means loopback access works without a browser warning out of the box.
+
+### Adding custom IP or hostname SANs
+
+To allow browser access by LAN IP (e.g., `https://192.168.1.10:8091`) without
+a certificate warning, add the server's IP as a SAN:
+
+```
+server:
+    ui-tls-san: 192.168.1.10
+    ui-tls-san: myserver.local
+```
+
+The `ui-tls-san` directive may appear multiple times — each line adds one SAN.
+IP addresses and hostnames are both accepted.
+
+### Applying the change
+
+The auto-generated certificate is cached on disk. After adding `ui-tls-san` directives,
+delete the cached cert files and restart to regenerate with the new SANs:
+
+```bash
+sudo rm /etc/runbound/webui-cert.pem /etc/runbound/webui-key.pem
+sudo systemctl restart runbound
+```
+
+After restart, reinstall the CA certificate in your browser (or trust the new cert) —
+the cert fingerprint changes on regeneration.
+
+---
+
 ## Verify DoT is working
 
 ```bash
