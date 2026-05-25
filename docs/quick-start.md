@@ -7,7 +7,7 @@ Up and running in 5 minutes.
 ## 1. Install
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/redlemonbe/Runbound/main/install.sh | sudo bash
+curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh | sudo bash
 ```
 
 That's it — the script detects your architecture (x86_64 / ARM64), downloads the
@@ -19,10 +19,23 @@ hardened systemd unit file.
 
 ```bash
 # Download and inspect first:
-curl -sSf -o install.sh https://raw.githubusercontent.com/redlemonbe/Runbound/main/install.sh
+curl -fsSL -o install.sh https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh
 less install.sh
 sudo bash install.sh
 ```
+
+At the end you'll see your API key and the service URL:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Version:  runbound 0.9.16
+ API key:  a1b2c3d4...   ← save this
+ Config:   /etc/runbound/runbound.conf
+ Logs:     journalctl -u runbound -f
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**Save the API key** — you'll need it to use the dashboard and the REST API.
 
 ---
 
@@ -46,6 +59,7 @@ server:
 forward-zone:
     name:         "."
     forward-addr: 1.1.1.1@853   # upstream resolver
+    forward-tls-upstream: yes
 ```
 
 **Migrating from Unbound?** Your existing config works as-is — Runbound reads
@@ -69,8 +83,9 @@ sudo RUNBOUND_API_KEY="your-key" runbound --config /etc/runbound/runbound.conf
 dig @127.0.0.1 google.com
 
 # Verify the API is reachable:
-curl -s http://localhost:8080/health -H "Authorization: Bearer $RUNBOUND_API_KEY"
-# → {"status":"ok","uptime_secs":3,"queries":0}
+curl -s http://localhost:8080/api/system \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
+# → {"version":"0.9.16","uptime_secs":3,...}
 ```
 
 ---
@@ -82,6 +97,7 @@ If you used `install.sh` (Step 1), the systemd unit is already installed and the
 
 ```bash
 sudo systemctl enable --now runbound
+sudo journalctl -u runbound -f   # watch logs
 ```
 
 For manual installs or a custom hardened unit file, see [systemd.md](systemd.md).
@@ -105,33 +121,105 @@ dig @127.0.0.1 myserver.home.
 
 # View stats
 curl -s "$API/api/stats" -H "Authorization: Bearer $TOKEN"
+
+# View service info (version, uptime, XDP status)
+curl -s "$API/api/system" -H "Authorization: Bearer $TOKEN"
 ```
 
 That's all. For the full API reference see [api.md](api.md).
 
 ---
 
-## Privacy defaults
+## Stop conflicting services first (if needed)
 
-By default Runbound keeps the last 1,000 queries (with client IPs) in a RAM ring buffer accessible via `GET /logs`. If this doesn't fit your retention policy:
+If port 53 is already taken:
 
+```bash
+# Check what's using port 53
+sudo ss -tlnp | grep :53
+
+# Common culprits
+sudo systemctl stop unbound
+sudo systemctl stop bind9
+sudo systemctl stop dnsmasq
+sudo systemctl disable systemd-resolved && sudo systemctl stop systemd-resolved
 ```
-server:
-    log-retention: 0     # disable the ring buffer entirely
-    log-client-ip: no    # or: keep the buffer but redact IPs
+
+Then re-run the install command.
+
+---
+
+## Uninstall
+
+```bash
+curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh | sudo bash -s -- --uninstall
 ```
 
-See [gdpr.md](gdpr.md) for the full GDPR compliance guide.
+Your config and data in `/etc/runbound` and `/var/lib/runbound` are kept.
 
 ---
 
 ## Web management console
 
-A browser dashboard is included at `examples/web-ui/index.html` — manage DNS
-entries, the blacklist, feeds, and live query logs without touching the CLI.
+Runbound includes an embedded web UI served on port 8090 (enable with `ui-enabled: yes`
+in the config), or you can use nginx as a reverse proxy.
 
-It requires a small nginx reverse proxy to bridge the browser to the
-localhost-only API. Full setup in [web-ui.md](web-ui.md) (5 minutes).
+**Option A — embedded server (simplest):**
+
+```
+server:
+    ui-enabled: yes
+    ui-port:    8090
+```
+
+Restart Runbound, then open `http://YOUR_SERVER_IP:8090`.
+
+**Option B — nginx reverse proxy:**
+
+```bash
+sudo apt install nginx
+
+sudo tee /etc/nginx/sites-enabled/runbound-ui << 'EOF'
+server {
+    listen 8090;
+    server_name _;
+    root /var/www/runbound-ui;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location /api/ {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_http_version 1.0;
+        proxy_set_header   Host $host;
+        proxy_read_timeout 30s;
+    }
+}
+EOF
+
+sudo systemctl reload nginx
+```
+
+Open `http://YOUR_SERVER_IP:8090`, enter your API key, click **Connect**.
+
+Full setup guide: [web-ui.md](web-ui.md).
+
+---
+
+## Privacy defaults
+
+By default Runbound keeps the last 1,000 queries (with client IPs redacted) in a RAM
+ring buffer accessible via `GET /api/logs`. To change this:
+
+```
+server:
+    log-retention: 0     # disable the ring buffer entirely
+    log-client-ip: yes   # include real client IPs (for investigation)
+```
+
+See [gdpr.md](gdpr.md) for the full GDPR compliance guide.
 
 ---
 

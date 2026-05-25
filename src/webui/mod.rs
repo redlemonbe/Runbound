@@ -47,6 +47,8 @@ pub struct WebUiState {
     creds:    Arc<std::sync::Mutex<WebUiCred>>,
     auth_path: PathBuf,
     auth_events: Arc<std::sync::Mutex<std::collections::VecDeque<AuthEvent>>>,
+    /// SEC-A1: per-IP login failure tracker — (failure_count, window_start).
+    login_rl: Arc<DashMap<std::net::IpAddr, (u32, Instant)>>,
 }
 
 struct WebUiCred {
@@ -68,7 +70,21 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         creds: Arc::new(std::sync::Mutex::new(creds)),
         auth_path,
         auth_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(100))),
+        login_rl: Arc::new(DashMap::new()),
     });
+    // SEC-B10: periodic cleanup of expired sessions (every 5 minutes).
+    {
+        let sessions = Arc::clone(&state.sessions);
+        let login_rl = Arc::clone(&state.login_rl);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                sessions.retain(|_, (exp, _)| std::time::Instant::now() < *exp);
+                login_rl.retain(|_, (_, since)| since.elapsed().as_secs() < 120);
+            }
+        });
+    }
     Router::new()
         .route("/", get(serve_dashboard))
         .route("/rb-styles.js", get(serve_rb_styles))
@@ -217,9 +233,24 @@ struct LoginForm { username: String, password: String }
 async fn handle_login(
     State(state): State<Arc<WebUiState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let client_ip = addr.ip().to_string();
+    let client_ip_addr = addr.ip();
+    let client_ip = client_ip_addr.to_string();
+    // SEC-A1/SEC-B5: atomic rate-limit — pre-increment inside the shard lock to prevent
+    // concurrent-request bypass. On success, entry is removed (reset). On failure, count stays.
+    {
+        let now = Instant::now();
+        let mut entry = state.login_rl.entry(client_ip_addr).or_insert((0u32, now));
+        let (count, since) = &mut *entry;
+        if since.elapsed().as_secs() >= 60 { *count = 0; *since = now; }
+        if *count >= 5 {
+            tracing::warn!(ip = %client_ip, "WebUI login rate-limited");
+            return (StatusCode::TOO_MANY_REQUESTS, Html("<h1>Too many attempts. Try again in a minute.</h1>")).into_response();
+        }
+        *count += 1; // Pre-increment atomically — prevents concurrent bypass
+    }
     let ok = {
         let creds = state.creds.lock().unwrap_or_else(|e| e.into_inner());
         if creds.username != form.username { false }
@@ -235,6 +266,8 @@ async fn handle_login(
         push_auth_event(&state, "login_fail", &form.username, &client_ip);
         return Redirect::to("/login?err=Invalid%20credentials").into_response();
     }
+    // Success — reset rate limit
+    state.login_rl.remove(&client_ip_addr);
     // Purge expired sessions before adding a new one
     state.sessions.retain(|_, (exp, _)| Instant::now() < *exp);
     let token = uuid::Uuid::new_v4().to_string();
@@ -243,13 +276,19 @@ async fn handle_login(
     state.sessions.insert(token.clone(), (Instant::now() + SESSION_TTL, csrf_token.clone()));
     tracing::info!(user = %form.username, ip = %client_ip, "WebUI login successful");
     push_auth_event(&state, "login_ok", &form.username, &client_ip);
+    // SEC-A2: add Secure flag when behind an HTTPS reverse proxy.
+    let secure = headers.get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+    let secure_attr = if secure { "; Secure" } else { "" };
     let cookie_session = format!(
-        "rb_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        "rb_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure_attr}",
         SESSION_TTL.as_secs()
     );
     // rb_csrf is NOT HttpOnly — JS reads it to add X-CSRF-Token header (SEC-19 double-submit).
     let cookie_csrf = format!(
-        "rb_csrf={csrf_token}; Path=/; SameSite=Lax; Max-Age={}",
+        "rb_csrf={csrf_token}; Path=/; SameSite=Lax; Max-Age={}{secure_attr}",
         SESSION_TTL.as_secs()
     );
     Response::builder()
@@ -294,8 +333,8 @@ async fn change_password(
     if !verify_csrf(&state, &headers) {
         return (StatusCode::FORBIDDEN, "CSRF token invalid or missing").into_response();
     }
-    if payload.username.trim().is_empty() || payload.password.len() < 4 {
-        return (StatusCode::BAD_REQUEST, "username required; password min 4 chars").into_response();
+    if payload.username.trim().is_empty() || payload.password.len() < 12 {
+        return (StatusCode::BAD_REQUEST, "username required; password min 12 chars").into_response();
     }
     let salt = SaltString::generate(&mut OsRng);
     let hash = match Argon2::default().hash_password(payload.password.as_bytes(), &salt) {
@@ -335,6 +374,12 @@ async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> 
         return (StatusCode::UNAUTHORIZED, r#"{"error":"not authenticated"}"#).into_response();
     }
     let method  = req.method().clone();
+    // SEC-B14: require CSRF token for all state-changing methods forwarded to the API.
+    if matches!(method, axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE | axum::http::Method::PATCH) {
+        if !verify_csrf(&state, req.headers()) {
+            return (StatusCode::FORBIDDEN, r#"{"error":"invalid CSRF token"}"#).into_response();
+        }
+    }
     let uri     = req.uri().clone();
     let headers = req.headers().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), 65_536).await {

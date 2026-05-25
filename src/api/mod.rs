@@ -310,6 +310,7 @@ pub struct AppState {
     pub events_tx: Option<tokio::sync::broadcast::Sender<crate::sync::NodeStatusEvent>>,
     /// #5: per-domain query counter — top-domains endpoint.
     pub domain_stats: Arc<crate::domain_stats::DomainStats>,
+    pub alert_tracker: Arc<crate::alerts::AlertTracker>,
     /// #89: ICMP echo responder statistics (polled from BPF per-CPU array).
     pub icmp_stats: Arc<crate::icmp::IcmpStats>,
     /// #89: Current ICMP config — updated via PUT /api/icmp/config.
@@ -645,6 +646,9 @@ pub fn router(state: AppState) -> Router {
             "/icmp/config",
             get(icmp_config_get_handler).put(icmp_config_put_handler),
         )
+        // Alert thresholds (#12)
+        .route("/alerts", get(get_alerts))
+        .route("/alerts/blocked/:ip", delete(delete_blocked_ip))
         // Administration
         .route("/rotate-key", post(rotate_key_handler))
         .layer(middleware::from_fn_with_state(
@@ -726,7 +730,7 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         (
             list.iter().filter(|u| u.healthy).count() as u32,
             list.len() as u32,
@@ -893,7 +897,7 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in system handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         (
             list.iter().filter(|u| u.healthy).count() as u32,
             list.len() as u32,
@@ -2260,7 +2264,7 @@ async fn delete_upstream_handler(
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in delete handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         let target_exists = list.iter().any(|u| u.id == id);
         if target_exists && list.len() == 1 {
             return (
@@ -2279,7 +2283,7 @@ async fn delete_upstream_handler(
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in delete handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(u) = list.iter().find(|u| u.id == id) {
             if u.source == "config" {
                 let addr = u.addr.clone();
@@ -2372,7 +2376,7 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
         let mut last = s
             .last_flush_at
             .lock()
-            .unwrap_or_else(|e| panic!("last_flush_at poisoned: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(t) = *last {
             let elapsed = t.elapsed().as_secs();
             if elapsed < cooldown {
@@ -2388,7 +2392,7 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
                 resp.headers_mut().insert(
                     axum::http::header::RETRY_AFTER,
                     axum::http::HeaderValue::from_str(&retry_after.to_string())
-                        .unwrap_or_else(|e| panic!("Retry-After header value: {e}")),
+                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
                 );
                 return resp;
             }
@@ -2519,7 +2523,7 @@ async fn patch_upstream_handler(
         let mut list = s
             .upstreams
             .write()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in patch handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(u) = list.iter_mut().find(|u| u.id == id) {
             if let Some(n) = name_patch {
                 u.name = n;
@@ -3173,7 +3177,7 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in metrics handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         list.iter()
             .map(|u| UpstreamMetric {
                 id: u.id.clone(),
@@ -3294,6 +3298,20 @@ fn validate_no_control_chars(s: &str, field: &'static str) -> Result<(), String>
             "Field '{}' must not contain control characters (\r, \n, etc.)",
             field
         ));
+    }
+    // SEC-B16: reject Unicode bidi override and format characters (log injection via U+202x, U+2028/9).
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if (0x200B..=0x200F).contains(&cp)  // zero-width, direction marks
+            || (0x202A..=0x202E).contains(&cp)  // bidi overrides
+            || cp == 0x2028 || cp == 0x2029     // line/paragraph separators
+            || (0xFFF9..=0xFFFB).contains(&cp)  // interlinear annotation
+        {
+            return Err(format!(
+                "Field '{}' must not contain Unicode control or format characters",
+                field
+            ));
+        }
     }
     Ok(())
 }
@@ -5918,5 +5936,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+
+// GET /api/alerts — alert rules, blocked clients, recent events (#12)
+// Auth handled by security_middleware.
+async fn get_alerts(State(state): State<AppState>) -> impl IntoResponse {
+    JsonExtract(state.alert_tracker.api_snapshot())
+}
+
+// DELETE /api/alerts/blocked/:ip — unblock a specific IP (#12)
+async fn delete_blocked_ip(
+    State(state): State<AppState>,
+    axum::extract::Path(ip_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match ip_str.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            let removed = state.alert_tracker.unblock(ip);
+            (StatusCode::OK, JsonExtract(serde_json::json!({"unblocked": removed, "ip": ip_str}))).into_response()
+        }
+        Err(_) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error": "invalid IP"}))).into_response(),
     }
 }

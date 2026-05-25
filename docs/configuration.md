@@ -856,6 +856,27 @@ forward-zone:
     forward-addr:         1.1.1.1@853
     forward-addr:         9.9.9.9@853
     forward-tls-upstream: yes
+
+# Optional — io_uring for TCP/DoT/DoH slow path (Linux 5.10+)
+# io-uring {
+#     enable: yes
+# }
+
+# Optional — AXFR zone transfers for secondary nameservers
+# axfr {
+#     enable: yes
+#     allow:  192.168.1.20     # IP of your secondary DNS
+# }
+
+# Optional — alert thresholds (DDoS detection + auto-block)
+# alert {
+#     name:             ddos-block
+#     metric:           client-qps
+#     window-s:         10
+#     threshold:        500
+#     action:           block
+#     block-duration-s: 300
+# }
 ```
 
 ---
@@ -955,6 +976,205 @@ The sync port number is configurable. Both sides use the same port number by con
 The REST API stays on localhost on all nodes.
 
 ---
+
+---
+
+## `io-uring:` directives
+
+> Requires Linux 5.1+ with io_uring support (`CONFIG_IO_URING`). On kernels
+> without io_uring, this section is silently ignored and Runbound falls back
+> to epoll/tokio default I/O.
+
+io_uring replaces the default epoll-based async I/O with the Linux io_uring
+submission-queue interface. Reduces system-call overhead on the slow path
+(TCP DNS, DoT, DoH) by batching I/O operations into ring buffers shared
+between user space and kernel.
+
+```
+io-uring {
+    enable: yes
+}
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `enable` | bool (`yes`/`no`) | `no` | Enable io_uring for async DNS and API I/O. |
+
+**Startup detection:** Runbound reads `/proc/sys/kernel/io_uring_disabled` at
+startup. If the value is `1` or `2` (restricted or disabled), io_uring is
+silently skipped even when `enable: yes` is set, and a `WARN` is emitted.
+
+**Performance impact (slow path):** io_uring reduces per-syscall overhead for
+TCP connections. The XDP fast path (UDP) is unaffected — it never uses syscalls.
+At 5M+ QPS with a high cache-hit rate (≥ 85 % XDP fast path), the improvement
+is primarily felt on the remaining slow-path TCP/DoT/DoH queries.
+
+**When to enable:**
+- Bare-metal or VM with Linux ≥ 5.1 and `io_uring_disabled = 0`
+- High-volume DoT/DoH deployments (millions of TCP connections)
+- Benchmarking the slow path
+
+**When to leave disabled (default):**
+- Containers with restricted syscall profiles (Docker default seccomp blocks
+  some io_uring operations on older container runtimes)
+- Kernels older than 5.10 (io_uring was stabilised in 5.10)
+
+Check your kernel's io_uring status:
+
+```bash
+cat /proc/sys/kernel/io_uring_disabled
+# 0 = enabled (safe to use)
+# 1 = restricted (only privileged processes)
+# 2 = disabled system-wide
+```
+
+---
+
+## `axfr:` directives
+
+AXFR zone transfers (RFC 5936) allow secondary DNS servers to pull a complete
+copy of a zone from Runbound. Useful for populating legacy resolvers, BIND9
+secondaries, or monitoring tools that speak AXFR.
+
+> AXFR support requires local zones to be defined with `local-zone:` /
+> `local-data:` or loaded via the API. Feed-populated blocklists are not
+> transferable via AXFR. Available since v0.9.13.
+
+```
+axfr {
+    enable: yes
+    allow:  192.168.0.0/16
+    allow:  10.0.0.0/8
+}
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `enable` | bool (`yes`/`no`) | `no` | Enable AXFR zone transfer responses on TCP port 53. |
+| `allow` | CIDR | — | IP range allowed to request AXFR. Repeat for multiple ranges. Required when `enable: yes`. |
+
+**Security model:** AXFR exposes your full zone contents in a single TCP
+connection. Always restrict `allow:` to trusted secondary nameserver IPs.
+Requests from IPs not matching any `allow:` range receive `REFUSED`.
+
+**Behaviour:**
+- AXFR is delivered as: SOA → all records → SOA (RFC 5936 §2.2)
+- Only `local-zone:` zones are transferable; the global catch-all is not
+- IXFR requests (RFC 1995) receive a full AXFR fallback response
+
+**Test a zone transfer:**
+
+```bash
+# Transfer the "home." zone from localhost
+dig @127.0.0.1 home. AXFR
+
+# Transfer from a secondary (replace with secondary IP):
+dig @192.168.1.10 home. AXFR
+```
+
+---
+
+## `alert:` directives
+
+Alert rules trigger automated responses when a DNS metric exceeds a threshold
+within a sliding time window. Use them to detect DDoS ramps, DNS flood attacks,
+and reconnaissance sweeps without external monitoring tools.
+
+Multiple `alert:` blocks can be defined — each creates an independent rule.
+
+```
+alert {
+    name:             ddos-ramp
+    metric:           client-qps
+    window-s:         10
+    threshold:        500
+    action:           block
+    block-duration-s: 300
+}
+
+alert {
+    name:      recon-sweep
+    metric:    client-qps
+    window-s:  60
+    threshold: 2000
+    action:    notify
+    notify-url: https://hooks.example.com/runbound-alert
+}
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | — | Human-readable rule identifier. Required. Appears in logs and webhook payloads. |
+| `metric` | string | `client-qps` | Metric to monitor. Currently supported: `client-qps` (queries/window/source IP). |
+| `window-s` | integer | `10` | Sliding window length in seconds. Queries older than `window-s` are expired. |
+| `threshold` | integer | `1000` | Query count that triggers the action (inclusive). |
+| `action` | string | `log` | What to do when the threshold is reached: `log`, `block`, or `notify`. |
+| `notify-url` | URL | — | Webhook URL for `action: notify`. POST with JSON payload (see below). |
+| `block-duration-s` | integer | `300` | Seconds to block the source IP for `action: block`. `0` = permanent until restart. |
+
+**Actions:**
+
+| Action | Behaviour |
+|---|---|
+| `log` | Emit a `WARN` log line. No traffic impact. |
+| `block` | Drop all queries from the source IP for `block-duration-s` seconds. Counter is visible in `GET /api/stats`. |
+| `notify` | POST a JSON webhook to `notify-url`. Non-blocking — uses a background tokio task. |
+
+**Webhook payload (`action: notify`):**
+
+```json
+{
+  "rule":      "recon-sweep",
+  "metric":    "client-qps",
+  "source_ip": "1.2.3.4",
+  "count":     2104,
+  "threshold": 2000,
+  "window_s":  60,
+  "ts":        1748188800
+}
+```
+
+**Alert status API:**
+
+```bash
+# List active blocks and recent alerts
+curl -s http://localhost:8080/api/alerts   -H "Authorization: Bearer $TOKEN"
+
+# Unblock an IP manually
+curl -s -X DELETE http://localhost:8080/api/alerts/block/1.2.3.4   -H "Authorization: Bearer $TOKEN"
+```
+
+> **Note:** Alert blocks are held in memory and do not persist across restarts.
+> After a restart, previously blocked IPs are unblocked until they re-trigger a rule.
+
+**Example — multi-layer protection:**
+
+```
+# Layer 1 — rate limiter (built-in, per-query token bucket)
+server:
+    rate-limit: 200
+
+# Layer 2 — alert: block after sustained flood
+alert {
+    name:             sustained-flood
+    metric:           client-qps
+    window-s:         5
+    threshold:        800
+    action:           block
+    block-duration-s: 600
+}
+
+# Layer 3 — notify NOC on very high-volume attack
+alert {
+    name:      noc-escalation
+    metric:    client-qps
+    window-s:  5
+    threshold: 5000
+    action:    notify
+    notify-url: https://pagerduty.example.com/webhook
+}
+```
+
 
 ## Environment variables
 
