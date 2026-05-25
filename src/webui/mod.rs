@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 static INDEX_HTML: &str = include_str!("../../examples/web-ui/index.html");
+static INDEX_HTML_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
 
 #[derive(Clone, serde::Serialize)]
 struct AuthEvent {
@@ -155,7 +156,21 @@ async fn serve_dashboard(State(state): State<Arc<WebUiState>>, req: Request<Body
     if !is_authenticated(&state, req.headers()) {
         return Redirect::to("/login").into_response();
     }
-    Html(INDEX_HTML).into_response()
+    let accepts_gzip = req.headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("gzip"))
+        .unwrap_or(false);
+    if accepts_gzip {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from(INDEX_HTML_GZ))
+            .unwrap_or_else(|_| Html(INDEX_HTML).into_response())
+    } else {
+        Html(INDEX_HTML).into_response()
+    }
 }
 
 
