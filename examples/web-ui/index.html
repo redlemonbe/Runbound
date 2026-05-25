@@ -756,7 +756,7 @@ function renderStats(s) {
   set('ov-nxdomain',fmt(s.nxdomain)); set('ov-refused',fmt(s.refused)); set('ov-local',fmt(s.local_hits));
   set('ov-cache-entries',fmt(s.cache_entries)); set('ov-cache-rate',pct(s.cache_hit_rate));
   if(s.xdp_cache_hits!=null) set('ov-xdp-cache-hits',fmt(s.xdp_cache_hits));
-  const d=s.dnssec??{},tot=(d.secure??0)+(d.bogus??0)+(d.insecure??0),off=tot===0&&(s.total??0)>0;
+  const d=s.dnssec??{},tot=(d.secure??0)+(d.bogus??0)+(d.insecure??0),dnssecEnabled=nodes['master']?.sys?.dnssec_validation,off=dnssecEnabled===false||(dnssecEnabled===undefined&&tot===0&&(s.total??0)>0);
   set('ov-dnssec-secure',off?'—':fmt(d.secure)); set('ov-dnssec-bogus',off?'—':fmt(d.bogus)); set('ov-dnssec-insecure',off?'—':fmt(d.insecure));
   set('ov-dnssec-status',off?'· validation off':'');
   set('stat-qps',fmtf(s.qps_1m)+' qps'); set('stat-total',fmt(s.total)+' queries'); set('stat-uptime',sec(s.uptime_secs));
