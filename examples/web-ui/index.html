@@ -313,7 +313,7 @@
         <span class="text-xs text-gray-700">peak&nbsp;<span id="qps-chart-peak" class="text-cyan-600 tabular-nums">—</span></span>
       </div>
       <svg id="qps-sparkline-svg" role="img" aria-label="QPS over last 60 seconds"
-           viewBox="0 0 480 52" width="100%" height="52" xmlns="http://www.w3.org/2000/svg" style="display:block">
+           viewBox="0 0 480 52" preserveAspectRatio="none" width="100%" height="52" xmlns="http://www.w3.org/2000/svg" style="display:block">
         <defs>
           <linearGradient id="spk-grad" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18"/>
@@ -462,7 +462,7 @@
 
   <!-- ═══ SYSTEM ═══ -->
   <div id="tab-system" class="hidden fade">
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 max-w-4xl mb-4">
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 max-w-4xl mx-auto mb-4">
       <div class="card">
         <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Runtime</div>
         <div class="space-y-2 text-sm">
@@ -497,7 +497,7 @@
         </div>
       </div>
     </div>
-    <div class="card max-w-4xl mb-3">
+    <div class="card max-w-4xl mx-auto mb-3">
       <div class="flex items-center justify-between mb-3">
         <div class="text-xs text-gray-600 uppercase tracking-wide">Sync / Slaves</div>
         <button onclick="loadSlaves()" class="btn-secondary text-xs">↻ Refresh</button>
@@ -508,7 +508,7 @@
   </div>
 
   <!-- ═══ ABOUT ═══ -->
-  <div id="tab-about" class="hidden fade max-w-3xl">
+  <div id="tab-about" class="hidden fade max-w-3xl mx-auto">
     <div class="flex items-center gap-3 mb-5">
       <span class="text-cyan-400 font-bold text-2xl tracking-widest" style="text-shadow:0 0 18px #22d3ee44">RUNBOUND</span>
       <span id="about-version" class="badge" style="background:#0e2233;color:#67e8f9;border:1px solid #164e63">—</span>
@@ -750,11 +750,6 @@ async function pollNodeStats(id) {
     nodes[id].stats = s; nodes[id].status = 'ok';
     _spkSlaveQps = Object.entries(nodes).filter(([k])=>k!=='master').reduce((a,[,n])=>a+(n.stats?.qps_1m??0),0);
     if (selectedNode === id && id !== 'master') _spkPush(Number(s.qps_1m ?? 0));
-    // When viewing all nodes, push aggregated QPS once master poll completes
-    if (selectedNode === 'all' && id === 'master') {
-      const agg = aggregateStats();
-      if (agg) _spkPush(Number(agg.qps_1m ?? 0));
-    }
     renderNodePills();
     if (selectedNode === id || selectedNode === 'all') updateOverview();
   } catch(e) {
@@ -1289,14 +1284,13 @@ function initSparkline() {
                 const now = Date.now();
                 if (_spkLastTotal != null && _spkLastTime != null) {
                   const dt = (now - _spkLastTime) / 1000;
-                  if (selectedNode !== 'all') {
-                    const extra = 0;
-                    if (dt > 0) _spkPush(Math.max(0, (d.total - _spkLastTotal) / dt) + extra);
-                  }
+                  const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
+                  if (dt > 0) _spkPush(Math.max(0, (d.total - _spkLastTotal) / dt) + extra);
                 }
                 _spkLastTotal = d.total; _spkLastTime = now;
               } else if (d.qps_1m != null) {
-                if (selectedNode !== 'all') _spkPush(Number(d.qps_1m));
+                const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
+                _spkPush(Number(d.qps_1m) + extra);
               }
             } catch(_) {}
           }
