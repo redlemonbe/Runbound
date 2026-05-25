@@ -107,6 +107,7 @@ async fn async_main(
         domain_stats,
         icmp_stats,
         icmp_cfg,
+        dnssec_enabled,
     ) = build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
@@ -354,6 +355,7 @@ async fn async_main(
         per_upstream_resolvers,
         racing_wins,
         domain_stats,
+        Arc::clone(&dnssec_enabled),
     )
     .await;
     fw_cleanup.close();
@@ -518,6 +520,7 @@ async fn build_and_launch(
     Arc<DomainStats>,
     Arc<crate::icmp::IcmpStats>,
     Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
+    Arc<std::sync::atomic::AtomicBool>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -1075,6 +1078,7 @@ async fn build_and_launch(
         domain_stats,
         icmp_stats,
         icmp_cfg,
+        dnssec_enabled,
     ))
 }
 
