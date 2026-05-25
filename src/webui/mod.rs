@@ -108,12 +108,16 @@ pub fn router(
     {
         let sessions = Arc::clone(&state.sessions);
         let login_rl = Arc::clone(&state.login_rl);
+        let burst_tracker_ref = Arc::clone(&state.burst_tracker);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             loop {
                 interval.tick().await;
                 sessions.retain(|_, (exp, _)| std::time::Instant::now() < *exp);
                 login_rl.retain(|_, (_, since)| since.elapsed().as_secs() < 120);
+                // Evict burst tracker entries older than 60 s (window is 5 s; these are long stale).
+                let burst_cutoff = Instant::now() - Duration::from_secs(60);
+                burst_tracker_ref.retain(|_, (_, ts)| *ts > burst_cutoff);
             }
         });
     }
@@ -270,7 +274,7 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
       <input type="password" name="password" value="" autocomplete="off" tabindex="-1" aria-hidden="true" style="display:none;position:absolute;left:-9999px;opacity:0;height:0;width:0;" />
       <div style="margin-bottom:16px">
         <label for="u">Username</label>
-        <input id="u" name="rb_user" type="text" autocomplete="username" class="input w-full"/>
+        <input id="u" name="rb_user" type="text" autocomplete="username" autofocus class="input w-full"/>
       </div>
       <div style="margin-bottom:26px">
         <label for="p">Password</label>
@@ -284,7 +288,7 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
   <script>
     const e=new URLSearchParams(location.search).get('err');
     if(e)document.getElementById('err').textContent=decodeURIComponent(e);
-    document.getElementById('p').focus();
+    document.getElementById('u').focus();
   </script>
 </body>
 </html>"#;
@@ -681,6 +685,19 @@ async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> 
 
 /// Ban an IP via the alert tracker + XDP BPF map + sync journal.
 async fn ban_bot(state: &WebUiState, ip: std::net::IpAddr, rule: &str) {
+    // Never ban loopback or RFC-1918 addresses â would lock out the server itself.
+    let skip = match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || {
+            let s = v6.segments();
+            // fc00::/7 â unique local
+            (s[0] & 0xfe00) == 0xfc00
+        },
+    };
+    if skip {
+        tracing::debug!(ip = %ip, rule = rule, "bot defense: skipping ban for loopback/private IP");
+        return;
+    }
     if state.alert_tracker.is_blocked(ip) {
         return; // already banned
     }
