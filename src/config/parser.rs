@@ -260,6 +260,12 @@ pub struct UnboundConfig {
     pub icmp_enabled: bool,
     pub icmp_rate_pps: u32,
     pub icmp_burst: u32,
+    // ── AXFR/IXFR zone transfer (#22) ────────────────────────────────────────
+    /// Enable AXFR zone transfer serving. Default: false.
+    pub axfr_enabled: bool,
+    /// CIDR ranges allowed to pull zone transfers. Required when axfr-enabled.
+    pub axfr_allow: Vec<String>,
+
     // ── Alert thresholds (#12) ────────────────────────────────────────────────
     pub alerts: Vec<AlertRule>,
 }
@@ -304,6 +310,8 @@ impl UnboundConfig {
             icmp_rate_pps: 10,
             icmp_burst: 5,
             audit_checkpoint_every: 10000,
+            axfr_enabled: false,
+            axfr_allow: vec![],
             alerts: vec![],
             ..Default::default()
         }
@@ -385,6 +393,13 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                     other
                 ),
             },
+            "axfr" => {
+                match key {
+                    "enable" => cfg.axfr_enabled = val.trim_matches('"') == "yes",
+                    "allow" => cfg.axfr_allow.push(val.trim_matches('"').to_string()),
+                    other => warn!("Line {}: unknown axfr directive '{}' — ignored", lineno + 1, other),
+                }
+            }
             "alert" => {
                 match key {
                     "name" => {
