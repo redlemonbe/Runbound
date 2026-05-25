@@ -9,6 +9,256 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.29] — 2026-05-25
+
+### Changed
+
+- WebUI: globe icon (Lucide style, `#22d3ee`, transparent background) added as SVG favicon (inline `data:` URI, no external file needed) and in the header banner alongside the RUNBOUND title, using `display:flex; align-items:center; gap:0.5rem`.
+
+---
+
+## [0.9.28] — 2026-05-25
+
+### Added
+
+- ICMP flood ban (XDP-level): `icmp_banned` BPF LRU_HASH map; IPs exceeding `ban_threshold` rate-limited packets per poll interval are dropped at XDP layer without touching the kernel network stack.
+- Cross-cluster ban propagation: `PUT /api/alerts/blocked/:ip` and `DELETE /api/alerts/blocked/:ip` are forwarded to all registered slaves via the relay.
+- `icmp.json` config: `enable`, `rate_limit` (pps), `burst`, `ban_threshold` fields.
+
+### Fixed
+
+- **SEC-B2** regression: RFC 1918 relay registration check blocked LAN slaves. New opt-in config flag `sync-allow-private-relay: yes` bypasses the check for private deployments.
+- Relay CLOSE-WAIT accumulation: hyper HTTP/1.1 keep-alive on the sync server left connections in CLOSE-WAIT after master closed the write side. Fixed with `.keep_alive(false)` on both server builders (`src/sync.rs`).
+
+---
+
+## [0.9.27] — 2026-05-25
+
+### Added
+
+- ACME DNS-01 challenge support: automatic Let's Encrypt certificate issuance and renewal with no port 80 requirement. Supports Cloudflare DNS-01 hook or custom shell hook script. Hot-swap on renewal — no restart needed. (`src/api/acme.rs`, `src/tls.rs`)
+
+---
+
+## [0.9.26] — 2026-05-25
+
+### Added
+
+- Local CA mode: Runbound generates a self-signed CA at startup if none exists. One-time CA certificate install in the browser/OS trust store gives zero-warning HTTPS for all management connections. Served at `GET /webui/ca.crt`. (`src/tls.rs`, `src/webui/mod.rs`)
+
+---
+
+## [0.9.25] — 2026-05-25
+
+### Fixed
+
+- Protection tab: CSRF token missing on ICMP form submissions — added `X-CSRF-Token` header to all protection API calls.
+- HTTP → HTTPS redirect now returns 301 with correct `Location` header including path and query string.
+- Button style inconsistencies in Protection tab resolved.
+
+---
+
+## [0.9.24] — 2026-05-25
+
+### Added
+
+- Protection tab: WebUI section for ICMP flood protection — enable/disable, rate limit, burst, and ban threshold controls; per-node badge showing `ok` / `flooding` / `banned` status based on delta counters.
+- HTTPS WebUI: embedded TLS server (rustls) serves the management console over HTTPS with auto-generated self-signed certificate.
+- Gzip compression for static WebUI assets (compile-time, `flate2`).
+
+---
+
+## [0.9.23] — 2026-05-25
+
+### Changed
+
+- WebUI static assets (HTML, CSS) compressed with gzip at compile time and served with `Content-Encoding: gzip` — reduces transfer size by ~75%.
+
+---
+
+## [0.9.22] — 2026-05-25
+
+### Fixed
+
+- WebUI: QPS sparkline on slave node view was displaying master QPS data instead of the selected slave's metrics.
+
+---
+
+## [0.9.21] — 2026-05-25
+
+### Fixed
+
+- WebUI: live QPS sparkline timing and bar height calculation corrected.
+- System and About tab content horizontal centering fixed.
+
+---
+
+## [0.9.20] — 2026-05-25
+
+### Fixed
+
+- WebUI: button reset styles, missing body margin, top-domains aggregation across nodes, sparkline rendering for all-nodes view.
+
+---
+
+## [0.9.19] — 2026-05-25
+
+### Changed
+
+- WebUI: Tailwind CDN replaced by a custom utility CSS bundle embedded at compile time. Eliminates the external CDN dependency — WebUI works fully offline. Bundle covers only the classes actually used (~4 KB minified). (`examples/web-ui/index.html`)
+
+---
+
+## [0.9.18] — 2026-05-25
+
+### Fixed
+
+- WebUI: duplicate `QPS_BUF` declaration causing a JavaScript runtime error on the overview tab.
+
+---
+
+## [0.9.17] — 2026-05-25
+
+### Performance
+
+- Cache snapshot: periodic RwLock-free snapshot eliminates lock contention on hot read paths under high QPS.
+- Domain stats (`/api/stats/domains`): O(1) per-domain counter update, served from snapshot.
+- Rate limiter: per-client token-bucket refill moved off the hot path.
+- Startup time: parallel zone loading, lazy BPF map initialisation.
+- `SO_BUSY_POLL`: enabled on AF_XDP sockets to reduce interrupt latency on supported NICs. (#145)
+
+---
+
+## [0.9.16] — 2026-05-25
+
+### Security
+
+- **SEC-B10** [MEDIUM]: Idle session cleanup task now runs every 60 s and removes sessions expired for more than 30 min — prevents unbounded session table growth. (`src/webui/mod.rs`)
+- **SEC-B16** [LOW]: Unicode control characters (U+0000–U+001F, U+007F, U+0080–U+009F) rejected in all free-text API input fields — prevents log injection and terminal escape sequences. (`src/api/mod.rs`)
+
+---
+
+## [0.9.15] — 2026-05-25
+
+### Security
+
+- **SEC-B1** [HIGH]: Relay HMAC window tightened from ±60 s to ±30 s; replay window uses a per-connection nonce set (BTreeSet, evicted after TTL). (`src/api/relay.rs`)
+- **SEC-B2** [HIGH]: Relay registration handler rejects RFC 1918 `relay_host` values by default. Opt-in `sync-allow-private-relay: yes` allows private-IP slaves. (`src/sync.rs`)
+- **SEC-B3** [MEDIUM]: `relay_host` validated as a valid hostname or IP at registration time; rejects raw URLs, path traversal, and embedded newlines. (`src/sync.rs`)
+- **SEC-B5** [MEDIUM]: Webhook URL validated against allowlist schema (https only, no private IPs) before delivery. (`src/api/mod.rs`)
+- **SEC-B9** [MEDIUM]: AXFR `axfr-allow` CIDR list validated at config parse time; malformed CIDRs cause startup failure with a clear error message. (`src/config/parser.rs`)
+- **SEC-B14** [LOW]: Rate limiter counters use saturating arithmetic to prevent u64 overflow under sustained flood. (`src/api/mod.rs`)
+- **SEC-B17** [LOW]: `/api/logs` pagination parameters clamped to `[0, 10_000]` to prevent OOM from large `limit` values. (`src/api/mod.rs`)
+
+---
+
+## [0.9.14] — 2026-05-25
+
+### Added
+
+- io_uring slow path: `use-io-uring: yes` config option enables the Tokio io-uring backend for the DNS slow path (TCP, DoT, fallback UDP). Detected at startup; graceful fallback to epoll if io_uring is unavailable. (#65) (`src/dns/server.rs`)
+
+---
+
+## [0.9.13] — 2026-05-25
+
+### Added
+
+- AXFR/IXFR zone transfer support (#22): Runbound can serve authoritative zones to secondary nameservers. `axfr-allow` CIDR whitelist controls which secondaries may transfer. Synthetic SOA generated from zone data. TSIG-ready architecture for authenticated transfers. (`src/dns/axfr.rs`)
+
+---
+
+## [0.9.12] — 2026-05-25
+
+### Added
+
+- Alert thresholds (#12): per-client QPS tracking with configurable `block`, `notify`, and `log` actions. New endpoints: `GET /api/alerts`, `PUT /api/alerts/blocked/:ip`, `DELETE /api/alerts/blocked/:ip`. Webhook delivery for notify events. (`src/api/mod.rs`, `src/alerts.rs`)
+
+---
+
+## [0.9.11] — 2026-05-25
+
+### Security
+
+- **SEC-A1** [HIGH]: Login endpoint rate-limited to 5 attempts per IP per minute (token bucket, in-memory). Excess attempts return 429 with `Retry-After` header. (`src/webui/mod.rs`)
+- **SEC-A2** [MEDIUM]: Session cookie gains `Secure` flag when the WebUI is served over HTTPS. (`src/webui/mod.rs`)
+- **SEC-A3** [MEDIUM]: Minimum password length enforced at 12 characters on `POST /api/webui/password`. (`src/webui/mod.rs`)
+- **SEC-A5** [LOW]: IPv6 link-local addresses (`fe80::/10`) rejected as `relay_host` values — they are non-routable and would silently fail. (`src/sync.rs`)
+
+---
+
+## [0.9.10] — 2026-05-25
+
+### Changed
+
+- Dead code removed across all modules; zero compiler warnings in release build.
+
+---
+
+## [0.9.9] — 2026-05-25
+
+### Added
+
+- XDP cache-hit counter: `CACHE_HITS` per-CPU BPF array incremented on every XDP-served response; exposed via `GET /api/stats` as `xdp_cache_hits`. (`ebpf/dns_xdp.c`, `src/dns/xdp/worker.rs`)
+- Relay top-domains: `GET /api/nodes/:id/relay/stats/domains` proxied correctly to slave. (`src/api/relay.rs`)
+- Relay system info: `GET /api/nodes/:id/relay/system` returns slave `GET /api/system` response. (`src/api/relay.rs`)
+
+---
+
+## [0.9.8] — 2026-05-25
+
+### Added
+
+- WebUI: node-aware QPS sparkline — per-node mini bar chart on the Overview tab updates independently as the selected node changes.
+- WebUI: relay top-domains panel in the Overview tab shows the top queried domains aggregated across all nodes.
+
+### Fixed
+
+- WebUI: login page placeholder text removed; unused credential hints cleared.
+
+---
+
+## [0.9.7] — 2026-05-25
+
+### Fixed
+
+- DoT upstream silent failures: connection errors now correctly logged and the upstream marked unhealthy. Reconnect logic retried with exponential backoff. (`src/upstreams.rs`)
+- DNSSEC stats not updating after API toggle: `dnssec_probe` task now respects the live config state change without restart. (`src/upstreams.rs`)
+
+---
+
+## [0.9.6] — 2026-05-25
+
+### Added
+
+- Auth activity in Logs tab: `login_ok`, `login_fail`, and `logout` events appear in the log stream with IP address.
+- `GET /api/relay/top-domains` endpoint added to slave API.
+- Favicon served at `/favicon.ico`.
+
+### Fixed
+
+- CORS headers on API responses: missing `Access-Control-Allow-Origin` for preflight requests resolved.
+- `GET /api/relay/system` returning 404 on some slave configurations.
+- Login page body background color incorrect in dark mode.
+- DNSSEC statistics not propagated to slave via config push.
+
+### Changed
+
+- Tailwind stylesheet file renamed from `tailwind.css` to `rb-styles.css`; `dns-prefetch` enabled by default.
+- Logs tab auto-refresh interval set to 5 s.
+
+---
+
+## [0.9.5] — 2026-05-25
+
+### Fixed
+
+- WebUI: dark theme CSS autofill override (SEC-19 follow-up) — browser autofill no longer overrides dark background on login and settings forms. (`examples/web-ui/index.html`)
+- Settings form indentation corrected.
+
+---
+
+
 ## [0.9.4] — 2026-05-25
 
 ### Security
