@@ -205,6 +205,15 @@ pub enum SyncOp {
     DeleteUpstream {
         id: String,
     },
+    // Bot defense cross-cluster ban propagation
+    AddGlobalBan {
+        ip: String,
+        rule: String,
+        expires_secs: Option<u64>,
+    },
+    DeleteGlobalBan {
+        ip: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1113,6 +1122,8 @@ pub struct SlaveClient {
     zones_mutex: Arc<tokio::sync::Mutex<()>>,
     cfg: Arc<UnboundConfig>,
     upstreams: SharedUpstreams,
+    alert_tracker: std::sync::Arc<crate::alerts::AlertTracker>,
+    icmp_stats: std::sync::Arc<crate::icmp::IcmpStats>,
 }
 
 impl SlaveClient {
@@ -1124,6 +1135,8 @@ impl SlaveClient {
         zones_mutex: Arc<tokio::sync::Mutex<()>>,
         cfg: Arc<UnboundConfig>,
         upstreams: SharedUpstreams,
+        alert_tracker: std::sync::Arc<crate::alerts::AlertTracker>,
+        icmp_stats: std::sync::Arc<crate::icmp::IcmpStats>,
     ) -> Self {
         Self {
             host_port: master.to_string(),
@@ -1133,6 +1146,8 @@ impl SlaveClient {
             zones_mutex,
             cfg,
             upstreams,
+            alert_tracker,
+            icmp_stats,
         }
     }
 
@@ -1457,6 +1472,23 @@ impl SlaveClient {
             }
             SyncOp::DeleteUpstream { id } => {
                 remove_upstream(&self.upstreams, &id);
+            }
+            SyncOp::AddGlobalBan { ip, rule, expires_secs } => {
+                if let Ok(parsed_ip) = ip.parse::<std::net::IpAddr>() {
+                    let dur = expires_secs.unwrap_or(86400);
+                    self.alert_tracker.block_bot(parsed_ip, &rule, dur);
+                    if let std::net::IpAddr::V4(ipv4) = parsed_ip {
+                        let _ = self.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+                    }
+                }
+            }
+            SyncOp::DeleteGlobalBan { ip } => {
+                if let Ok(parsed_ip) = ip.parse::<std::net::IpAddr>() {
+                    self.alert_tracker.unblock(parsed_ip);
+                    if let std::net::IpAddr::V4(ipv4) = parsed_ip {
+                        let _ = self.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+                    }
+                }
             }
         }
         Ok(())
