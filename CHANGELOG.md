@@ -9,6 +9,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.45] — 2026-05-26
+
+### Fixed
+
+- **ban_bot: skip loopback and RFC-1918 addresses**: `ban_bot` now checks the incoming IP before calling `is_blocked()`. Loopback (`127.x`, `::1`), RFC-1918 private ranges, link-local, and ULA (`fc00::/7`) addresses are silently skipped with a `DEBUG` log. Prevents the server from accidentally banning its own reverse-proxy or local admin.
+
+- **burst_tracker: evict stale entries**: The 5-minute session-cleanup task now also evicts `burst_tracker` entries older than 60 s. Without this, every unique IP that triggered a bad request accumulated indefinitely in memory.
+
+### Changed
+
+- **Login page: autofocus on username field**: The `rb_user` input now carries the `autofocus` attribute and receives `focus()` on load. The password field no longer steals focus on page load.
+
+### Added
+
+- **Header clock**: A live `HH:MM:SS` clock (`id="local-clock"`) appears in the header bar between the uptime stat and the Reload button (hidden on mobile, visible ≥ `sm`).
+
+- **Node card active border**: Active node card selection now renders a 2 px `cyan-400` border (`border-2 border-cyan-400`) instead of the previous 1 px `cyan-600`. Inactive cards use `border-2 border-transparent hover:border-cyan-900` for stable layout with no shift on selection.
+
+---
+
 ## [0.9.44] — 2026-05-26
 
 ### Fixed
