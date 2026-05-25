@@ -223,6 +223,8 @@ async fn async_main(
                     cfg.xdp_domain_routing,
                     cfg.xdp_ring_size,
                     xdp_ring_sizes,
+                    Arc::clone(&global_stats),
+                    Arc::clone(&domain_stats),
                 ) {
                     Ok(Some(h)) => {
                         info!(iface = %iface_name, "XDP kernel-bypass fast path active");
