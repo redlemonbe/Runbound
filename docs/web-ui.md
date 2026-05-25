@@ -1,8 +1,63 @@
 # Web Management Console
 
-Runbound ships a single-file HTML/JS dashboard (`examples/web-ui/index.html`) that
-lets you manage DNS entries, the blacklist, feeds, and live logs from any browser —
-no build step, no framework, no external CDN dependency (Tailwind JS is bundled).
+Runbound embeds a single-file HTML/JS dashboard served directly over HTTPS — no nginx,
+no external CDN, no build step. The UI is compiled into the binary at build time
+(`src/webui/index.html`).
+
+---
+
+## Enable the UI
+
+Add these lines inside the `server:` section of your `runbound.conf`:
+
+```
+server:
+    ui-enabled: yes
+    ui-port:    8091
+    # ui-bind:  0.0.0.0   # default — all interfaces
+```
+
+Restart the service:
+
+```bash
+sudo systemctl restart runbound
+```
+
+The dashboard is then available at `https://<server-ip>:8091`.
+
+---
+
+## Certificate trust (one-time setup)
+
+On first access your browser will warn about the self-signed certificate.
+Runbound generates its own CA at startup — install it once and all devices on
+your network get a trusted connection.
+
+Download the CA at:
+
+```
+https://<server-ip>:8091/webui/ca.crt
+```
+
+| OS | Steps |
+|---|---|
+| **macOS** | Double-click the file → Keychain Access → right-click → Get Info → Trust → Always Trust |
+| **Windows** | Double-click → Install Certificate → Local Machine → Trusted Root Certification Authorities |
+| **Linux** | `sudo cp runbound-ca.pem /usr/local/share/ca-certificates/runbound.crt && sudo update-ca-certificates` |
+| **Firefox** | Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import |
+| **iOS** | Open the file → Settings → General → VPN & Device Management → Install → then Certificate Trust Settings → Enable |
+| **Android** | Settings → Security → Install from storage → CA Certificate |
+
+The CA certificate is also downloadable from the Settings tab inside the UI after login.
+
+---
+
+## Login
+
+Open `https://<server-ip>:8091` and enter your credentials.
+
+Default username is `admin`. The password is set during install or changed via
+Settings → Change Password. Sessions expire after 8 hours (30-minute idle timeout).
 
 ---
 
@@ -10,165 +65,47 @@ no build step, no framework, no external CDN dependency (Tailwind JS is bundled)
 
 | Tab | What you can do |
 |---|---|
-| **Overview** | Real-time stats: QPS, total queries, cache hit rate, blocked, forwarded, SERVFAIL, avg latency, uptime; live 60-second QPS sparkline; top-10 queried domains table |
-| **DNS Entries** | Add / delete local A, AAAA, CNAME, TXT, MX records; **DNS Lookup** panel (live resolve with cache hit indicator) |
-| **Blacklist** | Add / delete blocked domains (nxdomain or refuse action) |
-| **Feeds** | Add / delete blocklist feed URLs; live entry count, **blocked count**, and full error text when last refresh fails |
-| **Upstreams** | Add / delete / rename upstream resolvers; 9 built-in presets; health dots, DNSSEC badge, latency sparkline, DoT SNI config; **cfg** badge for config-file upstreams; **↺ Reconnect DoT** button |
-| **Logs** | Tail the query ring buffer with 3-second auto-refresh |
-| **System** | Runtime metrics (version, memory, XDP mode, prefetch state); cache stats; slave list with version + zones; cache flush button with 60 s cooldown |
-| **About** | Version, licence, links, full API reference |
+| **Overview** | Real-time stats: QPS, cache hit rate, blocked, SERVFAIL, latency percentiles (p50/p95/p99); live 60-second QPS sparkline; top-10 queried domains |
+| **DNS** | Add / delete local A, AAAA, CNAME, TXT, MX, PTR, SRV records; DNS Lookup panel with cache hit indicator |
+| **Blacklist** | Add / delete blocked domains (`nxdomain` or `refuse` action) |
+| **Feeds** | Add / delete blocklist feed URLs (hosts or adblock format); preset list; entry count; error text on refresh failure |
+| **Upstreams** | Add / delete resolvers; 9 built-in presets; health dots, DNSSEC badge, latency sparkline, DoT SNI config; **↺ Reconnect DoT** button |
+| **Logs** | Query ring buffer with 3-second auto-refresh; WebUI auth activity log |
+| **Protection** | ICMP XDP flood protection: enable/disable per node; rate / burst / ban-threshold config; per-node stats cards; DDoS alert and blocked-IP log |
+| **System** | Runtime info (version, XDP mode, memory, CPU); slave list with sync status and version; cache flush button |
+| **Settings** | DNSSEC validation toggle; CA certificate download; password change; session info; recent auth event log |
+| **About** | Version badge, uptime, feature list, GitHub links, credits |
 
-The header bar also shows a live QPS / query count / uptime and a **↺ Reload** button
-that sends `POST /reload` to apply config changes without restarting the service.
-
----
-
-## Serving the dashboard
-
-Choose one of two approaches:
-
-### Option A — Embedded server (recommended)
-
-Add these lines inside the `server:` section of your `runbound.conf`:
-
-```
-server:
-    ui-enabled: yes
-    ui-port:    8090
-    # ui-bind:  0.0.0.0   # default — all interfaces
-```
-
-Restart the service (`sudo systemctl restart runbound`). The dashboard is then
-available at `http://<server-ip>:8090`.
-
-The embedded server binds on the specified port, serves the dashboard, and
-transparently proxies every `/api/*` request to `http://127.0.0.1:<api-port>` —
-the REST API stays localhost-only. No nginx, no extra packages.
-
-> **First connection:** Open `http://<server-ip>:8090`, enter your API key
-> (find it with `sudo grep RUNBOUND_API_KEY /etc/runbound/environment`), and click
-> **Connect**. The key is saved in `localStorage` automatically.
+The header bar shows: connection dot (blink green = connected, red = error), live
+QPS / query count / uptime, node pills for multi-node selection, **↺ Reload** button
+(`POST /api/reload` — applies config changes without restart), and **⏏ Logout**.
 
 ---
 
-### Option B — nginx reverse proxy
+## Multi-node
 
-Use nginx if you need HTTPS/TLS termination or already run nginx on the server.
-
-### 1. Install nginx
-
-```bash
-sudo apt-get install -y nginx
-```
-
-### 2. Create the site config
-
-```bash
-sudo mkdir -p /var/www/runbound-ui
-sudo cp examples/web-ui/index.html /var/www/runbound-ui/index.html
-```
-
-Create `/etc/nginx/sites-available/runbound-ui`:
-
-```nginx
-server {
-    listen 8090;
-    server_name _;
-
-    root /var/www/runbound-ui;
-    index index.html;
-
-    # Static dashboard
-    location / {
-        try_files $uri $uri/ =404;
-    }
-
-    # Proxy to Runbound API — keeps the API off the LAN
-    location /api/ {
-        proxy_pass            http://127.0.0.1:8080;
-        proxy_http_version    1.0;
-        proxy_set_header      Host $host;
-        proxy_set_header      X-Real-IP $remote_addr;
-        proxy_read_timeout    30s;
-    }
-}
-```
-
-Enable it:
-
-```bash
-sudo ln -sf /etc/nginx/sites-available/runbound-ui /etc/nginx/sites-enabled/runbound-ui
-sudo nginx -t && sudo systemctl enable --now nginx
-```
-
-### 3. Allow the port through the firewall
-
-```bash
-# UFW — allow LAN access only
-sudo ufw allow from 192.168.0.0/16 to any port 8090 proto tcp comment "Runbound web UI"
-```
-
-Adjust the subnet to match your network. **Do not expose port 8090 to the internet** —
-the dashboard forwards your API Bearer token with every request.
-
----
-
-## First connection
-
-Open `http://<server-ip>:8090` in your browser (or the port you configured).
-
-- **API URL** is pre-filled to `/api` — leave it as-is for both the embedded server
-  and the nginx proxy setup.
-- **API key** — find it in `/etc/runbound/environment`:
-
-  ```bash
-  sudo grep RUNBOUND_API_KEY /etc/runbound/environment
-  ```
-
-Enter the key and click **Connect**. The key is saved in `localStorage` and restored
-automatically on every subsequent visit.
-
-> **Tip:** On a private LAN server you can hardcode the key directly in the HTML so
-> the dashboard connects automatically on page load:
->
-> ```bash
-> sudo sed -i 's|placeholder="API key (Bearer token)"|value="YOUR_KEY_HERE" placeholder="API key (Bearer token)"|' \
->   /var/www/runbound-ui/index.html
-> ```
-
----
-
-## API URL reference
-
-The dashboard uses **relative paths** (`/api`) by default, which routes through the
-nginx proxy. If you point `cfg-url` directly at the Runbound API (e.g. for local
-testing on the same machine), use `http://localhost:8080` instead.
-
-| Setting | When to use |
-|---|---|
-| `/api` | nginx proxy — access from any LAN browser (default) |
-| `http://localhost:8080` | Direct — only works in a browser on the DNS server itself |
+When slaves are registered via the relay, node pills appear in the header. Click a
+node to scope Overview stats to that node, or keep **all** selected for cluster-wide
+aggregation.
 
 ---
 
 ## Security notes
 
-- The nginx proxy keeps port 8080 off the network — Runbound's API remains
-  localhost-only.
-- The Bearer token travels over plain HTTP inside your LAN. Use a VPN or
-  restrict the firewall rule to a management VLAN if you want stricter isolation.
-- For HTTPS, see [tls.md](tls.md) — you can terminate TLS in nginx and proxy
-  to the Runbound API backend.
+- All browser ↔ Runbound traffic is HTTPS (TLS 1.2+, rustls, auto-generated cert).
+- Sessions use HTTP-only cookies with CSRF tokens on all mutating requests.
+- The API port (8080) remains localhost-only — the UI server proxies `/api/*` internally.
+- Auto-logout after 30 minutes idle; hard session limit 8 hours.
+- All login attempts are logged (Settings → Recent Auth Events).
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `411 Length Required` on GET | `Content-Type: application/json` sent on a GET request | Update to the latest `index.html` from the repo (fixed in v0.5.7+) |
-| `411 Length Required` on POST | `proxy_set_header Content-Length ""` in nginx config clears the body length | Remove that line from the nginx `location /api/` block |
-| `Connection failed` | Wrong API URL or Bearer token | Check `/etc/runbound/environment` for the key |
-| Stats show `—` but no error | Auto-refresh polling before connect completes | Click **Connect** manually |
-| nginx `address already in use` on port 80 | Another service owns port 80 | Use a different listen port (8090 is the recommended default) |
+| Symptom | Fix |
+|---|---|
+| Browser certificate warning | Install the CA at `https://<ip>:8091/webui/ca.crt` |
+| `Connection refused` on port 8091 | Verify `ui-enabled: yes` in config; `sudo systemctl status runbound` |
+| Stats show `—` after login | Session may have expired — reload the page |
+| Login fails | Check credentials; change password via `POST /api/auth/reset-password` |
+| Port conflict | Change `ui-port` in `runbound.conf` to any free port |
