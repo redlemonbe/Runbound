@@ -256,6 +256,13 @@ pub struct UnboundConfig {
     /// Bind address for the web UI listener. Default: 0.0.0.0.
     pub ui_bind: String,
 
+    // ── UDP socket options (#20) ─────────────────────────────────────────────
+    /// Enable SO_BUSY_POLL + SO_PREFER_BUSY_POLL on UDP sockets. Default: false.
+    /// Spins in kernel context instead of sleeping between packets.
+    /// Reduces scheduler wake-up latency (p99) on dedicated servers.
+    /// Wastes CPU on shared/virtualized hosts — leave off unless benchmarked.
+    pub udp_busy_poll: bool,
+
     // ── ICMP echo responder (#89) ──────────────────────────────────────────
     pub icmp_enabled: bool,
     pub icmp_rate_pps: u32,
@@ -293,7 +300,7 @@ impl UnboundConfig {
             xdp_cache_snapshot: true,
             xdp_cache_snapshot_size: 10_000,
             cache_min_entries: 2048,
-            prefetch: true,
+            prefetch: false,
             prefetch_threshold: 5,
             cache_flush_cooldown: 60,
             resolv_fallback: true,
@@ -317,6 +324,7 @@ impl UnboundConfig {
             axfr_enabled: false,
             axfr_allow: vec![],
             alerts: vec![],
+            udp_busy_poll: false,
             ..Default::default()
         }
     }
@@ -596,6 +604,7 @@ fn parse_server_directive(
         }
         "hsm-api-key-label" => cfg.hsm_api_key_label = Some(val.trim_matches('"').to_string()),
         "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
+        "udp-busy-poll" => cfg.udp_busy_poll = val.trim_matches('"') == "yes",
         "cpu-affinity" => cfg.cpu_affinity = val.trim_matches('"') != "no",
         "xdp" => cfg.xdp = val.trim_matches('"') != "no",
         "xdp-interface" => cfg.xdp_interface = Some(val.trim_matches('"').to_string()),
