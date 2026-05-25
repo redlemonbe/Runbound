@@ -1,3 +1,4 @@
+pub mod ddns;
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 pub mod acl;
@@ -7,9 +8,10 @@ pub mod prefetch;
 pub mod ratelimit;
 pub mod server;
 pub mod xdp;
+pub mod hash;
 
 pub use acl::Acl;
-pub use local::{ZoneAction};
+pub use local::ZoneAction;
 pub use ratelimit::RateLimiter;
 pub use server::run_dns_server;
 
@@ -29,7 +31,7 @@ pub enum BlacklistAction {
 impl std::fmt::Display for BlacklistAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BlacklistAction::Refuse   => write!(f, "refuse"),
+            BlacklistAction::Refuse => write!(f, "refuse"),
             BlacklistAction::NxDomain => write!(f, "nxdomain"),
         }
     }
@@ -38,7 +40,7 @@ impl std::fmt::Display for BlacklistAction {
 impl From<&BlacklistAction> for ZoneAction {
     fn from(b: &BlacklistAction) -> Self {
         match b {
-            BlacklistAction::Refuse   => ZoneAction::Refuse,
+            BlacklistAction::Refuse => ZoneAction::Refuse,
             BlacklistAction::NxDomain => ZoneAction::NxDomain,
         }
     }

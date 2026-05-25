@@ -7,8 +7,8 @@
 // Uses DashMap<String, AtomicU32> instead of Mutex<HashMap> so that DNS
 // worker threads can increment counters without contending on a global lock.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 
@@ -37,7 +37,8 @@ impl PrefetchTracker {
 
     /// Return all domains with count >= threshold and reset all counters to zero.
     pub fn take_hot(&self, threshold: u32) -> Vec<String> {
-        let hot: Vec<String> = self.inner
+        let hot: Vec<String> = self
+            .inner
             .iter()
             .filter(|e| e.value().load(Ordering::Relaxed) >= threshold)
             .map(|e| e.key().clone())
@@ -77,7 +78,9 @@ mod tests {
     #[test]
     fn take_hot_filters_by_threshold() {
         let t = PrefetchTracker::new();
-        for _ in 0..5 { t.increment("hot.com"); }
+        for _ in 0..5 {
+            t.increment("hot.com");
+        }
         t.increment("cold.com");
         let hot = t.take_hot(5);
         assert_eq!(hot, vec!["hot.com"]);

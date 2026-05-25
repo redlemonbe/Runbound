@@ -24,7 +24,7 @@ use crate::config::parser::UnboundConfig;
 
 // ── Probe interval / timeout ───────────────────────────────────────────────
 const PROBE_INTERVAL_SECS: u64 = 30;
-const PROBE_TIMEOUT_MS:    u64 = 2_000;
+const PROBE_TIMEOUT_MS: u64 = 2_000;
 
 const BIND_V4: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
@@ -45,41 +45,49 @@ const DNS_PROBE_PACKET: [u8; 28] = [
     0x00, 0x00, // ANCOUNT = 0
     0x00, 0x00, // NSCOUNT = 0
     0x00, 0x01, // ARCOUNT = 1 (OPT RR)
-    0x00,       // root label (empty name = ".")
+    0x00, // root label (empty name = ".")
     0x00, 0x01, // QTYPE = A
     0x00, 0x01, // QCLASS = IN
     // OPT RR
-    0x00,             // Name = root
-    0x00, 0x29,       // Type = OPT (41)
-    0x10, 0x00,       // Class = 4096 (UDP payload size)
+    0x00, // Name = root
+    0x00, 0x29, // Type = OPT (41)
+    0x10, 0x00, // Class = 4096 (UDP payload size)
     0x00, 0x00, 0x80, 0x00, // TTL: ext-rcode=0, version=0, DO=1, Z=0
-    0x00, 0x00,       // RDLENGTH = 0
+    0x00, 0x00, // RDLENGTH = 0
 ];
 
 // ── Status per upstream ────────────────────────────────────────────────────
 #[derive(Serialize, Deserialize, Clone)]
 pub struct UpstreamStatus {
-    pub id:         String,
-    pub addr:       String,
+    pub id: String,
+    pub addr: String,
     /// Explicit DNS port — defaults to 53 (UDP) or 853 (DoT).
-    pub port:       u16,
-    pub name:       Option<String>,
-    pub protocol:   String,   // "udp" or "dot"
+    pub port: u16,
+    pub name: Option<String>,
+    pub protocol: String, // "udp" or "dot"
     /// #57: "config" = from unbound.conf forward-zone; "api" = added via REST API.
     #[serde(default = "default_source")]
-    pub source:     String,
-    pub healthy:    bool,
+    pub source: String,
+    pub healthy: bool,
     pub latency_ms: Option<u64>,
     pub last_check: String,
-    pub zone:       String,
+    pub zone: String,
     /// #48: whether the upstream validates DNSSEC (AD bit in probe response).
     /// None = not yet probed or upstream is unhealthy.
     /// Omitted from JSON when None; not persisted (runtime only).
     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing, default)]
     pub dnssec_supported: Option<bool>,
+    /// #34: true when upstream previously had DNSSEC (AD bit) but now no longer does.
+    /// Indicates active DNSSEC stripping. Cleared when DNSSEC support is restored.
+    #[serde(skip_deserializing, default)]
+    pub dnssec_stripping: bool,
     /// #49: rolling buffer of the last 5 latency measurements (ms).
     /// Not persisted; serialised as a JSON array.
-    #[serde(serialize_with = "serialize_latency_history", skip_deserializing, default)]
+    #[serde(
+        serialize_with = "serialize_latency_history",
+        skip_deserializing,
+        default
+    )]
     pub latency_history: VecDeque<u64>,
     /// #53: last error message from a failed health probe.
     /// Cleared on successful probe. Not persisted (runtime only).
@@ -97,12 +105,19 @@ pub struct UpstreamStatus {
     // Internal backoff state — not serialised in API responses.
     #[serde(skip, default)]
     pub consecutive_failures: u32,
+    /// SEC-24: consecutive probes returning AD=0 after AD=1. Must reach 2 before flagging.
+    #[serde(skip, default)]
+    pub consecutive_strip_count: u32,
     #[serde(skip, default = "Instant::now")]
     pub next_check_at: Instant,
 }
 
-fn default_source() -> String { "api".into() }
-fn is_false(b: &bool) -> bool { !b }
+fn default_source() -> String {
+    "api".into()
+}
+fn is_false(b: &bool) -> bool {
+    !b
+}
 
 /// #57: Deterministic stable UUID-format ID for config-file upstreams.
 /// Same addr+port+protocol always produces the same ID across restarts,
@@ -120,7 +135,9 @@ fn config_upstream_id(addr: &str, port: u16, protocol: &str) -> String {
 }
 
 fn serialize_latency_history<S>(v: &VecDeque<u64>, s: S) -> Result<S::Ok, S::Error>
-where S: serde::Serializer {
+where
+    S: serde::Serializer,
+{
     let vec: Vec<u64> = v.iter().copied().collect();
     serde::Serialize::serialize(&vec, s)
 }
@@ -145,12 +162,12 @@ pub type SharedUpstreams = Arc<RwLock<Vec<UpstreamStatus>>>;
 // Only durable fields are saved; runtime health state is not persisted.
 #[derive(Serialize, Deserialize)]
 struct PersistedUpstream {
-    id:           String,
-    addr:         String,
-    port:         u16,
-    protocol:     String,
-    name:         Option<String>,
-    zone:         String,
+    id: String,
+    addr: String,
+    port: u16,
+    protocol: String,
+    name: Option<String>,
+    zone: String,
     #[serde(default)]
     tls_hostname: Option<String>,
 }
@@ -162,26 +179,34 @@ struct UpstreamsFile {
 
 /// Persist all upstreams to `base_dir/upstreams.json` + optional .mac sidecar.
 pub fn save_upstreams(upstreams: &SharedUpstreams, base_dir: &Path) {
-    let list = upstreams.read()
+    let list = upstreams
+        .read()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in save_upstreams: {e}"));
     // #57: only persist API upstreams; config upstreams are re-derived from unbound.conf at startup.
     let file = UpstreamsFile {
-        upstreams: list.iter().filter(|u| u.source == "api").map(|u| PersistedUpstream {
-            id:           u.id.clone(),
-            addr:         u.addr.clone(),
-            port:         u.port,
-            protocol:     u.protocol.clone(),
-            name:         u.name.clone(),
-            zone:         u.zone.clone(),
-            tls_hostname: u.tls_hostname.clone(),
-        }).collect(),
+        upstreams: list
+            .iter()
+            .filter(|u| u.source == "api")
+            .map(|u| PersistedUpstream {
+                id: u.id.clone(),
+                addr: u.addr.clone(),
+                port: u.port,
+                protocol: u.protocol.clone(),
+                name: u.name.clone(),
+                zone: u.zone.clone(),
+                tls_hostname: u.tls_hostname.clone(),
+            })
+            .collect(),
     };
     drop(list);
 
     let path = base_dir.join("upstreams.json");
     let json = match serde_json::to_string_pretty(&file) {
         Ok(s) => s,
-        Err(e) => { warn!(%e, "upstreams: serialisation failed"); return; }
+        Err(e) => {
+            warn!(%e, "upstreams: serialisation failed");
+            return;
+        }
     };
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, &json) {
@@ -204,7 +229,7 @@ pub fn save_upstreams(upstreams: &SharedUpstreams, base_dir: &Path) {
 pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
     let path = base_dir.join("upstreams.json");
     let content = match std::fs::read_to_string(&path) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return vec![],
         Err(e) => {
             warn!(%e, path = %path.display(), "upstreams: read failed");
@@ -223,25 +248,30 @@ pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
             return vec![];
         }
     };
-    file.upstreams.into_iter().map(|p| UpstreamStatus {
-        id:                   p.id,
-        addr:                 p.addr,
-        port:                 p.port,
-        name:                 p.name,
-        protocol:             p.protocol,
-        source:               "api".into(),
-        zone:                 p.zone,
-        tls_hostname:         p.tls_hostname,
-        healthy:              false,
-        latency_ms:           None,
-        last_check:           String::new(),
-        dnssec_supported:     None,
-        latency_history:      VecDeque::new(),
-        last_error:           None,
-        temporary:            false,
-        consecutive_failures: 0,
-        next_check_at:        Instant::now(),
-    }).collect()
+    file.upstreams
+        .into_iter()
+        .map(|p| UpstreamStatus {
+            id: p.id,
+            addr: p.addr,
+            port: p.port,
+            name: p.name,
+            protocol: p.protocol,
+            source: "api".into(),
+            zone: p.zone,
+            tls_hostname: p.tls_hostname,
+            healthy: false,
+            latency_ms: None,
+            last_check: String::new(),
+            dnssec_supported: None,
+            dnssec_stripping: false,
+            latency_history: VecDeque::new(),
+            last_error: None,
+            temporary: false,
+            consecutive_failures: 0,
+            consecutive_strip_count: 0,
+            next_check_at: Instant::now(),
+        })
+        .collect()
 }
 
 // ── Backoff schedule ───────────────────────────────────────────────────────
@@ -249,9 +279,9 @@ pub fn load_upstreams(base_dir: &Path) -> Vec<UpstreamStatus> {
 fn backoff_secs(consecutive_failures: u32) -> u64 {
     match consecutive_failures {
         0 | 1 => PROBE_INTERVAL_SECS,
-        2     => 60,
-        3     => 120,
-        _     => 300,
+        2 => 60,
+        3 => 120,
+        _ => 300,
     }
 }
 
@@ -277,22 +307,24 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
             let id = config_upstream_id(&clean, port, protocol);
             statuses.push(UpstreamStatus {
                 id,
-                addr:                clean,
+                addr: clean,
                 port,
-                name:                None,
-                protocol:            protocol.into(),
-                source:              "config".into(),
-                zone:                fz.name.clone(),
-                tls_hostname:        None,
-                healthy:             false,
-                latency_ms:          None,
-                last_check:          String::new(),
-                dnssec_supported:    None,
-                latency_history:     VecDeque::new(),
-                last_error:          None,
-                temporary:           false,
+                name: None,
+                protocol: protocol.into(),
+                source: "config".into(),
+                zone: fz.name.clone(),
+                tls_hostname: None,
+                healthy: false,
+                latency_ms: None,
+                last_check: String::new(),
+                dnssec_supported: None,
+                dnssec_stripping: false,
+                latency_history: VecDeque::new(),
+                last_error: None,
+                temporary: false,
                 consecutive_failures: 0,
-                next_check_at:       Instant::now(),
+            consecutive_strip_count: 0,
+                next_check_at: Instant::now(),
             });
         }
     }
@@ -302,8 +334,11 @@ pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
 /// Merge persisted API upstreams into the config-file baseline.
 /// When (addr, protocol) duplicates exist, the persisted entry wins.
 pub fn merge_persisted(shared: &SharedUpstreams, persisted: Vec<UpstreamStatus>) {
-    if persisted.is_empty() { return; }
-    let mut list = shared.write()
+    if persisted.is_empty() {
+        return;
+    }
+    let mut list = shared
+        .write()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in merge_persisted: {e}"));
     for p in persisted {
         list.retain(|u| !(u.addr == p.addr && u.protocol == p.protocol));
@@ -313,33 +348,36 @@ pub fn merge_persisted(shared: &SharedUpstreams, persisted: Vec<UpstreamStatus>)
 
 /// Add a runtime upstream (POST /api/upstreams). Returns the new entry.
 pub fn add_upstream(
-    upstreams:    &SharedUpstreams,
-    addr:         String,
-    port:         u16,
-    protocol:     String,
-    name:         Option<String>,
+    upstreams: &SharedUpstreams,
+    addr: String,
+    port: u16,
+    protocol: String,
+    name: Option<String>,
     tls_hostname: Option<String>,
 ) -> UpstreamStatus {
     let entry = UpstreamStatus {
-        id:                  uuid::Uuid::new_v4().to_string(),
+        id: uuid::Uuid::new_v4().to_string(),
         addr,
         port,
         name,
         protocol,
-        source:              "api".into(),
+        source: "api".into(),
         tls_hostname,
-        healthy:             false,
-        latency_ms:          None,
-        last_check:          String::new(),
-        dnssec_supported:    None,
-        latency_history:     VecDeque::new(),
-        last_error:          None,
-        zone:                ".".into(),
-        temporary:           false,
+        healthy: false,
+        latency_ms: None,
+        last_check: String::new(),
+        dnssec_supported: None,
+        dnssec_stripping: false,
+        latency_history: VecDeque::new(),
+        last_error: None,
+        zone: ".".into(),
+        temporary: false,
         consecutive_failures: 0,
-        next_check_at:       Instant::now(),
+        consecutive_strip_count: 0,
+        next_check_at: Instant::now(),
     };
-    upstreams.write()
+    upstreams
+        .write()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in add_upstream: {e}"))
         .push(entry.clone());
     entry
@@ -348,9 +386,12 @@ pub fn add_upstream(
 /// Remove a runtime upstream by id (DELETE /api/upstreams/:id).
 /// Returns the removed entry if found.
 pub fn remove_upstream(upstreams: &SharedUpstreams, id: &str) -> Option<UpstreamStatus> {
-    let mut list = upstreams.write()
+    let mut list = upstreams
+        .write()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in remove_upstream: {e}"));
-    list.iter().position(|u| u.id == id).map(|pos| list.remove(pos))
+    list.iter()
+        .position(|u| u.id == id)
+        .map(|pos| list.remove(pos))
 }
 
 /// #50: Rename an upstream in-place. Used in unit tests; production code
@@ -361,7 +402,8 @@ pub fn patch_upstream_name(
     id: &str,
     name: Option<String>,
 ) -> Option<UpstreamStatus> {
-    let mut list = upstreams.write()
+    let mut list = upstreams
+        .write()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in patch_upstream_name: {e}"));
     if let Some(u) = list.iter_mut().find(|u| u.id == id) {
         u.name = name;
@@ -373,10 +415,18 @@ pub fn patch_upstream_name(
 
 /// Snapshot of (addr, port, use_tls, tls_hostname) for resolver rebuilds.
 pub fn upstream_addrs(upstreams: &SharedUpstreams) -> Vec<(String, u16, bool, Option<String>)> {
-    upstreams.read()
+    upstreams
+        .read()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in upstream_addrs: {e}"))
         .iter()
-        .map(|u| (u.addr.clone(), u.port, u.protocol == "dot", u.tls_hostname.clone()))
+        .map(|u| {
+            (
+                u.addr.clone(),
+                u.port,
+                u.protocol == "dot",
+                u.tls_hostname.clone(),
+            )
+        })
         .collect()
 }
 
@@ -388,10 +438,13 @@ pub fn parse_resolv_conf() -> Vec<String> {
         Ok(s) => s,
         Err(_) => return vec![],
     };
-    content.lines()
+    content
+        .lines()
         .filter_map(|line| {
             let line = line.trim();
-            if line.starts_with('#') || line.starts_with(';') { return None; }
+            if line.starts_with('#') || line.starts_with(';') {
+                return None;
+            }
             let mut parts = line.split_whitespace();
             if parts.next() == Some("nameserver") {
                 if let Some(ip) = parts.next() {
@@ -409,55 +462,65 @@ pub fn parse_resolv_conf() -> Vec<String> {
 /// Existing temporary entries are replaced (idempotent).
 pub fn add_resolv_fallback(upstreams: &SharedUpstreams) {
     let addrs = parse_resolv_conf();
-    if addrs.is_empty() { return; }
-    let mut list = upstreams.write()
+    if addrs.is_empty() {
+        return;
+    }
+    let mut list = upstreams
+        .write()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in add_resolv_fallback: {e}"));
     list.retain(|u| !u.temporary);
     for addr in addrs {
         list.push(UpstreamStatus {
-            id:                  uuid::Uuid::new_v4().to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
             addr,
-            port:                53,
-            name:                None,
-            protocol:            "udp".into(),
-            source:              "resolv.conf".into(),
-            zone:                ".".into(),
-            tls_hostname:        None,
-            healthy:             true,
-            latency_ms:          None,
-            last_check:          String::new(),
-            dnssec_supported:    None,
-            latency_history:     VecDeque::new(),
-            last_error:          None,
-            temporary:           true,
+            port: 53,
+            name: None,
+            protocol: "udp".into(),
+            source: "resolv.conf".into(),
+            zone: ".".into(),
+            tls_hostname: None,
+            healthy: true,
+            latency_ms: None,
+            last_check: String::new(),
+            dnssec_supported: None,
+            dnssec_stripping: false,
+            latency_history: VecDeque::new(),
+            last_error: None,
+            temporary: true,
             consecutive_failures: 0,
-            next_check_at:       Instant::now(),
+            consecutive_strip_count: 0,
+            next_check_at: Instant::now(),
         });
     }
 }
 
 /// Remove all temporary upstream entries (resolv.conf fallback).
 pub fn remove_resolv_fallback(upstreams: &SharedUpstreams) {
-    upstreams.write()
+    upstreams
+        .write()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in remove_resolv_fallback: {e}"))
         .retain(|u| !u.temporary);
 }
 
 /// True when all non-temporary upstreams exist and are all unhealthy.
 pub fn all_non_temporary_unhealthy(upstreams: &SharedUpstreams) -> bool {
-    let list = upstreams.read()
-        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in all_non_temporary_unhealthy: {e}"));
+    let list = upstreams.read().unwrap_or_else(|e| {
+        panic!("upstreams: RwLock poisoned in all_non_temporary_unhealthy: {e}")
+    });
     let mut found = false;
     for u in list.iter().filter(|u| !u.temporary) {
         found = true;
-        if u.healthy { return false; }
+        if u.healthy {
+            return false;
+        }
     }
     found
 }
 
 /// True when at least one non-temporary upstream is healthy.
 pub fn has_healthy_non_temporary(upstreams: &SharedUpstreams) -> bool {
-    upstreams.read()
+    upstreams
+        .read()
         .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in has_healthy_non_temporary: {e}"))
         .iter()
         .any(|u| !u.temporary && u.healthy)
@@ -466,11 +529,16 @@ pub fn has_healthy_non_temporary(upstreams: &SharedUpstreams) -> bool {
 /// #57: Remove a `forward-addr: addr@port` line from the config file in-place.
 /// Returns Ok(true) if a line was removed and the file was rewritten, Ok(false) if not found.
 /// The port suffix is optional in the file — matches both "1.1.1.1" and "1.1.1.1@53".
-pub fn remove_forward_addr_from_config(cfg_path: &str, addr: &str, port: u16) -> std::io::Result<bool> {
+pub fn remove_forward_addr_from_config(
+    cfg_path: &str,
+    addr: &str,
+    port: u16,
+) -> std::io::Result<bool> {
     let content = std::fs::read_to_string(cfg_path)?;
     let target_with_port = format!("{addr}@{port}");
     let mut removed = false;
-    let lines: Vec<&str> = content.lines()
+    let lines: Vec<&str> = content
+        .lines()
         .filter(|line| {
             let trimmed = line.trim();
             if let Some(val_raw) = trimmed.strip_prefix("forward-addr:") {
@@ -485,7 +553,9 @@ pub fn remove_forward_addr_from_config(cfg_path: &str, addr: &str, port: u16) ->
         .collect();
     if removed {
         let mut new_content = lines.join("\n");
-        if content.ends_with('\n') { new_content.push('\n'); }
+        if content.ends_with('\n') {
+            new_content.push('\n');
+        }
         std::fs::write(cfg_path, new_content)?;
     }
     Ok(removed)
@@ -521,20 +591,21 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
             .into_iter()
             .map(|(id, addr, port, protocol)| {
                 tokio::task::spawn_blocking(move || {
-                    let (healthy, latency, dnssec, last_error) = probe_upstream(&addr, port, &protocol);
+                    let (healthy, latency, dnssec, last_error) =
+                        probe_upstream(&addr, port, &protocol);
                     (id, healthy, latency, dnssec, last_error)
                 })
             })
             .collect();
-        let results: Vec<ProbeResultWithId> =
-            futures_util::future::join_all(handles)
-                .await
-                .into_iter()
-                .filter_map(|r| r.ok())
-                .collect();
+        let results: Vec<ProbeResultWithId> = futures_util::future::join_all(handles)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
 
         // Write results back, matching by UUID to avoid index aliasing.
-        let mut statuses = upstreams.write()
+        let mut statuses = upstreams
+            .write()
             .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health task: {e}"));
         let now_str = crate::logbuffer::format_ts(
             std::time::SystemTime::now()
@@ -543,7 +614,9 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 .as_secs(),
         );
         for (id, healthy, latency_ms, dnssec_supported, last_error) in results {
-            let Some(s) = statuses.iter_mut().find(|u| u.id == id) else { continue };
+            let Some(s) = statuses.iter_mut().find(|u| u.id == id) else {
+                continue;
+            };
             if healthy {
                 if s.consecutive_failures > 0 {
                     info!(
@@ -558,8 +631,24 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 if let Some(lat) = latency_ms {
                     push_latency(&mut s.latency_history, lat);
                 }
-                // #48: update DNSSEC detection result
+                // #48/#34: update DNSSEC detection; detect stripping transition
+                let was_dnssec = s.dnssec_supported;
                 s.dnssec_supported = dnssec_supported;
+                if was_dnssec == Some(true) && dnssec_supported == Some(false) {
+                    s.consecutive_strip_count += 1;
+                    if s.consecutive_strip_count >= 2 {
+                        s.dnssec_stripping = true;
+                        warn!(upstream = %s.addr, count = s.consecutive_strip_count,
+                            "DNSSEC stripping confirmed — upstream no longer sets AD bit (SEC-24 hysteresis)");
+                    } else {
+                        warn!(upstream = %s.addr, count = s.consecutive_strip_count,
+                            "DNSSEC stripping probe {}/{} — waiting for confirmation (SEC-24)",
+                            s.consecutive_strip_count, 2);
+                    }
+                } else if dnssec_supported == Some(true) {
+                    s.dnssec_stripping = false;
+                    s.consecutive_strip_count = 0;
+                }
                 // #53: clear last_error on success
                 s.last_error = None;
             } else {
@@ -579,7 +668,7 @@ pub async fn upstream_health_loop(upstreams: SharedUpstreams) {
                 // #53: record last_error
                 s.last_error = last_error;
             }
-            s.healthy    = healthy;
+            s.healthy = healthy;
             s.latency_ms = latency_ms;
             s.last_check = now_str.clone();
         }
@@ -618,7 +707,7 @@ fn probe_udp(addr: &str, port: u16) -> ProbeResult {
     };
 
     let sock = match UdpSocket::bind(bind) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return (false, None, None, Some("bind failed".into())),
     };
     let _ = sock.set_read_timeout(Some(Duration::from_millis(PROBE_TIMEOUT_MS)));
@@ -655,14 +744,14 @@ fn probe_dot(addr: &str, port: u16) -> ProbeResult {
         Ok(ip) => ip,
         Err(_) => return (false, None, None, Some("TCP connect failed".into())),
     };
-    let target  = SocketAddr::new(ip, port);
+    let target = SocketAddr::new(ip, port);
     let timeout = Duration::from_millis(PROBE_TIMEOUT_MS);
 
     let t0 = Instant::now();
 
     // Step 1: TCP connect
     let tcp = match TcpStream::connect_timeout(&target, timeout) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return (false, None, None, Some("TCP connect failed".into())),
     };
     let _ = tcp.set_read_timeout(Some(timeout));
@@ -670,20 +759,20 @@ fn probe_dot(addr: &str, port: u16) -> ProbeResult {
 
     // Step 2: TLS handshake
     let server_name = match rustls::pki_types::ServerName::try_from(addr.to_owned()) {
-        Ok(n)  => n,
+        Ok(n) => n,
         Err(_) => return (false, None, None, Some("TLS handshake failed".into())),
     };
     let config = Arc::new(
-        rustls::ClientConfig::builder_with_provider(
-            Arc::new(rustls::crypto::ring::default_provider()),
-        )
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
         .with_safe_default_protocol_versions()
         .unwrap_or_else(|e| panic!("TLS protocol versions: {e}"))
         .with_root_certificates(build_tls_roots())
         .with_no_client_auth(),
     );
     let conn = match rustls::ClientConnection::new(config, server_name) {
-        Ok(c)  => c,
+        Ok(c) => c,
         Err(_) => return (false, None, None, Some("TLS handshake failed".into())),
     };
     let mut tls = rustls::StreamOwned::new(conn, tcp);
@@ -713,7 +802,7 @@ fn probe_dot(addr: &str, port: u16) -> ProbeResult {
     // Step 6: verify ID match and extract AD bit
     if buf[0] == DNS_PROBE_PACKET[0] && buf[1] == DNS_PROBE_PACKET[1] {
         let latency = Some(t0.elapsed().as_millis() as u64);
-        let dnssec  = Some(parse_ad_bit(&buf));
+        let dnssec = Some(parse_ad_bit(&buf));
         (true, latency, dnssec, None)
     } else {
         (false, None, None, Some("id mismatch".into()))
@@ -779,13 +868,19 @@ mod tests {
         // byte[3] = 0x20 → AD bit set (QR=0, AA=0, TC=0, RD=0, RA=0, Z=0, AD=1)
         let mut buf = [0u8; 12];
         buf[3] = 0x20;
-        assert!(parse_ad_bit(&buf), "AD bit should be detected when byte[3] & 0x20");
+        assert!(
+            parse_ad_bit(&buf),
+            "AD bit should be detected when byte[3] & 0x20"
+        );
     }
 
     #[test]
     fn parse_ad_bit_not_set() {
         let buf = [0u8; 12];
-        assert!(!parse_ad_bit(&buf), "AD bit should be false when byte[3] = 0");
+        assert!(
+            !parse_ad_bit(&buf),
+            "AD bit should be false when byte[3] = 0"
+        );
     }
 
     #[test]
@@ -807,7 +902,9 @@ mod tests {
     #[test]
     fn latency_history_fills_to_three() {
         let mut history = VecDeque::new();
-        for i in 1..=3 { push_latency(&mut history, i * 10); }
+        for i in 1..=3 {
+            push_latency(&mut history, i * 10);
+        }
         assert_eq!(history.len(), 3);
         assert_eq!(history[2], 30);
     }
@@ -815,7 +912,9 @@ mod tests {
     #[test]
     fn latency_history_caps_at_five() {
         let mut history = VecDeque::new();
-        for i in 1..=7 { push_latency(&mut history, i * 10); }
+        for i in 1..=7 {
+            push_latency(&mut history, i * 10);
+        }
         assert_eq!(history.len(), 5, "history must be capped at 5");
         // First two (10, 20) dropped; remaining [30,40,50,60,70]
         assert_eq!(history[0], 30, "oldest retained entry should be 30ms");
@@ -831,7 +930,10 @@ mod tests {
         let snapshot: Vec<u64> = history.iter().copied().collect();
         // Simulate a failed probe: do NOT call push_latency
         let after: Vec<u64> = history.iter().copied().collect();
-        assert_eq!(snapshot, after, "history must be unchanged after a failed probe");
+        assert_eq!(
+            snapshot, after,
+            "history must be unchanged after a failed probe"
+        );
     }
 
     // ── #48: upstream unhealthy → dnssec_supported = None ────────────────
@@ -841,7 +943,10 @@ mod tests {
         // 192.0.2.0/24 is TEST-NET-1 — guaranteed unreachable (RFC 5737)
         let (healthy, _lat, dnssec, last_error) = probe_upstream("192.0.2.1", 53, "udp");
         assert!(!healthy);
-        assert!(dnssec.is_none(), "unhealthy upstream must have dnssec_supported = None");
+        assert!(
+            dnssec.is_none(),
+            "unhealthy upstream must have dnssec_supported = None"
+        );
         // #53: UDP timeout to TEST-NET must produce a timeout error
         assert_eq!(last_error.as_deref(), Some("timeout"));
     }
@@ -855,20 +960,32 @@ mod tests {
         // Simulate a previous failure
         {
             let mut list = upstreams.write().unwrap_or_else(|e| e.into_inner());
-            let s = list.iter_mut().find(|u| u.id == entry.id).unwrap_or_else(|| panic!("entry not found"));
+            let s = list
+                .iter_mut()
+                .find(|u| u.id == entry.id)
+                .unwrap_or_else(|| panic!("entry not found"));
             s.last_error = Some("timeout".into());
             s.healthy = false;
         }
         // Simulate a successful write-back (healthy=true → clear last_error)
         {
             let mut list = upstreams.write().unwrap_or_else(|e| e.into_inner());
-            let s = list.iter_mut().find(|u| u.id == entry.id).unwrap_or_else(|| panic!("entry not found"));
-            s.healthy    = true;
+            let s = list
+                .iter_mut()
+                .find(|u| u.id == entry.id)
+                .unwrap_or_else(|| panic!("entry not found"));
+            s.healthy = true;
             s.last_error = None;
         }
         let list = upstreams.read().unwrap_or_else(|e| e.into_inner());
-        let s = list.iter().find(|u| u.id == entry.id).unwrap_or_else(|| panic!("entry not found"));
-        assert!(s.last_error.is_none(), "last_error must be None after a successful probe");
+        let s = list
+            .iter()
+            .find(|u| u.id == entry.id)
+            .unwrap_or_else(|| panic!("entry not found"));
+        assert!(
+            s.last_error.is_none(),
+            "last_error must be None after a successful probe"
+        );
         assert!(s.healthy);
     }
 
@@ -893,7 +1010,14 @@ mod tests {
     #[test]
     fn patch_upstream_name_none_clears_name() {
         let upstreams = init_upstreams(&crate::config::parser::UnboundConfig::default());
-        let entry = add_upstream(&upstreams, "1.1.1.1".into(), 53, "udp".into(), Some("Old".into()), None);
+        let entry = add_upstream(
+            &upstreams,
+            "1.1.1.1".into(),
+            53,
+            "udp".into(),
+            Some("Old".into()),
+            None,
+        );
         let updated = patch_upstream_name(&upstreams, &entry.id, None);
         assert!(updated.unwrap().name.is_none());
     }

@@ -9,6 +9,156 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.4] — 2026-05-25
+
+### Security
+
+- **SEC-19** [HIGH]: CSRF double-submit cookie on WebUI. Login now sets a non-HttpOnly
+  `rb_csrf` cookie; `POST /api/webui/password` and `POST /logout` verify the
+  `X-CSRF-Token` request header matches the session-stored token.
+  (`src/webui/mod.rs`)
+
+- **SEC-AGV-01** [HIGH]: DDNS UPDATE handler rejects DELETE operations targeting
+  statically configured zone names. `LocalZoneSet` now carries a `static_names:
+  HashSet<Name>` populated from `unbound.conf` at startup; any DELETE with a matching
+  name returns `REFUSED`. Prevents TSIG-authenticated zone hijacking.
+  (`src/dns/ddns.rs`, `src/dns/local.rs`)
+
+- **SEC-20** [MEDIUM]: TSIG key material decoded once at startup instead of
+  base64-decoding on every UPDATE request. Stored as
+  `Vec<(String, TsigAlgorithm, Vec<u8>)>`.
+  (`src/dns/server.rs`)
+
+- **SEC-21** [MEDIUM]: Stale cache capped at `cache_max_entries` with simple eviction
+  to prevent OOM growth under high-cardinality domain traffic.
+  (`src/dns/server.rs`)
+
+- **SEC-AGV-02** [MEDIUM]: Schedule window validation in blacklist API handler — rejects
+  non-HH:MM values before storage. `is_active_now()` uses safe `.get(..2)` / `.get(3..5)`
+  slice access to prevent panics on short strings.
+  (`src/api/mod.rs`, `src/store.rs`)
+
+- **SEC-24** [LOW]: DNSSEC stripping detection now requires 2 consecutive AD=0 probe
+  results before setting `dnssec_stripping = true` — eliminates false positives from
+  upstream oscillation.
+  (`src/upstreams.rs`)
+
+- **SEC-26** [INFO]: SSE sparkline reconnect uses exponential backoff (1 s → 30 s max)
+  instead of silently dropping on stream close.
+  (`examples/web-ui/index.html`)
+
+### Added
+
+- **WebUI: logout button** in the management console header bar.
+- **WebUI: auto-logout** after 30 minutes of user inactivity (idle timer reset on
+  click/keydown/mousemove/touchstart).
+- **WebUI: Settings tab** — change username and password via `POST /api/webui/password`.
+  Active sessions are invalidated on credential change (SEC-25 fix from v0.9.3).
+- **WebUI: POST /logout** route alongside existing GET — required for CSRF-protected
+  logout from the embedded WebUI server.
+- **WebUI: CSRF in all API calls** — `api()` helper reads `rb_csrf` cookie and injects
+  `X-CSRF-Token` header on every non-GET request.
+
+### Fixed
+
+- **WebUI: QPS sparkline** always showed 0 on low-traffic servers because `qps_1m` is
+  an exponentially smoothed average that takes time to accumulate. Fixed to compute
+  instantaneous QPS from the delta of the `total` counter between SSE frames.
+
+---
+## [0.9.2] — 2026-05-24
+
+### Security
+- **SEC-12 fix**: XDP ICMP handler now rejects IPv4 packets with options (IHL≠5) instead
+  of parsing the ICMP header at wrong offset. Packets with IP options pass to kernel.
+- **SEC-16 fix**: WebUI reverse proxy body limit aligned to 65536 bytes (matching API
+  `MAX_BODY_BYTES`) — prevents up to 8 MB per-request heap allocation.
+
+### Fixed
+- **SEC-13 fix**: `icmp-rate-limit-burst` config now takes effect. New source IPs receive
+  `burst` initial free tokens before per-second rate limiting applies. Backed by a
+  `burst_left` field in the BPF `icmp_rate_entry` map value.
+
+---
+
+## [0.9.1] — 2026-05-24
+
+### Added
+- **XDP ICMP echo responder (#89)** (`ebpf/dns_xdp.c`, `src/icmp.rs`, `src/dns/xdp/loader.rs`)
+  Runbound now responds to ICMP echo requests at the XDP driver layer — zero kernel-
+  stack overhead. Per-source-IP token bucket rate limiting (configurable pps and burst)
+  drops excess pings with a BPF counter increment, no reply generated.
+
+  Configure via `runbound.conf`:
+  ```
+  icmp {
+      enable: yes
+      rate-limit: 20        # pings/s per source IP (default: 10)
+      rate-limit-burst: 8   # burst capacity (default: 5)
+  }
+  ```
+
+  Live config updates: `PUT /api/icmp/config` — applied to BPF within 1 second.
+  Stats: `GET /api/icmp/stats` returns `handled`, `replied`, `dropped`, `rate_limited`
+  counters from BPF per-CPU arrays (PR #122).
+
+---
+
+## [0.9.0] — 2026-05-24
+
+### Added
+- **Embedded web UI server (#4/#91)** (`src/webui/mod.rs`, `src/config/parser.rs`, `src/main.rs`)
+  Runbound now serves the management dashboard directly — no nginx required.
+  Enable with `ui-enabled: yes` in `runbound.conf`; configure port (`ui-port`, default 8090)
+  and bind address (`ui-bind`, default `0.0.0.0`). The embedded server proxies every
+  `/api/*` request to the local API (127.0.0.1), keeping the REST endpoint off the
+  network. Supports streaming responses (SSE live-events) through the proxy (PR #121).
+
+---
+
+## [0.8.2] — 2026-05-24
+
+### Added
+- **Top domains API (#5)** (`src/domain_stats.rs`, `src/api/mod.rs`)
+  `GET /api/stats/top-domains?limit=N` returns the most-queried domain names
+  since process start. Backed by a lock-free `DashMap<Box<str>, AtomicU64>` capped
+  at 10,000 domains. Overview tab shows a top-10 table with inline progress bars
+  (PR #117).
+
+- **Auto firewall management (#90)** (`src/firewall/`, `src/config/parser.rs`, `src/main.rs`)
+  Opt-in (`firewall-manage: yes`): on startup Runbound opens required ports
+  (DNS UDP+TCP, API, sync) in the host firewall; closes them on clean shutdown.
+  Detects UFW, nftables, iptables automatically or via `firewall-backend:`.
+  Tagged rules only — never flushes chains (PR #118).
+
+### Fixed
+- **SEC-2026-05-24-03 (#110)**: `is_private_ip()` accepted `::ffff:127.0.0.1` and
+  other IPv4-compatible IPv6 addresses as public, enabling SSRF via feed registration
+  (PR #115).
+- **SEC-2026-05-24-04 (#111)**: `cert_rl` rate-limit map keyed on `IP:port` rather
+  than IP alone; attacker could bypass per-IP cert-request limit by rotating ephemeral
+  source ports (PR #115).
+- **SEC-2026-05-24-05 (#112)**: `Acl::check()` called `to_ipv4_mapped()` on the
+  client address before matching, so `::ffff:192.168.1.1` could bypass IPv6 ACL rules
+  (PR #115).
+- **SEC-2026-05-24-06 (#113)**: `relay_host` was not validated at slave registration;
+  a malicious slave could register an internal address and cause SSRF from master relay
+  calls (PR #115).
+
+---
+
+## [0.8.1] — 2026-05-24
+
+### Security
+- **SEC-2026-05-24-01**: `is_private_ip()` did not canonicalise IPv4-in-IPv6 addresses
+  before the private-range check; `::127.0.0.1` bypassed SSRF protection on feed
+  registration (MEDIUM).
+- **SEC-2026-05-24-02**: Relay registration allowed registering slave addresses in
+  RFC-1918 ranges other than the relay host's own subnet, enabling internal-network
+  SSRF (MEDIUM).
+
+---
+
 ## [0.8.0] - 2026-05-24
 
 ### Performance

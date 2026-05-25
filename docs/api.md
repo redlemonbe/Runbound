@@ -365,6 +365,36 @@ The stream is a standard SSE event stream (`Content-Type: text/event-stream`). E
 
 ---
 
+### `GET /api/stats/top-domains`
+
+Most-queried domain names since process start, sorted by query count descending.
+Tracks up to 10,000 distinct domains. Counter is cumulative (not windowed).
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | 10 | Number of results (1–100) |
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     "http://localhost:8080/api/stats/top-domains?limit=20"
+```
+
+```json
+{
+  "top_queried": [
+    { "domain": "google.com.", "count": 4821 },
+    { "domain": "cloudflare.com.", "count": 3102 },
+    { "domain": "github.com.", "count": 1844 }
+  ],
+  "tracked_domains": 312
+}
+```
+
+`tracked_domains` is the current number of distinct domains in the in-memory map (max 10,000).
+Once the cap is reached, new domains are silently ignored until the process restarts.
+
+---
+
 ### `GET /api/logs`
 
 Recent DNS query log, newest first. Entries are kept in a fixed-size ring buffer pre-allocated at startup (zero allocation per query). The buffer size is controlled by `log-retention` in `runbound.conf` (default: **1,000**, compile-time max: 10,000). Set to `0` to disable the buffer entirely.
@@ -1055,6 +1085,79 @@ by SSE clients.
 disconnected when the channel is full.
 
 > The `-N` flag disables curl's output buffering — required to see events in real time.
+
+---
+
+---
+
+### ICMP echo responder
+
+> Requires XDP (`--features xdp`) compiled binary and `icmp { enable: yes }` in `runbound.conf`.
+> When XDP is inactive, endpoints are still available but counters stay at zero.
+
+#### `GET /api/icmp/stats`
+
+Returns cumulative counters polled from the BPF per-CPU array.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/icmp/stats
+```
+
+```json
+{"dropped":0,"handled":42,"rate_limited":7,"replied":35}
+```
+
+| Field | Description |
+|---|---|
+| `handled` | Echo requests that reached the XDP handler |
+| `replied` | Requests answered with XDP_TX (echo reply sent) |
+| `dropped` | Requests dropped before reply (reserved, currently unused) |
+| `rate_limited` | Requests dropped by per-source-IP rate limiter |
+
+Counters are updated by the background BPF poll task every second.
+
+---
+
+#### `GET /api/icmp/config`
+
+Returns the current ICMP responder configuration.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/icmp/config
+```
+
+```json
+{"burst":8,"enable":true,"rate_limit":20}
+```
+
+---
+
+#### `PUT /api/icmp/config`
+
+Live-update the ICMP responder config. Changes are applied to the BPF map within 1 second
+(next background poll tick).
+
+```bash
+curl -X PUT -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+     -H "Content-Type: application/json" \
+     -H "Content-Length: 41" \
+     -d '{"enable":true,"rate_limit":20,"burst":8}' \
+     http://localhost:8080/api/icmp/config
+```
+
+**Request body** (all fields optional — omitted fields keep their current value):
+
+| Field | Type | Description |
+|---|---|---|
+| `enable` | bool | Enable/disable the ICMP echo responder |
+| `rate_limit` | integer | Max echo requests per second per source IP |
+| `burst` | integer | Initial burst tokens granted to new source IPs |
+
+Returns the updated config:
+
+```json
+{"burst":8,"enable":true,"rate_limit":20}
+```
 
 ---
 

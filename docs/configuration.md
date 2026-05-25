@@ -213,6 +213,63 @@ with an error. There is no silent fallback.
 
 → Full setup guide including SoftHSM2, YubiHSM 2, and production recommendations: [docs/hsm.md](hsm.md)
 
+
+### Web UI (embedded server)
+
+Runbound can serve the management dashboard itself — no nginx required.
+
+```
+server:
+    ui-enabled: yes   # default: no
+    ui-port:    8090  # default: 8090
+    ui-bind:    0.0.0.0   # default: 0.0.0.0 (all interfaces)
+```
+
+| Directive | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ui-enabled` | bool (`yes`/`no`) | `no` | Enable the embedded web UI server |
+| `ui-port` | integer | `8090` | TCP port the UI server binds to |
+| `ui-bind` | string | `0.0.0.0` | Bind address for the UI server |
+
+The embedded server serves `index.html` at `GET /` and transparently proxies
+every `/api/*` request to `http://127.0.0.1:<api-port>` — the REST API remains
+localhost-only. See [web-ui.md](web-ui.md) for setup details.
+
+> **Note:** If `ui-enabled: no` (the default), no UI port is opened and the
+> `ui-port` / `ui-bind` directives are ignored.
+
+
+### ICMP echo responder (#89)
+
+> Requires a binary compiled with `--features xdp`. On binaries without XDP support, this
+> section is silently ignored.
+
+```
+icmp {
+    enable:           no     # default: no — set yes to activate XDP ICMP responder
+    rate-limit:       10     # echo requests/s per source IP before dropping (default: 10)
+    rate-limit-burst: 5      # initial burst tokens for new source IPs (default: 5)
+}
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `enable` | bool (`yes`/`no`) | `no` | Activate the XDP ICMP echo handler |
+| `rate-limit` | integer | `10` | Steady-state limit: max echo requests per second per source IP |
+| `rate-limit-burst` | integer | `5` | Burst tokens granted to new source IPs on first contact |
+
+**Rate limiting behaviour:** Each source IP starts with `rate-limit-burst` free tokens.
+Once burst tokens are consumed, the steady-state `rate-limit` (pings/s) applies within a
+1-second fixed window. Excess pings are dropped (XDP_DROP) with no reply. Counters are
+available via `GET /api/icmp/stats`.
+
+**Live updates:** `PUT /api/icmp/config` updates the running config without restart.
+The background BPF poll task applies changes to the kernel map within 1 second.
+
+> **Security note:** The default bind for the API is `127.0.0.1` only. The ICMP handler
+> operates at the XDP layer on the NIC, independent of the API port. The XDP program handles
+> frames arriving on the configured interface (`xdp-interface` or auto-detected).
+
 ### DNSSEC validation
 
 ```
@@ -652,6 +709,43 @@ plain-UDP upstreams. These fallback upstreams are:
 Set `resolv-fallback: no` to disable this behaviour entirely. Useful in
 environments where `/etc/resolv.conf` points to a loopback stub resolver
 (e.g. `systemd-resolved`) that would create a forwarding loop.
+
+---
+
+### Firewall auto-management
+
+Opt-in feature: Runbound can open the ports it needs (DNS, API, sync) in the
+host firewall on startup and close them on clean shutdown. Supports UFW,
+nftables, and iptables. Detected automatically; explicitly selectable.
+
+```
+server:
+    firewall-manage: no      # default: no — opt-in, never changes rules by default
+    firewall-backend: auto   # auto | ufw | nftables | iptables
+    firewall-tag: runbound   # comment tag added to every rule Runbound manages
+```
+
+**Detection order** (when `firewall-backend: auto`):
+1. UFW — if `ufw` binary exists and UFW is active
+2. nftables — if `nft` binary exists
+3. iptables — if `iptables` binary exists
+4. None — feature is a no-op (startup proceeds normally)
+
+**Ports opened** (on startup) and **closed** (on clean shutdown):
+
+| Port | Proto | Condition |
+|------|-------|-----------|
+| `port` (DNS) | UDP + TCP | always |
+| `api-port` | TCP | if API is enabled |
+| `sync-port` | TCP | master only |
+
+Rules are tagged with `firewall-tag` (default `runbound`). Only rules with
+that tag are ever removed. Runbound never flushes chains or modifies unrelated
+rules.
+
+> **Safety:** `firewall-manage: no` (default) means Runbound never touches
+> firewall rules unless explicitly enabled. If the process is killed with
+> SIGKILL the rules remain open until manually removed or next clean start.
 
 ---
 

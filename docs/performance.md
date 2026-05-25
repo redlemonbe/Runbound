@@ -1,5 +1,14 @@
 # Performance
 
+> **Version note (2026-05-24):** The benchmark below was run on Runbound v0.5.4.
+> Since then, six performance improvements were implemented and verified in v0.8.1
+> (PERF-01 through PERF-06 — see [docs/security-audit/v0.8.1-performance.md](security-audit/v0.8.1-performance.md)):
+> cache snapshot interval reduced to 10 ms, hot-path reads switched to lock-free
+> `ArcSwap`, `DashMap` replacing `Mutex<HashMap>`, NUMA-aware UMEM allocation,
+> 2 MiB hugepage support, TX batching per poll cycle, and one SO_REUSEPORT UDP
+> socket per physical CPU. Updated benchmark numbers (v0.8.1) will be published
+> once the Intel X540 client is available for XDP native-path testing.
+
 ## Official benchmark — 2026-05-20
 
 ### Test environment
@@ -141,7 +150,7 @@ The current client (Emulex be2net) does not support AF/XDP.
 A follow-up benchmark with an Intel X540-T2 client will test:
 
 - Runbound XDP native path on ixgbe (both ends)
-- Expected range: 500 000 – 14 000 000 QPS
+- Expected range: 500 000 – 14 000 000 QPS [UNVERIFIED — pending v0.8 benchmark]
 - Both BIND9 and Unbound lack XDP support — comparison becomes one-sided
 
 Results will be published in a dedicated benchmark report when available (pending Intel X520 hardware — see issue #84).

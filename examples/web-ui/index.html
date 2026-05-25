@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Runbound — Management Console</title>
-  <script src="/tailwind.js"></script>
+  <link rel="icon" href="/favicon.ico"/>
+  <script src="/rb-styles.js"></script>
   <style>
     body { font-family: 'SF Mono','Fira Code','Consolas',monospace; }
     .tab-active { border-bottom:2px solid #22d3ee; color:#22d3ee; }
@@ -28,6 +29,7 @@
     .badge-dot{background:#1a3a2a;color:#34d399}
     .badge-dnssec-ok{background:#14291a;color:#4ade80;border:1px solid #166534}
     .badge-dnssec-no{background:#1a1a1a;color:#4b5563;border:1px solid #374151}
+    .badge-dnssec-strip{background:#2d1a1a;color:#f87171;border:1px solid #7f1d1d}
     .badge-cfg{background:#2d1f3a;color:#c084fc;border:1px solid #6b21a8}
     .badge-xdp-on{background:#0e2a1a;color:#34d399;border:1px solid #166534}
     .badge-xdp-off{background:#1a1a1a;color:#4b5563;border:1px solid #374151}
@@ -41,6 +43,16 @@
     .dns-row{display:grid;grid-template-columns:minmax(100px,1.5fr) 60px minmax(120px,2fr) 55px 32px;gap:6px;align-items:center;padding:6px 12px;border-bottom:1px solid #0f172a;font-size:12px}
     .dns-row:hover{background:#0d1a2e}
     .dns-row-hdr{display:grid;grid-template-columns:minmax(100px,1.5fr) 60px minmax(120px,2fr) 55px 32px;gap:6px;padding:5px 12px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#374151;background:#080f1a;border-bottom:1px solid #1e293b}
+  /* SEC-19 / UX: prevent browser autofill overriding dark theme colors */
+  input:-webkit-autofill,
+  input:-webkit-autofill:hover,
+  input:-webkit-autofill:focus,
+  input:-webkit-autofill:active {
+    -webkit-text-fill-color:#e2e8f0 !important;
+    -webkit-box-shadow:0 0 0px 1000px #0f172a inset !important;
+    transition:background-color 5000s ease-in-out 0s;
+    caret-color:#e2e8f0;
+  }
   </style>
 </head>
 <body class="bg-gray-950 text-gray-200 min-h-screen pb-8">
@@ -49,9 +61,6 @@
 <div class="bg-gray-950 border-b border-gray-800/60 px-5 py-2.5 flex flex-wrap items-center gap-3 shadow-lg shadow-black/40">
   <span class="text-cyan-400 font-bold text-sm tracking-widest shrink-0" style="text-shadow:0 0 18px #22d3ee55">RUNBOUND</span>
   <span id="conn-dot" class="w-1.5 h-1.5 rounded-full bg-gray-700 shrink-0"></span>
-  <input id="cfg-url" type="text" value="/api" class="bg-gray-900 border border-gray-700 rounded px-3 py-1 text-xs w-44 focus:outline-none focus:border-cyan-600" placeholder="http://host/api" />
-  <input id="cfg-key" type="password" class="bg-gray-900 border border-gray-700 rounded px-3 py-1 text-xs w-64 focus:outline-none focus:border-cyan-600" placeholder="API key" />
-  <button onclick="connect()" class="bg-cyan-700 hover:bg-cyan-600 text-white text-xs px-4 py-1.5 rounded transition-colors shrink-0">Connect</button>
   <span id="conn-status" class="text-xs text-gray-600 shrink-0">not connected</span>
   <div id="node-pills" class="flex items-center gap-1.5 ml-1 flex-wrap"></div>
   <div class="ml-auto flex items-center gap-3 text-xs text-gray-500">
@@ -59,20 +68,22 @@
     <span id="stat-total" class="tabular-nums hidden sm:block">— queries</span>
     <span id="stat-uptime" class="hidden sm:block">—</span>
     <button onclick="doReload()" title="Reload config" class="border border-gray-700 hover:border-cyan-600 hover:text-cyan-400 text-gray-500 text-xs px-2.5 py-1 rounded transition-colors">↺ Reload</button>
+    <button onclick="doLogout()" title="Logout" class="border border-gray-700 hover:border-red-700 hover:text-red-400 text-gray-600 text-xs px-2.5 py-1 rounded transition-colors">⏏ Logout</button>
   </div>
 </div>
 
 <!-- Tabs -->
-<div class="border-b border-gray-800/60 flex gap-1 px-4 text-xs text-gray-500 bg-gray-950/80 sticky top-0 z-10">
-  <button class="py-3 px-3 tab-active transition-colors hover:text-gray-300" onclick="showTab('overview',this)">Overview</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('dns',this)">DNS</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('system',this)">System</button>
-  <button class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
-</div>
+<nav role="tablist" aria-label="Main navigation" class="border-b border-gray-800/60 flex gap-1 px-4 text-xs text-gray-500 bg-gray-950/80 sticky top-0 z-10">
+  <button role="tab" aria-selected="true"  aria-controls="tab-overview"   class="py-3 px-3 tab-active transition-colors hover:text-gray-300" onclick="showTab('overview',this)">Overview</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-dns"        class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('dns',this)">DNS</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-blacklist"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-feeds"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-upstreams"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-logs"       class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-system"     class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('system',this)">System</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-settings"   class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('settings',this)">Settings</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-about"      class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
+</nav>
 
 <div class="p-5 max-w-6xl mx-auto">
 
@@ -151,6 +162,45 @@
           <div class="flex justify-between"><span class="text-gray-500">Insecure</span><span id="ov-dnssec-insecure" class="text-gray-500 tabular-nums">—</span></div>
         </div>
       </div>
+    </div>
+    <!-- Live QPS chart (#7) -->
+    <div class="card mt-4" id="qps-chart-card" aria-label="Live queries per second chart">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">Live QPS <span class="text-gray-800 font-normal normal-case ml-1">60 s</span></span>
+        <span class="text-xs text-gray-700">peak&nbsp;<span id="qps-chart-peak" class="text-cyan-600 tabular-nums">—</span></span>
+      </div>
+      <svg id="qps-sparkline-svg" role="img" aria-label="QPS over last 60 seconds"
+           viewBox="0 0 480 52" width="100%" height="52" xmlns="http://www.w3.org/2000/svg" style="display:block">
+        <defs>
+          <linearGradient id="spk-grad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18"/>
+            <stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <text x="240" y="30" text-anchor="middle" fill="#1e293b" font-size="11" font-family="monospace">connecting…</text>
+      </svg>
+      <div class="flex justify-between text-xs text-gray-800 mt-1" aria-hidden="true">
+        <span>60s ago</span><span>now</span>
+      </div>
+    </div>
+    <!-- Top Domains (#5) -->
+    <div class="card mt-4" id="top-domains-card">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">Top Domains <span class="text-gray-800 font-normal normal-case ml-1">since startup</span></span>
+        <span class="text-xs text-gray-700">tracking <span id="top-domains-tracked" class="text-cyan-600 tabular-nums">—</span> domains</span>
+      </div>
+      <table class="w-full text-sm" aria-label="Top queried domains">
+        <thead>
+          <tr class="text-xs text-gray-600 border-b border-gray-800/40">
+            <th class="text-left pb-1.5 font-normal w-6">#</th>
+            <th class="text-left pb-1.5 font-normal">Domain</th>
+            <th class="text-right pb-1.5 font-normal">Queries</th>
+          </tr>
+        </thead>
+        <tbody id="top-domains-tbody">
+          <tr><td colspan="3" class="text-gray-700 text-xs pt-2">loading…</td></tr>
+        </tbody>
+      </table>
     </div>
     <div class="text-right text-xs text-gray-800 mt-3" id="ov-refreshed">—</div>
   </div>
@@ -261,6 +311,10 @@
       <span class="text-xs text-gray-700">Last 100 entries — requires verbosity ≥ 1</span>
     </div>
     <div id="log-list" class="space-y-0.5 font-mono text-xs"></div>
+    <div class="mt-4 card">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">WebUI Auth Activity</div>
+      <div id="auth-events-logs" class="space-y-1 font-mono text-xs"><span class="text-gray-700">Loading…</span></div>
+    </div>
   </div>
 
   <!-- ═══ SYSTEM ═══ -->
@@ -353,6 +407,57 @@
 
 </div>
 
+  <!-- ═══ SETTINGS ═══ -->
+  <div id="tab-settings" class="hidden fade max-w-2xl mx-auto">
+    <div class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-4">Change Password</div>
+      <div class="space-y-3 max-w-sm" style="padding-left:3px">
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Username</label>
+          <input id="set-username" type="text" class="input w-full" autocomplete="username" placeholder="admin" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">New password</label>
+          <input id="set-new-pass" type="password" class="input w-full" autocomplete="new-password" />
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Confirm new password</label>
+          <input id="set-confirm-pass" type="password" class="input w-full" autocomplete="new-password" />
+        </div>
+        <p class="text-xs text-gray-700">Active sessions are invalidated on save.</p>
+        <button onclick="changePassword()" class="btn-primary mt-1">Update credentials</button>
+      </div>
+    </div>
+    <div class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DNSSEC Validation</div>
+      <div class="flex items-start justify-between gap-4 mb-3">
+        <div>
+          <p class="text-sm text-gray-300">Validate DNSSEC signatures</p>
+          <p class="text-xs text-gray-600 mt-1">When enabled, cryptographic signatures are validated on all responses. When disabled, the upstream AD bit is trusted.</p>
+        </div>
+        <button id="dnssec-toggle-btn" onclick="toggleDnssec()" class="btn-secondary text-xs w-16 shrink-0">—</button>
+      </div>
+      <p id="dnssec-status-note" class="text-xs text-gray-700"></p>
+    </div>
+    <div class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Session</div>
+      <div class="space-y-2 text-sm">
+        <div class="flex justify-between"><span class="text-gray-500">Auto-logout (idle)</span><span class="text-gray-300">30 minutes</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Session duration</span><span class="text-gray-300">8 hours</span></div>
+      </div>
+      <button onclick="doLogout()" class="btn-secondary mt-4 text-xs">Logout now</button>
+    </div>
+    <div class="card">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-xs text-gray-600 uppercase tracking-wide">Recent Auth Events</div>
+        <button onclick="loadAuthEvents()" class="btn-secondary text-xs">Refresh</button>
+      </div>
+      <div id="auth-events-list" class="space-y-1 font-mono text-xs">
+        <span class="text-gray-700">Open Settings to load…</span>
+      </div>
+    </div>
+  </div>
+
 <!-- Toast -->
 <div id="toast" class="fixed bottom-8 right-6 hidden text-xs px-4 py-2 rounded-lg shadow-xl border"></div>
 <!-- Copyright -->
@@ -402,27 +507,29 @@ function nodeApi(nodeId, method, path, body) {
     return doFetch(relayUrl, masterKey);
   };
   if (nodeId === 'master') return doFetch(directUrl, n.key);
-  return doFetch(directUrl, n.key).catch(() => tryRelay());
+  // Use relay when available — avoids cross-origin requests from embedded WebUI
+  if (n.relayNodeId) return tryRelay();
+  return doFetch(directUrl, n.key);
 }
 
 // Current node's API (for tabs other than overview)
-let BASE = '/api', KEY = '';
-const h = b => { const o = {'Authorization': `Bearer ${KEY}`}; if(b) o['Content-Type']='application/json'; return o; };
+const BASE = '/api';
+function getCsrf() { const m = document.cookie.match(/(?:^|;\s*)rb_csrf=([^;]*)/); return m ? decodeURIComponent(m[1]) : ''; }
 async function api(method, path, body) {
-  const r = await fetch(BASE+path, {method, headers:h(!!body), body:body?JSON.stringify(body):undefined});
+  const headers = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  if (method !== 'GET' && method !== 'HEAD') headers['X-CSRF-Token'] = getCsrf();
+  const r = await fetch(BASE+path, {method, headers, body:body?JSON.stringify(body):undefined});
+  if (r.status === 401) { location.href = '/login'; return {}; }
   if (!r.ok) { let msg=`HTTP ${r.status}`; try{const j=await r.json();msg=j.error||j.message||msg;}catch(_){} throw new Error(msg); }
   return r.json().catch(()=>({}));
 }
 
-async function connect() {
-  BASE = document.getElementById('cfg-url').value.replace(/\/$/,'');
-  KEY  = document.getElementById('cfg-key').value.trim();
-  masterKey = KEY;
-  localStorage.setItem('rb-url', BASE); localStorage.setItem('rb-key', KEY);
+async function loadAll() {
   try {
     const s = await api('GET', '/stats');
     setConn(true);
-    nodes['master'] = {url:BASE, key:KEY, name:'Master', stats:s, sys:null, cache:null, status:'ok'};
+    nodes['master'] = {url:BASE, name:'Master', stats:s, sys:null, cache:null, status:'ok'};
     renderNodePills();
     updateOverview();
     clearInterval(statsTimer); statsTimer = setInterval(pollAll, 5000);
@@ -430,8 +537,8 @@ async function connect() {
     clearInterval(syncTimer);  syncTimer  = setInterval(discoverSlaves, 15000);
     pollAllSys();
     discoverSlaves();
-    toast('Connected');
-  } catch(e) { setConn(false, e.message); toast('Connection failed: '+e.message, true); }
+    initSparkline();
+  } catch(e) { setConn(false, e.message); }
 }
 
 async function discoverSlaves() {
@@ -463,6 +570,37 @@ async function discoverSlaves() {
 
 async function pollAll() {
   for (const id of Object.keys(nodes)) pollNodeStats(id);
+  pollTopDomains();
+}
+
+async function pollTopDomains() {
+  const id = selectedNode === 'all' ? 'master' : selectedNode;
+  if (!id || !nodes[id]) return;
+  try {
+    const d = await nodeApi(id, 'GET', '/stats/top-domains?limit=10');
+    const tbody = document.getElementById('top-domains-tbody');
+    const tracked = document.getElementById('top-domains-tracked');
+    if (!tbody) return;
+    if (tracked) tracked.textContent = (d.tracked_domains ?? '—').toLocaleString();
+    const rows = (d.top_queried ?? []);
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" class="text-gray-700 text-xs pt-2">no data yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map((r, i) => {
+      const domain = r.domain.replace(/\.$/, '');
+      const count = (r.count ?? 0).toLocaleString();
+      const bar = Math.round((r.count / rows[0].count) * 100);
+      return `<tr class="border-b border-gray-900/50 hover:bg-gray-800/30 transition-colors">
+        <td class="py-1.5 pr-2 text-gray-700 tabular-nums text-xs">${i + 1}</td>
+        <td class="py-1.5 pr-4">
+          <div class="text-gray-300 tabular-nums font-mono text-xs truncate max-w-xs" title="${esc(domain)}">${esc(domain)}</div>
+          <div class="h-0.5 bg-gray-800 rounded mt-1 w-full"><div class="h-0.5 bg-cyan-700 rounded" style="width:${bar}%"></div></div>
+        </td>
+        <td class="py-1.5 text-right text-cyan-400 tabular-nums text-xs">${count}</td>
+      </tr>`;
+    }).join('');
+  } catch(_) { /* silently ignore — endpoint may not exist on older servers */ }
 }
 async function pollAllSys() {
   for (const id of Object.keys(nodes)) pollNodeSys(id);
@@ -471,6 +609,8 @@ async function pollNodeStats(id) {
   try {
     const s = await nodeApi(id, 'GET', '/stats');
     nodes[id].stats = s; nodes[id].status = 'ok';
+    _spkSlaveQps = Object.entries(nodes).filter(([k])=>k!=='master').reduce((a,[,n])=>a+(n.stats?.qps_1m??0),0);
+    if (selectedNode === id && id !== 'master') _spkPush(Number(s.qps_1m ?? 0));
     renderNodePills();
     if (selectedNode === id || selectedNode === 'all') updateOverview();
   } catch(e) {
@@ -492,11 +632,10 @@ async function pollNodeSys(id) {
 
 function selectNode(id) {
   selectedNode = id;
-  // BASE/KEY always point to master — DNS, Blacklist, Feeds, Upstreams, Logs are master-only
-  BASE = nodes.master?.url ?? '/api';
-  KEY  = nodes.master?.key ?? masterKey;
+  QPS_BUF.length = 0; _spkLastTotal = null; _spkLastTime = null; _spkRender();
   renderNodePills();
   updateOverview();
+  pollTopDomains();
 }
 
 function nodeEffectiveStatus(n) {
@@ -530,7 +669,9 @@ function aggregateStats() {
     upstreams_healthy: sum('upstreams_healthy'), upstreams_total: sum('upstreams_total'),
     prefetch_enabled: s0.prefetch_enabled,
     dnssec: {
-      secure: sum('dnssec.secure'), bogus: sum('dnssec.bogus'), insecure: sum('dnssec.insecure')
+      secure:   ns.reduce((a,n)=>a+(n.stats?.dnssec?.secure??0),0),
+      bogus:    ns.reduce((a,n)=>a+(n.stats?.dnssec?.bogus??0),0),
+      insecure: ns.reduce((a,n)=>a+(n.stats?.dnssec?.insecure??0),0),
     }
   };
 }
@@ -625,7 +766,7 @@ function renderStats(s) {
   set('ov-nxdomain',fmt(s.nxdomain)); set('ov-refused',fmt(s.refused)); set('ov-local',fmt(s.local_hits));
   set('ov-cache-entries',fmt(s.cache_entries)); set('ov-cache-rate',pct(s.cache_hit_rate));
   if(s.xdp_cache_hits!=null) set('ov-xdp-cache-hits',fmt(s.xdp_cache_hits));
-  const d=s.dnssec??{},tot=(d.secure??0)+(d.bogus??0)+(d.insecure??0),off=tot===0&&(s.total??0)>0;
+  const d=s.dnssec??{},tot=(d.secure??0)+(d.bogus??0)+(d.insecure??0),dnssecEnabled=nodes['master']?.sys?.dnssec_validation,off=dnssecEnabled===false||(dnssecEnabled===undefined&&tot===0&&(s.total??0)>0);
   set('ov-dnssec-secure',off?'—':fmt(d.secure)); set('ov-dnssec-bogus',off?'—':fmt(d.bogus)); set('ov-dnssec-insecure',off?'—':fmt(d.insecure));
   set('ov-dnssec-status',off?'· validation off':'');
   set('stat-qps',fmtf(s.qps_1m)+' qps'); set('stat-total',fmt(s.total)+' queries'); set('stat-uptime',sec(s.uptime_secs));
@@ -826,14 +967,14 @@ async function loadUpstreamPresets(){
 }
 async function upstreamAddPreset(i){const p=upstreamPresetsCache[i];if(!p)return;try{const body={addr:p.addr,protocol:p.protocol,name:p.name};if(p.port)body.port=p.port;if(p.tls_hostname)body.tls_hostname=p.tls_hostname;const r=await api('POST','/upstreams',body);toast(`"${p.name}" added`);const id=r.upstream?.id;if(id){probingUpstreams.add(id);pollUpstreamHealth(id);}loadUpstreamPresets();loadUpstreams();}catch(e){toast('Add: '+e.message,true);}}
 function renderSparkline(h){if(!h||!h.length)return'';const max=Math.max(...h,1);const bars=h.map(v=>{const px=Math.max(3,Math.round((v/max)*14));return`<span style="height:${px}px" title="${v} ms"></span>`;}).join('');return`<span class="sparkbar">${bars}</span>`;}
-function dnssecBadge(v){if(v===true)return'<span class="badge badge-dnssec-ok">DNSSEC</span>';if(v===false)return'<span class="badge badge-dnssec-no">DNSSEC</span>';return'';}
+function dnssecBadge(supported,stripping){if(stripping)return'<span class="badge badge-dnssec-strip" title="DNSSEC stripping detected">⚠ STRIP</span>';if(supported===true)return'<span class="badge badge-dnssec-ok">DNSSEC</span>';if(supported===false)return'<span class="badge badge-dnssec-no">DNSSEC</span>';return '';}
 async function loadUpstreams(){
   try{
     const d=await api('GET','/upstreams'),upstreams=d.upstreams??[],healthy=d.healthy??0,total=d.total??upstreams.length;
     const badge=document.getElementById('upstream-health-badge');
     if(badge){badge.textContent=`${healthy}/${total}`;badge.className=healthy===total&&total>0?'ml-2 font-mono text-green-400':healthy===0?'ml-2 font-mono text-red-400':'ml-2 font-mono text-yellow-500';}
     document.getElementById('upstream-list').innerHTML=upstreams.length===0?empty('No upstreams configured.'):
-      upstreams.map(u=>{const latency=u.latency_ms!=null?u.latency_ms+' ms':'—';const lastCheck=u.last_check&&u.last_check!==''?new Date(u.last_check).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'—';const port=u.port??(u.protocol==='dot'?853:53);const probing=probingUpstreams.has(u.id);const hDot=probing?'<span class="w-2 h-2 rounded-full shrink-0 bg-yellow-400 blink"></span>':u.healthy?'<span class="w-2 h-2 rounded-full shrink-0 bg-green-500"></span>':'<span class="w-2 h-2 rounded-full shrink-0 bg-red-600"></span>';const proto=u.protocol==='dot'?'<span class="badge badge-dot">DoT</span>':'<span class="badge badge-udp">UDP</span>';const cfgBadge=u.source==='config'?'<span class="badge badge-cfg">cfg</span>':'';const spark=renderSparkline(u.latency_history);const dns=dnssecBadge(u.dnssec_supported);const name=u.name?`<span class="text-gray-400 truncate text-xs">${esc(u.name)}</span>`:'<span class="text-gray-700 italic text-xs">unnamed</span>';const sniBtn=u.protocol==='dot'?`<button class="edit-btn shrink-0" onclick="upstreamEditSni('${u.id}','${esc(u.tls_hostname||'')}')">SNI</button>`:'';const lastErr=!probing&&u.last_error?`<span class="text-red-400 text-xs shrink-0 cursor-help" title="${esc(u.last_error)}">⚠</span>`:'';return`<div class="row gap-2">${hDot}<span class="text-cyan-400 font-mono shrink-0 text-xs w-36">${esc(u.addr)}<span class="text-gray-700">:${port}</span></span>${proto}${cfgBadge}${dns}<span class="flex-1 min-w-0 flex items-center gap-1.5">${name}<button class="edit-btn shrink-0" onclick="upstreamRename('${u.id}','${esc(u.name||'')}')">✎</button>${sniBtn}</span>${spark?`<span class="shrink-0">${spark}</span>`:''}<span class="text-gray-600 w-14 text-right text-xs shrink-0 tabular-nums">${latency}</span><span class="text-gray-800 w-20 text-right text-xs shrink-0">↻ ${lastCheck}</span>${lastErr}<button class="del shrink-0" onclick="upstreamDelete('${u.id}')">✕</button></div>`;}).join('');
+      upstreams.map(u=>{const latency=u.latency_ms!=null?u.latency_ms+' ms':'—';const lastCheck=u.last_check&&u.last_check!==''?new Date(u.last_check).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'—';const port=u.port??(u.protocol==='dot'?853:53);const probing=probingUpstreams.has(u.id);const hDot=probing?'<span class="w-2 h-2 rounded-full shrink-0 bg-yellow-400 blink"></span>':u.healthy?'<span class="w-2 h-2 rounded-full shrink-0 bg-green-500"></span>':'<span class="w-2 h-2 rounded-full shrink-0 bg-red-600"></span>';const proto=u.protocol==='dot'?'<span class="badge badge-dot">DoT</span>':'<span class="badge badge-udp">UDP</span>';const cfgBadge=u.source==='config'?'<span class="badge badge-cfg">cfg</span>':'';const spark=renderSparkline(u.latency_history);const dns=dnssecBadge(u.dnssec_supported,u.dnssec_stripping);const name=u.name?`<span class="text-gray-400 truncate text-xs">${esc(u.name)}</span>`:'<span class="text-gray-700 italic text-xs">unnamed</span>';const sniBtn=u.protocol==='dot'?`<button class="edit-btn shrink-0" onclick="upstreamEditSni('${u.id}','${esc(u.tls_hostname||'')}')">SNI</button>`:'';const lastErr=!probing&&u.last_error?`<span class="text-red-400 text-xs shrink-0 cursor-help" title="${esc(u.last_error)}">⚠</span>`:'';return`<div class="row gap-2">${hDot}<span class="text-cyan-400 font-mono shrink-0 text-xs w-36">${esc(u.addr)}<span class="text-gray-700">:${port}</span></span>${proto}${cfgBadge}${dns}<span class="flex-1 min-w-0 flex items-center gap-1.5">${name}<button class="edit-btn shrink-0" onclick="upstreamRename('${u.id}','${esc(u.name||'')}')">✎</button>${sniBtn}</span>${spark?`<span class="shrink-0">${spark}</span>`:''}<span class="text-gray-600 w-14 text-right text-xs shrink-0 tabular-nums">${latency}</span><span class="text-gray-800 w-20 text-right text-xs shrink-0">↻ ${lastCheck}</span>${lastErr}<button class="del shrink-0" onclick="upstreamDelete('${u.id}')">✕</button></div>`;}).join('');
   }catch(e){toast('Upstreams: '+e.message,true);}
 }
 function upsProtocolChange(sel){const p=document.getElementById('ups-port');if(p)p.value=sel.value==='dot'?'853':'53';const t=document.getElementById('ups-tls-name');if(t)t.classList.toggle('hidden',sel.value!=='dot');}
@@ -855,7 +996,7 @@ async function loadLogs(){
       [...logs].reverse().map(l=>`<div class="flex gap-3 items-baseline py-0.5 border-b border-gray-900/60 hover:bg-gray-900/40"><span class="text-gray-700 w-20 shrink-0">${(l.timestamp??'').slice(11,19)}</span><span class="text-gray-600 w-28 truncate shrink-0">${esc(l.client??'')}</span><span class="text-cyan-400 flex-1 truncate">${esc(l.name??'')}</span><span class="text-gray-600 w-12 shrink-0">${esc(l.qtype??'')}</span><span class="${col(l.rcode)} w-20 shrink-0">${esc(l.rcode??'')}</span><span class="text-gray-700 w-14 text-right shrink-0 tabular-nums">${l.ms!=null?l.ms+' ms':''}</span></div>`).join('');
   }catch(e){toast('Logs: '+e.message,true);}
 }
-function toggleAutoLogs(el){clearInterval(logsTimer);if(el.checked){loadLogs();logsTimer=setInterval(loadLogs,3000);}}
+function toggleAutoLogs(el){clearInterval(logsTimer);if(el.checked){loadLogs();loadAuthEvents();logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}else{logsTimer=null;}}
 
 // ══════════════════════════════════════════════
 // System
@@ -918,6 +1059,25 @@ async function loadSlaves(){
 async function cacheFlush(){const btn=document.getElementById('btn-flush');try{const r=await api('POST','/cache/flush');toast(`Cache flushed — ${r.flushed_entries??0} entries cleared`);if(btn){btn.disabled=true;btn.classList.add('opacity-30','cursor-not-allowed');setTimeout(()=>{btn.disabled=false;btn.classList.remove('opacity-30','cursor-not-allowed');},60000);}loadSystem();}catch(e){toast(e.message.includes('FLUSH_COOLDOWN')||e.message.includes('429')?'Cache flush on cooldown (60 s)':'Flush failed: '+e.message,true);}}
 async function doReload(){try{await api('POST','/reload');toast('Config reloaded');}catch(e){toast('Reload: '+e.message,true);}}
 
+async function doLogout() {
+  try { await fetch('/logout', {method:'POST', headers:{'X-CSRF-Token':getCsrf()}}); } catch(_) {}
+  location.href = '/login';
+}
+
+async function changePassword() {
+  const username = (document.getElementById('set-username')?.value ?? '').trim();
+  const newP = document.getElementById('set-new-pass')?.value ?? '';
+  const conf = document.getElementById('set-confirm-pass')?.value ?? '';
+  if (!username || !newP) return toast('Username and password required', true);
+  if (newP !== conf) return toast('Passwords do not match', true);
+  if (newP.length < 8) return toast('Minimum 8 characters', true);
+  try {
+    await api('POST', '/webui/password', {username, password: newP});
+    toast('Credentials updated — you will be logged out');
+    setTimeout(() => { location.href = '/login'; }, 1500);
+  } catch(e) { toast('Error: '+e.message, true); }
+}
+
 // ══════════════════════════════════════════════
 // Helpers
 // ══════════════════════════════════════════════
@@ -929,16 +1089,101 @@ let toastTimer;
 function toast(msg,err=false){const el=document.getElementById('toast');el.textContent=msg;el.className=`fixed bottom-8 right-6 text-xs px-4 py-2 rounded-lg shadow-xl border ${err?'bg-red-950 border-red-900 text-red-300':'bg-gray-900 border-gray-700 text-gray-200'}`;el.style.animation='none';void el.offsetWidth;el.style.animation='slideUp .2s ease';clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.add('hidden'),3500);}
 
 function showTab(name,btn){
-  ['overview','dns','blacklist','feeds','upstreams','logs','system','about'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
-  document.querySelectorAll('.tab-active').forEach(b=>b.classList.remove('tab-active'));
+  if(name!=='logs'){clearInterval(logsTimer);logsTimer=null;const cb=document.getElementById('logs-auto');if(cb)cb.checked=false;}
+  ['overview','dns','blacklist','feeds','upstreams','logs','system','about','settings'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
+  document.querySelectorAll('.tab-active').forEach(b=>{b.classList.remove('tab-active');b.setAttribute('aria-selected','false');});
   const el=document.getElementById('tab-'+name);el.classList.remove('hidden');el.classList.add('fade');
-  btn.classList.add('tab-active');
+  btn.classList.add('tab-active');btn.setAttribute('aria-selected','true');
   if(name==='dns'){loadDns();}
   if(name==='blacklist')loadBlacklist();
   if(name==='feeds'){loadPresets();loadFeeds();}
   if(name==='upstreams'){loadUpstreamPresets();loadUpstreams();}
-  if(name==='logs')loadLogs();
+  if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
+  if(name==='settings'){initDnssecToggle();loadAuthEvents();}
+}
+
+// ══════════════════════════════════════════════
+// Live QPS sparkline (#7) — fetch-based SSE reader
+// ══════════════════════════════════════════════
+const QPS_BUF = [];
+const QPS_N   = 60;
+let _spkReader = null, _spkBuf = '', _spkBackoff = 1000;
+let _spkLastTotal = null, _spkLastTime = null;
+let _spkSlaveQps = 0; // sum of slave qps_1m, updated each pollNodeStats cycle
+
+function scheduleSpkReconnect() {
+  setTimeout(initSparkline, _spkBackoff);
+  _spkBackoff = Math.min(_spkBackoff * 2, 30000);
+}
+
+function initSparkline() {
+  if (_spkReader) { try { _spkReader.cancel(); } catch(_){} _spkReader = null; }
+  _spkBuf = '';
+  QPS_BUF.length = 0;
+  _spkLastTotal = null; _spkLastTime = null;
+  const svg = document.getElementById('qps-sparkline-svg');
+  if (svg) svg.innerHTML = '<text x="240" y="30" text-anchor="middle" fill="#1e293b" font-size="11" font-family="monospace">connecting…</text>';
+  fetch(BASE + '/stats/stream')
+    .then(r => {
+      if (!r.ok) { scheduleSpkReconnect(); return; }
+      _spkBackoff = 1000;
+      const reader = r.body.getReader();
+      _spkReader = reader;
+      const dec = new TextDecoder();
+      (function pump() {
+        reader.read().then(({done, value}) => {
+          if (done) { scheduleSpkReconnect(); return; }
+          _spkBuf += dec.decode(value, {stream: true});
+          const lines = _spkBuf.split('\n');
+          _spkBuf = lines.pop();
+          for (const ln of lines) {
+            if (!ln.startsWith('data: ')) continue;
+            try {
+              const d = JSON.parse(ln.slice(6));
+              if (d.total != null) {
+                const now = Date.now();
+                if (_spkLastTotal != null && _spkLastTime != null) {
+                  const dt = (now - _spkLastTime) / 1000;
+                  const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
+                  if (dt > 0) _spkPush(Math.max(0, (d.total - _spkLastTotal) / dt) + extra);
+                }
+                _spkLastTotal = d.total; _spkLastTime = now;
+              } else if (d.qps_1m != null) {
+                const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
+                _spkPush(Number(d.qps_1m) + extra);
+              }
+            } catch(_) {}
+          }
+          pump();
+        }).catch(() => { scheduleSpkReconnect(); });
+      })();
+    }).catch(() => { scheduleSpkReconnect(); });
+}
+
+function _spkPush(qps) {
+  QPS_BUF.push(qps);
+  if (QPS_BUF.length > QPS_N) QPS_BUF.shift();
+  _spkRender();
+}
+
+function _spkRender() {
+  const el = document.getElementById('qps-sparkline-svg');
+  if (!el || QPS_BUF.length < 2) return;
+  const W=480, H=52, P=4;
+  const max = Math.max(...QPS_BUF, 0.1);
+  const xs = i => (P + (i / (QPS_N - 1)) * (W - P*2)).toFixed(1);
+  const ys = v => (H - P - (v / max) * (H - P*2 - 2)).toFixed(1);
+  const pts = QPS_BUF.map((v, i) => xs(QPS_BUF.length <= 1 ? 0 : i * (QPS_N-1) / (QPS_BUF.length-1)) + ',' + ys(v)).join(' ');
+  const lastX = xs(QPS_N - 1);
+  el.innerHTML =
+    '<defs><linearGradient id="spk-grad" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18"/>' +
+    '<stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/></linearGradient></defs>' +
+    '<polyline fill="url(#spk-grad)" stroke="none" points="' + P + ',' + (H-P) + ' ' + pts + ' ' + lastX + ',' + (H-P) + '"/>' +
+    '<polyline fill="none" stroke="#22d3ee" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/>';
+  const pk = document.getElementById('qps-chart-peak');
+  if (pk) pk.textContent = max >= 1000 ? (max/1000).toFixed(1) + 'k' : max.toFixed(0);
 }
 
 let _modalResolve=null;
@@ -946,14 +1191,69 @@ function showInputModal(title,hint,value){document.getElementById('modal-title')
 function modalConfirm(){const val=document.getElementById('modal-input').value;document.getElementById('modal-overlay').classList.add('hidden');if(_modalResolve){_modalResolve(val);_modalResolve=null;}}
 function modalCancel(){document.getElementById('modal-overlay').classList.add('hidden');if(_modalResolve){_modalResolve(null);_modalResolve=null;}}
 
-window.onload=()=>{
-  const DEFAULT_KEY='40f5b3ce9cfa8449d30e6c88c3c26770f8c673866f52d909becf673aada19312';
-  const url=localStorage.getItem('rb-url')??'/api';
-  const key=localStorage.getItem('rb-key')??DEFAULT_KEY;
-  document.getElementById('cfg-url').value=url;
-  document.getElementById('cfg-key').value=key;
-  connect();
-};
+// Auto-logout after 30 minutes idle
+let _idleTimer = null;
+function resetIdleTimer() {
+  clearTimeout(_idleTimer);
+  _idleTimer = setTimeout(async () => {
+    try { await fetch('/logout', {method:'POST', headers:{'X-CSRF-Token':getCsrf()}}); } catch(_) {}
+    location.href = '/login';
+  }, 30 * 60 * 1000);
+}
+['click','keydown','mousemove','touchstart'].forEach(ev => document.addEventListener(ev, resetIdleTimer, {passive:true}));
+
+window.onload=()=>{ loadAll(); resetIdleTimer(); };
+// Settings — DNSSEC toggle + Auth events
+async function initDnssecToggle() {
+  try {
+    const sys = await api('GET', '/config');
+    const btn = document.getElementById('dnssec-toggle-btn');
+    const note = document.getElementById('dnssec-status-note');
+    if (!btn) return;
+    const enabled = sys.dnssec_validation === true;
+    btn.dataset.value = enabled;
+    btn.textContent = enabled ? 'ON' : 'OFF';
+    btn.className = enabled ? 'btn-primary text-xs w-16 shrink-0' : 'btn-secondary text-xs w-16 shrink-0';
+    if (note) note.textContent = enabled ? 'Active — signatures verified on every response.' : 'Disabled — trusting upstream AD bit only.';
+  } catch(e) {}
+}
+async function toggleDnssec() {
+  const btn = document.getElementById('dnssec-toggle-btn');
+  if (!btn) return;
+  const current = btn.dataset.value === 'true';
+  const next = !current;
+  try {
+    await api('PATCH', '/config', {dnssec_validation: next});
+    btn.dataset.value = next;
+    btn.textContent = next ? 'ON' : 'OFF';
+    btn.className = next ? 'btn-primary text-xs w-16 shrink-0' : 'btn-secondary text-xs w-16 shrink-0';
+    const note = document.getElementById('dnssec-status-note');
+    if (note) note.textContent = next ? 'Active — signatures verified on every response.' : 'Disabled — trusting upstream AD bit only.';
+    toast(next ? 'DNSSEC validation enabled' : 'DNSSEC validation disabled');
+  } catch(e) { toast('DNSSEC toggle failed', true); }
+}
+async function loadAuthEvents() {
+  const els = [document.getElementById('auth-events-list'), document.getElementById('auth-events-logs')].filter(Boolean);
+  if (!els.length) return;
+  try {
+    const r = await api('GET', '/webui/auth-events');
+    const events = (r.events || []).slice().reverse();
+    const html = events.length === 0
+      ? '<span class="text-gray-700">No events recorded yet.</span>'
+      : events.map(e => {
+          const ts = new Date(e.ts * 1000).toLocaleString([], {dateStyle:'short',timeStyle:'medium'});
+          const color = e.event === 'login_ok' ? 'text-green-400' : e.event === 'login_fail' ? 'text-red-400' : 'text-gray-500';
+          const label = ({login_ok:'login ok',login_fail:'login FAIL',logout:'logout'})[e.event] || e.event;
+          const user = e.user ? '<span class="text-cyan-700">'+esc(e.user)+'</span> ' : '';
+          const ip = e.ip ? '<span class="text-gray-600">'+esc(e.ip)+'</span>' : '';
+          return '<div class="flex gap-3 items-baseline"><span class="text-gray-600 shrink-0 w-36">'+ts+'</span><span class="'+color+' w-20 shrink-0">'+label+'</span>'+user+ip+'</div>';
+        }).join('');
+    els.forEach(el => el.innerHTML = html);
+  } catch(e) {
+    els.forEach(el => el.innerHTML = '<span class="text-gray-700">Auth events: embedded WebUI only (port 8091).</span>');
+  }
+}
+
 </script>
 
 <!-- Input modal -->

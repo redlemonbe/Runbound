@@ -40,6 +40,7 @@ hickory-resolver = { version = "0.26", features = [
     "tokio",
     "tls-ring",
     "https-ring",
+    "webpki-roots",
 ] }
 hickory-proto    = { version = "0.26", features = [
     "dnssec-ring",
@@ -74,6 +75,8 @@ tracing-appender   = "0.2"
 
 # Utils
 uuid            = { version = "1", features = ["v4", "serde"] }
+argon2 = { version = "0.5", features = ["std"] }
+base64   = "0.22"
 sha2            = "0.10"
 hmac            = "0.12"
 getrandom       = "0.3"
@@ -85,7 +88,7 @@ humantime       = "2"
 humantime-serde = "1"
 
 # HTTP client (feeds fetch + ACME HTTP-01 bridge)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # ACME (Let's Encrypt) — ring backend only; HTTP done via reqwest bridge
 instant-acme = { version = "0.8", default-features = false, features = ["ring"] }

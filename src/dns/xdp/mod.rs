@@ -80,13 +80,13 @@ pub mod socket;
 pub mod umem;
 
 #[cfg(feature = "xdp")]
-mod loader;
+pub mod loader;
 #[cfg(feature = "xdp")]
-mod worker;
+pub(super) mod worker;
 
 pub use umem::XdpRingSizes;
 
 #[cfg(feature = "xdp")]
-pub use worker::start_xdp;
-#[cfg(feature = "xdp")]
 pub use loader::XdpMode;
+#[cfg(feature = "xdp")]
+pub use worker::start_xdp;

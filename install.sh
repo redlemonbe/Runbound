@@ -43,7 +43,7 @@ else
 fi
 [ -n "$VERSION" ] || fail "Could not determine latest release version"
 
-ASSET="runbound-linux-${ARCH_TAG}-musl"
+ASSET="runbound-${ARCH_TAG}-linux-musl"
 DIRECT_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
 echo "Installing Runbound ${VERSION} (${ARCH_TAG})…"
 

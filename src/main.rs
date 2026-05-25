@@ -1,37 +1,43 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 mod acme;
+mod api;
 mod audit;
 mod config;
 mod cpu;
 mod dns;
-mod api;
-mod feeds;
+mod domain_stats;
 mod error;
+mod feeds;
+mod firewall;
 mod hsm;
+mod icmp;
 mod integrity;
 mod logbuffer;
 mod runtime;
-mod store;
 mod stats;
+mod store;
 mod sync;
 mod upstreams;
+mod webui;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::io::IsTerminal;
 use anyhow::Result;
 use arc_swap::ArcSwap;
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use api::{init_api_key, AppState};
 use config::parser::UnboundConfig;
 use dns::local::LocalZoneSet;
 use dns::{Acl, RateLimiter};
-use api::{AppState, init_api_key};
+use domain_stats::DomainStats;
+use icmp::{IcmpConfig, IcmpStats};
 use stats::Stats;
 
 const API_BIND: &str = "127.0.0.1"; // API must not be exposed externally
@@ -52,7 +58,10 @@ fn main() -> Result<()> {
     let core_count = cores.len();
 
     let runtime = if cfg.cpu_affinity && !cores.is_empty() {
-        info!(cores = core_count, "CPU affinity enabled — physical cores (HT excluded)");
+        info!(
+            cores = core_count,
+            "CPU affinity enabled — physical cores (HT excluded)"
+        );
         let cores_arc = Arc::new(cores);
         let thread_index = Arc::new(AtomicUsize::new(0));
         tokio::runtime::Builder::new_multi_thread()
@@ -77,27 +86,53 @@ fn main() -> Result<()> {
     runtime.block_on(async_main(cfg, base_dir, cfg_path))
 }
 
-async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: String) -> Result<()> {
-    let (zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams, per_upstream_resolvers, racing_wins) =
-        build_and_launch(&cfg, base_dir, cfg_path).await?;
+async fn async_main(
+    cfg: UnboundConfig,
+    base_dir: std::path::PathBuf,
+    cfg_path: String,
+) -> Result<()> {
+    let (
+        zones,
+        rate_limiter,
+        acl,
+        global_stats,
+        log_buffer,
+        audit,
+        xdp_mode,
+        resolver,
+        prefetch_tracker,
+        upstreams,
+        per_upstream_resolvers,
+        racing_wins,
+        domain_stats,
+        icmp_stats,
+        icmp_cfg,
+        dnssec_enabled,
+    ) = build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
     let mut xdp_cache_snapshot: Option<dns::cache_snapshot::SharedCacheSnapshot> = None;
-    let mut xdp_cache_mutable:  Option<dns::cache_snapshot::MutableCacheMap>     = None;
+    let mut xdp_cache_mutable: Option<dns::cache_snapshot::MutableCacheMap> = None;
     #[cfg(feature = "xdp")]
     if cfg.xdp && cfg.xdp_cache_snapshot {
-        let mutable  = Arc::new(dashmap::DashMap::new());
-        let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(dns::cache_snapshot::CacheSnapshot::default())));
-        tokio::spawn(dns::cache_snapshot::publish_loop(Arc::clone(&snapshot), Arc::clone(&mutable)));
+        let mutable = Arc::new(dashmap::DashMap::new());
+        let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            dns::cache_snapshot::CacheSnapshot::default(),
+        )));
+        tokio::spawn(dns::cache_snapshot::publish_loop(
+            Arc::clone(&snapshot),
+            Arc::clone(&mutable),
+        ));
         xdp_cache_snapshot = Some(snapshot);
-        xdp_cache_mutable  = Some(mutable);
+        xdp_cache_mutable = Some(mutable);
     }
 
     // #29: load XDP cache from disk on startup.
     #[cfg(feature = "xdp")]
     if let Some(ref cache) = xdp_cache_mutable {
         let cache_file = runtime::base_dir().join("xdp_cache.rkyv");
-        let loaded = dns::cache_snapshot::load_xdp_cache(cache, &cache_file, cfg.xdp_cache_snapshot_size);
+        let loaded =
+            dns::cache_snapshot::load_xdp_cache(cache, &cache_file, cfg.xdp_cache_snapshot_size);
         if loaded > 0 {
             info!(entries = loaded, path = %cache_file.display(), "XDP cache loaded from disk");
         }
@@ -111,14 +146,19 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         tokio::spawn(async move {
             let mut usr2 = match signal(SignalKind::user_defined2()) {
                 Ok(s) => s,
-                Err(e) => { tracing::warn!("Cannot install SIGUSR2 handler: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("Cannot install SIGUSR2 handler: {e}");
+                    return;
+                }
             };
             let cache_file = runtime::base_dir().join("xdp_cache.rkyv");
             loop {
                 usr2.recv().await;
                 match &cache_for_usr2 {
                     Some(cache) => match dns::cache_snapshot::save_xdp_cache(cache, &cache_file) {
-                        Ok(n)  => info!(entries = n, path = %cache_file.display(), "SIGUSR2 — XDP cache saved"),
+                        Ok(n) => {
+                            info!(entries = n, path = %cache_file.display(), "SIGUSR2 — XDP cache saved")
+                        }
                         Err(e) => tracing::warn!(err = %e, "SIGUSR2 — XDP cache save failed"),
                     },
                     None => tracing::debug!("SIGUSR2 — XDP cache not active, nothing to save"),
@@ -131,7 +171,7 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
     // The handle must stay alive for the entire process lifetime; dropping it
     // would detach the XDP program and destroy the XSKMAP.
     #[cfg(feature = "xdp")]
-    let _xdp_handle = if !cfg.xdp {
+    let mut _xdp_handle = if !cfg.xdp {
         info!("XDP fast path disabled (xdp: no / --no-xdp)");
         None
     } else if cfg.xdp_interface.as_deref() == Some("none") {
@@ -144,10 +184,14 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
             info!(iface = %explicit, "XDP interface: explicit config (xdp-interface)");
             Some(explicit.clone())
         } else {
-            let detected = cfg.interfaces.first()
+            let detected = cfg
+                .interfaces
+                .first()
                 .and_then(|s| {
                     let s = s.trim();
-                    if s == "0.0.0.0" || s == "::" || s.is_empty() { return None; }
+                    if s == "0.0.0.0" || s == "::" || s.is_empty() {
+                        return None;
+                    }
                     if s.parse::<std::net::IpAddr>().is_ok() {
                         return dns::xdp::socket::iface_for_ip(s);
                     }
@@ -162,14 +206,38 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         match iface {
             Some(ref iface_name) => {
                 let xdp_ring_sizes = dns::xdp::XdpRingSizes {
-                    rx:   cfg.xdp_rx_ring_size,
-                    tx:   cfg.xdp_tx_ring_size,
+                    rx: cfg.xdp_rx_ring_size,
+                    tx: cfg.xdp_tx_ring_size,
                     fill: cfg.xdp_fill_ring_size,
                     comp: cfg.xdp_comp_ring_size,
                 };
-                match dns::xdp::start_xdp(iface_name, Arc::clone(&zones), Arc::clone(&rate_limiter), Arc::clone(&acl), cfg.xdp_cpu_governor, cfg.xdp_irq_affinity, cfg.xdp_hugepages, xdp_cache_snapshot.clone(), cfg.xdp_domain_routing, cfg.xdp_ring_size, xdp_ring_sizes) {
-                    Ok(Some(h)) => { info!(iface = %iface_name, "XDP kernel-bypass fast path active"); xdp_mode.store(match h.mode { dns::xdp::XdpMode::Drv => 1, dns::xdp::XdpMode::Skb => 2 }, Ordering::Relaxed); Some(h) }
-                    Ok(None)    => None, // virtual interface or self-test — already warned
+                match dns::xdp::start_xdp(
+                    iface_name,
+                    Arc::clone(&zones),
+                    Arc::clone(&rate_limiter),
+                    Arc::clone(&acl),
+                    cfg.xdp_cpu_governor,
+                    cfg.xdp_irq_affinity,
+                    cfg.xdp_hugepages,
+                    xdp_cache_snapshot.clone(),
+                    cfg.xdp_domain_routing,
+                    cfg.xdp_ring_size,
+                    xdp_ring_sizes,
+                    Arc::clone(&global_stats),
+                    Arc::clone(&domain_stats),
+                ) {
+                    Ok(Some(h)) => {
+                        info!(iface = %iface_name, "XDP kernel-bypass fast path active");
+                        xdp_mode.store(
+                            match h.mode {
+                                dns::xdp::XdpMode::Drv => 1,
+                                dns::xdp::XdpMode::Skb => 2,
+                            },
+                            Ordering::Relaxed,
+                        );
+                        Some(h)
+                    }
+                    Ok(None) => None, // virtual interface or self-test — already warned
                     Err(e) => {
                         let reason = if e.contains("BPF_PROG_LOAD") {
                             "eBPF program rejected by kernel verifier"
@@ -185,9 +253,70 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
                     }
                 }
             }
-            None => { tracing::warn!("XDP: could not determine network interface; fast path disabled"); None }
+            None => {
+                tracing::warn!("XDP: could not determine network interface; fast path disabled");
+                None
+            }
         }
     };
+
+    // ── ICMP BPF init + stats poll task (#89) ──────────────────────────────
+    #[cfg(feature = "xdp")]
+    if let Some(ref mut h) = _xdp_handle {
+        // Push initial config to BPF map
+        if let Err(e) = h.icmp_update_config(cfg.icmp_enabled, cfg.icmp_rate_pps, cfg.icmp_burst) {
+            tracing::warn!(err=%e, "ICMP BPF config init failed");
+        } else if cfg.icmp_enabled {
+            info!(
+                "XDP ICMP echo responder active (rate={}/s)",
+                cfg.icmp_rate_pps
+            );
+        }
+    }
+    // Spawn BPF stats poll task — runs every second, updates Rust atomics.
+    // Also pushes Rust config to BPF map so PUT /api/icmp/config takes effect.
+    #[cfg(feature = "xdp")]
+    let _icmp_poll_task = {
+        use std::sync::atomic::Ordering;
+        let icmp_stats_poll = Arc::clone(&icmp_stats);
+        let icmp_cfg_poll = Arc::clone(&icmp_cfg);
+        // Move the XDP handle into the poll task — keeps it alive and accessible.
+        // DNS workers already have raw socket FDs and do not need this handle.
+        let mut xdp_h = _xdp_handle;
+        tokio::spawn(async move {
+            let mut last_rate = 0u32;
+            let mut last_enabled = false;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let Some(ref mut h) = xdp_h else {
+                    break;
+                };
+                // Read stats from BPF per-CPU array
+                if let Ok(vals) = h.icmp_read_stats() {
+                    icmp_stats_poll.handled.store(vals[0], Ordering::Relaxed);
+                    icmp_stats_poll.replied.store(vals[1], Ordering::Relaxed);
+                    icmp_stats_poll.dropped.store(vals[2], Ordering::Relaxed);
+                    icmp_stats_poll
+                        .rate_limited
+                        .store(vals[3], Ordering::Relaxed);
+                }
+                // Push config changes to BPF map
+                let (enabled, rate_pps, burst) = {
+                    let c = icmp_cfg_poll.lock().unwrap_or_else(|e| e.into_inner());
+                    (c.enabled, c.rate_pps, c.burst)
+                };
+                if (enabled != last_enabled || rate_pps != last_rate)
+                    && h.icmp_update_config(enabled, rate_pps, burst).is_ok()
+                {
+                    last_enabled = enabled;
+                    last_rate = rate_pps;
+                }
+            }
+        })
+    };
+    // When xdp feature is off: keep icmp_stats/icmp_cfg alive for API use
+    #[cfg(not(feature = "xdp"))]
+    let (_icmp_stats_keep, _icmp_cfg_keep) = (Arc::clone(&icmp_stats), Arc::clone(&icmp_cfg));
 
     // #93: TTY-only startup banner — not printed under systemd (no TTY on stderr).
     if std::io::stderr().is_terminal() {
@@ -205,7 +334,33 @@ async fn async_main(cfg: UnboundConfig, base_dir: std::path::PathBuf, cfg_path: 
         );
     }
 
-    let result = dns::run_dns_server(&cfg, zones, rate_limiter, acl, global_stats, log_buffer, resolver, prefetch_tracker, xdp_cache_mutable, cfg.xdp_cache_snapshot_size, upstreams, per_upstream_resolvers, racing_wins).await;
+    let fw_ports = firewall::PortSet::from_config(&cfg);
+    let fw_manager = std::sync::Arc::new(firewall::FirewallManager::new(
+        cfg.firewall_manage,
+        cfg.firewall_backend.as_deref(),
+        &cfg.firewall_tag,
+    ));
+    fw_manager.open(&fw_ports);
+    let fw_cleanup = Arc::clone(&fw_manager);
+    let result = dns::run_dns_server(
+        &cfg,
+        zones,
+        rate_limiter,
+        acl,
+        global_stats,
+        log_buffer,
+        resolver,
+        prefetch_tracker,
+        xdp_cache_mutable,
+        cfg.xdp_cache_snapshot_size,
+        upstreams,
+        per_upstream_resolvers,
+        racing_wins,
+        domain_stats,
+        Arc::clone(&dnssec_enabled),
+    )
+    .await;
+    fw_cleanup.close();
     audit.send(audit::AuditEvent::Shutdown);
     result
 }
@@ -222,13 +377,18 @@ fn handle_cli_flags(args: &[String]) -> Result<bool> {
     }
     // --gen-cert [hostname] — generate a self-signed TLS certificate for DoT/DoH/DoQ
     if let Some(pos) = args.iter().position(|a| a == "--gen-cert") {
-        let hostname = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("runbound.local");
+        let hostname = args
+            .get(pos + 1)
+            .map(|s| s.as_str())
+            .unwrap_or("runbound.local");
         gen_self_signed_cert(hostname)?;
         return Ok(true);
     }
     // --check-config [path] — validate config and systemd security parameters, then exit
     if let Some(pos) = args.iter().position(|a| a == "--check-config") {
-        let path = args.get(pos + 1).map(|s| s.as_str())
+        let path = args
+            .get(pos + 1)
+            .map(|s| s.as_str())
             .unwrap_or("/etc/unbound/unbound.conf");
         let code = run_check_config(path);
         std::process::exit(code);
@@ -256,15 +416,17 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         .install_default()
         .ok(); // ok() = no-op if already installed
 
-    let cfg_path = args.iter().skip(1)
+    let cfg_path = args
+        .iter()
+        .skip(1)
         .find(|a| !a.starts_with('-'))
         .cloned()
         .unwrap_or_else(|| "/etc/unbound/unbound.conf".to_string());
 
     // Derive runtime base_dir from config file's parent directory.
     // All runtime files (api.key, dns_entries.json, …) are stored there.
-    let cfg_canonical = std::fs::canonicalize(&cfg_path)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&cfg_path));
+    let cfg_canonical =
+        std::fs::canonicalize(&cfg_path).unwrap_or_else(|_| std::path::PathBuf::from(&cfg_path));
     let base_dir = cfg_canonical
         .parent()
         .map(|p| p.to_path_buf())
@@ -294,13 +456,14 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
             .init();
     } else {
         tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(
-                verbosity_to_filter(unbound_cfg.verbosity)
-            ))
+            .with_env_filter(tracing_subscriber::EnvFilter::new(verbosity_to_filter(
+                unbound_cfg.verbosity,
+            )))
             .init();
     }
 
-    runtime::BASE_DIR.set(base_dir.clone())
+    runtime::BASE_DIR
+        .set(base_dir.clone())
         .unwrap_or_else(|_| panic!("BASE_DIR set twice — this is a bug"));
     info!(base_dir = %base_dir.display(), "Runtime base_dir");
 
@@ -340,7 +503,7 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
 
 /// Init audit, ACME, zone set, background tasks, REST API, sync. Returns DNS server inputs.
 async fn build_and_launch(
-    cfg:      &UnboundConfig,
+    cfg: &UnboundConfig,
     base_dir: std::path::PathBuf,
     cfg_path: String,
 ) -> Result<(
@@ -356,10 +519,20 @@ async fn build_and_launch(
     upstreams::SharedUpstreams,
     dns::server::SharedResolversVec,
     Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
+    Arc<DomainStats>,
+    Arc<crate::icmp::IcmpStats>,
+    Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
+    Arc<std::sync::atomic::AtomicBool>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
-    let audit = audit::init(cfg.audit_log, audit_log_path, cfg.audit_log_hmac_key.clone(), base_dir.clone());
+    let audit = audit::init(
+        cfg.audit_log,
+        audit_log_path,
+        cfg.audit_log_hmac_key.clone(),
+        base_dir.clone(),
+        cfg.audit_checkpoint_every,
+    );
     audit.send(audit::AuditEvent::Startup);
 
     // ── ACME: auto-provision TLS cert if needed ────────────────────────────
@@ -367,22 +540,30 @@ async fn build_and_launch(
         if cfg.acme_domains.is_empty() {
             tracing::warn!("acme-email set but no acme-domain directives — ACME disabled");
         } else {
-            let cert_path = cfg.tls.cert_path.as_deref()
+            let cert_path = cfg
+                .tls
+                .cert_path
+                .as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| base_dir.join("cert.pem"));
-            let key_path = cfg.tls.key_path.as_deref()
+            let key_path = cfg
+                .tls
+                .key_path
+                .as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| base_dir.join("key.pem"));
-            let cache_dir = cfg.acme_cache_dir.as_deref()
+            let cache_dir = cfg
+                .acme_cache_dir
+                .as_deref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| base_dir.join("acme"));
             let acme_cfg = acme::AcmeConfig {
-                email:          email.clone(),
-                domains:        cfg.acme_domains.clone(),
-                cert_path:      cert_path.clone(),
-                key_path:       key_path.clone(),
+                email: email.clone(),
+                domains: cfg.acme_domains.clone(),
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
                 cache_dir,
-                staging:        cfg.acme_staging,
+                staging: cfg.acme_staging,
                 challenge_port: cfg.acme_challenge_port.unwrap_or(80),
             };
             if acme::needs_renewal(&cert_path) {
@@ -400,19 +581,22 @@ async fn build_and_launch(
     // ── Build in-memory zone set ───────────────────────────────────────────
     // ArcSwap: reads are a single atomic pointer load — zero lock contention
     // on the hot DNS query path regardless of core count.
-    let zones   = Arc::new(ArcSwap::new(Arc::new(build_zone_set(cfg))));
+    let zones = Arc::new(ArcSwap::new(Arc::new(build_zone_set(cfg))));
     let tls_cfg = Arc::new(cfg.tls.clone());
 
     // ── SIGHUP: hot-reload zones from config without dropping connections ──
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let zones_hup    = Arc::clone(&zones);
+        let zones_hup = Arc::clone(&zones);
         let cfg_path_hup = cfg_path.clone();
         tokio::spawn(async move {
             let mut hup = match signal(SignalKind::hangup()) {
                 Ok(s) => s,
-                Err(e) => { tracing::warn!("Cannot install SIGHUP handler: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("Cannot install SIGHUP handler: {e}");
+                    return;
+                }
             };
             loop {
                 hup.recv().await;
@@ -423,7 +607,7 @@ async fn build_and_launch(
                         zones_hup.store(Arc::new(new_zones));
                         info!(
                             local_zones = new_cfg.local_zones.len(),
-                            local_data  = new_cfg.local_data.len(),
+                            local_data = new_cfg.local_data.len(),
                             "Hot-reload complete"
                         );
                     }
@@ -431,7 +615,6 @@ async fn build_and_launch(
                 }
             }
         });
-
     }
 
     // ── Background: feed auto-update ───────────────────────────────────────
@@ -439,7 +622,7 @@ async fn build_and_launch(
 
     // ── REST API (localhost only, port from api-port directive, default 8081) ──
     let api_port = cfg.api_port.unwrap_or(8080);
-    let api_key  = init_api_key(cfg.api_key.clone());
+    let api_key = init_api_key(cfg.api_key.clone());
     info!(
         addr = %format!("{API_BIND}:{api_port}"),
         "REST API key: {}...{}",
@@ -456,9 +639,12 @@ async fn build_and_launch(
         }
     }
 
-    let global_stats   = Stats::new();
+    let global_stats = Stats::new();
     let snapshot_cache = stats::new_snapshot_cache(&global_stats);
-    tokio::spawn(stats::qps_update_loop(Arc::clone(&global_stats), Arc::clone(&snapshot_cache)));
+    tokio::spawn(stats::qps_update_loop(
+        Arc::clone(&global_stats),
+        Arc::clone(&snapshot_cache),
+    ));
     let log_buffer = logbuffer::new_shared(cfg.log_retention, cfg.log_client_ip);
 
     // ── SIGUSR1: stats dump (SIGUSR2 is wired in async_main after cache init) ──
@@ -473,19 +659,22 @@ async fn build_and_launch(
         tokio::spawn(async move {
             let mut usr1 = match signal(SignalKind::user_defined1()) {
                 Ok(s) => s,
-                Err(e) => { tracing::warn!("Cannot install SIGUSR1 handler: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("Cannot install SIGUSR1 handler: {e}");
+                    return;
+                }
             };
             loop {
                 usr1.recv().await;
                 let snap = stats_usr1.snapshot();
                 info!(
-                    total     = snap.total,
+                    total = snap.total,
                     forwarded = snap.forwarded,
-                    blocked   = snap.blocked,
-                    servfail  = snap.servfail,
-                    uptime_s  = snap.uptime_secs,
-                    qps_1m    = snap.qps_1m,
-                    hit_rate  = snap.cache_hit_rate,
+                    blocked = snap.blocked,
+                    servfail = snap.servfail,
+                    uptime_s = snap.uptime_secs,
+                    qps_1m = snap.qps_1m,
+                    hit_rate = snap.cache_hit_rate,
                     "SIGUSR1 — live stats dump"
                 );
             }
@@ -505,6 +694,7 @@ async fn build_and_launch(
     }
 
     let cfg_arc = Arc::new(cfg.clone());
+    let dnssec_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cfg.dnssec_validation));
 
     // ── Shared DNS resolver (hot-swappable via ArcSwap) ───────────────────
     let resolver = dns::server::create_shared_resolver(cfg)
@@ -514,8 +704,16 @@ async fn build_and_launch(
     // Hoist sync_key: master may auto-generate it; both master and slave need it for relay.
     let sync_key_resolved: Option<String> = cfg.sync_key.clone().or_else(|| {
         if cfg.is_master() && cfg.sync_port.is_some() {
-            let k = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-            info!("No sync-key in config — generated: {}...{}", &k[..8], &k[k.len()-4..]);
+            let k = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            info!(
+                "No sync-key in config — generated: {}...{}",
+                &k[..8],
+                &k[k.len() - 4..]
+            );
             info!("Add  sync-key: {k}  to both master and slave configs.");
             Some(k)
         } else {
@@ -526,26 +724,32 @@ async fn build_and_launch(
     let sync_journal = if let (true, Some(port)) = (cfg.is_master(), cfg.sync_port) {
         let journal = sync::SyncJournal::new();
         match sync::ensure_sync_cert() {
-            Ok((cert_pem, key_pem)) => {
-                match sync::cert_sha256_hex(&cert_pem) {
-                    Ok(fingerprint) => {
-                        info!(port, sha256 = %fingerprint, "Sync HTTPS server starting");
-                        let j        = Arc::clone(&journal);
-                        let cert_fp  = fingerprint.clone();
-                        let sync_key = sync_key_resolved.clone().unwrap_or_default();
-                        tokio::spawn(async move {
-                            if let Err(e) = sync::start_master_sync_server(
-                                port, j, sync_key, cert_fp, cert_pem, key_pem,
-                            ).await {
-                                error!("Sync server exited: {e}");
-                            }
-                        });
-                        Some(journal)
-                    }
-                    Err(e) => { tracing::warn!("Sync cert fingerprint error: {e}"); None }
+            Ok((cert_pem, key_pem)) => match sync::cert_sha256_hex(&cert_pem) {
+                Ok(fingerprint) => {
+                    info!(port, sha256 = %fingerprint, "Sync HTTPS server starting");
+                    let j = Arc::clone(&journal);
+                    let cert_fp = fingerprint.clone();
+                    let sync_key = sync_key_resolved.clone().unwrap_or_default();
+                    tokio::spawn(async move {
+                        if let Err(e) = sync::start_master_sync_server(
+                            port, j, sync_key, cert_fp, cert_pem, key_pem,
+                        )
+                        .await
+                        {
+                            error!("Sync server exited: {e}");
+                        }
+                    });
+                    Some(journal)
                 }
+                Err(e) => {
+                    tracing::warn!("Sync cert fingerprint error: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Sync cert error: {e}");
+                None
             }
-            Err(e) => { tracing::warn!("Sync cert error: {e}"); None }
         }
     } else {
         None
@@ -553,12 +757,17 @@ async fn build_and_launch(
 
     // Hoisted so both SlaveClient and AppState share the same mutex instance.
     let zones_mutex = Arc::new(tokio::sync::Mutex::new(()));
+    // Hoisted so both NodeRelay (slave relay) and DNS handler share the same instance.
+    let domain_stats = DomainStats::new();
 
     // Slave node UUID — generated once, persisted to disk (#88).
     let node_id: Option<String> = if cfg.is_slave() {
         match sync::ensure_node_id() {
             Ok(id) => Some(id),
-            Err(e) => { tracing::warn!("node-id generation failed: {e}"); None }
+            Err(e) => {
+                tracing::warn!("node-id generation failed: {e}");
+                None
+            }
         }
     } else {
         None
@@ -568,7 +777,9 @@ async fn build_and_launch(
         match (&cfg.sync_master, &sync_key_resolved) {
             (Some(master), Some(key)) => {
                 let client = sync::SlaveClient::new(
-                    master, key, cfg.sync_interval,
+                    master,
+                    key,
+                    cfg.sync_interval,
                     Arc::clone(&zones),
                     Arc::clone(&zones_mutex),
                     Arc::clone(&cfg_arc),
@@ -588,17 +799,22 @@ async fn build_and_launch(
                             Ok((cert_pem, key_pem)) => {
                                 // Start relay TLS server.
                                 let relay_state = std::sync::Arc::new(sync::NodeRelay {
-                                    zones:        Arc::clone(&zones),
-                                    zones_mutex:  Arc::clone(&zones_mutex),
-                                    cfg:          Arc::clone(&cfg_arc),
-                                    upstreams:    Arc::clone(&upstreams),
-                                    stats_cache:  Arc::clone(&snapshot_cache),
+                                    zones: Arc::clone(&zones),
+                                    zones_mutex: Arc::clone(&zones_mutex),
+                                    cfg: Arc::clone(&cfg_arc),
+                                    upstreams: Arc::clone(&upstreams),
+                                    stats_cache: Arc::clone(&snapshot_cache),
+                                    domain_stats: Arc::clone(&domain_stats),
+                                    dnssec_enabled: Arc::clone(&dnssec_enabled),
+                                    resolver: Arc::clone(&resolver),
                                 });
                                 let sk = key.clone();
                                 let cp = cert_pem.clone();
                                 let kp = key_pem.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = sync::start_node_server(port, sk, cp, kp, relay_state).await {
+                                    if let Err(e) =
+                                        sync::start_node_server(port, sk, cp, kp, relay_state).await
+                                    {
                                         error!("Node relay server exited: {e}");
                                     }
                                 });
@@ -612,12 +828,18 @@ async fn build_and_launch(
                                             // routing table. cfg.interfaces contains bind addresses
                                             // (e.g. 0.0.0.0) which are not routable from the master.
                                             let master_host = if master.starts_with('[') {
-                                                master.trim_start_matches('[')
-                                                    .split(']').next()
-                                                    .unwrap_or("127.0.0.1").to_string()
+                                                master
+                                                    .trim_start_matches('[')
+                                                    .split(']')
+                                                    .next()
+                                                    .unwrap_or("127.0.0.1")
+                                                    .to_string()
                                             } else {
-                                                master.split(':').next()
-                                                    .unwrap_or("127.0.0.1").to_string()
+                                                master
+                                                    .split(':')
+                                                    .next()
+                                                    .unwrap_or("127.0.0.1")
+                                                    .to_string()
                                             };
                                             let slave_ip = std::net::UdpSocket::bind("0.0.0.0:0")
                                                 .and_then(|s| {
@@ -626,7 +848,8 @@ async fn build_and_launch(
                                                 })
                                                 .map(|a| a.ip().to_string())
                                                 .unwrap_or_else(|_| {
-                                                    cfg.interfaces.iter()
+                                                    cfg.interfaces
+                                                        .iter()
                                                         .find(|ip| *ip != "0.0.0.0" && *ip != "::")
                                                         .cloned()
                                                         .unwrap_or_else(|| "127.0.0.1".to_string())
@@ -635,21 +858,32 @@ async fn build_and_launch(
                                             let master_addr = master.clone();
                                             let key2 = key.clone();
                                             let nid2 = nid.clone();
-                                            let ver  = env!("CARGO_PKG_VERSION").to_string();
+                                            let ver = env!("CARGO_PKG_VERSION").to_string();
                                             tokio::spawn(async move {
                                                 // Brief delay — let relay server bind before registering.
-                                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                                tokio::time::sleep(std::time::Duration::from_secs(
+                                                    2,
+                                                ))
+                                                .await;
                                                 // Retry with exponential backoff until success or shutdown.
                                                 let mut delay = 2u64;
                                                 loop {
                                                     if api::relay::register_with_master(
-                                                        master_addr.clone(), key2.clone(),
-                                                        nid2.clone(), relay_host.clone(),
-                                                        fp.clone(), ver.clone(),
-                                                    ).await {
+                                                        master_addr.clone(),
+                                                        key2.clone(),
+                                                        nid2.clone(),
+                                                        relay_host.clone(),
+                                                        fp.clone(),
+                                                        ver.clone(),
+                                                    )
+                                                    .await
+                                                    {
                                                         break;
                                                     }
-                                                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                                                    tokio::time::sleep(
+                                                        std::time::Duration::from_secs(delay),
+                                                    )
+                                                    .await;
                                                     delay = (delay * 2).min(300);
                                                 }
                                             });
@@ -661,7 +895,9 @@ async fn build_and_launch(
                     }
                 }
             }
-            _ => tracing::warn!("Slave mode enabled but sync-master or sync-key not set — sync disabled"),
+            _ => tracing::warn!(
+                "Slave mode enabled but sync-master or sync-key not set — sync disabled"
+            ),
         }
     }
 
@@ -679,13 +915,19 @@ async fn build_and_launch(
             loop {
                 interval.tick().await;
                 let hot = t.take_hot(threshold);
-                if hot.is_empty() { continue; }
-                tracing::debug!(count = hot.len(), "prefetch: queuing {} domain(s)", hot.len());
+                if hot.is_empty() {
+                    continue;
+                }
+                tracing::debug!(
+                    count = hot.len(),
+                    "prefetch: queuing {} domain(s)",
+                    hot.len()
+                );
                 for name in hot {
                     let r = Arc::clone(&res);
                     tokio::spawn(async move {
-                        use hickory_proto::rr::RecordType;
                         use hickory_proto::rr::Name;
+                        use hickory_proto::rr::RecordType;
                         if let Ok(n) = name.parse::<Name>() {
                             let _ = r.load().lookup(n, RecordType::A).await;
                         }
@@ -704,50 +946,68 @@ async fn build_and_launch(
         let addrs = upstreams::upstream_addrs(&upstreams);
         match dns::server::build_per_upstream_resolvers(&addrs, cfg.dnssec_validation) {
             Ok(vec) => {
-                info!(count = vec.len(), "upstream-racing: per-upstream resolvers built");
+                info!(
+                    count = vec.len(),
+                    "upstream-racing: per-upstream resolvers built"
+                );
                 per_upstream_resolvers.store(Arc::new(vec));
             }
-            Err(e) => tracing::warn!(err = %e, "upstream-racing: failed to build per-upstream resolvers — racing disabled"),
+            Err(e) => {
+                tracing::warn!(err = %e, "upstream-racing: failed to build per-upstream resolvers — racing disabled")
+            }
         }
     }
-    let racing_wins: Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>> =
-        Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new()));
+    let racing_wins: Arc<
+        dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>,
+    > = Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::new()));
 
     let events_tx = sync_journal.as_ref().map(|j| j.events_tx.clone());
 
+    let icmp_stats = IcmpStats::new();
+    let icmp_cfg = Arc::new(std::sync::Mutex::new(IcmpConfig {
+        enabled: cfg.icmp_enabled,
+        rate_pps: cfg.icmp_rate_pps,
+        burst: cfg.icmp_burst,
+    }));
+
     let state = AppState {
-        zones:            Arc::clone(&zones),
-        tls_cfg:          Arc::clone(&tls_cfg),
-        rate_limiter:     api::ApiRateLimiter::new_public(),
-        reload_limiter:   Arc::new(api::ReloadLimiter::new()),
-        zones_mutex:      Arc::clone(&zones_mutex),
-        stats:            Arc::clone(&global_stats),
-        stats_cache:      Arc::clone(&snapshot_cache),
-        cfg:              Arc::clone(&cfg_arc),
+        zones: Arc::clone(&zones),
+        tls_cfg: Arc::clone(&tls_cfg),
+        rate_limiter: api::ApiRateLimiter::new_public(),
+        reload_limiter: Arc::new(api::ReloadLimiter::new()),
+        zones_mutex: Arc::clone(&zones_mutex),
+        stats: Arc::clone(&global_stats),
+        stats_cache: Arc::clone(&snapshot_cache),
+        cfg: Arc::clone(&cfg_arc),
         cfg_path,
-        log_buffer:       Arc::clone(&log_buffer),
-        upstreams:        Arc::clone(&upstreams),
+        log_buffer: Arc::clone(&log_buffer),
+        upstreams: Arc::clone(&upstreams),
         sync_journal,
-        sync_key:         sync_key_resolved,
-        node_id,
-        slave_mode:       cfg.is_slave(),
-        base_dir:         Arc::new(base_dir),
-        audit:            audit.clone(),
-        xdp_active:       Arc::clone(&xdp_mode),
-        resolver:         Arc::clone(&resolver),
-        last_flush_at:    Arc::new(std::sync::Mutex::new(None)),
-        cache_evictions:  Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        lookup_limiter:   Arc::new(api::ReloadLimiter::new_with_params(10.0, 10.0)),
+        sync_key: sync_key_resolved,
+        slave_mode: cfg.is_slave(),
+        base_dir: Arc::new(base_dir.clone()),
+        audit: audit.clone(),
+        xdp_active: Arc::clone(&xdp_mode),
+        resolver: Arc::clone(&resolver),
+        last_flush_at: Arc::new(std::sync::Mutex::new(None)),
+        cache_evictions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        lookup_limiter: Arc::new(api::ReloadLimiter::new_with_params(10.0, 10.0)),
         per_upstream_resolvers: Arc::clone(&per_upstream_resolvers),
-        racing_wins:            Arc::clone(&racing_wins),
+        racing_wins: Arc::clone(&racing_wins),
         events_tx,
+        domain_stats: Arc::clone(&domain_stats),
+        icmp_stats: Arc::clone(&icmp_stats),
+        icmp_cfg: Arc::clone(&icmp_cfg),
+        dnssec_enabled: Arc::clone(&dnssec_enabled),
     };
-    let app      = api::router(state);
+    let app = api::router(state);
+
     let api_addr = format!("{API_BIND}:{api_port}");
     // Bind with std so the fd is runtime-agnostic; convert inside the API runtime.
     let std_listener = std::net::TcpListener::bind(&api_addr)
         .map_err(|e| anyhow::anyhow!("API bind {api_addr}: {e}"))?;
-    std_listener.set_nonblocking(true)
+    std_listener
+        .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("API set_nonblocking: {e}"))?;
     info!(addr=%api_addr, "REST API listening (localhost only)");
 
@@ -763,22 +1023,73 @@ async fn build_and_launch(
         .build()
         .map_err(|e| anyhow::anyhow!("API runtime: {e}"))?;
     api_rt.spawn(async move {
-        let listener = tokio::net::TcpListener::from_std(std_listener)
-            .expect("TcpListener::from_std failed");
+        let listener =
+            tokio::net::TcpListener::from_std(std_listener).expect("TcpListener::from_std failed");
         axum::serve(listener, app).await.ok()
     });
     Box::leak(Box::new(api_rt));
 
-    // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
-    let rate_limiter = RateLimiter::new(cfg.rate_limit.unwrap_or(200), cfg.rate_limit_prefix_v4, cfg.rate_limit_prefix_v6);
-    let acl          = Arc::new(Acl::from_config(&cfg.access_control));
+    // ── Embedded web UI server (#4/#91) ───────────────────────────────────────
+    if cfg.ui_enabled {
+        let ui_addr = format!("{}:{}", cfg.ui_bind, cfg.ui_port);
+        match std::net::TcpListener::bind(&ui_addr) {
+            Err(e) => {
+                error!(addr=%ui_addr, err=%e, "Web UI bind failed — continuing without UI");
+            }
+            Ok(ui_std_listener) => {
+                ui_std_listener.set_nonblocking(true).ok();
+                let api_port = cfg.api_port.unwrap_or(8080);
+                let ui_app = webui::router(api_port, api_key.clone(), base_dir.clone());
+                let ui_rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("runbound-ui")
+                    .enable_all()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Web UI runtime: {e}"))?;
+                ui_rt.spawn(async move {
+                    let listener = tokio::net::TcpListener::from_std(ui_std_listener)
+                        .expect("ui TcpListener::from_std failed");
+                    axum::serve(listener, ui_app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.ok()
+                });
+                Box::leak(Box::new(ui_rt));
+                info!(addr=%ui_addr, "Web UI listening");
+            }
+        }
+    }
 
-    Ok((zones, rate_limiter, acl, global_stats, log_buffer, audit, xdp_mode, resolver, prefetch_tracker, upstreams, per_upstream_resolvers, racing_wins))
+    // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
+    let rate_limiter = RateLimiter::new(
+        cfg.rate_limit.unwrap_or(200),
+        cfg.rate_limit_prefix_v4,
+        cfg.rate_limit_prefix_v6,
+    );
+    let acl = Arc::new(Acl::from_config(&cfg.access_control));
+
+    Ok((
+        zones,
+        rate_limiter,
+        acl,
+        global_stats,
+        log_buffer,
+        audit,
+        xdp_mode,
+        resolver,
+        prefetch_tracker,
+        upstreams,
+        per_upstream_resolvers,
+        racing_wins,
+        domain_stats,
+        icmp_stats,
+        icmp_cfg,
+        dnssec_enabled,
+    ))
 }
 
 fn print_help() {
     println!(concat!(
-        "runbound ", env!("CARGO_PKG_VERSION"), " — high-performance DNS server (Unbound drop-in)
+        "runbound ",
+        env!("CARGO_PKG_VERSION"),
+        " — high-performance DNS server (Unbound drop-in)
 ",
         "
 ",
@@ -980,15 +1291,20 @@ fn print_help() {
 /// Validate config + systemd security parameters without starting the server.
 /// Returns 0 (clean), 1 (critical error), 2 (warnings only).
 fn run_check_config(path: &str) -> i32 {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
     let mut warnings = 0u32;
-    let mut errors   = 0u32;
+    let mut errors = 0u32;
 
     // ── 1. Config parse ────────────────────────────────────────────────────
     let cfg = match config::load(path) {
         Ok(c) => {
-            println!("[OK]   Config parsed: port={} interfaces={:?}", c.port, c.interfaces);
+            println!(
+                "[OK]   Config parsed: port={} interfaces={:?}",
+                c.port, c.interfaces
+            );
             c
         }
         Err(e) => {
@@ -1006,9 +1322,7 @@ fn run_check_config(path: &str) -> i32 {
             _ => "debug",
         };
         println!("[OK]   verbosity: {} ({})", cfg.verbosity, level_name);
-        if cfg.verbosity > 1 && cfg.port == 53
-            && cfg.rate_limit.map(|r| r > 0).unwrap_or(true)
-        {
+        if cfg.verbosity > 1 && cfg.port == 53 && cfg.rate_limit.map(|r| r > 0).unwrap_or(true) {
             println!(
                 "[WARN] verbosity: {} ({}) logs every query — expect significant CPU \
                  overhead above 10k QPS. Use verbosity: 1 for production.",
@@ -1021,7 +1335,7 @@ fn run_check_config(path: &str) -> i32 {
     // ── 3. rate-limit ──────────────────────────────────────────────────────
     match cfg.rate_limit {
         None | Some(0) => println!("[OK]   Rate limit: disabled (unlimited)"),
-        Some(n)        => println!("[OK]   Rate limit: {n} QPS per source IP"),
+        Some(n) => println!("[OK]   Rate limit: {n} QPS per source IP"),
     }
 
     // ── 4. Data directory writable ─────────────────────────────────────────
@@ -1036,7 +1350,10 @@ fn run_check_config(path: &str) -> i32 {
             println!("[OK]   Data directory writable: {}", base_dir.display());
         }
         Err(e) => {
-            println!("[ERR]  Data directory not writable: {} — {e}", base_dir.display());
+            println!(
+                "[ERR]  Data directory not writable: {} — {e}",
+                base_dir.display()
+            );
             errors += 1;
         }
     }
@@ -1072,7 +1389,7 @@ fn run_check_config(path: &str) -> i32 {
 fn check_cfg_port(port: u16, errors: &mut u32) {
     use std::net::UdpSocket;
     match UdpSocket::bind(format!("0.0.0.0:{port}")) {
-        Ok(_)  => println!("[OK]   Port {port} available"),
+        Ok(_) => println!("[OK]   Port {port} available"),
         Err(e) => {
             println!("[ERR]  Port {port} already in use — {e}");
             *errors += 1;
@@ -1085,10 +1402,11 @@ fn check_cfg_capabilities(warnings: &mut u32) {
     // CAP_NET_RAW=13  CAP_NET_ADMIN=12  CAP_BPF=39
     // Read effective capability mask from /proc/self/status CapEff field.
     const CAP_NET_ADMIN: u64 = 1 << 12;
-    const CAP_NET_RAW:   u64 = 1 << 13;
-    const CAP_BPF:       u64 = 1 << 39;
+    const CAP_NET_RAW: u64 = 1 << 13;
+    const CAP_BPF: u64 = 1 << 39;
 
-    let cap_eff: Option<u64> = std::fs::read_to_string("/proc/self/status").ok()
+    let cap_eff: Option<u64> = std::fs::read_to_string("/proc/self/status")
+        .ok()
         .and_then(|s| {
             s.lines()
                 .find(|l| l.starts_with("CapEff:"))
@@ -1104,12 +1422,14 @@ fn check_cfg_capabilities(warnings: &mut u32) {
 
     for (name, bit) in [
         ("CAP_NET_ADMIN", CAP_NET_ADMIN),
-        ("CAP_NET_RAW",   CAP_NET_RAW),
-        ("CAP_BPF",       CAP_BPF),
+        ("CAP_NET_RAW", CAP_NET_RAW),
+        ("CAP_BPF", CAP_BPF),
     ] {
         if cap & bit == 0 {
             println!("[WARN] {name} not available — XDP will be disabled");
-            println!("       Fix: sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip $(which runbound)");
+            println!(
+                "       Fix: sudo setcap cap_net_raw,cap_net_admin,cap_bpf+eip $(which runbound)"
+            );
             println!("       Or add AmbientCapabilities={name} to the systemd service");
             *warnings += 1;
         } else {
@@ -1120,8 +1440,13 @@ fn check_cfg_capabilities(warnings: &mut u32) {
 
 #[cfg(target_os = "linux")]
 fn check_cfg_rlimit_memlock(warnings: &mut u32) {
-    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl); }
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl);
+    }
     if rl.rlim_cur == libc::RLIM_INFINITY {
         println!("[OK]   RLIMIT_MEMLOCK: unlimited");
         return;
@@ -1132,11 +1457,17 @@ fn check_cfg_rlimit_memlock(warnings: &mut u32) {
             .unwrap_or(false);
     let mb = rl.rlim_cur / (1024 * 1024);
     if under_systemd {
-        println!("[WARN] RLIMIT_MEMLOCK is limited ({}MB) — XDP UMEM allocation will fail", mb);
+        println!(
+            "[WARN] RLIMIT_MEMLOCK is limited ({}MB) — XDP UMEM allocation will fail",
+            mb
+        );
         println!("       Fix: add LimitMEMLOCK=infinity to the systemd service file");
         *warnings += 1;
     } else {
-        println!("[INFO] RLIMIT_MEMLOCK = {}MB — running outside systemd.", mb);
+        println!(
+            "[INFO] RLIMIT_MEMLOCK = {}MB — running outside systemd.",
+            mb
+        );
         println!("       At runtime LimitMEMLOCK=infinity from the service file will apply.");
         println!("       Run 'runbound --check-config' via systemd-run to test under real");
         println!("       runtime conditions.");
@@ -1157,11 +1488,16 @@ fn check_cfg_xdp_interface(cfg: &config::parser::UnboundConfig, warnings: &mut u
     let iface = if let Some(ref explicit) = cfg.xdp_interface {
         Some(explicit.clone())
     } else {
-        cfg.interfaces.first()
+        cfg.interfaces
+            .first()
             .and_then(|s| {
                 let s = s.trim();
-                if s == "0.0.0.0" || s == "::" || s.is_empty() { return None; }
-                if s.parse::<std::net::IpAddr>().is_ok() { return iface_for_ip(s); }
+                if s == "0.0.0.0" || s == "::" || s.is_empty() {
+                    return None;
+                }
+                if s.parse::<std::net::IpAddr>().is_ok() {
+                    return iface_for_ip(s);
+                }
                 Some(s.to_string())
             })
             .or_else(default_interface)
@@ -1175,15 +1511,21 @@ fn check_cfg_xdp_interface(cfg: &config::parser::UnboundConfig, warnings: &mut u
         }
     };
     if is_virtual_interface(iface_name) {
-        println!("[WARN] '{}' is a virtual interface (ipvlan / macvlan / bridge / veth) \
+        println!(
+            "[WARN] '{}' is a virtual interface (ipvlan / macvlan / bridge / veth) \
                   — AF/XDP requires a physical NIC or a direct VLAN sub-interface \
-                  (e.g. bond0.10).", iface_name);
+                  (e.g. bond0.10).",
+            iface_name
+        );
         println!("       XDP will be disabled at runtime; DNS will fall back to UDP.");
         println!("       Suggestion: bind Runbound directly to the physical interface");
         println!("       or VLAN sub-interface instead.");
         *warnings += 1;
     } else {
-        println!("[OK]   Interface '{}' is physical — XDP compatible", iface_name);
+        println!(
+            "[OK]   Interface '{}' is physical — XDP compatible",
+            iface_name
+        );
     }
 }
 
@@ -1195,7 +1537,7 @@ fn gen_self_signed_cert(hostname: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let cert_path = "/etc/runbound/cert.pem";
-    let key_path  = "/etc/runbound/key.pem";
+    let key_path = "/etc/runbound/key.pem";
 
     println!("Generating self-signed certificate for: {hostname}");
 
@@ -1213,12 +1555,10 @@ fn gen_self_signed_cert(hostname: &str) -> anyhow::Result<()> {
     fs::create_dir_all("/etc/runbound")
         .map_err(|e| anyhow::anyhow!("create /etc/runbound: {e}"))?;
 
-    fs::write(cert_path, cert.pem())
-        .map_err(|e| anyhow::anyhow!("write {cert_path}: {e}"))?;
+    fs::write(cert_path, cert.pem()).map_err(|e| anyhow::anyhow!("write {cert_path}: {e}"))?;
 
     let key_pem = key_pair.serialize_pem();
-    fs::write(key_path, &key_pem)
-        .map_err(|e| anyhow::anyhow!("write {key_path}: {e}"))?;
+    fs::write(key_path, &key_pem).map_err(|e| anyhow::anyhow!("write {key_path}: {e}"))?;
 
     // Protect the private key: readable by owner only
     #[cfg(unix)]
@@ -1243,6 +1583,35 @@ fn gen_self_signed_cert(hostname: &str) -> anyhow::Result<()> {
 
 /// Build the in-memory zone set from config + persisted store + blacklist + feeds.
 /// Called at startup, on SIGHUP hot-reload, and by POST /reload.
+/// #9: Background loop that re-evaluates scheduled blocking rules every 60 seconds.
+/// When a scheduled entry crosses its time boundary, rebuild the zone set to
+/// activate or deactivate the block.
+pub async fn schedule_enforce_loop(
+    zones: Arc<arc_swap::ArcSwap<dns::local::LocalZoneSet>>,
+    cfg_path: String,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let bl = match store::load_blacklist() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Only do work if any scheduled entries exist
+        if bl.entries.iter().all(|e| e.schedule.is_none()) {
+            continue;
+        }
+        let new_cfg = match crate::config::load(&cfg_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let new_zones = build_zone_set(&new_cfg);
+        zones.store(Arc::new(new_zones));
+        tracing::debug!("schedule_enforce: zone set rebuilt");
+    }
+}
+
 pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
     let mut zone_set = LocalZoneSet::from_config(&cfg.local_zones, &cfg.local_data);
 
@@ -1252,7 +1621,10 @@ pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
             if let Some(rr) = entry.to_rr_string() {
                 if let Some(record) = dns::local::parse_local_data(&rr) {
                     let name = record.name.clone();
-                    zone_set.zones.entry(name.clone()).or_insert(dns::ZoneAction::Static);
+                    zone_set
+                        .zones
+                        .entry(name.clone())
+                        .or_insert(dns::ZoneAction::Static);
                     zone_set.records.entry(name).or_default().push(record);
                 }
             }
@@ -1263,12 +1635,20 @@ pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
     }
 
     // Persisted blacklist (override_zone so blacklist always shadows static zones)
+    // #9: only apply entries whose schedule is currently active (or have no schedule)
     if let Ok(bl) = store::load_blacklist() {
-        for entry in &bl.entries {
+        let active: Vec<_> = bl.entries.iter()
+            .filter(|e| e.schedule.as_ref().map_or(true, |s| s.is_active_now()))
+            .collect();
+        for entry in &active {
             zone_set.override_zone(&entry.domain, dns::ZoneAction::from(&entry.action));
         }
         if !bl.entries.is_empty() {
-            tracing::info!(count = bl.entries.len(), "Loaded persisted blacklist entries");
+            tracing::info!(
+                total = bl.entries.len(),
+                active = active.len(),
+                "Loaded persisted blacklist entries"
+            );
         }
     }
 

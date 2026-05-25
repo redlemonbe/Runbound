@@ -29,7 +29,9 @@ pub fn store_key() -> Option<Vec<u8>> {
     }
     let raw = std::env::var("RUNBOUND_STORE_KEY").ok()?;
     let raw = raw.trim();
-    if raw.is_empty() { return None; }
+    if raw.is_empty() {
+        return None;
+    }
     if raw.len() >= 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
         hex::decode(raw).ok()
     } else {
@@ -47,8 +49,14 @@ pub fn compute_mac(content: &[u8], key: &[u8]) -> String {
 
 /// Write a .mac sidecar for `path` atomically (tmp → rename).
 /// No-op when `key` is `None`.
-pub fn write_mac(path: &std::path::Path, content: &[u8], key: Option<&[u8]>) -> std::io::Result<()> {
-    let Some(k) = key else { return Ok(()); };
+pub fn write_mac(
+    path: &std::path::Path,
+    content: &[u8],
+    key: Option<&[u8]>,
+) -> std::io::Result<()> {
+    let Some(k) = key else {
+        return Ok(());
+    };
     let mac_str = compute_mac(content, k);
     let mac_path = path.with_extension("mac");
     let tmp = mac_path.with_extension("mac.tmp");
@@ -61,13 +69,17 @@ pub fn write_mac(path: &std::path::Path, content: &[u8], key: Option<&[u8]>) -> 
 /// Returns:
 /// - `Ok(())` — verified, or no key configured
 /// - `Err(msg)` — .mac present and HMAC mismatch (caller must refuse load)
-pub fn verify_mac(path: &std::path::Path, content: &[u8], key: Option<&[u8]>) -> Result<(), String> {
+pub fn verify_mac(
+    path: &std::path::Path,
+    content: &[u8],
+    key: Option<&[u8]>,
+) -> Result<(), String> {
     let mac_path = path.with_extension("mac");
     let mac_exists = mac_path.exists();
 
     match (key, mac_exists) {
-        (None, false)  => Ok(()),
-        (None, true)   => {
+        (None, false) => Ok(()),
+        (None, true) => {
             warn!(
                 path = %path.display(),
                 "Store .mac file found but RUNBOUND_STORE_KEY is not set — integrity cannot be verified."
