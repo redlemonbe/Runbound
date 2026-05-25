@@ -826,6 +826,7 @@ pub async fn start_master_sync_server(
                 )
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
                 .serve_connection(io, svc)
                 .await
             {
@@ -1517,6 +1518,7 @@ pub async fn start_node_server(
                 handle_relay_request(req, sync_key.clone(), Arc::clone(&relay))
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
                 .serve_connection(io, svc)
                 .await
             {
