@@ -112,36 +112,19 @@ Your config and data in `/etc/runbound` and `/var/lib/runbound` are kept.
 
 ## Dashboard (Web UI)
 
-Runbound ships with a browser dashboard. To serve it, install nginx:
+Runbound embeds the dashboard — no nginx needed. Enable it in your config:
 
-```bash
-sudo apt install nginx
-
-# Create the site config
-sudo tee /etc/nginx/sites-enabled/runbound-ui << 'EOF'
-server {
-    listen 8090;
-    server_name _;
-    root /var/www/runbound-ui;
-    index index.html;
-
-    location / {
-        try_files $uri $uri/ =404;
-    }
-
-    location /api/ {
-        proxy_pass         http://127.0.0.1:8080;
-        proxy_http_version 1.0;
-        proxy_set_header   Host $host;
-        proxy_read_timeout 30s;
-    }
-}
-EOF
-
-sudo systemctl reload nginx
+```
+server:
+    ui-enabled: yes
+    ui-port:    8091
 ```
 
-Open `http://YOUR_SERVER_IP:8090` in your browser, enter your API key, click **Connect**.
+Restart the service, then open `https://YOUR_SERVER_IP:8091`.
+
+On first access your browser will warn about the self-signed certificate. Download the Runbound CA at `https://YOUR_SERVER_IP:8091/webui/ca.crt` and install it once — no more warnings on any device on your network.
+
+Enter your API key and click **Connect**. Full setup guide: [docs/web-ui.md](docs/web-ui.md).
 
 ---
 
@@ -208,7 +191,7 @@ Disable without editing config: `RUNBOUND_DISABLE_XDP=1` — useful if the host 
 
 Full index: **[docs/index.md](docs/index.md)**
 
-Quick links: [Quick Start](docs/quick-start.md) · [Configuration](docs/configuration.md) · [REST API](docs/api.md) · [XDP](docs/xdp.md) · [Internals](docs/internals.md) · [Systemd](docs/systemd.md) · [Security Audit](docs/security-audit/v0.9.15-audit.md)
+Quick links: [Quick Start](docs/quick-start.md) · [Configuration](docs/configuration.md) · [REST API](docs/api.md) · [XDP](docs/xdp.md) · [Internals](docs/internals.md) · [Systemd](docs/systemd.md) · [Security Audit](docs/security-audit/SECURITY-AUDIT.md)
 
 ---
 
