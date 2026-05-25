@@ -75,7 +75,9 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         .route("/login",  get(serve_login).post(handle_login))
         .route("/logout", get(handle_logout).post(handle_logout))
         .route("/api/webui/password", post(change_password))
+        .route("/favicon.ico", get(serve_favicon))
         .route("/webui/auth-events", get(auth_events_handler))
+        .route("/api/webui/auth-events", get(auth_events_handler))
         .route("/api",       any(proxy_api))
         .route("/api/*path", any(proxy_api))
         .with_state(state)
@@ -199,6 +201,11 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
   </script>
 </body>
 </html>"#;
+
+async fn serve_favicon() -> impl axum::response::IntoResponse {
+    static FAVICON: &[u8] = include_bytes!("../../examples/web-ui/favicon.ico");
+    ([(axum::http::header::CONTENT_TYPE, "image/x-icon")], FAVICON)
+}
 
 async fn serve_login() -> Html<&'static str> {
     Html(LOGIN_HTML)
