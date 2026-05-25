@@ -1579,14 +1579,15 @@ function initSparkline() {
   const svg = document.getElementById('qps-sparkline-svg');
   if (svg) svg.innerHTML = '<text x="240" y="30" text-anchor="middle" fill="#1e293b" font-size="11" font-family="monospace">connecting…</text>';
   fetch(BASE + '/stats/stream')
-    .then(r => {
+    .then(async r => {
       if (!r.ok) { scheduleSpkReconnect(); return; }
       _spkBackoff = 1000;
       const reader = r.body.getReader();
       _spkReader = reader;
       const dec = new TextDecoder();
-      (function pump() {
-        reader.read().then(({done, value}) => {
+      try {
+        while (true) {
+          const {done, value} = await reader.read();
           if (done) { scheduleSpkReconnect(); return; }
           _spkBuf += dec.decode(value, {stream: true});
           const lines = _spkBuf.split('\n');
@@ -1611,9 +1612,8 @@ function initSparkline() {
               }
             } catch(_) {}
           }
-          pump();
-        }).catch(() => { scheduleSpkReconnect(); });
-      })();
+        }
+      } catch(_) { scheduleSpkReconnect(); }
     }).catch(() => { scheduleSpkReconnect(); });
 }
 
