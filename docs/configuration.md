@@ -1294,6 +1294,10 @@ server:
   `/.git/*`, `/phpmyadmin`, `/xmlrpc.php`, etc.) → immediate ban (rule: `bot-scanner`).
 - **Behavioral burst**: 10 failed requests within 5 seconds from the same IP → ban (rule: `bot-burst`).
 
+
+
+> **Note:** Loopback addresses (`127.x`, `::1`), RFC-1918 private addresses, link-local, and ULA (`fc00::/7`) are **never** banned by the bot defense engine, even if they trigger a detection rule. This prevents the server from banning itself when internal tooling or health checks hit scanner trap paths.
+
 **Enforcement**: Bans use the same pipeline as alert blocks — XDP BPF map injection (IPv4) or
 userspace block (IPv6). Bans persist to `alert-blocks.json` and survive restarts.
 
