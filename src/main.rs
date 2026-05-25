@@ -984,7 +984,6 @@ async fn build_and_launch(
         upstreams: Arc::clone(&upstreams),
         sync_journal,
         sync_key: sync_key_resolved,
-        node_id,
         slave_mode: cfg.is_slave(),
         base_dir: Arc::new(base_dir.clone()),
         audit: audit.clone(),
