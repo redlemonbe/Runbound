@@ -1012,7 +1012,6 @@ async fn handle_sync_request(
                         }
                     }
                     std::net::IpAddr::V4(_) => {}
-                    _ => {}
                 }
             }
         }

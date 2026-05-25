@@ -551,6 +551,8 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         .unwrap_or_else(|_| panic!("BASE_DIR set twice — this is a bug"));
     info!(base_dir = %base_dir.display(), "Runtime base_dir");
 
+    dns::hasher::init();
+
     info!(
         path = %cfg_path,
         verbosity = unbound_cfg.verbosity,

@@ -4,6 +4,8 @@
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+
+use crate::dns::hasher::DnsHasherBuilder;
 use std::str::FromStr;
 
 use hickory_proto::rr::{
@@ -40,8 +42,8 @@ impl From<&str> for ZoneAction {
 ///          Clone happens only on API writes (rare), never on DNS reads (ArcSwap).
 #[derive(Debug, Default, Clone)]
 pub struct LocalZoneSet {
-    pub zones: HashMap<Name, ZoneAction>,
-    pub records: HashMap<Name, Vec<Record>>,
+    pub zones: HashMap<Name, ZoneAction, DnsHasherBuilder>,
+    pub records: HashMap<Name, Vec<Record>, DnsHasherBuilder>,
     /// SEC-AGV-01: names that were statically configured at startup.
     /// DDNS DELETE operations on these names are rejected.
     pub static_names: HashSet<Name>,
@@ -49,7 +51,7 @@ pub struct LocalZoneSet {
 
 impl LocalZoneSet {
     pub fn from_config(zones: &[LocalZone], data: &[LocalData]) -> Self {
-        let mut map = HashMap::with_capacity(zones.len());
+        let mut map = HashMap::with_capacity_and_hasher(zones.len(), DnsHasherBuilder::new());
         for z in zones {
             let name_str = if z.name.ends_with('.') {
                 z.name.clone()
@@ -62,7 +64,7 @@ impl LocalZoneSet {
         }
         // Build record map: O(1) name lookup replaces O(n) Vec scan on every query.
         // Also sets implicit static zone for each local-data name (Unbound behaviour).
-        let mut record_map: HashMap<Name, Vec<Record>> = HashMap::new();
+        let mut record_map: HashMap<Name, Vec<Record>, DnsHasherBuilder> = HashMap::with_hasher(DnsHasherBuilder::new());
         for d in data {
             if let Some(rec) = parse_local_data(&d.rr) {
                 let name = rec.name.clone();
