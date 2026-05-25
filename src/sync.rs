@@ -773,6 +773,7 @@ pub async fn start_master_sync_server(
     cert_fingerprint: String,
     cert_pem: String,
     key_pem: String,
+    allow_private_relay: bool,
 ) -> anyhow::Result<()> {
     let tls_config = Arc::new(server_tls_config(&cert_pem, &key_pem)?);
     let acceptor = TlsAcceptor::from(tls_config);
@@ -793,6 +794,7 @@ pub async fn start_master_sync_server(
         let journal = Arc::clone(&journal);
         let sync_key = sync_key.clone();
         let cert_fp = cert_fingerprint.clone();
+        let allow_priv = allow_private_relay;
 
         let peer_str = peer.to_string();
         tokio::spawn(async move {
@@ -820,6 +822,7 @@ pub async fn start_master_sync_server(
                     sync_key.clone(),
                     cert_fp.clone(),
                     peer_str2.clone(),
+                    allow_priv,
                 )
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
@@ -838,6 +841,7 @@ async fn handle_sync_request(
     sync_key: String,
     cert_fingerprint: String,
     peer_addr: String,
+    allow_private_relay: bool,
 ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -992,8 +996,9 @@ async fn handle_sync_request(
                             })));
                         }
                     }
-                    // SEC-B2: reject RFC 1918 private ranges
-                    std::net::IpAddr::V4(v4) => {
+                    // SEC-B2: reject RFC 1918 private ranges unless explicitly allowed
+                    // (sync-allow-private-relay: yes in config — for LAN deployments).
+                    std::net::IpAddr::V4(v4) if !allow_private_relay => {
                         let o = v4.octets();
                         let is_private = o[0] == 10
                             || (o[0] == 172 && (o[1] & 0xf0) == 16)
@@ -1001,10 +1006,11 @@ async fn handle_sync_request(
                         if is_private {
                             return Ok(json_resp(400, serde_json::json!({
                                 "error": "INVALID_RELAY_HOST",
-                                "details": "private RFC 1918 address not allowed as relay_host"
+                                "details": "private RFC 1918 not allowed (set sync-allow-private-relay: yes for LAN)"
                             })));
                         }
                     }
+                    std::net::IpAddr::V4(_) => {}
                     _ => {}
                 }
             }

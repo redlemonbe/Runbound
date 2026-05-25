@@ -815,9 +815,10 @@ async fn build_and_launch(
                     let j = Arc::clone(&journal);
                     let cert_fp = fingerprint.clone();
                     let sync_key = sync_key_resolved.clone().unwrap_or_default();
+                    let allow_priv = cfg.sync_allow_private_relay;
                     tokio::spawn(async move {
                         if let Err(e) = sync::start_master_sync_server(
-                            port, j, sync_key, cert_fp, cert_pem, key_pem,
+                            port, j, sync_key, cert_fp, cert_pem, key_pem, allow_priv,
                         )
                         .await
                         {
