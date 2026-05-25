@@ -264,7 +264,7 @@ impl UnboundConfig {
             xdp_cache_snapshot: true,
             xdp_cache_snapshot_size: 10_000,
             cache_min_entries: 2048,
-            prefetch: false,
+            prefetch: true,
             prefetch_threshold: 5,
             cache_flush_cooldown: 60,
             resolv_fallback: true,

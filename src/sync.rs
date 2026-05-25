@@ -1725,6 +1725,8 @@ async fn handle_relay_request(
                 "cpu_percent": serde_json::Value::Null,
                 "mem_avail_mb": serde_json::Value::Null,
                 "workers": 0u32,
+                "prefetch_enabled": relay.cfg.prefetch,
+                "dnssec_validation": relay.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed),
             })))
         }
         ("GET", op) if op.starts_with("cache") => {
