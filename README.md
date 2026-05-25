@@ -163,7 +163,7 @@ curl -s -X POST http://localhost:8080/api/feeds \
 
 Architecture designed for linear scaling with core count — SO_REUSEPORT, ArcSwap lock-free config, per-core CPU affinity, and adaptive cache. See docs/performance.md for current benchmark data.
 
-**Userspace benchmark (v0.9.45):** 147k QPS (Phase A) · 68k QPS under stress (Phase B, c=100) vs BIND9 56k / Unbound 52k. XDP disabled. See [`benchmarks/v0.9.45_userspace.md`](benchmarks/v0.9.45_userspace.md).
+**Userspace benchmark (v0.9.45):** 147k QPS (Phase A) · 68k QPS under stress (Phase B, c=100) vs BIND9 56k / Unbound 52k. XDP disabled. See [`docs/bench-runs/agent/v0.9.45_userspace.md`](docs/bench-runs/agent/v0.9.45_userspace.md).
 
 | Query path | Latency |
 |------------|---------|
