@@ -968,16 +968,24 @@ async fn handle_sync_request(
                         }),
                     ));
                 }
-                if let std::net::IpAddr::V4(v4) = ip {
-                    if v4.is_link_local() {
-                        return Ok(json_resp(
-                            400,
-                            serde_json::json!({
+                match ip {
+                    std::net::IpAddr::V4(v4) if v4.is_link_local() => {
+                        return Ok(json_resp(400, serde_json::json!({
+                            "error": "INVALID_RELAY_HOST",
+                            "details": "link-local not allowed as relay_host"
+                        })));
+                    }
+                    // SEC-A5: also reject IPv6 link-local (fe80::/10)
+                    std::net::IpAddr::V6(v6) => {
+                        let s = v6.segments();
+                        if (s[0] & 0xffc0) == 0xfe80 {
+                            return Ok(json_resp(400, serde_json::json!({
                                 "error": "INVALID_RELAY_HOST",
                                 "details": "link-local not allowed as relay_host"
-                            }),
-                        ));
+                            })));
+                        }
                     }
+                    _ => {}
                 }
             }
         }
