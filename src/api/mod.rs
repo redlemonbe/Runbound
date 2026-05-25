@@ -730,7 +730,7 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in health handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         (
             list.iter().filter(|u| u.healthy).count() as u32,
             list.len() as u32,
@@ -897,7 +897,7 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in system handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         (
             list.iter().filter(|u| u.healthy).count() as u32,
             list.len() as u32,
@@ -2264,7 +2264,7 @@ async fn delete_upstream_handler(
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in delete handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         let target_exists = list.iter().any(|u| u.id == id);
         if target_exists && list.len() == 1 {
             return (
@@ -2283,7 +2283,7 @@ async fn delete_upstream_handler(
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in delete handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(u) = list.iter().find(|u| u.id == id) {
             if u.source == "config" {
                 let addr = u.addr.clone();
@@ -2376,7 +2376,7 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
         let mut last = s
             .last_flush_at
             .lock()
-            .unwrap_or_else(|e| panic!("last_flush_at poisoned: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(t) = *last {
             let elapsed = t.elapsed().as_secs();
             if elapsed < cooldown {
@@ -2392,7 +2392,7 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
                 resp.headers_mut().insert(
                     axum::http::header::RETRY_AFTER,
                     axum::http::HeaderValue::from_str(&retry_after.to_string())
-                        .unwrap_or_else(|e| panic!("Retry-After header value: {e}")),
+                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
                 );
                 return resp;
             }
@@ -2523,7 +2523,7 @@ async fn patch_upstream_handler(
         let mut list = s
             .upstreams
             .write()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in patch handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(u) = list.iter_mut().find(|u| u.id == id) {
             if let Some(n) = name_patch {
                 u.name = n;
@@ -3177,7 +3177,7 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
         let list = s
             .upstreams
             .read()
-            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in metrics handler: {e}"));
+            .unwrap_or_else(|e| e.into_inner());
         list.iter()
             .map(|u| UpstreamMetric {
                 id: u.id.clone(),
