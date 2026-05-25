@@ -1445,6 +1445,8 @@ pub struct NodeRelay {
     pub cfg: Arc<UnboundConfig>,
     pub upstreams: SharedUpstreams,
     pub stats_cache: crate::stats::SharedSnapshot,
+    pub dnssec_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub resolver: crate::dns::server::SharedResolver,
 }
 
 /// Slave relay TLS server — listens on sync_port, handles /relay/* paths.
@@ -1707,6 +1709,40 @@ async fn handle_relay_request(
                 "total":     total,
                 "healthy":   healthy,
             })))
+        }
+        // ── System info (for WebUI node overview) ───────────────────────────
+        ("GET", "system") => {
+            let snap = relay.stats_cache.load();
+            Ok(json_ok(serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_secs": snap.uptime_secs,
+                "xdp_active": false,
+                "xdp_mode": serde_json::Value::Null,
+                "cpu_percent": serde_json::Value::Null,
+                "mem_avail_mb": serde_json::Value::Null,
+                "workers": 0u32,
+            })))
+        }
+        ("GET", op) if op.starts_with("cache") => {
+            Ok(json_ok(serde_json::json!({ "entries": 0, "hit_rate": 0.0 })))
+        }
+        // ── DNSSEC toggle propagation ────────────────────────────────────────
+        ("PATCH", "config") => {
+            #[derive(serde::Deserialize)]
+            struct ConfigPatch { dnssec_validation: Option<bool> }
+            let p: ConfigPatch = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") }))),
+            };
+            if let Some(v) = p.dnssec_validation {
+                relay.dnssec_enabled.store(v, std::sync::atomic::Ordering::Relaxed);
+                let addrs = crate::upstreams::upstream_addrs(&relay.upstreams);
+                if let Err(e) = crate::dns::server::rebuild_and_swap(&relay.resolver, &addrs, v).await {
+                    tracing::warn!(%e, "relay: resolver rebuild after DNSSEC toggle");
+                }
+                tracing::info!(dnssec = v, "DNSSEC toggle applied on slave via relay");
+            }
+            Ok(json_ok(serde_json::json!({ "ok": true })))
         }
         _ => Ok(json_resp(404, serde_json::json!({ "error": "NOT_FOUND" }))),
     }

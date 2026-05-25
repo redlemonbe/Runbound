@@ -403,7 +403,7 @@
 </div>
 
   <!-- ═══ SETTINGS ═══ -->
-  <div id="tab-settings" class="hidden fade max-w-2xl">
+  <div id="tab-settings" class="hidden fade max-w-2xl mx-auto">
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-4">Change Password</div>
       <div class="space-y-3 max-w-sm" style="padding-left:3px">
@@ -424,6 +424,17 @@
       </div>
     </div>
     <div class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DNSSEC Validation</div>
+      <div class="flex items-start justify-between gap-4 mb-3">
+        <div>
+          <p class="text-sm text-gray-300">Validate DNSSEC signatures</p>
+          <p class="text-xs text-gray-600 mt-1">When enabled, cryptographic signatures are validated on all responses. When disabled, the upstream AD bit is trusted.</p>
+        </div>
+        <button id="dnssec-toggle-btn" onclick="toggleDnssec()" class="btn-secondary text-xs w-16 shrink-0">—</button>
+      </div>
+      <p id="dnssec-status-note" class="text-xs text-gray-700"></p>
+    </div>
+    <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Session</div>
       <div class="space-y-2 text-sm">
         <div class="flex justify-between"><span class="text-gray-500">Auto-logout (idle)</span><span class="text-gray-300">30 minutes</span></div>
@@ -432,9 +443,13 @@
       <button onclick="doLogout()" class="btn-secondary mt-4 text-xs">Logout now</button>
     </div>
     <div class="card">
-      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Auth Events</div>
-      <p class="text-xs text-gray-500 mb-3">Login and logout events are recorded in the system journal with timestamps.</p>
-      <code class="text-xs text-gray-600 bg-gray-900/60 px-3 py-2 rounded block">journalctl -u runbound -g "WebUI"</code>
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-xs text-gray-600 uppercase tracking-wide">Recent Auth Events</div>
+        <button onclick="loadAuthEvents()" class="btn-secondary text-xs">Refresh</button>
+      </div>
+      <div id="auth-events-list" class="space-y-1 font-mono text-xs">
+        <span class="text-gray-700">Open Settings to load…</span>
+      </div>
     </div>
   </div>
 
@@ -487,7 +502,9 @@ function nodeApi(nodeId, method, path, body) {
     return doFetch(relayUrl, masterKey);
   };
   if (nodeId === 'master') return doFetch(directUrl, n.key);
-  return doFetch(directUrl, n.key).catch(() => tryRelay());
+  // Use relay when available — avoids cross-origin requests from embedded WebUI
+  if (n.relayNodeId) return tryRelay();
+  return doFetch(directUrl, n.key);
 }
 
 // Current node's API (for tabs other than overview)
@@ -1072,6 +1089,7 @@ function showTab(name,btn){
   if(name==='upstreams'){loadUpstreamPresets();loadUpstreams();}
   if(name==='logs')loadLogs();
   if(name==='system'){loadSystem();loadSlaves();}
+  if(name==='settings'){initDnssecToggle();loadAuthEvents();}
 }
 
 // ══════════════════════════════════════════════
@@ -1171,6 +1189,57 @@ function resetIdleTimer() {
 ['click','keydown','mousemove','touchstart'].forEach(ev => document.addEventListener(ev, resetIdleTimer, {passive:true}));
 
 window.onload=()=>{ loadAll(); resetIdleTimer(); };
+// Settings — DNSSEC toggle + Auth events
+async function initDnssecToggle() {
+  try {
+    const sys = await api('GET', '/config');
+    const btn = document.getElementById('dnssec-toggle-btn');
+    const note = document.getElementById('dnssec-status-note');
+    if (!btn) return;
+    const enabled = sys.dnssec_validation === true;
+    btn.dataset.value = enabled;
+    btn.textContent = enabled ? 'ON' : 'OFF';
+    btn.className = enabled ? 'btn-primary text-xs w-16 shrink-0' : 'btn-secondary text-xs w-16 shrink-0';
+    if (note) note.textContent = enabled ? 'Active — signatures verified on every response.' : 'Disabled — trusting upstream AD bit only.';
+  } catch(e) {}
+}
+async function toggleDnssec() {
+  const btn = document.getElementById('dnssec-toggle-btn');
+  if (!btn) return;
+  const current = btn.dataset.value === 'true';
+  const next = !current;
+  try {
+    await api('PATCH', '/config', {dnssec_validation: next});
+    btn.dataset.value = next;
+    btn.textContent = next ? 'ON' : 'OFF';
+    btn.className = next ? 'btn-primary text-xs w-16 shrink-0' : 'btn-secondary text-xs w-16 shrink-0';
+    const note = document.getElementById('dnssec-status-note');
+    if (note) note.textContent = next ? 'Active — signatures verified on every response.' : 'Disabled — trusting upstream AD bit only.';
+    toast(next ? 'DNSSEC validation enabled' : 'DNSSEC validation disabled');
+  } catch(e) { toast('DNSSEC toggle failed', true); }
+}
+async function loadAuthEvents() {
+  const el = document.getElementById('auth-events-list');
+  if (!el) return;
+  try {
+    const r = await api('GET', '/webui/auth-events');
+    const events = (r.events || []).slice().reverse();
+    if (events.length === 0) {
+      el.innerHTML = '<span class="text-gray-700">No events recorded yet.</span>';
+      return;
+    }
+    el.innerHTML = events.map(e => {
+      const ts = new Date(e.ts * 1000).toLocaleString([], {dateStyle:'short',timeStyle:'medium'});
+      const color = e.event === 'login_ok' ? 'text-green-400' : e.event === 'login_fail' ? 'text-red-400' : 'text-gray-500';
+      const label = ({login_ok:'login ok',login_fail:'login FAIL',logout:'logout'})[e.event] || e.event;
+      const user = e.user ? '<span class="text-cyan-700">'+esc(e.user)+'</span>' : '';
+      return '<div class="flex gap-3 items-baseline"><span class="text-gray-600 shrink-0 w-36">'+ts+'</span><span class="'+color+' w-20 shrink-0">'+label+'</span>'+user+'</div>';
+    }).join('');
+  } catch(e) {
+    el.innerHTML = '<span class="text-gray-700">Auth events: embedded WebUI only (port 8091).</span>';
+  }
+}
+
 </script>
 
 <!-- Input modal -->
