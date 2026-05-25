@@ -11,10 +11,14 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::StreamExt as _;
 use serde::Deserialize;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
+use crate::alerts::AlertTracker;
+use crate::icmp::IcmpBanCmd;
+use crate::sync::{SyncJournal, SyncOp};
 
 static INDEX_HTML: &str = include_str!("index.html");
 static INDEX_HTML_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
@@ -52,6 +56,14 @@ pub struct WebUiState {
     login_rl: Arc<DashMap<std::net::IpAddr, (u32, Instant)>>,
     /// Local CA cert PEM served at /webui/ca.crt. Empty when TLS disabled.
     ca_cert_pem: Arc<String>,
+    // ── Bot defense ──────────────────────────────────────────────────────────
+    pub alert_tracker: Arc<AlertTracker>,
+    pub ban_cmd_tx: tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>,
+    pub sync_journal: Option<Arc<SyncJournal>>,
+    pub bot_ban_duration_secs: u64,
+    pub bot_honeypot_enabled: bool,
+    /// Per-IP bad-request burst tracker: (count, window_start).
+    burst_tracker: Arc<DashMap<IpAddr, (u64, Instant), ahash::RandomState>>,
 }
 
 struct WebUiCred {
@@ -59,7 +71,17 @@ struct WebUiCred {
     hash:     String, // argon2id encoded string
 }
 
-pub fn router(api_port: u16, api_key: String, base_dir: PathBuf, ca_cert_pem: String) -> Router {
+pub fn router(
+    api_port: u16,
+    api_key: String,
+    base_dir: PathBuf,
+    ca_cert_pem: String,
+    alert_tracker: Arc<AlertTracker>,
+    ban_cmd_tx: tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>,
+    sync_journal: Option<Arc<SyncJournal>>,
+    bot_ban_duration_secs: u64,
+    bot_honeypot_enabled: bool,
+) -> Router {
     let auth_path = base_dir.join(CRED_FILE);
     let creds = load_or_default_creds(&auth_path);
     let state = Arc::new(WebUiState {
@@ -75,6 +97,12 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf, ca_cert_pem: St
         auth_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(100))),
         login_rl: Arc::new(DashMap::new()),
         ca_cert_pem: Arc::new(ca_cert_pem),
+        alert_tracker,
+        ban_cmd_tx,
+        sync_journal,
+        bot_ban_duration_secs,
+        bot_honeypot_enabled,
+        burst_tracker: Arc::new(DashMap::with_hasher(ahash::RandomState::default())),
     });
     // SEC-B10: periodic cleanup of expired sessions (every 5 minutes).
     {
@@ -101,6 +129,26 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf, ca_cert_pem: St
         .route("/webui/security-audit", get(serve_security_audit))
         .route("/api",       any(proxy_api))
         .route("/api/*path", any(proxy_api))
+        // Bot defense: scanner trap routes
+        .route("/wp-admin",  any(bot_trap_handler))
+        .route("/wp-admin/*path",  any(bot_trap_handler))
+        .route("/.env",  any(bot_trap_handler))
+        .route("/.git/config",  any(bot_trap_handler))
+        .route("/.git/*path",  any(bot_trap_handler))
+        .route("/phpmyadmin",  any(bot_trap_handler))
+        .route("/phpmyadmin/*path",  any(bot_trap_handler))
+        .route("/xmlrpc.php",  any(bot_trap_handler))
+        .route("/admin",  any(bot_trap_handler))
+        .route("/administrator",  any(bot_trap_handler))
+        .route("/config.php",  any(bot_trap_handler))
+        .route("/wp-login.php",  any(bot_trap_handler))
+        .route("/cgi-bin/*path",  any(bot_trap_handler))
+        .route("/shell",  any(bot_trap_handler))
+        .route("/cmd",  any(bot_trap_handler))
+        .route("/.aws/credentials",  any(bot_trap_handler))
+        .route("/actuator/*path",  any(bot_trap_handler))
+        .route("/console",  any(bot_trap_handler))
+        .route("/manager/*path",  any(bot_trap_handler))
         .with_state(state)
 }
 
@@ -218,13 +266,15 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
       <div style="color:#152a38;font-size:10px;margin-top:7px;letter-spacing:.18em">MANAGEMENT CONSOLE</div>
     </div>
     <form method="POST" action="/login">
+      <input type="text" name="username" value="" autocomplete="off" tabindex="-1" aria-hidden="true" style="display:none;position:absolute;left:-9999px;opacity:0;height:0;width:0;" />
+      <input type="password" name="password" value="" autocomplete="off" tabindex="-1" aria-hidden="true" style="display:none;position:absolute;left:-9999px;opacity:0;height:0;width:0;" />
       <div style="margin-bottom:16px">
         <label for="u">Username</label>
-        <input id="u" name="username" type="text" autocomplete="username" class="input w-full"/>
+        <input id="u" name="rb_user" type="text" autocomplete="username" class="input w-full"/>
       </div>
       <div style="margin-bottom:26px">
         <label for="p">Password</label>
-        <input id="p" name="password" type="password" autocomplete="current-password" class="input w-full"/>
+        <input id="p" name="rb_pass" type="password" autocomplete="current-password" class="input w-full"/>
       </div>
       <button type="submit" class="btn-primary w-full mt-2">Sign in →</button>
     </form>
@@ -410,7 +460,15 @@ async fn serve_login() -> Html<&'static str> {
 }
 
 #[derive(Deserialize)]
-struct LoginForm { username: String, password: String }
+struct LoginForm {
+    rb_user: String,
+    rb_pass: String,
+    // Honeypot fields — must be empty (bots fill these)
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+}
 
 async fn handle_login(
     State(state): State<Arc<WebUiState>>,
@@ -435,19 +493,27 @@ async fn handle_login(
         }
         *count += 1; // Pre-increment atomically — prevents concurrent bypass
     }
+    // Bot defense: honeypot check
+    if state.bot_honeypot_enabled && (!form.username.is_empty() || !form.password.is_empty()) {
+        ban_bot(&state, client_ip_addr, "bot-honeypot").await;
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
     let ok = {
         let creds = state.creds.lock().unwrap_or_else(|e| e.into_inner());
-        if creds.username != form.username { false }
+        if creds.username != form.rb_user { false }
         else {
             match PasswordHash::new(&creds.hash) {
-                Ok(h) => Argon2::default().verify_password(form.password.as_bytes(), &h).is_ok(),
+                Ok(h) => Argon2::default().verify_password(form.rb_pass.as_bytes(), &h).is_ok(),
                 Err(_) => false,
             }
         }
     };
     if !ok {
-        tracing::warn!(user = %form.username, ip = %client_ip, "WebUI login FAILED — invalid credentials");
-        push_auth_event(&state, "login_fail", &form.username, &client_ip);
+        tracing::warn!(user = %form.rb_user, ip = %client_ip, "WebUI login FAILED — invalid credentials");
+        push_auth_event(&state, "login_fail", &form.rb_user, &client_ip);
+        if track_bad_request(&state, client_ip_addr) {
+            ban_bot(&state, client_ip_addr, "bot-burst").await;
+        }
         return Redirect::to("/login?err=Invalid%20credentials").into_response();
     }
     // Success — reset rate limit
@@ -458,8 +524,8 @@ async fn handle_login(
     // SEC-19: generate CSRF token, stored alongside session expiry.
     let csrf_token = uuid::Uuid::new_v4().to_string().replace('-', "");
     state.sessions.insert(token.clone(), (Instant::now() + SESSION_TTL, csrf_token.clone()));
-    tracing::info!(user = %form.username, ip = %client_ip, "WebUI login successful");
-    push_auth_event(&state, "login_ok", &form.username, &client_ip);
+    tracing::info!(user = %form.rb_user, ip = %client_ip, "WebUI login successful");
+    push_auth_event(&state, "login_ok", &form.rb_user, &client_ip);
     // SEC-A2: add Secure flag when behind an HTTPS reverse proxy.
     let secure = headers.get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -608,6 +674,57 @@ async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> 
                 .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response())
         }
     }
+}
+
+
+// ── Bot defense helpers ───────────────────────────────────────────────────────
+
+/// Ban an IP via the alert tracker + XDP BPF map + sync journal.
+async fn ban_bot(state: &WebUiState, ip: std::net::IpAddr, rule: &str) {
+    if state.alert_tracker.is_blocked(ip) {
+        return; // already banned
+    }
+    state.alert_tracker.block_bot(ip, rule, state.bot_ban_duration_secs);
+    if let std::net::IpAddr::V4(ipv4) = ip {
+        let _ = state.ban_cmd_tx.send(IcmpBanCmd::Ban(ipv4));
+    }
+    if let Some(journal) = &state.sync_journal {
+        journal.push(SyncOp::AddGlobalBan {
+            ip: ip.to_string(),
+            rule: rule.to_string(),
+            expires_secs: Some(state.bot_ban_duration_secs),
+        });
+    }
+    tracing::warn!(ip = %ip, rule = rule, "bot defense: IP banned");
+}
+
+/// Track a bad request (failed login / scanner hit) for a given IP.
+/// Returns true if the burst threshold (10 in 5s) has been reached.
+fn track_bad_request(state: &WebUiState, ip: std::net::IpAddr) -> bool {
+    let now = Instant::now();
+    let threshold = 10u64;
+    let window = Duration::from_secs(5);
+
+    let mut entry = state.burst_tracker.entry(ip).or_insert((0u64, now));
+    if now.duration_since(entry.1) > window {
+        *entry = (1, now);
+        false
+    } else {
+        entry.0 += 1;
+        entry.0 >= threshold
+    }
+}
+
+/// Catch-all handler for known scanner/bot paths (wp-admin, .env, .git, etc.).
+async fn bot_trap_handler(
+    State(state): State<Arc<WebUiState>>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+) -> impl IntoResponse {
+    let ip = connect_info
+        .map(|ConnectInfo(a)| a.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    ban_bot(&state, ip, "bot-scanner").await;
+    (StatusCode::NOT_FOUND, "Not Found")
 }
 
 // ── WebUI TLS cert management ────────────────────────────────────────────────
@@ -787,7 +904,23 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt as _;
 
-    fn app() -> Router { router(19999, "test-key".to_string(), std::path::PathBuf::from("/tmp"), String::new()) }
+    fn app() -> Router {
+        use crate::alerts::AlertTracker;
+        use crate::icmp::IcmpStats;
+        let tracker = AlertTracker::new(vec![], None);
+        let icmp = IcmpStats::new();
+        router(
+            19999,
+            "test-key".to_string(),
+            std::path::PathBuf::from("/tmp"),
+            String::new(),
+            tracker,
+            icmp.ban_cmd_tx.clone(),
+            None,
+            86400,
+            false,
+        )
+    }
 
     async fn body_str(b: Body) -> String {
         String::from_utf8_lossy(&axum::body::to_bytes(b, usize::MAX).await.unwrap()).into_owned()
@@ -824,7 +957,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/login")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("username=admin&password=wrongpassword"))
+                    .body(Body::from("rb_user=admin&rb_pass=wrongpassword"))
                     .unwrap(),
             )
             .await
