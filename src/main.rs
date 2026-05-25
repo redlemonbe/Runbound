@@ -107,6 +107,7 @@ async fn async_main(
         domain_stats,
         icmp_stats,
         icmp_cfg,
+        dnssec_enabled,
     ) = build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
@@ -222,6 +223,8 @@ async fn async_main(
                     cfg.xdp_domain_routing,
                     cfg.xdp_ring_size,
                     xdp_ring_sizes,
+                    Arc::clone(&global_stats),
+                    Arc::clone(&domain_stats),
                 ) {
                     Ok(Some(h)) => {
                         info!(iface = %iface_name, "XDP kernel-bypass fast path active");
@@ -354,6 +357,7 @@ async fn async_main(
         per_upstream_resolvers,
         racing_wins,
         domain_stats,
+        Arc::clone(&dnssec_enabled),
     )
     .await;
     fw_cleanup.close();
@@ -518,6 +522,7 @@ async fn build_and_launch(
     Arc<DomainStats>,
     Arc<crate::icmp::IcmpStats>,
     Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
+    Arc<std::sync::atomic::AtomicBool>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -752,6 +757,8 @@ async fn build_and_launch(
 
     // Hoisted so both SlaveClient and AppState share the same mutex instance.
     let zones_mutex = Arc::new(tokio::sync::Mutex::new(()));
+    // Hoisted so both NodeRelay (slave relay) and DNS handler share the same instance.
+    let domain_stats = DomainStats::new();
 
     // Slave node UUID — generated once, persisted to disk (#88).
     let node_id: Option<String> = if cfg.is_slave() {
@@ -797,6 +804,7 @@ async fn build_and_launch(
                                     cfg: Arc::clone(&cfg_arc),
                                     upstreams: Arc::clone(&upstreams),
                                     stats_cache: Arc::clone(&snapshot_cache),
+                                    domain_stats: Arc::clone(&domain_stats),
                                     dnssec_enabled: Arc::clone(&dnssec_enabled),
                                     resolver: Arc::clone(&resolver),
                                 });
@@ -955,7 +963,6 @@ async fn build_and_launch(
 
     let events_tx = sync_journal.as_ref().map(|j| j.events_tx.clone());
 
-    let domain_stats = DomainStats::new();
     let icmp_stats = IcmpStats::new();
     let icmp_cfg = Arc::new(std::sync::Mutex::new(IcmpConfig {
         enabled: cfg.icmp_enabled,
@@ -977,7 +984,6 @@ async fn build_and_launch(
         upstreams: Arc::clone(&upstreams),
         sync_journal,
         sync_key: sync_key_resolved,
-        node_id,
         slave_mode: cfg.is_slave(),
         base_dir: Arc::new(base_dir.clone()),
         audit: audit.clone(),
@@ -1075,6 +1081,7 @@ async fn build_and_launch(
         domain_stats,
         icmp_stats,
         icmp_cfg,
+        dnssec_enabled,
     ))
 }
 

@@ -144,7 +144,7 @@ pub struct RunboundHandler {
     pub stats: Arc<Stats>,
     pub log_buffer: SharedLogBuffer,
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
-    dnssec_enabled: bool,
+    dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     dnssec_log_bogus: bool,
     /// Optional prefetch tracker — None when prefetch: no (default).
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
@@ -190,7 +190,7 @@ impl RunboundHandler {
         cache_max_ttl: u32,
         stats: Arc<Stats>,
         log_buffer: SharedLogBuffer,
-        dnssec_enabled: bool,
+        dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
         dnssec_log_bogus: bool,
         prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
         xdp_cache: Option<super::cache_snapshot::MutableCacheMap>,
@@ -553,7 +553,7 @@ impl RunboundHandler {
                     let addrs = crate::upstreams::upstream_addrs(&self.upstreams);
                     let resolver_rebuild = Arc::clone(&self.resolver);
                     let stats_rebuild = Arc::clone(&self.stats);
-                    let dnssec = self.dnssec_enabled;
+                    let dnssec = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
                     tokio::spawn(async move {
                         if rebuild_and_swap(&resolver_rebuild, &addrs, dnssec)
                             .await
@@ -577,7 +577,7 @@ impl RunboundHandler {
             {
                 let ups = Arc::clone(&self.upstreams);
                 let res = Arc::clone(&self.resolver);
-                let dnssec = self.dnssec_enabled;
+                let dnssec = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
                 tokio::spawn(async move {
                     crate::upstreams::add_resolv_fallback(&ups);
                     let addrs = crate::upstreams::upstream_addrs(&ups);
@@ -643,7 +643,7 @@ impl RunboundHandler {
                 };
 
                 // DNSSEC: check for bogus proof on individual records in success path.
-                if self.dnssec_enabled {
+                if self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                     let has_bogus = records.iter().any(|r| r.proof.is_bogus());
                     if has_bogus {
                         self.stats.inc_dnssec_bogus();
@@ -775,7 +775,7 @@ impl RunboundHandler {
             }
             Err(e) => {
                 // DNSSEC bogus via NSEC denial: validated proof the record does not exist.
-                let is_dnssec_bogus = self.dnssec_enabled
+                let is_dnssec_bogus = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed)
                     && matches!(&e, NetError::Dns(DnsError::Nsec { proof, .. }) if proof.is_bogus());
 
                 if is_dnssec_bogus {
@@ -1169,7 +1169,7 @@ pub fn create_shared_resolvers_vec() -> SharedResolversVec {
 /// Create a SharedResolver from config at startup. Call once in build_and_launch.
 pub fn create_shared_resolver(cfg: &UnboundConfig) -> anyhow::Result<SharedResolver> {
     let size = cache_size_from_meminfo();
-    let resolver = build_resolver(cfg, size)?;
+    let resolver = build_resolver(cfg, size, cfg.dnssec_validation)?;
     Ok(Arc::new(ArcSwap::new(Arc::new(resolver))))
 }
 
@@ -1370,7 +1370,7 @@ pub fn build_resolver_from_addrs(
 }
 
 /// Build resolver from forward-zones in unbound.conf, fallback to system resolvers.
-fn build_resolver(cfg: &UnboundConfig, cache_size: usize) -> anyhow::Result<TokioResolver> {
+fn build_resolver(cfg: &UnboundConfig, cache_size: usize, dnssec: bool) -> anyhow::Result<TokioResolver> {
     let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
 
     for fwd in &cfg.forward_zones {
@@ -1442,7 +1442,7 @@ fn build_resolver(cfg: &UnboundConfig, cache_size: usize) -> anyhow::Result<Toki
                        // Enable only when operating as a full recursive resolver with complete RRSIG chains.
                        // Forwarders must leave this off: upstreams strip RRSIGs before forwarding,
                        // causing spurious SERVFAIL for every signed domain (gmail.com, google.com…).
-    opts.validate = cfg.dnssec_validation;
+    opts.validate = dnssec;
     opts.use_hosts_file = ResolveHosts::Never; // don't leak host file data
 
     TokioResolver::builder_with_config(resolver_cfg, TokioRuntimeProvider::default())
@@ -1568,6 +1568,8 @@ pub async fn memory_guard_loop(
     cfg: Arc<UnboundConfig>,
     stats: Arc<Stats>,
     initial_cache_size: usize,
+    upstreams: crate::upstreams::SharedUpstreams,
+    dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(MEM_CHECK_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1619,21 +1621,30 @@ pub async fn memory_guard_loop(
         if used_ratio >= MEM_HIGH_WATERMARK {
             // High pressure — recalc from current RAM state, flush rate limiter.
             let new_size = cache_size_from_meminfo();
-            match build_resolver(&cfg, new_size) {
-                Ok(new_res) => {
-                    resolver.store(Arc::new(new_res));
-                    stats.reset_cache();
-                    let freed = rate_limiter.clear();
-                    warn!(
-                        used_pct = format!("{:.1}%", used_ratio * 100.0),
-                        cache_from = current_cache_size,
-                        cache_to = new_size,
-                        freed_buckets = freed,
-                        "memory pressure high — cache flushed, resized, rate limiter cleared"
-                    );
-                    current_cache_size = new_size;
+            {
+                let _mg_addrs = crate::upstreams::upstream_addrs(&upstreams);
+                let _mg_built = if _mg_addrs.is_empty() {
+                    build_resolver(&cfg, new_size, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
+                } else {
+                    build_resolver_from_addrs(&_mg_addrs, new_size, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
+                };
+                match _mg_built {
+                    Ok(new_res) => {
+                        let _ = warm_up(&new_res).await;
+                        resolver.store(Arc::new(new_res));
+                        stats.reset_cache();
+                        let freed = rate_limiter.clear();
+                        warn!(
+                            used_pct = format!("{:.1}%", used_ratio * 100.0),
+                            cache_from = current_cache_size,
+                            cache_to = new_size,
+                            freed_buckets = freed,
+                            "memory pressure high — cache flushed, resized, rate limiter cleared"
+                        );
+                        current_cache_size = new_size;
+                    }
+                    Err(e) => warn!(%e, "memory guard: resolver rebuild failed (high pressure)"),
                 }
-                Err(e) => warn!(%e, "memory guard: resolver rebuild failed (high pressure)"),
             }
         } else if used_ratio >= MEM_MOD_WATERMARK {
             // Moderate pressure — halve cache, floor at cache_min_entries.
@@ -1652,22 +1663,31 @@ pub async fn memory_guard_loop(
                 // cooldown active — skip this cycle silently
             } else {
                 let new_size = (current_cache_size / 2).max(min);
-                match build_resolver(&cfg, new_size) {
-                    Ok(new_res) => {
-                        resolver.store(Arc::new(new_res));
-                        stats.reset_cache();
-                        warn!(
-                            used_pct = format!("{:.1}%", used_ratio * 100.0),
-                            cache_from = current_cache_size,
-                            cache_to = new_size,
-                            "memory pressure — cache halved"
-                        );
-                        current_cache_size = new_size;
-                        last_halved = Instant::now();
-                        pct_before_last_halve = Some(used_ratio);
-                    }
-                    Err(e) => {
-                        warn!(%e, "memory guard: resolver rebuild failed (moderate pressure)")
+                {
+                    let _mg_addrs = crate::upstreams::upstream_addrs(&upstreams);
+                    let _mg_built = if _mg_addrs.is_empty() {
+                        build_resolver(&cfg, new_size, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
+                    } else {
+                        build_resolver_from_addrs(&_mg_addrs, new_size, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
+                    };
+                    match _mg_built {
+                        Ok(new_res) => {
+                            let _ = warm_up(&new_res).await;
+                            resolver.store(Arc::new(new_res));
+                            stats.reset_cache();
+                            warn!(
+                                used_pct = format!("{:.1}%", used_ratio * 100.0),
+                                cache_from = current_cache_size,
+                                cache_to = new_size,
+                                "memory pressure — cache halved"
+                            );
+                            current_cache_size = new_size;
+                            last_halved = Instant::now();
+                            pct_before_last_halve = Some(used_ratio);
+                        }
+                        Err(e) => {
+                            warn!(%e, "memory guard: resolver rebuild failed (moderate pressure)")
+                        }
                     }
                 }
             }
@@ -1677,20 +1697,29 @@ pub async fn memory_guard_loop(
             let elapsed = last_scale_up.elapsed();
             if optimal > current_cache_size && elapsed >= Duration::from_secs(MEM_SCALEUP_COOLDOWN)
             {
-                match build_resolver(&cfg, optimal) {
-                    Ok(new_res) => {
-                        resolver.store(Arc::new(new_res));
-                        stats.reset_cache();
-                        info!(
-                            used_pct = format!("{:.1}%", used_ratio * 100.0),
-                            cache_from = current_cache_size,
-                            cache_to = optimal,
-                            "memory pressure resolved — cache scaled up"
-                        );
-                        current_cache_size = optimal;
-                        last_scale_up = Instant::now();
+                {
+                    let _mg_addrs = crate::upstreams::upstream_addrs(&upstreams);
+                    let _mg_built = if _mg_addrs.is_empty() {
+                        build_resolver(&cfg, optimal, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
+                    } else {
+                        build_resolver_from_addrs(&_mg_addrs, optimal, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
+                    };
+                    match _mg_built {
+                        Ok(new_res) => {
+                            let _ = warm_up(&new_res).await;
+                            resolver.store(Arc::new(new_res));
+                            stats.reset_cache();
+                            info!(
+                                used_pct = format!("{:.1}%", used_ratio * 100.0),
+                                cache_from = current_cache_size,
+                                cache_to = optimal,
+                                "memory pressure resolved — cache scaled up"
+                            );
+                            current_cache_size = optimal;
+                            last_scale_up = Instant::now();
+                        }
+                        Err(e) => warn!(%e, "memory guard: resolver rebuild failed (scale up)"),
                     }
-                    Err(e) => warn!(%e, "memory guard: resolver rebuild failed (scale up)"),
                 }
             }
         }
@@ -1948,6 +1977,7 @@ pub async fn run_dns_server(
     per_upstream_resolvers: SharedResolversVec,
     racing_wins: Arc<DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
+    dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -1970,8 +2000,10 @@ pub async fn run_dns_server(
         let res = Arc::clone(&resolver);
         let cfg_arc = Arc::new(cfg.clone());
         let stats_mg = Arc::clone(&stats);
+        let ups_mg = Arc::clone(&upstreams);
+        let dnssec_mg = Arc::clone(&dnssec_enabled);
         tokio::spawn(async move {
-            memory_guard_loop(rl, res, cfg_arc, stats_mg, initial_cache_size).await
+            memory_guard_loop(rl, res, cfg_arc, stats_mg, initial_cache_size, ups_mg, dnssec_mg).await
         });
     }
 
@@ -2004,7 +2036,7 @@ pub async fn run_dns_server(
         let res_ka = Arc::clone(&resolver);
         let ups_ka = upstreams.clone();
         let stats_ka = Arc::clone(&stats);
-        let dnssec = cfg.dnssec_validation;
+        let dnssec = dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(dot_keepalive_loop(res_ka, ups_ka, stats_ka, dnssec));
     }
 
@@ -2016,7 +2048,7 @@ pub async fn run_dns_server(
         let ups_r = Arc::clone(&upstreams);
         let res_r = Arc::clone(&resolver);
         let fa_r = Arc::clone(&fallback_active);
-        let dnssec = cfg.dnssec_validation;
+        let dnssec = dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2045,7 +2077,7 @@ pub async fn run_dns_server(
         cache_max_ttl,
         stats,
         log_buffer,
-        cfg.dnssec_validation,
+        Arc::clone(&dnssec_enabled),
         cfg.dnssec_log_bogus,
         prefetch_tracker,
         xdp_cache,
