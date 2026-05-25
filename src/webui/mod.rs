@@ -170,10 +170,16 @@ async fn serve_dashboard(State(state): State<Arc<WebUiState>>, req: Request<Body
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
             .body(Body::from(INDEX_HTML_GZ))
             .unwrap_or_else(|_| Html(INDEX_HTML).into_response())
     } else {
-        Html(INDEX_HTML).into_response()
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+            .body(Body::from(INDEX_HTML))
+            .unwrap_or_else(|_| Html(INDEX_HTML).into_response())
     }
 }
 
