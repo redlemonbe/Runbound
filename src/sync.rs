@@ -1710,6 +1710,22 @@ async fn handle_relay_request(
                 "healthy":   healthy,
             })))
         }
+        // ── System info (for WebUI node overview) ───────────────────────────
+        ("GET", "system") => {
+            let snap = relay.stats_cache.load();
+            Ok(json_ok(serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_secs": snap.uptime_secs,
+                "xdp_active": false,
+                "xdp_mode": serde_json::Value::Null,
+                "cpu_percent": serde_json::Value::Null,
+                "mem_avail_mb": serde_json::Value::Null,
+                "workers": 0u32,
+            })))
+        }
+        ("GET", op) if op.starts_with("cache") => {
+            Ok(json_ok(serde_json::json!({ "entries": 0, "hit_rate": 0.0 })))
+        }
         // ── DNSSEC toggle propagation ────────────────────────────────────────
         ("PATCH", "config") => {
             #[derive(serde::Deserialize)]
