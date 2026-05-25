@@ -1,6 +1,6 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.9.44  
+**Current version:** v0.9.45  
 **Last updated:** 2026-05-26  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
@@ -38,7 +38,7 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 | D | v0.9.43–v0.9.44 features | — | **Pending** — bot defense, alert hot-reload, IP SAN not yet audited |
 
 **New attack surface since last audit (Cycle C, v0.9.41):**
-- Bot defense engine (`src/webui/mod.rs`): honeypot detection, scanner trap, burst tracker — potential for IP spoofing false-positives or self-DoS if attacker can generate 127.0.0.1-sourced requests
+- Bot defense engine (`src/webui/mod.rs`): honeypot detection, scanner trap, burst tracker — loopback/RFC-1918 self-ban fixed in v0.9.45; `burst_tracker` unbounded growth fixed in v0.9.45 (eviction every 5 min). Remaining: IP rotation attack flooding `blocked` map not yet mitigated.
 - `SyncOp::AddGlobalBan` / `DeleteGlobalBan` — new relay operations; ban injection via compromised slave not evaluated
 - `AlertTracker.update_rules()` — rules can now be replaced at runtime via hot-reload; concurrent modification behavior under load not audited
 - `ui-tls-san` — attacker with config write access could add arbitrary SANs to the cert
