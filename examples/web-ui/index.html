@@ -58,7 +58,9 @@
      Covers only what this UI actually uses.
      ══════════════════════════════════════════════ */
   *,*::before,*::after{box-sizing:border-box}
-  button{font-family:inherit}
+  html,body{margin:0;padding:0}
+  button{font-family:inherit;background:transparent;border:0;padding:0;cursor:pointer;color:inherit}
+  svg{max-width:100%}
   /* Display */
   .flex{display:flex}.grid{display:grid}.block{display:block}
   .hidden{display:none!important}.fixed{position:fixed}.sticky{position:sticky}
@@ -704,33 +706,40 @@ async function pollAll() {
 }
 
 async function pollTopDomains() {
-  const id = selectedNode === 'all' ? 'master' : selectedNode;
-  if (!id || !nodes[id]) return;
-  try {
-    const d = await nodeApi(id, 'GET', '/stats/top-domains?limit=10');
-    const tbody = document.getElementById('top-domains-tbody');
-    const tracked = document.getElementById('top-domains-tracked');
-    if (!tbody) return;
-    if (tracked) tracked.textContent = (d.tracked_domains ?? '—').toLocaleString();
-    const rows = (d.top_queried ?? []);
-    if (rows.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="3" class="text-gray-700 text-xs pt-2">no data yet</td></tr>';
-      return;
-    }
-    tbody.innerHTML = rows.map((r, i) => {
-      const domain = r.domain.replace(/\.$/, '');
-      const count = (r.count ?? 0).toLocaleString();
-      const bar = Math.round((r.count / rows[0].count) * 100);
-      return `<tr class="border-b border-gray-900/50 hover:bg-gray-800/30 transition-colors">
-        <td class="py-1.5 pr-2 text-gray-700 tabular-nums text-xs">${i + 1}</td>
-        <td class="py-1.5 pr-4">
-          <div class="text-gray-300 tabular-nums font-mono text-xs truncate max-w-xs" title="${esc(domain)}">${esc(domain)}</div>
-          <div class="h-0.5 bg-gray-800 rounded mt-1 w-full"><div class="h-0.5 bg-cyan-700 rounded" style="width:${bar}%"></div></div>
-        </td>
-        <td class="py-1.5 text-right text-cyan-400 tabular-nums text-xs">${count}</td>
-      </tr>`;
-    }).join('');
-  } catch(_) { /* silently ignore — endpoint may not exist on older servers */ }
+  const tbody = document.getElementById('top-domains-tbody');
+  const tracked = document.getElementById('top-domains-tracked');
+  if (!tbody) return;
+  const merged = {};
+  let maxTracked = 0;
+  const ids = selectedNode === 'all' ? Object.keys(nodes) : [selectedNode];
+  await Promise.all(ids.filter(id => nodes[id]).map(async id => {
+    try {
+      const d = await nodeApi(id, 'GET', '/stats/top-domains?limit=20');
+      if ((d.tracked_domains ?? 0) > maxTracked) maxTracked = d.tracked_domains ?? 0;
+      for (const r of (d.top_queried ?? [])) {
+        const k = r.domain.replace(/\.$/, '');
+        merged[k] = (merged[k] ?? 0) + (r.count ?? 0);
+      }
+    } catch(_) {}
+  }));
+  if (tracked) tracked.textContent = (maxTracked || '—').toLocaleString();
+  const rows = Object.entries(merged).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="3" class="text-gray-700 text-xs pt-2">no data yet</td></tr>';
+    return;
+  }
+  const top = rows[0][1];
+  tbody.innerHTML = rows.map(([domain, count], i) => {
+    const bar = Math.round((count / top) * 100);
+    return `<tr class="border-b border-gray-900/50 hover:bg-gray-800/30 transition-colors">
+      <td class="py-1.5 pr-2 text-gray-700 tabular-nums text-xs">${i + 1}</td>
+      <td class="py-1.5 pr-4">
+        <div class="text-gray-300 tabular-nums font-mono text-xs truncate max-w-xs" title="${esc(domain)}">${esc(domain)}</div>
+        <div class="h-0.5 bg-gray-800 rounded mt-1 w-full"><div class="h-0.5 bg-cyan-700 rounded" style="width:${bar}%"></div></div>
+      </td>
+      <td class="py-1.5 text-right text-cyan-400 tabular-nums text-xs">${count.toLocaleString()}</td>
+    </tr>`;
+  }).join('');
 }
 async function pollAllSys() {
   for (const id of Object.keys(nodes)) pollNodeSys(id);
@@ -741,6 +750,11 @@ async function pollNodeStats(id) {
     nodes[id].stats = s; nodes[id].status = 'ok';
     _spkSlaveQps = Object.entries(nodes).filter(([k])=>k!=='master').reduce((a,[,n])=>a+(n.stats?.qps_1m??0),0);
     if (selectedNode === id && id !== 'master') _spkPush(Number(s.qps_1m ?? 0));
+    // When viewing all nodes, push aggregated QPS once master poll completes
+    if (selectedNode === 'all' && id === 'master') {
+      const agg = aggregateStats();
+      if (agg) _spkPush(Number(agg.qps_1m ?? 0));
+    }
     renderNodePills();
     if (selectedNode === id || selectedNode === 'all') updateOverview();
   } catch(e) {
@@ -1275,13 +1289,14 @@ function initSparkline() {
                 const now = Date.now();
                 if (_spkLastTotal != null && _spkLastTime != null) {
                   const dt = (now - _spkLastTime) / 1000;
-                  const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
-                  if (dt > 0) _spkPush(Math.max(0, (d.total - _spkLastTotal) / dt) + extra);
+                  if (selectedNode !== 'all') {
+                    const extra = 0;
+                    if (dt > 0) _spkPush(Math.max(0, (d.total - _spkLastTotal) / dt) + extra);
+                  }
                 }
                 _spkLastTotal = d.total; _spkLastTime = now;
               } else if (d.qps_1m != null) {
-                const extra = selectedNode === 'all' ? _spkSlaveQps : 0;
-                _spkPush(Number(d.qps_1m) + extra);
+                if (selectedNode !== 'all') _spkPush(Number(d.qps_1m));
               }
             } catch(_) {}
           }
