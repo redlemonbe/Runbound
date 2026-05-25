@@ -241,6 +241,7 @@
     <span id="stat-qps" class="tabular-nums">— qps</span>
     <span id="stat-total" class="tabular-nums hidden sm:block">— queries</span>
     <span id="stat-uptime" class="hidden sm:block">—</span>
+    <span id="local-clock" class="tabular-nums hidden sm:block text-gray-500"></span>
     <button onclick="doReload()" title="Reload config" class="border border-gray-700 hover:border-cyan-600 hover:text-cyan-400 text-gray-500 text-xs px-2.5 py-1 rounded transition-colors">↺ Reload</button>
     <button onclick="doLogout()" title="Logout" class="border border-gray-700 hover:border-red-700 hover:text-red-400 text-gray-600 text-xs px-2.5 py-1 rounded transition-colors">⏏ Logout</button>
   </div>
@@ -959,7 +960,7 @@ function updateOverview() {
     set('ov-nodes-detail', `${okCount} / ${sortedIds.length} online`);
     bar.classList.remove('hidden');
     const allSelected = selectedNode === 'all';
-    const allCard = `<div class="card flex items-center gap-3 py-2 px-3 cursor-pointer ${allSelected?'border-cyan-600':'border-transparent hover:border-cyan-800'} transition-all" onclick="selectNode('all')">
+    const allCard = `<div class="card flex items-center gap-3 py-2 px-3 cursor-pointer ${allSelected?'border-2 border-cyan-400':'border-2 border-transparent hover:border-cyan-900'} transition-all" onclick="selectNode('all')">
         <span class="w-2 h-2 rounded-full bg-cyan-500 shrink-0"></span>
         <div>
           <div class="text-xs text-gray-300">Nodes</div>
@@ -978,7 +979,7 @@ function updateOverview() {
       const qps = n.stats?.qps_1m!=null ? Number(n.stats.qps_1m).toFixed(1)+' qps' : '—';
       const authWarn = n.status==='error' && eff2!=='ok' ? `<div class="text-xs text-red-400" title="${esc(n.lastErr??'')}">⚠ unreachable</div>` : '';
       const isSelected = selectedNode === id;
-      const borderCls = isSelected ? 'border-cyan-600' : 'border-transparent hover:border-cyan-800';
+      const borderCls = isSelected ? 'border-2 border-cyan-400' : 'border-2 border-transparent hover:border-cyan-900';
       return `<div class="card flex items-center gap-3 py-2 px-3 cursor-pointer ${borderCls} transition-all" onclick="selectNode('${id}')">
         <span class="w-2 h-2 rounded-full ${dot} shrink-0"></span>
         <div>
@@ -1718,6 +1719,15 @@ async function loadAuthEvents() {
   }
 }
 
+(function(){
+  const clockEl = document.getElementById('local-clock');
+  if (!clockEl) return;
+  const tick = () => {
+    clockEl.textContent = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+  };
+  tick();
+  setInterval(tick, 1000);
+})();
 </script>
 
 <!-- Input modal -->
