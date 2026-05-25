@@ -140,6 +140,10 @@ server:
     bot-honeypot-enabled:  yes
 ```
 
+
+
+> **Note:** Loopback addresses (`127.x`, `::1`), RFC-1918 private addresses, link-local, and ULA (`fc00::/7`) are **never** banned by the bot defense engine, even if they trigger a detection rule. This prevents the server from banning itself when internal tooling or health checks hit scanner trap paths.
+
 ### Enforcement
 
 Bans are enforced via the same pipeline as alert blocks: XDP BPF map injection (IPv4) or
