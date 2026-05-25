@@ -6,12 +6,23 @@
 // global lock. Capped at MAX_TRACKED domains to bound worst-case heap usage.
 // Counters are cumulative since process start; no windowing in this version.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap as StdHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 
 const MAX_TRACKED: usize = 10_000;
+/// Flush the thread-local accumulator into the global DashMap every N increments.
+/// Reduces atomic contention on hot domains by up to FLUSH_INTERVAL× (PERF-4 / #136).
+const FLUSH_INTERVAL: u64 = 512;
+
+thread_local! {
+    static TL_DS_BUF: RefCell<StdHashMap<Box<str>, u64>> =
+        RefCell::new(StdHashMap::new());
+    static TL_DS_CALLS: Cell<u64> = const { Cell::new(0) };
+}
 
 pub struct DomainStats {
     map: DashMap<Box<str>, AtomicU64, ahash::RandomState>,
@@ -25,24 +36,47 @@ impl DomainStats {
     }
 
     /// Increment the query counter for `domain`.
-    /// Silently ignored when MAX_TRACKED is reached.
+    ///
+    /// Writes to a thread-local accumulator and flushes to the shared DashMap
+    /// every FLUSH_INTERVAL calls (PERF-4 / #136).  Counts within the unflushed
+    /// window may be temporarily invisible to GET /api/stats/top-domains —
+    /// acceptable for a monitoring dashboard.
     pub fn inc(&self, domain: &str) {
-        if let Some(v) = self.map.get(domain) {
-            v.fetch_add(1, Ordering::Relaxed);
-            return;
+        TL_DS_BUF.with(|buf| {
+            *buf.borrow_mut().entry(domain.into()).or_insert(0) += 1;
+        });
+        let calls = TL_DS_CALLS.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
+        if calls % FLUSH_INTERVAL == 0 {
+            self.flush_tl();
         }
-        if self.map.len() >= MAX_TRACKED {
-            return;
-        }
-        self.map
-            .entry(domain.into())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drain the calling thread's accumulator into the shared DashMap.
+    pub fn flush_tl(&self) {
+        TL_DS_BUF.with(|buf| {
+            let mut map = buf.borrow_mut();
+            for (k, n) in map.drain() {
+                if let Some(v) = self.map.get(k.as_ref()) {
+                    v.fetch_add(n, Ordering::Relaxed);
+                } else if self.map.len() < MAX_TRACKED {
+                    self.map
+                        .entry(k)
+                        .or_insert_with(|| AtomicU64::new(0))
+                        .fetch_add(n, Ordering::Relaxed);
+                }
+            }
+        });
     }
 
     /// Return the top `limit` domains by query count, sorted descending.
     /// Each tuple is (domain, count).
+    /// Flushes the calling thread's TL buffer first so counts are up-to-date.
     pub fn top(&self, limit: usize) -> Vec<(String, u64)> {
+        self.flush_tl();
         let mut v: Vec<(String, u64)> = self
             .map
             .iter()
@@ -91,9 +125,11 @@ mod tests {
         for i in 0..MAX_TRACKED {
             ds.inc(&format!("domain{i}.test"));
         }
+        ds.flush_tl(); // drain TL batch buffer before checking len
         assert_eq!(ds.len(), MAX_TRACKED);
         // A new domain should be silently ignored.
         ds.inc("overflow.test");
+        ds.flush_tl();
         assert_eq!(ds.len(), MAX_TRACKED);
         // An existing domain should still increment.
         ds.inc("domain0.test");

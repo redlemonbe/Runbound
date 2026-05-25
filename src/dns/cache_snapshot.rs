@@ -70,6 +70,10 @@ pub static XDP_CACHE_SNAPSHOT_HITS: AtomicU64 = AtomicU64::new(0);
 pub static XDP_CACHE_SNAPSHOT_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Live entry count, updated by publish_loop after each snapshot swap.
 pub static XDP_CACHE_SNAPSHOT_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// Monotonic write-generation counter — incremented by cache_insert on every new entry.
+/// publish_loop compares against its last-seen value to skip the O(n) DashMap clone
+/// when no new entries have been inserted since the previous snapshot (PERF-1 / #135).
+pub static CACHE_WRITE_GEN: AtomicU64 = AtomicU64::new(0);
 
 // ── Per-worker packet distribution (#67) ─────────────────────────────────────
 // 64 slots (one per NIC queue / worker thread). Incremented by xdp_worker
@@ -107,6 +111,7 @@ pub fn cache_insert(
         }
     }
     mutable.insert(key, entry);
+    CACHE_WRITE_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
 // ── #29: rkyv-based cache persistence ────────────────────────────────────────
@@ -249,13 +254,26 @@ pub fn load_xdp_cache(
     loaded
 }
 
-/// Background task: every 10 ms, clone the mutable map (evicting expired
-/// entries), then atomically publish it as the new read-only snapshot.
+/// Background task: publish the XDP read-only snapshot from the mutable DashMap.
+///
+/// PERF-1 (#135): skip the O(n) DashMap clone when no new entries were inserted
+/// since the previous tick — `CACHE_WRITE_GEN` is bumped by `cache_insert`.
+/// A forced eviction pass runs every 256 ticks (~2.5 s) to drop TTL-expired
+/// entries even in steady-state (warm cache, no new inserts).
 pub async fn publish_loop(snapshot: SharedCacheSnapshot, mutable: MutableCacheMap) {
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_gen: u64 = 0;
+    let mut evict_tick: u8 = 0;
     loop {
         interval.tick().await;
+        let cur_gen = CACHE_WRITE_GEN.load(Ordering::Relaxed);
+        evict_tick = evict_tick.wrapping_add(1);
+        let force_evict = evict_tick == 0; // every 256 × 10ms ≈ 2.56 s
+        if cur_gen == last_gen && !force_evict {
+            continue; // nothing changed — skip the clone entirely
+        }
+        last_gen = cur_gen;
         let now = Instant::now();
         let new_snap: CacheSnapshot = mutable
             .iter()
