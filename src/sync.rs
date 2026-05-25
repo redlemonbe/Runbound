@@ -1710,6 +1710,10 @@ async fn handle_relay_request(
                 "healthy":   healthy,
             })))
         }
+        // ── Top-domain stats stub ────────────────────────────────────────────
+        ("GET", op) if op.starts_with("stats/top-domains") => {
+            Ok(json_ok(serde_json::json!({ "top_queried": [], "tracked_domains": 0 })))
+        }
         // ── System info (for WebUI node overview) ───────────────────────────
         ("GET", "system") => {
             let snap = relay.stats_cache.load();
@@ -1721,6 +1725,8 @@ async fn handle_relay_request(
                 "cpu_percent": serde_json::Value::Null,
                 "mem_avail_mb": serde_json::Value::Null,
                 "workers": 0u32,
+                "prefetch_enabled": relay.cfg.prefetch,
+                "dnssec_validation": relay.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed),
             })))
         }
         ("GET", op) if op.starts_with("cache") => {
