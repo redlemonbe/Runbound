@@ -245,6 +245,9 @@ pub struct UnboundConfig {
     // ── Dynamic DNS RFC 2136 (#14) ───────────────────────────────────────────────
     /// Enable DNS UPDATE (RFC 2136). Default: false.
     pub allow_update: bool,
+    /// Return empty NOERROR for HTTPS record queries (type 65) — prevents browsers
+    /// from using HTTP/3 when QUIC is blocked on the network. Default: false.
+    pub block_https_record: bool,
     /// TSIG keys for authorizing DNS UPDATEs: Vec of (name, algorithm, base64-secret).
     /// Algorithm: hmac-sha256 (recommended), hmac-sha512, hmac-sha1.
     /// Example config: tsig-key: "ddns-key" hmac-sha256 "base64secret=="
@@ -667,6 +670,7 @@ fn parse_server_directive(
         "resolv-fallback" => cfg.resolv_fallback = val.trim_matches('"') != "no",
         "serve-stale" => cfg.serve_stale = val.trim_matches('"') != "no",
         "allow-update" => cfg.allow_update = val.trim_matches('"') != "no",
+        "block-https-record" => cfg.block_https_record = val.trim_matches('"') == "yes",
         "tsig-key" => {
             // Format: "keyname" algorithm "base64secret"
             let parts: Vec<&str> = val.splitn(3, ' ').collect();
