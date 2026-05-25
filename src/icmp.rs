@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// ICMP echo responder — config types, stats, and BPF map accessors (#89).
+// ICMP echo responder — config types, stats, BPF map accessors, flood ban (#89).
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+use dashmap::DashMap;
 
 /// In-memory config mirroring the BPF `icmp_cfg_entry` map entry.
 #[derive(Clone, Debug)]
@@ -10,6 +14,8 @@ pub struct IcmpConfig {
     pub enabled: bool,
     pub rate_pps: u32,
     pub burst: u32,
+    /// Rate-limited packets from same IP within one poll cycle to trigger a ban.
+    pub ban_threshold: u32,
 }
 
 impl Default for IcmpConfig {
@@ -18,22 +24,87 @@ impl Default for IcmpConfig {
             enabled: false,
             rate_pps: 10,
             burst: 5,
+            ban_threshold: 100,
         }
     }
 }
 
-/// Rust-side counters populated by polling the BPF per-CPU array.
-/// Held in AppState; the poll task increments these from the BPF map.
-#[derive(Default)]
+#[derive(Clone, Debug, serde::Serialize)]
+pub enum BanSource {
+    IcmpFlood,
+    Manual,
+    Relay,
+}
+
+#[derive(Clone, Debug)]
+pub struct BanEntry {
+    pub ts: Instant,
+    pub src: BanSource,
+}
+
+/// Command sent to the XDP poll task to apply/remove a kernel-level ban.
+pub enum IcmpBanCmd {
+    Ban(Ipv4Addr),
+    Unban(Ipv4Addr),
+}
+
+/// Rust-side counters + ban tracking + channels for propagation.
+///
+/// # Channel design
+/// `ban_cmd_tx/rx`: created at construction time in `new()`.
+/// - NodeRelay and AppState clone `ban_cmd_tx` to forward ban commands.
+/// - The XDP poll task calls `ban_cmd_rx.lock().take()` once to own the receiver.
+///
+/// `ban_propagate_tx`: set once by `build_and_launch` (where sync_journal is
+/// available) to propagate new bans to slaves via relay.
 pub struct IcmpStats {
     pub handled: AtomicU64,
     pub replied: AtomicU64,
-    pub dropped: AtomicU64,
+    pub dropped: AtomicU64,  // = banned_drop (BPF stat index 2)
     pub rate_limited: AtomicU64,
+    /// IPs currently banned by flood detection or manual API call.
+    pub banned: DashMap<IpAddr, BanEntry, ahash::RandomState>,
+    /// Sender cloned by NodeRelay/AppState to forward ban commands to the poll task.
+    pub ban_cmd_tx: tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>,
+    /// Consumed once by the XDP poll task; None after that.
+    pub ban_cmd_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<IcmpBanCmd>>>,
+    /// Set once by build_and_launch to propagate new bans to slaves via relay.
+    pub ban_propagate_tx: OnceLock<tokio::sync::mpsc::UnboundedSender<IpAddr>>,
 }
 
 impl IcmpStats {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Arc::new(Self {
+            handled: AtomicU64::new(0),
+            replied: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            banned: DashMap::with_hasher(ahash::RandomState::default()),
+            ban_cmd_tx: tx,
+            ban_cmd_rx: Mutex::new(Some(rx)),
+            ban_propagate_tx: OnceLock::new(),
+        })
+    }
+
+    pub fn ban(&self, ip: IpAddr, src: BanSource) {
+        self.banned.insert(ip, BanEntry { ts: Instant::now(), src });
+    }
+
+    pub fn unban(&self, ip: IpAddr) {
+        self.banned.remove(&ip);
+    }
+
+    pub fn banned_snapshot(&self) -> Vec<serde_json::Value> {
+        let now = Instant::now();
+        self.banned.iter().map(|e| {
+            let ip = *e.key();
+            let entry = e.value();
+            serde_json::json!({
+                "ip": ip.to_string(),
+                "source": format!("{:?}", entry.src),
+                "banned_ago_s": now.duration_since(entry.ts).as_secs(),
+            })
+        }).collect()
     }
 }

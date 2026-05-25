@@ -215,6 +215,32 @@ impl AlertTracker {
     pub fn unblock(&self, ip: IpAddr) -> bool {
         self.blocked.remove(&ip).is_some()
     }
+
+    /// Immediately block an IP without going through a rule threshold.
+    /// Used by ICMP flood detector and relay propagation.
+    pub fn block_manual(&self, ip: IpAddr, rule: String) {
+        if self.is_blocked(ip) {
+            return;
+        }
+        self.blocked.insert(ip, BlockEntry { expires: None, rule: rule.clone() });
+        let event = AlertEvent {
+            ts: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            rule,
+            client_ip: ip.to_string(),
+            count: 0,
+            action: "block".to_string(),
+        };
+        tracing::warn!(ip = %ip, "IP manually blocked");
+        if let Ok(mut q) = self.recent.lock() {
+            if q.len() >= RECENT_ALERTS_CAP {
+                q.pop_front();
+            }
+            q.push_back(event);
+        }
+    }
 }
 
 async fn webhook_sender(

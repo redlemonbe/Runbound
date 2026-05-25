@@ -276,15 +276,25 @@ async fn async_main(
         }
     }
     // Spawn BPF stats poll task — runs every second, updates Rust atomics.
-    // Also pushes Rust config to BPF map so PUT /api/icmp/config takes effect.
+    // Also detects ICMP floods, applies XDP bans, and pushes config changes to BPF.
     #[cfg(feature = "xdp")]
     let _icmp_poll_task = {
         use std::sync::atomic::Ordering;
         let icmp_stats_poll = Arc::clone(&icmp_stats);
         let icmp_cfg_poll = Arc::clone(&icmp_cfg);
+        let alert_tracker_poll = Arc::clone(&alert_tracker);
+        // Take the receiver from IcmpStats (created in new(), consumed once here).
+        let mut ban_cmd_rx = icmp_stats
+            .ban_cmd_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("IcmpStats ban_cmd_rx already consumed");
         // Move the XDP handle into the poll task — keeps it alive and accessible.
         // DNS workers already have raw socket FDs and do not need this handle.
         let mut xdp_h = _xdp_handle;
+        // Local set of IPs currently banned in BPF — used to detect delta changes.
+        let mut bpf_banned: std::collections::HashSet<u32> = std::collections::HashSet::new();
         tokio::spawn(async move {
             let mut last_rate = 0u32;
             let mut last_enabled = false;
@@ -293,15 +303,72 @@ async fn async_main(
                 let Some(ref mut h) = xdp_h else {
                     break;
                 };
+
+                // Process ban/unban commands from API and relay handlers
+                while let Ok(cmd) = ban_cmd_rx.try_recv() {
+                    use crate::icmp::IcmpBanCmd;
+                    match cmd {
+                        IcmpBanCmd::Ban(ipv4) => {
+                            let be32 = u32::from(ipv4).to_be();
+                            if bpf_banned.insert(be32) {
+                                let _ = h.icmp_ban_ip(be32);
+                            }
+                        }
+                        IcmpBanCmd::Unban(ipv4) => {
+                            let be32 = u32::from(ipv4).to_be();
+                            if bpf_banned.remove(&be32) {
+                                let _ = h.icmp_unban_ip(be32);
+                            }
+                        }
+                    }
+                }
+
                 // Read stats from BPF per-CPU array
                 if let Ok(vals) = h.icmp_read_stats() {
                     icmp_stats_poll.handled.store(vals[0], Ordering::Relaxed);
                     icmp_stats_poll.replied.store(vals[1], Ordering::Relaxed);
                     icmp_stats_poll.dropped.store(vals[2], Ordering::Relaxed);
-                    icmp_stats_poll
-                        .rate_limited
-                        .store(vals[3], Ordering::Relaxed);
+                    icmp_stats_poll.rate_limited.store(vals[3], Ordering::Relaxed);
                 }
+
+                // Flood detection: read per-IP rate-limited counts, ban exceeding IPs
+                let ban_threshold = {
+                    let c = icmp_cfg_poll.lock().unwrap_or_else(|e| e.into_inner());
+                    c.ban_threshold
+                };
+                if let Ok(rl_hits) = h.icmp_read_and_reset_rl() {
+                    for (ip_be32, count) in rl_hits {
+                        if count < ban_threshold as u64 {
+                            continue;
+                        }
+                        // Convert BE32 to Ipv4Addr (ip_be32 is network byte order)
+                        let ipv4 = std::net::Ipv4Addr::from(u32::from_be(ip_be32));
+                        let ip_addr = std::net::IpAddr::V4(ipv4);
+                        if icmp_stats_poll.banned.contains_key(&ip_addr) {
+                            continue; // already banned
+                        }
+                        tracing::warn!(
+                            ip = %ipv4,
+                            rl_count = count,
+                            "ICMP flood detected — IP banned at XDP layer"
+                        );
+                        // Update in-memory ban list + AlertTracker
+                        icmp_stats_poll.ban(ip_addr, crate::icmp::BanSource::IcmpFlood);
+                        alert_tracker_poll.block_manual(
+                            ip_addr,
+                            "icmp-flood".to_string(),
+                        );
+                        // Apply XDP ban
+                        if bpf_banned.insert(ip_be32) {
+                            let _ = h.icmp_ban_ip(ip_be32);
+                        }
+                        // Propagate to slaves via relay
+                        if let Some(tx) = icmp_stats_poll.ban_propagate_tx.get() {
+                            let _ = tx.send(ip_addr);
+                        }
+                    }
+                }
+
                 // Push config changes to BPF map
                 let (enabled, rate_pps, burst) = {
                     let c = icmp_cfg_poll.lock().unwrap_or_else(|e| e.into_inner());
@@ -779,6 +846,27 @@ async fn build_and_launch(
     let domain_stats = DomainStats::new();
     let alert_tracker = crate::alerts::AlertTracker::new(cfg.alerts.clone());
 
+    // icmp state hoisted here so NodeRelay (slave relay) can reference it
+    let icmp_stats = IcmpStats::new();
+    let (icmp_en, icmp_rate, icmp_burst_val, icmp_ban_thr) = {
+        let p = base_dir.join("icmp.json");
+        std::fs::read_to_string(&p).ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(|v| (
+                v["enable"].as_bool().unwrap_or(cfg.icmp_enabled),
+                v["rate_limit"].as_u64().map(|x| x as u32).unwrap_or(cfg.icmp_rate_pps),
+                v["burst"].as_u64().map(|x| x as u32).unwrap_or(cfg.icmp_burst),
+                v["ban_threshold"].as_u64().map(|x| x as u32).unwrap_or(100),
+            ))
+            .unwrap_or((cfg.icmp_enabled, cfg.icmp_rate_pps, cfg.icmp_burst, 100))
+    };
+    let icmp_cfg = Arc::new(std::sync::Mutex::new(IcmpConfig {
+        enabled: icmp_en,
+        rate_pps: icmp_rate,
+        burst: icmp_burst_val,
+        ban_threshold: icmp_ban_thr,
+    }));
+
     // Slave node UUID — generated once, persisted to disk (#88).
     let node_id: Option<String> = if cfg.is_slave() {
         match sync::ensure_node_id() {
@@ -826,6 +914,10 @@ async fn build_and_launch(
                                     domain_stats: Arc::clone(&domain_stats),
                                     dnssec_enabled: Arc::clone(&dnssec_enabled),
                                     resolver: Arc::clone(&resolver),
+                                    icmp_stats: Arc::clone(&icmp_stats),
+                                    icmp_cfg: Arc::clone(&icmp_cfg),
+                                    base_dir: Arc::new(base_dir.clone()),
+                                    alert_tracker: Arc::clone(&alert_tracker),
                                 });
                                 let sk = key.clone();
                                 let cp = cert_pem.clone();
@@ -982,12 +1074,25 @@ async fn build_and_launch(
 
     let events_tx = sync_journal.as_ref().map(|j| j.events_tx.clone());
 
-    let icmp_stats = IcmpStats::new();
-    let icmp_cfg = Arc::new(std::sync::Mutex::new(IcmpConfig {
-        enabled: cfg.icmp_enabled,
-        rate_pps: cfg.icmp_rate_pps,
-        burst: cfg.icmp_burst,
-    }));
+    // Set up ICMP ban propagation: relay new bans to slaves.
+    // The poll task sends IpAddr values here; we push a PUT /alerts/blocked/{ip} to slaves.
+    if let (Some(ref j), Some(ref k)) = (&sync_journal, &sync_key_resolved) {
+        let (ban_tx, mut ban_rx) = tokio::sync::mpsc::unbounded_channel::<std::net::IpAddr>();
+        let _ = icmp_stats.ban_propagate_tx.set(ban_tx);
+        let j_arc = Arc::clone(j);
+        let k_str = k.clone();
+        tokio::spawn(async move {
+            while let Some(ip) = ban_rx.recv().await {
+                crate::api::relay::push_to_slaves(
+                    &j_arc,
+                    &k_str,
+                    axum::http::Method::PUT,
+                    format!("alerts/blocked/{ip}"),
+                    bytes::Bytes::new(),
+                );
+            }
+        });
+    }
 
     let state = AppState {
         zones: Arc::clone(&zones),

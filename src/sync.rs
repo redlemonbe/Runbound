@@ -1464,6 +1464,10 @@ pub struct NodeRelay {
     pub domain_stats: Arc<crate::domain_stats::DomainStats>,
     pub dnssec_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub resolver: crate::dns::server::SharedResolver,
+    pub icmp_stats: std::sync::Arc<crate::icmp::IcmpStats>,
+    pub icmp_cfg: std::sync::Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
+    pub base_dir: std::sync::Arc<std::path::PathBuf>,
+    pub alert_tracker: std::sync::Arc<crate::alerts::AlertTracker>,
 }
 
 /// Slave relay TLS server — listens on sync_port, handles /relay/* paths.
@@ -1795,7 +1799,74 @@ async fn handle_relay_request(
             Ok(json_ok(serde_json::json!({ "entries": 0, "hit_rate": 0.0 })))
         }
         // ── DNSSEC toggle propagation ────────────────────────────────────────
-        ("PATCH", "config") => {
+        ("GET", "icmp/stats") => {
+            use std::sync::atomic::Ordering::Relaxed;
+            Ok(json_ok(serde_json::json!({
+                "handled":      relay.icmp_stats.handled.load(Relaxed),
+                "replied":      relay.icmp_stats.replied.load(Relaxed),
+                "dropped":      relay.icmp_stats.dropped.load(Relaxed),
+                "rate_limited": relay.icmp_stats.rate_limited.load(Relaxed),
+            })))
+        }
+        ("GET", "icmp/config") => {
+            let cfg = relay.icmp_cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            Ok(json_ok(serde_json::json!({
+                "enable":     cfg.enabled,
+                "rate_limit": cfg.rate_pps,
+                "burst":      cfg.burst,
+            })))
+        }
+        ("PUT", "icmp/config") => {
+            #[derive(serde::Deserialize)]
+            struct IcmpPut { enable: Option<bool>, rate_limit: Option<u32>, burst: Option<u32>, ban_threshold: Option<u32> }
+            let p: IcmpPut = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") }))),
+            };
+            let (enabled, rate_pps, burst_v, ban_thr) = {
+                let mut cfg = relay.icmp_cfg.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(v) = p.enable         { cfg.enabled = v; }
+                if let Some(v) = p.rate_limit     { cfg.rate_pps = v; }
+                if let Some(v) = p.burst          { cfg.burst = v; }
+                if let Some(v) = p.ban_threshold  { cfg.ban_threshold = v; }
+                (cfg.enabled, cfg.rate_pps, cfg.burst, cfg.ban_threshold)
+            };
+            let _ = std::fs::write(
+                relay.base_dir.join("icmp.json"),
+                serde_json::json!({"enable":enabled,"rate_limit":rate_pps,"burst":burst_v,"ban_threshold":ban_thr}).to_string(),
+            );
+            Ok(json_ok(serde_json::json!({ "enable": enabled, "rate_limit": rate_pps, "burst": burst_v, "ban_threshold": ban_thr })))
+        }
+        // Ban propagation from master flood detector
+        ("PUT", op) if op.starts_with("alerts/blocked/") => {
+            let ip_str = op.trim_start_matches("alerts/blocked/");
+            match ip_str.parse::<std::net::IpAddr>() {
+                Err(_) => Ok(json_resp(400, serde_json::json!({ "error": "invalid IP" }))),
+                Ok(ip) => {
+                    relay.alert_tracker.block_manual(ip, "icmp-flood-relay".to_string());
+                    relay.icmp_stats.ban(ip, crate::icmp::BanSource::Relay);
+                    if let std::net::IpAddr::V4(ipv4) = ip {
+                        let _ = relay.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+                    }
+                    Ok(json_ok(serde_json::json!({ "ok": true, "ip": ip_str })))
+                }
+            }
+        }
+        ("DELETE", op) if op.starts_with("alerts/blocked/") => {
+            let ip_str = op.trim_start_matches("alerts/blocked/");
+            match ip_str.parse::<std::net::IpAddr>() {
+                Err(_) => Ok(json_resp(400, serde_json::json!({ "error": "invalid IP" }))),
+                Ok(ip) => {
+                    relay.alert_tracker.unblock(ip);
+                    relay.icmp_stats.unban(ip);
+                    if let std::net::IpAddr::V4(ipv4) = ip {
+                        let _ = relay.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+                    }
+                    Ok(json_ok(serde_json::json!({ "ok": true, "ip": ip_str })))
+                }
+            }
+        }
+                ("PATCH", "config") => {
             #[derive(serde::Deserialize)]
             struct ConfigPatch { dnssec_validation: Option<bool> }
             let p: ConfigPatch = match serde_json::from_slice(&body_bytes) {
