@@ -700,7 +700,7 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
     impl_tls_signature_verification!(TofuVerifier);
 }
 
-fn pinned_client_config(fingerprint: &str) -> rustls::ClientConfig {
+pub fn pinned_client_config(fingerprint: &str) -> rustls::ClientConfig {
     rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier {
@@ -982,6 +982,26 @@ async fn handle_sync_request(
                             return Ok(json_resp(400, serde_json::json!({
                                 "error": "INVALID_RELAY_HOST",
                                 "details": "link-local not allowed as relay_host"
+                            })));
+                        }
+                        // SEC-B2: reject ULA fc00::/7
+                        if (s[0] & 0xfe00) == 0xfc00 {
+                            return Ok(json_resp(400, serde_json::json!({
+                                "error": "INVALID_RELAY_HOST",
+                                "details": "unique-local (ULA) not allowed as relay_host"
+                            })));
+                        }
+                    }
+                    // SEC-B2: reject RFC 1918 private ranges
+                    std::net::IpAddr::V4(v4) => {
+                        let o = v4.octets();
+                        let is_private = o[0] == 10
+                            || (o[0] == 172 && (o[1] & 0xf0) == 16)
+                            || (o[0] == 192 && o[1] == 168);
+                        if is_private {
+                            return Ok(json_resp(400, serde_json::json!({
+                                "error": "INVALID_RELAY_HOST",
+                                "details": "private RFC 1918 address not allowed as relay_host"
                             })));
                         }
                     }
