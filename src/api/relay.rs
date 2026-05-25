@@ -230,7 +230,12 @@ pub async fn relay_forward_handler(
         }
     };
 
-    let tls = relay_tls_config();
+    // SEC-B1: use cert pinning when fingerprint is known (TOFU established at registration).
+    let tls = if let Some(fp) = &slave.cert_fingerprint {
+        Arc::new(crate::sync::pinned_client_config(fp))
+    } else {
+        relay_tls_config()
+    };
     match relay_request(&relay_host, tls, &method_str, &path, &sync_key, body).await {
         Ok((status, resp_bytes)) => {
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);

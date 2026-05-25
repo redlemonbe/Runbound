@@ -137,6 +137,7 @@ pub struct RunboundHandler {
     pub zones: Arc<ArcSwap<LocalZoneSet>>,
     resolver: Arc<ArcSwap<TokioResolver>>,
     rate_limiter: Arc<RateLimiter>,
+    alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
     inflight: Arc<Semaphore>,
     acl: Arc<Acl>,
     private_addrs: Arc<PrivateAddressSet>,
@@ -177,6 +178,7 @@ pub struct RunboundHandler {
     /// #14: TSIG keys for DNS UPDATE authentication: (name, algorithm, base64-secret).
     /// SEC-20: pre-decoded TSIG keys (name_lower, algorithm, key_bytes) — decoded once at startup.
     tsig_keys: Vec<(String, TsigAlgorithm, Vec<u8>)>,
+    axfr_allow: Vec<String>,
 }
 
 impl RunboundHandler {
@@ -209,11 +211,15 @@ impl RunboundHandler {
         stale_max_age: u64,
         allow_update: bool,
         tsig_keys_raw: Vec<(String, String, String)>,
+        alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
+        axfr_allow: Vec<String>,
     ) -> Self {
         Self {
             zones,
             resolver,
             rate_limiter,
+            alert_tracker,
+            axfr_allow,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS)),
             acl,
             private_addrs,
@@ -248,14 +254,14 @@ impl RunboundHandler {
                     "hmac-sha384" | "HMAC-SHA384" => TsigAlgorithm::HmacSha384,
                     "hmac-sha1"   | "HMAC-SHA1"   => TsigAlgorithm::HmacSha1,
                     other => {
-                        tracing::warn!(alg=%other, key=%name, "TSIG: unsupported algorithm, key ignored");
+                        tracing::error!(alg=%other, key=%name, "TSIG: unsupported algorithm — key will NOT be loaded, DDNS may be unprotected");
                         return None;
                     }
                 };
                 match base64::engine::general_purpose::STANDARD.decode(&secret_b64) {
                     Ok(bytes) => Some((name.to_ascii_lowercase(), alg, bytes)),
                     Err(e) => {
-                        tracing::warn!(key=%name, err=%e, "TSIG: base64 decode failed at startup, key ignored");
+                        tracing::error!(key=%name, err=%e, "TSIG: base64 decode failed — key will NOT be loaded, DDNS may be unprotected");
                         None
                     }
                 }
@@ -869,6 +875,22 @@ impl RequestHandler for RunboundHandler {
         self.stats.inc_total();
         self.domain_stats.inc(&qname.to_string());
 
+        // ── 0b. AXFR/IXFR zone transfer dispatch (#22) ────────────────
+        if qtype == RecordType::AXFR || qtype == RecordType::IXFR {
+            let axfr_zones = self.zones.load();
+            if !self.axfr_allow.is_empty() {
+                return crate::dns::axfr::handle_axfr(
+                    request,
+                    response_handle,
+                    &axfr_zones,
+                    client_ip,
+                    &qname.to_string(),
+                    &self.axfr_allow,
+                ).await;
+            }
+            return send_error(request, response_handle, ResponseCode::Refused).await;
+        }
+
         // ── 0a. RFC 2136 DNS UPDATE dispatch ────────────────────────────
         if request.metadata.op_code == OpCode::Update {
             if !self.allow_update {
@@ -931,6 +953,14 @@ impl RequestHandler for RunboundHandler {
                 start,
             );
             return send_error(request, response_handle, ResponseCode::Refused).await;
+        }
+
+        // ── 1b. Alert threshold check (#12) ────────────────────────────
+        if let Some(at) = &self.alert_tracker {
+            if at.record(client_ip) {
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
+                return send_error(request, response_handle, ResponseCode::Refused).await;
+            }
         }
 
         // ── 2. Concurrency cap (anti-OOM) ──────────────────────────────
@@ -1977,6 +2007,7 @@ pub async fn run_dns_server(
     per_upstream_resolvers: SharedResolversVec,
     racing_wins: Arc<DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
+    alert_tracker: Arc<crate::alerts::AlertTracker>,
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
@@ -2094,6 +2125,8 @@ pub async fn run_dns_server(
         cfg.stale_max_age,
         cfg.allow_update,
         cfg.tsig_keys.clone(),
+        Some(Arc::clone(&alert_tracker)),
+        cfg.axfr_allow.clone(),
     );
     let mut server = Server::new(handler);
 
