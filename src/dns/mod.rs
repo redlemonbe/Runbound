@@ -3,13 +3,13 @@ pub mod ddns;
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 pub mod acl;
 pub mod cache_snapshot;
+pub mod hasher;
 pub mod local;
 pub mod axfr;
 pub mod prefetch;
 pub mod ratelimit;
 pub mod server;
 pub mod xdp;
-pub mod hash;
 
 pub use acl::Acl;
 pub use local::ZoneAction;
