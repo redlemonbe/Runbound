@@ -48,6 +48,7 @@ MemoryDenyWriteExecute=no      # required for eBPF JIT compilation
 LimitNOFILE=131072             # 32× SO_REUSEPORT sockets + XDP sockets + DoT connections
 LimitNPROC=4096                # cap on XDP worker threads (max 64) + tokio pool
 LimitMEMLOCK=infinity          # required for AF_XDP UMEM mmap
+MemoryMax=2G                   # cgroup v2 memory cap — prevents runaway growth; adjust to your RAM
 
 # Optional: pre-allocate hugepages before Runbound starts (recommended in production)
 # Uncomment and adjust the count to match xdp-hugepages in runbound.conf
