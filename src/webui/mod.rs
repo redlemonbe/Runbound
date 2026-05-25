@@ -636,7 +636,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt as _;
 
-    fn app() -> Router { router(19999, "test-key".to_string(), std::path::PathBuf::from("/tmp")) }
+    fn app() -> Router { router(19999, "test-key".to_string(), std::path::PathBuf::from("/tmp"), String::new()) }
 
     async fn body_str(b: Body) -> String {
         String::from_utf8_lossy(&axum::body::to_bytes(b, usize::MAX).await.unwrap()).into_owned()

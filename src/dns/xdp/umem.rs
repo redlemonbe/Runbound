@@ -11,7 +11,7 @@
 // user space share these rings without any other synchronization mechanism.
 
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(dead_code)]
+
 
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
@@ -130,7 +130,6 @@ pub struct AddrRing {
     _mapsize: usize,
     producer: *mut u32,
     consumer: *mut u32,
-    flags: *mut u32,
     descs: *mut u64,
     pub size: u32,
     pub mask: u32,
@@ -197,37 +196,6 @@ impl AddrRing {
         out
     }
 
-    /// Like `dequeue_all` but appends into a caller-supplied Vec (avoids heap allocation).
-    /// The caller is responsible for clearing `out` before each call.
-    pub fn dequeue_all_into(&self, out: &mut Vec<u64>) {
-        fence(Ordering::Acquire);
-        // SAFETY: `self.producer` points into the mmap'd ring shared with the
-        //         kernel (see `mmap_addr_ring`). Acquire fence above ensures
-        //         we observe all descriptor writes before reading the counter.
-        let prod = unsafe { ptr::read_volatile(self.producer) };
-        // SAFETY: Same mapping; volatile read required for shared-memory ring.
-        let cons = unsafe { ptr::read_volatile(self.consumer) };
-        let available = prod.wrapping_sub(cons) as usize;
-        for i in 0..available {
-            let idx = (cons.wrapping_add(i as u32)) & self.mask;
-            // SAFETY: `idx` is masked to [0, size), within the mmap'd descriptor array.
-            out.push(unsafe { ptr::read_volatile(self.descs.add(idx as usize)) });
-        }
-        if available > 0 {
-            // SAFETY: `self.consumer` is valid; advances consumer to release slots.
-            unsafe {
-                ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32));
-            }
-        }
-    }
-
-    /// True if the kernel has set the NEED_WAKEUP flag on this ring.
-    pub fn needs_wakeup(&self) -> bool {
-        fence(Ordering::Acquire);
-        // SAFETY: `self.flags` points into the mmap'd ring region (see `mmap_addr_ring`).
-        //         Volatile read is required; the kernel may set this flag concurrently.
-        (unsafe { ptr::read_volatile(self.flags) } & XDP_RING_NEED_WAKEUP) != 0
-    }
 
     /// Read the current producer index (volatile).
     /// A non-zero value confirms the ring was seeded at startup.
@@ -253,34 +221,7 @@ pub struct DescRing {
 unsafe impl Send for DescRing {}
 
 impl DescRing {
-    /// Consume all pending RX descriptors.
-    pub fn consume_rx(&self) -> Vec<XdpDesc> {
-        fence(Ordering::Acquire);
-        // SAFETY: `self.producer` points into the mmap'd ring shared with the
-        //         kernel (see `mmap_desc_ring`). Acquire fence above ensures we
-        //         observe all descriptor writes before reading the counter.
-        let prod = unsafe { ptr::read_volatile(self.producer) };
-        // SAFETY: Same mapping; volatile read required for shared-memory ring.
-        let cons = unsafe { ptr::read_volatile(self.consumer) };
-        let available = prod.wrapping_sub(cons) as usize;
-        if available == 0 {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(available);
-        for i in 0..available {
-            let idx = (cons.wrapping_add(i as u32)) & self.mask;
-            // SAFETY: `idx` is masked to [0, size), so `self.descs.add(idx)` is
-            //         within the mmap'd XdpDesc array.
-            out.push(unsafe { ptr::read_volatile(self.descs.add(idx as usize)) });
-        }
-        // SAFETY: `self.consumer` is valid; advances consumer to release slots.
-        unsafe {
-            ptr::write_volatile(self.consumer, cons.wrapping_add(available as u32));
-        }
-        out
-    }
-
-    /// Like `consume_rx` but appends into a caller-supplied Vec (avoids heap allocation).
+    /// Consume all pending RX descriptors into a caller-supplied Vec (avoids heap allocation).
     /// The caller is responsible for clearing `out` before each call.
     /// Returns the number of descriptors consumed.
     pub fn consume_rx_into(&self, out: &mut Vec<XdpDesc>) -> usize {
@@ -542,19 +483,6 @@ impl Umem {
         Some(unsafe { slice::from_raw_parts_mut(self.area.add(offset as usize), len) })
     }
 
-    /// Get an immutable slice for the frame at the given UMEM offset.
-    /// Returns `None` if the bounds check fails (malformed kernel descriptor).
-    pub unsafe fn frame(&self, offset: u64, len: usize) -> Option<&[u8]> {
-        if (offset as usize).saturating_add(len) > self.area_len {
-            return None;
-        }
-        // SAFETY: The bounds check above ensures `offset + len <= area_len`, so
-        //         `self.area.add(offset)` through `+len` is within the mmap'd region.
-        //         The region is PROT_READ|PROT_WRITE; u8 has alignment 1.
-        //         Lifetime: the slice borrows `self` immutably for its duration.
-        Some(unsafe { slice::from_raw_parts(self.area.add(offset as usize), len) })
-    }
-
     /// Reclaim TX completion frames back into the free pool.
     pub fn reclaim_tx(&mut self) {
         for addr in self.comp.dequeue_all() {
@@ -696,7 +624,6 @@ unsafe fn mmap_addr_ring(
         _mapsize: mapsize,
         producer: unsafe { map.add(off.producer as usize) } as *mut u32,
         consumer: unsafe { map.add(off.consumer as usize) } as *mut u32,
-        flags: unsafe { map.add(off.flags as usize) } as *mut u32,
         descs: unsafe { map.add(off.desc as usize) } as *mut u64,
         size,
         mask: size - 1,

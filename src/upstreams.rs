@@ -396,7 +396,7 @@ pub fn remove_upstream(upstreams: &SharedUpstreams, id: &str) -> Option<Upstream
 
 /// #50: Rename an upstream in-place. Used in unit tests; production code
 /// patches fields directly in the handler to handle multiple fields atomically.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn patch_upstream_name(
     upstreams: &SharedUpstreams,
     id: &str,
