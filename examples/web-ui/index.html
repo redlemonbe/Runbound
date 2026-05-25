@@ -204,20 +204,12 @@
   .icmp-metric-card{display:flex;flex-direction:column;justify-content:space-between;min-height:80px}
   .icmp-metric-card .metric-value{margin-top:auto;line-height:1.2}
 
-  /* ── ICMP config form ── */
-  .icmp-config-row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:1rem;padding-top:12px;border-top:1px solid rgba(31,41,55,.4)}
+  /* ── ICMP config form : inputs + bouton sur la même ligne à 38px ── */
+  .icmp-config-row{display:flex;flex-wrap:wrap;align-items:flex-end;gap:16px;padding-top:12px;border-top:1px solid rgba(31,41,55,.4)}
+  .icmp-config-row .input{height:38px}
+  .icmp-config-row>.btn-primary,.icmp-config-row>.btn-secondary{height:38px;padding:0 14px;line-height:38px}
   .icmp-config-field{display:flex;flex-direction:column}
   .icmp-config-field .field-label{font-size:.75rem;color:#4b5563;margin-bottom:5px;line-height:1;white-space:nowrap}
-  /* number inputs : no spin buttons, compact, centré */
-  .icmp-num{width:64px;text-align:center;background:#070e1a;border:1px solid #1e293b;border-radius:6px;height:34px;color:#e2e8f0;font-size:13px;font-family:inherit;outline:none;transition:border-color .2s ease;-webkit-appearance:textfield;-moz-appearance:textfield;appearance:textfield}
-  .icmp-num:focus{border-color:#0e7490}
-  .icmp-num::-webkit-outer-spin-button,.icmp-num::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
-  /* bouton principal ICMP */
-  .icmp-btn-main{height:34px;padding:0 18px;background:#0e4f63;border:1px solid #1679a0;border-radius:6px;color:#e2e8f0;font-size:12px;font-family:inherit;cursor:pointer;transition:all .2s ease}
-  .icmp-btn-main:hover{background:#115f7a;border-color:#22d3ee66;color:#fff}
-  /* bouton secondaire ICMP outline */
-  .icmp-btn-outline{height:34px;padding:0 16px;background:transparent;border:1px solid #2d3f52;border-radius:6px;color:#64748b;font-size:12px;font-family:inherit;cursor:pointer;transition:all .2s ease}
-  .icmp-btn-outline:hover{border-color:#0e7490;color:#67e8f9}
 
   /* ── Bouton CA download : plus de volume ── */
   .btn-ca-dl{display:inline-block;padding:8px 18px;margin-bottom:18px}
@@ -561,18 +553,18 @@
       <div class="icmp-config-row">
         <div class="icmp-config-field">
           <span class="field-label">Rate (pps)</span>
-          <input type="number" id="prot-icmp-rate" min="1" max="10000" class="icmp-num"/>
+          <input type="number" id="prot-icmp-rate" min="1" max="10000" class="input w-24"/>
         </div>
         <div class="icmp-config-field">
           <span class="field-label">Burst</span>
-          <input type="number" id="prot-icmp-burst" min="1" max="500" class="icmp-num"/>
+          <input type="number" id="prot-icmp-burst" min="1" max="500" class="input w-20"/>
         </div>
         <div class="icmp-config-field">
           <span class="field-label">Ban after (pkts)</span>
-          <input type="number" id="prot-icmp-banthr" min="1" max="10000" class="icmp-num" style="width:78px"/>
+          <input type="number" id="prot-icmp-banthr" min="1" max="10000" class="input w-24"/>
         </div>
-        <button id="prot-icmp-toggle" onclick="toggleIcmp()" class="icmp-btn-main">—</button>
-        <button onclick="saveIcmpConfig()" class="icmp-btn-outline">Apply to all</button>
+        <button id="prot-icmp-toggle" onclick="toggleIcmp()" class="btn-primary text-xs">—</button>
+        <button onclick="saveIcmpConfig()" class="btn-secondary text-xs">Apply to all</button>
         <span id="prot-icmp-msg" class="text-xs self-center"></span>
       </div>
     </div>
