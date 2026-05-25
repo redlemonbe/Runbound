@@ -225,6 +225,7 @@
   <button role="tab" aria-selected="false" aria-controls="tab-logs"       class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
   <button role="tab" aria-selected="false" aria-controls="tab-system"     class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('system',this)">System</button>
   <button role="tab" aria-selected="false" aria-controls="tab-settings"   class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('settings',this)">Settings</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-protection" class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('protection',this)">Protection</button>
   <button role="tab" aria-selected="false" aria-controls="tab-about"      class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
 </nav>
 
@@ -505,6 +506,56 @@
       <div id="sys-slaves-list" class="text-sm text-gray-600 italic">—</div>
     </div>
     <div class="text-xs text-gray-800" id="sys-refreshed">—</div>
+  </div>
+
+  <!-- ═══ PROTECTION ═══ -->
+  <div id="tab-protection" class="hidden fade max-w-4xl mx-auto">
+
+    <!-- ICMP XDP Responder -->
+    <div class="card mb-4">
+      <div class="flex items-center justify-between mb-4">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">ICMP XDP Responder</span>
+        <div class="flex items-center gap-3">
+          <span id="prot-icmp-status" class="badge" style="background:#1a1a1a;color:#6b7280;border:1px solid #374151">—</span>
+          <button id="prot-icmp-toggle" onclick="toggleIcmp()" class="btn-secondary text-xs">—</button>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+        <div class="card"><div class="text-xs text-gray-600 mb-1">Handled</div><div id="prot-icmp-handled" class="text-xl tabular-nums text-white">—</div></div>
+        <div class="card"><div class="text-xs text-gray-600 mb-1">Replied</div><div id="prot-icmp-replied" class="text-xl tabular-nums text-green-400">—</div></div>
+        <div class="card"><div class="text-xs text-gray-600 mb-1">Rate limited</div><div id="prot-icmp-rl" class="text-xl tabular-nums text-yellow-500">—</div></div>
+        <div class="card"><div class="text-xs text-gray-600 mb-1">Dropped</div><div id="prot-icmp-dropped" class="text-xl tabular-nums text-red-400">—</div></div>
+      </div>
+      <div class="flex flex-wrap gap-4 items-end pt-3 border-t border-gray-800/40">
+        <div>
+          <div class="text-xs text-gray-600 mb-1.5">Rate limit (pps)</div>
+          <input type="number" id="prot-icmp-rate" min="1" max="10000" class="input w-28"/>
+        </div>
+        <div>
+          <div class="text-xs text-gray-600 mb-1.5">Burst</div>
+          <input type="number" id="prot-icmp-burst" min="1" max="500" class="input w-24"/>
+        </div>
+        <button onclick="saveIcmpConfig()" class="btn-secondary text-xs">Save config</button>
+        <span id="prot-icmp-msg" class="text-xs"></span>
+      </div>
+    </div>
+
+    <!-- DDoS Alerts -->
+    <div class="card">
+      <div class="flex items-center justify-between mb-4">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">DDoS Alerts</span>
+        <button onclick="loadProtection()" class="btn-secondary text-xs">↻ Refresh</button>
+      </div>
+      <div class="mb-4">
+        <div class="text-xs text-gray-600 mb-2">Blocked IPs</div>
+        <div id="prot-blocked"><span class="text-gray-700 italic text-sm">—</span></div>
+      </div>
+      <div>
+        <div class="text-xs text-gray-600 mb-2">Recent alerts</div>
+        <div id="prot-alerts" class="space-y-0.5" style="max-height:280px;overflow-y:auto"><span class="text-gray-700 italic text-sm">—</span></div>
+      </div>
+    </div>
+
   </div>
 
   <!-- ═══ ABOUT ═══ -->
@@ -1229,7 +1280,7 @@ function toast(msg,err=false){const el=document.getElementById('toast');el.textC
 
 function showTab(name,btn){
   if(name!=='logs'){clearInterval(logsTimer);logsTimer=null;const cb=document.getElementById('logs-auto');if(cb)cb.checked=false;}
-  ['overview','dns','blacklist','feeds','upstreams','logs','system','about','settings'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
+  ['overview','dns','blacklist','feeds','upstreams','logs','system','protection','about','settings'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
   document.querySelectorAll('.tab-active').forEach(b=>{b.classList.remove('tab-active');b.setAttribute('aria-selected','false');});
   const el=document.getElementById('tab-'+name);el.classList.remove('hidden');el.classList.add('fade');
   btn.classList.add('tab-active');btn.setAttribute('aria-selected','true');
@@ -1239,7 +1290,108 @@ function showTab(name,btn){
   if(name==='upstreams'){loadUpstreamPresets();loadUpstreams();}
   if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
+  if(name==='protection'){loadProtection();}
   if(name==='settings'){initDnssecToggle();loadAuthEvents();}
+}
+
+
+// ══════════════════════════════════════════════
+// Protection tab — ICMP + DDoS alerts
+// ══════════════════════════════════════════════
+async function loadProtection() {
+  const nodeId = selectedNode === 'all' ? 'master' : selectedNode;
+  try {
+    const s = await nodeApi(nodeId, 'GET', '/icmp/stats');
+    document.getElementById('prot-icmp-handled').textContent = fmt(s.handled ?? 0);
+    document.getElementById('prot-icmp-replied').textContent  = fmt(s.replied ?? 0);
+    document.getElementById('prot-icmp-rl').textContent       = fmt(s.rate_limited ?? 0);
+    document.getElementById('prot-icmp-dropped').textContent  = fmt(s.dropped ?? 0);
+  } catch(_) {}
+  try {
+    const c = await nodeApi(nodeId, 'GET', '/icmp/config');
+    const en = c.enable ?? false;
+    const badge  = document.getElementById('prot-icmp-status');
+    const toggle = document.getElementById('prot-icmp-toggle');
+    badge.textContent = en ? 'ENABLED' : 'DISABLED';
+    badge.style.cssText = en
+      ? 'background:#052e16;color:#4ade80;border:1px solid #166534'
+      : 'background:#1a1a1a;color:#6b7280;border:1px solid #374151';
+    toggle.textContent = en ? 'Disable' : 'Enable';
+    toggle._icmpEnabled = en;
+    document.getElementById('prot-icmp-rate').value  = c.rate_limit ?? 10;
+    document.getElementById('prot-icmp-burst').value = c.burst ?? 5;
+  } catch(_) {}
+  try {
+    const a = await nodeApi('master', 'GET', '/alerts');
+    renderBlockedIps(a.blocked_clients ?? []);
+    renderAlertsList(a.recent_alerts ?? []);
+  } catch(_) {}
+}
+
+async function toggleIcmp() {
+  const toggle = document.getElementById('prot-icmp-toggle');
+  const en   = !toggle._icmpEnabled;
+  const rate = parseInt(document.getElementById('prot-icmp-rate').value)  || 10;
+  const burst= parseInt(document.getElementById('prot-icmp-burst').value) || 5;
+  const nodeId = selectedNode === 'all' ? 'master' : selectedNode;
+  try {
+    await nodeApi(nodeId, 'PUT', '/icmp/config', {enable: en, rate_limit: rate, burst});
+    showProtMsg(en ? 'ICMP responder enabled' : 'ICMP responder disabled');
+    loadProtection();
+  } catch(e) { showProtMsg('Error: ' + e.message, true); }
+}
+
+async function saveIcmpConfig() {
+  const toggle = document.getElementById('prot-icmp-toggle');
+  const en   = toggle._icmpEnabled ?? false;
+  const rate = parseInt(document.getElementById('prot-icmp-rate').value)  || 10;
+  const burst= parseInt(document.getElementById('prot-icmp-burst').value) || 5;
+  const nodeId = selectedNode === 'all' ? 'master' : selectedNode;
+  try {
+    await nodeApi(nodeId, 'PUT', '/icmp/config', {enable: en, rate_limit: rate, burst});
+    showProtMsg('Config saved');
+  } catch(e) { showProtMsg('Error: ' + e.message, true); }
+}
+
+async function unblockIp(ip) {
+  try {
+    await nodeApi('master', 'DELETE', '/alerts/blocked/' + encodeURIComponent(ip));
+    loadProtection();
+  } catch(e) { showProtMsg('Unblock failed: ' + e.message, true); }
+}
+
+function showProtMsg(msg, err=false) {
+  const el = document.getElementById('prot-icmp-msg');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = err ? '#f87171' : '#4ade80';
+  setTimeout(() => { if(el.textContent===msg) el.textContent=''; }, 3000);
+}
+
+function renderBlockedIps(list) {
+  const el = document.getElementById('prot-blocked');
+  if (!list.length) { el.innerHTML = '<span class="text-gray-700 italic text-sm">No blocked IPs</span>'; return; }
+  el.innerHTML = list.map(ip => `<div class="flex items-center justify-between py-1.5 border-b border-gray-800/40 text-sm">
+    <span class="font-mono text-red-400">${esc(ip)}</span>
+    <button onclick="unblockIp(${JSON.stringify(ip)})" class="btn-secondary text-xs">Unblock</button>
+  </div>`).join('');
+}
+
+function renderAlertsList(list) {
+  const el = document.getElementById('prot-alerts');
+  if (!list.length) { el.innerHTML = '<span class="text-gray-700 italic text-sm">No recent alerts</span>'; return; }
+  el.innerHTML = list.slice().reverse().map(a => {
+    const ts = a.ts ? new Date(a.ts*1000).toLocaleTimeString() : '?';
+    const kind = esc(a.kind ?? a.alert_type ?? '?');
+    const src  = esc(a.src ?? a.source_ip ?? '?');
+    const msg  = esc(a.detail ?? a.message ?? '');
+    return `<div class="flex items-center gap-3 py-1 border-b border-gray-800/30 text-xs">
+      <span class="text-gray-700 shrink-0 tabular-nums w-20">${ts}</span>
+      <span class="badge shrink-0" style="background:#2a1010;color:#f87171;border:1px solid #7f1d1d">${kind}</span>
+      <span class="font-mono text-gray-400 shrink-0">${src}</span>
+      <span class="text-gray-600 truncate">${msg}</span>
+    </div>`;
+  }).join('');
 }
 
 // ══════════════════════════════════════════════

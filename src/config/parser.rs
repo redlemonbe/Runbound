@@ -255,6 +255,12 @@ pub struct UnboundConfig {
     pub ui_port: u16,
     /// Bind address for the web UI listener. Default: 0.0.0.0.
     pub ui_bind: String,
+    /// Enable TLS on the web UI listener. Default: true.
+    pub ui_tls: bool,
+    /// Path to TLS certificate PEM for the web UI. Empty = auto-generated self-signed.
+    pub ui_cert: String,
+    /// Path to TLS private key PEM for the web UI. Empty = auto-generated self-signed.
+    pub ui_key: String,
 
     // ── UDP socket options (#20) ─────────────────────────────────────────────
     /// Enable SO_BUSY_POLL + SO_PREFER_BUSY_POLL on UDP sockets. Default: false.
@@ -316,6 +322,9 @@ impl UnboundConfig {
             ui_enabled: false,
             ui_port: 8090,
             ui_bind: "0.0.0.0".to_owned(),
+            ui_tls: true,
+            ui_cert: String::new(),
+            ui_key: String::new(),
             icmp_enabled: false,
             icmp_rate_pps: 10,
             icmp_burst: 5,
@@ -647,6 +656,9 @@ fn parse_server_directive(
         "ui-enabled" => cfg.ui_enabled = val.trim_matches('"') == "yes",
         "ui-port" => cfg.ui_port = val.parse().unwrap_or(8090),
         "ui-bind" => cfg.ui_bind = val.trim_matches('"').to_owned(),
+        "ui-tls"  => cfg.ui_tls = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
+        "ui-cert" => cfg.ui_cert = val.trim().trim_matches('"').to_owned(),
+        "ui-key"  => cfg.ui_key  = val.trim().trim_matches('"').to_owned(),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }

@@ -437,6 +437,91 @@ async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> 
     }
 }
 
+// ── WebUI TLS cert management ────────────────────────────────────────────────
+
+/// Load cert+key from configured paths, or auto-generate a self-signed cert.
+/// Returns (cert_pem, key_pem, expires_at).
+pub fn ensure_webui_cert(
+    cert_path: &str,
+    key_path: &str,
+    base_dir: &std::path::Path,
+) -> anyhow::Result<(String, String, std::time::SystemTime)> {
+    // File mode: both paths configured and files exist → load
+    if !cert_path.is_empty() && !key_path.is_empty() {
+        if let (Ok(cert), Ok(key)) = (
+            std::fs::read_to_string(cert_path),
+            std::fs::read_to_string(key_path),
+        ) {
+            // Conservative expiry estimate for file-mode certs (renewal triggered by mtime change)
+            let expires = std::time::SystemTime::now()
+                + std::time::Duration::from_secs(90 * 24 * 3600);
+            tracing::info!(cert=%cert_path, "WebUI TLS: loaded cert from file");
+            return Ok((cert, key, expires));
+        }
+    }
+    gen_webui_cert(cert_path, key_path, base_dir)
+}
+
+fn gen_webui_cert(
+    cert_path: &str,
+    key_path: &str,
+    base_dir: &std::path::Path,
+) -> anyhow::Result<(String, String, std::time::SystemTime)> {
+    tracing::info!("WebUI TLS: generating self-signed certificate (365 days)");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let not_before = rcgen::date_time_ymd(1970, 1, 1)
+        + std::time::Duration::from_secs(now.saturating_sub(60));
+    let not_after  = not_before + std::time::Duration::from_secs(366 * 24 * 3600);
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .map_err(|e| anyhow::anyhow!("webui cert params: {e}"))?;
+    params.not_before = not_before;
+    params.not_after  = not_after;
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| anyhow::anyhow!("webui key gen: {e}"))?;
+    let cert = params.self_signed(&key_pair)
+        .map_err(|e| anyhow::anyhow!("webui cert sign: {e}"))?;
+    let rcgen::CertifiedKey { cert, key_pair } = rcgen::CertifiedKey { cert, key_pair };
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+
+    // Save to configured paths, or default base_dir locations
+    let save_cert = if !cert_path.is_empty() {
+        std::path::PathBuf::from(cert_path)
+    } else {
+        base_dir.join("webui-cert.pem")
+    };
+    let save_key = if !key_path.is_empty() {
+        std::path::PathBuf::from(key_path)
+    } else {
+        base_dir.join("webui-key.pem")
+    };
+    let _ = std::fs::create_dir_all(base_dir);
+    if let Err(e) = std::fs::write(&save_cert, &cert_pem) {
+        tracing::warn!(path=%save_cert.display(), err=%e, "Could not save WebUI cert");
+    }
+    if let Err(e) = std::fs::write(&save_key, &key_pem) {
+        tracing::warn!(path=%save_key.display(), err=%e, "Could not save WebUI key");
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&save_key, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    let expires = std::time::SystemTime::now()
+        + std::time::Duration::from_secs(365 * 24 * 3600);
+    tracing::info!(
+        cert=%save_cert.display(),
+        key=%save_key.display(),
+        "WebUI TLS certificate saved"
+    );
+    Ok((cert_pem, key_pem, expires))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
