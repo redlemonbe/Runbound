@@ -189,6 +189,13 @@
   .del:hover{background:#3b0a0a40;border-color:#7f1d1d}
   .edit-btn{color:#374151;cursor:pointer;font-size:11px;padding:2px 6px;border:1px solid #1e293b;border-radius:4px;transition:color .1s}
   .edit-btn:hover{color:#94a3b8;border-color:#374151}
+  /* ── Slave cards grid ── */
+  .slave-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+  .slave-card{background:#0c1525;border:1px solid #1e293b;border-radius:8px;padding:14px}
+  .slave-card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid rgba(31,41,55,.55)}
+  .slave-metrics{display:flex;flex-direction:column;gap:7px;font-size:.8125rem}
+  .slave-metrics .row-m{display:flex;justify-content:space-between;align-items:center;gap:8px}
+
   /* ── ICMP metric cards : flex vertical, titre haut / valeur bas ── */
   .icmp-metric-card{display:flex;flex-direction:column;justify-content:space-between;min-height:80px}
   .icmp-metric-card .metric-value{margin-top:auto;line-height:1.2}
@@ -522,11 +529,13 @@
     <div class="card max-w-4xl mx-auto mb-3">
       <div class="flex items-center justify-between mb-3">
         <div class="text-xs text-gray-600 uppercase tracking-wide">Sync / Slaves</div>
-        <button onclick="loadSlaves()" class="btn-secondary text-xs">↻ Refresh</button>
+        <div class="flex items-center gap-3">
+          <span id="sys-refreshed" class="text-xs text-gray-700 font-mono tabular-nums"></span>
+          <button onclick="loadSlaves()" class="btn-secondary text-xs">↻ Refresh</button>
+        </div>
       </div>
       <div id="sys-slaves-list" class="text-sm text-gray-600 italic">—</div>
     </div>
-    <div class="text-xs text-gray-800" id="sys-refreshed">—</div>
   </div>
 
   <!-- ═══ PROTECTION ═══ -->
@@ -1247,7 +1256,6 @@ async function loadSystem(){
     set('sys-mem-total',s.mem_total_mb!=null?s.mem_total_mb.toLocaleString()+' MB':'—');
     set('sys-mem-avail',s.mem_avail_mb!=null?s.mem_avail_mb.toLocaleString()+' MB':'—');
     if(s.cache_entries!=null)set('sys-cache-entries',s.cache_entries.toLocaleString());
-    set('sys-refreshed','updated '+new Date().toLocaleTimeString());
   }catch(_){}
   try{
     const c = n.cache ?? await nodeApi(nId,'GET','/cache/stats');
@@ -1262,23 +1270,53 @@ async function loadSlaves(){
   const el=document.getElementById('sys-slaves-list');
   try{
     const d=await api('GET','/sync/slaves'),slaves=d.slaves??[];
-    if(!slaves.length){el.innerHTML=d.note?`<span class="text-gray-700">${esc(d.note)}</span>`:'<span class="text-gray-700">No slaves connected.</span>';return;}
+    if(!slaves.length){el.innerHTML=d.note?`<span class="text-gray-700">${esc(d.note)}</span>`:'<span class="text-gray-700">No slaves connected.</span>';set('sys-refreshed','updated '+new Date().toLocaleTimeString());return;}
     const now=Math.floor(Date.now()/1000);
     const byIp={};slaves.forEach(s=>{const ip=s.addr.replace(/:\d+$/,'');if(!byIp[ip]||s.last_seen_secs>byIp[ip].last_seen_secs)byIp[ip]=s;});
     const deduped=Object.values(byIp);
     const elapsed=s=>Math.max(0,now-(s.last_seen_secs??0));
     const connStatus=s=>{const e=elapsed(s);return e<30?'synced':e<120?'stale':'offline';};
-    const syncTime=s=>{if(!s.last_seen_secs)return'—';return new Date(s.last_seen_secs*1000).toLocaleTimeString('fr-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});};
-    const badge=st=>st==='synced'?'<span class="text-xs font-semibold text-green-400">✓ synced</span>':st==='stale'?'<span class="text-xs font-semibold text-yellow-400">● stale</span>':'<span class="text-xs font-semibold text-red-400">✗ offline</span>';
+    const syncTime=s=>{if(!s.last_seen_secs)return'—';return new Date(s.last_seen_secs*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});};
+    const statusBadge=st=>st==='synced'
+      ?'<span class="text-xs font-semibold text-green-400">● synced</span>'
+      :st==='stale'
+        ?'<span class="text-xs font-semibold text-yellow-400">● stale</span>'
+        :'<span class="text-xs font-semibold text-red-400">● offline</span>';
     // Fetch system info for each slave via relay (best-effort)
-    const slaveSystemData = {};
-    await Promise.all(deduped.map(async s => {
-      const ip = s.addr.replace(/:\d+$/, '');
-      const nid = Object.keys(nodes).find(k => k === ip);
-      if (!nid || !nodes[nid]) return;
-      try { slaveSystemData[ip] = await nodeApi(nid, 'GET', '/system'); } catch(_) {}
+    const slaveSystemData={};
+    await Promise.all(deduped.map(async s=>{
+      const ip=s.addr.replace(/:\d+$/,'');
+      const nid=Object.keys(nodes).find(k=>k===ip);
+      if(!nid||!nodes[nid])return;
+      try{slaveSystemData[ip]=await nodeApi(nid,'GET','/system');}catch(_){}
     }));
-    el.innerHTML=deduped.map(s=>{const st=s.status==='connected'?'synced':s.status??connStatus(s),ip=s.addr.replace(/:\d+$/,'');const sys=slaveSystemData[ip];const ver=(sys?.version??s.version)?`<span class="text-gray-700 text-xs font-mono">${esc(sys?.version??s.version)}</span>`:'';const zones=s.zones_synced!=null?`<span class="text-gray-600 text-xs">${s.zones_synced} zones</span>`:'';const xdp=sys?`<span class="text-gray-600 text-xs">${sys.xdp_active?'XDP '+esc(sys.xdp_mode??'on'):'XDP off'}</span>`:'';const cpu=sys?.cpu_percent!=null?`<span class="text-gray-600 text-xs">CPU ${sys.cpu_percent.toFixed(1)}%</span>`:'';const mem=sys?.mem_avail_mb!=null?`<span class="text-gray-600 text-xs">${sys.mem_avail_mb.toLocaleString()} MB free</span>`:'';return`<div class="flex items-center gap-3 py-1.5 border-b border-gray-800/40"><span class="text-cyan-300 font-mono text-xs w-32 shrink-0">${esc(ip)}</span>${ver}${zones}${xdp}${cpu}${mem}<span class="flex-1"></span><span class="w-24 text-right">${badge(st)}</span><span class="text-gray-600 text-xs w-20 text-right font-mono">${syncTime(s)}</span></div>`;}).join('');
+    el.innerHTML='<div class="slave-cards">'+deduped.map(s=>{
+      const st=s.status==='connected'?'synced':s.status??connStatus(s);
+      const ip=s.addr.replace(/:\d+$/,'');
+      const sys=slaveSystemData[ip];
+      const ver=sys?.version??s.version;
+      const cpuPct=sys?.cpu_percent!=null?sys.cpu_percent.toFixed(1)+' %':'—';
+      const memUsed=sys?.mem_total_mb!=null&&sys?.mem_avail_mb!=null
+        ?(sys.mem_total_mb-sys.mem_avail_mb).toLocaleString()+' / '+sys.mem_total_mb.toLocaleString()+' MB':'—';
+      const xdpBadge=sys
+        ?(sys.xdp_active?`<span class="badge badge-xdp-on">${esc(sys.xdp_mode??'active')}</span>`:'<span class="badge badge-xdp-off">off</span>')
+        :'<span class="text-gray-700">—</span>';
+      return`<div class="slave-card">
+  <div class="slave-card-hdr">
+    <span class="text-cyan-300 font-mono text-xs">${esc(ip)}</span>
+    ${statusBadge(st)}
+  </div>
+  <div class="slave-metrics">
+    <div class="row-m"><span class="text-gray-500">Version</span><span class="text-cyan-300 font-mono">${ver?esc(ver):'—'}</span></div>
+    <div class="row-m"><span class="text-gray-500">CPU usage</span><span class="text-yellow-500 tabular-nums">${cpuPct}</span></div>
+    <div class="row-m"><span class="text-gray-500">Memory used</span><span class="text-green-400 tabular-nums">${memUsed}</span></div>
+    <div class="row-m"><span class="text-gray-500">XDP</span>${xdpBadge}</div>
+    <div class="row-m"><span class="text-gray-500">Zones synced</span><span class="text-gray-300 tabular-nums">${s.zones_synced??'—'}</span></div>
+    <div class="row-m"><span class="text-gray-500">Last sync</span><span class="text-gray-400 font-mono">${syncTime(s)}</span></div>
+  </div>
+</div>`;
+    }).join('')+'</div>';
+    set('sys-refreshed','updated '+new Date().toLocaleTimeString());
   }catch(_){if(el)el.innerHTML='<span class="text-gray-700 italic">Slave info unavailable.</span>';}
 }
 async function cacheFlush(){const btn=document.getElementById('btn-flush');try{const r=await api('POST','/cache/flush');toast(`Cache flushed — ${r.flushed_entries??0} entries cleared`);if(btn){btn.disabled=true;btn.classList.add('opacity-30','cursor-not-allowed');setTimeout(()=>{btn.disabled=false;btn.classList.remove('opacity-30','cursor-not-allowed');},60000);}loadSystem();}catch(e){toast(e.message.includes('FLUSH_COOLDOWN')||e.message.includes('429')?'Cache flush on cooldown (60 s)':'Flush failed: '+e.message,true);}}
