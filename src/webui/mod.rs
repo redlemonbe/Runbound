@@ -166,13 +166,7 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     .card{position:relative;z-index:1;background:rgba(6,11,20,.94);backdrop-filter:blur(14px);border:1px solid rgba(34,211,238,.1);border-top:1px solid rgba(34,211,238,.28);border-radius:12px;padding:38px;width:100%;max-width:380px;box-sizing:border-box;margin:0 16px;box-shadow:0 32px 64px rgba(0,0,0,.65),0 0 0 1px rgba(34,211,238,.03);animation:fade-in .35s ease-out}
     .logo{color:#22d3ee;font-size:20px;font-weight:700;letter-spacing:.14em;display:inline-block}
     .cursor{display:inline-block;color:#22d3ee;animation:blink 1.1s step-end infinite;margin-left:1px}
-    input{display:block;width:100%;background:#030609;border:1px solid #152030;color:#e2e8f0 !important;border-radius:6px;padding:9px 13px;font-size:13px;outline:none;box-sizing:border-box;font-family:inherit;margin:0;transition:border-color .15s,box-shadow .15s}
-    input:focus{border-color:#22d3ee;box-shadow:0 0 0 2px rgba(34,211,238,.12)}
-    input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus,input:-webkit-autofill:active{-webkit-text-fill-color:#e2e8f0 !important;-webkit-box-shadow:0 0 0px 1000px #030609 inset !important;transition:background-color 5000s ease-in-out 0s;caret-color:#e2e8f0}
-    button{display:block;width:100%;background:#0e4f63;color:#e2e8f0;border:1px solid #0e6680;border-radius:6px;padding:10px 14px;cursor:pointer;font-size:13px;font-family:inherit;transition:background .15s;margin-top:4px}
-    button:hover{background:#0f6b89}
 
-    label{display:block;color:#3d5a6e;font-size:10px;text-transform:uppercase;letter-spacing:.12em;margin-bottom:7px}
   </style>
 </head>
 <body>
@@ -183,14 +177,14 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     </div>
     <form method="POST" action="/login">
       <div style="margin-bottom:16px">
-        <label for="u">Username</label>
-        <input id="u" name="username" type="text" autocomplete="username"/>
+        <label for="u" class="text-xs text-gray-500 block mb-1">Username</label>
+        <input id="u" name="username" type="text" autocomplete="username" class="input w-full"/>
       </div>
       <div style="margin-bottom:26px">
-        <label for="p">Password</label>
-        <input id="p" name="password" type="password" autocomplete="current-password"/>
+        <label for="p" class="text-xs text-gray-500 block mb-1">Password</label>
+        <input id="p" name="password" type="password" autocomplete="current-password" class="input w-full"/>
       </div>
-      <button type="submit">Sign in &#8594;</button>
+      <button type="submit" class="btn-primary w-full mt-2">Sign in →</button>
     </form>
     <div id="err" style="color:#f87171;font-size:12px;text-align:center;margin-top:16px;min-height:16px"></div>
     <div style="color:#0c1a24;font-size:10px;text-align:center;margin-top:26px">Delete webui-auth.conf to reset credentials</div>
