@@ -28,7 +28,7 @@ At the end you'll see your API key and the service URL:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Version:  runbound 0.9.16
+ Version:  runbound 0.9.29
  API key:  a1b2c3d4...   ← save this
  Config:   /etc/runbound/runbound.conf
  Logs:     journalctl -u runbound -f
@@ -85,7 +85,7 @@ dig @127.0.0.1 google.com
 # Verify the API is reachable:
 curl -s http://localhost:8080/api/system \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
-# → {"version":"0.9.16","uptime_secs":3,...}
+# → {"version":"0.9.29","uptime_secs":3,...}
 ```
 
 ---
@@ -161,48 +161,21 @@ Your config and data in `/etc/runbound` and `/var/lib/runbound` are kept.
 
 ## Web management console
 
-Runbound includes an embedded web UI served on port 8090 (enable with `ui-enabled: yes`
-in the config), or you can use nginx as a reverse proxy.
-
-**Option A — embedded server (simplest):**
+Runbound includes an embedded web UI with HTTPS (since v0.9.24). Enable it in the config:
 
 ```
 server:
     ui-enabled: yes
-    ui-port:    8090
+    ui-port:    8091
 ```
 
-Restart Runbound, then open `http://YOUR_SERVER_IP:8090`.
+Restart Runbound, then open `https://YOUR_SERVER_IP:8091`.
 
-**Option B — nginx reverse proxy:**
+On first access your browser will warn about the self-signed certificate.  
+**One-time fix:** download the Runbound CA at `https://YOUR_SERVER_IP:8091/webui/ca.crt`
+and add it to your OS / browser trust store — no more warnings on any device on your network.
 
-```bash
-sudo apt install nginx
-
-sudo tee /etc/nginx/sites-enabled/runbound-ui << 'EOF'
-server {
-    listen 8090;
-    server_name _;
-    root /var/www/runbound-ui;
-    index index.html;
-
-    location / {
-        try_files $uri $uri/ =404;
-    }
-
-    location /api/ {
-        proxy_pass         http://127.0.0.1:8080;
-        proxy_http_version 1.0;
-        proxy_set_header   Host $host;
-        proxy_read_timeout 30s;
-    }
-}
-EOF
-
-sudo systemctl reload nginx
-```
-
-Open `http://YOUR_SERVER_IP:8090`, enter your API key, click **Connect**.
+Enter your API key, click **Connect**.
 
 Full setup guide: [web-ui.md](web-ui.md).
 
