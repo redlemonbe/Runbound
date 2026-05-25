@@ -537,8 +537,9 @@ async function loadAll() {
     clearInterval(syncTimer);  syncTimer  = setInterval(discoverSlaves, 15000);
     pollAllSys();
     discoverSlaves();
+    toast('Connected');
     initSparkline();
-  } catch(e) { setConn(false, e.message); }
+  } catch(e) { setConn(false, e.message); toast('Connection failed: '+e.message, true); }
 }
 
 async function discoverSlaves() {
@@ -1159,6 +1160,69 @@ function initSparkline() {
         }).catch(() => { scheduleSpkReconnect(); });
       })();
     }).catch(() => { scheduleSpkReconnect(); });
+}
+
+function _spkPush(qps) {
+  QPS_BUF.push(qps);
+  if (QPS_BUF.length > QPS_N) QPS_BUF.shift();
+  _spkRender();
+}
+
+function _spkRender() {
+  const el = document.getElementById('qps-sparkline-svg');
+  if (!el || QPS_BUF.length < 2) return;
+  const W=480, H=52, P=4;
+  const max = Math.max(...QPS_BUF, 0.1);
+  const xs = i => (P + (i / (QPS_N - 1)) * (W - P*2)).toFixed(1);
+  const ys = v => (H - P - (v / max) * (H - P*2 - 2)).toFixed(1);
+  const pts = QPS_BUF.map((v, i) => xs(QPS_BUF.length <= 1 ? 0 : i * (QPS_N-1) / (QPS_BUF.length-1)) + ',' + ys(v)).join(' ');
+  const lastX = xs(QPS_N - 1);
+  el.innerHTML =
+    '<defs><linearGradient id="spk-grad" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0%" stop-color="#22d3ee" stop-opacity="0.18"/>' +
+    '<stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/></linearGradient></defs>' +
+    '<polyline fill="url(#spk-grad)" stroke="none" points="' + P + ',' + (H-P) + ' ' + pts + ' ' + lastX + ',' + (H-P) + '"/>' +
+    '<polyline fill="none" stroke="#22d3ee" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/>';
+  const pk = document.getElementById('qps-chart-peak');
+  if (pk) pk.textContent = max >= 1000 ? (max/1000).toFixed(1) + 'k' : max.toFixed(0);
+}
+
+// ══════════════════════════════════════════════
+// Live QPS sparkline (#7) — fetch-based SSE reader
+// ══════════════════════════════════════════════
+const QPS_BUF = [];
+const QPS_N   = 60;
+let _spkReader = null, _spkBuf = '';
+
+function initSparkline() {
+  if (_spkReader) { try { _spkReader.cancel(); } catch(_){} _spkReader = null; }
+  _spkBuf = '';
+  QPS_BUF.length = 0;
+  const svg = document.getElementById('qps-sparkline-svg');
+  if (svg) svg.innerHTML = '<text x="240" y="30" text-anchor="middle" fill="#1e293b" font-size="11" font-family="monospace">connecting…</text>';
+  fetch(BASE + '/stats/stream', {headers: {'Authorization': 'Bearer ' + KEY}})
+    .then(r => {
+      if (!r.ok) return;
+      const reader = r.body.getReader();
+      _spkReader = reader;
+      const dec = new TextDecoder();
+      (function pump() {
+        reader.read().then(({done, value}) => {
+          if (done) return;
+          _spkBuf += dec.decode(value, {stream: true});
+          const lines = _spkBuf.split('\n');
+          _spkBuf = lines.pop();
+          for (const ln of lines) {
+            if (!ln.startsWith('data: ')) continue;
+            try {
+              const d = JSON.parse(ln.slice(6));
+              if (d.qps_1m != null) _spkPush(Number(d.qps_1m));
+            } catch(_) {}
+          }
+          pump();
+        }).catch(() => {});
+      })();
+    }).catch(() => {});
 }
 
 function _spkPush(qps) {
