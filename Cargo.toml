@@ -2,11 +2,11 @@
 # Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 [package]
 name = "runbound"
-version = "0.9.37"
+version = "0.9.38"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "AGPL-3.0-or-later"
-description = "A DNS server. Just for fun."
+description = "High-performance DNS server with XDP kernel-bypass, REST API, and web dashboard"
 readme = "README.md"
 repository = "https://github.com/redlemonbe/Runbound"
 homepage = "https://github.com/redlemonbe/Runbound"

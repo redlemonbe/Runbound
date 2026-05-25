@@ -9,6 +9,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.38] — 2026-05-25
+
+### Fixed
+
+- `src/webui/mod.rs`: `include_str!` and `include_bytes!` paths corrected to `"index.html"` and `"favicon.ico"` after the source move to `src/webui/` in v0.9.37.
+- `install.sh`: health check URL corrected from port `8081` to `8080`.
+- `src/api/mod.rs`: removed leftover `eprintln!` debug statement from rate-limiter test.
+
+### Changed
+
+- `Cargo.toml`: package description updated to reflect the project's current scope.
+- `README.md`: dashboard section rewritten — nginx setup removed, replaced with embedded UI instructions (available since v0.9.0).
+- `docs/api.md`: removed dead reference to `examples/web-ui/`; version examples updated to v0.9.37.
+- `docs/index.md`: removed pinned version string.
+- `AUDIT-PRINCIPLES.md`: removed from repository root.
+- `.github/workflows/release.yml`: release creation made idempotent; asset upload uses `--clobber`; binary naming aligned to `runbound-{arch}-linux-{libc}`.
+
+---
+
+## [0.9.37] — 2026-05-25
+
+### Changed
+
+- Web UI source moved from `examples/web-ui/` to `src/webui/` — compiled into the binary, no external files needed at runtime.
+- `examples/web-ui/` directory removed.
+
+---
+
 ## [0.9.36] — 2026-05-25
 
 ### Fixed
@@ -2613,7 +2641,77 @@ v0.4.0. See `audit.toml` for per-CVE exposure analysis and mitigations.
 
 ---
 
-[Unreleased]: https://github.com/redlemonbe/Runbound/compare/v0.5.7...HEAD
+[Unreleased]: https://github.com/redlemonbe/Runbound/compare/v0.9.38...HEAD
+[0.9.38]: https://github.com/redlemonbe/Runbound/compare/v0.9.37...v0.9.38
+[0.9.37]: https://github.com/redlemonbe/Runbound/compare/v0.9.36...v0.9.37
+[0.9.36]: https://github.com/redlemonbe/Runbound/compare/v0.9.35...v0.9.36
+[0.9.35]: https://github.com/redlemonbe/Runbound/compare/v0.9.34...v0.9.35
+[0.9.34]: https://github.com/redlemonbe/Runbound/compare/v0.9.33...v0.9.34
+[0.9.33]: https://github.com/redlemonbe/Runbound/compare/v0.9.32...v0.9.33
+[0.9.32]: https://github.com/redlemonbe/Runbound/compare/v0.9.31...v0.9.32
+[0.9.31]: https://github.com/redlemonbe/Runbound/compare/v0.9.30...v0.9.31
+[0.9.30]: https://github.com/redlemonbe/Runbound/compare/v0.9.29...v0.9.30
+[0.9.29]: https://github.com/redlemonbe/Runbound/compare/v0.9.28...v0.9.29
+[0.9.28]: https://github.com/redlemonbe/Runbound/compare/v0.9.27...v0.9.28
+[0.9.27]: https://github.com/redlemonbe/Runbound/compare/v0.9.26...v0.9.27
+[0.9.26]: https://github.com/redlemonbe/Runbound/compare/v0.9.25...v0.9.26
+[0.9.25]: https://github.com/redlemonbe/Runbound/compare/v0.9.24...v0.9.25
+[0.9.24]: https://github.com/redlemonbe/Runbound/compare/v0.9.23...v0.9.24
+[0.9.23]: https://github.com/redlemonbe/Runbound/compare/v0.9.22...v0.9.23
+[0.9.22]: https://github.com/redlemonbe/Runbound/compare/v0.9.21...v0.9.22
+[0.9.21]: https://github.com/redlemonbe/Runbound/compare/v0.9.20...v0.9.21
+[0.9.20]: https://github.com/redlemonbe/Runbound/compare/v0.9.19...v0.9.20
+[0.9.19]: https://github.com/redlemonbe/Runbound/compare/v0.9.18...v0.9.19
+[0.9.18]: https://github.com/redlemonbe/Runbound/compare/v0.9.17...v0.9.18
+[0.9.17]: https://github.com/redlemonbe/Runbound/compare/v0.9.16...v0.9.17
+[0.9.16]: https://github.com/redlemonbe/Runbound/compare/v0.9.15...v0.9.16
+[0.9.15]: https://github.com/redlemonbe/Runbound/compare/v0.9.14...v0.9.15
+[0.9.14]: https://github.com/redlemonbe/Runbound/compare/v0.9.13...v0.9.14
+[0.9.13]: https://github.com/redlemonbe/Runbound/compare/v0.9.12...v0.9.13
+[0.9.12]: https://github.com/redlemonbe/Runbound/compare/v0.9.11...v0.9.12
+[0.9.11]: https://github.com/redlemonbe/Runbound/compare/v0.9.10...v0.9.11
+[0.9.10]: https://github.com/redlemonbe/Runbound/compare/v0.9.9...v0.9.10
+[0.9.9]: https://github.com/redlemonbe/Runbound/compare/v0.9.8...v0.9.9
+[0.9.8]: https://github.com/redlemonbe/Runbound/compare/v0.9.7...v0.9.8
+[0.9.7]: https://github.com/redlemonbe/Runbound/compare/v0.9.6...v0.9.7
+[0.9.6]: https://github.com/redlemonbe/Runbound/compare/v0.9.5...v0.9.6
+[0.9.5]: https://github.com/redlemonbe/Runbound/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/redlemonbe/Runbound/compare/v0.9.3...v0.9.4
+[0.9.3]: https://github.com/redlemonbe/Runbound/compare/v0.9.2...v0.9.3
+[0.9.2]: https://github.com/redlemonbe/Runbound/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/redlemonbe/Runbound/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/redlemonbe/Runbound/compare/v0.8.3...v0.9.0
+[0.8.3]: https://github.com/redlemonbe/Runbound/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/redlemonbe/Runbound/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/redlemonbe/Runbound/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/redlemonbe/Runbound/compare/v0.7.1...v0.8.0
+[0.7.1]: https://github.com/redlemonbe/Runbound/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/redlemonbe/Runbound/compare/v0.6.24...v0.7.0
+[0.6.24]: https://github.com/redlemonbe/Runbound/compare/v0.6.23...v0.6.24
+[0.6.23]: https://github.com/redlemonbe/Runbound/compare/v0.6.22...v0.6.23
+[0.6.22]: https://github.com/redlemonbe/Runbound/compare/v0.6.21...v0.6.22
+[0.6.21]: https://github.com/redlemonbe/Runbound/compare/v0.6.20...v0.6.21
+[0.6.20]: https://github.com/redlemonbe/Runbound/compare/v0.6.19...v0.6.20
+[0.6.19]: https://github.com/redlemonbe/Runbound/compare/v0.6.18...v0.6.19
+[0.6.18]: https://github.com/redlemonbe/Runbound/compare/v0.6.17...v0.6.18
+[0.6.17]: https://github.com/redlemonbe/Runbound/compare/v0.6.16...v0.6.17
+[0.6.16]: https://github.com/redlemonbe/Runbound/compare/v0.6.15...v0.6.16
+[0.6.15]: https://github.com/redlemonbe/Runbound/compare/v0.6.14...v0.6.15
+[0.6.14]: https://github.com/redlemonbe/Runbound/compare/v0.6.13...v0.6.14
+[0.6.13]: https://github.com/redlemonbe/Runbound/compare/v0.6.12...v0.6.13
+[0.6.12]: https://github.com/redlemonbe/Runbound/compare/v0.6.11...v0.6.12
+[0.6.11]: https://github.com/redlemonbe/Runbound/compare/v0.6.10...v0.6.11
+[0.6.10]: https://github.com/redlemonbe/Runbound/compare/v0.6.9...v0.6.10
+[0.6.9]: https://github.com/redlemonbe/Runbound/compare/v0.6.8...v0.6.9
+[0.6.8]: https://github.com/redlemonbe/Runbound/compare/v0.6.7...v0.6.8
+[0.6.7]: https://github.com/redlemonbe/Runbound/compare/v0.6.6...v0.6.7
+[0.6.6]: https://github.com/redlemonbe/Runbound/compare/v0.6.5...v0.6.6
+[0.6.5]: https://github.com/redlemonbe/Runbound/compare/v0.6.4...v0.6.5
+[0.6.4]: https://github.com/redlemonbe/Runbound/compare/v0.6.3...v0.6.4
+[0.6.3]: https://github.com/redlemonbe/Runbound/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/redlemonbe/Runbound/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/redlemonbe/Runbound/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/redlemonbe/Runbound/compare/v0.5.7...v0.6.0
 [0.5.7]: https://github.com/redlemonbe/Runbound/compare/v0.5.5...v0.5.7
 [0.5.5]: https://github.com/redlemonbe/Runbound/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/redlemonbe/Runbound/compare/v0.5.3...v0.5.4
