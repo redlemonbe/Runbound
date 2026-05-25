@@ -1833,7 +1833,7 @@ fn build_tls_config(
 // is driven by a separate tokio task on a separate thread, giving true
 // multi-core parallelism without any userspace load-balancing overhead.
 #[cfg(unix)]
-fn bind_reuseport_udp(addr: &str) -> anyhow::Result<UdpSocket> {
+fn bind_reuseport_udp(addr: &str, busy_poll_usec: u32) -> anyhow::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock_addr: std::net::SocketAddr = addr
         .parse()
@@ -1854,6 +1854,35 @@ fn bind_reuseport_udp(addr: &str) -> anyhow::Result<UdpSocket> {
     socket
         .set_nonblocking(true)
         .map_err(|e| anyhow::anyhow!("nonblocking: {e}"))?;
+    // #20: SO_BUSY_POLL — spin in kernel context for `busy_poll_usec` µs before
+    // sleeping. Reduces scheduler wake-up latency at the cost of CPU burn.
+    // Only useful on dedicated servers; harmless but wasteful on shared hosts.
+    // SO_PREFER_BUSY_POLL (kernel 5.11+) is hardcoded as 69 — silently ignored
+    // on older kernels (ENOPROTOOPT).
+    if busy_poll_usec > 0 {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let usec = busy_poll_usec as libc::c_int;
+        let one: libc::c_int = 1;
+        // SAFETY: fd is a valid DGRAM socket; both options take a c_int value.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                (&usec as *const libc::c_int).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            // SO_PREFER_BUSY_POLL = 69 (Linux 5.11+, ENOPROTOOPT on older kernels — ignored)
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                69,
+                (&one as *const libc::c_int).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
     let std_socket: std::net::UdpSocket = socket.into();
     UdpSocket::from_std(std_socket).map_err(|e| anyhow::anyhow!("tokio from_std: {e}"))
 }
@@ -2055,12 +2084,21 @@ pub async fn run_dns_server(
         );
     }
 
-    // Level 1 (#77): warm up DoT connections before accepting queries.
+    // Level 1 (#77) — #84 two-phase startup: spawn warm-up in background so
+    // DNS sockets open immediately.  Cache hits and local-zone queries are served
+    // from the first packet; upstream forwarding becomes available ~800ms later
+    // once the DoT pool is ready.  Queries that miss the cache before the pool
+    // is live will wait for hickory's lazy-connect retry (no SERVFAIL storm).
     let dot_count = upstreams
         .read()
         .map(|u| u.iter().filter(|s| s.protocol == "dot").count())
         .unwrap_or(0);
-    warm_up_dot_connections(&resolver, dot_count).await;
+    {
+        let res_wu = Arc::clone(&resolver);
+        tokio::spawn(async move {
+            warm_up_dot_connections(&res_wu, dot_count).await;
+        });
+    }
 
     // Level 3 (#77): spawn keepalive task.
     {
@@ -2152,7 +2190,8 @@ pub async fn run_dns_server(
         // giving near-linear QPS scaling with core count.
         #[cfg(unix)]
         for i in 0..ncpus {
-            let udp = bind_reuseport_udp(&udp_addr)
+            let busy_poll = if cfg.udp_busy_poll { 50 } else { 0 };
+            let udp = bind_reuseport_udp(&udp_addr, busy_poll)
                 .map_err(|e| anyhow::anyhow!("UDP SO_REUSEPORT socket {i}: {e}"))?;
             server.register_socket(udp);
         }
