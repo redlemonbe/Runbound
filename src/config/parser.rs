@@ -257,10 +257,14 @@ pub struct UnboundConfig {
     pub ui_bind: String,
     /// Enable TLS on the web UI listener. Default: true.
     pub ui_tls: bool,
-    /// Path to TLS certificate PEM for the web UI. Empty = auto-generated self-signed.
+    /// Path to TLS certificate PEM for the web UI. Empty = auto-generated (signed by local CA).
     pub ui_cert: String,
-    /// Path to TLS private key PEM for the web UI. Empty = auto-generated self-signed.
+    /// Path to TLS private key PEM for the web UI. Empty = auto-generated.
     pub ui_key: String,
+    /// Path to the local CA certificate PEM. Empty = auto-generated in base_dir.
+    pub ui_ca_cert: String,
+    /// Path to the local CA private key PEM. Empty = auto-generated in base_dir.
+    pub ui_ca_key: String,
 
     // ── UDP socket options (#20) ─────────────────────────────────────────────
     /// Enable SO_BUSY_POLL + SO_PREFER_BUSY_POLL on UDP sockets. Default: false.
@@ -325,6 +329,8 @@ impl UnboundConfig {
             ui_tls: true,
             ui_cert: String::new(),
             ui_key: String::new(),
+            ui_ca_cert: String::new(),
+            ui_ca_key: String::new(),
             icmp_enabled: false,
             icmp_rate_pps: 10,
             icmp_burst: 5,
@@ -657,8 +663,10 @@ fn parse_server_directive(
         "ui-port" => cfg.ui_port = val.parse().unwrap_or(8090),
         "ui-bind" => cfg.ui_bind = val.trim_matches('"').to_owned(),
         "ui-tls"  => cfg.ui_tls = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
-        "ui-cert" => cfg.ui_cert = val.trim().trim_matches('"').to_owned(),
-        "ui-key"  => cfg.ui_key  = val.trim().trim_matches('"').to_owned(),
+        "ui-cert"    => cfg.ui_cert    = val.trim().trim_matches('"').to_owned(),
+        "ui-key"     => cfg.ui_key     = val.trim().trim_matches('"').to_owned(),
+        "ui-ca-cert" => cfg.ui_ca_cert = val.trim().trim_matches('"').to_owned(),
+        "ui-ca-key"  => cfg.ui_ca_key  = val.trim().trim_matches('"').to_owned(),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }

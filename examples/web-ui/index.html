@@ -603,6 +603,19 @@
 
   <!-- ═══ SETTINGS ═══ -->
   <div id="tab-settings" class="hidden fade max-w-2xl mx-auto">
+    <div id="settings-ca-card" class="card mb-4 hidden">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Local CA Certificate</div>
+      <p class="text-xs text-gray-400 mb-3">Install this CA certificate once on each device to get a trusted HTTPS connection without browser warnings.</p>
+      <a href="/webui/ca.crt" download="runbound-ca.pem" class="btn-primary text-xs inline-block mb-4">↓ Download CA certificate</a>
+      <div class="space-y-2 text-xs text-gray-500">
+        <div><span class="text-gray-300">macOS</span> — Double-click the file → Keychain Access → right-click → Get Info → Trust → Always Trust</div>
+        <div><span class="text-gray-300">Windows</span> — Double-click → Install Certificate → Local Machine → Trusted Root Certification Authorities</div>
+        <div><span class="text-gray-300">Linux</span> — <span class="font-mono bg-gray-900 px-1 rounded">sudo cp runbound-ca.pem /usr/local/share/ca-certificates/runbound.crt &amp;&amp; sudo update-ca-certificates</span></div>
+        <div><span class="text-gray-300">Firefox</span> — Settings → Privacy &amp; Security → Certificates → View Certificates → Authorities → Import</div>
+        <div><span class="text-gray-300">iOS</span> — Open the file → Settings → General → VPN &amp; Device Management → Install → Settings → General → About → Certificate Trust Settings → Enable</div>
+        <div><span class="text-gray-300">Android</span> — Settings → Security → Install from storage → CA Certificate</div>
+      </div>
+    </div>
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-4">Change Password</div>
       <div class="space-y-3 max-w-sm" style="padding-left:3px">
@@ -1292,7 +1305,7 @@ function showTab(name,btn){
   if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
   if(name==='protection'){loadProtection();}
-  if(name==='settings'){initDnssecToggle();loadAuthEvents();}
+  if(name==='settings'){initDnssecToggle();loadAuthEvents();initCaCard();}
 }
 
 
@@ -1526,6 +1539,14 @@ async function toggleDnssec() {
     toast(next ? 'DNSSEC validation enabled' : 'DNSSEC validation disabled');
   } catch(e) { toast('DNSSEC toggle failed', true); }
 }
+function initCaCard() {
+  // Show the CA card only when the server serves a CA cert (TLS mode)
+  fetch('/webui/ca.crt', {method:'HEAD'}).then(r => {
+    const card = document.getElementById('settings-ca-card');
+    if (card) card.classList.toggle('hidden', !r.ok);
+  }).catch(() => {});
+}
+
 async function loadAuthEvents() {
   const els = [document.getElementById('auth-events-list'), document.getElementById('auth-events-logs')].filter(Boolean);
   if (!els.length) return;
