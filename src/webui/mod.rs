@@ -232,11 +232,13 @@ struct LoginForm { username: String, password: String }
 
 async fn handle_login(
     State(state): State<Arc<WebUiState>>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
     headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let client_ip_addr = addr.ip();
+    let client_ip_addr = connect_info
+        .map(|ConnectInfo(a)| a.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let client_ip = client_ip_addr.to_string();
     // SEC-A1/SEC-B5: atomic rate-limit — pre-increment inside the shard lock to prevent
     // concurrent-request bypass. On success, entry is removed (reset). On failure, count stays.
