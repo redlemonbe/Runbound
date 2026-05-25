@@ -1176,15 +1176,20 @@ alert {
 **Alert status API:**
 
 ```bash
-# List active blocks and recent alerts
+# List active blocks, rules, and recent alerts
 curl -s http://localhost:8080/api/alerts   -H "Authorization: Bearer $TOKEN"
 
+# Manually block an IP (permanent, no expiry)
+curl -s -X PUT http://localhost:8080/api/alerts/blocked/1.2.3.4   -H "Authorization: Bearer $TOKEN"
+
 # Unblock an IP manually
-curl -s -X DELETE http://localhost:8080/api/alerts/block/1.2.3.4   -H "Authorization: Bearer $TOKEN"
+curl -s -X DELETE http://localhost:8080/api/alerts/blocked/1.2.3.4   -H "Authorization: Bearer $TOKEN"
 ```
 
-> **Note:** Alert blocks are held in memory and do not persist across restarts.
-> After a restart, previously blocked IPs are unblocked until they re-trigger a rule.
+> **Note:** Alert blocks are persisted to `alert-blocks.json` in the config directory and survive
+> restarts. Blocks with an expiry time that has already passed are dropped on load.
+> Alert *rules* (the `alert:` blocks in `runbound.conf`) are loaded at startup only —
+> changes to rules require a full restart; `POST /api/reload` does not update them.
 
 **Example — multi-layer protection:**
 
