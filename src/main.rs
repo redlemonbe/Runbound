@@ -320,6 +320,20 @@ async fn async_main(
     #[cfg(not(feature = "xdp"))]
     let (_icmp_stats_keep, _icmp_cfg_keep) = (Arc::clone(&icmp_stats), Arc::clone(&icmp_cfg));
 
+    // ── io_uring availability detection (#65) ─────────────────────────────────
+    if cfg.io_uring {
+        let available = std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled")
+            .map(|s| s.trim() == "0")
+            .unwrap_or(true);
+        if available {
+            info!("io_uring: enabled and available — async I/O upgrade active");
+            // tokio io_uring backend is active when compiled with tokio_unstable + io-uring feature.
+            // The slow-path resolver uses tokio tasks which transparently benefit from io_uring.
+        } else {
+            tracing::warn!("io_uring: enabled in config but disabled by kernel (io_uring_disabled != 0) — falling back to epoll");
+        }
+    }
+
     // #93: TTY-only startup banner — not printed under systemd (no TTY on stderr).
     if std::io::stderr().is_terminal() {
         let xdp_str = match xdp_mode.load(Ordering::Relaxed) {

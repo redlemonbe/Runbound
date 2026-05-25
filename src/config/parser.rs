@@ -262,6 +262,9 @@ pub struct UnboundConfig {
     pub icmp_burst: u32,
     // ── AXFR/IXFR zone transfer (#22) ────────────────────────────────────────
     /// Enable AXFR zone transfer serving. Default: false.
+    /// Enable io_uring for async I/O operations. Requires Linux 5.1+. Default: false.
+    /// When enabled, detected at startup and logged. Falls back silently if unavailable.
+    pub io_uring: bool,
     pub axfr_enabled: bool,
     /// CIDR ranges allowed to pull zone transfers. Required when axfr-enabled.
     pub axfr_allow: Vec<String>,
@@ -310,6 +313,7 @@ impl UnboundConfig {
             icmp_rate_pps: 10,
             icmp_burst: 5,
             audit_checkpoint_every: 10000,
+            io_uring: false,
             axfr_enabled: false,
             axfr_allow: vec![],
             alerts: vec![],
@@ -393,6 +397,12 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                     other
                 ),
             },
+            "io-uring" => {
+                match key {
+                    "enable" => cfg.io_uring = val.trim_matches('"') == "yes",
+                    other => warn!("Line {}: unknown io-uring directive '{}' — ignored", lineno + 1, other),
+                }
+            }
             "axfr" => {
                 match key {
                     "enable" => cfg.axfr_enabled = val.trim_matches('"') == "yes",
