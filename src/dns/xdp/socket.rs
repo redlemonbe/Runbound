@@ -13,7 +13,7 @@
 //   5. bind(sockaddr_xdp{ifindex, queue_id, ...})
 
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(dead_code)]
+
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, Ordering};

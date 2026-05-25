@@ -764,6 +764,7 @@ async fn icmp_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
         "replied":      s.icmp_stats.replied.load(Ordering::Relaxed),
         "dropped":      s.icmp_stats.dropped.load(Ordering::Relaxed),
         "rate_limited": s.icmp_stats.rate_limited.load(Ordering::Relaxed),
+        "banned":       s.icmp_stats.banned_snapshot(),
     }))
 }
 
