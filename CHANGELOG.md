@@ -9,6 +9,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.41] — 2026-05-25
+
+### Fixed
+
+- `src/config/parser.rs`, `src/dns/server.rs`: new `forward-tls-hostname` directive in `forward-zone:` blocks — `build_resolver` passes the configured hostname to `dot_tls_name`, enabling custom DoT servers outside the built-in IP→hostname map (SEC-B13).
+- `src/api/relay.rs`: relay outbound connections (`relay_request`, `register`) now derive TLS SNI from the peer address (`host:port` → `host`) using `ServerName::IpAddress` for IPv4/IPv6 peers and DNS name parsing for hostname peers — removes hardcoded `"runbound-relay"` (SEC-B13).
+- `src/sync.rs`: `sync_get` derives TLS SNI from `host_port` — removes hardcoded `"runbound-sync"` (SEC-B13).
+- `src/api/mod.rs`, `src/dns/server.rs`: test code updated — `ForwardZone` initializers include `tls_hostname: None`; `AlertTracker::new` calls pass `None` as `base_dir`.
+
+### Added
+
+- `docs/configuration.md`: `forward-tls-hostname` directive documented with built-in SNI map table and custom server example.
+
+---
+
 ## [0.9.40] — 2026-05-25
 
 ### Fixed
@@ -2680,7 +2695,10 @@ v0.4.0. See `audit.toml` for per-CVE exposure analysis and mitigations.
 
 ---
 
-[Unreleased]: https://github.com/redlemonbe/Runbound/compare/v0.9.38...HEAD
+[Unreleased]: https://github.com/redlemonbe/Runbound/compare/v0.9.41...HEAD
+[0.9.41]: https://github.com/redlemonbe/Runbound/compare/v0.9.40...v0.9.41
+[0.9.40]: https://github.com/redlemonbe/Runbound/compare/v0.9.39...v0.9.40
+[0.9.39]: https://github.com/redlemonbe/Runbound/compare/v0.9.38...v0.9.39
 [0.9.38]: https://github.com/redlemonbe/Runbound/compare/v0.9.37...v0.9.38
 [0.9.37]: https://github.com/redlemonbe/Runbound/compare/v0.9.36...v0.9.37
 [0.9.36]: https://github.com/redlemonbe/Runbound/compare/v0.9.35...v0.9.36
