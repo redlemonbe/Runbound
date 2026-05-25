@@ -36,7 +36,7 @@ struct BlockEntry {
 }
 
 pub struct AlertTracker {
-    rules: Vec<AlertRule>,
+    rules: std::sync::RwLock<Vec<AlertRule>>,
     client_counts: DashMap<IpAddr, ClientBucket, ahash::RandomState>,
     blocked: DashMap<IpAddr, BlockEntry, ahash::RandomState>,
     recent: Mutex<VecDeque<AlertEvent>>,
@@ -50,7 +50,7 @@ impl AlertTracker {
         tokio::spawn(webhook_sender(rx));
         let base_dir_arc = base_dir.map(Arc::new);
         let tracker = std::sync::Arc::new(Self {
-            rules,
+            rules: std::sync::RwLock::new(rules),
             client_counts: DashMap::with_hasher(ahash::RandomState::default()),
             blocked: DashMap::with_hasher(ahash::RandomState::default()),
             recent: Mutex::new(VecDeque::new()),
@@ -143,7 +143,7 @@ impl AlertTracker {
 
     /// Record a query from `ip`. Returns true if the query should be blocked.
     pub fn record(&self, ip: IpAddr) -> bool {
-        if self.rules.is_empty() {
+        if self.rules.read().unwrap().is_empty() {
             return false;
         }
 
@@ -156,9 +156,9 @@ impl AlertTracker {
 
         // GC client_counts when table is full.
         if self.client_counts.len() >= MAX_CLIENT_BUCKETS {
+            let max_window = self.rules.read().unwrap().iter().map(|r| r.window_s).max().unwrap_or(60);
             self.client_counts.retain(|_, b| {
-                now.duration_since(b.window_start).as_secs()
-                    < self.rules.iter().map(|r| r.window_s).max().unwrap_or(60) * 2
+                now.duration_since(b.window_start).as_secs() < max_window * 2
             });
         }
 
@@ -168,21 +168,25 @@ impl AlertTracker {
         });
 
         // Check per-rule, smallest window first.
-        for rule in &self.rules {
-            if rule.metric != "client-qps" {
-                continue;
-            }
-            let elapsed = now.duration_since(bucket.window_start).as_secs();
-            if elapsed >= rule.window_s {
-                bucket.count = 0;
-                bucket.window_start = now;
+        {
+            let rules = self.rules.read().unwrap();
+            for rule in rules.iter() {
+                if rule.metric != "client-qps" {
+                    continue;
+                }
+                let elapsed = now.duration_since(bucket.window_start).as_secs();
+                if elapsed >= rule.window_s {
+                    bucket.count = 0;
+                    bucket.window_start = now;
+                }
             }
         }
         bucket.count += 1;
         let count = bucket.count;
         drop(bucket);
 
-        for rule in &self.rules {
+        let rules_snapshot: Vec<_> = self.rules.read().unwrap().clone();
+        for rule in &rules_snapshot {
             if rule.metric != "client-qps" {
                 continue;
             }
@@ -267,7 +271,7 @@ impl AlertTracker {
             })
             .collect();
 
-        let rules: Vec<serde_json::Value> = self.rules.iter().map(|r| serde_json::json!({
+        let rules: Vec<serde_json::Value> = self.rules.read().unwrap().iter().map(|r| serde_json::json!({
             "name": r.name,
             "metric": r.metric,
             "window_s": r.window_s,
@@ -288,6 +292,13 @@ impl AlertTracker {
         let removed = self.blocked.remove(&ip).is_some();
         if removed { self.persist_blocks(); }
         removed
+    }
+
+    /// Hot-reload: replace the active alert rules without restarting (#149).
+    pub fn update_rules(&self, new_rules: Vec<AlertRule>) {
+        let count = new_rules.len();
+        *self.rules.write().unwrap() = new_rules;
+        tracing::info!(count, "alert rules updated via hot-reload");
     }
 
     /// Immediately block an IP without going through a rule threshold.

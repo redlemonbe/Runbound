@@ -9,6 +9,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.44] — 2026-05-26
+
+### Fixed
+
+- **#148 — alert `name:` directive silently required**: Directives in an `alert:` block that appear before `name:` were silently dropped because `last_mut()` returned `None` on an empty vec. A warning is now emitted and a placeholder rule (named `alert-{lineno}`) is auto-inserted so no directives are lost. Always place `name:` first in each alert block.
+
+- **#149 — `POST /api/reload` did not reload alert rules**: `AlertTracker.rules` was a plain `Vec<AlertRule>` with no way to update it without a restart. The field is now wrapped in `std::sync::RwLock<Vec<AlertRule>>`. A new `update_rules()` method atomically replaces the rule set. The reload handler calls it after rebuilding zones, so alert rules now take effect immediately on `POST /api/reload`. The response body includes an `"alert_rules"` count field.
+
+- **#150 — WebUI TLS cert missing IP SAN**: The auto-generated WebUI certificate only listed `localhost` as a Subject Alternative Name. Accessing the WebUI by IP (e.g. `https://192.168.1.10:8091`) caused a TLS validation failure in all browsers. Auto-generated certs now always include `127.0.0.1` and `::1`. A new `ui-tls-san` config directive (repeatable) adds custom IPs or hostnames. Existing certs must be deleted and the service restarted to regenerate with the new SANs.
+
+### Documentation
+
+- `docs/configuration.md`: added `ui-tls-san` directive reference and new **WebUI TLS certificate SANs** section; added **Bot defense** section; updated alert status persistence note to mention auto-deban and bot bans; added `name:` ordering note to alert directive table.
+- `docs/api.md`: updated `POST /api/reload` response example to include `"alert_rules"`; corrected the reload note to reflect that alert rules are now reloaded live; added bot defense ban note to `GET /api/alerts`.
+- `docs/web-ui.md`: added **Bot Defense** section covering honeypot, scanner trap, behavioral burst, viewing bans, and configuration.
+- `docs/tls.md`: added **WebUI TLS — auto-generated certificate SANs** section documenting default SANs and `ui-tls-san` usage.
+
+---
+
 ## [0.9.43] — 2026-05-26
 
 ### Added

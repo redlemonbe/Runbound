@@ -316,6 +316,11 @@ pub struct UnboundConfig {
     pub bot_ban_duration_secs: u64,
     /// Enable honeypot fields in the WebUI login form. Default: false.
     pub bot_honeypot_enabled: bool,
+
+    // ── WebUI TLS SANs (#150) ─────────────────────────────────────────────────
+    /// Extra IP addresses or hostnames to add as Subject Alternative Names to the
+    /// auto-generated WebUI TLS certificate. Repeat the directive for multiple SANs.
+    pub ui_tls_san: Vec<String>,
 }
 
 impl UnboundConfig {
@@ -376,6 +381,7 @@ impl UnboundConfig {
             bot_ban_duration_secs: 86400,
             bot_honeypot_enabled: false,
             udp_busy_poll: false,
+            ui_tls_san: vec![],
             ..Default::default()
         }
     }
@@ -472,6 +478,26 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                 }
             }
             "alert" => {
+                // #148: helper — ensure a rule exists before writing sub-directives.
+                // If name: was not the first directive, emit a warning and auto-insert a
+                // placeholder rule so the remaining directives are not silently dropped.
+                let ensure_rule = |alerts: &mut Vec<AlertRule>, k: &str, ln: usize| {
+                    if alerts.is_empty() {
+                        warn!(
+                            "Line {}: alert directive '{}' before 'name:' — inserting unnamed rule.                              Add 'name: <label>' as the first directive in your alert block.",
+                            ln, k
+                        );
+                        alerts.push(AlertRule {
+                            name: format!("alert-{}", ln),
+                            metric: "client-qps".to_string(),
+                            window_s: 10,
+                            threshold: 1000,
+                            action: "log".to_string(),
+                            notify_url: None,
+                            block_duration_s: 300,
+                        });
+                    }
+                };
                 match key {
                     "name" => {
                         cfg.alerts.push(AlertRule {
@@ -484,12 +510,30 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                             block_duration_s: 300,
                         });
                     }
-                    "metric" => { if let Some(r) = cfg.alerts.last_mut() { r.metric = val.trim_matches('"').to_string(); } }
-                    "window-s" => { if let Some(r) = cfg.alerts.last_mut() { r.window_s = val.trim_matches('"').parse().unwrap_or(10); } }
-                    "threshold" => { if let Some(r) = cfg.alerts.last_mut() { r.threshold = val.trim_matches('"').parse().unwrap_or(1000); } }
-                    "action" => { if let Some(r) = cfg.alerts.last_mut() { r.action = val.trim_matches('"').to_string(); } }
-                    "notify-url" => { if let Some(r) = cfg.alerts.last_mut() { r.notify_url = Some(val.trim_matches('"').to_string()); } }
-                    "block-duration-s" => { if let Some(r) = cfg.alerts.last_mut() { r.block_duration_s = val.trim_matches('"').parse().unwrap_or(300); } }
+                    "metric" => {
+                        ensure_rule(&mut cfg.alerts, key, lineno + 1);
+                        cfg.alerts.last_mut().unwrap().metric = val.trim_matches('"').to_string();
+                    }
+                    "window-s" => {
+                        ensure_rule(&mut cfg.alerts, key, lineno + 1);
+                        cfg.alerts.last_mut().unwrap().window_s = val.trim_matches('"').parse().unwrap_or(10);
+                    }
+                    "threshold" => {
+                        ensure_rule(&mut cfg.alerts, key, lineno + 1);
+                        cfg.alerts.last_mut().unwrap().threshold = val.trim_matches('"').parse().unwrap_or(1000);
+                    }
+                    "action" => {
+                        ensure_rule(&mut cfg.alerts, key, lineno + 1);
+                        cfg.alerts.last_mut().unwrap().action = val.trim_matches('"').to_string();
+                    }
+                    "notify-url" => {
+                        ensure_rule(&mut cfg.alerts, key, lineno + 1);
+                        cfg.alerts.last_mut().unwrap().notify_url = Some(val.trim_matches('"').to_string());
+                    }
+                    "block-duration-s" => {
+                        ensure_rule(&mut cfg.alerts, key, lineno + 1);
+                        cfg.alerts.last_mut().unwrap().block_duration_s = val.trim_matches('"').parse().unwrap_or(300);
+                    }
                     other => warn!("Line {}: unknown alert directive '{}' — ignored", lineno + 1, other),
                 }
             }
@@ -733,6 +777,9 @@ fn parse_server_directive(
         }
         "bot-honeypot-enabled" => {
             cfg.bot_honeypot_enabled = val.trim_matches('"') == "yes";
+        }
+        "ui-tls-san" => {
+            cfg.ui_tls_san.push(val.trim_matches('"').to_string());
         }
         // Accepted but unused — common Unbound tuning directives
         "num-threads"

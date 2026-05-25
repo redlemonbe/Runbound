@@ -100,6 +100,52 @@ aggregation.
 
 ---
 
+## Bot Defense
+
+Runbound's built-in bot defense system automatically protects the WebUI login and admin surface.
+No external WAF or reverse proxy is needed.
+
+### Detection layers
+
+**Honeypot** (opt-in via `bot-honeypot-enabled: yes`): The login form contains hidden fields
+that legitimate browsers leave empty. Any client that fills them in is immediately banned.
+This catches most credential-stuffing bots on first contact.
+
+**Scanner trap paths**: Requests to well-known vulnerability scanner paths
+(`/wp-admin`, `/.env`, `/.git/config`, `/.git/*`, `/phpmyadmin`, `/xmlrpc.php`, etc.)
+trigger an immediate ban. There is no legitimate reason for a DNS server UI to receive
+these requests.
+
+**Behavioral burst**: Any IP that produces 10 or more failed requests within a 5-second window
+is automatically banned (rule: `bot-burst`). This catches brute-force tools that retry quickly.
+
+### Viewing bot bans
+
+Bot bans appear alongside regular alert blocks in the **Protection** tab of the WebUI. They
+are also returned by `GET /api/alerts` under `blocked_clients`, with `rule` values of
+`bot-honeypot`, `bot-scanner`, or `bot-burst`.
+
+### Configuration directives
+
+| Directive | Default | Description |
+|---|---|---|
+| `bot-ban-duration-secs` | `86400` | Duration of a bot ban in seconds. `0` = permanent. |
+| `bot-honeypot-enabled` | `no` | Enable the hidden honeypot field in the login form. |
+
+```
+server:
+    bot-ban-duration-secs: 86400
+    bot-honeypot-enabled:  yes
+```
+
+### Enforcement
+
+Bans are enforced via the same pipeline as alert blocks: XDP BPF map injection (IPv4) or
+userspace block (IPv6). They persist across restarts in `alert-blocks.json` and are
+automatically purged by a background task when they expire.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
