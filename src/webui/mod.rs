@@ -166,7 +166,12 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     .card{position:relative;z-index:1;background:rgba(6,11,20,.94);backdrop-filter:blur(14px);border:1px solid rgba(34,211,238,.1);border-top:1px solid rgba(34,211,238,.28);border-radius:12px;padding:38px;width:100%;max-width:380px;box-sizing:border-box;margin:0 16px;box-shadow:0 32px 64px rgba(0,0,0,.65),0 0 0 1px rgba(34,211,238,.03);animation:fade-in .35s ease-out}
     .logo{color:#22d3ee;font-size:20px;font-weight:700;letter-spacing:.14em;display:inline-block}
     .cursor{display:inline-block;color:#22d3ee;animation:blink 1.1s step-end infinite;margin-left:1px}
-
+    label{display:block;color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.12em;margin-bottom:7px}
+    input{display:block;width:100%;background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:9px 13px;font-size:13px;outline:none;box-sizing:border-box;color:#e2e8f0;font-family:inherit;margin:0;transition:border-color .15s,box-shadow .15s}
+    input:focus{border-color:#0e7490;box-shadow:0 0 0 2px rgba(8,145,178,.15)}
+    input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus,input:-webkit-autofill:active{-webkit-text-fill-color:#e2e8f0 !important;-webkit-box-shadow:0 0 0px 1000px #0f172a inset !important;transition:background-color 5000s ease-in-out 0s;caret-color:#e2e8f0}
+    button{display:block;width:100%;background:#0e4f63;color:#e2e8f0;border:1px solid #0e6680;border-radius:6px;padding:10px 14px;cursor:pointer;font-size:13px;font-family:inherit;font-weight:600;transition:background .15s;margin-top:8px}
+    button:hover{background:#0f6b89}
   </style>
 </head>
 <body>
@@ -177,12 +182,12 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     </div>
     <form method="POST" action="/login">
       <div style="margin-bottom:16px">
-        <label for="u" class="text-xs text-gray-500 block mb-1">Username</label>
-        <input id="u" name="username" type="text" autocomplete="username" class="input w-full"/>
+        <label for="u">Username</label>
+        <input id="u" name="username" type="text" autocomplete="username" class="input w-full" placeholder="admin"/>
       </div>
       <div style="margin-bottom:26px">
-        <label for="p" class="text-xs text-gray-500 block mb-1">Password</label>
-        <input id="p" name="password" type="password" autocomplete="current-password" class="input w-full"/>
+        <label for="p">Password</label>
+        <input id="p" name="password" type="password" autocomplete="current-password" class="input w-full" placeholder="········"/>
       </div>
       <button type="submit" class="btn-primary w-full mt-2">Sign in →</button>
     </form>
