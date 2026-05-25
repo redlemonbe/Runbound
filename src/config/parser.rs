@@ -40,6 +40,24 @@ pub struct TlsConfig {
     pub dot_client_auth_ca: Option<String>,
 }
 
+// ── Alert thresholds (#12) ────────────────────────────────────────────────
+#[derive(Debug, Clone)]
+pub struct AlertRule {
+    pub name: String,
+    /// "client-qps" — queries per window per source IP.
+    pub metric: String,
+    /// Sliding window length in seconds.
+    pub window_s: u64,
+    /// Query count that triggers the alert (inclusive).
+    pub threshold: u64,
+    /// "log" (default), "block", "notify".
+    pub action: String,
+    /// Webhook URL for action="notify".
+    pub notify_url: Option<String>,
+    /// Seconds to block the IP for action="block". 0 = permanent until restart.
+    pub block_duration_s: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UnboundConfig {
     pub interfaces: Vec<String>,
@@ -242,6 +260,8 @@ pub struct UnboundConfig {
     pub icmp_enabled: bool,
     pub icmp_rate_pps: u32,
     pub icmp_burst: u32,
+    // ── Alert thresholds (#12) ────────────────────────────────────────────────
+    pub alerts: Vec<AlertRule>,
 }
 
 impl UnboundConfig {
@@ -284,6 +304,7 @@ impl UnboundConfig {
             icmp_rate_pps: 10,
             icmp_burst: 5,
             audit_checkpoint_every: 10000,
+            alerts: vec![],
             ..Default::default()
         }
     }
@@ -364,6 +385,28 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                     other
                 ),
             },
+            "alert" => {
+                match key {
+                    "name" => {
+                        cfg.alerts.push(AlertRule {
+                            name: val.trim_matches('"'  ).to_string(),
+                            metric: "client-qps".to_string(),
+                            window_s: 10,
+                            threshold: 1000,
+                            action: "log".to_string(),
+                            notify_url: None,
+                            block_duration_s: 300,
+                        });
+                    }
+                    "metric" => { if let Some(r) = cfg.alerts.last_mut() { r.metric = val.trim_matches('"').to_string(); } }
+                    "window-s" => { if let Some(r) = cfg.alerts.last_mut() { r.window_s = val.trim_matches('"').parse().unwrap_or(10); } }
+                    "threshold" => { if let Some(r) = cfg.alerts.last_mut() { r.threshold = val.trim_matches('"').parse().unwrap_or(1000); } }
+                    "action" => { if let Some(r) = cfg.alerts.last_mut() { r.action = val.trim_matches('"').to_string(); } }
+                    "notify-url" => { if let Some(r) = cfg.alerts.last_mut() { r.notify_url = Some(val.trim_matches('"').to_string()); } }
+                    "block-duration-s" => { if let Some(r) = cfg.alerts.last_mut() { r.block_duration_s = val.trim_matches('"').parse().unwrap_or(300); } }
+                    other => warn!("Line {}: unknown alert directive '{}' — ignored", lineno + 1, other),
+                }
+            }
             other => {
                 warn!("Line {}: unknown section '{}' — ignored", lineno + 1, other);
             }
