@@ -1066,13 +1066,114 @@ async fn build_and_launch(
                     .enable_all()
                     .build()
                     .map_err(|e| anyhow::anyhow!("Web UI runtime: {e}"))?;
-                ui_rt.spawn(async move {
-                    let listener = tokio::net::TcpListener::from_std(ui_std_listener)
-                        .expect("ui TcpListener::from_std failed");
-                    axum::serve(listener, ui_app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.ok()
-                });
-                Box::leak(Box::new(ui_rt));
-                info!(addr=%ui_addr, "Web UI listening");
+                if cfg.ui_tls {
+                    // TLS path: cert gen/load + auto-renewal loop + manual accept loop
+                    let (cert_pem, key_pem, cert_expires) =
+                        webui::ensure_webui_cert(&cfg.ui_cert, &cfg.ui_key, &base_dir)?;
+                    let initial_cfg = Arc::new(crate::sync::server_tls_config(&cert_pem, &key_pem)?);
+                    let tls_state: Arc<tokio::sync::RwLock<Arc<rustls::ServerConfig>>> =
+                        Arc::new(tokio::sync::RwLock::new(initial_cfg));
+
+                    // Cert renewal background task (checks every 6 h)
+                    {
+                        let tls_state2    = Arc::clone(&tls_state);
+                        let cert_path_r   = cfg.ui_cert.clone();
+                        let key_path_r    = cfg.ui_key.clone();
+                        let base_dir_r    = base_dir.clone();
+                        ui_rt.spawn(async move {
+                            let mut interval = tokio::time::interval(
+                                std::time::Duration::from_secs(6 * 3600)
+                            );
+                            interval.tick().await; // skip first tick
+                            let mut expires   = cert_expires;
+                            let mut last_mtime: Option<std::time::SystemTime> = None;
+                            loop {
+                                interval.tick().await;
+                                let need = if cert_path_r.is_empty() {
+                                    // Auto-gen: renew 30 days before expiry
+                                    expires
+                                        .duration_since(std::time::SystemTime::now())
+                                        .map(|d| d.as_secs() < 30 * 24 * 3600)
+                                        .unwrap_or(true)
+                                } else {
+                                    // File mode: reload when cert file changes
+                                    let mtime = std::fs::metadata(&cert_path_r)
+                                        .and_then(|m| m.modified())
+                                        .ok();
+                                    let changed = mtime != last_mtime;
+                                    if changed { last_mtime = mtime; }
+                                    changed
+                                };
+                                if !need { continue; }
+                                match webui::ensure_webui_cert(&cert_path_r, &key_path_r, &base_dir_r) {
+                                    Ok((c, k, new_exp)) => {
+                                        match crate::sync::server_tls_config(&c, &k) {
+                                            Ok(cfg2) => {
+                                                *tls_state2.write().await = Arc::new(cfg2);
+                                                expires = new_exp;
+                                                info!("WebUI TLS certificate renewed");
+                                            }
+                                            Err(e) => warn!("WebUI TLS rebuild: {e}"),
+                                        }
+                                    }
+                                    Err(e) => warn!("WebUI cert renewal: {e}"),
+                                }
+                            }
+                        });
+                    }
+
+                    // TLS accept loop
+                    ui_rt.spawn(async move {
+                        use hyper_util::rt::{TokioExecutor, TokioIo};
+                        use hyper_util::server::conn::auto::Builder as HyperBuilder;
+                        use tower::Service as _;
+                        let listener = tokio::net::TcpListener::from_std(ui_std_listener)
+                            .expect("ui TcpListener::from_std");
+                        let make_svc = ui_app
+                            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+                        loop {
+                            let (tcp, addr) = match listener.accept().await {
+                                Ok(x) => x,
+                                Err(e) => { warn!("WebUI accept: {e}"); continue; }
+                            };
+                            let server_cfg = Arc::clone(&*tls_state.read().await);
+                            let acceptor   = tokio_rustls::TlsAcceptor::from(server_cfg);
+                            let mut ms     = make_svc.clone();
+                            tokio::spawn(async move {
+                                let svc = match ms.call(addr).await {
+                                    Ok(s) => s,
+                                    Err(_) => return,
+                                };
+                                let svc = hyper_util::service::TowerToHyperService::new(svc);
+                                match acceptor.accept(tcp).await {
+                                    Ok(tls) => {
+                                        HyperBuilder::new(TokioExecutor::new())
+                                            .serve_connection_with_upgrades(TokioIo::new(tls), svc)
+                                            .await
+                                            .ok();
+                                    }
+                                    Err(e) => {
+                                        let h = if e.to_string().contains("InvalidContentType")
+                                            || e.to_string().contains("corrupt message")
+                                        { " — use HTTPS" } else { "" };
+                                        tracing::debug!(peer=%addr, "WebUI TLS: {e}{h}");
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    Box::leak(Box::new(ui_rt));
+                    info!(addr=%ui_addr, "Web UI listening (HTTPS)");
+                } else {
+                    // Plain HTTP
+                    ui_rt.spawn(async move {
+                        let listener = tokio::net::TcpListener::from_std(ui_std_listener)
+                            .expect("ui TcpListener::from_std failed");
+                        axum::serve(listener, ui_app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.ok()
+                    });
+                    Box::leak(Box::new(ui_rt));
+                    info!(addr=%ui_addr, "Web UI listening (HTTP)");
+                }
             }
         }
     }
