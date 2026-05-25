@@ -32,7 +32,7 @@ fn now_unix() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-static TAILWIND_JS: &[u8] = include_bytes!("../../examples/web-ui/tailwind.min.js");
+static RB_STYLES_JS: &[u8] = include_bytes!("../../examples/web-ui/rb-styles.js");
 
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 const CRED_FILE: &str = "webui-auth.conf";
@@ -71,11 +71,13 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
     });
     Router::new()
         .route("/", get(serve_dashboard))
-        .route("/tailwind.js", get(serve_tailwind))
+        .route("/rb-styles.js", get(serve_rb_styles))
         .route("/login",  get(serve_login).post(handle_login))
         .route("/logout", get(handle_logout).post(handle_logout))
         .route("/api/webui/password", post(change_password))
+        .route("/favicon.ico", get(serve_favicon))
         .route("/webui/auth-events", get(auth_events_handler))
+        .route("/api/webui/auth-events", get(auth_events_handler))
         .route("/api",       any(proxy_api))
         .route("/api/*path", any(proxy_api))
         .with_state(state)
@@ -142,8 +144,8 @@ async fn serve_dashboard(State(state): State<Arc<WebUiState>>, req: Request<Body
     Html(INDEX_HTML).into_response()
 }
 
-async fn serve_tailwind() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "application/javascript")], TAILWIND_JS)
+async fn serve_rb_styles() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/javascript")], RB_STYLES_JS)
 }
 
 const LOGIN_HTML: &str = r#"<!DOCTYPE html>
@@ -152,7 +154,8 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <title>Runbound — Sign in</title>
-  <script src="/tailwind.js"></script>
+  <link rel="icon" href="/favicon.ico"/>
+  <script src="/rb-styles.js"></script>
   <style>
     @keyframes glow-pulse{0%,100%{opacity:.6}50%{opacity:1}}
     @keyframes fade-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
@@ -163,13 +166,12 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     .card{position:relative;z-index:1;background:rgba(6,11,20,.94);backdrop-filter:blur(14px);border:1px solid rgba(34,211,238,.1);border-top:1px solid rgba(34,211,238,.28);border-radius:12px;padding:38px;width:100%;max-width:380px;box-sizing:border-box;margin:0 16px;box-shadow:0 32px 64px rgba(0,0,0,.65),0 0 0 1px rgba(34,211,238,.03);animation:fade-in .35s ease-out}
     .logo{color:#22d3ee;font-size:20px;font-weight:700;letter-spacing:.14em;display:inline-block}
     .cursor{display:inline-block;color:#22d3ee;animation:blink 1.1s step-end infinite;margin-left:1px}
-    input{display:block;width:100%;background:#030609;border:1px solid #152030;color:#e2e8f0 !important;border-radius:6px;padding:9px 13px;font-size:13px;outline:none;box-sizing:border-box;font-family:inherit;margin:0;transition:border-color .15s,box-shadow .15s}
-    input:focus{border-color:#22d3ee;box-shadow:0 0 0 2px rgba(34,211,238,.12)}
-    input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus,input:-webkit-autofill:active{-webkit-text-fill-color:#e2e8f0 !important;-webkit-box-shadow:0 0 0px 1000px #030609 inset !important;transition:background-color 5000s ease-in-out 0s;caret-color:#e2e8f0}
-    button{display:block;width:100%;background:#0e4f63;color:#e2e8f0;border:1px solid #0e6680;border-radius:6px;padding:10px 14px;cursor:pointer;font-size:13px;font-family:inherit;transition:background .15s;margin-top:4px}
+    label{display:block;color:#64748b;font-size:10px;text-transform:uppercase;letter-spacing:.12em;margin-bottom:7px}
+    input{display:block;width:100%;background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:9px 13px;font-size:13px;outline:none;box-sizing:border-box;color:#e2e8f0;font-family:inherit;margin:0;transition:border-color .15s,box-shadow .15s}
+    input:focus{border-color:#0e7490;box-shadow:0 0 0 2px rgba(8,145,178,.15)}
+    input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus,input:-webkit-autofill:active{-webkit-text-fill-color:#e2e8f0 !important;-webkit-box-shadow:0 0 0px 1000px #0f172a inset !important;transition:background-color 5000s ease-in-out 0s;caret-color:#e2e8f0}
+    button{display:block;width:100%;background:#0e4f63;color:#e2e8f0;border:1px solid #0e6680;border-radius:6px;padding:10px 14px;cursor:pointer;font-size:13px;font-family:inherit;font-weight:600;transition:background .15s;margin-top:8px}
     button:hover{background:#0f6b89}
-
-    label{display:block;color:#3d5a6e;font-size:10px;text-transform:uppercase;letter-spacing:.12em;margin-bottom:7px}
   </style>
 </head>
 <body>
@@ -181,13 +183,13 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     <form method="POST" action="/login">
       <div style="margin-bottom:16px">
         <label for="u">Username</label>
-        <input id="u" name="username" type="text" autocomplete="username"/>
+        <input id="u" name="username" type="text" autocomplete="username" class="input w-full"/>
       </div>
       <div style="margin-bottom:26px">
         <label for="p">Password</label>
-        <input id="p" name="password" type="password" autocomplete="current-password"/>
+        <input id="p" name="password" type="password" autocomplete="current-password" class="input w-full"/>
       </div>
-      <button type="submit">Sign in &#8594;</button>
+      <button type="submit" class="btn-primary w-full mt-2">Sign in →</button>
     </form>
     <div id="err" style="color:#f87171;font-size:12px;text-align:center;margin-top:16px;min-height:16px"></div>
     <div style="color:#0c1a24;font-size:10px;text-align:center;margin-top:26px">Delete webui-auth.conf to reset credentials</div>
@@ -199,6 +201,11 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
   </script>
 </body>
 </html>"#;
+
+async fn serve_favicon() -> impl axum::response::IntoResponse {
+    static FAVICON: &[u8] = include_bytes!("../../examples/web-ui/favicon.ico");
+    ([(axum::http::header::CONTENT_TYPE, "image/x-icon")], FAVICON)
+}
 
 async fn serve_login() -> Html<&'static str> {
     Html(LOGIN_HTML)
@@ -394,8 +401,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tailwind_js_served() {
-        let resp = app().oneshot(Request::builder().uri("/tailwind.js").body(Body::empty()).unwrap()).await.unwrap();
+    async fn rb_styles_served() {
+        let resp = app().oneshot(Request::builder().uri("/rb-styles.js").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("content-type").unwrap().to_str().unwrap().contains("javascript"));
     }
