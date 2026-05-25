@@ -40,7 +40,7 @@ unsafe fn crc32c_sse42(crc: u32, bytes: &[u8]) -> u32 {
     use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
     let mut crc64 = crc as u64;
     // SAFETY: align_to::<u64> is safe for u64 (any bit pattern is valid).
-    let (prefix, aligned, suffix) = unsafe { bytes.align_to::<u64>() };
+    let (prefix, aligned, suffix) = bytes.align_to::<u64>();
     for &b in prefix {
         crc64 = _mm_crc32_u8(crc64 as u32, b) as u64;
     }
@@ -61,16 +61,16 @@ unsafe fn crc32c_sse42(crc: u32, bytes: &[u8]) -> u32 {
 unsafe fn crc32c_arm(crc: u32, bytes: &[u8]) -> u32 {
     use std::arch::aarch64::{__crc32cb, __crc32cd};
     // SAFETY: align_to::<u64> is safe for u64 (any bit pattern is valid).
-    let (prefix, aligned, suffix) = unsafe { bytes.align_to::<u64>() };
+    let (prefix, aligned, suffix) = bytes.align_to::<u64>();
     let mut crc = crc;
     for &b in prefix {
-        crc = unsafe { __crc32cb(crc, b) };
+        crc = __crc32cb(crc, b);
     }
     for &word in aligned {
-        crc = unsafe { __crc32cd(crc, word) };
+        crc = __crc32cd(crc, word);
     }
     for &b in suffix {
-        crc = unsafe { __crc32cb(crc, b) };
+        crc = __crc32cb(crc, b);
     }
     crc
 }
