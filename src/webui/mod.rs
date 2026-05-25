@@ -18,6 +18,7 @@ use tracing::warn;
 
 static INDEX_HTML: &str = include_str!("index.html");
 static INDEX_HTML_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/index.html.gz"));
+static SECURITY_AUDIT_MD: &str = include_str!("../../docs/security-audit/SECURITY-AUDIT.md");
 
 #[derive(Clone, serde::Serialize)]
 struct AuthEvent {
@@ -97,6 +98,7 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf, ca_cert_pem: St
         .route("/webui/auth-events", get(auth_events_handler))
         .route("/api/webui/auth-events", get(auth_events_handler))
         .route("/webui/ca.crt", get(serve_ca_cert))
+        .route("/webui/security-audit", get(serve_security_audit))
         .route("/api",       any(proxy_api))
         .route("/api/*path", any(proxy_api))
         .with_state(state)
@@ -192,9 +194,9 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
   <title>Runbound — Sign in</title>
   <link rel="icon" href="/favicon.ico"/>
   <style>
-    @keyframes glow-pulse{0%,100%{opacity:.6}50%{opacity:1}}
+    @keyframes glow-pulse{{0%,100%{{opacity:.6}}50%{{opacity:1}}}}
     @keyframes fade-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-    @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+    @keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:0}}}}
     body{color:#e2e8f0;font-family:'SF Mono','Fira Code','Consolas',monospace;background-color:#060b14;background-image:radial-gradient(circle at 1px 1px,rgba(34,211,238,.055) 1px,transparent 0);background-size:30px 30px;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;overflow:hidden;position:relative}
     body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 150% 65% at 50% -20%,rgba(14,102,128,.28) 0%,transparent 62%);pointer-events:none;animation:glow-pulse 6s ease-in-out infinite}
     body::after{content:'';position:fixed;bottom:-20%;left:50%;transform:translateX(-50%);width:60%;height:40%;background:radial-gradient(ellipse at center,rgba(14,102,128,.08) 0%,transparent 70%);pointer-events:none;animation:glow-pulse 8s ease-in-out infinite reverse}
@@ -253,6 +255,155 @@ async fn serve_ca_cert(State(state): State<Arc<WebUiState>>) -> Response {
         .body(Body::from(state.ca_cert_pem.as_ref().clone()))
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response())
 }
+
+async fn serve_security_audit() -> impl IntoResponse {
+    let md = SECURITY_AUDIT_MD;
+    let html = format!(r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Runbound — Security Audit</title>
+  <style>
+    :root{{--bg:#050d18;--bg2:#0e1e2e;--accent:#67e8f9;--text:#d1d5db;--muted:#6b7280;--border:#1e3a5f;--green:#4ade80;--red:#f87171;--yellow:#fbbf24}}
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.7;padding:2rem 1rem}}
+    .wrap{{max-width:900px;margin:0 auto}}
+    h1{{color:var(--accent);font-size:1.6rem;margin-bottom:.3rem;letter-spacing:.04em}}
+    h2{{color:var(--accent);font-size:1.15rem;margin:2rem 0 .7rem;border-bottom:1px solid var(--border);padding-bottom:.3rem}}
+    h3{{color:#93c5fd;font-size:1rem;margin:1.2rem 0 .4rem}}
+    h4{{color:#c084fc;font-size:.9rem;margin:1rem 0 .3rem}}
+    p{{margin:.4rem 0}}
+    a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}
+    code{{background:var(--bg2);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-family:'Courier New',monospace;font-size:.85em;color:#e2e8f0}}
+    pre{{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:1rem;overflow-x:auto;margin:.6rem 0}}
+    pre code{{background:none;border:none;padding:0;font-size:.82em}}
+    table{{border-collapse:collapse;width:100%;margin:.6rem 0;font-size:.85em}}
+    th{{background:var(--bg2);color:var(--accent);border:1px solid var(--border);padding:.35rem .7rem;text-align:left}}
+    td{{border:1px solid var(--border);padding:.3rem .7rem;vertical-align:top}}
+    tr:nth-child(even) td{{background:#08121e}}
+    ul,ol{{margin:.3rem 0 .3rem 1.5rem}}
+    li{{margin:.15rem 0}}
+    hr{{border:none;border-top:1px solid var(--border);margin:1.5rem 0}}
+    blockquote{{border-left:3px solid var(--border);padding:.3rem 1rem;color:var(--muted);margin:.4rem 0}}
+    .badge-fixed{{color:var(--green);font-weight:600}}
+    .badge-open{{color:var(--yellow);font-weight:600}}
+    .badge-accepted{{color:var(--muted);font-weight:600}}
+    .badge-disputed{{color:#a78bfa;font-weight:600}}
+    .header-bar{{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:1rem 1.2rem;margin-bottom:1.5rem;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem}}
+    .back{{font-size:.8rem;color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:.3rem .8rem;cursor:pointer;background:transparent;color:var(--accent)}}
+    .back:hover{{background:var(--bg2)}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header-bar">
+    <div>
+      <div style="color:var(--accent);font-weight:700;font-size:1rem;letter-spacing:.06em">RUNBOUND — Security Audit</div>
+      <div style="color:var(--muted);font-size:.75rem;margin-top:.2rem">Consolidated findings — all cycles</div>
+    </div>
+    <button class="back" onclick="history.back()">← Back to dashboard</button>
+  </div>
+  <div id="content"></div>
+</div>
+<script>
+const raw = {md_json};
+
+function esc(s){{return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}}
+function badge(s){{
+  if(/✅/.test(s)) return s.replace(/✅/g,'<span class="badge-fixed">✅</span>');
+  if(/⏳/.test(s)) return s.replace(/⏳/g,'<span class="badge-open">⏳</span>');
+  if(/⚠️/.test(s)) return s.replace(/⚠️/g,'<span class="badge-accepted">⚠️</span>');
+  if(/🔄/.test(s)) return s.replace(/🔄/g,'<span class="badge-disputed">🔄</span>');
+  return s;
+}}
+function md(text){{
+  let lines = text.split('
+');
+  let out = '';
+  let inPre = false;
+  let inTable = false;
+  let tableHeader = false;
+  for(let i=0;i<lines.length;i++){{
+    let l = lines[i];
+    if(l.startsWith('```')){{
+      if(inPre){{out+='</code></pre>
+';inPre=false;}}
+      else{{
+        let lang=l.slice(3).trim();
+        out+=`<pre><code class="lang-${{lang}}">`; inPre=true;
+      }}
+      continue;
+    }}
+    if(inPre){{out+=esc(l)+'
+';continue;}}
+    // Table detection
+    if(/^\|/.test(l)){{
+      if(!inTable){{out+='<table>
+<thead>
+<tr>'; inTable=true; tableHeader=true;}}
+      else if(/^\|[-:| ]+\|/.test(l)){{out+='</tr>
+</thead>
+<tbody>
+';tableHeader=false;continue;}}
+      else{{out+='<tr>';}}
+      let cells=l.split('|').slice(1,-1);
+      let tag=tableHeader?'th':'td';
+      cells.forEach(c=>{{out+=`<${{tag}}>${{inlinemd(badge(c.trim()))}}</${{tag}}>`;}});
+      out+='</tr>
+'; continue;
+    }}else if(inTable){{out+='</tbody></table>
+';inTable=false;}}
+    if(/^#{{1,4}} /.test(l)){{
+      let m=l.match(/^(#+) (.*)/);
+      let lvl=m[1].length;
+      out+=`<h${{lvl}}>${{inlinemd(badge(m[2]))}}</h${{lvl}}>
+`;
+    }} else if(/^---+$/.test(l)){{
+      out+='<hr>
+';
+    }} else if(/^> /.test(l)){{
+      out+=`<blockquote>${{inlinemd(l.slice(2))}}</blockquote>
+`;
+    }} else if(/^[\*\-] /.test(l)){{
+      out+=`<li>${{inlinemd(l.slice(2))}}</li>
+`;
+    }} else if(/^\d+\. /.test(l)){{
+      out+=`<li>${{inlinemd(l.replace(/^\d+\. /,''))}}</li>
+`;
+    }} else if(l.trim()===''){{
+      out+='
+';
+    }} else {{
+      out+=`<p>${{inlinemd(badge(l))}}</p>
+`;
+    }}
+  }}
+  if(inTable) out+='</tbody></table>
+';
+  if(inPre) out+='</code></pre>
+';
+  return out;
+}}
+function inlinemd(s){{
+  s=badge(s);
+  s=s.replace(/`([^`]+)`/g,'<code>$1</code>');
+  s=s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  s=s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2">$1</a>');
+  return s;
+}}
+document.getElementById('content').innerHTML = md(raw);
+</script>
+</body>
+</html>"##,
+        md_json = serde_json::to_string(md).unwrap_or_default()
+    );
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+}
+
 
 async fn serve_login() -> Html<&'static str> {
     Html(LOGIN_HTML)
