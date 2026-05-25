@@ -100,6 +100,17 @@ slave will catch up via the normal delta-journal sync on its next poll.
 
 ---
 
+## Bot defense ban replication (v0.9.43+)
+
+When the master bans an IP via the bot defense system (honeypot, scanner detection, or behavioral burst), the ban is immediately propagated to all slaves:
+
+- **`SyncOp::AddGlobalBan`** — pushes the banned IP, the triggering rule (`bot-honeypot`, `bot-scanner`, `bot-burst`, or `manual`), and the expiry duration. Slaves apply the ban locally using their own XDP tier or userspace block.
+- **`SyncOp::DeleteGlobalBan`** — pushed when a ban expires on the master (auto-deban task, every 60 s) or when a manual unban is issued via `DELETE /api/alerts/blocked/:ip`. Slaves immediately clear the IP from their block list and XDP map.
+
+Manual blocks via `PUT /api/alerts/blocked/:ip` are also replicated using the same mechanism.
+
+---
+
 ## Relay forwarding
 
 The master's REST API exposes a relay endpoint that forwards any request to a specific

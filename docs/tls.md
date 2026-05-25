@@ -246,3 +246,25 @@ forward-zone:
 ```
 
 **Pi-hole:** DNS settings → Custom upstream → `192.168.1.5#853`.
+
+---
+
+## Per-upstream SNI (forward-tls-hostname)
+
+When using DoT upstreams (`forward-tls-upstream: yes`), Runbound uses the `forward-tls-hostname` directive to set a specific SNI for each upstream independently:
+
+```
+forward-zone:
+    name: "."
+    forward-addr: 1.1.1.1@853
+    forward-tls-upstream: yes
+    forward-tls-hostname: cloudflare-dns.com
+
+forward-zone:
+    name: "."
+    forward-addr: 9.9.9.9@853
+    forward-tls-upstream: yes
+    forward-tls-hostname: dns.quad9.net
+```
+
+If omitted, Runbound derives the hostname from the IP using a built-in resolver list. See [configuration.md](configuration.md) for the full directive reference.
