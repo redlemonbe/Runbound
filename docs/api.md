@@ -135,6 +135,11 @@ Blocked domain example:
 |-------|----------|---------|-------|
 | `name` | Yes | — | Domain name (trailing dot optional) |
 | `type` | No | `"A"` | Record type: `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `PTR`, `NS`, `SOA` |
+| `value` | Yes | — | Record value (IP for A/AAAA, hostname for CNAME/MX/NS, text for TXT) |
+| `ttl` | No | 3600 | TTL in seconds (0–2147483647, capped at 86400) |
+| `priority` | No | — | Required for `MX` and `SRV` records (0–65535). Default: 10 if omitted |
+| `weight` | No | — | `SRV` only: load-balancing weight |
+| `port` | No | — | `SRV` only: target port |
 
 ---
 
@@ -532,6 +537,31 @@ for the full live lists.
 
 ---
 
+
+### `PATCH /api/config`
+
+Toggle runtime settings without restarting. Currently supports DNSSEC validation.
+The change is applied immediately and propagated to all registered slaves.
+
+```bash
+curl -X PATCH http://localhost:8080/api/config \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"dnssec_validation": true}'
+```
+
+```json
+{"ok": true, "dnssec_validation": true}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `dnssec_validation` | bool | Enable or disable DNSSEC validation at runtime |
+
+**Note:** This change is not persisted to `runbound.conf`. To make it permanent, edit `dnssec-validation: yes/no` in the config file and restart.
+
+---
+
 ### `POST /api/reload`
 
 Hot-reload: re-parse `runbound.conf` and rebuild all in-memory DNS data without dropping connections.
@@ -546,7 +576,7 @@ curl -X POST http://localhost:8080/api/reload \
 {"status": "ok", "cfg_path": "/etc/runbound/unbound.conf", "local_zones": 5, "local_data": 12}
 ```
 
-**Note:** ACL rules, forward-zone upstreams, and privacy settings (`log-retention`, `log-client-ip`) require a full restart.
+**Note:** ACL rules, forward-zone upstreams, alert rules, and privacy settings (`log-retention`, `log-client-ip`) require a full restart.
 
 ---
 
@@ -1158,6 +1188,95 @@ Returns the updated config:
 ```json
 {"burst":8,"enable":true,"rate_limit":20}
 ```
+
+---
+
+## Alert thresholds
+
+Monitor client query rates and automatically block abusive sources.
+Alert rules are defined in `runbound.conf` (see [Configuration](configuration.md#alert-thresholds)).
+Rules are loaded at startup; changing them in the config file requires a restart (not just `POST /api/reload`).
+
+### `GET /api/alerts`
+
+Returns active alert rules, currently blocked clients, and recent alert events.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/alerts
+```
+
+```json
+{
+  "rules": [
+    {
+      "name": "main",
+      "metric": "client-qps",
+      "threshold": 100,
+      "window_s": 10,
+      "action": "block",
+      "block_duration_s": 300
+    }
+  ],
+  "blocked_clients": [
+    {
+      "ip": "203.0.113.42",
+      "rule": "main",
+      "permanent": false,
+      "expires_in_s": 247
+    }
+  ],
+  "recent_alerts": [
+    {
+      "rule": "main",
+      "client_ip": "203.0.113.42",
+      "count": 127,
+      "action": "block",
+      "ts": 1716000000
+    }
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `rules` | Active alert rules loaded from config |
+| `blocked_clients` | IPs currently blocked; `permanent: true` means no expiry (blocked until restart or manual unblock) |
+| `recent_alerts` | Last 100 alert events (ring buffer) |
+| `expires_in_s` | Seconds until the block expires; absent for permanent blocks |
+
+---
+
+### `PUT /api/alerts/blocked/:ip`
+
+Manually block an IP address. The block is permanent (no expiry) and persisted to `alert-blocks.json`.
+
+```bash
+curl -X PUT http://localhost:8080/api/alerts/blocked/203.0.113.42 \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
+```
+
+```json
+{"ip": "203.0.113.42", "blocked": true}
+```
+
+The IP is blocked immediately at the DNS layer (REFUSED response) and, if XDP is active, at the XDP layer (packet drop).
+
+---
+
+### `DELETE /api/alerts/blocked/:ip`
+
+Unblock a previously blocked IP (manual or rule-triggered).
+
+```bash
+curl -X DELETE http://localhost:8080/api/alerts/blocked/203.0.113.42 \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
+```
+
+```json
+{"ip": "203.0.113.42", "unblocked": true}
+```
+
+Returns `{"unblocked": false}` if the IP was not blocked.
 
 ---
 
