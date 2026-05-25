@@ -237,17 +237,21 @@ eviction pass runs every 256 ticks (~2.56 s) to drop TTL-expired entries regardl
 Effect: at steady-state (warm cache, no new upstream responses), CPU usage of the
 publish loop drops to near zero. Under heavy ingest the full clone still runs.
 
-**Planned (#64 — wire format cache):** pre-serialize the DNS response payload at insert time. XDP worker skips DNS parsing entirely — just `memcpy` the pre-built UDP payload into the TX frame and patch the QueryID (2 bytes). Expected hot path: **< 300 ns** total.
+**Wire format cache (v0.6.8, #64):** `CacheEntry` stores a pre-serialized UDP payload
+(`wire_payload: Bytes`) built at cache-insert time. XDP worker answers cache hits with a
+direct `memcpy` + 2-byte QueryID patch — no DNS parsing on the hot path. Reduces
+cache-hit latency from ~930 ns to ~580 ns.
 
 ```rust
-// planned
+// src/dns/cache_snapshot.rs
 struct CacheEntry {
-    wire: Bytes,        // pre-serialized UDP payload (DNS header + answer section)
-    expires: Instant,
+    wire_payload: Bytes,  // full UDP payload, QID zeroed at bytes [0..2]
+    expires_at: Instant,
 }
-// worker:
-frame[..entry.wire.len()].copy_from_slice(&entry.wire);
-frame[10..12].copy_from_slice(&query_id.to_be_bytes());  // patch QueryID
+// worker (src/dns/xdp/worker.rs):
+let wire = &entry.wire_payload;
+frame[..wire.len()].copy_from_slice(wire);
+frame[0..2].copy_from_slice(&query_id.to_be_bytes());  // patch QueryID
 ```
 
 ### TX batching
@@ -446,7 +450,7 @@ RCODE=NOERROR
 | Cache snapshot lookup (DashMap) | v0.6.9 | ~100 ns |
 | Build response (wire_payload memcpy + QueryID patch) | v0.6.8 | ~80 ns |
 | TX enqueue + kick (batch/32) | v0.6.8 | ~50 ns |
-| **Total — cache hit (wire format)** | | **~580 ns** |
+| **Total — cache hit (wire format, v0.6.8)** | | **~580 ns** |
 | Slow path — local zone (Tokio) | v0.4.14 | ~200 µs |
 | Slow path — upstream UDP | v0.4.14 | RTT + ~50 µs |
 | Slow path — upstream DoT | v0.6.7 | RTT + ~2 ms |
@@ -514,6 +518,7 @@ Full recursive DNSSEC validation — chain of trust from root, NSEC/NSEC3 negati
 | `icmp_rate_limit` (BPF LRU hash) | `ebpf/dns_xdp.c` | Per-IP ICMP token bucket |
 | `icmp_banned` (BPF LRU hash) | `ebpf/dns_xdp.c` | ICMP flood ban list |
 | `OnceLock<String>` | `src/dns/xdp/socket.rs` | Active interface name — read by API without lock |
+| `OnceLock<ArcSwap<String>>` | `src/api/mod.rs` | API key — ArcSwap inner allows live rotation via `POST /api/rotate-key` without restart |
 | `AtomicU64` — `CACHE_WRITE_GEN` | `src/dns/cache_snapshot.rs` | Generation counter for publish-loop skip |
 | `AtomicU32` × 2 | `src/dns/xdp/socket.rs` | `nic_rx_ring`, `nic_rx_ring_max` — read by API |
 
