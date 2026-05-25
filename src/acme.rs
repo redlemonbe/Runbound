@@ -310,7 +310,7 @@ async fn challenge_server(
         .ok();
 }
 
-// ── Background renewal loop ────────────────────────────────────────────────
+// ── Background renewal loop (HTTP-01) ─────────────────────────────────────
 
 /// Background task: checks every 6 h and renews when ≤30 days remain.
 pub async fn renewal_loop(config: AcmeConfig) {
@@ -323,6 +323,275 @@ pub async fn renewal_loop(config: AcmeConfig) {
                     info!("ACME cert renewed — restart runbound to apply the new certificate")
                 }
                 Err(e) => error!(err = %e, "ACME cert renewal failed — will retry in 6 h"),
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DNS-01 challenge — Cloudflare or generic hook script
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub enum DnsProvider {
+    Cloudflare { api_token: String },
+    /// External script: called as `script add NAME VALUE` / `script del NAME VALUE`
+    Hook { script: String },
+}
+
+pub struct AcmeDns01Config {
+    pub email:     String,
+    pub domain:    String,
+    pub cert_path: PathBuf,
+    pub key_path:  PathBuf,
+    pub cache_dir: PathBuf,
+    pub provider:  DnsProvider,
+}
+
+// ── DNS provider helpers ───────────────────────────────────────────────────
+
+/// Returns (zone_id, record_id) on success.
+async fn cf_create_txt(token: &str, name: &str, value: &str) -> Result<(String, String)> {
+    let client = reqwest::Client::new();
+
+    // Find the Cloudflare zone: try progressively shorter suffixes
+    let parts: Vec<&str> = name.trim_start_matches("_acme-challenge.").split('.').collect();
+    let mut zone_id = String::new();
+    for i in 0..parts.len().saturating_sub(1) {
+        let candidate = parts[i..].join(".");
+        let resp: serde_json::Value = client
+            .get(format!("https://api.cloudflare.com/client/v4/zones?name={candidate}&status=active"))
+            .bearer_auth(token)
+            .send().await
+            .context("CF zone lookup request")?
+            .json().await
+            .context("CF zone lookup parse")?;
+        if let Some(id) = resp["result"][0]["id"].as_str() {
+            zone_id = id.to_owned();
+            break;
+        }
+    }
+    if zone_id.is_empty() {
+        bail!("Cloudflare: no active zone found for {name}");
+    }
+
+    // Create TXT record (TTL 60 s for fast propagation)
+    let resp: serde_json::Value = client
+        .post(format!("https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "type":    "TXT",
+            "name":    name,
+            "content": value,
+            "ttl":     60
+        }))
+        .send().await
+        .context("CF create TXT request")?
+        .json().await
+        .context("CF create TXT parse")?;
+
+    let record_id = resp["result"]["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Cloudflare: no record ID in response: {resp}"))?
+        .to_owned();
+
+    info!(record=%name, "ACME: Cloudflare TXT record created");
+    Ok((zone_id, record_id))
+}
+
+async fn cf_delete_txt(token: &str, zone_id: &str, record_id: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    client
+        .delete(format!(
+            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+        ))
+        .bearer_auth(token)
+        .send().await
+        .context("CF delete TXT request")?;
+    info!("ACME: Cloudflare TXT record deleted");
+    Ok(())
+}
+
+async fn hook_run(script: &str, action: &str, name: &str, value: &str) -> Result<()> {
+    let status = tokio::process::Command::new(script)
+        .args([action, name, value])
+        .status()
+        .await
+        .with_context(|| format!("ACME hook: failed to run {script}"))?;
+    if !status.success() {
+        bail!("ACME hook: {script} {action} exited with {status}");
+    }
+    info!(action, record=%name, "ACME: hook script executed");
+    Ok(())
+}
+
+// ── DNS-01 certificate provisioning ───────────────────────────────────────
+
+pub async fn ensure_certificate_dns01(config: &AcmeDns01Config) -> Result<()> {
+    std::fs::create_dir_all(&config.cache_dir)
+        .with_context(|| format!("create ACME cache dir: {}", config.cache_dir.display()))?;
+
+    // Reuse the reqwest-backed account builder
+    let http = Box::new(ReqwestClient(reqwest::Client::new()));
+    let creds_path = config.cache_dir.join("account-dns01.json");
+
+    let account = if creds_path.exists() {
+        let json = zeroize::Zeroizing::new(
+            std::fs::read_to_string(&creds_path).context("read ACME account")?,
+        );
+        let creds: AccountCredentials = serde_json::from_str(&json).context("parse ACME account")?;
+        Account::builder_with_http(http)
+            .from_credentials(creds)
+            .await
+            .context("restore ACME account")?
+    } else {
+        let contact = format!("mailto:{}", config.email);
+        let dir = LetsEncrypt::Production.url().to_owned();
+        let (account, creds) = Account::builder_with_http(http)
+            .create(
+                &NewAccount {
+                    contact: &[&contact],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                dir,
+                None,
+            )
+            .await
+            .context("create ACME account")?;
+        let json = zeroize::Zeroizing::new(serde_json::to_string_pretty(&creds)?);
+        std::fs::write(&creds_path, json.as_bytes()).context("save ACME account")?;
+        info!(path=%creds_path.display(), "ACME: account credentials saved");
+        account
+    };
+
+    let mut order = account
+        .new_order(&NewOrder::new(&[Identifier::Dns(config.domain.clone())]))
+        .await
+        .context("ACME new order")?;
+
+    // Process DNS-01 challenges
+    struct Cleanup { zone_id: String, record_id: String, name: String, value: String }
+    let mut cleanups: Vec<Cleanup> = Vec::new();
+
+    {
+        let mut authorizations = order.authorizations();
+        while let Some(res) = authorizations.next().await {
+            let mut authz = res.context("fetch ACME authorization")?;
+            match authz.status {
+                AuthorizationStatus::Valid => continue,
+                AuthorizationStatus::Pending => {}
+                other => bail!("ACME authorization status {other:?}"),
+            }
+
+            let mut challenge = authz
+                .challenge(ChallengeType::Dns01)
+                .ok_or_else(|| anyhow::anyhow!("No DNS-01 challenge offered"))?;
+
+            let txt_value   = challenge.key_authorization().dns_value();
+            let record_name = format!("_acme-challenge.{}", config.domain);
+
+            info!(record=%record_name, "ACME: creating DNS TXT record");
+            let (zone_id, record_id) = match &config.provider {
+                DnsProvider::Cloudflare { api_token } => {
+                    cf_create_txt(api_token, &record_name, &txt_value).await?
+                }
+                DnsProvider::Hook { script } => {
+                    hook_run(script, "add", &record_name, &txt_value).await?;
+                    (String::new(), String::new())
+                }
+            };
+            cleanups.push(Cleanup { zone_id, record_id, name: record_name, value: txt_value });
+
+            // Let DNS propagate before signalling ready
+            info!("ACME: waiting 30 s for DNS propagation");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+
+            challenge.set_ready().await.context("ACME set challenge ready")?;
+        }
+    }
+
+    // Poll until order is Ready
+    let status = order
+        .poll_ready(&RetryPolicy::default())
+        .await
+        .context("ACME poll ready")?;
+
+    // Clean up TXT records regardless of outcome
+    for c in &cleanups {
+        let _ = match &config.provider {
+            DnsProvider::Cloudflare { api_token } => {
+                cf_delete_txt(api_token, &c.zone_id, &c.record_id).await
+            }
+            DnsProvider::Hook { script } => hook_run(script, "del", &c.name, &c.value).await,
+        };
+    }
+
+    if status != OrderStatus::Ready {
+        bail!("ACME order not ready after polling: {status:?}");
+    }
+
+    // Finalize (instant-acme generates a fresh ECDSA P-256 key)
+    let private_key_pem = order.finalize().await.context("ACME finalize")?;
+    let cert_chain_pem  = order
+        .poll_certificate(&RetryPolicy::default())
+        .await
+        .context("ACME download certificate")?;
+
+    // Atomic write: write to .tmp then rename
+    let cert_tmp = config.cert_path.with_extension("pem.tmp");
+    let key_tmp  = config.key_path.with_extension("pem.tmp");
+
+    if let Some(p) = config.cert_path.parent() { let _ = std::fs::create_dir_all(p); }
+    std::fs::write(&cert_tmp, &cert_chain_pem).context("write cert tmp")?;
+    std::fs::write(&key_tmp,  &private_key_pem).context("write key tmp")?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&key_tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&cert_tmp, &config.cert_path).context("rename cert")?;
+    std::fs::rename(&key_tmp,  &config.key_path).context("rename key")?;
+
+    info!(
+        domain = %config.domain,
+        cert   = %config.cert_path.display(),
+        "ACME: DNS-01 certificate issued"
+    );
+    Ok(())
+}
+
+// ── DNS-01 renewal loop with hot-swap ─────────────────────────────────────
+
+/// Background task: checks every 6 h, renews when ≤30 days remain,
+/// and hot-swaps the certificate into `tls_state` without a restart.
+pub async fn renewal_loop_dns01(
+    config: AcmeDns01Config,
+    tls_state: Arc<RwLock<Arc<rustls::ServerConfig>>>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+        if !needs_renewal(&config.cert_path) {
+            continue;
+        }
+        info!(domain = %config.domain, "ACME: DNS-01 cert renewal triggered");
+        match ensure_certificate_dns01(&config).await {
+            Err(e) => {
+                error!(err = %e, "ACME DNS-01 renewal failed — will retry in 6 h");
+            }
+            Ok(()) => {
+                // Hot-swap: read new cert files, rebuild ServerConfig, swap Arc
+                let cert = match std::fs::read_to_string(&config.cert_path) {
+                    Ok(c) => c, Err(e) => { error!(err=%e, "ACME: read renewed cert"); continue; }
+                };
+                let key = match std::fs::read_to_string(&config.key_path) {
+                    Ok(k) => k, Err(e) => { error!(err=%e, "ACME: read renewed key"); continue; }
+                };
+                match crate::sync::server_tls_config(&cert, &key) {
+                    Ok(new_cfg) => {
+                        *tls_state.write().await = Arc::new(new_cfg);
+                        info!(domain = %config.domain, "ACME: certificate hot-swapped (no restart needed)");
+                    }
+                    Err(e) => error!(err = %e, "ACME: rebuild TLS config failed"),
+                }
             }
         }
     }
