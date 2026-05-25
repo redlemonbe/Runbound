@@ -52,15 +52,8 @@ Complete reference for Runbound. Each page covers the current stable release.. E
 |------|--------------------|
 | [security.md](security.md) | Security features — ACL, rate limiting, DNS rebinding, DNSSEC, CHAOS class |
 | [hardening.md](hardening.md) | systemd hardening deep-dive — every directive explained, what breaks if missing |
-| [security-audit/v0.6.9-audit.md](security-audit/v0.6.9-audit.md) | v0.6.9 audit report — SEC and PERF findings, risk matrix, recommendations |
-| [security-audit/v0.6.9-pentest.md](security-audit/v0.6.9-pentest.md) | Black-box pentest v0.6.9 — API + DNS protocol, findings SEC-11 + PERF-11 |
-| [security-audit/v0.9.1-icmp-webui.md](security-audit/v0.9.1-icmp-webui.md) | v0.9.0–v0.9.1 audit — WebUI proxy and XDP ICMP handler (7 findings) |
-| [security-audit/v0.9.3-prerelease.md](security-audit/v0.9.3-prerelease.md) | v0.9.3 pre-release audit — 6 new attack surfaces |
-| [security-audit/v0.9.3-gemini.md](security-audit/v0.9.3-gemini.md) | v0.9.3 adversarial audit [AI-ADVERSARIAL] — Gemini 2.5 Pro cross-check |
-| [security-audit/v0.9.4-remediation.md](security-audit/v0.9.4-remediation.md) | v0.9.4 remediation verification |
-| [security-audit/v0.9.10-audit.md](security-audit/v0.9.10-audit.md) | v0.9.10 security audit — cycle A findings |
-| [security-audit/v0.9.15-audit.md](security-audit/v0.9.15-audit.md) | v0.9.15 security audit — cycle B, 17 findings (SEC-B1–SEC-B17) |
-| [security-audit/v0.9.15-perf-audit.md](security-audit/v0.9.15-perf-audit.md) | v0.9.15 performance audit — 8 findings toward 5M+ QPS target |
+| [security-audit/SECURITY-AUDIT.md](security-audit/SECURITY-AUDIT.md) | Master audit document — all cycles (A/B/C), current finding statuses, known limitations |
+| [security-audit/v0.9.38-audit.md](security-audit/v0.9.38-audit.md) | v0.9.38 Cycle C detailed report — dual AI audit (Claude + Gemini), 8 findings |
 | [audit.md](audit.md) | Supply-chain audit — dependency scanning, cargo-deny, RUSTSEC cadence |
 | [hsm.md](hsm.md) | HSM / PKCS#11 integration — hardware key storage, HMAC audit log |
 | [gdpr.md](gdpr.md) | GDPR compliance guide — data inventory, `log-client-ip`, retention |
@@ -72,7 +65,7 @@ Complete reference for Runbound. Each page covers the current stable release.. E
 | Page | What you will find |
 |------|--------------------|
 | [performance.md](performance.md) | Official benchmark — methodology, results, comparison with BIND9 and Unbound |
-| [security-audit/v0.5.4-benchmark.md](security-audit/v0.5.4-benchmark.md) | Raw benchmark data v0.5.4 — all phases, all servers, full output |
+| [performance.md](performance.md) | Official benchmark — methodology, results, hardware, comparison with BIND9 and Unbound |
 
 ---
 
@@ -81,4 +74,3 @@ Complete reference for Runbound. Each page covers the current stable release.. E
 | Page | What you will find |
 |------|--------------------|
 | [philosophy.md](philosophy.md) | Design rationale — why Rust, why XDP, how Runbound differs from legacy resolvers |
-| [security-audit/v0.4.5-code-audit.md](security-audit/v0.4.5-code-audit.md) | v0.4.5 internal code quality audit — unsafe inventory, dependency rationale |

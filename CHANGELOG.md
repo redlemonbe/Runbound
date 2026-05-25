@@ -9,6 +9,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.40] — 2026-05-25
+
+### Fixed
+
+- `src/api/relay.rs`: `push_to_slaves` now uses `pinned_client_config(fingerprint)` when a certificate fingerprint is configured for a slave — TLS certificate pinning was accepted but not applied on outbound relay calls (SEC-C1).
+- `src/alerts.rs`: `AlertTracker` persists blocked IPs to `{base_dir}/alert-blocks.json` on every change and reloads on startup — alert-triggered bans now survive service restarts (SEC-B7).
+
+### Changed
+
+- `ebpf/dns_xdp.c`: `icmp_rl_counts` BPF map `max_entries` increased from 8192 to 65536 — eliminates map overflow under ~8 000 concurrent ICMP sources (SEC-C4).
+
+### Added
+
+- `src/icmp.rs`: `IcmpStats::cleanup_expired_bans(ttl_secs)` — removes stale entries from the in-memory ICMP ban table and issues corresponding XDP unban commands.
+- `src/main.rs`: hourly background task calling `cleanup_expired_bans(86_400)` — ICMP bans now expire after 24 h without a service restart (SEC-C3).
+- `docs/security-audit/SECURITY-AUDIT.md`: consolidated master audit document — merges all per-version reports from cycles A, B, and C into a single source of truth.
+
+### Removed
+
+- 17 superseded per-version audit files under `docs/security-audit/` (cycles A and B) — replaced by `SECURITY-AUDIT.md`.
+
+---
+
+## [0.9.39] — 2026-05-25
+
+### Fixed
+
+- `src/dns/hasher.rs`: removed redundant `unsafe {}` blocks inside `unsafe fn crc32c_sse42` and `unsafe fn crc32c_arm` — an `unsafe fn` body is already an unsafe context; inner blocks were noise without effect.
+- `src/api/mod.rs`: Unicode bidirectional control characters (U+202A–U+202E, U+2066–U+2069, U+200F, U+061C) now rejected in `validate_no_control_chars` — prevents homoglyph domain injection (SEC-B16).
+- `src/webui/mod.rs`: background task evicts expired WebUI sessions from the session DashMap every 5 minutes — unbounded session accumulation fixed (SEC-B10).
+- `src/api/relay.rs` (`sync.rs`): relay ban handler calls both `icmp_stats.ban()` (DashMap) and `ban_cmd_tx.send()` (XDP) — ban was previously recorded in-memory but not enforced at the XDP layer (SEC-C2).
+
+### Added
+
+- `src/dns/hasher.rs`: CRC32c hardware-accelerated domain hasher — SSE4.2 on x86_64, ARM CRC extension on aarch64, FNV-1a software fallback. Runtime-detected via `HAS_HW_CRC32C: AtomicBool`. Wired at startup via `dns::hasher::init()` (PERF-C1).
+- `src/main.rs`: `dns::hasher::init()` call at startup for CPU feature detection.
+
+---
+
 ## [0.9.38] — 2026-05-25
 
 ### Fixed
