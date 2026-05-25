@@ -1137,15 +1137,19 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
         Ok(new_cfg) => {
             let new_zones = crate::build_zone_set(&new_cfg);
             s.zones.store(std::sync::Arc::new(new_zones));
-            info!(cfg_path = %s.cfg_path, "API hot-reload complete");
+            // #149: hot-reload alert rules without restart
+            let alert_rules_count = new_cfg.alerts.len();
+            s.alert_tracker.update_rules(new_cfg.alerts.clone());
+            info!(cfg_path = %s.cfg_path, alert_rules = alert_rules_count, "API hot-reload complete");
             s.audit.send(AuditEvent::ConfigReload);
             (
                 StatusCode::OK,
                 JsonExtract(serde_json::json!({
-                    "status":      "ok",
-                    "cfg_path":    s.cfg_path,
-                    "local_zones": new_cfg.local_zones.len(),
-                    "local_data":  new_cfg.local_data.len(),
+                    "status":       "ok",
+                    "cfg_path":     s.cfg_path,
+                    "local_zones":  new_cfg.local_zones.len(),
+                    "local_data":   new_cfg.local_data.len(),
+                    "alert_rules":  alert_rules_count,
                 })),
             )
         }

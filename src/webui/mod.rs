@@ -812,6 +812,7 @@ pub fn ensure_webui_cert(
     ca_cert_pem: &str,
     ca_key_pem: &str,
     base_dir: &std::path::Path,
+    extra_sans: &[String],
 ) -> anyhow::Result<(String, String, std::time::SystemTime)> {
     if !cert_path.is_empty() && !key_path.is_empty() {
         if let (Ok(cert), Ok(key)) = (
@@ -824,7 +825,7 @@ pub fn ensure_webui_cert(
             return Ok((cert, key, expires));
         }
     }
-    gen_webui_cert(cert_path, key_path, ca_cert_pem, ca_key_pem, base_dir)
+    gen_webui_cert(cert_path, key_path, ca_cert_pem, ca_key_pem, base_dir, extra_sans)
 }
 
 fn gen_webui_cert(
@@ -833,6 +834,7 @@ fn gen_webui_cert(
     ca_cert_pem: &str,
     ca_key_pem: &str,
     base_dir: &std::path::Path,
+    extra_sans: &[String],
 ) -> anyhow::Result<(String, String, std::time::SystemTime)> {
     tracing::info!("WebUI TLS: generating certificate signed by local CA (366 days)");
     let now = std::time::SystemTime::now()
@@ -852,11 +854,34 @@ fn gen_webui_cert(
         .map_err(|e| anyhow::anyhow!("CA re-sign: {e}"))?;
 
     // Generate server cert with IP SANs for LAN access
+    tracing::info!(sans = ?extra_sans, "WebUI TLS: adding IP/DNS SANs to certificate");
     let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
         .map_err(|e| anyhow::anyhow!("server cert params: {e}"))?;
     params.not_before = not_before;
     params.not_after  = not_after;
     params.distinguished_name.push(rcgen::DnType::CommonName, "Runbound WebUI");
+
+    // Always include loopback IP SANs (#150)
+    params.subject_alt_names.push(rcgen::SanType::IpAddress(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    ));
+    params.subject_alt_names.push(rcgen::SanType::IpAddress(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    ));
+
+    // Add any extra SANs from config (ui-tls-san directives)
+    for san in extra_sans {
+        let s = san.trim();
+        if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+            params.subject_alt_names.push(rcgen::SanType::IpAddress(ip));
+        } else if !s.is_empty() {
+            if let Ok(ia5) = rcgen::Ia5String::try_from(s) {
+                params.subject_alt_names.push(rcgen::SanType::DnsName(ia5));
+            } else {
+                tracing::warn!(san = s, "WebUI TLS: invalid DNS SAN — skipped");
+            }
+        }
+    }
 
     let key_pair = rcgen::KeyPair::generate()
         .map_err(|e| anyhow::anyhow!("server key gen: {e}"))?;
