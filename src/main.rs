@@ -526,6 +526,7 @@ async fn build_and_launch(
         audit_log_path,
         cfg.audit_log_hmac_key.clone(),
         base_dir.clone(),
+        cfg.audit_checkpoint_every,
     );
     audit.send(audit::AuditEvent::Startup);
 
@@ -688,6 +689,7 @@ async fn build_and_launch(
     }
 
     let cfg_arc = Arc::new(cfg.clone());
+    let dnssec_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cfg.dnssec_validation));
 
     // ── Shared DNS resolver (hot-swappable via ArcSwap) ───────────────────
     let resolver = dns::server::create_shared_resolver(cfg)
@@ -795,6 +797,8 @@ async fn build_and_launch(
                                     cfg: Arc::clone(&cfg_arc),
                                     upstreams: Arc::clone(&upstreams),
                                     stats_cache: Arc::clone(&snapshot_cache),
+                                    dnssec_enabled: Arc::clone(&dnssec_enabled),
+                                    resolver: Arc::clone(&resolver),
                                 });
                                 let sk = key.clone();
                                 let cp = cert_pem.clone();
@@ -988,6 +992,7 @@ async fn build_and_launch(
         domain_stats: Arc::clone(&domain_stats),
         icmp_stats: Arc::clone(&icmp_stats),
         icmp_cfg: Arc::clone(&icmp_cfg),
+        dnssec_enabled: Arc::clone(&dnssec_enabled),
     };
     let app = api::router(state);
 
@@ -1038,7 +1043,7 @@ async fn build_and_launch(
                 ui_rt.spawn(async move {
                     let listener = tokio::net::TcpListener::from_std(ui_std_listener)
                         .expect("ui TcpListener::from_std failed");
-                    axum::serve(listener, ui_app).await.ok()
+                    axum::serve(listener, ui_app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.ok()
                 });
                 Box::leak(Box::new(ui_rt));
                 info!(addr=%ui_addr, "Web UI listening");

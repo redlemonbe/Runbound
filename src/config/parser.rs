@@ -95,6 +95,8 @@ pub struct UnboundConfig {
     pub audit_log_path: Option<String>,
     /// HMAC-SHA256 key (hex or raw). Auto-generated if empty.
     pub audit_log_hmac_key: Option<String>,
+    /// Write a checkpoint every N audit entries for fast crash recovery (#28). Default: 10000. 0 = disabled.
+    pub audit_checkpoint_every: u64,
 
     // ── Slave/master sync (Runbound extensions) ────────────────────────────
     /// Node role: "master" (default) or "slave".
@@ -281,6 +283,7 @@ impl UnboundConfig {
             icmp_enabled: false,
             icmp_rate_pps: 10,
             icmp_burst: 5,
+            audit_checkpoint_every: 10000,
             ..Default::default()
         }
     }
@@ -498,6 +501,7 @@ fn parse_server_directive(
         "audit-log" => cfg.audit_log = val.trim_matches('"') == "yes",
         "audit-log-path" => cfg.audit_log_path = Some(val.trim_matches('"').to_string()),
         "audit-log-hmac-key" => cfg.audit_log_hmac_key = Some(val.trim_matches('"').to_string()),
+        "audit-checkpoint-every" => cfg.audit_checkpoint_every = val.parse().unwrap_or(10000),
         // Slave/master sync directives
         "mode" => cfg.mode = val.trim_matches('"').to_string(),
         "sync-port" => cfg.sync_port = val.parse().ok(),
