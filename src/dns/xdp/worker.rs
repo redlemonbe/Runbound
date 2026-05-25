@@ -75,6 +75,8 @@ pub fn start_xdp(
     domain_routing: bool,
     ring_size: Option<u32>,
     xdp_ring_sizes: XdpRingSizes,
+    stats: Arc<crate::stats::Stats>,
+    domain_stats: Arc<crate::domain_stats::DomainStats>,
 ) -> Result<Option<XdpHandle>, String> {
     if std::env::var("RUNBOUND_DISABLE_XDP").is_ok() {
         tracing::info!("XDP disabled via RUNBOUND_DISABLE_XDP environment variable");
@@ -99,6 +101,8 @@ pub fn start_xdp(
                     domain_routing,
                     ring_size,
                     xdp_ring_sizes,
+                    stats,
+                    domain_stats,
                 );
                 if result.as_ref().map(|r| r.is_some()).unwrap_or(false) {
                     tracing::info!(parent = %parent, "XDP active on parent interface");
@@ -127,6 +131,8 @@ pub fn start_xdp(
         domain_routing,
         ring_size,
         xdp_ring_sizes,
+        stats,
+        domain_stats,
     )
 }
 
@@ -143,6 +149,8 @@ fn start_xdp_on_iface(
     domain_routing: bool,
     ring_size: Option<u32>,
     xdp_ring_sizes: XdpRingSizes,
+    stats: Arc<crate::stats::Stats>,
+    domain_stats: Arc<crate::domain_stats::DomainStats>,
 ) -> Result<Option<XdpHandle>, String> {
     let ifidx = iface_index(iface).ok_or_else(|| format!("interface {iface} not found"))?;
 
@@ -243,9 +251,11 @@ fn start_xdp_on_iface(
             }
         }
         let q_idx = q as usize;
+        let st = Arc::clone(&stats);
+        let ds = Arc::clone(&domain_stats);
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
-            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor, cs, q_idx))
+            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor, cs, q_idx, st, ds))
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
@@ -437,6 +447,8 @@ fn xdp_worker(
     cpu_governor: bool,
     cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
     worker_id: usize,
+    stats: Arc<crate::stats::Stats>,
+    domain_stats: Arc<crate::domain_stats::DomainStats>,
 ) {
     use libc::{poll, pollfd, POLLIN};
 
@@ -568,6 +580,8 @@ fn xdp_worker(
                     src_ip,
                     &mut dns_scratch,
                     cache_arc.as_deref(),
+                    &stats,
+                    &domain_stats,
                 ) {
                     Some(tx_len) => {
                         // Track per-worker packet distribution (#67)
@@ -656,6 +670,8 @@ fn process_packet(
     src_ip: Option<IpAddr>,
     dns_scratch: &mut Vec<u8>,
     cache_snap: Option<&crate::dns::cache_snapshot::CacheSnapshot>,
+    stats: &Arc<crate::stats::Stats>,
+    domain_stats: &Arc<crate::domain_stats::DomainStats>,
 ) -> Option<usize> {
     // ── Ethernet ─────────────────────────────────────────────────────────────
     if rx.len() < ETH_HDR {
@@ -731,7 +747,7 @@ fn process_packet(
         len
     } else if let Some(snap) = cache_snap {
         // Cache hit — answer_from_cache writes directly into tx[dns_off..].
-        match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..]) {
+        match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats)) {
             Some(len) => len,
             None => return None,
         }
@@ -800,6 +816,24 @@ fn process_packet(
     Some(reply_len)
 }
 
+fn wire_qname_to_str(wire: &[u8]) -> String {
+    let mut s = String::with_capacity(wire.len());
+    let mut pos = 0;
+    let mut first = true;
+    while pos < wire.len() {
+        let len = wire[pos] as usize;
+        pos += 1;
+        if len == 0 { break; }
+        if !first { s.push('.'); }
+        first = false;
+        if pos + len <= wire.len() {
+            s.push_str(std::str::from_utf8(&wire[pos..pos + len]).unwrap_or("?"));
+        }
+        pos += len;
+    }
+    s
+}
+
 /// Look up `query_bytes` in the frozen XDP cache snapshot.
 /// On a hit, writes the wire response directly into `tx_dns` (a slice of the TX
 /// UMEM frame starting at the DNS payload offset) and returns `Some(len)`.
@@ -819,6 +853,8 @@ fn answer_from_cache(
     acl: &Acl,
     src_ip: Option<IpAddr>,
     tx_dns: &mut [u8],
+    stats: Option<&Arc<crate::stats::Stats>>,
+    domain_stats: Option<&Arc<crate::domain_stats::DomainStats>>,
 ) -> Option<usize> {
     // ACL check first — denied clients must not receive cached data.
     if let Some(ip) = src_ip {
@@ -927,6 +963,8 @@ fn answer_from_cache(
             tx_dns[1] = qid[1];
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(s) = stats { s.inc_total(); }
+            if let Some(ds) = domain_stats { ds.inc(&wire_qname_to_str(&key.name)); }
             return Some(wire.len());
         }
     }
@@ -1028,7 +1066,7 @@ mod cache_tests {
         let acl = crate::dns::acl::Acl::from_config(&[]);
         let query = make_query(0xBEEF, "example.com", 1);
         let mut tx_dns = vec![0u8; 512];
-        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
+        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns, None, None);
         assert!(result.is_some(), "expected cache hit");
         assert_eq!(tx_dns[0], 0xBE, "QID byte 0 patched");
         assert_eq!(tx_dns[1], 0xEF, "QID byte 1 patched");
@@ -1046,7 +1084,7 @@ mod cache_tests {
         // Query with mixed case — should still hit because we lowercase
         let query = make_query(1, "EXAMPLE.COM", 1);
         let mut tx_dns = vec![0u8; 512];
-        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
+        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns, None, None);
         assert!(result.is_some(), "cache should hit with uppercase query");
     }
 
@@ -1061,7 +1099,7 @@ mod cache_tests {
         let acl = crate::dns::acl::Acl::from_config(&[]);
         let query = make_query(1, "old.example.com", 1);
         let mut tx_dns = vec![0u8; 512];
-        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
+        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns, None, None);
         assert!(result.is_none(), "expired entry must not be served");
     }
 
@@ -1076,7 +1114,7 @@ mod cache_tests {
         let acl = crate::dns::acl::Acl::from_config(&[]);
         let query = make_query(1, "example.com", 255); // QTYPE=ANY
         let mut tx_dns = vec![0u8; 512];
-        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns);
+        let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns, None, None);
         assert!(
             result.is_none(),
             "ANY queries must not be served from cache"

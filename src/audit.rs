@@ -223,7 +223,7 @@ async fn writer_task(
     };
 
     let mut seq = start_seq;
-    let mut last_mac = String::new();
+    let mut last_mac;
     let mut block_start_seq = start_seq;
 
     while let Some(event) = rx.recv().await {

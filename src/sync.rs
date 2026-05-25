@@ -397,18 +397,6 @@ impl SyncJournal {
         self.save_nodes();
     }
 
-    /// Refresh last_seen for a registered node (called on relay contact).
-    pub fn touch_node(&self, node_id: &str) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Ok(mut map) = self.registered_nodes.lock() {
-            if let Some(s) = map.get_mut(node_id) {
-                s.last_seen_at = now;
-            }
-        }
-    }
 
     /// Return all registered nodes with relay_host set (for config push).
     pub fn registered_slaves(&self) -> Vec<SlaveInfo> {
@@ -1445,6 +1433,7 @@ pub struct NodeRelay {
     pub cfg: Arc<UnboundConfig>,
     pub upstreams: SharedUpstreams,
     pub stats_cache: crate::stats::SharedSnapshot,
+    pub domain_stats: Arc<crate::domain_stats::DomainStats>,
     pub dnssec_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub resolver: crate::dns::server::SharedResolver,
 }
@@ -1710,17 +1699,38 @@ async fn handle_relay_request(
                 "healthy":   healthy,
             })))
         }
+        ("GET", op) if op.starts_with("stats/top-domains") => {
+            let limit: usize = op.split('=').last()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10)
+                .min(100);
+            let top = relay.domain_stats.top(limit);
+            let tracked = relay.domain_stats.len();
+            let entries: Vec<_> = top.into_iter()
+                .map(|(d, c)| serde_json::json!({"domain": d, "count": c}))
+                .collect();
+            Ok(json_ok(serde_json::json!({ "top_queried": entries, "tracked_domains": tracked })))
+        }
         // ── System info (for WebUI node overview) ───────────────────────────
         ("GET", "system") => {
             let snap = relay.stats_cache.load();
+            let mem_avail_mb: Option<u64> = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
+                s.lines().find(|l| l.starts_with("MemAvailable:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|kb| kb / 1024)
+            });
+            let workers = crate::cpu::physical_cores().len().max(1) as u32;
             Ok(json_ok(serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "uptime_secs": snap.uptime_secs,
                 "xdp_active": false,
                 "xdp_mode": serde_json::Value::Null,
                 "cpu_percent": serde_json::Value::Null,
-                "mem_avail_mb": serde_json::Value::Null,
-                "workers": 0u32,
+                "mem_avail_mb": mem_avail_mb,
+                "workers": workers,
+                "prefetch_enabled": relay.cfg.prefetch,
+                "dnssec_validation": relay.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed),
             })))
         }
         ("GET", op) if op.starts_with("cache") => {

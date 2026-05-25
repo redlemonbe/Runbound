@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // DNS domain name hash — issue #72
