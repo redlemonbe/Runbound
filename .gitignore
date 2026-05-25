@@ -35,3 +35,14 @@ RAPPORT_TEST_COMPLET.txt
 /tmp/runbound-*.conf
 /tmp/queries-*.txt
 runbound-v*
+
+# Claude Code context — contains local infra credentials, never commit
+CLAUDE.md
+
+# Agent state files
+.agent-state/
+.agent-state/**
+
+# Patch scripts (local tooling)
+/tmp/*.py
+/tmp/*.sh
