@@ -118,15 +118,14 @@ async fn relay_request(
         .handshake(io)
         .await
         .map_err(|e| anyhow::anyhow!("HTTP handshake: {e}"))?;
-    tokio::spawn(async move {
-        conn.await.ok();
-    });
+    let conn_handle = tokio::spawn(async move { conn.await });
 
     let content_length = body.len().to_string();
     let req = hyper::Request::builder()
         .method(method)
         .uri(path)
         .header("host", relay_host)
+        .header("connection", "close")
         .header("content-type", "application/json")
         .header("content-length", &content_length)
         .header("x-runbound-ts", ts.to_string())
@@ -145,6 +144,8 @@ async fn relay_request(
         .await
         .map_err(|e| anyhow::anyhow!("relay collect: {e}"))?
         .to_bytes();
+    drop(sender);
+    let _ = tokio::time::timeout(Duration::from_millis(500), conn_handle).await;
     Ok((status, bytes))
 }
 
@@ -387,15 +388,14 @@ pub async fn register_with_master(
             .handshake(io)
             .await
             .map_err(|e| anyhow::anyhow!("HTTP handshake: {e}"))?;
-        tokio::spawn(async move {
-            conn.await.ok();
-        });
+        let conn_handle = tokio::spawn(async move { conn.await });
 
         let len = body.len().to_string();
         let req = hyper::Request::builder()
             .method("POST")
             .uri("/nodes/register")
             .header("host", &master_sync_addr)
+            .header("connection", "close")
             .header("content-type", "application/json")
             .header("content-length", &len)
             .header("x-runbound-ts", ts.to_string())
@@ -408,7 +408,10 @@ pub async fn register_with_master(
             .map_err(|_| anyhow::anyhow!("send timeout"))?
             .map_err(|e| anyhow::anyhow!("send: {e}"))?;
 
-        Ok(resp.status().as_u16())
+        let status = resp.status().as_u16();
+        drop(sender);
+        let _ = tokio::time::timeout(Duration::from_millis(500), conn_handle).await;
+        Ok(status)
     }
     .await;
 
