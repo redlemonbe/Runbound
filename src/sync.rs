@@ -1445,6 +1445,7 @@ pub struct NodeRelay {
     pub cfg: Arc<UnboundConfig>,
     pub upstreams: SharedUpstreams,
     pub stats_cache: crate::stats::SharedSnapshot,
+    pub domain_stats: Arc<crate::domain_stats::DomainStats>,
     pub dnssec_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub resolver: crate::dns::server::SharedResolver,
 }
