@@ -9,6 +9,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.42] — 2026-05-25
+
+### Added
+
+- WebUI: new route `/webui/security-audit` — the consolidated security audit document (all cycles A/B/C) is now accessible directly from the WebUI without requiring internet access.
+- WebUI: About tab — "Security Audit" link added to the Links card, opening the embedded audit document.
+- `docs/api.md`: documented `PATCH /api/config` (DNSSEC toggle), `GET /api/alerts`, `PUT/DELETE /api/alerts/blocked/:ip` (manual block/unblock), and `priority`/`value`/`ttl`/`weight`/`port` fields in `POST /api/dns`.
+- `docs/configuration.md`: fixed incorrect `/api/alerts/block` endpoint URL (→ `/alerts/blocked`); corrected persistence note (alert blocks survive restarts via `alert-blocks.json`, SEC-B7).
+
+### Fixed
+
+- `docs/api.md`: `POST /api/reload` note now lists alert rules as requiring a full restart (not just a reload).
+
+---
+
 ## [0.9.41] — 2026-05-25
 
 ### Fixed
