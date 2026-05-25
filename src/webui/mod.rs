@@ -72,6 +72,19 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         auth_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(100))),
         login_rl: Arc::new(DashMap::new()),
     });
+    // SEC-B10: periodic cleanup of expired sessions (every 5 minutes).
+    {
+        let sessions = Arc::clone(&state.sessions);
+        let login_rl = Arc::clone(&state.login_rl);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                sessions.retain(|_, (exp, _)| std::time::Instant::now() < *exp);
+                login_rl.retain(|_, (_, since)| since.elapsed().as_secs() < 120);
+            }
+        });
+    }
     Router::new()
         .route("/", get(serve_dashboard))
         .route("/rb-styles.js", get(serve_rb_styles))
