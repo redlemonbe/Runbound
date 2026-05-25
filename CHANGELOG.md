@@ -9,6 +9,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.36] — 2026-05-25
+
+### Fixed
+
+- WebUI Protection: bouton "Apply to all" aligné à la même hauteur (38 px) que "Enable/Disable" via `.icmp-config-row>.btn-secondary { height:38px; line-height:38px }`.
+
+---
+
+## [0.9.35] — 2026-05-25
+
+### Changed
+
+- WebUI Protection: refonte du formulaire ICMP (suppression spin buttons, inputs compacts centrés, boutons primary/outline). Remplacé par v0.9.36 (trop intrusif).
+
+---
+
+## [0.9.34] — 2026-05-25
+
+### Fixed
+
+- WebUI: point de connexion (conn-dot, blink vert/rouge) restauré dans le banner — supprimé par erreur en v0.9.33.
+- WebUI: copyright en bas retiré du positionnement `fixed` — affiché en fin de page (flux normal).
+
+---
+
+## [0.9.33] — 2026-05-25
+
+### Changed
+
+- WebUI: badge "connected / not connected" supprimé du banner (le point coloré suffit).
+- WebUI: logo ASCII éclairci (`#1e4d6b` → `#2d7ab5`) pour meilleure lisibilité sur fond sombre.
+- WebUI Settings: section DNSSEC déplacée en première position.
+
+---
+
+## [0.9.32] — 2026-05-25
+
+### Added
+
+- Config option `block-https-record: yes` : retourne NOERROR vide pour les requêtes de type HTTPS (type 65), empêchant les navigateurs de négocier HTTP/3 (QUIC) quand UDP/443 est bloqué sur le réseau.
+
+---
+
+## [0.9.31] — 2026-05-25
+
+### Fixed
+
+- Détection cgroup v2 : lecture de `/proc/self/cgroup` pour résoudre le chemin exact du cgroup du processus au lieu d'utiliser `/sys/fs/cgroup` (racine), qui n'a pas de `memory.max` sous cgroup v2 unified hierarchy.
+- Ajout `MemoryMax=2G` dans l'unit systemd pour fixer la limite cgroup et éviter la pression mémoire faussement reportée.
+
+---
+
+## [0.9.30] — 2026-05-25
+
+### Fixed
+
+- Relay : accumulation de connexions TCP en état CLOSE-WAIT sur le port 8082 du slave. La tâche hyper HTTP/1.1 était fire-and-forget — le handle de connexion est maintenant attendu avec timeout 500 ms après collecte de la réponse. Header `Connection: close` ajouté pour signaler la fermeture au serveur distant.
+
+---
+
 ## [0.9.29] — 2026-05-25
 
 ### Changed
