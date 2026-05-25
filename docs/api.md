@@ -5,7 +5,7 @@ Runbound exposes a REST API on **localhost only** (HTTP). The port defaults to
 require a Bearer token. `GET /health` is the only unauthenticated endpoint (liveness probe).
 
 > **Looking for a GUI?** A ready-made browser dashboard is included at
-> `examples/web-ui/index.html`. Setup in [web-ui.md](web-ui.md).
+> The dashboard is served directly by Runbound. See [web-ui.md](web-ui.md).
 
 ---
 
@@ -274,7 +274,7 @@ curl http://localhost:8080/health
 ```json
 {
   "status":              "ok",
-  "version":             "0.6.9",
+  "version":             "0.9.37",
   "uptime_secs":         3600,
   "xdp_active":          true,
   "upstreams_healthy":   4,
@@ -684,7 +684,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 
 ```json
 {
-  "version": "0.6.9",
+  "version": "0.9.37",
   "uptime_secs": 3600,
   "xdp_active": true,
   "xdp_mode": "drv",
