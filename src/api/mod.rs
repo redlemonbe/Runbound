@@ -2136,6 +2136,21 @@ async fn add_upstream_handler(
     } else {
         ip
     };
+    // SEC-NEW-01: normalize IPv6-mapped/compatible IPv4 (::ffff:x.x.x.x and ::x.x.x.x) before
+    // checks. to_ipv4() covers both mapped and deprecated IPv4-compatible forms; to_ipv4_mapped()
+    // only handles the ::ffff: form and would miss ::127.0.0.1 (RFC 4291 §2.5.5.1).
+    // Guard: skip normalization for the native IPv6 loopback (::1) because to_ipv4() maps it to
+    // 0.0.0.1, which is not flagged as loopback — we preserve the original so is_loopback() works.
+    #[allow(deprecated)]
+    let ip = if let IpAddr::V6(v6) = ip {
+        if v6.is_loopback() {
+            IpAddr::V6(v6)
+        } else {
+            v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6))
+        }
+    } else {
+        ip
+    };
     // FIX #40: reject loopback and IPv4 link-local
     if ip.is_loopback() {
         return (
