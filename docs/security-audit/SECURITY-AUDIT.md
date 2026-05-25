@@ -1,6 +1,6 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.9.40  
+**Current version:** v0.9.41  
 **Last updated:** 2026-05-25  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
@@ -14,20 +14,16 @@ This document consolidates all security and performance audit cycles conducted o
 |-------|--------------|------|---------|---------------|
 | [Pre-release](#pre-release-audits-v045--v094) | v0.4.5 → v0.9.4 | 2026-05-23/24 | AI-INTERNAL, AI-ADVERSARIAL (Gemini 2.5 Pro) | 0 (all fixed or accepted) |
 | [A](#cycle-a--v0910) | v0.8.2 → v0.9.10 | 2026-05-25 | AI-INTERNAL | 0 (all fixed or accepted) |
-| [B](#cycle-b--v0915) | v0.9.10 → v0.9.15 | 2026-05-25 | AI-ADVERSARIAL | 1 open (SEC-B13) |
+| [B](#cycle-b--v0915) | v0.9.10 → v0.9.15 | 2026-05-25 | AI-ADVERSARIAL | 0 (all fixed or accepted) |
 | [C](#cycle-c--v0938) | v0.9.15 → v0.9.38 | 2026-05-25 | AI-ADVERSARIAL + AI-ADVERSARIAL (Gemini 2.5 Pro) | 0 (all fixed, accepted, or disputed) |
 
 ---
 
 ## Current Open Findings
 
-As of v0.9.40, the following findings remain unresolved:
+As of v0.9.41, **zero findings remain open**. All tracked findings have been fixed, accepted, or classified as false positives.
 
-| ID | Severity | File | Description |
-|----|----------|------|-------------|
-| SEC-B13 | MEDIUM | relay.rs | Relay SNI hardcoded to `"runbound-relay"` — fix depends on full fleet re-registration |
-
-All other previously-open findings have been fixed (SEC-B7, SEC-B10, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
+All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
 
 ---
 
@@ -192,7 +188,7 @@ The design is consistent: `ban()` updates reporting state; callers own XDP enfor
 | SEC-B10 | MEDIUM | ✅ Fixed v0.9.39 | webui/mod.rs | Session DashMap unbounded growth |
 | SEC-B11 | MEDIUM | ⚠️ Accepted | parser.rs | Zone limit per-reload (root required to modify config) |
 | SEC-B12 | MEDIUM | 🔄 Disputed | sync.rs | HMAC ±30s replay window — not a vuln |
-| SEC-B13 | MEDIUM | ⏳ Open | relay.rs | SNI hardcoded; fix requires full fleet re-registration |
+| SEC-B13 | MEDIUM | ✅ Fixed v0.9.41 | relay.rs / sync.rs / config | SNI now dynamic from peer address; new `forward-tls-hostname` directive |
 | SEC-B14 | MEDIUM | ✅ Fixed v0.9.15 | webui/mod.rs | CSRF bypass on proxied API endpoints |
 | SEC-B15 | LOW | ⚠️ Accepted | sync.rs | /proc/meminfo not bounds-checked (reporting only) |
 | SEC-B16 | LOW | ✅ Fixed v0.9.39 | api/mod.rs | Unicode bidi control characters in log fields |
@@ -204,7 +200,7 @@ The design is consistent: `ban()` updates reporting state; callers own XDP enfor
 
 **SEC-B7 (MEDIUM, Fixed v0.9.40):** Alert-triggered blocks were stored only in memory. On restart, all blocks (including permanent ones) were cleared silently. Fixed: `AlertTracker` now persists the block set to `{base_dir}/alert-blocks.json` on every block/unblock event. Blocks are loaded on startup; expired entries are skipped.
 
-**SEC-B13 (MEDIUM, Open):** SNI hardcoded to `"runbound-relay"`. With cert pinning now enforced (SEC-B1/SEC-C1 fixed), the SNI is no longer the trust anchor for pinned nodes. Remaining risk is limited to pre-registration nodes. Full fix requires removing `NoCertVerifier` fallback after all nodes are re-registered with v0.9.15+.
+**SEC-B13 (MEDIUM, Fixed v0.9.41):** Three hardcoded SNI values replaced with dynamic derivation. (1) `forward-zone:` now accepts `forward-tls-hostname` — `build_resolver` passes it to `dot_tls_name`, enabling custom DoT servers outside the built-in IP map (Cloudflare/Quad9/Google/OpenDNS). (2) Relay outbound (`relay_request`, `register`) and sync (`sync_get`) now derive SNI from the peer address via `ServerName::IpAddress` for IPv4/IPv6 or DNS name parsing for hostnames.
 
 ---
 
@@ -313,4 +309,4 @@ Notable pre-release findings now closed:
 - LOW — best-practice deviation; no direct exploit path
 - INFO — architectural observation
 
-**R10 (re-audit independence):** Cycle B fixes were re-evaluated by Gemini 2.5 Pro (different model) in Cycle C. Cycle C fixes (v0.9.40) have not yet been independently re-audited. Re-audit should use a different model or human reviewer before next release.
+**R10 (re-audit independence):** Cycle B fixes were re-evaluated by Gemini 2.5 Pro (different model) in Cycle C. Cycle C fixes (v0.9.40) and SEC-B13 fix (v0.9.41) have not yet been independently re-audited. Re-audit should use a different model or human reviewer before the next release cycle.
