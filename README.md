@@ -29,7 +29,7 @@ Most existing `unbound.conf` files work as-is. Non-standard or exotic directives
 | Linear scaling (no lock contention) | ❌ | ❌ | ✅ |
 | Static binary, no dependencies | ❌ | ❌ | ✅ musl |
 
-*¹ Runbound's sync mechanism uses a REST API-driven approach, architecturally different from BIND9's AXFR/IXFR (RFC 1995/5936). AXFR/IXFR support is planned for v1.2.
+*¹ Runbound ships both REST API-driven replication and standard AXFR/IXFR zone transfers (RFC 5936, v0.9.13+). AXFR requires explicit ACL configuration — see [docs/configuration.md](docs/configuration.md).
 
 ---
 
@@ -60,7 +60,7 @@ At the end you'll see:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Version:  runbound 0.9.2
+ Version:  runbound 0.9.16
  API key:  a1b2c3d4...   ← save this
  Config:   /etc/runbound/runbound.conf
  Logs:     journalctl -u runbound -f
@@ -208,7 +208,7 @@ Disable without editing config: `RUNBOUND_DISABLE_XDP=1` — useful if the host 
 
 Full index: **[docs/index.md](docs/index.md)**
 
-Quick links: [Quick Start](docs/quick-start.md) · [Configuration](docs/configuration.md) · [REST API](docs/api.md) · [XDP](docs/xdp.md) · [Internals](docs/internals.md) · [Systemd](docs/systemd.md) · [Security Audit](docs/security-audit.md)
+Quick links: [Quick Start](docs/quick-start.md) · [Configuration](docs/configuration.md) · [REST API](docs/api.md) · [XDP](docs/xdp.md) · [Internals](docs/internals.md) · [Systemd](docs/systemd.md) · [Security Audit](docs/security-audit/v0.9.15-audit.md)
 
 ---
 
