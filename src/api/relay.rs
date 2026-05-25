@@ -310,8 +310,13 @@ pub fn push_to_slaves(
         let key = key.clone();
         let method_s = method_s.clone();
         let node_id = slave.node_id.unwrap_or_default();
+        let cert_fp = slave.cert_fingerprint.clone();
         tokio::spawn(async move {
-            let tls = relay_tls_config();
+            let tls = if let Some(ref fp) = cert_fp {
+                Arc::new(crate::sync::pinned_client_config(fp))
+            } else {
+                relay_tls_config()
+            };
             match relay_request(&relay_host, tls, &method_s, &path, &key, body).await {
                 Ok((status, _)) if status < 300 => {
                     info!(node_id, relay_host, path, "Config push OK");
