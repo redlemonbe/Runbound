@@ -310,6 +310,12 @@ pub struct UnboundConfig {
 
     // ── Alert thresholds (#12) ────────────────────────────────────────────────
     pub alerts: Vec<AlertRule>,
+
+    // ── Bot defense (#bot-defense) ──────────────────────────────────────────
+    /// Duration in seconds for automatic bot bans. Default: 86400 (24h). 0 = permanent.
+    pub bot_ban_duration_secs: u64,
+    /// Enable honeypot fields in the WebUI login form. Default: false.
+    pub bot_honeypot_enabled: bool,
 }
 
 impl UnboundConfig {
@@ -367,6 +373,8 @@ impl UnboundConfig {
             axfr_enabled: false,
             axfr_allow: vec![],
             alerts: vec![],
+            bot_ban_duration_secs: 86400,
+            bot_honeypot_enabled: false,
             udp_busy_poll: false,
             ..Default::default()
         }
@@ -719,6 +727,12 @@ fn parse_server_directive(
         }
         "xdp-comp-ring-size" => {
             cfg.xdp_comp_ring_size = parse_xdp_ring_size(val, "xdp-comp-ring-size", lineno)?
+        }
+        "bot-ban-duration-secs" => {
+            cfg.bot_ban_duration_secs = val.trim_matches('"').parse().unwrap_or(86400);
+        }
+        "bot-honeypot-enabled" => {
+            cfg.bot_honeypot_enabled = val.trim_matches('"') == "yes";
         }
         // Accepted but unused — common Unbound tuning directives
         "num-threads"
