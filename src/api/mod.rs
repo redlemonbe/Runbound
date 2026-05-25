@@ -3299,6 +3299,20 @@ fn validate_no_control_chars(s: &str, field: &'static str) -> Result<(), String>
             field
         ));
     }
+    // SEC-B16: reject Unicode bidi override and format characters (log injection via U+202x, U+2028/9).
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if (0x200B..=0x200F).contains(&cp)  // zero-width, direction marks
+            || (0x202A..=0x202E).contains(&cp)  // bidi overrides
+            || cp == 0x2028 || cp == 0x2029     // line/paragraph separators
+            || (0xFFF9..=0xFFFB).contains(&cp)  // interlinear annotation
+        {
+            return Err(format!(
+                "Field '{}' must not contain Unicode control or format characters",
+                field
+            ));
+        }
+    }
     Ok(())
 }
 
