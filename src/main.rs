@@ -1122,10 +1122,12 @@ async fn build_and_launch(
                         });
                     }
 
-                    // TLS accept loop
+                    // TLS accept loop — with HTTP-to-HTTPS redirect detection
+                    let ui_port_tls = cfg.ui_port;
                     ui_rt.spawn(async move {
                         use hyper_util::rt::{TokioExecutor, TokioIo};
                         use hyper_util::server::conn::auto::Builder as HyperBuilder;
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
                         use tower::Service as _;
                         let listener = tokio::net::TcpListener::from_std(ui_std_listener)
                             .expect("ui TcpListener::from_std");
@@ -1140,6 +1142,42 @@ async fn build_and_launch(
                             let acceptor   = tokio_rustls::TlsAcceptor::from(server_cfg);
                             let mut ms     = make_svc.clone();
                             tokio::spawn(async move {
+                                let mut tcp = tcp;
+                                // Peek at first byte: HTTP methods start with uppercase ASCII.
+                                // TLS ClientHello starts with 0x16 (22). If plain HTTP, redirect.
+                                let mut peek = [0u8; 1];
+                                if tcp.peek(&mut peek).await.unwrap_or(0) == 1
+                                    && peek[0].is_ascii_uppercase()
+                                {
+                                    // Plain HTTP — read request to extract Host + path
+                                    let mut buf = vec![0u8; 4096];
+                                    let n = tcp.read(&mut buf).await.unwrap_or(0);
+                                    let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                                    let path = req.lines().next()
+                                        .and_then(|l| l.split_whitespace().nth(1))
+                                        .unwrap_or("/")
+                                        .to_owned();
+                                    let host_hdr = req.lines()
+                                        .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+                                        .and_then(|l| l.splitn(2, ':').nth(1))
+                                        .map(|h| h.trim().to_owned());
+                                    let location = match host_hdr {
+                                        // Host already includes port (e.g. "192.168.8.12:8091")
+                                        Some(h) if h.contains(':') => {
+                                            format!("https://{h}{path}")
+                                        }
+                                        // Host without port — append server port
+                                        Some(h) => format!("https://{h}:{ui_port_tls}{path}"),
+                                        None => format!("https://{}:{ui_port_tls}{path}", addr.ip()),
+                                    };
+                                    let body = format!("<a href=\"{location}\">HTTPS required</a>");
+                                    let resp = format!(
+                                        "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        body.len()
+                                    );
+                                    tcp.write_all(resp.as_bytes()).await.ok();
+                                    return;
+                                }
                                 let svc = match ms.call(addr).await {
                                     Ok(s) => s,
                                     Err(_) => return,
@@ -1153,10 +1191,7 @@ async fn build_and_launch(
                                             .ok();
                                     }
                                     Err(e) => {
-                                        let h = if e.to_string().contains("InvalidContentType")
-                                            || e.to_string().contains("corrupt message")
-                                        { " — use HTTPS" } else { "" };
-                                        tracing::debug!(peer=%addr, "WebUI TLS: {e}{h}");
+                                        tracing::debug!(peer=%addr, "WebUI TLS: {e}");
                                     }
                                 }
                             });
