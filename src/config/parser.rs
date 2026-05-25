@@ -20,6 +20,9 @@ pub struct ForwardZone {
     pub addrs: Vec<String>,
     /// Send queries over DNS-over-TLS (port 853) instead of plain UDP/TCP.
     pub tls: bool,
+    /// Explicit TLS SNI hostname for DoT upstreams (`forward-tls-hostname`).
+    /// Overrides the built-in IP→hostname map in `dot_tls_name`.
+    pub tls_hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -419,11 +422,13 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                     name: String::new(),
                     addrs: Vec::new(),
                     tls: false,
+                    tls_hostname: None,
                 });
                 match key {
                     "name" => fwd.name = val.trim_matches('"').to_string(),
                     "forward-addr" => fwd.addrs.push(val.trim_matches('"').to_string()),
                     "forward-tls-upstream" => fwd.tls = val.trim() == "yes",
+                    "forward-tls-hostname" => fwd.tls_hostname = Some(val.trim_matches('"').to_string()),
                     other => warn!(
                         "Line {}: unknown forward-zone directive '{}' — ignored",
                         lineno + 1,

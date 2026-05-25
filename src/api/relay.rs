@@ -105,8 +105,13 @@ async fn relay_request(
     .map_err(|_| anyhow::anyhow!("relay TCP connect timeout to {relay_host}"))?
     .map_err(|e| anyhow::anyhow!("relay TCP connect {relay_host}: {e}"))?;
 
-    let server_name = rustls::pki_types::ServerName::try_from("runbound-relay")
-        .map_err(|e| anyhow::anyhow!("SNI: {e}"))?;
+    let sni_host = relay_host.rsplit_once(':').map(|(h, _)| h).unwrap_or(relay_host);
+    let server_name = if let Ok(ip) = sni_host.parse::<std::net::IpAddr>() {
+        rustls::pki_types::ServerName::IpAddress(ip.into())
+    } else {
+        rustls::pki_types::ServerName::try_from(sni_host.to_owned())
+            .map_err(|e| anyhow::anyhow!("SNI: {e}"))?
+    };
     let connector = tokio_rustls::TlsConnector::from(tls_config);
     let tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(server_name, tcp))
         .await
@@ -365,11 +370,16 @@ pub async fn register_with_master(
     let sig = hmac_sign(&sync_key, "POST", "/nodes/register", ts);
 
     let tls_config = relay_tls_config();
-    let server_name = match rustls::pki_types::ServerName::try_from("runbound-relay") {
-        Ok(n) => n,
-        Err(e) => {
-            warn!("register: SNI error: {e}");
-            return false;
+    let sni_host = master_sync_addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&master_sync_addr);
+    let server_name = if let Ok(ip) = sni_host.parse::<std::net::IpAddr>() {
+        rustls::pki_types::ServerName::IpAddress(ip.into())
+    } else {
+        match rustls::pki_types::ServerName::try_from(sni_host.to_owned()) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("register: SNI error: {e}");
+                return false;
+            }
         }
     };
 

@@ -780,6 +780,7 @@ forward-zone:
 | `name` | Zone to forward. `"."` forwards everything not answered locally. |
 | `forward-addr` | Upstream resolver. `ip@port` syntax. Repeat for redundancy. |
 | `forward-tls-upstream` | `yes` → send queries over DNS-over-TLS (port 853). |
+| `forward-tls-hostname` | TLS SNI hostname for DoT. Overrides the built-in IP→name map. Required for custom DoT servers. |
 
 **DNS-over-TLS to upstream:**
 
@@ -789,6 +790,27 @@ forward-zone:
     forward-addr:         1.1.1.1@853
     forward-addr:         1.0.0.1@853
     forward-tls-upstream: yes
+    # forward-tls-hostname: cloudflare-dns.com  ← auto-detected for 1.1.1.1/1.0.0.1
+```
+
+Built-in SNI map (no `forward-tls-hostname` needed for these):
+
+| IP | SNI used |
+|---|---|
+| `1.1.1.1`, `1.0.0.1` | `cloudflare-dns.com` |
+| `9.9.9.9`, `149.112.112.112` | `dns.quad9.net` |
+| `8.8.8.8`, `8.8.4.4` | `dns.google` |
+| `208.67.222.222`, `208.67.220.220` | `dns.opendns.com` |
+| *(any other IP)* | IP literal — TLS will fail unless you set `forward-tls-hostname` |
+
+For custom DoT servers, set the hostname explicitly:
+
+```
+forward-zone:
+    name:                 "."
+    forward-addr:         203.0.113.1@853
+    forward-tls-upstream: yes
+    forward-tls-hostname: dot.internal.example.com
 ```
 
 The `@port` syntax works for both plain and TLS upstreams. When `forward-tls-upstream: yes`
