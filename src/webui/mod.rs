@@ -32,7 +32,7 @@ fn now_unix() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-static TAILWIND_JS: &[u8] = include_bytes!("../../examples/web-ui/tailwind.min.js");
+static RB_STYLES_JS: &[u8] = include_bytes!("../../examples/web-ui/rb-styles.js");
 
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 const CRED_FILE: &str = "webui-auth.conf";
@@ -71,7 +71,7 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
     });
     Router::new()
         .route("/", get(serve_dashboard))
-        .route("/tailwind.js", get(serve_tailwind))
+        .route("/rb-styles.js", get(serve_rb_styles))
         .route("/login",  get(serve_login).post(handle_login))
         .route("/logout", get(handle_logout).post(handle_logout))
         .route("/api/webui/password", post(change_password))
@@ -144,8 +144,8 @@ async fn serve_dashboard(State(state): State<Arc<WebUiState>>, req: Request<Body
     Html(INDEX_HTML).into_response()
 }
 
-async fn serve_tailwind() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "application/javascript")], TAILWIND_JS)
+async fn serve_rb_styles() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/javascript")], RB_STYLES_JS)
 }
 
 const LOGIN_HTML: &str = r#"<!DOCTYPE html>
@@ -154,7 +154,8 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <title>Runbound — Sign in</title>
-  <script src="/tailwind.js"></script>
+  <link rel="icon" href="/favicon.ico"/>
+  <script src="/rb-styles.js"></script>
   <style>
     @keyframes glow-pulse{0%,100%{opacity:.6}50%{opacity:1}}
     @keyframes fade-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
@@ -401,8 +402,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tailwind_js_served() {
-        let resp = app().oneshot(Request::builder().uri("/tailwind.js").body(Body::empty()).unwrap()).await.unwrap();
+    async fn rb_styles_served() {
+        let resp = app().oneshot(Request::builder().uri("/rb-styles.js").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("content-type").unwrap().to_str().unwrap().contains("javascript"));
     }
