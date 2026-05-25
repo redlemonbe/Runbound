@@ -47,6 +47,8 @@ pub struct WebUiState {
     creds:    Arc<std::sync::Mutex<WebUiCred>>,
     auth_path: PathBuf,
     auth_events: Arc<std::sync::Mutex<std::collections::VecDeque<AuthEvent>>>,
+    /// SEC-A1: per-IP login failure tracker — (failure_count, window_start).
+    login_rl: Arc<DashMap<std::net::IpAddr, (u32, Instant)>>,
 }
 
 struct WebUiCred {
@@ -68,6 +70,7 @@ pub fn router(api_port: u16, api_key: String, base_dir: PathBuf) -> Router {
         creds: Arc::new(std::sync::Mutex::new(creds)),
         auth_path,
         auth_events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(100))),
+        login_rl: Arc::new(DashMap::new()),
     });
     Router::new()
         .route("/", get(serve_dashboard))
@@ -217,9 +220,22 @@ struct LoginForm { username: String, password: String }
 async fn handle_login(
     State(state): State<Arc<WebUiState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let client_ip = addr.ip().to_string();
+    let client_ip_addr = addr.ip();
+    let client_ip = client_ip_addr.to_string();
+    // SEC-A1: rate-limit login failures — 5 failures per 60s per IP.
+    {
+        let now = Instant::now();
+        let mut entry = state.login_rl.entry(client_ip_addr).or_insert((0u32, now));
+        let (count, since) = &mut *entry;
+        if since.elapsed().as_secs() >= 60 { *count = 0; *since = now; }
+        if *count >= 5 {
+            tracing::warn!(ip = %client_ip, "WebUI login rate-limited");
+            return (StatusCode::TOO_MANY_REQUESTS, Html("<h1>Too many attempts. Try again in a minute.</h1>")).into_response();
+        }
+    }
     let ok = {
         let creds = state.creds.lock().unwrap_or_else(|e| e.into_inner());
         if creds.username != form.username { false }
@@ -231,6 +247,10 @@ async fn handle_login(
         }
     };
     if !ok {
+        // SEC-A1: increment failure counter on bad credentials.
+        if let Some(mut entry) = state.login_rl.get_mut(&client_ip_addr) {
+            entry.value_mut().0 += 1;
+        }
         tracing::warn!(user = %form.username, ip = %client_ip, "WebUI login FAILED — invalid credentials");
         push_auth_event(&state, "login_fail", &form.username, &client_ip);
         return Redirect::to("/login?err=Invalid%20credentials").into_response();
@@ -243,13 +263,19 @@ async fn handle_login(
     state.sessions.insert(token.clone(), (Instant::now() + SESSION_TTL, csrf_token.clone()));
     tracing::info!(user = %form.username, ip = %client_ip, "WebUI login successful");
     push_auth_event(&state, "login_ok", &form.username, &client_ip);
+    // SEC-A2: add Secure flag when behind an HTTPS reverse proxy.
+    let secure = headers.get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+    let secure_attr = if secure { "; Secure" } else { "" };
     let cookie_session = format!(
-        "rb_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        "rb_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure_attr}",
         SESSION_TTL.as_secs()
     );
     // rb_csrf is NOT HttpOnly — JS reads it to add X-CSRF-Token header (SEC-19 double-submit).
     let cookie_csrf = format!(
-        "rb_csrf={csrf_token}; Path=/; SameSite=Lax; Max-Age={}",
+        "rb_csrf={csrf_token}; Path=/; SameSite=Lax; Max-Age={}{secure_attr}",
         SESSION_TTL.as_secs()
     );
     Response::builder()
@@ -294,8 +320,8 @@ async fn change_password(
     if !verify_csrf(&state, &headers) {
         return (StatusCode::FORBIDDEN, "CSRF token invalid or missing").into_response();
     }
-    if payload.username.trim().is_empty() || payload.password.len() < 4 {
-        return (StatusCode::BAD_REQUEST, "username required; password min 4 chars").into_response();
+    if payload.username.trim().is_empty() || payload.password.len() < 12 {
+        return (StatusCode::BAD_REQUEST, "username required; password min 12 chars").into_response();
     }
     let salt = SaltString::generate(&mut OsRng);
     let hash = match Argon2::default().hash_password(payload.password.as_bytes(), &salt) {
