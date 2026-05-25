@@ -52,7 +52,7 @@ Complete reference for Runbound. Each page covers the current stable release.. E
 |------|--------------------|
 | [security.md](security.md) | Security features — ACL, rate limiting, DNS rebinding, DNSSEC, CHAOS class |
 | [hardening.md](hardening.md) | systemd hardening deep-dive — every directive explained, what breaks if missing |
-| [security-audit/SECURITY-AUDIT.md](security-audit/SECURITY-AUDIT.md) | Master audit document — all cycles (A/B/C), current finding statuses, known limitations |
+| [security-audit/SECURITY-AUDIT.md](security-audit/SECURITY-AUDIT.md) | Master audit document — all cycles (A/B/C/D), current finding statuses, known limitations |
 | [security-audit/v0.9.38-audit.md](security-audit/v0.9.38-audit.md) | v0.9.38 Cycle C detailed report — dual AI audit (Claude + Gemini), 8 findings |
 | [audit.md](audit.md) | Supply-chain audit — dependency scanning, cargo-deny, RUSTSEC cadence |
 | [hsm.md](hsm.md) | HSM / PKCS#11 integration — hardware key storage, HMAC audit log |

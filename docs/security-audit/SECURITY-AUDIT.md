@@ -1,7 +1,7 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.9.41  
-**Last updated:** 2026-05-25  
+**Current version:** v0.9.44  
+**Last updated:** 2026-05-26  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
 This document consolidates all security and performance audit cycles conducted on Runbound. Individual per-cycle files in this directory are historical records; this file is the authoritative status reference.
@@ -16,6 +16,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [A](#cycle-a--v0910) | v0.8.2 → v0.9.10 | 2026-05-25 | AI-INTERNAL | 0 (all fixed or accepted) |
 | [B](#cycle-b--v0915) | v0.9.10 → v0.9.15 | 2026-05-25 | AI-ADVERSARIAL | 0 (all fixed or accepted) |
 | [C](#cycle-c--v0938) | v0.9.15 → v0.9.38 | 2026-05-25 | AI-ADVERSARIAL + AI-ADVERSARIAL (Gemini 2.5 Pro) | 0 (all fixed, accepted, or disputed) |
+| [D](#audit-status--v0944) | v0.9.43–v0.9.44 | — | — | **Pending** |
 
 ---
 
@@ -24,6 +25,25 @@ This document consolidates all security and performance audit cycles conducted o
 As of v0.9.41, **zero findings remain open**. All tracked findings have been fixed, accepted, or classified as false positives.
 
 All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
+
+---
+
+## Audit status — v0.9.44
+
+| Cycle | Scope | Auditor | Status |
+|-------|-------|---------|--------|
+| A | Core DNS, XDP, API | [AI-INTERNAL] Claude | Complete |
+| B | Auth, relay, WebUI | [AI-INTERNAL] Claude | Complete |
+| C | v0.9.3–v0.9.41 hardening | [AI-ADVERSARIAL] Claude + Gemini | Complete — 0 open findings |
+| D | v0.9.43–v0.9.44 features | — | **Pending** — bot defense, alert hot-reload, IP SAN not yet audited |
+
+**New attack surface since last audit (Cycle C, v0.9.41):**
+- Bot defense engine (`src/webui/mod.rs`): honeypot detection, scanner trap, burst tracker — potential for IP spoofing false-positives or self-DoS if attacker can generate 127.0.0.1-sourced requests
+- `SyncOp::AddGlobalBan` / `DeleteGlobalBan` — new relay operations; ban injection via compromised slave not evaluated
+- `AlertTracker.update_rules()` — rules can now be replaced at runtime via hot-reload; concurrent modification behavior under load not audited
+- `ui-tls-san` — attacker with config write access could add arbitrary SANs to the cert
+
+Cycle D should be scheduled before v1.0.
 
 ---
 

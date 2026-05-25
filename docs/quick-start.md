@@ -28,7 +28,7 @@ At the end you'll see your API key and the service URL:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Version:  runbound 0.9.41
+ Version:  runbound 0.9.44
  API key:  a1b2c3d4...   ← save this
  Config:   /etc/runbound/runbound.conf
  Logs:     journalctl -u runbound -f
@@ -85,7 +85,7 @@ dig @127.0.0.1 google.com
 # Verify the API is reachable:
 curl -s http://localhost:8080/api/system \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
-# → {"version":"0.9.41","uptime_secs":3,...}
+# → {"version":"0.9.44","uptime_secs":3,...}
 ```
 
 ---
