@@ -4,6 +4,7 @@ pub mod ddns;
 pub mod acl;
 pub mod cache_snapshot;
 pub mod local;
+pub mod axfr;
 pub mod prefetch;
 pub mod ratelimit;
 pub mod server;

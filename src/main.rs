@@ -7,6 +7,7 @@ mod config;
 mod cpu;
 mod dns;
 mod domain_stats;
+mod alerts;
 mod error;
 mod feeds;
 mod firewall;
@@ -105,6 +106,7 @@ async fn async_main(
         per_upstream_resolvers,
         racing_wins,
         domain_stats,
+        alert_tracker,
         icmp_stats,
         icmp_cfg,
         dnssec_enabled,
@@ -318,6 +320,20 @@ async fn async_main(
     #[cfg(not(feature = "xdp"))]
     let (_icmp_stats_keep, _icmp_cfg_keep) = (Arc::clone(&icmp_stats), Arc::clone(&icmp_cfg));
 
+    // ── io_uring availability detection (#65) ─────────────────────────────────
+    if cfg.io_uring {
+        let available = std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled")
+            .map(|s| s.trim() == "0")
+            .unwrap_or(true);
+        if available {
+            info!("io_uring: enabled and available — async I/O upgrade active");
+            // tokio io_uring backend is active when compiled with tokio_unstable + io-uring feature.
+            // The slow-path resolver uses tokio tasks which transparently benefit from io_uring.
+        } else {
+            tracing::warn!("io_uring: enabled in config but disabled by kernel (io_uring_disabled != 0) — falling back to epoll");
+        }
+    }
+
     // #93: TTY-only startup banner — not printed under systemd (no TTY on stderr).
     if std::io::stderr().is_terminal() {
         let xdp_str = match xdp_mode.load(Ordering::Relaxed) {
@@ -357,6 +373,7 @@ async fn async_main(
         per_upstream_resolvers,
         racing_wins,
         domain_stats,
+        Arc::clone(&alert_tracker),
         Arc::clone(&dnssec_enabled),
     )
     .await;
@@ -520,6 +537,7 @@ async fn build_and_launch(
     dns::server::SharedResolversVec,
     Arc<dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>>,
     Arc<DomainStats>,
+    Arc<crate::alerts::AlertTracker>,
     Arc<crate::icmp::IcmpStats>,
     Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
     Arc<std::sync::atomic::AtomicBool>,
@@ -759,6 +777,7 @@ async fn build_and_launch(
     let zones_mutex = Arc::new(tokio::sync::Mutex::new(()));
     // Hoisted so both NodeRelay (slave relay) and DNS handler share the same instance.
     let domain_stats = DomainStats::new();
+    let alert_tracker = crate::alerts::AlertTracker::new(cfg.alerts.clone());
 
     // Slave node UUID — generated once, persisted to disk (#88).
     let node_id: Option<String> = if cfg.is_slave() {
@@ -996,6 +1015,7 @@ async fn build_and_launch(
         racing_wins: Arc::clone(&racing_wins),
         events_tx,
         domain_stats: Arc::clone(&domain_stats),
+        alert_tracker: Arc::clone(&alert_tracker),
         icmp_stats: Arc::clone(&icmp_stats),
         icmp_cfg: Arc::clone(&icmp_cfg),
         dnssec_enabled: Arc::clone(&dnssec_enabled),
@@ -1079,6 +1099,7 @@ async fn build_and_launch(
         per_upstream_resolvers,
         racing_wins,
         domain_stats,
+        alert_tracker,
         icmp_stats,
         icmp_cfg,
         dnssec_enabled,

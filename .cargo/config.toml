@@ -1,14 +1,18 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
-# Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 [build]
 jobs = 32
+rustflags = ["--cfg", "tokio_unstable"]
 
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = ["--cfg", "tokio_unstable", "-C", "link-arg=-fuse-ld=mold"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["--cfg", "tokio_unstable"]
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-gnu-linker-wrapper"
+rustflags = ["--cfg", "tokio_unstable"]
 
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-gnu-gcc"
+rustflags = ["--cfg", "tokio_unstable"]
