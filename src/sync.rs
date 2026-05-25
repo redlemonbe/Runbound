@@ -397,18 +397,6 @@ impl SyncJournal {
         self.save_nodes();
     }
 
-    /// Refresh last_seen for a registered node (called on relay contact).
-    pub fn touch_node(&self, node_id: &str) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Ok(mut map) = self.registered_nodes.lock() {
-            if let Some(s) = map.get_mut(node_id) {
-                s.last_seen_at = now;
-            }
-        }
-    }
 
     /// Return all registered nodes with relay_host set (for config push).
     pub fn registered_slaves(&self) -> Vec<SlaveInfo> {
