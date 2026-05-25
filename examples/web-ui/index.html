@@ -502,7 +502,9 @@ function nodeApi(nodeId, method, path, body) {
     return doFetch(relayUrl, masterKey);
   };
   if (nodeId === 'master') return doFetch(directUrl, n.key);
-  return doFetch(directUrl, n.key).catch(() => tryRelay());
+  // Use relay when available — avoids cross-origin requests from embedded WebUI
+  if (n.relayNodeId) return tryRelay();
+  return doFetch(directUrl, n.key);
 }
 
 // Current node's API (for tabs other than overview)
