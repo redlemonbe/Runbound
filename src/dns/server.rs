@@ -1431,7 +1431,8 @@ fn build_resolver(cfg: &UnboundConfig, cache_size: usize, dnssec: bool) -> anyho
                 if fwd.tls {
                     // DNS-over-TLS: encrypted channel, single TCP connection per server.
                     // dot_tls_name derives the correct SNI hostname for well-known resolvers.
-                    let tls_name = dot_tls_name(&ip, None);
+                    // forward-tls-hostname overrides the built-in map for custom DoT servers.
+                    let tls_name = dot_tls_name(&ip, fwd.tls_hostname.as_deref());
                     let mut cc = ConnectionConfig::tls(tls_name);
                     cc.port = port;
                     resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc]));
@@ -2439,5 +2440,23 @@ mod tests {
             dot_tls_name(&ip, Some("my-custom-dot.example.com")),
             Arc::from("my-custom-dot.example.com"),
         );
+    }
+
+    #[test]
+    fn dot_tls_name_explicit_overrides_known_resolver() {
+        // forward-tls-hostname must win even over the built-in Cloudflare mapping
+        let ip: IpAddr = "1.1.1.1".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            dot_tls_name(&ip, Some("dot.internal.example.com")),
+            Arc::from("dot.internal.example.com"),
+        );
+    }
+
+    #[test]
+    fn dot_tls_name_custom_ip_no_fallback_to_literal() {
+        // Unknown IP with no explicit hostname falls back to the IP literal —
+        // correct behaviour: TLS will fail rather than silently accept.
+        let ip: IpAddr = "203.0.113.1".parse().unwrap_or_else(|_| unreachable!());
+        assert_eq!(dot_tls_name(&ip, None), Arc::from("203.0.113.1"));
     }
 }
