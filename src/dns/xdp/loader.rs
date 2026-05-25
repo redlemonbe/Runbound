@@ -10,7 +10,7 @@ use std::os::fd::RawFd;
 
 use aya::programs::xdp::XdpLinkId;
 use aya::{
-    maps::{Array, CpuMap, PerCpuArray, XskMap},
+    maps::{Array, CpuMap, HashMap, PerCpuArray, PerCpuHashMap, XskMap},
     programs::{Xdp, XdpFlags},
     Ebpf, EbpfLoader,
 };
@@ -195,6 +195,52 @@ impl XdpHandle {
             out[i as usize] = vals.iter().sum();
         }
         Ok(out)
+    }
+
+    /// Read per-IP rate-limited hit counts and reset (delete) each processed entry.
+    /// Returns `(ip_be32, total_count)` pairs for IPs with count > 0.
+    /// The PERCPU map stores one u64 per CPU; we sum all slots.
+    pub fn icmp_read_and_reset_rl(&mut self) -> Result<Vec<(u32, u64)>, String> {
+        let map = self
+            .bpf
+            .map_mut("icmp_rl_counts")
+            .ok_or_else(|| "icmp_rl_counts map not found".to_string())?;
+        let mut hash = PerCpuHashMap::<_, u32, u64>::try_from(map).map_err(|e| e.to_string())?;
+        let keys: Vec<u32> = hash
+            .keys()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Ok(vals) = hash.get(&key, 0) {
+                let total: u64 = vals.iter().sum();
+                if total > 0 {
+                    out.push((key, total));
+                }
+                let _ = hash.remove(&key);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Insert `ip_be32` (network-byte-order IPv4) into the BPF `icmp_banned` map.
+    pub fn icmp_ban_ip(&mut self, ip_be32: u32) -> Result<(), String> {
+        let map = self
+            .bpf
+            .map_mut("icmp_banned")
+            .ok_or_else(|| "icmp_banned map not found".to_string())?;
+        let mut hash = HashMap::<_, u32, u8>::try_from(map).map_err(|e| e.to_string())?;
+        hash.insert(ip_be32, 1u8, 0).map_err(|e| e.to_string())
+    }
+
+    /// Remove `ip_be32` from the BPF `icmp_banned` map (unban).
+    pub fn icmp_unban_ip(&mut self, ip_be32: u32) -> Result<(), String> {
+        let map = self
+            .bpf
+            .map_mut("icmp_banned")
+            .ok_or_else(|| "icmp_banned map not found".to_string())?;
+        let mut hash = HashMap::<_, u32, u8>::try_from(map).map_err(|e| e.to_string())?;
+        hash.remove(&ip_be32).map_err(|e| e.to_string())
     }
 
     /// Initialise CPUMAP entries for `nb_workers` CPUs.

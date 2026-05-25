@@ -648,7 +648,7 @@ pub fn router(state: AppState) -> Router {
         )
         // Alert thresholds (#12)
         .route("/alerts", get(get_alerts))
-        .route("/alerts/blocked/:ip", delete(delete_blocked_ip))
+        .route("/alerts/blocked/:ip", delete(delete_blocked_ip).put(put_blocked_ip))
         // Administration
         .route("/rotate-key", post(rotate_key_handler))
         .layer(middleware::from_fn_with_state(
@@ -772,9 +772,10 @@ async fn icmp_config_get_handler(State(s): State<AppState>) -> impl IntoResponse
     use axum::Json;
     let cfg = s.icmp_cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
     Json(serde_json::json!({
-        "enable":     cfg.enabled,
-        "rate_limit": cfg.rate_pps,
-        "burst":      cfg.burst,
+        "enable":        cfg.enabled,
+        "rate_limit":    cfg.rate_pps,
+        "burst":         cfg.burst,
+        "ban_threshold": cfg.ban_threshold,
     }))
 }
 
@@ -783,6 +784,7 @@ struct IcmpConfigRequest {
     enable: Option<bool>,
     rate_limit: Option<u32>,
     burst: Option<u32>,
+    ban_threshold: Option<u32>,
 }
 
 // ── PUT /api/icmp/config (#89) ────────────────────────────────────────────
@@ -792,24 +794,33 @@ async fn icmp_config_put_handler(
 ) -> impl IntoResponse {
     use axum::Json;
     let mut cfg = s.icmp_cfg.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(v) = body.enable {
-        cfg.enabled = v;
-    }
-    if let Some(v) = body.rate_limit {
-        cfg.rate_pps = v;
-    }
-    if let Some(v) = body.burst {
-        cfg.burst = v;
-    }
+    if let Some(v) = body.enable        { cfg.enabled = v; }
+    if let Some(v) = body.rate_limit    { cfg.rate_pps = v; }
+    if let Some(v) = body.burst         { cfg.burst = v; }
+    if let Some(v) = body.ban_threshold { cfg.ban_threshold = v; }
     let enabled = cfg.enabled;
     let rate_pps = cfg.rate_pps;
     let burst = cfg.burst;
+    let ban_threshold = cfg.ban_threshold;
     drop(cfg);
 
+    let _ = std::fs::write(
+        s.base_dir.join("icmp.json"),
+        serde_json::json!({"enable":enabled,"rate_limit":rate_pps,"burst":burst,"ban_threshold":ban_threshold}).to_string(),
+    );
+
+    if let (Some(ref j), Some(ref k)) = (&s.sync_journal, &s.sync_key) {
+        crate::api::relay::push_to_slaves(
+            j, k, axum::http::Method::PUT, "icmp/config".to_string(),
+            bytes::Bytes::from(serde_json::json!({"enable":enabled,"rate_limit":rate_pps,"burst":burst,"ban_threshold":ban_threshold}).to_string()),
+        );
+    }
+
     Json(serde_json::json!({
-        "enable":     enabled,
-        "rate_limit": rate_pps,
-        "burst":      burst,
+        "enable":        enabled,
+        "rate_limit":    rate_pps,
+        "burst":         burst,
+        "ban_threshold": ban_threshold,
     }))
 }
 
@@ -5948,6 +5959,24 @@ async fn get_alerts(State(state): State<AppState>) -> impl IntoResponse {
     JsonExtract(state.alert_tracker.api_snapshot())
 }
 
+// PUT /api/alerts/blocked/:ip — manually block an IP (XDP + AlertTracker)
+async fn put_blocked_ip(
+    State(state): State<AppState>,
+    axum::extract::Path(ip_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match ip_str.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            state.alert_tracker.block_manual(ip, "manual".to_string());
+            state.icmp_stats.ban(ip, crate::icmp::BanSource::Manual);
+            if let std::net::IpAddr::V4(ipv4) = ip {
+                let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+            }
+            (StatusCode::OK, JsonExtract(serde_json::json!({"blocked": true, "ip": ip_str}))).into_response()
+        }
+        Err(_) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error": "invalid IP"}))).into_response(),
+    }
+}
+
 // DELETE /api/alerts/blocked/:ip — unblock a specific IP (#12)
 async fn delete_blocked_ip(
     State(state): State<AppState>,
@@ -5956,6 +5985,10 @@ async fn delete_blocked_ip(
     match ip_str.parse::<std::net::IpAddr>() {
         Ok(ip) => {
             let removed = state.alert_tracker.unblock(ip);
+            state.icmp_stats.unban(ip);
+            if let std::net::IpAddr::V4(ipv4) = ip {
+                let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+            }
             (StatusCode::OK, JsonExtract(serde_json::json!({"unblocked": removed, "ip": ip_str}))).into_response()
         }
         Err(_) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error": "invalid IP"}))).into_response(),
