@@ -127,6 +127,8 @@ pub struct UnboundConfig {
     pub sync_key: Option<String>,
     /// Slave only: sync interval in seconds. Default: 30.
     pub sync_interval: u64,
+    /// Master only: allow RFC 1918/ULA slave relay_host (local network deployments).
+    pub sync_allow_private_relay: bool,
 
     // ── ACME (Let's Encrypt) ───────────────────────────────────────────────
     /// Contact email for Let's Encrypt account.
@@ -619,6 +621,7 @@ fn parse_server_directive(
         "sync-master" => cfg.sync_master = Some(val.trim_matches('"').to_string()),
         "sync-key" => cfg.sync_key = Some(val.trim_matches('"').to_string()),
         "sync-interval" => cfg.sync_interval = val.parse().unwrap_or(30),
+        "sync-allow-private-relay" => cfg.sync_allow_private_relay = matches!(val.trim(), "yes" | "true" | "1"),
         // ACME / Let's Encrypt
         "acme-email" => cfg.acme_email = Some(val.trim_matches('"').to_string()),
         "acme-domain" => cfg.acme_domains.push(val.trim_matches('"').to_string()),
