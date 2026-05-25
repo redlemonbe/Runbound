@@ -282,8 +282,6 @@ pub struct AppState {
     pub sync_journal: Option<Arc<SyncJournal>>,
     /// Sync/relay HMAC key — used to sign relay requests (#85/#87).
     pub sync_key: Option<String>,
-    /// This node's stable UUID — set on slave for identification (#88).
-    pub node_id: Option<String>,
     /// True when running as slave — all write operations are blocked (503).
     pub slave_mode: bool,
     /// Directory where runtime files (api.key, dns_entries.json, …) are stored.
@@ -3400,7 +3398,6 @@ mod tests {
             upstreams,
             sync_journal: None,
             sync_key: None,
-            node_id: None,
             slave_mode: false,
             base_dir: Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
             audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp"), 0),
@@ -5558,7 +5555,6 @@ mod tests {
             upstreams,
             sync_journal: None,
             sync_key: None,
-            node_id: None,
             slave_mode: false,
             base_dir: Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
             audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp"), 0),
