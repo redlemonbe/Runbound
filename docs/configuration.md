@@ -293,6 +293,23 @@ When enabled, every DNSSEC validation failure emits a `WARN` log line with the q
 name, record type, and reason (`bogus`). Useful for diagnosing misconfigured zones
 without enabling full `verbosity: 2` noise.
 
+### HTTP/3 guard
+
+```
+block-https-record: yes   # default: no
+```
+
+When enabled, Runbound returns `NOERROR` with an empty answer for all DNS queries of
+type HTTPS (type 65). This prevents browsers from discovering HTTP/3 (QUIC) support
+via DNS and forces them to use HTTP/2 over TCP.
+
+**Use case:** networks where UDP/443 is blocked or unreliable. Without this option,
+browsers cache the HTTPS record and attempt QUIC connections that silently fail,
+causing slow or broken page loads for sites that advertise `alpn="h3"`.
+
+This has no effect on browsers that use DNS-over-HTTPS (DoH) directly — they bypass
+Runbound entirely for DNS resolution.
+
 ### Privacy controls (RGPD / GDPR)
 
 ```
