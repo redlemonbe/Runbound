@@ -973,6 +973,7 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         "nic_rx_dropped":  nic_rx_dropped,
         "upstream_racing":      s.cfg.upstream_racing,
         "upstream_racing_wins": upstream_racing_wins,
+            "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
     }))
 }
 
