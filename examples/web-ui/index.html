@@ -255,10 +255,10 @@
   <button role="tab" aria-selected="false" aria-controls="tab-feeds"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
   <button role="tab" aria-selected="false" aria-controls="tab-upstreams"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
   <button role="tab" aria-selected="false" aria-controls="tab-logs"       class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
-  <button role="tab" aria-selected="false" aria-controls="tab-system"     class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('system',this)">System</button>
-  <button role="tab" aria-selected="false" aria-controls="tab-settings"   class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('settings',this)">Settings</button>
   <button role="tab" aria-selected="false" aria-controls="tab-protection" class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('protection',this)">Protection</button>
-  <button role="tab" aria-selected="false" aria-controls="tab-about"      class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('about',this)">About</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-system"     class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('system',this)">System</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-settings"   class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('settings',this)">Settings</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-about"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('about',this)">About</button>
 </nav>
 
 <div class="p-5 max-w-6xl mx-auto">
@@ -706,6 +706,7 @@
 // Node management
 // ══════════════════════════════════════════════
 let nodes = {}; // id -> {url, key, name, stats, sys, cache, status, lastErr, syncStatus, syncLastSeen}
+const prevIcmpStats = {}; // nodeId -> {dropped, rate_limited} — previous poll values for delta detection
 let masterKey = '';
 let selectedNode = 'all'; // 'all' | node id
 let statsTimer = null, sysTimer = null, syncTimer = null, logsTimer = null, protectionTimer = null;
@@ -1431,7 +1432,19 @@ async function loadProtection() {
       if(el(`prot-b-${nodeId}`)) el(`prot-b-${nodeId}`).textContent = fmtN(rl);
       if(el(`prot-d-${nodeId}`)) el(`prot-d-${nodeId}`).textContent = fmtN(dr);
       const badge = el(`prot-badge-${nodeId}`);
-      if(badge){ badge.textContent = dr > 0 ? 'banned' : rl > 0 ? 'flooding' : 'ok'; badge.className = (dr>0||rl>0) ? 'badge' : 'badge badge-xdp-on'; if(dr>0) badge.style.cssText='background:#2d1a1a;color:#f87171;border:1px solid #7f1d1d'; else if(rl>0) badge.style.cssText='background:#2d2010;color:#fbbf24;border:1px solid #92400e'; else badge.style.cssText=''; }
+      if(badge){
+        const prev = prevIcmpStats[nodeId] ?? {dropped:0, rate_limited:0};
+        const deltaDr = dr - prev.dropped;
+        const deltaRl = rl - prev.rate_limited;
+        prevIcmpStats[nodeId] = {dropped:dr, rate_limited:rl};
+        const active = deltaDr > 0;
+        const flooding = !active && deltaRl > 0;
+        badge.textContent = active ? 'banned' : flooding ? 'flooding' : 'ok';
+        badge.className = 'badge';
+        if(active) badge.style.cssText='background:#2d1a1a;color:#f87171;border:1px solid #7f1d1d';
+        else if(flooding) badge.style.cssText='background:#2d2010;color:#fbbf24;border:1px solid #92400e';
+        else badge.style.cssText='background:#0e2a1a;color:#34d399;border:1px solid #166534';
+      }
     } catch(_) {}
   }));
 
