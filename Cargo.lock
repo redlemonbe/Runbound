@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "runbound"
-version = "0.9.47"
+version = "0.9.48"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2351,6 +2351,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webpki-roots 0.26.11",
  "zeroize",

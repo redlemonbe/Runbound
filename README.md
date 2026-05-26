@@ -1,5 +1,7 @@
 # Runbound
 
+## The World's First ASM-Accelerated DNS Server
+
 **Unbound-compatible DNS server — REST API, XDP kernel-bypass, no restart ever.**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial License](https://img.shields.io/badge/license-commercial-green.svg)](COMMERCIAL_LICENSE.md)

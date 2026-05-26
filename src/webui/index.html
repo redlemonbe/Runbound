@@ -595,11 +595,12 @@
 
   <!-- ═══ ABOUT ═══ -->
   <div id="tab-about" class="hidden fade max-w-3xl mx-auto">
-    <div class="flex items-center gap-3 mb-5">
+    <div class="flex items-center gap-3 mb-2">
       <span class="text-cyan-400 font-bold text-2xl tracking-widest" style="text-shadow:0 0 18px #22d3ee44">RUNBOUND</span>
       <span id="about-version" class="badge" style="background:#0e2233;color:#67e8f9;border:1px solid #164e63">—</span>
       <span class="badge" style="background:#1a1a1a;color:#6b7280;border:1px solid #374151">AGPL-3.0</span>
     </div>
+    <div class="text-sm mb-5" style="color:#67e8f9;letter-spacing:.06em;text-shadow:0 0 8px #22d3ee22">The World's First ASM-Accelerated DNS Server</div>
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
       <div class="card">
         <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Runtime</div>
@@ -613,6 +614,7 @@
       <div class="card">
         <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Features</div>
         <ul class="text-sm text-gray-400 space-y-1">
+          <li class="flex gap-2"><span class="text-cyan-600">›</span>SSE2/AVX2/CRC32c SIMD hot path — 195k+ QPS</li>
           <li class="flex gap-2"><span class="text-cyan-600">›</span>XDP zero-copy fast path (AF_XDP, SKB/DRV)</li>
           <li class="flex gap-2"><span class="text-cyan-600">›</span>Cache direct TX — ~300 ns/hit</li>
           <li class="flex gap-2"><span class="text-cyan-600">›</span>REST API — Bearer auth, rate-limited</li>
