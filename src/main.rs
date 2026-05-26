@@ -1267,6 +1267,7 @@ async fn build_and_launch(
                         sync_journal.as_ref().map(Arc::clone),
                         cfg.bot_ban_duration_secs,
                         cfg.bot_honeypot_enabled,
+                        true, // tls_enabled: ACME TLS
                     );
                     let initial_cfg = Arc::new(crate::sync::server_tls_config(&cert_pem, &key_pem)?);
                     let tls_state: Arc<tokio::sync::RwLock<Arc<rustls::ServerConfig>>> =
@@ -1333,6 +1334,7 @@ async fn build_and_launch(
                         sync_journal.as_ref().map(Arc::clone),
                         cfg.bot_ban_duration_secs,
                         cfg.bot_honeypot_enabled,
+                        true, // tls_enabled: local CA TLS
                     );
                     let (cert_pem, key_pem, cert_expires) =
                         webui::ensure_webui_cert(&cfg.ui_cert, &cfg.ui_key, &ca_cert_pem, &ca_key_pem, &base_dir, &cfg.ui_tls_san)?;
@@ -1477,6 +1479,7 @@ async fn build_and_launch(
                         sync_journal.as_ref().map(Arc::clone),
                         cfg.bot_ban_duration_secs,
                         cfg.bot_honeypot_enabled,
+                        false, // tls_enabled: plain HTTP
                     );
                     ui_rt.spawn(async move {
                         let listener = tokio::net::TcpListener::from_std(ui_std_listener)
