@@ -132,6 +132,35 @@ struct {
     __type(value, __u8);  // 1 = banned
 } icmp_banned SEC(".maps");
 
+// DNS wire-format QNAME → u8 (1 = block). Populated/cleared by userspace.
+// Key is the raw QNAME bytes from the DNS packet, zero-padded to 256 bytes.
+// Only the first 128 bytes are matched (covers all practical domain names).
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 500000);
+    __type(key, char[256]);
+    __type(value, __u8);
+} dns_blacklist SEC(".maps");
+
+// Per-CPU blocked-packet counter. Index 0 = total blocks.
+// Summed by userspace; no atomics required (each CPU owns its slice).
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} block_stats SEC(".maps");
+
+// DNS header wire layout — used for in-place NXDOMAIN response forge.
+struct dnshdr {
+    __be16 id;
+    __be16 flags;   // QR/OPCODE/AA/TC/RD | RA/Z/AD/CD/RCODE
+    __be16 qdcount;
+    __be16 ancount;
+    __be16 nscount;
+    __be16 arcount;
+};
+
 // One's complement 16-bit add with carry fold (endianness-agnostic).
 static __always_inline __u16 csum16_add(__u16 a, __u16 b)
 {
@@ -178,6 +207,64 @@ static __always_inline __u32 dns_qname_hash(const __u8 *qname, const __u8 *data_
         qname++;
     }
     return h;
+}
+
+// Copy up to 128 bytes of the QNAME (starting at qname_start) into key[256].
+// Fixed-count unrolled loop: each iteration has a concrete constant offset so
+// the BPF verifier can track packet bounds without scalar state explosion.
+// key[128..255] remain zero (zeroed by caller) — matching Rust insertion padding.
+static __always_inline void extract_qname_key(
+    const __u8 *qname_start, const __u8 *data_end, char key[256])
+{
+    #pragma unroll
+    for (int i = 0; i < 128; i++) {
+        const __u8 *p = qname_start + i;
+        if ((const void *)(p + 1) > data_end)
+            break;
+        key[i] = (char)*p;
+    }
+}
+
+// Forge an NXDOMAIN response in-place for an IPv4 DNS query.
+// Swaps MACs, swaps IP src/dst, swaps UDP ports, sets DNS QR=1 RA=1 RCODE=3.
+// UDP checksum is cleared (valid for IPv4 per RFC 768).
+// Returns 0 on success; -1 if DNS header is out of bounds.
+static __always_inline int forge_nxdomain_ipv4(
+    struct ethhdr *eth, struct iphdr *ip, struct udphdr *udp, void *data_end)
+{
+    struct dnshdr *dns = (struct dnshdr *)(udp + 1);
+    if ((void *)(dns + 1) > data_end)
+        return -1;
+
+    // Swap Ethernet MACs
+    __u8 tmp_mac[ETH_ALEN];
+    __builtin_memcpy(tmp_mac,           eth->h_source, ETH_ALEN);
+    __builtin_memcpy(eth->h_source,     eth->h_dest,   ETH_ALEN);
+    __builtin_memcpy(eth->h_dest,       tmp_mac,       ETH_ALEN);
+
+    // Swap IP src/dst (IP checksum unchanged — swap preserves ones-complement sum)
+    __be32 tmp_ip  = ip->saddr;
+    ip->saddr = ip->daddr;
+    ip->daddr = tmp_ip;
+
+    // Swap UDP ports
+    __be16 tmp_port = udp->source;
+    udp->source = udp->dest;
+    udp->dest   = tmp_port;
+
+    // Clear UDP checksum (optional for IPv4, avoids recalculation)
+    udp->check = 0;
+
+    // Set DNS response flags: QR=1, RA=1, RCODE=3 (NXDOMAIN), preserve RD
+    __u16 rd = bpf_ntohs(dns->flags) & 0x0100u;
+    dns->flags = bpf_htons(0x8083u | rd);
+
+    // Zero answer counts (should already be 0 in a query — be defensive)
+    dns->ancount = 0;
+    dns->nscount = 0;
+    dns->arcount = 0;
+
+    return 0;
 }
 
 SEC("xdp")
@@ -328,6 +415,25 @@ int dns_xdp(struct xdp_md *ctx)
 
     if (udp->dest != bpf_htons(53))
         return XDP_PASS;
+
+    // ── Blacklist fast-block (#153) ──────────────────────────────────────────────
+    // IPv4 only: forge NXDOMAIN in-place and XDP_TX back to client (~1 µs RTT).
+    // IPv6 blacklisted queries fall through to AF_XDP / hickory slow path.
+    if (eth_proto == ETH_P_IP) {
+        // QNAME sits 54 bytes from frame start: ETH(14)+IPv4(20)+UDP(8)+DNS_HDR(12)
+        char key[256] = {};
+        extract_qname_key((const __u8 *)data + 54u, (const __u8 *)data_end, key);
+        __u8 *hit = bpf_map_lookup_elem(&dns_blacklist, key);
+        if (hit && *hit) {
+            __u32 bsk = 0;
+            __u64 *bsv = bpf_map_lookup_elem(&block_stats, &bsk);
+            if (bsv) (*bsv)++;
+            struct iphdr *bl_ip = (void *)(eth + 1);
+            if ((void *)(bl_ip + 1) > data_end) return XDP_PASS;
+            if (forge_nxdomain_ipv4(eth, bl_ip, udp, data_end) == 0)
+                return XDP_TX;
+        }
+    }
 
     // ── Domain-affinity routing via CPUMAP (#67) ─────────────────────────────
     // When enabled: hash the DNS QNAME and route to a dedicated CPU/worker.

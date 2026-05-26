@@ -112,6 +112,7 @@ async fn async_main(
         icmp_stats,
         icmp_cfg,
         dnssec_enabled,
+        blacklist_reload_rx,
     ) = build_and_launch(&cfg, base_dir, cfg_path).await?;
 
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
@@ -297,6 +298,7 @@ async fn async_main(
         let mut xdp_h = _xdp_handle;
         // Local set of IPs currently banned in BPF — used to detect delta changes.
         let mut bpf_banned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut blacklist_reload_rx = blacklist_reload_rx;
         tokio::spawn(async move {
             let mut last_rate = 0u32;
             let mut last_enabled = false;
@@ -322,6 +324,14 @@ async fn async_main(
                                 let _ = h.icmp_unban_ip(be32);
                             }
                         }
+                    }
+                }
+
+                // #153: Apply pending blacklist reload commands
+                while let Ok(domains) = blacklist_reload_rx.try_recv() {
+                    match h.blacklist_reload(&domains) {
+                        Ok(n) => tracing::debug!(count = n, "XDP blacklist reloaded"),
+                        Err(e) => tracing::warn!(err = %e, "XDP blacklist reload failed"),
                     }
                 }
 
@@ -388,6 +398,8 @@ async fn async_main(
     // When xdp feature is off: keep icmp_stats/icmp_cfg alive for API use
     #[cfg(not(feature = "xdp"))]
     let (_icmp_stats_keep, _icmp_cfg_keep) = (Arc::clone(&icmp_stats), Arc::clone(&icmp_cfg));
+    #[cfg(not(feature = "xdp"))]
+    drop(blacklist_reload_rx);
 
     // ── io_uring availability detection (#65) ─────────────────────────────────
     if cfg.io_uring {
@@ -612,6 +624,7 @@ async fn build_and_launch(
     Arc<crate::icmp::IcmpStats>,
     Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
     Arc<std::sync::atomic::AtomicBool>,
+    tokio::sync::mpsc::Receiver<Vec<String>>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
     let audit_log_path = cfg.audit_log_path.as_deref().map(std::path::PathBuf::from);
@@ -1122,6 +1135,10 @@ async fn build_and_launch(
         None
     };
 
+    // #153: XDP blacklist reload channel — sender stored in AppState for API handlers,
+    // receiver returned to async_main() for use in the ICMP/XDP poll task.
+    let (blacklist_reload_tx, blacklist_reload_rx) = tokio::sync::mpsc::channel::<Vec<String>>(8);
+
     let state = AppState {
         zones: Arc::clone(&zones),
         tls_cfg: Arc::clone(&tls_cfg),
@@ -1153,6 +1170,7 @@ async fn build_and_launch(
         icmp_cfg: Arc::clone(&icmp_cfg),
         dnssec_enabled: Arc::clone(&dnssec_enabled),
         user_registry,
+        blacklist_reload_tx: Some(blacklist_reload_tx),
     };
     let app = api::router(state);
 
@@ -1522,6 +1540,7 @@ async fn build_and_launch(
         icmp_stats,
         icmp_cfg,
         dnssec_enabled,
+        blacklist_reload_rx,
     ))
 }
 
