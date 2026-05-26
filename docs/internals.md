@@ -1,7 +1,7 @@
 # Runbound Internals — Packet Lifecycle & Architecture
 
 Audience: kernel/network engineers, performance analysts, contributors.  
-Version: v0.9.37. Planned items are marked **[planned]**.
+Version: v0.9.46. Planned items are marked **[planned]**.
 
 ---
 
@@ -219,6 +219,34 @@ TX enqueue + kick        ~50 ns   batch of 32 frames per sendto() kick
                         ────────
 total (cache hit)      ~930 ns   ≈ 1 µs/query
 ```
+
+### SIMD hot-path dispatch (v0.9.46)
+
+`src/dns/simd.rs` detects the CPU feature level once at startup via `OnceLock`:
+
+```
+SimdLevel::detect() → CPUID → Scalar | SSE2 | SSE42 | AVX2 | AVX512
+```
+
+The detected level is applied transparently to three hot-path operations:
+
+| Operation | Scalar | SSE2 | AVX2 |
+|-----------|--------|------|------|
+| QNAME label lowercase | 1 byte/cycle | 16 bytes/cycle | 32 bytes/cycle |
+| QNAME parse (label scan + dot insert) | 2 passes | 1 pass (fused) | 1 pass (fused) |
+| `QuestionKey` equality | byte loop | `pcmpeqb`+`pmovmskb` | `vpcmpeqb`+`vpmovmskb` |
+
+**CRC32c domain hashing** (`src/dns/hasher.rs`): hardware `_mm_crc32_u64` replaces FNV-1a. ~20 ns/lookup on SSE4.2 CPUs vs ~80 ns for FNV-1a.
+
+```rust
+// src/dns/simd.rs — level detected once, then static
+pub fn simd_level() -> SimdLevel {
+    static LEVEL: OnceLock<SimdLevel> = OnceLock::new();
+    *LEVEL.get_or_init(SimdLevel::detect)
+}
+```
+
+No runtime branch overhead — dispatch is a single indirect call resolved at init.
 
 ### Cache snapshot
 
@@ -443,14 +471,15 @@ RCODE=NOERROR
 | AF_XDP ring enqueue | v0.4.14 | ~0 ns |
 | poll() wakeup | v0.4.14 | ~100 ns |
 | Parse Ethernet/IP/UDP | v0.4.14 | ~50 ns |
-| Parse DNS QNAME | v0.4.14 | ~80 ns |
+| Parse DNS QNAME (SSE2 1-pass, v0.9.46) | v0.9.46 | ~40 ns |
 | ACL check | v0.5.0 | ~50 ns |
 | Rate limiter (DashMap) | v0.5.0 | ~100 ns |
 | LocalZoneSet lookup | v0.4.14 | ~200 ns |
+| Domain hash (CRC32c SSE4.2, v0.9.46) | v0.9.46 | ~20 ns |
 | Cache snapshot lookup (DashMap) | v0.6.9 | ~100 ns |
 | Build response (wire_payload memcpy + QueryID patch) | v0.6.8 | ~80 ns |
 | TX enqueue + kick (batch/32) | v0.6.8 | ~50 ns |
-| **Total — cache hit (wire format, v0.6.8)** | | **~580 ns** |
+| **Total — cache hit (wire format + SIMD, v0.9.46)** | | **~530 ns** |
 | Slow path — local zone (Tokio) | v0.4.14 | ~200 µs |
 | Slow path — upstream UDP | v0.4.14 | RTT + ~50 µs |
 | Slow path — upstream DoT | v0.6.7 | RTT + ~2 ms |
