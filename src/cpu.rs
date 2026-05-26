@@ -137,3 +137,129 @@ pub fn pin_to_cpu(cpu_id: usize) {
     #[cfg(not(target_os = "linux"))]
     let _ = cpu_id;
 }
+
+// ── SIMD level detection ──────────────────────────────────────────────────────
+
+use std::sync::OnceLock;
+
+/// Available SIMD tiers, ordered weakest → strongest.
+/// Each level is a strict superset of the previous on x86_64.
+/// Baseline for Runbound: Sse42 (Xeon E5-2690 v2 / Ivy Bridge, 2013+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SimdLevel {
+    Scalar,  // non-x86, or no SIMD detected
+    Sse2,    // x86_64 ABI baseline — always available
+    Sse42,   // Nehalem+ (2008) — CRC32, PCMPISTRI
+    Avx2,    // Haswell+ (2013) — 256-bit integer SIMD
+    Avx512,  // Skylake-SP+ (2017) — 512-bit SIMD
+}
+
+impl SimdLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Sse2   => "sse2",
+            Self::Sse42  => "sse4.2",
+            Self::Avx2   => "avx2",
+            Self::Avx512 => "avx512f",
+        }
+    }
+}
+
+/// Detected CPU instruction-set features.
+#[derive(Debug, Clone)]
+pub struct CpuFeatures {
+    pub sse2:    bool,
+    pub sse4_2:  bool,
+    pub avx:     bool,
+    pub avx2:    bool,
+    pub avx512f: bool,
+    pub popcnt:  bool,
+    pub bmi2:    bool,
+}
+
+impl CpuFeatures {
+    /// Probe the running CPU once; subsequent calls return the cached result.
+    pub fn get() -> &'static Self {
+        static CACHE: OnceLock<CpuFeatures> = OnceLock::new();
+        CACHE.get_or_init(Self::detect)
+    }
+
+    fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        return Self {
+            sse2:    true, // x86_64 ABI guarantee — never needs a runtime check
+            sse4_2:  std::is_x86_feature_detected!("sse4.2"),
+            avx:     std::is_x86_feature_detected!("avx"),
+            avx2:    std::is_x86_feature_detected!("avx2"),
+            avx512f: std::is_x86_feature_detected!("avx512f"),
+            popcnt:  std::is_x86_feature_detected!("popcnt"),
+            bmi2:    std::is_x86_feature_detected!("bmi2"),
+        };
+        #[allow(unreachable_code)]
+        Self { sse2: false, sse4_2: false, avx: false,
+               avx2: false, avx512f: false, popcnt: false, bmi2: false }
+    }
+
+    /// Best SIMD tier available on this CPU.
+    pub fn best_level(&self) -> SimdLevel {
+        if self.avx512f { SimdLevel::Avx512 }
+        else if self.avx2 { SimdLevel::Avx2 }
+        else if self.sse4_2 { SimdLevel::Sse42 }
+        else if self.sse2   { SimdLevel::Sse2 }
+        else                { SimdLevel::Scalar }
+    }
+}
+
+/// The best SIMD level for this process. Detected once, lock-free after that.
+/// Use this in hot-path dispatch: one comparison, no CPUID overhead.
+#[inline]
+pub fn simd_level() -> SimdLevel {
+    static LEVEL: OnceLock<SimdLevel> = OnceLock::new();
+    *LEVEL.get_or_init(|| CpuFeatures::get().best_level())
+}
+
+/// Log CPU capabilities and physical-core count at startup (call once).
+pub fn log_cpu_info() {
+    let f = CpuFeatures::get();
+    let level = simd_level();
+    let cores = physical_cores();
+    tracing::info!(
+        "[CPU] SIMD={} | sse4.2={} avx={} avx2={} avx512f={} | physical cores={} (HT excluded)",
+        level.as_str(), f.sse4_2, f.avx, f.avx2, f.avx512f, cores.len()
+    );
+}
+
+#[cfg(test)]
+mod simd_tests {
+    use super::*;
+
+    #[test]
+    fn sse2_always_on_x86_64() {
+        #[cfg(target_arch = "x86_64")]
+        assert!(CpuFeatures::get().sse2);
+    }
+
+    #[test]
+    fn level_ordering() {
+        assert!(SimdLevel::Scalar < SimdLevel::Sse2);
+        assert!(SimdLevel::Sse2   < SimdLevel::Sse42);
+        assert!(SimdLevel::Sse42  < SimdLevel::Avx2);
+        assert!(SimdLevel::Avx2   < SimdLevel::Avx512);
+    }
+
+    #[test]
+    fn best_level_consistent() {
+        let f = CpuFeatures::get();
+        let l = f.best_level();
+        if l >= SimdLevel::Avx2  { assert!(f.avx2); }
+        if l >= SimdLevel::Sse42 { assert!(f.sse4_2); }
+        if l >= SimdLevel::Sse2  { assert!(f.sse2); }
+    }
+
+    #[test]
+    fn simd_level_cached() {
+        // Two calls must return the same value (OnceLock)
+        assert_eq!(simd_level(), simd_level());
+    }
+}
