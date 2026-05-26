@@ -9,6 +9,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.52] -- 2026-05-26
+
+### Changed
+
+- **Multi-user zone enforcement**: DNS, blacklist, and feed handlers now enforce per-user ownership:
+  - `GET /api/dns` and `GET /api/blacklist`: non-admin users see only their own entries plus admin-owned entries (backward-compat: entries with no `owner_user_id` are treated as admin-owned and visible to all).
+  - `POST /api/dns` and `POST /api/blacklist`: non-admin must pass `may_manage_name` check (name must be under one of their `zone_prefixes`); entry is tagged with `owner_user_id`.
+  - `DELETE /api/dns/:id` and `DELETE /api/blacklist/:id`: non-admin can only delete their own entries.
+  - `POST /api/feeds` and `DELETE /api/feeds/:id`: admin-only.
+
+---
+
 ## [0.9.51] -- 2026-05-26
 
 ### Added
