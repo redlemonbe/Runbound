@@ -85,6 +85,60 @@ unsafe fn copy_lowercase_sse2(dst: &mut SmallVec<[u8; 64]>, src: &[u8]) {
     dst.set_len(base + len);
 }
 
+
+/// Test byte-slice equality using SSE2 (16 bytes/iteration).
+/// Returns false immediately on first 16-byte chunk mismatch.
+#[inline]
+pub fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { bytes_eq_sse2(a, b) };
+    }
+    a == b  // scalar fallback — unreachable on x86_64
+}
+
+/// pcmpeqb + pmovmskb: compare 16 bytes/iteration, early-exit on mismatch.
+/// mask = 0xFFFF means all 16 bytes equal; any lower value = mismatch.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn bytes_eq_sse2(a: &[u8], b: &[u8]) -> bool {
+    let mut pa = a.as_ptr();
+    let mut pb = b.as_ptr();
+    let mut remaining = a.len();
+
+    while remaining >= 16 {
+        let mask: u32;
+        core::arch::asm!(
+            "movdqu {va}, [{pa}]",
+            "movdqu {vb}, [{pb}]",
+            "pcmpeqb {va}, {vb}",
+            "pmovmskb {mask:e}, {va}",
+            pa   = in(reg)      pa,
+            pb   = in(reg)      pb,
+            va   = out(xmm_reg) _,
+            vb   = out(xmm_reg) _,
+            mask = out(reg)     mask,
+            options(nostack),
+        );
+        if mask != 0xFFFF {
+            return false;
+        }
+        pa = pa.add(16);
+        pb = pb.add(16);
+        remaining -= 16;
+    }
+
+    for i in 0..remaining {
+        if *pa.add(i) != *pb.add(i) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,4 +183,50 @@ mod tests {
         assert_eq!(lower(b"www"), b"www");
         assert_eq!(lower(b"API-v2"), b"api-v2");
     }
+
+    #[test]
+    fn bytes_eq_identical() {
+        assert!(bytes_eq(b"example.com.", b"example.com."));
+    }
+
+    #[test]
+    fn bytes_eq_different() {
+        assert!(!bytes_eq(b"example.com.", b"example.net."));
+    }
+
+    #[test]
+    fn bytes_eq_different_len() {
+        assert!(!bytes_eq(b"example.com.", b"example.com"));
+    }
+
+    #[test]
+    fn bytes_eq_empty() {
+        assert!(bytes_eq(b"", b""));
+    }
+
+    #[test]
+    fn bytes_eq_all_lengths_0_to_80() {
+        for len in 0..=80usize {
+            let a: Vec<u8> = (0u8..).take(len).collect();
+            let mut b = a.clone();
+            assert!(bytes_eq(&a, &b), "should be equal at len={len}");
+            if !b.is_empty() {
+                let last = b.len() - 1;
+                b[last] ^= 0xFF;
+                assert!(!bytes_eq(&a, &b), "should differ at len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_eq_mismatch_at_each_position() {
+        // Verify early-exit works: flip one byte at each position
+        let base: Vec<u8> = (0u8..32).collect();
+        for pos in 0..32usize {
+            let mut other = base.clone();
+            other[pos] ^= 0xFF;
+            assert!(!bytes_eq(&base, &other), "should differ at pos={pos}");
+        }
+    }
+
 }
