@@ -321,6 +321,10 @@ pub struct UnboundConfig {
     /// Extra IP addresses or hostnames to add as Subject Alternative Names to the
     /// auto-generated WebUI TLS certificate. Repeat the directive for multiple SANs.
     pub ui_tls_san: Vec<String>,
+
+    // ── Webhooks (#11) ────────────────────────────────────────────────────────
+    /// List of webhook targets for system event notifications.
+    pub webhooks: Vec<crate::webhooks::WebhookTarget>,
 }
 
 impl UnboundConfig {
@@ -382,6 +386,7 @@ impl UnboundConfig {
             bot_honeypot_enabled: false,
             udp_busy_poll: false,
             ui_tls_san: vec![],
+            webhooks: vec![],
             ..Default::default()
         }
     }
@@ -777,6 +782,34 @@ fn parse_server_directive(
         }
         "bot-honeypot-enabled" => {
             cfg.bot_honeypot_enabled = val.trim_matches('"') == "yes";
+        }
+        "webhook" | "webhook-url" => {
+            // webhook "https://hooks.slack.com/..." (followed by format/token/events directives)
+            cfg.webhooks.push(crate::webhooks::WebhookTarget {
+                url:    val.trim_matches('"').to_owned(),
+                format: crate::webhooks::WebhookFormat::GenericJson,
+                token:  None,
+                events: vec![],
+            });
+        }
+        "webhook-format" => {
+            if let Ok(f) = val.trim_matches('"').parse::<crate::webhooks::WebhookFormat>() {
+                if let Some(last) = cfg.webhooks.last_mut() { last.format = f; }
+            }
+        }
+        "webhook-token" => {
+            if let Some(last) = cfg.webhooks.last_mut() {
+                last.token = Some(val.trim_matches('"').to_owned());
+            }
+        }
+        "webhook-events" => {
+            if let Some(last) = cfg.webhooks.last_mut() {
+                for ev in val.split_whitespace() {
+                    if let Ok(kind) = ev.trim_matches('"').parse() {
+                        last.events.push(kind);
+                    }
+                }
+            }
         }
         "ui-tls-san" => {
             cfg.ui_tls_san.push(val.trim_matches('"').to_string());
