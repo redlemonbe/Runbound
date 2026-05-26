@@ -1141,14 +1141,25 @@ async fn build_and_launch(
         });
     }
 
-    // Multi-user registry — load users.json if present.
+    // Multi-user registry — load users.json if present, or create ephemeral if extra keys defined.
     let users_json_path = base_dir.join("users.json");
-    let user_registry = if users_json_path.exists() {
+    let user_registry: Option<Arc<crate::multiuser::UserRegistry>> = if users_json_path.exists() {
         tracing::info!(path = %users_json_path.display(), "Loading multi-user registry");
+        Some(crate::multiuser::UserRegistry::load(&users_json_path))
+    } else if !cfg.extra_api_keys.is_empty() {
         Some(crate::multiuser::UserRegistry::load(&users_json_path))
     } else {
         None
     };
+    // Inject api-key-extra static keys from config (#13).
+    if let Some(ref reg) = user_registry {
+        for ek in &cfg.extra_api_keys {
+            if !ek.key.is_empty() {
+                tracing::info!(label = %ek.label, role = ?ek.role, "Injecting static API key");
+                reg.inject_static_key(ek.label.clone(), ek.key.clone(), ek.role);
+            }
+        }
+    }
 
     // #153: XDP blacklist reload channel — sender stored in AppState for API handlers,
     // receiver returned to async_main() for use in the ICMP/XDP poll task.
