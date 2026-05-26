@@ -28,6 +28,8 @@ pub enum BlacklistAction {
     Refuse,
     /// Client receives NXDOMAIN — domain appears to not exist
     NxDomain,
+    /// Redirect to block page HTTP server IP.
+    BlockPage,
 }
 
 impl std::fmt::Display for BlacklistAction {
@@ -35,6 +37,7 @@ impl std::fmt::Display for BlacklistAction {
         match self {
             BlacklistAction::Refuse => write!(f, "refuse"),
             BlacklistAction::NxDomain => write!(f, "nxdomain"),
+            BlacklistAction::BlockPage => write!(f, "block_page"),
         }
     }
 }
@@ -44,6 +47,7 @@ impl From<&BlacklistAction> for ZoneAction {
         match b {
             BlacklistAction::Refuse => ZoneAction::Refuse,
             BlacklistAction::NxDomain => ZoneAction::NxDomain,
+            BlacklistAction::BlockPage => ZoneAction::BlockPage,
         }
     }
 }

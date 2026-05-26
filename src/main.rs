@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 mod acme;
+mod blockpage;
 mod api;
 mod audit;
 mod config;
@@ -722,6 +723,19 @@ async fn build_and_launch(
 
     // ── Background: feed auto-update ───────────────────────────────────────
     tokio::spawn(async move { feeds::feed_update_loop(86400).await });
+
+    // ── Block page server ────────────────────────────────────────────────────────
+    if cfg.block_page {
+        let bp_cfg = std::sync::Arc::new(blockpage::BlockPageConfig {
+            redirect_ip: cfg.block_page_redirect_ip.as_deref().and_then(|s| s.parse().ok()),
+            port: if cfg.block_page_port == 0 { 8083 } else { cfg.block_page_port },
+            title: if cfg.block_page_title.is_empty() { "Access Blocked".to_string() } else { cfg.block_page_title.clone() },
+            org: if cfg.block_page_org.is_empty() { "Runbound DNS Filter".to_string() } else { cfg.block_page_org.clone() },
+            allow_bypass: cfg.block_page_allow_bypass,
+            bypass_pin: cfg.block_page_bypass_pin.clone(),
+        });
+        blockpage::start(bp_cfg).await;
+    }
 
     // ── REST API (localhost only, port from api-port directive, default 8081) ──
     let api_port = cfg.api_port.unwrap_or(8080);
@@ -2123,6 +2137,21 @@ pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
     // Feed block-list entries (also override static zones)
     for (domain, action) in feeds::collect_feed_entries() {
         zone_set.override_zone(&domain, dns::ZoneAction::from(&action));
+    }
+
+    // For BlockPage zones: insert A record pointing to block page server IP
+    if let Some(ref ip_str) = cfg.block_page_redirect_ip {
+        if let Ok(bp_ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+            use hickory_proto::rr::{rdata, RData, Record};
+            let zone_keys: Vec<_> = zone_set.zones.iter()
+                .filter(|(_, v)| **v == dns::ZoneAction::BlockPage)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for name in zone_keys {
+                let rec = Record::from_rdata(name.clone(), 10, RData::A(rdata::A(bp_ip)));
+                zone_set.records.entry(name).or_default().push(rec);
+            }
+        }
     }
 
     zone_set
