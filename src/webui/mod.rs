@@ -376,8 +376,7 @@ function badge(s){{
   return s;
 }}
 function md(text){{
-  let lines = text.split('
-');
+  let lines = text.split('\n');
   let out = '';
   let inPre = false;
   let inTable = false;
@@ -385,41 +384,31 @@ function md(text){{
   for(let i=0;i<lines.length;i++){{
     let l = lines[i];
     if(l.startsWith('```')){{
-      if(inPre){{out+='</code></pre>
-';inPre=false;}}
+      if(inPre){{out+='</code></pre>\n';inPre=false;}}
       else{{
         let lang=l.slice(3).trim();
         out+=`<pre><code class="lang-${{lang}}">`; inPre=true;
       }}
       continue;
     }}
-    if(inPre){{out+=esc(l)+'
-';continue;}}
+    if(inPre){{out+=esc(l)+'\n';continue;}}
     // Table detection
     if(/^\|/.test(l)){{
-      if(!inTable){{out+='<table>
-<thead>
-<tr>'; inTable=true; tableHeader=true;}}
-      else if(/^\|[-:| ]+\|/.test(l)){{out+='</tr>
-</thead>
-<tbody>
-';tableHeader=false;continue;}}
+      if(!inTable){{out+='<table>\n<thead>\n<tr>'; inTable=true; tableHeader=true;}}
+      else if(/^\|[-:| ]+\|/.test(l)){{out+='</tr>\n</thead>\n<tbody>\n';tableHeader=false;continue;}}
       else{{out+='<tr>';}}
       let cells=l.split('|').slice(1,-1);
       let tag=tableHeader?'th':'td';
       cells.forEach(c=>{{out+=`<${{tag}}>${{inlinemd(badge(c.trim()))}}</${{tag}}>`;}});
-      out+='</tr>
-'; continue;
-    }}else if(inTable){{out+='</tbody></table>
-';inTable=false;}}
+      out+='</tr>\n'; continue;
+    }}else if(inTable){{out+='</tbody></table>\n';inTable=false;}}
     if(/^#{{1,4}} /.test(l)){{
       let m=l.match(/^(#+) (.*)/);
       let lvl=m[1].length;
       out+=`<h${{lvl}}>${{inlinemd(badge(m[2]))}}</h${{lvl}}>
 `;
     }} else if(/^---+$/.test(l)){{
-      out+='<hr>
-';
+      out+='<hr>\n';
     }} else if(/^> /.test(l)){{
       out+=`<blockquote>${{inlinemd(l.slice(2))}}</blockquote>
 `;
@@ -430,17 +419,14 @@ function md(text){{
       out+=`<li>${{inlinemd(l.replace(/^\d+\. /,''))}}</li>
 `;
     }} else if(l.trim()===''){{
-      out+='
-';
+      out+='\n';
     }} else {{
       out+=`<p>${{inlinemd(badge(l))}}</p>
 `;
     }}
   }}
-  if(inTable) out+='</tbody></table>
-';
-  if(inPre) out+='</code></pre>
-';
+  if(inTable) out+='</tbody></table>\n';
+  if(inPre) out+='</code></pre>\n';
   return out;
 }}
 function inlinemd(s){{
