@@ -80,6 +80,22 @@ intercepted at the driver level before reaching the kernel network stack:
 - **Rate-limited clients** → silently dropped at NIC level
 - **ACL deny** → silently dropped; ACL refuse → REFUSED response crafted in XDP path
 
+## SIMD acceleration in the XDP worker (v0.9.46)
+
+The XDP worker thread (`src/dns/xdp/worker.rs`) uses SIMD intrinsics on the hot path.
+CPU feature level is detected once at startup via `src/dns/simd.rs`:
+
+| Operation | Scalar | SSE2 | AVX2 |
+|-----------|--------|------|------|
+| QNAME label lowercase | 1 B/cycle | 16 B/cycle | 32 B/cycle |
+| QNAME wire parse | 2-pass | 1-pass (fused) | 1-pass (fused) |
+| Cache key equality | byte loop | `pcmpeqb`+mask | `vpcmpeqb`+mask |
+| Domain hash | FNV-1a ~80 ns | CRC32c ~20 ns | CRC32c ~20 ns |
+
+Dispatch is resolved at init — no per-packet branch overhead. On CPUs without SSE2
+(rare; all x86_64 cores have SSE2 by spec) the scalar fallback is used transparently.
+
+
 ## Requirements
 
 | Item | Details |
