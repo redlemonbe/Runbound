@@ -1300,6 +1300,113 @@ on slave nodes.
 
 ---
 
+## Multi-user mode
+
+Multi-user mode is enabled by creating a `users.json` file in the Runbound data directory and restarting the service. When disabled, all endpoints behave as before and these routes return `{"error":"MULTI_USER_DISABLED"}`.
+
+### User model
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string (UUID) | Immutable user identifier |
+| `username` | string (1-64 chars) | Display name |
+| `api_key` | string (32 hex chars) | Bearer token for this user |
+| `zone_prefixes` | string[] | DNS suffixes this user may manage (trailing dot normalised, e.g. `["home.", "internal."]`) |
+| `enabled` | bool | Set to false to suspend access without deleting the user |
+| `admin` | bool | Admin users bypass zone_prefix checks and have full access |
+
+### Zone isolation
+
+Non-admin users are restricted to entries whose name falls under one of their `zone_prefixes`:
+
+- `GET /api/dns` — returns only entries owned by the user, plus admin-owned entries (backward-compatible: entries with no `owner_user_id` are treated as admin-owned).
+- `POST /api/dns` — the name must match a `zone_prefix`; the entry is tagged with `owner_user_id`.
+- `DELETE /api/dns/:id` — only allowed for entries the user owns.
+- Same rules apply to `GET/POST/DELETE /api/blacklist`.
+- `POST/DELETE /api/feeds` — admin-only.
+
+### User management endpoints
+
+All user management endpoints require the master API key (admin context). Callers authenticated with a per-user key can only access `GET /api/users/me` and `POST /api/users/:id/rotate-key` (self only).
+
+#### `GET /api/users`
+
+List all users. Admin only.
+
+```bash
+curl -H "Authorization: Bearer $MASTER_KEY" http://localhost:8080/api/users
+```
+
+Response:
+```json
+[
+  {
+    "id": "a1b2c3d4-...",
+    "username": "alice",
+    "api_key": "...",
+    "zone_prefixes": ["home.", "internal."],
+    "enabled": true,
+    "admin": false
+  }
+]
+```
+
+#### `POST /api/users`
+
+Create a user. Returns the new API key — **copy it immediately, it is not shown again**.
+
+```bash
+curl -X POST -H "Authorization: Bearer $MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  http://localhost:8080/api/users \
+  -d '{"username":"alice","zone_prefixes":["home.","internal."],"admin":false}'
+```
+
+Response: `201 Created`
+```json
+{
+  "id": "a1b2c3d4-...",
+  "username": "alice",
+  "api_key": "3a7f9e2c...",
+  "zone_prefixes": ["home.", "internal."],
+  "enabled": true,
+  "admin": false
+}
+```
+
+#### `DELETE /api/users/:id`
+
+Delete a user. Admin only.
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $MASTER_KEY" \
+  http://localhost:8080/api/users/a1b2c3d4-...
+```
+
+#### `GET /api/users/me`
+
+Returns the profile of the authenticated user (works with both master key and per-user key).
+
+```bash
+curl -H "Authorization: Bearer $USER_KEY" http://localhost:8080/api/users/me
+```
+
+#### `POST /api/users/:id/rotate-key`
+
+Generate a new API key. Allowed for admins or the user themselves. The old key is immediately invalidated.
+
+```bash
+curl -X POST -H "Authorization: Bearer $MASTER_KEY" \
+  http://localhost:8080/api/users/a1b2c3d4-.../rotate-key
+```
+
+Response:
+```json
+{"api_key": "7c4d1a9e..."}
+```
+
+---
+
 ## HTTP status codes
 
 | Code | Meaning |
