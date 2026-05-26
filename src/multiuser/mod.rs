@@ -18,6 +18,40 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
+// ── RBAC Role ────────────────────────────────────────────────────────────
+
+/// RBAC role for API key scoping (#13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Read-only: GET on all endpoints.
+    #[default]
+    Read,
+    /// DNS write: read + POST/DELETE on /api/dns, /api/zones.
+    Dns,
+    /// Operator: read + POST/DELETE on /api/dns, /api/zones, /api/blacklist, /api/feeds.
+    Operator,
+    /// Admin: full access (same as admin: true).
+    Admin,
+}
+
+impl Role {
+    /// Whether this role allows write (POST/PUT/DELETE/PATCH) on the given path prefix.
+    pub fn may_write(self, path: &str) -> bool {
+        match self {
+            Role::Read => false,
+            Role::Dns => path.starts_with("/api/dns") || path.starts_with("/api/zones"),
+            Role::Operator => {
+                path.starts_with("/api/dns")
+                    || path.starts_with("/api/zones")
+                    || path.starts_with("/api/blacklist")
+                    || path.starts_with("/api/feeds")
+            }
+            Role::Admin => true,
+        }
+    }
+}
+
 // ── User account ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +69,9 @@ pub struct UserAccount {
     /// Admin users have the same privileges as the master API key.
     #[serde(default)]
     pub admin: bool,
+    /// RBAC role — only meaningful when admin: false. Admin users always have full access.
+    #[serde(default)]
+    pub role: Role,
 }
 
 fn default_true() -> bool { true }
@@ -152,6 +189,7 @@ impl UserRegistry {
         username: String,
         zone_prefixes: Vec<String>,
         admin: bool,
+        role: Role,
     ) -> Result<Arc<UserAccount>, String> {
         // Reject duplicate usernames.
         if self.by_id.iter().any(|e| e.value().username == username) {
@@ -168,6 +206,7 @@ impl UserRegistry {
             zone_prefixes: prefixes,
             enabled: true,
             admin,
+            role,
         };
         let arc = Arc::new(u);
         self.by_id.insert(arc.id.clone(), Arc::clone(&arc));
@@ -178,6 +217,22 @@ impl UserRegistry {
         Ok(arc)
     }
 
+
+    /// Inject a statically-configured API key (from api-key-extra: config blocks) into
+    /// the in-memory registry without persisting to users.json.
+    pub fn inject_static_key(&self, label: String, key: String, role: Role) {
+        let u = Arc::new(UserAccount {
+            id: format!("static:{}", label),
+            username: label.clone(),
+            api_key: key.clone(),
+            zone_prefixes: vec![],
+            enabled: true,
+            admin: matches!(role, Role::Admin),
+            role,
+        });
+        self.by_id.insert(u.id.clone(), Arc::clone(&u));
+        self.by_key.insert(key, u);
+    }
     pub fn delete_user(&self, id: &str) -> bool {
         let Some(entry) = self.by_id.remove(id) else { return false };
         self.by_key.remove(&entry.1.api_key);
@@ -198,6 +253,7 @@ impl UserRegistry {
             zone_prefixes: arc.zone_prefixes.clone(),
             enabled: arc.enabled,
             admin: arc.admin,
+            role: arc.role,
         });
         self.by_key.remove(&old_key);
         self.by_key.insert(new_key.clone(), Arc::clone(&updated));
@@ -219,6 +275,7 @@ pub struct RequestUser {
     pub username: String,
     pub admin: bool,
     pub zone_prefixes: Vec<String>,
+    pub role: Role,
 }
 
 impl RequestUser {
@@ -229,6 +286,7 @@ impl RequestUser {
             username: "admin".to_string(),
             admin: true,
             zone_prefixes: vec![],
+            role: Role::Admin,
         }
     }
 
@@ -238,6 +296,7 @@ impl RequestUser {
             username: u.username.clone(),
             admin: u.admin,
             zone_prefixes: u.zone_prefixes.clone(),
+            role: if u.admin { Role::Admin } else { u.role },
         }
     }
 
@@ -265,7 +324,7 @@ mod tests {
         let u = UserAccount {
             id: "1".into(), username: "alice".into(), api_key: "k".into(),
             zone_prefixes: vec!["shop.example.com.".into()],
-            enabled: true, admin: false,
+            enabled: true, admin: false, role: Default::default(),
         };
         assert!(u.may_manage_name("shop.example.com."));
         assert!(u.may_manage_name("www.shop.example.com."));
@@ -278,7 +337,7 @@ mod tests {
         let u = UserAccount {
             id: "1".into(), username: "admin".into(), api_key: "k".into(),
             zone_prefixes: vec![],
-            enabled: true, admin: true,
+            enabled: true, admin: true, role: Default::default(),
         };
         assert!(u.may_manage_name("anything.example.com."));
     }
@@ -287,7 +346,7 @@ mod tests {
     fn request_user_may_manage_name_no_trailing_dot() {
         let ru = RequestUser {
             id: "1".into(), username: "bob".into(), admin: false,
-            zone_prefixes: vec!["api.example.com.".into()],
+            zone_prefixes: vec!["api.example.com.".into()], role: Default::default(),
         };
         // name without trailing dot should still match
         assert!(ru.may_manage_name("api.example.com"));
@@ -309,12 +368,12 @@ mod tests {
         let reg = UserRegistry::load(&path);
         assert!(reg.is_empty());
 
-        let u = reg.create_user("alice".into(), vec!["alice.test.".into()], false).unwrap();
+        let u = reg.create_user("alice".into(), vec!["alice.test.".into()], false, Default::default()).unwrap();
         assert_eq!(u.username, "alice");
         assert_eq!(reg.by_api_key(&u.api_key).unwrap().username, "alice");
 
         // Duplicate username rejected
-        assert!(reg.create_user("alice".into(), vec![], false).is_err());
+        assert!(reg.create_user("alice".into(), vec![], false, Default::default()).is_err());
 
         // File was written
         assert!(path.exists());
