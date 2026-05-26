@@ -954,9 +954,7 @@ fn answer_from_cache(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
-        for i in 0..label_len {
-            name_buf.push(query_bytes[pos + i] | 0x20); // ASCII lowercase
-        }
+        crate::dns::simd::copy_lowercase_label(&mut name_buf, &query_bytes[pos..pos + label_len]);
         pos += label_len;
     }
 
