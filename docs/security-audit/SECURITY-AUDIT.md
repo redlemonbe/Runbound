@@ -1,6 +1,6 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.9.48  
+**Current version:** v0.9.50  
 **Last updated:** 2026-05-26  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
@@ -23,7 +23,7 @@ This document consolidates all security and performance audit cycles conducted o
 
 ## Current Open Findings
 
-As of v0.9.48, **zero findings remain open**. All tracked findings have been fixed, accepted, or classified as false positives.
+As of v0.9.50, **zero findings remain open**. All tracked findings have been fixed, accepted, or classified as false positives.
 
 All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
 
@@ -484,3 +484,119 @@ No exploitable memory safety issue found.
 | ACC-E2 | LOW | TOFU cert pinning window at first registration | **Accepted** |
 | INFO-E1 | INFO | AUTH_FAILURES Relaxed race | **Accepted** |
 | INFO-E2 | INFO | SIMD unsafe block review | **Accepted** |
+
+
+---
+
+## Cycle F — v0.9.49–v0.9.50 (Cycle D close-out + bot defense hardening)
+
+**Date:** 2026-05-26
+**Version audited:** v0.9.49–v0.9.50
+**Sources:**
+- [AI-INTERNAL: Claude Sonnet 4.6] — systematic review of Cycle D pending items and new surface since Cycle E
+
+**Scope:** Cycle D pending items (bot defense IP rotation, ban injection via compromised slave, AlertTracker hot-reload, ui-tls-san), plus incremental review of DDNS TSIG, feed SSRF, and serde error reflection.
+
+**Cycle D pending items resolution:**
+
+| Item | Resolution |
+|------|-----------|
+| IP rotation attack flooding blocked map | **SEC-F1 — Fixed** |
+| Ban injection via compromised slave | **ACC-F1 — Accepted** (relay is master->slave only) |
+| AlertTracker hot-reload concurrent safety | **ACC-F2 — Accepted** (RwLock correct) |
+| ui-tls-san SAN injection | **ACC-F3 — Accepted** (rcgen validates all SANs) |
+
+---
+
+### SEC-F1 — blocked DashMap unbounded growth under IP-rotation flood
+
+| Field | Value |
+|-------|-------|
+| **Severity** | MEDIUM |
+| **Status** | Fixed in v0.9.50 |
+| **Source** | [AI-INTERNAL] |
+| **Location** | src/alerts.rs - block_bot, block_manual, trigger |
+
+**Description:** The blocked DashMap in AlertTracker had no hard size cap. The background eviction task runs every 60 seconds (main.rs:1474). An attacker rotating through many source IPs and repeatedly triggering the bot trap (10 failed requests in 5s per IP) could accumulate entries faster than the 60s eviction cycle removes them. At ~100 bytes per entry, sustained IP rotation could exhaust RAM before expiry-based eviction reduces the map. With a default 86400s ban duration, entries persist for 24h, making the issue more severe.
+
+**Fix:** Added MAX_BLOCKED_ENTRIES = 50_000 constant. All three insertion paths (block_bot, block_manual, trigger) now check self.blocked.len() >= MAX_BLOCKED_ENTRIES before inserting a new IP. Existing IPs (updates / re-bans) are exempt from the cap. When the cap is reached, the insertion is skipped with a WARN log entry.
+
+**Residual risk:** When the cap is full, new IPs cannot be banned until eviction runs (up to 60s). This provides a 60s evasion window for IPs beyond the 50k cap. Acceptable trade-off given the alternative is OOM crash.
+
+---
+
+### ACC-F1 — Ban injection via compromised slave: architectural analysis
+
+| Field | Value |
+|-------|-------|
+| **Severity** | LOW |
+| **Status** | Accepted |
+| **Source** | [AI-INTERNAL] |
+| **Location** | src/sync.rs - SyncOp::AddGlobalBan |
+
+**Description:** Cycle D flagged AddGlobalBan / DeleteGlobalBan as potential vectors for a compromised slave to inject bans on the master.
+
+**Analysis:** The relay architecture is strictly master-to-slave. SyncOp::AddGlobalBan is pushed by the master to slaves via relay::push_to_slaves. The slave relay server receives it and calls SyncOpHandler::apply() -- this runs on the slave, not the master. There is no reverse relay channel by which a slave can send SyncOp to the master. A compromised slave can only harm itself.
+
+**Accepted because:** The threat is a false positive. Relay is one-directional by design.
+
+---
+
+### ACC-F2 — AlertTracker hot-reload: concurrent safety
+
+| Field | Value |
+|-------|-------|
+| **Severity** | LOW |
+| **Status** | Accepted |
+| **Source** | [AI-INTERNAL] |
+| **Location** | src/alerts.rs - update_rules |
+
+**Description:** Cycle D flagged update_rules() for concurrent modification behavior under load.
+
+**Analysis:** update_rules acquires self.rules.write().unwrap() -- a standard RwLock write guard. All concurrent readers (check(), record()) acquire self.rules.read() and block until the write guard is released. The RwLock provides mutual exclusion between rule replacement and concurrent reads. No race condition is possible.
+
+**Accepted because:** The implementation is correct. RwLock<Vec<AlertRule>> is the appropriate primitive.
+
+---
+
+### ACC-F3 — ui-tls-san: SAN injection risk
+
+| Field | Value |
+|-------|-------|
+| **Severity** | LOW |
+| **Status** | Accepted (validated safe) |
+| **Source** | [AI-INTERNAL] |
+| **Location** | src/webui/mod.rs - gen_webui_cert |
+
+**Description:** Cycle D flagged ui-tls-san directives as a potential SAN injection vector.
+
+**Analysis:** Each SAN value is validated before use. IP: san.trim().parse::<std::net::IpAddr>() -- Rust stdlib parser. DNS: rcgen::Ia5String::try_from(s) -- printable ASCII only. Invalid values are skipped with a WARN log. No injection path exists.
+
+**Accepted because:** Inputs are validated. Config-write access is already privileged.
+
+---
+
+### INFO-F1 — serde_json syntax errors reflected to API clients
+
+| Field | Value |
+|-------|-------|
+| **Severity** | INFO |
+| **Status** | Accepted |
+| **Source** | [AI-INTERNAL] |
+| **Location** | src/api/mod.rs - ApiJson::from_request |
+
+**Description:** JsonRejection::JsonSyntaxError(e).to_string() is reflected in the 400 response. serde_json syntax errors contain only the line/column of the malformed token -- no internal type names, file paths, or heap addresses.
+
+**Accepted because:** Information exposed is minimal and derived from the attacker's own input.
+
+---
+
+## Findings Summary -- v0.9.50
+
+| ID | Severity | Title | Status |
+|----|----------|-------|--------|
+| SEC-F1 | MEDIUM | blocked DashMap unbounded growth under IP-rotation flood | **Fixed v0.9.50** |
+| ACC-F1 | LOW | Ban injection via compromised slave (Cycle D item) | **Accepted** (false positive) |
+| ACC-F2 | LOW | AlertTracker hot-reload concurrent safety (Cycle D item) | **Accepted** (RwLock correct) |
+| ACC-F3 | LOW | ui-tls-san SAN injection (Cycle D item) | **Accepted** (rcgen validates) |
+| INFO-F1 | INFO | serde_json syntax error reflected to client | **Accepted** |
