@@ -15,6 +15,8 @@ use crate::config::parser::AlertRule;
 
 const MAX_CLIENT_BUCKETS: usize = 100_000;
 const RECENT_ALERTS_CAP: usize = 200;
+/// Hard cap on blocked IPs — prevents memory exhaustion under IP-rotation flood attacks.
+const MAX_BLOCKED_ENTRIES: usize = 50_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AlertEvent {
@@ -222,13 +224,17 @@ impl AlertTracker {
 
         match rule.action.as_str() {
             "block" => {
-                let expires = if rule.block_duration_s == 0 {
-                    None
+                if !self.blocked.contains_key(&ip) && self.blocked.len() >= MAX_BLOCKED_ENTRIES {
+                    tracing::warn!(ip = %ip, "blocked map full -- ban dropped");
                 } else {
-                    Some(now + std::time::Duration::from_secs(rule.block_duration_s))
-                };
-                self.blocked.insert(ip, BlockEntry { expires, rule: rule.name.clone() });
-                self.persist_blocks();
+                    let expires = if rule.block_duration_s == 0 {
+                        None
+                    } else {
+                        Some(now + std::time::Duration::from_secs(rule.block_duration_s))
+                    };
+                    self.blocked.insert(ip, BlockEntry { expires, rule: rule.name.clone() });
+                    self.persist_blocks();
+                }
             }
             "notify" => {
                 if let Some(url) = &rule.notify_url {
@@ -307,6 +313,10 @@ impl AlertTracker {
         if self.is_blocked(ip) {
             return;
         }
+        if self.blocked.len() >= MAX_BLOCKED_ENTRIES {
+            tracing::warn!(ip = %ip, "blocked map full -- manual ban dropped");
+            return;
+        }
         self.blocked.insert(ip, BlockEntry { expires: None, rule: rule.clone() });
         self.persist_blocks();
         let event = AlertEvent {
@@ -330,6 +340,10 @@ impl AlertTracker {
 
     /// Block an IP for a fixed duration (used by bot defense). Emits an AlertEvent.
     pub fn block_bot(&self, ip: std::net::IpAddr, rule: &str, duration_secs: u64) {
+        if !self.blocked.contains_key(&ip) && self.blocked.len() >= MAX_BLOCKED_ENTRIES {
+            tracing::warn!(ip = %ip, rule = rule, "blocked map full -- bot ban dropped");
+            return;
+        }
         let expires = if duration_secs == 0 {
             None
         } else {
