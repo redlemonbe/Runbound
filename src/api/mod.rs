@@ -311,6 +311,8 @@ pub struct AppState {
     /// #5: per-domain query counter — top-domains endpoint.
     pub domain_stats: Arc<crate::domain_stats::DomainStats>,
     pub alert_tracker: Arc<crate::alerts::AlertTracker>,
+    pub webhook_targets: Arc<tokio::sync::RwLock<Vec<crate::webhooks::WebhookTarget>>>,
+    pub webhook_dispatcher: crate::webhooks::WebhookDispatcher,
     /// #89: ICMP echo responder statistics (polled from BPF per-CPU array).
     pub icmp_stats: Arc<crate::icmp::IcmpStats>,
     /// #89: Current ICMP config — updated via PUT /api/icmp/config.
@@ -655,6 +657,7 @@ pub fn router(state: AppState) -> Router {
         )
         // Alert thresholds (#12)
         .route("/alerts", get(get_alerts))
+        .route("/webhooks/test", post(post_webhook_test))
         .route("/alerts/blocked/:ip", delete(delete_blocked_ip).put(put_blocked_ip))
         // Administration
         .route("/rotate-key", post(rotate_key_handler))
@@ -1162,6 +1165,14 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
             s.alert_tracker.update_rules(new_cfg.alerts.clone());
             info!(cfg_path = %s.cfg_path, alert_rules = alert_rules_count, "API hot-reload complete");
             s.audit.send(AuditEvent::ConfigReload);
+            // Fire config-reloaded webhook (#11)
+            {
+                let tgts = s.webhook_targets.try_read();
+                if let Ok(tgts) = tgts {
+                    let ev = crate::webhooks::WebhookEvent::now("config-reloaded");
+                    s.webhook_dispatcher.fire(&tgts, ev);
+                }
+            }
             (
                 StatusCode::OK,
                 JsonExtract(serde_json::json!({
@@ -2476,6 +2487,14 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
             s.cache_evictions.store(0, Ordering::Relaxed);
             info!(flushed = before, "DNS cache flushed via API");
             s.audit.send(AuditEvent::ConfigReload);
+            // Fire config-reloaded webhook (#11)
+            {
+                let tgts = s.webhook_targets.try_read();
+                if let Ok(tgts) = tgts {
+                    let ev = crate::webhooks::WebhookEvent::now("config-reloaded");
+                    s.webhook_dispatcher.fire(&tgts, ev);
+                }
+            }
             (
                 StatusCode::OK,
                 JsonExtract(serde_json::json!({
@@ -3633,6 +3652,11 @@ mod tests {
             events_tx: None,
             domain_stats: crate::domain_stats::DomainStats::new(),
             alert_tracker: crate::alerts::AlertTracker::new(vec![], None),
+            webhook_targets: Arc::new(tokio::sync::RwLock::new(vec![])),
+            webhook_dispatcher: {
+                let targets = Arc::new(tokio::sync::RwLock::new(vec![]));
+                crate::webhooks::WebhookDispatcher::new(Arc::clone(&targets))
+            },
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
@@ -5797,6 +5821,11 @@ mod tests {
             events_tx: None,
             domain_stats: crate::domain_stats::DomainStats::new(),
             alert_tracker: crate::alerts::AlertTracker::new(vec![], None),
+            webhook_targets: Arc::new(tokio::sync::RwLock::new(vec![])),
+            webhook_dispatcher: {
+                let targets = Arc::new(tokio::sync::RwLock::new(vec![]));
+                crate::webhooks::WebhookDispatcher::new(Arc::clone(&targets))
+            },
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
@@ -6153,6 +6182,25 @@ mod tests {
     }
 }
 
+
+// POST /api/webhooks/test — send a test notification to all configured webhooks (#11)
+async fn post_webhook_test(State(state): State<AppState>) -> impl IntoResponse {
+    let targets = state.webhook_targets.read().await;
+    let event = crate::webhooks::WebhookEvent {
+        kind: "config-reloaded".to_owned(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        client: None,
+        domain: None,
+        feed: None,
+        message: Some("Webhook test from Runbound dashboard".to_owned()),
+        node_id: None,
+    };
+    state.webhook_dispatcher.fire(&targets, event);
+    (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"sent": targets.len()})))
+}
 
 // GET /api/alerts — alert rules, blocked clients, recent events (#12)
 // Auth handled by security_middleware.
