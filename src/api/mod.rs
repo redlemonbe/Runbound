@@ -502,6 +502,16 @@ async fn security_middleware(
 
             if let Some(user) = maybe_user {
                 AUTH_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+                // RBAC: enforce role-based write restrictions
+                let method = req.method().clone();
+                let is_write = !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
+                if is_write && !user.admin && !user.role.may_write(path) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                        "Forbidden: role does not permit writes to this endpoint",
+                    ).into_response();
+                }
                 req.extensions_mut().insert(crate::multiuser::RequestUser::from_account(&user));
             } else {
                 let failures = AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -3483,6 +3493,7 @@ async fn list_users_handler(
         "zone_prefixes": u.zone_prefixes,
         "enabled": u.enabled,
         "admin": u.admin,
+        "role": u.role,
     })).collect();
     (StatusCode::OK, JsonExtract(serde_json::json!({"users": users}))).into_response()
 }
@@ -3494,6 +3505,8 @@ struct CreateUserRequest {
     zone_prefixes: Vec<String>,
     #[serde(default)]
     admin: bool,
+    #[serde(default)]
+    role: crate::multiuser::Role,
 }
 
 /// POST /api/users — admin only: create user. Returns the new API key once.
@@ -3512,7 +3525,7 @@ async fn create_user_handler(
     if body.username.trim().is_empty() || body.username.len() > 64 {
         return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_USERNAME"}))).into_response();
     }
-    match reg.create_user(body.username, body.zone_prefixes, body.admin) {
+    match reg.create_user(body.username, body.zone_prefixes, body.admin, body.role) {
         Ok(u) => {
             info!(id = %u.id, username = %u.username, "User created");
             (StatusCode::CREATED, JsonExtract(serde_json::json!({
@@ -3522,6 +3535,7 @@ async fn create_user_handler(
                 "zone_prefixes": u.zone_prefixes,
                 "enabled": u.enabled,
                 "admin": u.admin,
+                "role": u.role,
             }))).into_response()
         }
         Err(e) => (StatusCode::CONFLICT, JsonExtract(serde_json::json!({"error": e}))).into_response(),
