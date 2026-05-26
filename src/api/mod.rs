@@ -1640,7 +1640,7 @@ async fn dns_lookup_handler(
     {
         let zones_snap = s.zones.load();
         match zones_snap.find(&lower) {
-            Some(crate::dns::ZoneAction::Refuse) | Some(crate::dns::ZoneAction::NxDomain) => {
+            Some(crate::dns::ZoneAction::Refuse) | Some(crate::dns::ZoneAction::NxDomain) | Some(crate::dns::ZoneAction::BlockPage) => {
                 return (
                     StatusCode::OK,
                     JsonExtract(serde_json::json!({

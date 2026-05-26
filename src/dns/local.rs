@@ -23,6 +23,8 @@ pub enum ZoneAction {
     // Mirrors Unbound's "redirect" zone type — reserved for future CNAME-based redirect support
     #[allow(dead_code)]
     Redirect,
+    /// Return block page IP instead of NXDOMAIN.
+    BlockPage,
 }
 
 impl From<&str> for ZoneAction {
@@ -31,6 +33,7 @@ impl From<&str> for ZoneAction {
             "refuse" | "inform_deny" => ZoneAction::Refuse,
             "always_nxdomain" | "nxdomain" => ZoneAction::NxDomain,
             "static" | "redirect" => ZoneAction::Static,
+            "block_page" | "block-page" => ZoneAction::BlockPage,
             _ => ZoneAction::Refuse,
         }
     }

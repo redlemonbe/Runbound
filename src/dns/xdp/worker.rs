@@ -1242,14 +1242,22 @@ fn answer_dns(
     resp.metadata.recursion_available = false;
     resp.add_query(q.clone());
 
-    match zones.find(&name) {
+    let zone_action = zones.find(&name); match zone_action {
         Some(ZoneAction::Refuse) => {
             resp.metadata.response_code = ResponseCode::Refused;
             resp.metadata.authoritative = false;
         }
-        Some(ZoneAction::NxDomain) => {
-            resp.metadata.response_code = ResponseCode::NXDomain;
-            resp.metadata.authoritative = true;
+        Some(ZoneAction::NxDomain) | Some(ZoneAction::BlockPage) => {
+            // BlockPage: if pre-inserted A record exists, return it; otherwise NxDomain
+            let bp_records = zones.local_records(&name, rtype);
+            if matches!(zone_action, Some(ZoneAction::BlockPage)) && !bp_records.is_empty() {
+                resp.metadata.response_code = ResponseCode::NoError;
+                resp.metadata.authoritative = true;
+                for r in bp_records { resp.add_answer(r.clone()); }
+            } else {
+                resp.metadata.response_code = ResponseCode::NXDomain;
+                resp.metadata.authoritative = true;
+            }
         }
         Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
             resp.metadata.authoritative = true;
