@@ -329,6 +329,16 @@ pub struct UnboundConfig {
     /// auto-generated WebUI TLS certificate. Repeat the directive for multiple SANs.
     pub ui_tls_san: Vec<String>,
 
+    // ── White-label branding (#25) ─────────────────────────────────────────────
+    /// Custom product name displayed in the web UI (default: "Runbound"). 
+    pub ui_brand_name: String,
+    /// URL of a custom logo image displayed in the header (default: empty = built-in SVG globe).
+    pub ui_brand_logo_url: String,
+    /// Hex accent color for the UI (default: #22d3ee = cyan-400).
+    pub ui_accent_color: String,
+    /// Custom favicon URL (default: empty = built-in).
+    pub ui_favicon_url: String,
+
     // ── Webhooks (#11) ────────────────────────────────────────────────────────
     /// List of webhook targets for system event notifications.
     pub webhooks: Vec<crate::webhooks::WebhookTarget>,
@@ -393,6 +403,10 @@ impl UnboundConfig {
             bot_honeypot_enabled: false,
             udp_busy_poll: false,
             ui_tls_san: vec![],
+            ui_brand_name: "Runbound".to_string(),
+            ui_brand_logo_url: String::new(),
+            ui_accent_color: "#22d3ee".to_string(),
+            ui_favicon_url: String::new(),
             webhooks: vec![],
             ..Default::default()
         }
@@ -779,6 +793,10 @@ fn parse_server_directive(
         "ui-acme-dns"     => cfg.ui_acme_dns     = val.trim().trim_matches('"').to_owned(),
         "ui-acme-cf-token"=> cfg.ui_acme_cf_token= val.trim().trim_matches('"').to_owned(),
         "ui-acme-hook"    => cfg.ui_acme_hook    = val.trim().trim_matches('"').to_owned(),
+        "ui-brand-name"    => cfg.ui_brand_name    = val.trim().trim_matches('"').to_owned(),
+        "ui-brand-logo-url" => cfg.ui_brand_logo_url = val.trim().trim_matches('"').to_owned(),
+        "ui-accent-color"  => cfg.ui_accent_color  = val.trim().trim_matches('"').to_owned(),
+        "ui-favicon-url"   => cfg.ui_favicon_url   = val.trim().trim_matches('"').to_owned(),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }
