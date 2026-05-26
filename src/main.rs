@@ -8,6 +8,7 @@ mod cpu;
 mod dns;
 mod domain_stats;
 mod alerts;
+mod webhooks;
 mod error;
 mod feeds;
 mod firewall;
@@ -1166,6 +1167,11 @@ async fn build_and_launch(
         events_tx,
         domain_stats: Arc::clone(&domain_stats),
         alert_tracker: Arc::clone(&alert_tracker),
+        webhook_targets: Arc::new(tokio::sync::RwLock::new(cfg_arc.webhooks.clone())),
+        webhook_dispatcher: {
+            let targets = Arc::new(tokio::sync::RwLock::new(cfg_arc.webhooks.clone()));
+            crate::webhooks::WebhookDispatcher::new(Arc::clone(&targets))
+        },
         icmp_stats: Arc::clone(&icmp_stats),
         icmp_cfg: Arc::clone(&icmp_cfg),
         dnssec_enabled: Arc::clone(&dnssec_enabled),
