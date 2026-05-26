@@ -1,1 +1,0 @@
-Benchmark discrepancies log. This file records cases where agent-run and maintainer-run benchmarks diverged by more than 5%, along with hypotheses on the cause and resolution. No discrepancies recorded yet.
