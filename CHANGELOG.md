@@ -9,6 +9,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.57] — 2026-05-26
+
+### Added
+
+- **Hot backup**: `POST /api/backup` — snapshots config (`runbound.conf`) + DNS entries + blacklist + feeds + upstreams to `base_dir/backups/backup_<ts>[_label]/`. Optional `label` field for named snapshots.
+- **Backup listing**: `GET /api/backup` — returns JSON array with id, timestamp, and file list.
+- **Hot restore**: `POST /api/backup/restore` with `{"id": "backup_<ts>"}` — copies all snapshot files back and triggers a hot-reload of the config.
+- **Backup deletion**: `DELETE /api/backup/:id` — removes a snapshot directory.
+
+---
+
 ## [0.9.52] -- 2026-05-26
 
 ### Changed
