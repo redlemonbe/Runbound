@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 /// Wire format: length-prefixed labels, e.g. `\x07example\x03com\x00`.
 /// Lowercase is guaranteed by the caller (LowerName or equivalent).
 /// 64 bytes is enough for names up to ~60 chars without heap allocation.
-#[derive(Hash, Eq, PartialEq, Clone)]
+#[derive(Hash, Eq, Clone)]
 pub struct QuestionKey {
     /// Wire-format DNS name, lowercased (matches QNAME bytes from the client).
     pub name: SmallVec<[u8; 64]>,
@@ -42,6 +42,16 @@ pub struct QuestionKey {
     /// Wire-format query class (1 = IN).
     pub qclass: u16,
 }
+
+impl PartialEq for QuestionKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.qtype == other.qtype
+            && self.qclass == other.qclass
+            && crate::dns::simd::bytes_eq(&self.name, &other.name)
+    }
+}
+
 
 pub struct CacheEntry {
     /// Full DNS response datagram in wire format with QID zeroed (bytes [0..2]).
