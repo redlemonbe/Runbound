@@ -55,6 +55,7 @@ fn main() -> Result<()> {
     // ── Tokio runtime with optional CPU affinity ──────────────────────────
     // init_runtime() has already installed the tracing subscriber, so info!()
     // works here without a running async runtime.
+    cpu::log_cpu_info();
     let cores = cpu::physical_cores();
     let core_count = cores.len();
 
