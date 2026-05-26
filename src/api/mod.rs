@@ -1837,6 +1837,7 @@ async fn add_blacklist_handler(
 async fn delete_blacklist_handler(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
 ) -> impl IntoResponse {
     let _guard = s.zones_mutex.lock().await;
 
@@ -1850,6 +1851,7 @@ async fn delete_blacklist_handler(
             );
         }
     };
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
     let pos = bl.entries.iter().position(|e| e.id == id);
     let Some(pos) = pos else {
         return (
@@ -1857,6 +1859,9 @@ async fn delete_blacklist_handler(
             JsonExtract(serde_json::json!({"error":"NOT_FOUND","id":id})),
         );
     };
+    if !caller.admin && bl.entries[pos].owner_user_id.as_deref() != Some(caller.id.as_str()) {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"not your entry"})));
+    }
     let removed = bl.entries.remove(pos);
     if let Err(e) = store::save_blacklist(&bl) {
         warn!(err = %e, "blacklist save failed in delete");
@@ -1920,8 +1925,13 @@ async fn get_feeds_handler(State(_s): State<AppState>) -> impl IntoResponse {
 
 async fn add_feed_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     ApiJson(p): ApiJson<AddFeedRequest>,
 ) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"feed management requires admin"})));
+    }
     // Enforce subscription cap before attempting download/validation.
     let current = feeds::load_feeds().unwrap_or_default();
     if current.feeds.len() >= MAX_FEEDS {
@@ -1968,7 +1978,12 @@ async fn add_feed_handler(
 async fn delete_feed_handler(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
 ) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"feed management requires admin"})));
+    }
     match remove_feed(&id) {
         Ok(()) => {
             s.audit.send(AuditEvent::FeedDelete { id: id.clone() });
