@@ -179,6 +179,18 @@ curl -X DELETE "http://localhost:8080/api/blacklist/$ID" \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
 ```
 
+#### XDP fast-path blacklist (v0.9.53+)
+
+When XDP is active, blacklisted domains are pushed into a BPF hash map
+(`dns_blacklist`, 500 000 entries). IPv4 DNS queries matching a blocked domain are
+answered with **NXDOMAIN in-place at the XDP layer** — no kernel stack, no hickory
+overhead (~1 µs RTT).
+
+- IPv6 queries for blocked domains fall through to the hickory slow path (still blocked).
+- The map is updated atomically after every `POST /api/blacklist` and `DELETE /api/blacklist/:id`.
+- `GET /api/stats` includes `xdp_blocked_total` — packets blocked at the XDP layer.
+- `GET /api/blacklist` includes `xdp_active: true` when the BPF map is loaded.
+
 ---
 
 ### Feeds
