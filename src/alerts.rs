@@ -347,7 +347,8 @@ impl AlertTracker {
             count: 1,
             action: "block".to_string(),
         };
-        let _ = self.notify_tx.send(("bot_ban".to_string(), event.clone()));
+        // Note: block_bot does not dispatch to notify_tx (no URL context available here).
+        // The event is recorded in recent_alerts; callers should use trigger() for webhook delivery.
         if let Ok(mut q) = self.recent.lock() {
             if q.len() >= RECENT_ALERTS_CAP { q.pop_front(); }
             q.push_back(event);
@@ -375,6 +376,43 @@ impl AlertTracker {
     }
 }
 
+/// Returns true if the URL is safe to POST to (scheme is http/https, not a private address).
+fn is_safe_webhook_url(url: &str) -> bool {
+    // Reject non-HTTP/HTTPS schemes (file://, ftp://, etc.)
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return false;
+    }
+    // Parse to extract hostname and reject RFC-1918 / loopback / link-local.
+    let Ok(parsed) = url::Url::parse(url) else { return false };
+    let host = parsed.host_str().unwrap_or("");
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return false;
+        }
+        if let std::net::IpAddr::V4(v4) = ip {
+            if v4.is_private() || v4.is_link_local() {
+                return false;
+            }
+        }
+        if let std::net::IpAddr::V6(v6) = ip {
+            if v6.is_loopback() {
+                return false;
+            }
+        }
+    }
+    // Reject common localhost/metadata aliases
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc == "localhost"
+        || host_lc.ends_with(".local")
+        || host_lc == "metadata.google.internal"
+        || host_lc == "169.254.169.254"
+    {
+        return false;
+    }
+    true
+}
+
 async fn webhook_sender(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(String, AlertEvent)>,
 ) {
@@ -384,6 +422,10 @@ async fn webhook_sender(
         .unwrap_or_default();
 
     while let Some((url, event)) = rx.recv().await {
+        if !is_safe_webhook_url(&url) {
+            tracing::warn!(url = %url, "Alert webhook: URL rejected (private/loopback/invalid scheme)");
+            continue;
+        }
         let body = serde_json::json!({
             "source": "runbound",
             "event": "alert_threshold",
