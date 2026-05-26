@@ -102,6 +102,9 @@ pub struct DnsEntry {
     // ── Metadata ──
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Multi-user: owner user ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
 }
 
 impl DnsEntry {
@@ -278,6 +281,9 @@ pub struct BlacklistEntry {
     /// #9: optional time window — if absent the rule is always active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleWindow>,
+    /// Multi-user: owner user ID (None = admin-owned).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
