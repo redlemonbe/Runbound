@@ -176,6 +176,7 @@ pub struct RunboundHandler {
     /// #14: allow DNS UPDATE (RFC 2136). False = refuse all UPDATE messages.
     allow_update: bool,
     block_https_record: bool,
+
     /// #14: TSIG keys for DNS UPDATE authentication: (name, algorithm, base64-secret).
     /// SEC-20: pre-decoded TSIG keys (name_lower, algorithm, key_bytes) — decoded once at startup.
     tsig_keys: Vec<(String, TsigAlgorithm, Vec<u8>)>,
@@ -212,6 +213,8 @@ impl RunboundHandler {
         stale_max_age: u64,
         allow_update: bool,
         block_https_record: bool,
+
+
         tsig_keys_raw: Vec<(String, String, String)>,
         alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
         axfr_allow: Vec<String>,
@@ -249,6 +252,7 @@ impl RunboundHandler {
             stale_max_age,
             allow_update,
             block_https_record,
+
             // SEC-20: decode TSIG keys once at startup instead of per-request.
             tsig_keys: tsig_keys_raw.into_iter().filter_map(|(name, alg_str, secret_b64)| {
                 let alg = match alg_str.as_str() {
@@ -376,6 +380,22 @@ impl RunboundHandler {
                     LogAction::Blocked,
                     start,
                 );
+                return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
+            }
+            Some(ZoneAction::BlockPage) => {
+                debug!(name=%sanitize_dns_name(qname), "local-zone BlockPage redirect");
+                self.stats.inc_blocked();
+                self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Blocked, start);
+                // If block_page_ip is configured, it was pre-inserted as a Static A record.
+                // Fall through to NxDomain if no record found.
+                let bp_records = zones_snap.local_records(qname, qtype);
+                if !bp_records.is_empty() {
+                    let mut metadata = Metadata::response_from_request(&request.metadata);
+                    metadata.authoritative = true;
+                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let response = builder.build(metadata, bp_records, std::iter::empty(), std::iter::empty(), std::iter::empty());
+                    return Ok(response_handle.send_response(response).await.unwrap_or_else(|e| { tracing::error!("bp send: {e}"); servfail_info(request) }));
+                }
                 return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
             }
             Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
@@ -2196,6 +2216,7 @@ pub async fn run_dns_server(
         cfg.stale_max_age,
         cfg.allow_update,
         cfg.block_https_record,
+
         cfg.tsig_keys.clone(),
         Some(Arc::clone(&alert_tracker)),
         cfg.axfr_allow.clone(),
