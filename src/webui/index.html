@@ -261,6 +261,7 @@
   <button role="tab" aria-selected="false" aria-controls="tab-upstreams"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
   <button role="tab" aria-selected="false" aria-controls="tab-logs"       class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
   <button role="tab" aria-selected="false" aria-controls="tab-protection" class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('protection',this)">Protection</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-users"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('users',this)">Users</button>
   <button role="tab" aria-selected="false" aria-controls="tab-system"     class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('system',this)">System</button>
   <button role="tab" aria-selected="false" aria-controls="tab-settings"   class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('settings',this)">Settings</button>
   <button role="tab" aria-selected="false" aria-controls="tab-about"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('about',this)">About</button>
@@ -732,6 +733,42 @@
         <span class="text-gray-700">Open Settings to load…</span>
       </div>
     </div>
+  </div>
+
+  <!-- ═══ USERS ═══ -->
+  <div id="tab-users" class="hidden fade max-w-3xl mx-auto">
+    <div id="users-disabled-notice" class="hidden card mb-4 text-xs text-yellow-400">
+      Multi-user mode is disabled. To enable it, create <code class="font-mono bg-gray-800 px-1 rounded">users.json</code>
+      in the Runbound data directory and restart the service.
+    </div>
+    <div id="users-create-section" class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Create user</div>
+      <div class="flex gap-2 flex-wrap items-end">
+        <div class="flex flex-col gap-1">
+          <label class="text-xs text-gray-600">Username</label>
+          <input id="u-username" type="text" placeholder="alice" class="input w-36" />
+        </div>
+        <div class="flex flex-col gap-1">
+          <label class="text-xs text-gray-600">Zone prefixes (comma-separated)</label>
+          <input id="u-prefixes" type="text" placeholder="home., internal." class="input w-64" />
+        </div>
+        <div class="flex flex-col gap-1 items-center">
+          <label class="text-xs text-gray-600">Admin</label>
+          <input id="u-admin" type="checkbox" class="accent-cyan-500 mt-2" />
+        </div>
+        <button onclick="userCreate()" class="btn-primary self-end">+ Create</button>
+      </div>
+    </div>
+    <div id="users-key-modal" class="hidden card mb-4 border border-cyan-800">
+      <div class="text-xs text-gray-400 mb-1">New API key — copy it now, it will not be shown again:</div>
+      <div id="users-key-value" class="font-mono text-cyan-300 text-sm break-all bg-gray-900 rounded px-3 py-2 my-2"></div>
+      <button onclick="document.getElementById('users-key-modal').classList.add('hidden')" class="btn-secondary text-xs mt-1">Close</button>
+    </div>
+    <div class="flex items-center justify-between mb-2">
+      <span class="text-xs text-gray-600 uppercase tracking-wide">Users</span>
+      <button onclick="loadUsers()" class="btn-secondary text-xs">↻ Refresh</button>
+    </div>
+    <div id="users-list" class="space-y-1.5"><span class="text-xs text-gray-700 italic">Loading…</span></div>
   </div>
 
 <!-- Toast -->
@@ -1394,7 +1431,7 @@ function toast(msg,err=false){const el=document.getElementById('toast');el.textC
 function showTab(name,btn){
   if(name!=='logs'){clearInterval(logsTimer);logsTimer=null;const cb=document.getElementById('logs-auto');if(cb)cb.checked=false;}
   if(name!=='protection'){clearInterval(protectionTimer);protectionTimer=null;}
-  ['overview','dns','blacklist','feeds','upstreams','logs','system','protection','about','settings'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
+  ['overview','dns','blacklist','feeds','upstreams','logs','system','protection','about','settings','users'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
   document.querySelectorAll('.tab-active').forEach(b=>{b.classList.remove('tab-active');b.setAttribute('aria-selected','false');});
   const el=document.getElementById('tab-'+name);el.classList.remove('hidden');el.classList.add('fade');
   btn.classList.add('tab-active');btn.setAttribute('aria-selected','true');
@@ -1406,6 +1443,7 @@ function showTab(name,btn){
   if(name==='system'){loadSystem();loadSlaves();}
   if(name==='protection'){loadProtection();protectionTimer=setInterval(loadProtection,4000);}
   if(name==='settings'){initDnssecToggle();loadAuthEvents();initCaCard();}
+  if(name==='users'){loadUsers();}
 }
 
 
@@ -1735,6 +1773,84 @@ async function loadAuthEvents() {
   tick();
   setInterval(tick, 1000);
 })();
+
+// ══════════════════════════════════════════════
+// Users tab
+// ══════════════════════════════════════════════
+async function loadUsers() {
+  const el = document.getElementById('users-list');
+  el.innerHTML = '<span class="text-xs text-gray-700 italic">Loading…</span>';
+  try {
+    const r = await apiFetch('/api/users');
+    const d = await r.json();
+    const notice = document.getElementById('users-disabled-notice');
+    const createSection = document.getElementById('users-create-section');
+    if (d.error === 'MULTI_USER_DISABLED') {
+      notice.classList.remove('hidden');
+      createSection.classList.add('hidden');
+      el.innerHTML = '';
+      return;
+    }
+    notice.classList.add('hidden');
+    createSection.classList.remove('hidden');
+    if (!Array.isArray(d) || !d.length) { el.innerHTML = '<span class="text-xs text-gray-600 italic">No users yet.</span>'; return; }
+    el.innerHTML = d.map(u => {
+      const adminBadge = u.admin ? '<span class="px-1.5 py-0.5 rounded bg-cyan-900 text-cyan-300 text-xs">admin</span>' : '';
+      const prefixes = (u.zone_prefixes||[]).join(', ') || '<span class="text-gray-700 italic">all zones</span>';
+      return '<div class="card flex items-center gap-3 flex-wrap text-xs">' +
+        '<span class="font-mono text-gray-300 w-32 truncate">' + esc(u.username) + '</span>' +
+        '<span class="text-gray-600 font-mono text-xs w-24 truncate" title="' + esc(u.id) + '">' + u.id.slice(0,8) + '…</span>' +
+        adminBadge +
+        '<span class="text-gray-500 flex-1">' + prefixes + '</span>' +
+        '<button onclick="userRotateKey('' + u.id + '')" class="btn-secondary text-xs">↻ Rotate key</button>' +
+        '<button onclick="userDelete('' + u.id + '','' + esc(u.username) + '')" class="text-xs text-red-500 hover:text-red-400 px-2 py-1 rounded hover:bg-red-900/20">Delete</button>' +
+        '</div>';
+    }).join('');
+  } catch(e) { el.innerHTML = '<span class="text-xs text-red-500">' + esc(e.message) + '</span>'; }
+}
+
+async function userCreate() {
+  const username = document.getElementById('u-username').value.trim();
+  const prefixesRaw = document.getElementById('u-prefixes').value.trim();
+  const admin = document.getElementById('u-admin').checked;
+  if (!username) { toast('Username required', true); return; }
+  const zone_prefixes = prefixesRaw ? prefixesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+  try {
+    const r = await apiFetch('/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({username, zone_prefixes, admin}) });
+    const d = await r.json();
+    if (!r.ok) { toast('Error: ' + (d.error||r.status), true); return; }
+    document.getElementById('u-username').value = '';
+    document.getElementById('u-prefixes').value = '';
+    document.getElementById('u-admin').checked = false;
+    showApiKey(d.api_key);
+    loadUsers();
+  } catch(e) { toast(e.message, true); }
+}
+
+async function userDelete(id, name) {
+  if (!confirm('Delete user ' + name + '?')) return;
+  try {
+    const r = await apiFetch('/api/users/' + id, { method: 'DELETE' });
+    if (!r.ok) { const d = await r.json(); toast('Error: ' + (d.error||r.status), true); return; }
+    loadUsers();
+  } catch(e) { toast(e.message, true); }
+}
+
+async function userRotateKey(id) {
+  if (!confirm('Rotate API key? The old key will stop working immediately.')) return;
+  try {
+    const r = await apiFetch('/api/users/' + id + '/rotate-key', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { toast('Error: ' + (d.error||r.status), true); return; }
+    showApiKey(d.api_key);
+  } catch(e) { toast(e.message, true); }
+}
+
+function showApiKey(key) {
+  document.getElementById('users-key-value').textContent = key;
+  document.getElementById('users-key-modal').classList.remove('hidden');
+}
+
 </script>
 
 <!-- Input modal -->
