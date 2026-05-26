@@ -88,6 +88,8 @@ pub struct UnboundConfig {
     pub api_key: Option<String>,
     /// Static scoped API keys from api-key-extra blocks (#13).
     pub extra_api_keys: Vec<ExtraApiKey>,
+    /// Per-subnet DNS override zones for split-horizon DNS (#10).
+    pub split_horizon: Vec<SplitHorizonEntry>,
     /// REST API port. Default: 8081.
     pub api_port: Option<u16>,
     /// Maximum TTL cap for cached records (seconds). Default: 86400 (24 h).
@@ -355,6 +357,14 @@ pub struct ExtraApiKey {
     pub role: crate::multiuser::Role,
 }
 
+/// Per-subnet DNS override zone for split-horizon DNS (#10).
+#[derive(Debug, Clone, Default)]
+pub struct SplitHorizonEntry {
+    pub name: String,
+    pub subnets: Vec<String>,
+    pub local_data: Vec<LocalData>,
+}
+
 impl UnboundConfig {
     pub fn defaults() -> Self {
         Self {
@@ -441,6 +451,7 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
     let mut cfg = UnboundConfig::defaults();
     let mut current_forward: Option<ForwardZone> = None;
     let mut current_extra_key: Option<ExtraApiKey> = None;
+    let mut current_split: Option<SplitHorizonEntry> = None;
     let mut current_section = String::new();
 
     for (lineno, raw) in content.lines().enumerate() {
@@ -457,6 +468,11 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
             if let Some(ek) = current_extra_key.take() {
                 if !ek.label.is_empty() && !ek.key.is_empty() {
                     cfg.extra_api_keys.push(ek);
+                }
+            }
+            if let Some(se) = current_split.take() {
+                if !se.subnets.is_empty() {
+                    cfg.split_horizon.push(se);
                 }
             }
             current_section = line.trim_end_matches(':').to_string();
@@ -532,6 +548,20 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                         };
                     }
                     other => warn!("Line {}: unknown api-key-extra directive '{}' — ignored", lineno + 1, other),
+                }
+            },
+            "split-horizon" => {
+                let se = current_split.get_or_insert_with(SplitHorizonEntry::default);
+                match key {
+                    "name" => se.name = val.trim_matches('"').to_string(),
+                    "subnet" => se.subnets.push(val.trim_matches('"').to_string()),
+                    "local-data" => {
+                        let rr = val.trim_matches('"').trim().to_string();
+                        if !rr.is_empty() {
+                            se.local_data.push(LocalData { rr });
+                        }
+                    }
+                    other => warn!("Line {}: unknown split-horizon directive '{}' — ignored", lineno + 1, other),
                 }
             },
             "io-uring" => {
@@ -619,6 +649,11 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
     if let Some(ek) = current_extra_key {
         if !ek.label.is_empty() && !ek.key.is_empty() {
             cfg.extra_api_keys.push(ek);
+        }
+    }
+    if let Some(se) = current_split {
+        if !se.subnets.is_empty() {
+            cfg.split_horizon.push(se);
         }
     }
 
