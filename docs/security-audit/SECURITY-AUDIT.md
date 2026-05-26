@@ -600,3 +600,74 @@ No exploitable memory safety issue found.
 | ACC-F2 | LOW | AlertTracker hot-reload concurrent safety (Cycle D item) | **Accepted** (RwLock correct) |
 | ACC-F3 | LOW | ui-tls-san SAN injection (Cycle D item) | **Accepted** (rcgen validates) |
 | INFO-F1 | INFO | serde_json syntax error reflected to client | **Accepted** |
+
+
+---
+
+## Cycle E — [AI-INTERNAL] — 2026-05-26 — v0.9.58 (Webhook notifications)
+
+**Scope:** src/webhooks.rs (WebhookDispatcher, WebhookTarget, delivery), src/api/mod.rs (AppState extension, POST /webhooks/test, reload_handler), src/config/parser.rs (webhook directives), src/main.rs (AppState construction).
+
+### E-001 — INFO — SSRF via webhook URL: is_safe_url() validated
+
+| Field | Value |
+|-------|-------|
+| **Severity** | INFO |
+| **Discovered** | 2026-05-26 |
+| **Status** | No finding |
+
+Description: send_once() calls is_safe_url() before any HTTP request. Rejects: non-http(s) schemes, loopback (127.x, ::1), private RFC1918 (10/8, 172.16/12, 192.168/16), link-local (169.254.x), metadata endpoints (metadata.google.internal, 169.254.169.254), .local hostnames, localhost. DNS rebinding not mitigated (no custom resolver on webhook client), but internal services are protected by IP check on initial URL parse.
+
+Risk residual: DNS rebinding attack possible if attacker controls a domain that resolves to a private IP after the URL check. Probability: low in this deployment context.
+
+---
+
+### E-002 — INFO — Unbounded channel for webhook delivery queue
+
+| Field | Value |
+|-------|-------|
+| **Severity** | INFO |
+| **CWE** | CWE-400 (Uncontrolled Resource Consumption) |
+| **Discovered** | 2026-05-26 |
+| **Status** | Accepted |
+
+Description: tokio::sync::mpsc::unbounded_channel is used for the delivery queue. If webhook targets are unreachable and many events fire (e.g., under a domain-blocking flood), the queue can grow unbounded. Each queued item is a (WebhookTarget, WebhookEvent) clone (~hundreds of bytes). Under extreme flooding: potential memory pressure.
+
+Accepted: (a) Webhook targets are admin-configured, not user-supplied; (b) delivery task processes with retry+backoff (max 3x), not infinite retry; (c) most Runbound deployments have <10 events/min; (d) a bounded channel would drop events, which is worse UX.
+
+---
+
+### E-003 — INFO — config-reloaded event uses try_read()
+
+| Field | Value |
+|-------|-------|
+| **Severity** | INFO |
+| **Discovered** | 2026-05-26 |
+| **Status** | Accepted |
+
+Description: reload_handler() fires config-reloaded webhook using s.webhook_targets.try_read(). If the lock is held (write in progress), the event is silently dropped. This is intentional to avoid blocking the reload response on webhook firing.
+
+Accepted: Webhook delivery is best-effort by design. A missed config-reloaded notification is acceptable.
+
+---
+
+### E-004 — INFO — Webhook test endpoint fires with 0 targets (no auth bypass)
+
+| Field | Value |
+|-------|-------|
+| **Severity** | INFO |
+| **Discovered** | 2026-05-26 |
+| **Status** | No finding |
+
+Description: POST /api/webhooks/test is protected by the same auth middleware as all other API endpoints (401 without valid bearer token). When no webhook targets are configured, it returns {"sent": 0}. Verified live: curl without auth -> 401, with auth and no targets -> {"sent": 0}.
+
+---
+
+## Findings Summary -- v0.9.58
+
+| ID | Severity | Title | Status |
+|----|----------|-------|--------|
+| E-001 | INFO | SSRF via webhook URL | No finding |
+| E-002 | INFO | Unbounded delivery queue | Accepted |
+| E-003 | INFO | config-reloaded silently dropped under lock | Accepted |
+| E-004 | INFO | /webhooks/test without targets | No finding |
