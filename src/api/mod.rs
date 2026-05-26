@@ -3,6 +3,7 @@
 // Runbound REST API — full DNS management + feeds + DoT/DoH status
 
 pub mod relay;
+pub mod clients;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -637,6 +638,9 @@ pub fn router(state: AppState) -> Router {
         .route("/upstreams/:id/probe", post(probe_upstream_handler))
         .route("/cache/stats", get(cache_stats_handler))
         .route("/logs", get(logs_handler).delete(clear_logs_handler))
+        .route("/clients", get(clients::clients_handler))
+        .route("/clients/:ip", get(clients::client_detail_handler))
+        .route("/clients/:ip/logs", get(clients::client_logs_handler))
         .route("/audit/tail", get(audit_tail_handler))
         .route("/metrics", get(metrics_handler))
         // Sync
@@ -731,6 +735,9 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/api/sync/slaves",       "description":"List connected slave nodes (master mode only)"},
             {"method":"GET",    "path":"/api/nodes",             "description":"List registered nodes with relay capability (#88)"},
             {"method":"ANY",    "path":"/api/nodes/{id}/relay/*", "description":"Relay request to a registered slave via HMAC-signed channel (#85)"},
+            {"method":"GET",    "path":"/api/clients",         "description":"Per-client DNS activity — list all active clients with stats (#6)"},
+            {"method":"GET",    "path":"/api/clients/:ip",      "description":"Per-client detail: top domains, action breakdown (#6)"},
+            {"method":"GET",    "path":"/api/clients/:ip/logs", "description":"Recent log entries for a specific client IP (#6)"},
             {"method":"GET",    "path":"/api/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
             {"method":"DELETE", "path":"/api/logs",             "description":"Clear the in-memory query log ring buffer (GDPR right-to-erasure)"},
             {"method":"GET",    "path":"/api/audit/tail",       "description":"Last N audit log entries — ?n=100"},
