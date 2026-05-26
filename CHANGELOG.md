@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.50] -- 2026-05-26
+
+### Security
+
+- **SEC-F1 fix: cap AlertTracker blocked map at 50 000 entries** (Cycle F): The blocked DashMap in AlertTracker had no size cap. Under an IP-rotation flood (many distinct source IPs triggering the bot trap), the map could grow unboundedly between the 60s eviction cycles, exhausting RAM. Added MAX_BLOCKED_ENTRIES = 50_000 constant; block_bot, block_manual, and trigger now check the cap before inserting new IPs. Existing IPs (re-bans / updates) are exempt. Excess bans are logged as WARN and silently dropped until the next eviction cycle clears space.
+
+- **Security audit Cycle F complete**: All Cycle D pending items resolved (SEC-F1 fixed; ACC-F1 / ACC-F2 / ACC-F3 accepted after code review showed no exploitable issues). Zero open findings as of v0.9.50. See docs/security-audit/SECURITY-AUDIT.md.
+
+---
+
 ## [0.9.46] — 2026-05-26
 
 ### Performance
