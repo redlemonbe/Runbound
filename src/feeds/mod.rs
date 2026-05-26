@@ -81,6 +81,9 @@ pub struct Feed {
     /// Last error message from a failed update; null when last update was successful.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Multi-user: owner user ID (None = admin-owned, visible to all admins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -453,6 +456,7 @@ pub async fn add_feed(
         last_updated: None,
         description,
         last_error: None,
+        owner_user_id: None,
     };
     config.feeds.push(feed.clone());
     save_feeds(&config)?;

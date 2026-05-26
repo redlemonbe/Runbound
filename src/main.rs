@@ -21,6 +21,7 @@ mod store;
 mod sync;
 mod upstreams;
 mod webui;
+mod multiuser;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -1112,6 +1113,15 @@ async fn build_and_launch(
         });
     }
 
+    // Multi-user registry — load users.json if present.
+    let users_json_path = base_dir.join("users.json");
+    let user_registry = if users_json_path.exists() {
+        tracing::info!(path = %users_json_path.display(), "Loading multi-user registry");
+        Some(crate::multiuser::UserRegistry::load(&users_json_path))
+    } else {
+        None
+    };
+
     let state = AppState {
         zones: Arc::clone(&zones),
         tls_cfg: Arc::clone(&tls_cfg),
@@ -1142,6 +1152,7 @@ async fn build_and_launch(
         icmp_stats: Arc::clone(&icmp_stats),
         icmp_cfg: Arc::clone(&icmp_cfg),
         dnssec_enabled: Arc::clone(&dnssec_enabled),
+        user_registry,
     };
     let app = api::router(state);
 
