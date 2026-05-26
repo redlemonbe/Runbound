@@ -318,6 +318,8 @@ pub struct AppState {
     /// Runtime DNSSEC validation toggle (#72 perf path). Mirrors cfg.dnssec_validation at startup.
     /// Updated by PATCH /api/config; all rebuild_and_swap calls read from here.
     pub dnssec_enabled: Arc<AtomicBool>,
+    /// Multi-user registry (None = single-user mode, only master API key works).
+    pub user_registry: Option<Arc<crate::multiuser::UserRegistry>>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -388,7 +390,7 @@ pub struct AddBlacklistRequest {
 
 async fn security_middleware(
     State(state): State<AppState>,
-    req: Request<axum::body::Body>,
+    mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     // ── 0. Body size pre-check ───────────────────────────────────────
@@ -486,33 +488,35 @@ async fn security_middleware(
         let key = get_api_key();
         let expected = format!("Bearer {}", key.as_str());
         if !constant_time_eq(auth.as_bytes(), expected.as_bytes()) {
-            let failures = AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            // All post-comparison side effects (audit event, periodic warning) run in a
-            // background task so the 401 is returned immediately with no timing signal.
-            // Combined with the pre-auth sleep above, this eliminates the timing oracle.
-            let audit = state.audit.clone();
-            let path_owned = path.to_string();
-            tokio::spawn(async move {
-                audit.send(AuditEvent::AuthFailure { path: path_owned });
-                if failures.is_multiple_of(10) {
-                    warn!(
-                        failures,
-                        "Repeated API authentication failures — check RUNBOUND_API_KEY"
-                    );
-                }
-            });
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(
-                    axum::http::header::WWW_AUTHENTICATE,
-                    "Bearer realm=\"runbound\"",
-                )],
-                "Unauthorized",
-            )
-                .into_response();
+            // Master key did not match -- check user registry if multi-user is enabled.
+            let user_bearer = auth.strip_prefix("Bearer ").unwrap_or("");
+            let maybe_user = state.user_registry.as_ref()
+                .and_then(|reg| reg.by_api_key(user_bearer))
+                .filter(|u| u.enabled);
+
+            if let Some(user) = maybe_user {
+                AUTH_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+                req.extensions_mut().insert(crate::multiuser::RequestUser::from_account(&user));
+            } else {
+                let failures = AUTH_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let audit = state.audit.clone();
+                let path_owned = path.to_string();
+                tokio::spawn(async move {
+                    audit.send(AuditEvent::AuthFailure { path: path_owned });
+                    if failures.is_multiple_of(10) {
+                        warn!(failures, "Repeated API authentication failures — check RUNBOUND_API_KEY");
+                    }
+                });
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(axum::http::header::WWW_AUTHENTICATE, "Bearer realm=\"runbound\"")],
+                    "Unauthorized",
+                ).into_response();
+            }
+        } else {
+            AUTH_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+            req.extensions_mut().insert(crate::multiuser::RequestUser::admin_context());
         }
-        // Successful auth resets the failure counter.
-        AUTH_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ── 3. Security response headers ──────────────────────────────────
@@ -560,7 +564,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 async fn slave_guard_middleware(
     State(state): State<AppState>,
-    req: Request<axum::body::Body>,
+    mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     if state.slave_mode && req.method() != axum::http::Method::GET {
@@ -651,6 +655,11 @@ pub fn router(state: AppState) -> Router {
         .route("/alerts/blocked/:ip", delete(delete_blocked_ip).put(put_blocked_ip))
         // Administration
         .route("/rotate-key", post(rotate_key_handler))
+        // Multi-user management
+        .route("/users", get(list_users_handler).post(create_user_handler))
+        .route("/users/me", get(get_me_handler))
+        .route("/users/:id", delete(delete_user_handler))
+        .route("/users/:id/rotate-key", post(rotate_user_key_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             slave_guard_middleware,
@@ -1333,6 +1342,7 @@ fn validate_dns_entry(
         matching_type: req.matching_type,
         cert_data: req.cert_data.clone(),
         description: req.description.clone(),
+        owner_user_id: None, // Set by caller for user-owned entries
     };
     let rr = match entry.to_rr_string() {
         Some(r) => r,
@@ -1769,6 +1779,7 @@ async fn add_blacklist_handler(
             action: req.action.clone(),
             description: req.description.clone(),
             schedule: req.schedule.clone(),
+            owner_user_id: None,
         };
         bl.entries.push(entry.clone());
         if let Err(e) = store::save_blacklist(&bl) {
@@ -3386,6 +3397,143 @@ fn validate_dns_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+// ── Multi-user management handlers ────────────────────────────────────────
+
+/// GET /api/users — admin only: list all users (keys redacted).
+async fn list_users_handler(
+    State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
+    let Some(ref reg) = s.user_registry else {
+        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
+    };
+    let users: Vec<serde_json::Value> = reg.all_users().iter().map(|u| serde_json::json!({
+        "id": u.id,
+        "username": u.username,
+        "zone_prefixes": u.zone_prefixes,
+        "enabled": u.enabled,
+        "admin": u.admin,
+    })).collect();
+    (StatusCode::OK, JsonExtract(serde_json::json!({"users": users}))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    #[serde(default)]
+    zone_prefixes: Vec<String>,
+    #[serde(default)]
+    admin: bool,
+}
+
+/// POST /api/users — admin only: create user. Returns the new API key once.
+async fn create_user_handler(
+    State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+    ApiJson(body): ApiJson<CreateUserRequest>,
+) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
+    let Some(ref reg) = s.user_registry else {
+        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
+    };
+    if body.username.trim().is_empty() || body.username.len() > 64 {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_USERNAME"}))).into_response();
+    }
+    match reg.create_user(body.username, body.zone_prefixes, body.admin) {
+        Ok(u) => {
+            info!(id = %u.id, username = %u.username, "User created");
+            (StatusCode::CREATED, JsonExtract(serde_json::json!({
+                "id": u.id,
+                "username": u.username,
+                "api_key": u.api_key,
+                "zone_prefixes": u.zone_prefixes,
+                "enabled": u.enabled,
+                "admin": u.admin,
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::CONFLICT, JsonExtract(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// DELETE /api/users/:id — admin only.
+async fn delete_user_handler(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
+    let Some(ref reg) = s.user_registry else {
+        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
+    };
+    if reg.delete_user(&id) {
+        info!(id = %id, "User deleted");
+        (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok"}))).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"NOT_FOUND"}))).into_response()
+    }
+}
+
+/// GET /api/users/me — authenticated user (admin or regular).
+async fn get_me_handler(
+    State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    // For admin context (master key), return basic info without zone_prefixes.
+    if caller.id == "admin" {
+        return (StatusCode::OK, JsonExtract(serde_json::json!({
+            "id": "admin",
+            "username": "admin",
+            "admin": true,
+            "zone_prefixes": [],
+        }))).into_response();
+    }
+    // For user key, return full profile.
+    if let Some(ref reg) = s.user_registry {
+        if let Some(u) = reg.by_id(&caller.id) {
+            return (StatusCode::OK, JsonExtract(serde_json::json!({
+                "id": u.id,
+                "username": u.username,
+                "admin": u.admin,
+                "zone_prefixes": u.zone_prefixes,
+            }))).into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"NOT_FOUND"}))).into_response()
+}
+
+/// POST /api/users/:id/rotate-key — admin or self: generate new API key.
+async fn rotate_user_key_handler(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin && caller.id != id {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
+    let Some(ref reg) = s.user_registry else {
+        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
+    };
+    match reg.rotate_key(&id) {
+        Some(new_key) => {
+            info!(id = %id, "User API key rotated");
+            (StatusCode::OK, JsonExtract(serde_json::json!({"api_key": new_key}))).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"NOT_FOUND"}))).into_response(),
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3448,6 +3596,7 @@ mod tests {
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
+            user_registry: None,
         };
         router(state)
     }
@@ -5610,6 +5759,7 @@ mod tests {
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
+            user_registry: None,
         };
         let app = router(state);
 

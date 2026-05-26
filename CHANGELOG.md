@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.51] -- 2026-05-26
+
+### Added
+
+- **Multi-user mode**: Per-user API keys, zone ownership isolation, and user management REST API.
+  - New module `src/multiuser/`: `UserAccount`, `UserRegistry` (DashMap-backed, persisted to `users.json`), `RequestUser` extension injected by auth middleware.
+  - Users have `zone_prefixes` -- they can only read/write DNS entries and blacklist entries whose name falls under one of their prefixes. Admins have unrestricted access.
+  - `DnsEntry`, `BlacklistEntry`, `Feed` structs carry an optional `owner_user_id` field (backward-compatible: existing data treated as admin-owned).
+  - New routes: `GET /api/users`, `POST /api/users`, `DELETE /api/users/:id`, `GET /api/users/me`, `POST /api/users/:id/rotate-key`.
+  - Auth middleware accepts both the master API key (admin context) and per-user keys (user context injected via axum Extension).
+  - Single-user mode preserved: if `users.json` is absent, multi-user registry is not loaded and behaviour is unchanged.
+
+---
+
 ## [0.9.50] -- 2026-05-26
 
 ### Security
