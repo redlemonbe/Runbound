@@ -924,39 +924,63 @@ fn answer_from_cache(
 
     let qid = [query_bytes[0], query_bytes[1]];
 
-    // ── Walk QNAME (wire-format length-prefixed labels) ───────────────────
-    // Builds a wire-format key identical to what the cache inserter produces:
-    // length bytes copied as-is; label content bytes ASCII-lowercased.
-    // Compression pointers (top 2 bits = 11) are rejected — they never appear
-    // in client queries, only in responses.
-    let mut name_buf: SmallVec<[u8; 64]> = SmallVec::new();
-    let mut pos = 12usize;
-    loop {
-        if pos >= query_bytes.len() {
+    // ── Parse QNAME — bulk SIMD pass (#152) ─────────────────────────────────
+    // Key insight: label length bytes are always 0x00–0x3F, which is below 'A'
+    // (0x41). The SIMD lowercase operation only modifies bytes in [0x41, 0x5A].
+    // Therefore we can lowercase the ENTIRE QNAME wire encoding in one SIMD
+    // call — length bytes and the root \x00 are untouched — then validate
+    // compression pointers on the result (already in L1 cache).
+    //
+    // Old approach: N copy_lowercase_label calls (one per label) + N bounds checks.
+    // New approach: 1 find_zero (SIMD \0 scan) + 1 copy_lowercase_label + 1 local walk.
+    let qname_region = &query_bytes[12..];
+    let zero_pos = match crate::dns::simd::find_zero(qname_region) {
+        Some(p) => p,
+        None => {
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return None;
         }
-        let label_len = query_bytes[pos] as usize;
-        // Compression pointer — must not appear in a query; bail out.
-        if label_len & 0xC0 == 0xC0 {
-            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
-        name_buf.push(query_bytes[pos]); // length byte — copy verbatim
-        pos += 1;
-        if label_len == 0 {
-            break;
-        } // root label = QNAME end
-        if pos + label_len > query_bytes.len() {
-            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
-        crate::dns::simd::copy_lowercase_label(&mut name_buf, &query_bytes[pos..pos + label_len]);
-        pos += label_len;
+    };
+    // qname_wire_len includes the terminating \x00 byte.
+    let qname_wire_len = zero_pos + 1;
+    // Packet must contain QTYPE(2) + QCLASS(2) after the QNAME.
+    if 12 + qname_wire_len + 4 > query_bytes.len() {
+        crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
     }
+
+    // Bulk lowercase: one SIMD call covering all labels + length bytes + root.
+    let mut name_buf: SmallVec<[u8; 64]> = SmallVec::new();
+    crate::dns::simd::copy_lowercase_label(&mut name_buf, &qname_region[..qname_wire_len]);
+
+    // Validate label structure on local (L1-cached) name_buf: no compression
+    // pointers (0xC0+), labels within bounds, proper termination.
+    let mut vpos = 0usize;
+    loop {
+        if vpos >= name_buf.len() {
+            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        let lb = name_buf[vpos];
+        if lb & 0xC0 == 0xC0 {
+            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        if lb == 0 {
+            break;
+        }
+        vpos += 1 + lb as usize;
+        if vpos >= name_buf.len() {
+            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+    }
+    let pos = 12 + qname_wire_len;
 
     // QTYPE(2) + QCLASS(2) follow the QNAME.
     if query_bytes.len() < pos + 4 {

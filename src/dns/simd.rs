@@ -310,6 +310,93 @@ unsafe fn bytes_eq_avx2(a: &[u8], b: &[u8]) -> bool {
 }
 
 
+/// Find the position of the first 0x00 byte in `bytes` (up to 255 bytes).
+/// Returns `None` if no zero is found within that range.
+/// Used by the XDP QNAME parser to determine wire length before bulk lowercasing.
+#[inline]
+pub fn find_zero(bytes: &[u8]) -> Option<usize> {
+    let limit = bytes.len().min(255);
+    #[cfg(target_arch = "x86_64")]
+    {
+        return unsafe { find_zero_sse2(bytes, limit) };
+    }
+    #[allow(unreachable_code)]
+    bytes[..limit].iter().position(|&b| b == 0)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn find_zero_sse2(bytes: &[u8], limit: usize) -> Option<usize> {
+    use std::arch::x86_64::_mm_setzero_si128;
+
+    let zero16 = _mm_setzero_si128();
+    let mut pos = 0usize;
+
+    while pos + 16 <= limit {
+        let mask: u32;
+        core::arch::asm!(
+            "movdqu {v}, [{ptr}]",
+            "pcmpeqb {v}, {zero}",
+            "pmovmskb {mask:e}, {v}",
+            ptr  = in(reg)      bytes.as_ptr().add(pos),
+            zero = in(xmm_reg)  zero16,
+            v    = out(xmm_reg) _,
+            mask = out(reg)     mask,
+            options(nostack, nomem),
+        );
+        if mask != 0 {
+            return Some(pos + mask.trailing_zeros() as usize);
+        }
+        pos += 16;
+    }
+
+    while pos < limit {
+        if *bytes.as_ptr().add(pos) == 0 {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod find_zero_tests {
+    use super::*;
+
+    #[test]
+    fn find_zero_empty() {
+        assert_eq!(find_zero(b""), None);
+    }
+
+    #[test]
+    fn find_zero_not_found() {
+        let v: Vec<u8> = (1u8..=32).collect();
+        assert_eq!(find_zero(&v), None);
+    }
+
+    #[test]
+    fn find_zero_at_each_position() {
+        for pos in 0..64usize {
+            let mut v: Vec<u8> = (1u8..=100).take(64).collect();
+            v[pos] = 0;
+            assert_eq!(find_zero(&v), Some(pos), "failed at pos={pos}");
+        }
+    }
+
+    #[test]
+    fn find_zero_qname_example() {
+        // wire: \x07example\x03com\x00
+        let wire = b"\x07example\x03com\x00";
+        assert_eq!(find_zero(wire), Some(12)); // \x00 is at index 12
+    }
+
+    #[test]
+    fn find_zero_first_wins() {
+        let wire = b"\x03abc\x00\x00extra";
+        assert_eq!(find_zero(wire), Some(4)); // first \x00
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
