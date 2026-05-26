@@ -181,6 +181,8 @@ pub struct RunboundHandler {
     /// SEC-20: pre-decoded TSIG keys (name_lower, algorithm, key_bytes) — decoded once at startup.
     tsig_keys: Vec<(String, TsigAlgorithm, Vec<u8>)>,
     axfr_allow: Vec<String>,
+    /// #10: compiled split-horizon entries — (CidrBlock list, per-subnet LocalZoneSet).
+    split_horizon: Vec<(Vec<super::acl::CidrBlock>, std::sync::Arc<LocalZoneSet>)>,
 }
 
 impl RunboundHandler {
@@ -218,6 +220,7 @@ impl RunboundHandler {
         tsig_keys_raw: Vec<(String, String, String)>,
         alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
         axfr_allow: Vec<String>,
+        split_horizon: Vec<(Vec<super::acl::CidrBlock>, std::sync::Arc<LocalZoneSet>)>,
     ) -> Self {
         Self {
             zones,
@@ -253,6 +256,7 @@ impl RunboundHandler {
             allow_update,
             block_https_record,
 
+            split_horizon,
             // SEC-20: decode TSIG keys once at startup instead of per-request.
             tsig_keys: tsig_keys_raw.into_iter().filter_map(|(name, alg_str, secret_b64)| {
                 let alg = match alg_str.as_str() {
@@ -341,7 +345,8 @@ impl RunboundHandler {
     /// Attempt to answer from local zones (blacklist, static data, CNAME chains).
     /// Returns `Ok(info)` when a response was sent; `Err(rh)` when no local match
     /// was found and the query should fall through to recursive resolution.
-    async fn handle_local_zone<R: ResponseHandler>(
+    /// Core zone lookup logic. Accepts an explicit zone set (for split-horizon or global use).
+    async fn handle_zone_set<R: ResponseHandler>(
         &self,
         request: &Request,
         mut response_handle: R,
@@ -349,8 +354,8 @@ impl RunboundHandler {
         qtype: RecordType,
         client_ip: IpAddr,
         start: Instant,
+        zones_snap: &LocalZoneSet,
     ) -> Result<ResponseInfo, R> {
-        let zones_snap = self.zones.load();
         let zone_action = zones_snap.find(qname);
 
         match zone_action {
@@ -506,6 +511,20 @@ impl RunboundHandler {
         }
         // Reached only via the None arm — response_handle was not consumed.
         Err(response_handle)
+    }
+
+    /// Global local-zone lookup (delegates to handle_zone_set with self.zones).
+    async fn handle_local_zone<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: R,
+        qname: &LowerName,
+        qtype: RecordType,
+        client_ip: IpAddr,
+        start: Instant,
+    ) -> Result<ResponseInfo, R> {
+        let zones_guard = self.zones.load();
+        self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, &zones_guard).await
     }
 
     /// Recursive upstream resolution with DNSSEC validation and rebinding protection.
@@ -1068,6 +1087,21 @@ impl RequestHandler for RunboundHandler {
         }
 
         debug!(%client_ip, name=%sanitize_dns_name(qname), type=%qtype, "DNS query");
+
+        // ── 3e. Split-horizon DNS (#10) — per-subnet zone overrides ───────
+        // Find first split-horizon entry whose subnets contain client_ip.
+        // If the query name resolves in that zone, answer immediately.
+        // If no match (None zone action), fall through to global zones.
+        let response_handle = if let Some((_, sh_zones)) = self.split_horizon.iter().find(|(subnets, _)| {
+            subnets.iter().any(|cb| cb.contains(client_ip))
+        }) {
+            match self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, sh_zones).await {
+                Ok(info) => return info,
+                Err(rh) => rh,
+            }
+        } else {
+            response_handle
+        };
 
         // ── 4. Local zones ──────────────────────────────────────────────
         let response_handle = match self
@@ -2220,6 +2254,21 @@ pub async fn run_dns_server(
         cfg.tsig_keys.clone(),
         Some(Arc::clone(&alert_tracker)),
         cfg.axfr_allow.clone(),
+        {
+            // #10: compile split-horizon entries — parse subnets + build LocalZoneSets
+            cfg.split_horizon.iter().filter_map(|entry| {
+                let subnets: Vec<super::acl::CidrBlock> = entry.subnets.iter()
+                    .filter_map(|s| super::acl::CidrBlock::parse(s.trim()))
+                    .collect();
+                if subnets.is_empty() {
+                    warn!(name=%entry.name, "split-horizon: no valid subnets — entry skipped");
+                    return None;
+                }
+                let zones = LocalZoneSet::from_config(&[], &entry.local_data);
+                info!(name=%entry.name, subnets=%entry.subnets.len(), records=%entry.local_data.len(), "split-horizon zone loaded");
+                Some((subnets, std::sync::Arc::new(zones)))
+            }).collect()
+        },
     );
     let mut server = Server::new(handler);
 

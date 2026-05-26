@@ -30,13 +30,13 @@ pub enum AclAction {
     Refuse,
 }
 
-struct CidrBlock {
+pub(crate) struct CidrBlock {
     prefix: IpAddr,
     prefix_len: u8,
 }
 
 impl CidrBlock {
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         let (ip_str, prefix_len) = if let Some(pos) = s.find('/') {
             let len: u8 = s[pos + 1..].parse().ok()?;
             (&s[..pos], len)
@@ -53,7 +53,7 @@ impl CidrBlock {
     }
 
     #[inline]
-    fn contains(&self, ip: IpAddr) -> bool {
+    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         match (self.prefix, ip) {
             (IpAddr::V4(net), IpAddr::V4(addr)) => {
                 if self.prefix_len == 0 {
