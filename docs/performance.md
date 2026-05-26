@@ -5,6 +5,7 @@ Benchmark reports are stored in [`docs/bench-runs/`](bench-runs/).
 | Run | Version | Author | Hardware | Report |
 |-----|---------|--------|----------|--------|
 | 2026-05-26 | v0.9.45 | Agent (Claude Sonnet 4.6) | Xeon E5-2690 v2 / Threadripper PRO 5995WX | [v0.9.45_userspace.md](bench-runs/agent/v0.9.45_userspace.md) |
+| 2026-05-26 | v0.9.45 | Agent (Claude Sonnet 4.6) | Threadripper PRO 5995WX (server) / Xeon E5-2690 v2 (client) | [v0.9.45_threadripper_server.md](bench-runs/agent/v0.9.45_threadripper_server.md) |
 
 ## Methodology
 
