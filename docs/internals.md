@@ -1,7 +1,7 @@
 # Runbound Internals — Packet Lifecycle & Architecture
 
 Audience: kernel/network engineers, performance analysts, contributors.  
-Version: v0.9.46. Planned items are marked **[planned]**.
+Version: v0.9.49.
 
 ---
 
@@ -504,7 +504,7 @@ With 8 XDP workers and 95% cache hit rate (typical for a resolver with hot domai
 8 × 1 M × 0.95 = 7.6 M QPS   (theoretical)
 ```
 
-With wire format cache (#64, planned):
+With wire format cache (#64, v0.6.8, implemented):
 
 ```
 8 × 3.3 M × 0.95 = 25 M QPS   (theoretical)
@@ -514,19 +514,27 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 
 ---
 
-## 8. Planned optimisations
+## 8. Roadmap
 
-### #65 — io_uring slow path
+### Implemented — v0.9.46 (asm-hotpath)
 
-Replace `recvmsg`/`sendmsg` syscalls on the Tokio UDP path with `io_uring` submission queues. Reduces syscall overhead on the slow path. Useful when XDP is unavailable (containers, cloud VMs).
+| Feature | Issue | Location |
+|---------|-------|----------|
+| CRC32c SSE4.2 domain hashing | #72 | `src/dns/hasher.rs` |
+| SSE2 label lowercasing (16 bytes/iter) | #151 | `src/dns/simd.rs`, `src/dns/xdp/worker.rs` |
+| AVX2 label lowercasing (32 bytes/iter) | #151 | `src/dns/simd.rs` |
+| SSE2 `QuestionKey` equality (`pcmpeqb`+`pmovmskb`) | #151 | `src/dns/simd.rs` |
+| Bulk SIMD QNAME 1-pass parse | #152 | `src/dns/simd.rs` |
+| CPU feature OnceLock dispatch (SimdLevel) | #152 | `src/cpu.rs` |
 
-### #29 — rkyv zero-copy cache persistence
+### Planned — v1.0
 
-Replace `bincode` serialization with `rkyv` zero-copy deserialization for the on-disk cache snapshot. Target: < 5 ms restart with 1 M cache entries (currently ~800 ms with bincode).
-
-### DNSSEC (v1.x)
-
-Full recursive DNSSEC validation — chain of trust from root, NSEC/NSEC3 negative proof, DS/DNSKEY management. Not a patch — a full resolver mode. Planned for v1.x after the XDP optimisation work is complete.
+| Feature | Issue | Notes |
+|---------|-------|-------|
+| io_uring slow path | #65 | Replace recvmsg/sendmsg on Tokio UDP path with io_uring SQEs. Useful for containers/cloud VMs without XDP. |
+| rkyv zero-copy cache persistence | #29 | Replace bincode with rkyv. Target: < 5 ms restart with 1M entries. |
+| DNSSEC full validation | #34 | Chain of trust from root, NSEC/NSEC3, DS/DNSKEY. Full resolver mode — not a patch. |
+| eBPF XDP program in Rust (aya-bpf) | — | Rewrite `ebpf/dns_xdp.c` in Rust using `aya-bpf` crate. Eliminates clang build dependency. |
 
 ---
 
