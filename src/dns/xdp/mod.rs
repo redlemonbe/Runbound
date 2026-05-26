@@ -76,6 +76,7 @@
 // worker.rs:328     — slice::from_raw_parts{_mut} for RX/TX frames: bounds-checked above the block
 // worker.rs:385     — libc::sendto(null, 0, MSG_DONTWAIT) to kick TX driver (hot loop)
 
+pub mod blacklist;
 pub mod socket;
 pub mod umem;
 
