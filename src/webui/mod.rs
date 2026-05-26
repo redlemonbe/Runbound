@@ -66,6 +66,11 @@ pub struct WebUiState {
     burst_tracker: Arc<DashMap<IpAddr, (u64, Instant), ahash::RandomState>>,
     /// True when the WebUI is serving TLS directly (not behind a reverse proxy).
     tls_enabled: bool,
+    // ── White-label branding (#25) ─────────────────────────────────────────────
+    pub brand_name: String,
+    pub brand_logo_url: String,
+    pub accent_color: String,
+    pub favicon_url: String,
 }
 
 struct WebUiCred {
@@ -84,6 +89,10 @@ pub fn router(
     bot_ban_duration_secs: u64,
     bot_honeypot_enabled: bool,
     tls_enabled: bool,
+    brand_name: String,
+    brand_logo_url: String,
+    accent_color: String,
+    favicon_url: String,
 ) -> Router {
     let auth_path = base_dir.join(CRED_FILE);
     let creds = load_or_default_creds(&auth_path);
@@ -107,6 +116,10 @@ pub fn router(
         bot_honeypot_enabled,
         burst_tracker: Arc::new(DashMap::with_hasher(ahash::RandomState::default())),
         tls_enabled,
+        brand_name,
+        brand_logo_url,
+        accent_color,
+        favicon_url,
     });
     // SEC-B10: periodic cleanup of expired sessions (every 5 minutes).
     {
@@ -135,6 +148,7 @@ pub fn router(
         .route("/api/webui/auth-events", get(auth_events_handler))
         .route("/webui/ca.crt", get(serve_ca_cert))
         .route("/webui/security-audit", get(serve_security_audit))
+        .route("/webui/branding", get(serve_branding))
         .route("/api",       any(proxy_api))
         .route("/api/*path", any(proxy_api))
         // Bot defense: scanner trap routes
@@ -1001,3 +1015,26 @@ mod tests {
         assert!(loc.contains("/login") && loc.contains("err="), "expected redirect to /login?err=...");
     }
 }
+
+async fn serve_branding(
+    State(state): State<Arc<WebUiState>>,
+    req: Request<Body>,
+) -> Response {
+    if !is_authenticated(&state, req.headers()) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    let body = format!(
+        r#"{{"brand_name":{},"brand_logo_url":{},"accent_color":{},"favicon_url":{}}}"#,
+        serde_json::to_string(&state.brand_name).unwrap_or_default(),
+        serde_json::to_string(&state.brand_logo_url).unwrap_or_default(),
+        serde_json::to_string(&state.accent_color).unwrap_or_default(),
+        serde_json::to_string(&state.favicon_url).unwrap_or_default(),
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response())
+}
+
