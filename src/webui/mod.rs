@@ -64,6 +64,8 @@ pub struct WebUiState {
     pub bot_honeypot_enabled: bool,
     /// Per-IP bad-request burst tracker: (count, window_start).
     burst_tracker: Arc<DashMap<IpAddr, (u64, Instant), ahash::RandomState>>,
+    /// True when the WebUI is serving TLS directly (not behind a reverse proxy).
+    tls_enabled: bool,
 }
 
 struct WebUiCred {
@@ -81,6 +83,7 @@ pub fn router(
     sync_journal: Option<Arc<SyncJournal>>,
     bot_ban_duration_secs: u64,
     bot_honeypot_enabled: bool,
+    tls_enabled: bool,
 ) -> Router {
     let auth_path = base_dir.join(CRED_FILE);
     let creds = load_or_default_creds(&auth_path);
@@ -103,6 +106,7 @@ pub fn router(
         bot_ban_duration_secs,
         bot_honeypot_enabled,
         burst_tracker: Arc::new(DashMap::with_hasher(ahash::RandomState::default())),
+        tls_enabled,
     });
     // SEC-B10: periodic cleanup of expired sessions (every 5 minutes).
     {
@@ -530,11 +534,12 @@ async fn handle_login(
     state.sessions.insert(token.clone(), (Instant::now() + SESSION_TTL, csrf_token.clone()));
     tracing::info!(user = %form.rb_user, ip = %client_ip, "WebUI login successful");
     push_auth_event(&state, "login_ok", &form.rb_user, &client_ip);
-    // SEC-A2: add Secure flag when behind an HTTPS reverse proxy.
-    let secure = headers.get("x-forwarded-proto")
+    // SEC-A2: add Secure flag when TLS is active (direct or via reverse proxy).
+    let forwarded_https = headers.get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("https"))
         .unwrap_or(false);
+    let secure = state.tls_enabled || forwarded_https;
     let secure_attr = if secure { "; Secure" } else { "" };
     let cookie_session = format!(
         "rb_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure_attr}",
@@ -961,6 +966,7 @@ mod tests {
             None,
             86400,
             false,
+            false, // tls_enabled: tests use HTTP
         )
     }
 
