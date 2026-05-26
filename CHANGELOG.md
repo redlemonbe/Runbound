@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.58] — 2026-05-26
+
+### Added
+
+- **Webhook notifications** (#11): multi-target webhook system for system event alerts.
+  - 4 formats: Slack (blocks API), Discord (embeds + color), ntfy (Priority/Tags headers), GenericJson
+  - Per-target event filtering: , , , , , , , 
+  - Retry: 3 attempts with exponential backoff (1s, 2s); rejects private/loopback URLs
+  - Config directives: , , , 
+  -  — fire a test notification to all configured targets
+  -  event auto-fires on successful 
+
+---
+
 ## [0.9.57] — 2026-05-26
 
 ### Added
