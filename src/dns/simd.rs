@@ -342,7 +342,7 @@ unsafe fn find_zero_sse2(bytes: &[u8], limit: usize) -> Option<usize> {
             zero = in(xmm_reg)  zero16,
             v    = out(xmm_reg) _,
             mask = out(reg)     mask,
-            options(nostack, nomem),
+            options(nostack),
         );
         if mask != 0 {
             return Some(pos + mask.trailing_zeros() as usize);
