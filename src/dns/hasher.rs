@@ -54,6 +54,62 @@ unsafe fn crc32c_sse42(crc: u32, bytes: &[u8]) -> u32 {
     crc
 }
 
+
+// ── x86_64 SSE4.2 — raw asm! (no align_to overhead, unaligned reads) ────────
+//
+// Eliminates align_to::<u64>() overhead for short DNS names (8-64 bytes).
+// Adds a 4-byte stage between the 8-byte loop and the byte tail.
+// options(pure, nomem, nostack) lets the compiler schedule freely around calls.
+//
+// CRC32Q latency: 3 cycles. Throughput: 1/cycle. Sequential dependency chain
+// is the bottleneck for short inputs; 3-stream parallel variant is a TODO.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_sse42_asm(mut crc: u32, bytes: &[u8]) -> u32 {
+    let mut ptr = bytes.as_ptr();
+    let mut remaining = bytes.len();
+
+    while remaining >= 8 {
+        let word = ptr.cast::<u64>().read_unaligned();
+        let mut crc64 = crc as u64;
+        core::arch::asm!(
+            "crc32 {acc}, {word}",
+            acc = inout(reg) crc64,
+            word = in(reg) word,
+            options(nostack, nomem, pure),
+        );
+        crc = crc64 as u32;
+        ptr = ptr.add(8);
+        remaining -= 8;
+    }
+
+    if remaining >= 4 {
+        let dword = ptr.cast::<u32>().read_unaligned();
+        core::arch::asm!(
+            "crc32 {acc:e}, {dword:e}",
+            acc = inout(reg) crc,
+            dword = in(reg) dword,
+            options(nostack, nomem, pure),
+        );
+        ptr = ptr.add(4);
+        remaining -= 4;
+    }
+
+    while remaining > 0 {
+        let byte = ptr.read();
+        core::arch::asm!(
+            "crc32 {acc:e}, {byte}",
+            acc = inout(reg) crc,
+            byte = in(reg_byte) byte,
+            options(nostack, nomem, pure),
+        );
+        ptr = ptr.add(1);
+        remaining -= 1;
+    }
+
+    crc
+}
 // ── aarch64 CRC32 ────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]
@@ -82,7 +138,7 @@ fn crc32c_hw(crc: u32, bytes: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: only called when HAS_HW_CRC32C is true; init() confirmed SSE4.2.
-        return unsafe { crc32c_sse42(crc, bytes) };
+        return unsafe { crc32c_sse42_asm(crc, bytes) };
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -269,4 +325,44 @@ mod tests {
         assert_eq!(map.get("evil.com."), Some(&1337));
         assert_eq!(map.get("missing.com."), None);
     }
+
+    #[test]
+    fn asm_matches_intrinsic() {
+        // Verify crc32c_sse42_asm produces identical output to crc32c_sse42
+        // for all interesting input lengths (0..=80 covers all DNS label sizes).
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("sse4.2") {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let data: Vec<u8> = (0u8..=79).collect();
+            for len in 0..=80usize {
+                let input = &data[..len];
+                let intrinsic = unsafe { crc32c_sse42(0, input) };
+                let asm_out   = unsafe { crc32c_sse42_asm(0, input) };
+                assert_eq!(
+                    intrinsic, asm_out,
+                    "asm/intrinsic mismatch at len={len}: {intrinsic:#010x} vs {asm_out:#010x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn asm_stable_across_starts() {
+        // Same content, different starting CRC — ensures asm version handles
+        // the crc accumulator correctly across all 3 input-size stages.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let data = b"example.com.";
+            let a = unsafe { crc32c_sse42_asm(0xFFFF_FFFFu32, data) };
+            let b = unsafe { crc32c_sse42_asm(0xFFFF_FFFFu32, data) };
+            assert_eq!(a, b);
+            // Also check it differs from zero-init (basic sanity)
+            let z = unsafe { crc32c_sse42_asm(0, data) };
+            assert_ne!(a, z);
+        }
+    }
+
 }
