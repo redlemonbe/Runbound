@@ -663,6 +663,10 @@ pub fn router(state: AppState) -> Router {
         .route("/users/me", get(get_me_handler))
         .route("/users/:id", delete(delete_user_handler))
         .route("/users/:id/rotate-key", post(rotate_user_key_handler))
+        // Backup & restore
+        .route("/backup", get(list_backups_handler).post(backup_handler))
+        .route("/backup/restore", post(restore_handler))
+        .route("/backup/:id", delete(delete_backup_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             slave_guard_middleware,
@@ -729,6 +733,10 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/api/audit/tail",       "description":"Last N audit log entries — ?n=100"},
             {"method":"GET",    "path":"/api/metrics",          "description":"Prometheus/OpenMetrics exposition (text/plain; version=0.0.4)"},
             {"method":"POST",   "path":"/api/rotate-key",       "description":"Atomically rotate API key — reads new key from RUNBOUND_API_KEY env var"},
+            {"method":"POST",   "path":"/api/backup",            "description":"Snapshot config + DNS entries + blacklist + feeds to base_dir/backups/"},
+            {"method":"GET",    "path":"/api/backup",            "description":"List available backup snapshots"},
+            {"method":"POST",   "path":"/api/backup/restore",    "description":"Restore a snapshot by id (triggers hot-reload)"},
+            {"method":"DELETE", "path":"/api/backup/:id",        "description":"Delete a backup snapshot"},
         ]
     }))
 }
@@ -6197,5 +6205,156 @@ async fn delete_blocked_ip(
             (StatusCode::OK, JsonExtract(serde_json::json!({"unblocked": removed, "ip": ip_str}))).into_response()
         }
         Err(_) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error": "invalid IP"}))).into_response(),
+    }
+}
+
+// ── Backup / Restore ─────────────────────────────────────────────────────────
+
+fn runbound_backup_dir(s: &AppState) -> std::path::PathBuf {
+    s.base_dir.join("backups")
+}
+
+async fn backup_handler(
+    State(s): State<AppState>,
+    body: axum::extract::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let label = body.get("label")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= 32
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or("")
+        .to_owned();
+
+    let dir_name = if label.is_empty() {
+        format!("backup_{ts}")
+    } else {
+        format!("backup_{ts}_{label}")
+    };
+
+    let bdir = runbound_backup_dir(&s).join(&dir_name);
+    if let Err(e) = std::fs::create_dir_all(&bdir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({"error": format!("cannot create backup dir: {e}")}))).into_response();
+    }
+
+    // Config file
+    if let Err(e) = std::fs::copy(&s.cfg_path, bdir.join("runbound.conf")) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({"error": format!("config copy failed: {e}")}))).into_response();
+    }
+
+    // Data files from base_dir
+    for fname in &["dns_entries.json", "blacklist.json", "feeds.json", "upstreams.json"] {
+        let src = s.base_dir.join(fname);
+        if src.exists() {
+            let _ = std::fs::copy(&src, bdir.join(fname));
+        }
+    }
+
+    (StatusCode::OK, JsonExtract(serde_json::json!({
+        "id": dir_name,
+        "ts": ts,
+    }))).into_response()
+}
+
+async fn list_backups_handler(
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let bdir = runbound_backup_dir(&s);
+    let entries = match std::fs::read_dir(&bdir) {
+        Ok(e) => e,
+        Err(_) => return (StatusCode::OK, JsonExtract(serde_json::json!([]))).into_response(),
+    };
+
+    let mut items: Vec<serde_json::Value> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.metadata().map(|m| m.is_dir()).unwrap_or(false))
+        .filter(|e| e.file_name().to_string_lossy().starts_with("backup_"))
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let ts = e.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let files: Vec<String> = std::fs::read_dir(e.path())
+                .map(|rd| rd.filter_map(|f| f.ok())
+                    .map(|f| f.file_name().to_string_lossy().to_string())
+                    .collect())
+                .unwrap_or_default();
+            serde_json::json!({"id": name, "ts": ts, "files": files})
+        })
+        .collect();
+
+    items.sort_by_key(|v| v["id"].as_str().unwrap_or("").to_owned());
+    (StatusCode::OK, JsonExtract(serde_json::json!(items))).into_response()
+}
+
+async fn restore_handler(
+    State(s): State<AppState>,
+    body: axum::extract::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let id = match body.get("id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_owned(),
+        None => return (StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error": "Missing id field"}))).into_response(),
+    };
+
+    if id.contains('/') || id.contains("..") || !id.starts_with("backup_") {
+        return (StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error": "Invalid backup id"}))).into_response();
+    }
+
+    let bdir = runbound_backup_dir(&s).join(&id);
+    if !bdir.exists() {
+        return (StatusCode::NOT_FOUND,
+            JsonExtract(serde_json::json!({"error": "Backup not found"}))).into_response();
+    }
+
+    // Restore config
+    if let Err(e) = std::fs::copy(bdir.join("runbound.conf"), &s.cfg_path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({"error": format!("config restore failed: {e}")}))).into_response();
+    }
+
+    // Restore data files
+    for fname in &["dns_entries.json", "blacklist.json", "feeds.json", "upstreams.json"] {
+        let src = bdir.join(fname);
+        if src.exists() {
+            let _ = std::fs::copy(&src, s.base_dir.join(fname));
+        }
+    }
+
+    // Trigger hot-reload to pick up restored config
+    match crate::config::load(&s.cfg_path) {
+        Ok(_) => { tracing::info!(backup_id = %id, "backup restored, hot-reload triggered"); }
+        Err(e) => { tracing::warn!("restored config but reload failed: {e}"); }
+    }
+
+    (StatusCode::OK, JsonExtract(serde_json::json!({
+        "ok": true,
+        "restored": id,
+    }))).into_response()
+}
+
+async fn delete_backup_handler(
+    State(s): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if id.contains('/') || id.contains("..") || !id.starts_with("backup_") {
+        return (StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error": "Invalid backup id"}))).into_response();
+    }
+    let bdir = runbound_backup_dir(&s).join(&id);
+    match std::fs::remove_dir_all(&bdir) {
+        Ok(_) => (StatusCode::OK, JsonExtract(serde_json::json!({"ok": true, "deleted": id}))).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error": "Backup not found"}))).into_response(),
     }
 }
