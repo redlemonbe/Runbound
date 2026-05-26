@@ -320,6 +320,9 @@ pub struct AppState {
     pub dnssec_enabled: Arc<AtomicBool>,
     /// Multi-user registry (None = single-user mode, only master API key works).
     pub user_registry: Option<Arc<crate::multiuser::UserRegistry>>,
+    /// #153: Channel to send the current blacklist domain list to the XDP poll task
+    /// for fast-path NXDOMAIN blocking. None when XDP is disabled.
+    pub blacklist_reload_tx: Option<tokio::sync::mpsc::Sender<Vec<String>>>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -1806,6 +1809,13 @@ async fn add_blacklist_handler(
     };
 
     info!(domain=%req.domain, action=?req.action, "Blacklist entry added");
+    // #153: push updated blacklist to XDP fast path
+    if let Some(ref tx) = s.blacklist_reload_tx {
+        if let Ok(bl) = store::load_blacklist() {
+            let domains: Vec<String> = bl.entries.iter().map(|e| e.domain.clone()).collect();
+            let _ = tx.try_send(domains);
+        }
+    }
     s.audit.send(AuditEvent::BlacklistAdd {
         domain: entry.domain.clone(),
     });
@@ -1877,6 +1887,13 @@ async fn delete_blacklist_handler(
     s.zones.store(Arc::new(new_zones));
 
     info!(id=%id, domain=%removed.domain, "Blacklist entry deleted");
+    // #153: push updated blacklist to XDP fast path
+    if let Some(ref tx) = s.blacklist_reload_tx {
+        if let Ok(bl) = store::load_blacklist() {
+            let domains: Vec<String> = bl.entries.iter().map(|e| e.domain.clone()).collect();
+            let _ = tx.try_send(domains);
+        }
+    }
     s.audit.send(AuditEvent::BlacklistDelete { id: id.clone() });
     if let Some(ref j) = s.sync_journal {
         j.push(SyncOp::DeleteBlacklist { id: id.clone() });
@@ -3612,6 +3629,7 @@ mod tests {
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
             user_registry: None,
+            blacklist_reload_tx: None,
         };
         router(state)
     }
@@ -5775,6 +5793,7 @@ mod tests {
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
             user_registry: None,
+            blacklist_reload_tx: None,
         };
         let app = router(state);
 
