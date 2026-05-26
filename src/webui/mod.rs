@@ -967,6 +967,10 @@ mod tests {
             86400,
             false,
             false, // tls_enabled: tests use HTTP
+            "Runbound".to_string(),
+            String::new(),
+            "#22d3ee".to_string(),
+            String::new(),
         )
     }
 

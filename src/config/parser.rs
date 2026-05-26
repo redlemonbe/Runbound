@@ -86,6 +86,8 @@ pub struct UnboundConfig {
     pub rate_limit_prefix_v6: u8,
     /// REST API key. Overridden by RUNBOUND_API_KEY env var if both are set.
     pub api_key: Option<String>,
+    /// Static scoped API keys from api-key-extra blocks (#13).
+    pub extra_api_keys: Vec<ExtraApiKey>,
     /// REST API port. Default: 8081.
     pub api_port: Option<u16>,
     /// Maximum TTL cap for cached records (seconds). Default: 86400 (24 h).
@@ -344,6 +346,15 @@ pub struct UnboundConfig {
     pub webhooks: Vec<crate::webhooks::WebhookTarget>,
 }
 
+
+/// Statically-provisioned scoped API key from api-key-extra: config block (#13).
+#[derive(Debug, Clone, Default)]
+pub struct ExtraApiKey {
+    pub label: String,
+    pub key: String,
+    pub role: crate::multiuser::Role,
+}
+
 impl UnboundConfig {
     pub fn defaults() -> Self {
         Self {
@@ -429,6 +440,7 @@ pub fn parse_file(path: &str) -> Result<UnboundConfig> {
 pub fn parse_str(content: &str) -> Result<UnboundConfig> {
     let mut cfg = UnboundConfig::defaults();
     let mut current_forward: Option<ForwardZone> = None;
+    let mut current_extra_key: Option<ExtraApiKey> = None;
     let mut current_section = String::new();
 
     for (lineno, raw) in content.lines().enumerate() {
@@ -441,6 +453,11 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
         if line.ends_with(':') && !line.contains(' ') {
             if let Some(fwd) = current_forward.take() {
                 cfg.forward_zones.push(fwd);
+            }
+            if let Some(ek) = current_extra_key.take() {
+                if !ek.label.is_empty() && !ek.key.is_empty() {
+                    cfg.extra_api_keys.push(ek);
+                }
             }
             current_section = line.trim_end_matches(':').to_string();
             continue;
@@ -489,6 +506,33 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                     lineno + 1,
                     other
                 ),
+            },
+            "api-key-extra" => {
+                let ek = current_extra_key.get_or_insert_with(ExtraApiKey::default);
+                match key {
+                    "label" => ek.label = val.trim_matches('"').to_string(),
+                    "key" => {
+                        let raw = val.trim_matches('"');
+                        ek.key = if let Some(env_var) = raw.strip_prefix("env:") {
+                            std::env::var(env_var).unwrap_or_default()
+                        } else {
+                            raw.to_string()
+                        };
+                    }
+                    "role" => {
+                        ek.role = match val.trim_matches('"').to_lowercase().as_str() {
+                            "read"     => crate::multiuser::Role::Read,
+                            "dns"      => crate::multiuser::Role::Dns,
+                            "operator" => crate::multiuser::Role::Operator,
+                            "admin"    => crate::multiuser::Role::Admin,
+                            other => {
+                                warn!("Line {}: unknown role '{}' — defaulting to read", lineno + 1, other);
+                                crate::multiuser::Role::Read
+                            }
+                        };
+                    }
+                    other => warn!("Line {}: unknown api-key-extra directive '{}' — ignored", lineno + 1, other),
+                }
             },
             "io-uring" => {
                 match key {
@@ -571,6 +615,11 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
 
     if let Some(fwd) = current_forward {
         cfg.forward_zones.push(fwd);
+    }
+    if let Some(ek) = current_extra_key {
+        if !ek.label.is_empty() && !ek.key.is_empty() {
+            cfg.extra_api_keys.push(ek);
+        }
     }
 
     Ok(cfg)
