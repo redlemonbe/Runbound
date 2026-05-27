@@ -142,6 +142,8 @@ pub struct RunboundHandler {
     acl: Arc<Acl>,
     private_addrs: Arc<PrivateAddressSet>,
     cache_max_ttl: u32,
+    /// #164: minimum TTL floor — prevents clients from re-querying too aggressively.
+    cache_min_ttl: u32,
     pub stats: Arc<Stats>,
     pub log_buffer: SharedLogBuffer,
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
@@ -194,6 +196,7 @@ impl RunboundHandler {
         acl: Arc<Acl>,
         private_addrs: Arc<PrivateAddressSet>,
         cache_max_ttl: u32,
+        cache_min_ttl: u32,
         stats: Arc<Stats>,
         log_buffer: SharedLogBuffer,
         dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -232,6 +235,7 @@ impl RunboundHandler {
             acl,
             private_addrs,
             cache_max_ttl,
+            cache_min_ttl,
             stats,
             log_buffer,
             dnssec_enabled,
@@ -669,16 +673,18 @@ impl RunboundHandler {
                 }
 
                 let ttl_cap = self.cache_max_ttl;
-                let needs_cap = lookup.answers().iter().any(|r| r.ttl > ttl_cap);
+                let ttl_floor = self.cache_min_ttl;
+                let needs_cap = lookup.answers().iter().any(|r| r.ttl > ttl_cap || r.ttl < ttl_floor);
                 let capped: Vec<Record>;
                 let records: &[Record] = if needs_cap {
                     capped = lookup
                         .answers()
                         .iter()
                         .map(|r| {
-                            if r.ttl > ttl_cap {
+                            let new_ttl = r.ttl.max(ttl_floor).min(ttl_cap);
+                            if new_ttl != r.ttl {
                                 let mut rc = r.clone();
-                                rc.ttl = ttl_cap;
+                                rc.ttl = new_ttl;
                                 rc
                             } else {
                                 r.clone()
@@ -729,6 +735,7 @@ impl RunboundHandler {
                             .map(|r| r.ttl)
                             .min()
                             .unwrap_or(60)
+                            .max(self.cache_min_ttl)
                             .min(self.cache_max_ttl);
                         // Build wire-format name key
                         let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
@@ -2161,7 +2168,8 @@ pub async fn run_dns_server(
     }
 
     let cache_max_ttl = cfg.cache_max_ttl.unwrap_or(86400);
-    info!(cache_max_ttl, "TTL cap configured");
+    let cache_min_ttl = cfg.cache_min_ttl.unwrap_or(0);
+    info!(cache_max_ttl, cache_min_ttl, "TTL cap/floor configured");
 
     let private_addrs = Arc::new(PrivateAddressSet::from_config(&cfg.private_addresses));
     if !private_addrs.is_empty() {
@@ -2231,6 +2239,7 @@ pub async fn run_dns_server(
         acl,
         private_addrs,
         cache_max_ttl,
+        cache_min_ttl,
         stats,
         log_buffer,
         Arc::clone(&dnssec_enabled),

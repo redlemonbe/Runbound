@@ -94,6 +94,8 @@ pub struct UnboundConfig {
     pub api_port: Option<u16>,
     /// Maximum TTL cap for cached records (seconds). Default: 86400 (24 h).
     pub cache_max_ttl: Option<u32>,
+    /// #164: minimum TTL to advertise for cached answers (floor enforcement).
+    pub cache_min_ttl: Option<u32>,
     /// Minimum number of cache entries during memory pressure halvings. Default: 2048.
     /// The cache halving mechanism will never reduce the cache below this value.
     pub cache_min_entries: usize,
@@ -770,6 +772,7 @@ fn parse_server_directive(
         }
         "api-port" => cfg.api_port = val.parse().ok(),
         "cache-max-ttl" => cfg.cache_max_ttl = val.parse().ok(),
+        "cache-min-ttl" => cfg.cache_min_ttl = val.parse().ok(),
         "cache-min-entries" => cfg.cache_min_entries = val.parse::<usize>().unwrap_or(2048).max(1),
         "private-address" => {
             let cidr = val.trim_matches('"').trim().to_string();
