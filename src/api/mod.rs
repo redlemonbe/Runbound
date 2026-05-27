@@ -3240,6 +3240,18 @@ fn render_prometheus_metrics(
         ));
     }
 
+    // Per-record-type query counters (v0.9.65)
+    if !snap.qtype_stats.is_empty() {
+        out.push_str("# HELP runbound_queries_by_type_total DNS queries by record type\n");
+        out.push_str("# TYPE runbound_queries_by_type_total counter\n");
+        for (qtype, count) in &snap.qtype_stats {
+            out.push_str(&format!(
+                "runbound_queries_by_type_total{{type=\"{}\"}} {}\n",
+                qtype, count,
+            ));
+        }
+    }
+
     // Per-upstream metrics with labels — omit latency when not yet measured (null → skip, no NaN).
     if !upstreams.is_empty() {
         out.push_str(
