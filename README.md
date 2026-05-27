@@ -30,6 +30,12 @@ Most existing `unbound.conf` files work as-is. Non-standard or exotic directives
 | Embedded browser dashboard | ❌ | ❌ | ✅ no nginx needed |
 | Linear scaling (no lock contention) | ❌ | ❌ | ✅ |
 | Static binary, no dependencies | ❌ | ❌ | ✅ musl |
+| Split-horizon DNS (per-subnet answers) | ❌ | ⚠️ views | ✅ v0.9.63 |
+| RBAC (read/dns/operator/admin roles) | ❌ | ❌ | ✅ v0.9.62 |
+| Webhook notifications (Slack/Discord/ntfy) | ❌ | ❌ | ✅ v0.9.58 |
+| Multi-user API with zone isolation | ❌ | ❌ | ✅ v0.9.51 |
+| White-label UI branding | ❌ | ❌ | ✅ v0.9.61 |
+| Hot backup / restore | ❌ | ❌ | ✅ API |
 
 *¹ Runbound ships both REST API-driven replication and standard AXFR/IXFR zone transfers (RFC 5936, v0.9.13+). AXFR requires explicit ACL configuration — see [docs/configuration.md](docs/configuration.md).
 
