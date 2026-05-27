@@ -922,6 +922,7 @@ impl RequestHandler for RunboundHandler {
         let client_ip = info.src.ip();
 
         self.stats.inc_total();
+        self.stats.inc_qtype_raw(u16::from(qtype));
         self.domain_stats.inc(&qname.to_string());
 
         // ── 0b. AXFR/IXFR zone transfer dispatch (#22) ────────────────

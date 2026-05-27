@@ -1020,7 +1020,7 @@ fn answer_from_cache(
             tx_dns[1] = qid[1];
             crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(s) = stats { s.inc_total(); }
+            if let Some(s) = stats { s.inc_total(); s.inc_qtype_raw(qtype); }
             if let Some(ds) = domain_stats { ds.inc(&wire_qname_to_str(&key.name)); }
             return Some(wire.len());
         }
