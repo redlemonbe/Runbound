@@ -117,6 +117,10 @@ pub struct Stats {
     pub dot_reconnects_total: AtomicU64,
     /// ISO-8601 timestamp of the last successful resolver rebuild; None until first rebuild.
     pub last_reconnect_at: std::sync::Mutex<Option<String>>,
+    /// Per-DNS-record-type query counters. Index = type code 0–255.
+    pub qtype_counts: Vec<AtomicU64>,
+    /// Accumulates queries with record type > 255 (e.g. CAA=257).
+    pub qtype_high: AtomicU64,
 }
 
 impl Stats {
@@ -143,6 +147,8 @@ impl Stats {
             dnssec_insecure: AtomicU64::new(0),
             dot_reconnects_total: AtomicU64::new(0),
             last_reconnect_at: std::sync::Mutex::new(None),
+            qtype_counts: (0..256).map(|_| AtomicU64::new(0)).collect(),
+            qtype_high: AtomicU64::new(0),
         })
     }
 
@@ -159,6 +165,16 @@ impl Stats {
         };
         if let Ok(mut g) = self.last_reconnect_at.lock() {
             *g = Some(ts);
+        }
+    }
+
+    /// Increment the per-query-type counter for the given DNS type code.
+    #[inline]
+    pub fn inc_qtype_raw(&self, type_code: u16) {
+        if (type_code as usize) < self.qtype_counts.len() {
+            self.qtype_counts[type_code as usize].fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.qtype_high.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -311,6 +327,7 @@ impl Stats {
             0.0
         };
         let (qps_1m, qps_5m, qps_peak) = self.qps_stats();
+        let qtype_stats = Self::build_qtype_stats(&self.qtype_counts, self.qtype_high.load(Ordering::Relaxed));
         StatsSnapshot {
             total,
             blocked,
@@ -332,7 +349,29 @@ impl Stats {
             dnssec_secure: self.dnssec_secure.load(Ordering::Relaxed),
             dnssec_bogus: self.dnssec_bogus.load(Ordering::Relaxed),
             dnssec_insecure: self.dnssec_insecure.load(Ordering::Relaxed),
+            qtype_stats,
         }
+    }
+
+    fn build_qtype_stats(counts: &[AtomicU64], high: u64) -> Vec<(String, u64)> {
+        const NAMED: &[(usize, &str)] = &[
+            (1, "A"), (2, "NS"), (5, "CNAME"), (6, "SOA"), (12, "PTR"),
+            (15, "MX"), (16, "TXT"), (28, "AAAA"), (33, "SRV"), (43, "DS"),
+            (46, "RRSIG"), (47, "NSEC"), (48, "DNSKEY"), (52, "TLSA"), (255, "ANY"),
+        ];
+        let known: std::collections::HashSet<usize> = NAMED.iter().map(|&(i, _)| i).collect();
+        let mut result: Vec<(String, u64)> = NAMED.iter().filter_map(|&(idx, name)| {
+            let n = counts.get(idx).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+            if n > 0 { Some((name.to_owned(), n)) } else { None }
+        }).collect();
+        let other: u64 = counts.iter().enumerate()
+            .filter(|(i, _)| !known.contains(i))
+            .map(|(_, c)| c.load(Ordering::Relaxed))
+            .sum::<u64>()
+            .saturating_add(high);
+        if other > 0 { result.push(("OTHER".to_owned(), other)); }
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result
     }
 }
 
@@ -357,6 +396,8 @@ pub struct StatsSnapshot {
     pub dnssec_secure: u64,
     pub dnssec_bogus: u64,
     pub dnssec_insecure: u64,
+    /// Per-record-type query distribution, sorted descending by count.
+    pub qtype_stats: Vec<(String, u64)>,
 }
 
 pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
@@ -389,6 +430,9 @@ pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
             "bogus":    snap.dnssec_bogus,
             "insecure": snap.dnssec_insecure,
         },
+        "qtype_stats": snap.qtype_stats.iter()
+            .map(|(k, v)| serde_json::json!({"type": k, "count": v}))
+            .collect::<Vec<_>>(),
     })
 }
 
