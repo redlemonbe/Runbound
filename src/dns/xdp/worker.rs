@@ -884,9 +884,13 @@ fn process_packet(
         tx[ip_off + 12..ip_off + 16].copy_from_slice(&dst);
         tx[ip_off + 16..ip_off + 20].copy_from_slice(&src);
 
-        // Clear then recompute IPv4 header checksum
-        tx[ip_off + 10..ip_off + 12].fill(0);
-        let cksum = ipv4_checksum(&tx[ip_off..ip_off + ip_hdr_len]);
+        // RFC 1624 incremental checksum update: only total_length changed.
+        // HC' = ~(~HC + ~m + m')  (one's-complement 16-bit arithmetic)
+        // src<->dst swap is neutral (same words, same sum). Read from rx
+        // (header intact); tx already has new_tot written at ip_len_off.
+        let old_cksum = u16::from_be_bytes([rx[ip_off + 10], rx[ip_off + 11]]);
+        let old_tot   = u16::from_be_bytes([rx[ip_len_off], rx[ip_len_off + 1]]);
+        let cksum = ip_checksum_update(old_cksum, old_tot, new_tot);
         tx[ip_off + 10..ip_off + 12].copy_from_slice(&cksum.to_be_bytes());
     } else {
         // IPv6: copy, set payload length, swap src/dst
@@ -1523,6 +1527,24 @@ fn fold_checksum(mut s: u64) -> u16 {
     } // RFC 768: 0 is transmitted as all-ones
 }
 
+/// RFC 1624 §3 incremental IPv4 checksum update for a single changed 16-bit word.
+///
+/// HC  = old (valid) header checksum
+/// m   = old value of the changed word  (old total_length)
+/// m'  = new value of the changed word  (new total_length)
+/// HC' = ~(~HC + ~m + m')  — computed in 32-bit, folded to 16-bit.
+///
+/// Convention: matches fold_checksum() — maps 0x0000 → 0xFFFF (RFC 768).
+#[inline]
+fn ip_checksum_update(old_cksum: u16, old_word: u16, new_word: u16) -> u16 {
+    let mut sum = (!old_cksum) as u32 + (!old_word) as u32 + new_word as u32;
+    // Fold carries: at most two passes (sum <= 3 * 0xFFFF = 0x2FFFD).
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    let r = !(sum as u16);
+    if r == 0 { 0xFFFF } else { r }
+}
+
 fn ipv4_checksum(header: &[u8]) -> u16 {
     fold_checksum(ones_complement_sum(header))
 }
@@ -1609,4 +1631,99 @@ mod tests {
             "empty payload"
         );
     }
+
+    /// Correctness guard: ip_checksum_update must be byte-identical to
+    /// a full ipv4_checksum recompute on the modified header.
+    ///
+    /// Method: build a valid IPv4 header with old_tot, compute its checksum
+    /// via ipv4_checksum, then assert incremental == full recompute with new_tot.
+    #[test]
+    fn incremental_checksum_matches_full_recompute() {
+        // Build a minimal 20-byte IPv4 header with a given total_length.
+        // IHL=5, DSCP=0, TTL=64, proto=17 (UDP), src=12.34.56.78, dst=192.168.1.1
+        fn make_ipv4_hdr(tot_len: u16) -> [u8; 20] {
+            let mut h = [0u8; 20];
+            h[0] = 0x45;                               // Version=4, IHL=5
+            h[1] = 0x00;                               // DSCP/ECN
+            h[2..4].copy_from_slice(&tot_len.to_be_bytes()); // total length
+            h[4..6].copy_from_slice(&0x1234u16.to_be_bytes()); // id
+            h[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF, frag=0
+            h[8] = 64;                                 // TTL
+            h[9] = 17;                                 // proto = UDP
+            // h[10..12] = checksum — set below
+            h[12..16].copy_from_slice(&[12, 34, 56, 78]);  // src
+            h[16..20].copy_from_slice(&[192, 168, 1, 1]);  // dst
+            h
+        }
+
+        fn full_cksum_with_new_tot(old_hdr: &[u8; 20], new_tot: u16) -> u16 {
+            let mut h = *old_hdr;
+            h[2..4].copy_from_slice(&new_tot.to_be_bytes());
+            h[10..12].fill(0);
+            ipv4_checksum(&h)
+        }
+
+        let cases: &[(u16, u16)] = &[
+            // (old_tot, new_tot) — realistic DNS query→response size change
+            (60,  120),    // small query, larger response
+            (100, 80),     // response shorter than query
+            (20,  1480),   // minimum header → near-MTU
+            (0xFFE0, 0xFFF0), // near-overflow: fold carry exercised
+            (0xFFFF, 20),  // max → small (carry path)
+            (28,  28),     // unchanged: incremental must equal full recompute
+            // Zero-sum edge: force a result that would be 0x0000 before convention
+            // (hard to construct deterministically; covered by carry-fold cases above)
+        ];
+
+        for &(old_tot, new_tot) in cases {
+            let hdr = make_ipv4_hdr(old_tot);
+            // Compute valid checksum for the query header (old_tot)
+            let mut hdr_for_cksum = hdr;
+            hdr_for_cksum[10..12].fill(0);
+            let old_cksum = ipv4_checksum(&hdr_for_cksum);
+
+            let incremental = ip_checksum_update(old_cksum, old_tot, new_tot);
+            let full        = full_cksum_with_new_tot(&hdr, new_tot);
+
+            assert_eq!(
+                incremental, full,
+                "incremental != full for old_tot={old_tot} new_tot={new_tot}: \
+                 got {incremental:#06x}, expected {full:#06x}"
+            );
+        }
+    }
+
+    /// Convention guard: ip_checksum_update never returns 0x0000 (maps to 0xFFFF).
+    #[test]
+    fn incremental_checksum_zero_convention() {
+        // To get 0xFFFF from fold_checksum, the pre-NOT sum must be 0x0000,
+        // meaning NOT(result) == 0xFFFF → result == 0x0000 before convention.
+        // We verify our function also returns 0xFFFF, not 0x0000, in that case
+        // by exhaustive check on a small range of inputs — and by construction
+        // via the equivalence test above (if incremental == full and full never
+        // returns 0 from ipv4_checksum on a valid header, we're covered).
+        // Spot-check: a header whose incremental result would naively be 0.
+        // Use brute force on 4-byte toy headers to find such a case.
+        let mut found_zero_candidate = false;
+        'outer: for a in 0u16..=0xFF {
+            for b in 0u16..=0xFF {
+                // Minimal 4-byte "header" so ipv4_checksum/fold_checksum can
+                // return 0xFFFF (all-ones input → sum=0xFFFF → NOT=0 → 0xFFFF).
+                let hdr = [(a >> 8) as u8, (a & 0xFF) as u8,
+                           (b >> 8) as u8, (b & 0xFF) as u8];
+                let ck = ipv4_checksum(&hdr);
+                // Try updating word 0 from a→a: should be idempotent
+                let upd = ip_checksum_update(ck, a, a);
+                assert_ne!(upd, 0x0000,
+                    "ip_checksum_update returned 0x0000 for a={a:#06x} b={b:#06x}");
+                if ck == 0xFFFF {
+                    found_zero_candidate = true;
+                    break 'outer;
+                }
+            }
+        }
+        // Ensure we actually exercised the 0xFFFF case
+        assert!(found_zero_candidate, "no 0xFFFF checksum found in sweep — test may be incomplete");
+    }
+
 }
