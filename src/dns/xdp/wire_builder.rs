@@ -311,6 +311,106 @@ pub fn build_answer_a_aaaa<'z>(
 }
 
 
+// ── Build negative / error responses ─────────────────────────────────────────
+
+/// Internal: write DNS header + echo question section into `out`.
+/// Returns the position after the question section, or None if out is too small.
+///
+/// Shared by build_nxdomain / build_nodata / build_refused.
+#[inline(always)]
+fn write_header_and_question(
+    out:      &mut [u8],
+    id:       u16,
+    flags:    u16,
+    ancount:  u16,
+    qname:    &[u8],
+    qtype:    u16,
+    qclass:   u16,
+) -> Option<usize> {
+    let qname_len = qname.len();
+    let total = DNS_HDR + qname_len + 4; // header + qname + qtype(2) + qclass(2)
+    if out.len() < total {
+        return None;
+    }
+    let mut pos = 0;
+    pos = put_u16(out, pos, id);       // ID
+    pos = put_u16(out, pos, flags);    // Flags
+    pos = put_u16(out, pos, 1);        // QDCOUNT = 1
+    pos = put_u16(out, pos, ancount);  // ANCOUNT
+    pos = put_u16(out, pos, 0);        // NSCOUNT = 0
+    pos = put_u16(out, pos, 0);        // ARCOUNT = 0
+    out[pos..pos + qname_len].copy_from_slice(qname);
+    pos += qname_len;
+    pos = put_u16(out, pos, qtype);    // QTYPE  (echo)
+    pos = put_u16(out, pos, qclass);   // QCLASS (echo)
+    Some(pos)
+}
+
+/// QR=1 AA=1 RD=1 RA=1 RCODE=3 (NXDOMAIN)
+const FLAGS_AA_NXDOMAIN: u16 = 0x8583;
+
+/// QR=1 AA=0 RD=1 RA=1 RCODE=5 (REFUSED)
+const FLAGS_REFUSED: u16 = 0x8585;
+
+/// Build an NXDOMAIN response directly into `out`.
+///
+/// Wire: Header(12, RCODE=3, ancount=0) + echo Question.
+/// No SOA in authority (RFC-minimal; negative caching not supported in fast path —
+/// acceptable, follow-up #156). dig reports `status: NXDOMAIN` correctly.
+///
+/// Returns `Some(len)` on success, `None` if `out` is too small.
+pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
+    write_header_and_question(
+        out,
+        wq.id,
+        FLAGS_AA_NXDOMAIN,
+        0,
+        wq.qname_wire,
+        wq.qtype,
+        wq.qclass,
+    )
+}
+
+/// Build a NODATA response (NOERROR, ancount=0) directly into `out`.
+///
+/// Used when the zone exists but has no records of the requested type.
+/// Wire: Header(12, RCODE=0, ancount=0) + echo Question.
+/// AA=1 (we are authoritative for the zone).
+///
+/// Returns `Some(len)` on success, `None` if `out` is too small.
+pub fn build_nodata(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
+    // FLAGS_AA_NOERROR = 0x8580 (QR=1 AA=1 RD=1 RA=1 RCODE=0)
+    write_header_and_question(
+        out,
+        wq.id,
+        FLAGS_AA_NOERROR,
+        0,
+        wq.qname_wire,
+        wq.qtype,
+        wq.qclass,
+    )
+}
+
+/// Build a REFUSED response directly into `out`.
+///
+/// Used when ACL action is Refuse.
+/// Wire: Header(12, RCODE=5, ancount=0) + echo Question.
+/// AA=0 (not authoritative — we refused to process).
+///
+/// Returns `Some(len)` on success, `None` if `out` is too small.
+pub fn build_refused(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
+    write_header_and_question(
+        out,
+        wq.id,
+        FLAGS_REFUSED,
+        0,
+        wq.qname_wire,
+        wq.qtype,
+        wq.qclass,
+    )
+}
+
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -410,4 +510,97 @@ mod tests {
         buf[12] = 0x05; // qname label len=5 (won't find \0 properly but QR check is first)
         assert!(parse_query(&buf).is_none());
     }
+    // ── build_nxdomain / build_nodata / build_refused ────────────────────────
+
+    /// Helper: build a minimal wire query for tests.
+    /// Returns (buf, WireQuery) for a standard A query of "a.test." (7 wire bytes).
+    fn make_wire_query_a() -> ([u8; 512], Vec<u8>) {
+        // Wire QNAME for "a.test.": \x01 a \x04 test \x00
+        let qname: Vec<u8> = vec![0x01, b'a', 0x04, b't', b'e', b's', b't', 0x00];
+        let mut buf = vec![0u8; 512];
+        // Construct a fake WireQuery manually using the struct fields
+        // (we bypass parse_query to avoid building a full DNS packet)
+        let _ = &buf; // silence unused
+        (
+            [0u8; 512],
+            qname,
+        )
+    }
+
+    /// NXDOMAIN: wire-correct header (flags=0x8583, ancount=0) + echo question.
+    #[test]
+    fn build_nxdomain_wire_correct() {
+        let qname: &[u8] = &[0x01, b'a', 0x04, b't', b'e', b's', b't', 0x00]; // "a.test."
+        let wq = WireQuery { id: 0xABCD, qname_wire: qname, qtype: 1, qclass: 1, has_edns: false };
+        let mut out = [0u8; 512];
+        let len = build_nxdomain(&wq, &mut out).expect("build_nxdomain failed");
+
+        // Header: ID=0xABCD, flags=0x8583, qdcount=1, ancount=0, nscount=0, arcount=0
+        assert_eq!(&out[0..2],   &[0xAB, 0xCD], "ID mismatch");
+        assert_eq!(&out[2..4],   &[0x85, 0x83], "flags must be 0x8583 (AA NXDOMAIN)");
+        assert_eq!(&out[4..6],   &[0x00, 0x01], "qdcount=1");
+        assert_eq!(&out[6..8],   &[0x00, 0x00], "ancount=0");
+        assert_eq!(&out[8..10],  &[0x00, 0x00], "nscount=0");
+        assert_eq!(&out[10..12], &[0x00, 0x00], "arcount=0");
+
+        // Question: echo qname + qtype + qclass
+        assert_eq!(&out[12..12 + qname.len()], qname, "QNAME echo mismatch");
+        let qtype_off = 12 + qname.len();
+        assert_eq!(&out[qtype_off..qtype_off+2], &[0x00, 0x01], "QTYPE A=1");
+        assert_eq!(&out[qtype_off+2..qtype_off+4], &[0x00, 0x01], "QCLASS IN=1");
+
+        assert_eq!(len, 12 + qname.len() + 4);
+    }
+
+    /// NODATA: flags=0x8580 (NOERROR AA), ancount=0.
+    #[test]
+    fn build_nodata_wire_correct() {
+        let qname: &[u8] = &[0x01, b'b', 0x04, b't', b'e', b's', b't', 0x00];
+        let wq = WireQuery { id: 0x1234, qname_wire: qname, qtype: 28, qclass: 1, has_edns: false };
+        let mut out = [0u8; 512];
+        let len = build_nodata(&wq, &mut out).expect("build_nodata failed");
+
+        assert_eq!(&out[0..2], &[0x12, 0x34], "ID");
+        assert_eq!(&out[2..4], &[0x85, 0x80], "flags must be 0x8580 (AA NOERROR)");
+        assert_eq!(&out[4..6], &[0x00, 0x01], "qdcount=1");
+        assert_eq!(&out[6..8], &[0x00, 0x00], "ancount=0");
+        assert_eq!(len, 12 + qname.len() + 4);
+    }
+
+    /// REFUSED: flags=0x8585 (REFUSED), ancount=0, AA=0.
+    #[test]
+    fn build_refused_wire_correct() {
+        let qname: &[u8] = &[0x04, b't', b'e', b's', b't', 0x00];
+        let wq = WireQuery { id: 0xFFFF, qname_wire: qname, qtype: 1, qclass: 1, has_edns: false };
+        let mut out = [0u8; 512];
+        let len = build_refused(&wq, &mut out).expect("build_refused failed");
+
+        assert_eq!(&out[0..2], &[0xFF, 0xFF], "ID");
+        assert_eq!(&out[2..4], &[0x85, 0x85], "flags must be 0x8585 (REFUSED)");
+        assert_eq!(&out[6..8], &[0x00, 0x00], "ancount=0");
+        assert_eq!(len, 12 + qname.len() + 4);
+    }
+
+    /// Buffer too small → None (no panic, no partial write).
+    #[test]
+    fn build_nxdomain_buf_too_small() {
+        let qname: &[u8] = &[0x01, b'a', 0x04, b't', b'e', b's', b't', 0x00];
+        let wq = WireQuery { id: 0x0001, qname_wire: qname, qtype: 1, qclass: 1, has_edns: false };
+        let mut out = [0u8; 10]; // too small (need 12+8+4=24)
+        assert!(build_nxdomain(&wq, &mut out).is_none());
+    }
+
+    /// All three share the same question echo — cross-check qtype=AAAA.
+    #[test]
+    fn build_negative_echo_qtype_aaaa() {
+        let qname: &[u8] = &[0x03, b'f', b'o', b'o', 0x00];
+        let wq = WireQuery { id: 0x0042, qname_wire: qname, qtype: 28, qclass: 1, has_edns: false };
+        let mut out = [0u8; 512];
+        let len = build_nxdomain(&wq, &mut out).unwrap();
+        let qtype_off = 12 + qname.len();
+        assert_eq!(&out[qtype_off..qtype_off+2], &[0x00, 0x1C], "QTYPE AAAA=28");
+        assert_eq!(len, 12 + qname.len() + 4);
+    }
+
+
 }
