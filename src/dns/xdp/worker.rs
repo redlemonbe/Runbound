@@ -49,8 +49,8 @@ use super::wire_builder::{
     build_refused, parse_query, EdnsInfo,
 };
 use super::socket::{
-    create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface, maximize_nic_ring,
-    parent_interface, sanitize_iface_name, XskSocket, XDP_ACTIVE_IFACE,
+    create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface,
+    parent_interface, sanitize_iface_name, XskSocket,
 };
 use super::umem::{XdpDesc, XdpRingSizes, FRAME_SIZE};
 use crate::dns::acl::{Acl, AclAction};
@@ -349,8 +349,8 @@ fn start_xdp_on_iface(
 
     // #80: maximize NIC ring buffers before attaching XDP to prevent hardware
     // FIFO overflow at ≥10M QPS. Silent fallback on EOPNOTSUPP / EPERM.
-    let _ = XDP_ACTIVE_IFACE.set(iface.to_owned());
-    maximize_nic_ring(iface, ring_size);
+    // XDP_ACTIVE_IFACE + maximize_nic_ring are now set via register_xdp_iface()
+    // after socket bind (post-bind state is authoritative). (#159)
 
     // Bug B: check MTU before attach — virtio-net refuses DRV mode when MTU > 3506.
     // Falling back to SKB mode is acceptable but must be visible to the operator.
@@ -414,7 +414,20 @@ fn start_xdp_on_iface(
     }
 
     let queue_modes: Vec<(u32, bool)> = sockets.iter().map(|(q, s)| (*q, s.zerocopy)).collect();
+    // #159: register per-interface state in the Vec registry (works for N interfaces).
+    // Also feed compat singleton (first iface wins, subsequent skipped silently).
+    let (nic_rx_ring, nic_rx_ring_max) = super::socket::maximize_nic_ring(iface, None);
+    super::socket::register_xdp_iface(super::socket::XdpIfaceState {
+        iface:           iface.to_owned(),
+        queue_modes:     queue_modes.clone(),
+        nic_rx_ring,
+        nic_rx_ring_max,
+    });
+    // Compat shims — first iface only (existing API callers unchanged).
     super::socket::XDP_QUEUE_MODES.set(queue_modes).ok();
+    let _ = super::socket::XDP_ACTIVE_IFACE.set(iface.to_owned());
+    super::socket::XDP_NIC_RX_RING.store(nic_rx_ring, std::sync::atomic::Ordering::Relaxed);
+    super::socket::XDP_NIC_RX_RING_MAX.store(nic_rx_ring_max, std::sync::atomic::Ordering::Relaxed);
 
     // #155 — Gate domain-routing OFF when any socket is in true zerocopy mode.
     //
