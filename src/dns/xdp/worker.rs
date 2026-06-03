@@ -452,33 +452,10 @@ fn start_xdp_on_iface(
     }
 
     // debug/xdp-tx-multi: per-interface instrumentation counters
+    // iface_ctr declared here (before workers) so Arc::clone is valid in spawn closures.
+    // The logger thread is spawned AFTER workers (below) to avoid logging zeros
+    // if the self-test fails and workers are never spawned (#fix/xdp-multi-iface-tx).
     let iface_ctr = XdpIfaceCounters::new(iface);
-    {
-        // Logger thread: logs 6 counters 1×/sec then resets them.
-        let ctr = Arc::clone(&iface_ctr);
-        std::thread::Builder::new()
-            .name(format!("xdp-log-{iface}"))
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let rx  = ctr.rx_drained.swap(0, AOrdering::Relaxed);
-                let ans = ctr.answers_built.swap(0, AOrdering::Relaxed);
-                let enq = ctr.tx_enqueued.swap(0, AOrdering::Relaxed);
-                let kck = ctr.tx_kicks.swap(0, AOrdering::Relaxed);
-                let cmp = ctr.tx_completed.swap(0, AOrdering::Relaxed);
-                let emp = ctr.tx_free_empty.swap(0, AOrdering::Relaxed);
-                tracing::info!(
-                    iface = %ctr.iface,
-                    rx_drained    = rx,
-                    answers_built = ans,
-                    tx_enqueued   = enq,
-                    tx_kicks      = kck,
-                    tx_completed  = cmp,
-                    tx_free_empty = emp,
-                    "[DBG-TX] per-interface counters"
-                );
-            })
-            .ok();
-    }
 
     // #68: build queue→core map for IRQ affinity pinning after thread spawn.
     let mut queue_to_core: Vec<(u32, usize)> = Vec::with_capacity(sockets.len());
@@ -507,6 +484,11 @@ fn start_xdp_on_iface(
             })
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
+    tracing::info!(
+        iface   = %iface,
+        workers = queue_to_core.len(),
+        "XDP workers spawned — confirm count is queue_count (#fix/xdp-multi-iface-tx)"
+    );
 
     // #68: pin NIC queue IRQs to their XDP worker cores to avoid cross-core cache misses.
     if irq_affinity {
@@ -516,6 +498,35 @@ fn start_xdp_on_iface(
     // fix/xdp-multi-iface-affinity: governor is now pinned centrally in
     // start_xdp_multi (or start_xdp for mono-iface) to cover the UNION of
     // all interface core blocks.  Return queue_to_core to the caller instead.
+
+    // Spawn the logger thread AFTER workers are confirmed live.
+    // This guarantees that if the self-test caused Ok(None), no logger
+    // thread is left looping and emitting misleading rx_drained=0 (#fix/xdp-multi-iface-tx).
+    {
+        let ctr = Arc::clone(&iface_ctr);
+        std::thread::Builder::new()
+            .name(format!("xdp-log-{iface}"))
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let rx  = ctr.rx_drained.swap(0, AOrdering::Relaxed);
+                let ans = ctr.answers_built.swap(0, AOrdering::Relaxed);
+                let enq = ctr.tx_enqueued.swap(0, AOrdering::Relaxed);
+                let kck = ctr.tx_kicks.swap(0, AOrdering::Relaxed);
+                let cmp = ctr.tx_completed.swap(0, AOrdering::Relaxed);
+                let emp = ctr.tx_free_empty.swap(0, AOrdering::Relaxed);
+                tracing::info!(
+                    iface = %ctr.iface,
+                    rx_drained    = rx,
+                    answers_built = ans,
+                    tx_enqueued   = enq,
+                    tx_kicks      = kck,
+                    tx_completed  = cmp,
+                    tx_free_empty = emp,
+                    "[DBG-TX] per-interface counters"
+                );
+            })
+            .ok();
+    }
     Ok(Some(handle))
 }
 
@@ -747,7 +758,19 @@ fn xdp_worker(
                 // SAFETY: `&mut pfd` is a valid pointer to a single `pollfd`.
                 //         nfds=1 matches the array length. timeout=1 ms is valid.
                 let ret = unsafe { poll(&mut pfd, 1, 1 /* ms */) };
-                if ret < 0 { break; }
+                if ret < 0 {
+                    // poll() error: log and keep running instead of silently
+                    // killing the worker — a dead worker leaves rx_drained=0
+                    // and is indistinguishable from "no traffic" (#fix/xdp-multi-iface-tx).
+                    tracing::warn!(
+                        iface  = %counters.iface,
+                        worker = worker_id,
+                        err    = %std::io::Error::last_os_error(),
+                        "xdp_worker: poll() error — sleeping 1 ms then retrying"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
                 empty_spins = 0;
             }
             continue;
