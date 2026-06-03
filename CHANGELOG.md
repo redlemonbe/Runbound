@@ -9,6 +9,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.68] — 2026-06-03
+
+### Added
+
+- **`xdp-cpu-governor` config option** (#158): opt-in (default off) pinning of the `performance` CPU frequency governor on the XDP worker cores at startup. The default OS governors (`schedutil`/`powersave`) under-clock the bursty DNS hot path mid-flood, adding frequency-ramp jitter; pinning `performance` stabilises per-core frequency. Enable with `xdp-cpu-governor: performance` in the `server:` block. Best-effort: WARNs and continues if the cpufreq sysfs is absent (VMs/containers) or the write is refused (no `CAP_SYS_ADMIN`); only the cores actually used by XDP workers are touched.
+
+### Fixed
+
+- **Governor restoration now runs on SIGTERM/SIGINT** (#158): Runbound had no terminate handler, so `systemctl stop` (SIGTERM) killed the process without unwinding the stack — a pinned `performance` governor stayed in place indefinitely after stop. A graceful SIGTERM/SIGINT handler now restores each core's original governor before exit (extracted out of the detached XDP poll task; verified on bare metal that cores return to their original governor after stop). The `Drop` restore is kept as a fallback for the clean-return path.
+
+---
+
 ## [0.9.67] — 2026-06-03
 
 ### Added
