@@ -142,3 +142,129 @@ Deux pistes post-#155 :
 - p99 stable, zéro crash sous flood 12M pps
 - Méthodo : `ethtool -N <nic> rx-flow-hash udp4 sdfn` + `ethtool -A <nic> rx off tx off`
   + `rate-limit: 0` + `dnsmark ≥ v1.2.1 --max-outstanding 0`
+
+---
+
+## #156 — Étape 0 : Analyse statique du hot path (2026-06-03)
+
+### Contrainte réelle : profil perf non exécutable depuis le worker
+
+**Faits établis :**
+- worker-amd64 (192.168.8.231) = LXC Proxmox, CPU AMD Threadripper PRO, NIC veth — PAS le récepteur X520
+- `perf` absent sur le worker + `perf_event_paranoid=4` (interdit même root)
+- Runbound non running sur le worker
+- → Le profil `perf record -g` doit être exécuté sur la machine récepteur par l'architecte
+
+**Ce document = analyse statique du code source, pas un profil mesuré.**
+Labellisé SUPPOSÉ/SUSPECTÉ — autorité = perf réel sur le récepteur.
+
+---
+
+### Hot path par paquet (lu en source primaire — worker.rs)
+
+```
+Boucle principale xdp_worker() :
+  1. poll(fd, 1ms timeout)                       ← syscall, 1ms min latency
+  2. sock.umem.reclaim_tx()                      ← retire frames TX completed
+  3. sock.rx.consume_rx_into(&mut rxds)          ← lecture ring RX (userspace, ZC)
+  4. zones.load()                                ← ArcSwap::load() — atomic pointer swap, cheap
+  5. cache_snapshot.load_full()                  ← Arc clone, O(1)
+  6. prefetch next frame (_mm_prefetch T0)       ← SSE prefetch, inline asm
+  7. Per-paquet :
+     a. extract_src_ip(rx_frame)                 ← 2 branches, ~5 instructions
+     b. TL_RL rate-limiter (thread_local cache)  ← HashMap lookup, ~10ns si hit
+     c. process_packet() :
+        i.   parse Eth/IP/UDP headers            ← ~15 instructions, slice indexing
+        ii.  answer_dns() — local zone path :
+               Message::from_bytes(query_bytes)  ← *** HICKORY DESERIALIZE — SUSPECT #1 ***
+               BinEncoder::new() + emit()        ← *** HICKORY SERIALIZE — SUSPECT #1 ***
+        iii. answer_from_cache() — cache path :
+               QNAME wire extraction (loop)      ← SUSPECT #2 : boucle octets wire
+               HashMap::get(&QuestionKey)        ← hash CRC32c SSE4.2 + eq (simd::bytes_eq)
+               copy_from_slice(wire)             ← memcpy direct en TX UMEM, O(len)
+     d. UDP checksum (ones_complement_sum)       ← SUSPECT #3 : scalar 8B/iter
+     e. IPv4 checksum                            ← même implémentation
+  8. sock.umem.fill.enqueue_batch(&rx_addrs)     ← retour frames kernel
+  9. sock.tx.enqueue_tx(&tx_descs)               ← TX ring push
+ 10. sendto() si NEED_WAKEUP                     ← syscall conditionnel
+```
+
+---
+
+### Suspects hotspot (SUPPOSÉS — à valider par perf réel)
+
+#### SUSPECT #1 — CRITIQUE : Sérialisation hickory dans answer_dns() (local zone path)
+
+`Message::from_bytes()` + `BinEncoder::new()` + `resp.emit()` = allocation dynamique
+(hickory BinEncoder utilise un Vec interne) + parsing complet du message DNS via
+l'AST hickory (Message → queries → records). Sur le chemin local-zone (le plus
+chaud en bench), c'est potentiellement **la fonction la plus coûteuse par paquet**.
+
+**Estimation :** 50-200 ns/paquet selon la complexité du nom et la taille de la réponse.
+À 322k qps/cœur = 3.1µs/paquet. Si hickory coûte 200ns → ~6% du budget.
+
+**Comparaison :** le chemin cache (`answer_from_cache()`) n'utilise PAS hickory —
+lookup HashMap + copy_from_slice wire → ~20-50ns. C'est probablement 3-5× plus rapide.
+
+**Implication #156 :** si le bench est majoritairement sur local-zone (vs cache), remplacer
+`answer_dns()` par un sérialiseur wire minimal sans allocation ni AST hickory pourrait
+être le gain Levier B le plus important.
+
+#### SUSPECT #2 — MODÉRÉ : Extraction QNAME dans answer_from_cache()
+
+```rust
+// Boucle octet par octet sur le wire QNAME
+let lb = *query_bytes.get(vpos)?;
+vpos += 1 + lb as usize;
+```
+Sur des noms longs (ex. `a.bench.local.` = 14 bytes), c'est ~5 iterations.
+SmallVec<[u8;64]> évite le heap. Le hash CRC32c SSE4.2 est déjà optimal.
+**Suspect mineur sauf si les noms sont très longs.**
+
+#### SUSPECT #3 — MINEUR : Checksums UDP/IPv4 scalaires
+
+`ones_complement_sum()` traite 8 bytes/iter (4 u16 accumulés dans u64) — pas vectorisé.
+Sur un paquet DNS typique de 80 bytes payload : ~10 iterations. Probablement <5ns.
+**Suspect mineur sur DNS (paquets courts). Non prioritaire.**
+
+#### SUSPECT #4 — POLL SYSCALL : timeout 1ms
+
+`poll(fd, 1ms)` avec 12M pps entrant → le ring RX ne sera jamais vide → poll retourne
+immédiatement (POLLIN toujours set). Le 1ms timeout est une borne max, pas un délai réel.
+**Non suspect sous flood. Serait un problème à faible charge uniquement.**
+
+---
+
+### Levier A — Cross-queue ZC : question ouverte à trancher en mesure
+
+**Situation :** RSS 82599 = 16 queues max. Cœurs physiques 0-19 disponibles (20 physiques).
+4 cœurs idle (16-19) car pas de queue RX associée.
+
+**Question :** `bpf_redirect_map(&XSKS, hash % 20, XDP_PASS)` sur 20 XSKs liés à 20 queues,
+quand le RSS ne remplit que 16 queues → les 4 XSKs "extra" (queues 16-19) reçoivent
+des paquets via redirect, pas via RX ring natif. Le ZC tient-il ?
+
+**Réponse supposée (NON confirmée) :** Sur ixgbe, `XDP_REDIRECT` vers un XSK lié à une queue
+qui ne reçoit pas de trafic RSS natif peut fonctionner en ZC si l'XSK est lié en mode
+`XDP_ZEROCOPY` — le driver ixgbe supporte `ndo_xsk_wakeup` sur toutes les queues, pas
+seulement celles actives en RSS. Mais ce n'est pas documenté explicitement pour le cas
+"RSS queue count < XSK count".
+
+**Action nécessaire (architecte) :** tester empiriquement. Créer 20 XSKs, XSKMAP[0..19],
+eBPF hash % 20, ethtool queues=16. Observer :
+- `ip xfrm` / `ethtool -S` : compteurs ZC (zerocopy_rx) sur queues 16-19
+- Logs Runbound : "zerocopy" sur toutes les queues
+- Débit vs baseline 16-queue
+
+**Si ZC casse sur queues 16-19 → même problème que CPUMAP (#155) → Levier A abandonné.**
+
+---
+
+### Plan d'action #156 (conditionné par le profil réel)
+
+1. **Architecte : exécuter `perf record -g` sur récepteur** pendant dnsmark flood 12M pps
+   → top 10 fonctions → valider/invalider les suspects ci-dessus
+2. Si Suspect #1 confirmé → Levier B : sérialiseur wire minimal dans answer_dns()
+3. Levier A : test empirique cross-queue ZC (16→20 queues)
+4. Combiner A + B si les deux tiennent → cible 10M qps
+
