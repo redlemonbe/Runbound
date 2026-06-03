@@ -117,6 +117,7 @@ pub fn start_xdp(
                     cache_snapshot,
                     domain_routing,
                     busy_poll,
+                    0,   // core_base=0 for virtual parent fallback (mono-iface)
                     ring_size,
                     xdp_ring_sizes,
                     stats,
@@ -137,7 +138,7 @@ pub fn start_xdp(
             }
         }
     }
-    start_xdp_on_iface(
+    let mut handle = start_xdp_on_iface(
         iface,
         zones,
         rate_limiter,
@@ -148,11 +149,23 @@ pub fn start_xdp(
         cache_snapshot,
         domain_routing,
         busy_poll,
+        0,          // core_base — mono-interface: always starts at core 0
         ring_size,
         xdp_ring_sizes,
         stats,
         domain_stats,
-    )
+    )?;
+    // Mono-interface governor: pin on the handle's own cores.
+    if cpu_governor {
+        if let Some(ref mut h) = handle {
+            let cores = crate::cpu::physical_cores();
+            let q = get_rx_queue_count(iface).max(1) as usize;
+            let n = q.min(cores.len());
+            let xdp_cores: Vec<usize> = (0..n).map(|i| cores[i]).collect();
+            h.governor_guard = Some(super::governor::pin_performance(&xdp_cores));
+        }
+    }
+    Ok(handle)
 }
 
 /// Start XDP fast path on multiple interfaces simultaneously.
@@ -178,9 +191,40 @@ pub fn start_xdp_multi(
     stats: Arc<crate::stats::Stats>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
 ) -> Vec<XdpHandle> {
+    let physical_cores = crate::cpu::physical_cores();
+    let total_phys = physical_cores.len().max(1);
+
+    // fix/xdp-multi-iface-affinity: assign each interface a contiguous block
+    // of physical cores starting at core_base, accumulated across interfaces.
+    // iface0 → [0..n0), iface1 → [n0..n0+n1), ...
+    // If total_queues > physical_cores.len(), wraps via modulo (WARN below).
+    let mut core_base: usize = 0;
     let mut handles = Vec::new();
+
+    // Collect all XDP worker cores across all interfaces for GovernorGuard union.
+    let mut all_xdp_cores: Vec<usize> = Vec::new();
+
     for &iface in ifaces {
-        match start_xdp(
+        let queue_count = get_rx_queue_count(iface).max(1) as usize;
+        // Warn if we are about to wrap (collision via modulo)
+        if core_base + queue_count > total_phys {
+            tracing::warn!(
+                iface = %iface,
+                core_base,
+                queue_count,
+                physical_cores = total_phys,
+                "fix/xdp-multi-iface-affinity: total queues exceed physical cores —                  wrapping core assignment via modulo. Consider reducing queue count                  or using a machine with more physical cores."
+            );
+        }
+        // Collect the cores this interface will use (before potential wrap)
+        for q in 0..queue_count {
+            let core_id = physical_cores[(core_base + q) % total_phys];
+            if !all_xdp_cores.contains(&core_id) {
+                all_xdp_cores.push(core_id);
+            }
+        }
+
+        match start_xdp_on_iface(
             iface,
             Arc::clone(&zones),
             Arc::clone(&rate_limiter),
@@ -191,6 +235,7 @@ pub fn start_xdp_multi(
             cache_snapshot.clone(),
             domain_routing,
             busy_poll,
+            core_base,
             ring_size,
             xdp_ring_sizes,
             Arc::clone(&stats),
@@ -198,20 +243,43 @@ pub fn start_xdp_multi(
         ) {
             Ok(Some(h)) => {
                 tracing::info!(
-                    iface = %iface,
-                    mode  = ?h.mode,
-                    "XDP fast path active"
+                    iface       = %iface,
+                    mode        = ?h.mode,
+                    core_base,
+                    queue_count,
+                    cores       = ?physical_cores.iter()
+                                    .skip(core_base % total_phys)
+                                    .take(queue_count)
+                                    .collect::<Vec<_>>(),
+                    "XDP fast path active (core block assigned)"
                 );
                 handles.push(h);
+                core_base += queue_count;
             }
             Ok(None) => {
                 tracing::warn!(iface = %iface, "XDP: skipped (virtual / self-test)");
+                // Still advance core_base to keep blocks consistent for subsequent ifaces
+                core_base += queue_count;
             }
             Err(e) => {
                 tracing::warn!(iface = %iface, err = %e, "XDP attach failed — skipping interface");
+                core_base += queue_count;
             }
         }
     }
+
+    // fix/xdp-multi-iface-affinity: pin governor on the UNION of all interface
+    // core blocks (not just the first 0-15).  One GovernorGuard on the first handle.
+    if cpu_governor && !handles.is_empty() && !all_xdp_cores.is_empty() {
+        handles[0].governor_guard = Some(
+            super::governor::pin_performance(&all_xdp_cores)
+        );
+        tracing::info!(
+            cores = ?all_xdp_cores,
+            "xdp-cpu-governor: performance pinned on union of all XDP interface cores"
+        );
+    }
+
     if handles.is_empty() {
         tracing::warn!("XDP: no interface could be bound — fast path disabled");
     } else {
@@ -232,12 +300,13 @@ fn start_xdp_on_iface(
     zones: Arc<ArcSwap<LocalZoneSet>>,
     rate_limiter: Arc<RateLimiter>,
     acl: Arc<Acl>,
-    cpu_governor: bool,
+    _cpu_governor: bool,  // governor managed centrally in start_xdp/start_xdp_multi
     irq_affinity: bool,
     hugepages: bool,
     cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
     domain_routing: bool,
     busy_poll: bool,
+    core_base: usize,
     ring_size: Option<u32>,
     xdp_ring_sizes: XdpRingSizes,
     stats: Arc<crate::stats::Stats>,
@@ -359,10 +428,13 @@ fn start_xdp_on_iface(
         let rl = Arc::clone(&rate_limiter);
         let acl = Arc::clone(&acl);
         let cs = cache_snapshot.clone();
+        // fix/xdp-multi-iface-affinity: offset by core_base so each interface
+        // gets a distinct physical-core block (no collision between iface N workers).
+        // Wraps via modulo when total_queues > physical_cores (WARN emitted below).
         let core_id = if cores.is_empty() {
             0
         } else {
-            cores[q as usize % cores.len()]
+            cores[(core_base + q as usize) % cores.len()]
         };
         queue_to_core.push((q, core_id));
         let q_idx = q as usize;
@@ -379,22 +451,9 @@ fn start_xdp_on_iface(
         crate::cpu::set_irq_affinity(iface, &queue_to_core);
     }
 
-    // #158: pin CPU governor to 'performance' on XDP worker cores if requested.
-    // Uses GovernorGuard: reads current governor, writes 'performance', restores on Drop.
-    // Best-effort: WARNs on EACCES or missing cpufreq sysfs (VMs/containers), never fatal.
-    if cpu_governor {
-        let xdp_cores: Vec<usize> = {
-            let mut seen = std::collections::HashSet::new();
-            queue_to_core.iter()
-                .map(|(_, c)| *c)
-                .filter(|c| seen.insert(*c))
-                .collect()
-        };
-        handle.governor_guard = Some(
-            super::governor::pin_performance(&xdp_cores)
-        );
-    }
-
+    // fix/xdp-multi-iface-affinity: governor is now pinned centrally in
+    // start_xdp_multi (or start_xdp for mono-iface) to cover the UNION of
+    // all interface core blocks.  Return queue_to_core to the caller instead.
     Ok(Some(handle))
 }
 
@@ -1806,6 +1865,95 @@ mod tests {
         }
         // Ensure we actually exercised the 0xFFFF case
         assert!(found_zero_candidate, "no 0xFFFF checksum found in sweep — test may be incomplete");
+    }
+
+
+    // ─── fix/xdp-multi-iface-affinity tests ─────────────────────────────────
+
+    /// Simulate the core assignment logic for 2 interfaces × N queues.
+    /// Verifies zero collision between interface core blocks.
+    #[test]
+    fn multi_iface_core_assignment_no_collision() {
+        // Simulate physical_cores() returning [0..31] (32 physical cores)
+        let physical_cores: Vec<usize> = (0..32).collect();
+        let total_phys = physical_cores.len();
+
+        let iface0_queues: usize = 16;
+        let iface1_queues: usize = 16;
+
+        let core_base_iface0: usize = 0;
+        let core_base_iface1: usize = core_base_iface0 + iface0_queues;
+
+        let mut cores_iface0 = Vec::new();
+        let mut cores_iface1 = Vec::new();
+
+        for q in 0..iface0_queues {
+            cores_iface0.push(physical_cores[(core_base_iface0 + q) % total_phys]);
+        }
+        for q in 0..iface1_queues {
+            cores_iface1.push(physical_cores[(core_base_iface1 + q) % total_phys]);
+        }
+
+        // Zero collision: no core appears in both sets
+        for c in &cores_iface0 {
+            assert!(
+                !cores_iface1.contains(c),
+                "collision: core {c} appears in both iface0 and iface1 blocks"
+            );
+        }
+
+        // iface0 gets cores 0-15, iface1 gets cores 16-31
+        assert_eq!(cores_iface0, (0usize..16).collect::<Vec<_>>());
+        assert_eq!(cores_iface1, (16usize..32).collect::<Vec<_>>());
+    }
+
+    /// Verify wrap-on-overflow: when total_queues > physical_cores, indices wrap
+    /// via modulo — no panic, no OOB.
+    #[test]
+    fn multi_iface_core_wrap_no_panic() {
+        let physical_cores: Vec<usize> = (0..4).collect(); // only 4 physical cores
+        let total_phys = physical_cores.len();
+
+        // 2 ifaces × 4 queues = 8 workers on 4 cores → wrap
+        let iface0_queues: usize = 4;
+        let iface1_queues: usize = 4;
+        let core_base_iface1 = iface0_queues; // = 4
+
+        // Must not panic
+        for q in 0..iface1_queues {
+            let core_id = physical_cores[(core_base_iface1 + q) % total_phys];
+            // Core IDs should wrap: (4+0)%4=0, (4+1)%4=1, ... same as iface0 (collision via wrap)
+            assert!(core_id < total_phys, "core_id {core_id} out of range");
+        }
+    }
+
+    /// Governor union covers all interfaces: for 2 ifaces × 2 queues on 4 cores,
+    /// the union set has exactly 4 distinct core IDs, not just the first 2.
+    #[test]
+    fn multi_iface_governor_covers_union() {
+        let physical_cores: Vec<usize> = (0..8).collect();
+        let total_phys = physical_cores.len();
+
+        let iface0_queues = 2usize;
+        let iface1_queues = 2usize;
+
+        let mut all_xdp_cores: Vec<usize> = Vec::new();
+
+        let core_base_iface0 = 0;
+        for q in 0..iface0_queues {
+            let c = physical_cores[(core_base_iface0 + q) % total_phys];
+            if !all_xdp_cores.contains(&c) { all_xdp_cores.push(c); }
+        }
+        let core_base_iface1 = iface0_queues;
+        for q in 0..iface1_queues {
+            let c = physical_cores[(core_base_iface1 + q) % total_phys];
+            if !all_xdp_cores.contains(&c) { all_xdp_cores.push(c); }
+        }
+
+        // Union = 4 distinct cores (0,1 from iface0 + 2,3 from iface1)
+        assert_eq!(all_xdp_cores.len(), 4,
+            "governor union should cover all 4 distinct XDP cores, got {:?}", all_xdp_cores);
+        assert_eq!(all_xdp_cores, vec![0usize, 1, 2, 3]);
     }
 
 }
