@@ -177,100 +177,112 @@ async fn async_main(
     // ── XDP fast path (optional, feature-gated) ───────────────────────────
     // The handle must stay alive for the entire process lifetime; dropping it
     // would detach the XDP program and destroy the XSKMAP.
+    // ── XDP multi-interface init (#feat/xdp-multi-interface) ─────────────────
+    // xdp-interface supports three modes:
+    //   <name>       — single interface (backward-compatible)
+    //   <a>,<b>,...  — explicit list, bind each independently
+    //   auto         — enumerate all eligible interfaces via list_eligible_interfaces()
+    //   none         — disable XDP via interface override
+    //   absent       — auto-detect single interface from listen IP / default route (legacy default)
     #[cfg(feature = "xdp")]
-    let mut _xdp_handle = if !cfg.xdp {
+    let mut _xdp_handles: Vec<dns::xdp::XdpHandle> = if !cfg.xdp {
         info!("XDP fast path disabled (xdp: no / --no-xdp)");
-        None
+        vec![]
     } else if cfg.xdp_interface.as_deref() == Some("none") {
         // #79: xdp-interface: none disables XDP without touching the xdp: directive.
         info!("XDP fast path disabled (xdp-interface: none)");
-        None
+        vec![]
     } else {
-        // #79: explicit interface wins; otherwise auto-detect from listen address / default route.
-        let iface = if let Some(ref explicit) = cfg.xdp_interface {
-            info!(iface = %explicit, "XDP interface: explicit config (xdp-interface)");
-            Some(explicit.clone())
-        } else {
-            let detected = cfg
-                .interfaces
-                .first()
-                .and_then(|s| {
-                    let s = s.trim();
-                    if s == "0.0.0.0" || s == "::" || s.is_empty() {
-                        return None;
-                    }
-                    if s.parse::<std::net::IpAddr>().is_ok() {
-                        return dns::xdp::socket::iface_for_ip(s);
-                    }
-                    Some(s.to_string())
-                })
-                .or_else(dns::xdp::socket::default_interface);
-            if let Some(ref name) = detected {
-                info!(iface = %name, "XDP auto-selected interface (use xdp-interface: to override)");
-            }
-            detected
+        let xdp_ring_sizes = dns::xdp::XdpRingSizes {
+            rx: cfg.xdp_rx_ring_size,
+            tx: cfg.xdp_tx_ring_size,
+            fill: cfg.xdp_fill_ring_size,
+            comp: cfg.xdp_comp_ring_size,
         };
-        match iface {
-            Some(ref iface_name) => {
-                let xdp_ring_sizes = dns::xdp::XdpRingSizes {
-                    rx: cfg.xdp_rx_ring_size,
-                    tx: cfg.xdp_tx_ring_size,
-                    fill: cfg.xdp_fill_ring_size,
-                    comp: cfg.xdp_comp_ring_size,
-                };
-                match dns::xdp::start_xdp(
-                    iface_name,
-                    Arc::clone(&zones),
-                    Arc::clone(&rate_limiter),
-                    Arc::clone(&acl),
-                    cfg.xdp_cpu_governor,
-                    cfg.xdp_irq_affinity,
-                    cfg.xdp_hugepages,
-                    xdp_cache_snapshot.clone(),
-                    cfg.xdp_domain_routing,
-                    cfg.xdp_busy_poll,
-                    cfg.xdp_ring_size,
-                    xdp_ring_sizes,
-                    Arc::clone(&global_stats),
-                    Arc::clone(&domain_stats),
-                ) {
-                    Ok(Some(h)) => {
-                        info!(iface = %iface_name, "XDP kernel-bypass fast path active");
-                        xdp_mode.store(
-                            match h.mode {
-                                dns::xdp::XdpMode::Drv => 1,
-                                dns::xdp::XdpMode::Skb => 2,
-                            },
-                            Ordering::Relaxed,
-                        );
-                        Some(h)
-                    }
-                    Ok(None) => None, // virtual interface or self-test — already warned
-                    Err(e) => {
-                        let reason = if e.contains("BPF_PROG_LOAD") {
-                            "eBPF program rejected by kernel verifier"
-                        } else if e.contains("Operation not permitted") || e.contains("EPERM") {
-                            "missing CAP_NET_ADMIN/CAP_BPF (add to systemd service)"
-                        } else if e.contains("AF_XDP") {
-                            "AF_XDP not allowed (add AF_XDP to RestrictAddressFamilies in service)"
-                        } else {
-                            "NIC or kernel does not support AF_XDP"
-                        };
-                        tracing::warn!("XDP disabled: {} — error: {}", reason, e);
-                        None
-                    }
+
+        // Resolve the interface list from config
+        let iface_list: Vec<String> = match cfg.xdp_interface.as_deref() {
+            Some("auto") => {
+                // Enumerate all eligible interfaces (UP, physical, non-bonded)
+                let found = dns::xdp::socket::list_eligible_interfaces();
+                if found.is_empty() {
+                    tracing::warn!("XDP auto: no eligible interface found — fast path disabled");
                 }
+                found
+            }
+            Some(explicit) if explicit.contains(',') => {
+                // Comma-separated explicit list: "nic2,nic3"
+                explicit.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            Some(explicit) => {
+                // Single explicit interface name
+                vec![explicit.to_string()]
             }
             None => {
-                tracing::warn!("XDP: could not determine network interface; fast path disabled");
-                None
+                // Legacy: auto-detect single interface from listen address / default route
+                let detected = cfg
+                    .interfaces
+                    .first()
+                    .and_then(|s| {
+                        let s = s.trim();
+                        if s == "0.0.0.0" || s == "::" || s.is_empty() {
+                            return None;
+                        }
+                        if s.parse::<std::net::IpAddr>().is_ok() {
+                            return dns::xdp::socket::iface_for_ip(s);
+                        }
+                        Some(s.to_string())
+                    })
+                    .or_else(dns::xdp::socket::default_interface);
+                if let Some(ref name) = detected {
+                    info!(iface = %name, "XDP auto-selected interface (use xdp-interface: to override)");
+                } else {
+                    tracing::warn!("XDP: could not determine network interface; fast path disabled");
+                }
+                detected.into_iter().collect()
             }
+        };
+
+        if iface_list.is_empty() {
+            vec![]
+        } else {
+            let iface_refs: Vec<&str> = iface_list.iter().map(|s| s.as_str()).collect();
+            let handles = dns::xdp::start_xdp_multi(
+                &iface_refs,
+                Arc::clone(&zones),
+                Arc::clone(&rate_limiter),
+                Arc::clone(&acl),
+                cfg.xdp_cpu_governor,
+                cfg.xdp_irq_affinity,
+                cfg.xdp_hugepages,
+                xdp_cache_snapshot.clone(),
+                cfg.xdp_domain_routing,
+                cfg.xdp_busy_poll,
+                cfg.xdp_ring_size,
+                xdp_ring_sizes,
+                Arc::clone(&global_stats),
+                Arc::clone(&domain_stats),
+            );
+            // Update xdp_mode from the first handle (representative)
+            if let Some(h) = handles.first() {
+                xdp_mode.store(
+                    match h.mode {
+                        dns::xdp::XdpMode::Drv => 1,
+                        dns::xdp::XdpMode::Skb => 2,
+                    },
+                    Ordering::Relaxed,
+                );
+            }
+            handles
         }
     };
-
     // ── ICMP BPF init + stats poll task (#89) ──────────────────────────────
+    // Multi-iface: ICMP BPF ops target the primary handle (index 0).
     #[cfg(feature = "xdp")]
-    if let Some(ref mut h) = _xdp_handle {
+    if let Some(h) = _xdp_handles.first_mut() {
         // Push initial config to BPF map
         if let Err(e) = h.icmp_update_config(cfg.icmp_enabled, cfg.icmp_rate_pps, cfg.icmp_burst) {
             tracing::warn!(err=%e, "ICMP BPF config init failed");
@@ -286,15 +298,17 @@ async fn async_main(
     // reached on SIGTERM (OS kills the process before unwind).  We extract the
     // guard here so it can be stored in an Arc<Mutex> and explicitly dropped in
     // a SIGTERM handler.
+    // #158 + multi-iface: extract all GovernorGuards before handles move into poll task.
+    // Each handle may have pinned different cores; we collect all guards.
     #[cfg(feature = "xdp")]
-    let _xdp_governor_guard: Option<dns::xdp::governor::GovernorGuard> = {
-        _xdp_handle.as_mut().and_then(|h| h.take_governor_guard())
+    let _xdp_governor_guards: Vec<dns::xdp::governor::GovernorGuard> = {
+        _xdp_handles.iter_mut().filter_map(|h| h.take_governor_guard()).collect()
     };
     #[cfg(not(feature = "xdp"))]
-    let _xdp_governor_guard: Option<()> = None;
+    let _xdp_governor_guards: Vec<()> = vec![];
 
-    // Wrap in Arc<Mutex> for sharing with SIGTERM handler.
-    let governor_arc = std::sync::Arc::new(std::sync::Mutex::new(_xdp_governor_guard));
+    // Wrap in Arc<Mutex<Vec>> for sharing with SIGTERM handler.
+    let governor_arc = std::sync::Arc::new(std::sync::Mutex::new(_xdp_governor_guards));
 
     // Spawn BPF stats poll task — runs every second, updates Rust atomics.
     // Also detects ICMP floods, applies XDP bans, and pushes config changes to BPF.
@@ -311,9 +325,12 @@ async fn async_main(
             .unwrap()
             .take()
             .expect("IcmpStats ban_cmd_rx already consumed");
-        // Move the XDP handle into the poll task — keeps it alive and accessible.
-        // DNS workers already have raw socket FDs and do not need this handle.
-        let mut xdp_h = _xdp_handle;
+        // Move the primary XDP handle into the poll task — keeps it alive.
+        // Additional handles (multi-interface) are kept alive in _xdp_handles_rest.
+        // DNS workers already have raw socket FDs and do not need these handles.
+        let mut xdp_h = if _xdp_handles.is_empty() { None } else { Some(_xdp_handles.remove(0)) };
+        // Keep remaining handles alive for their Drop (cleans up BPF programs)
+        let _xdp_handles_rest = _xdp_handles;
         // Local set of IPs currently banned in BPF — used to detect delta changes.
         let mut bpf_banned: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut blacklist_reload_rx = blacklist_reload_rx;
@@ -446,14 +463,14 @@ async fn async_main(
                 _ = term.recv() => { info!("SIGTERM received — graceful shutdown"); }
                 _ = intr.recv() => { info!("SIGINT received — graceful shutdown"); }
             }
-            // Drop the GovernorGuard explicitly: restores the CPU frequency
-            // governor on each XDP core synchronously before exit (#158).
-            // take() ensures idempotency if Drop also runs on a clean path.
+            // Drop all GovernorGuards: restores CPU governor on every XDP core (#158).
+            // Multi-interface: one guard per interface; each core returns to its original governor.
             #[cfg(feature = "xdp")]
-            if let Ok(mut guard) = gg.lock() {
-                if let Some(g) = guard.take() {
-                    drop(g);
-                    info!("CPU governor restored — XDP cores back to original governor");
+            if let Ok(mut guards) = gg.lock() {
+                let count = guards.len();
+                guards.drain(..).for_each(drop);
+                if count > 0 {
+                    info!(cores = count, "CPU governor restored on all XDP interfaces");
                 }
             }
             std::process::exit(0);

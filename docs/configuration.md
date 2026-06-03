@@ -557,11 +557,27 @@ IP address. In multi-NIC systems this may silently pick the wrong interface.
 Use `xdp-interface:` to pin XDP to a specific NIC:
 
 ```
-# Dual-NIC setup: virtio for management, X520 for DNS
-# Without this directive, Runbound may pick the wrong interface
+# Single NIC — explicit
 server:
     xdp-interface: eth1
+
+# Dual-NIC 10G — bind XDP on both fibres simultaneously
+server:
+    xdp-interface: nic2,nic3
+
+# Auto-detect all eligible physical interfaces (UP, non-bonded, non-virtual)
+server:
+    xdp-interface: auto
 ```
+
+**Multi-interface mode** ( or ): Runbound binds an independent
+AF_XDP socket set and worker pool on each interface. Useful for multi-fibre setups
+where a single 10 GbE card is the bottleneck. XDP is **not compatible with bonding**
+— use independent interfaces, never a bond master.
+
+The  mode enumerates  and skips: , bridges (,
+), , , bonded interfaces (master or slave). A WARN is logged for
+each skipped bonded interface.
 
 Set `xdp-interface: none` to disable XDP via the interface override — equivalent to
 `xdp: no` but leaves the `xdp:` directive unchanged for other hosts sharing the
