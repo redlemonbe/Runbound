@@ -1,37 +1,7 @@
 # Runbound — FINDINGS (agent Nexus)
 
 **Branche de travail :** `perf/xdp-fastpath`  
-**Dernier commit ingéré :** `81591c5` (2026-06-03 13:17:54 — identique à `main`)  
-**Mis à jour :** 2026-06-03
-
----
-
-## ÉTAPE 0 : Ingestion — statut
-
-| Fichier | Lu | Notes |
-|---------|----|-----------|
-| README.md | ✅ | Drop-in Unbound, XDP commercial license, 4.77M QPS table |
-| CLAUDE.md | ✅ | Absent du repo |
-| Cargo.toml | ✅ | v0.9.65, feature xdp = dep:aya, musl, thin-LTO strip |
-| docs/benchmark/v0.9.65.md | ✅ | **Référence perf** — 4.77M QPS, p50 1.25ms, p99 3.72ms |
-| docs/xdp.md | ✅ | Architecture, requirements, modes, SIMD dispatch |
-| docs/internals.md | ✅ | Pipeline ZC, CPUMAP FNV-1a hash, XSKMAP limits |
-| docs/performance.md | ✅ | Tableau historique bench |
-| docs/configuration.md | ✅ | Directives xdp-domain-routing, benchmark.conf |
-| docs/git-workflow.md | ✅ | Solo maintainer, enforce_admins, PR flow |
-| docs/security-audit/SECURITY-AUDIT.md | ✅ | 12 conventions audit, 0 finding ouvert à v0.9.50 |
-| src/cpu.rs | ✅ | physical_cores() — thread_siblings_list, min du groupe |
-| src/dns/xdp/loader.rs | ✅ | XdpHandle::load(), init_cpumap() (blob partiel ~7k) |
-| src/dns/xdp/worker.rs | ✅ | start_xdp(), start_xdp_on_iface() (blob partiel) |
-| src/dns/xdp/mod.rs | ✅ | Inventaire unsafe, modules |
-| src/dns/xdp/socket.rs | ✅ (listing) | create_xsk_socket, maximize_nic_ring |
-| src/dns/xdp/umem.rs | ✅ | FRAME_SIZE=4096, XdpRingSizes, AddrRing/DescRing |
-| ebpf/dns_xdp.c | ✅ | XSKMAP max=64, CPUMAP max=256, NB_WORKERS, FNV-1a QNAME hash |
-| examples/benchmark.conf | ✅ | xdp-domain-routing: yes (problème documenté ci-dessous) |
-| docs/benchmark/v0.9.45.md | listing |
-| docs/benchmark/v0.9.46.md | listing |
-
-**Fichiers encore à lire :** init_cpumap() complet (blob tronqué), hot loop worker.rs (~300+), simd.rs, hasher.rs, docs restants (hardening, security, ha, sync, api, web-ui, troubleshooting…)
+**Mis à jour :** 2026-06-03 (session #155 — commits 1-3 approuvés, C4 en cours)
 
 ---
 
@@ -41,72 +11,126 @@
 Hardware  : Intel Xeon E5-2690 v2 ×2 (40C/80T), NIC Intel X520/82599
 Mode      : AF_XDP DRV zero-copy (ixgbe)
 Queues    : 16 (RSS 82599 max)
-Workers   : 16 threads XDP sur cœurs physiques
+Workers   : 16 threads XDP sur cœurs physiques 0-15
 QPS       : 4,772,073
 p50       : 1.251 ms   p99: 3.719 ms   p999: 4.065 ms
 Flood     : 12.3M pps tenu sans crash
 Condition : ethtool -N nic3 rx-flow-hash udp4 sdfn
             ethtool -A nic3 rx off tx off
             rate-limit: 0, local-zone wildcard → IP publique
+            dnsmark ≥ v1.2.1, --max-outstanding 0, port source varié
 ```
 
-**~298k qps/cœur ZC.** Plafond = RSS 82599 (16 rings max). Sur X520, plafond réaliste ~6M (20 cœurs physiques).
+**~298k qps/cœur ZC.** Plafond RSS 82599 = 16 rings max. Plafond réaliste X520 ~6M (20 cœurs physiques).
 
 ---
 
-## Issue #155 — xdp-domain-routing (CPUMAP) casse le fast path
+## Issue #155 — CPUMAP casse le fast path ZC
 
 ### Symptôme mesuré
-- `xdp-domain-routing: yes` engage 40 cœurs MAIS → **120k qps** (×40 pire que 4.77M)
-- Cause 1 : CPUMAP redirect repasse par le stack kernel → perd le zerocopy
-- Cause 2 : `init_cpumap()` mappe les entrées vers des CPU IDs bruts (0..NB_WORKERS) sans consulter `physical_cores()` → route sur des siblings HT (cpu24-38 sur le Xeon)
+- `xdp-domain-routing: yes` → **120k qps** au lieu de 4.77M (**×40 pire**)
+- Cause 1 : `bpf_redirect_map(CPUMAP)` ré-enfile le paquet sur le backlog/NAPI du CPU cible  
+  (nouveau contexte, hors ring driver ZC) → chemin copy/skb
+- Cause 2 : `init_cpumap()` initialisait les entrées CPUMAP avec des CPU IDs bruts (0..NB_WORKERS)  
+  sans consulter `physical_cores()` → routage sur siblings HT (cpu20-39 sur E5-2690 v2)
 
-### Localisation du bug (vérifiée en source)
-- `src/dns/xdp/loader.rs` : `init_cpumap(effective_workers)` — **code exact à relire** (blob tronqué)
-- `ebpf/dns_xdp.c` : `bpf_redirect_map(&CPUMAP, h % nb_workers, XDP_PASS)` — le CPUMAP index = hash % nb_workers, mappé vers un CPU ID
-- `src/dns/xdp/worker.rs` : `XdpHandle::load(iface, queue_count, domain_routing)` avec `nb_workers = queue_count`
+### Décision d'architecte (2026-06-03) — ACTÉE
+- **CPUMAP et ZC sont mutuellement exclusifs.** Structurel : impossible de préserver le ZC  
+  dans un `bpf_redirect_map(CPUMAP)` (kthread NAPI, hors contexte driver).
+- **ZC gagne sur interface ZC.** `domain_routing` reste disponible uniquement en mode  
+  SKB/copy (sa localité cache a un sens là uniquement).
 
-### Plan #155 — 3 commits atomiques
+### Commits posés (branche perf/xdp-fastpath)
 
-**Commit 1 — fix HT (safe, ne touche pas au ZC)** :
-- Dans `init_cpumap()` : remplacer le mapping `[i → i]` par `[i → physical_cores()[i % physical_cores().len()]]`
-- NB_WORKERS injecté = `physical_cores().len().min(queue_count)` (ou queue_count, selon ce que révèle la lecture complète d'init_cpumap)
-
-**Commit 2 — WARN CPUMAP + ZC** :
-- Dans `start_xdp_on_iface()` : si `domain_routing=true` ET `mode=DRV` → émettre un `tracing::warn!` explicite
-- Message : "xdp-domain-routing: yes redirects via CPUMAP which breaks AF_XDP zero-copy (measured: ×40 throughput drop). Disable for maximum QPS. Use only for cache-locality on non-ZC paths."
-
-**Commit 3 — benchmark.conf corrigé** :
-- Changer `xdp-domain-routing: yes` → `xdp-domain-routing: no` dans `examples/benchmark.conf`
-- Ajouter un commentaire expliquant pourquoi
-
-**Commit 4 (optionnel, exploratoire) — gate OFF domain_routing sur interface ZC** :
-- Si `domain_routing=true` ET mode=DRV détecté après attach → forcer `domain_routing=false`, logger WARN
-- À discuter avec l'architecte avant d'implémenter (comportement-surprise possible)
-
-### Question à trancher avant le commit 4
-CPUMAP peut-il préserver le ZC en chaînant vers un XSK sur le CPU cible ? Réponse probable : non (CPUMAP reschedulée par kthread, perd le contexte XDP driver). À confirmer en doc kernel (kernel.org/doc/html/latest/networking/af_xdp.html) avant de décider.
+| # | Commit | Statut | Hash |
+|---|--------|--------|------|
+| 1 | `fix(xdp): #155 init_cpumap uses physical_cores() — no HT siblings` | ✅ APPROUVÉ | `3a7aa67` |
+| 2 | `warn(xdp): #155 domain-routing breaks ZC — runtime warning` | ✅ APPROUVÉ | `bf8f8cd` |
+| 3 | `conf(benchmark): #155 fix two silent traps in benchmark.conf` | ✅ poussé, en review | `b74c83f` |
+| 4 | `fix(xdp): #155 gate domain-routing OFF when ZC active` | ⏳ à coder | — |
 
 ---
 
-## Issue #156 — Monter sur X520 sans casser le ZC (exploratoire)
+### Détail Commit 1 — physical_cores() dans init_cpumap()
 
-### Piste 1 : cross-queue XSK redirect en ZC
-- Rediriger un paquet reçu sur RX queue N vers un XSK lié à la queue M, en ZC, sur ixgbe
-- Si faisable → 16 → 20 cœurs physiques (les 4 cœurs 16-19 idle sur le bench)
-- **Non vérifié** — à rechercher dans la doc ixgbe et les patchsets AF_XDP upstream
+**Bug :** `for cpu_idx in 0..nb_workers { cpu_map.set(cpu_idx, ...) }` — clé = CPU ID brut.  
+Sur E5-2690 v2, siblings = cpu20-39 → si queue_count>20, entrées CPUMAP sur HT.
 
-### Piste 2 : efficacité par cœur (profiling hot path worker.rs)
-- Identifier où passe le temps par paquet : parse eth/ip/udp/dns → lookup LocalZoneSet/cache snapshot → build réponse → enqueue TX
-- À faire : `perf stat -e cache-misses,instructions,cycles` sur un worker thread en bench
-- Gain per-cœur → gain global sans toucher au NIC
+**Fix :**
+- Dans `load()` : `effective_workers = nb_workers.max(1).min(phys_count)` (plafonne NB_WORKERS eBPF)
+- Dans `init_cpumap()` : itère sur `physical_cores()[0..n]`, initialise `CPUMAP[phys[i]]`
+- WARN bruyant si `cpu_id != i as u32` (topologie non-linéaire — perte silencieuse signalée)
+
+**Limite connue (follow-up #155) :** sur NUMA exotique avec IDs physiques non-contigus (ex: [0,2,4,…]),
+l'eBPF hash `h % NB_WORKERS` produit des clés 0..N-1 mais seules les clés paires seraient initialisées
+→ perte silencieuse de paquets (XDP_PASS). Vraie robustesse = table d'indirection `worker_slot → cpu_id`
+dans l'eBPF. Non requis sur hardware supporté (Intel/AMD : physiques = 0..N-1 contigus, vérifié sur E5-2690 v2).
 
 ---
 
-## Règles absolues rappelées
+### Détail Commit 2 — WARN démarrage
+
+**Point d'injection :** `loader.rs::load()`, après l'attach XDP (mode connu), avant `init_cpumap()`.  
+**Condition :** `actual_routing && matches!(mode, XdpMode::Drv)`
+
+**⚠️ Notes architecte pour Commit 4 (à appliquer) :**
+
+1. **DRV ≠ ZC strict** : `XdpMode::Drv` = driver natif XDP, pas nécessairement ZC actif  
+   (on peut avoir DRV + XDP_COPY si le bind ZC échoue). Vérité terrain = `sock.zerocopy`  
+   par socket, connu après `load()`. Pour WARN, DRV est proxy acceptable.  
+   Pour gate-off dur (C4) : préférer `sock.zerocopy` si atteignable ; sinon DRV reste raisonnable.  
+   **Ne pas désactiver domain-routing sur DRV+copy** (pas de ZC à protéger dans ce cas).
+
+2. **Réconcilier WARN et gate (Commit 4) :** si C4 met `actual_routing = false` sur interface ZC,  
+   le WARN actuel (sur `actual_routing`) ne se déclenchera plus — contradiction.  
+   → **Solution C4 :** garder `requested_domain_routing` (config brute), faire le WARN sur  
+   `requested_domain_routing && ZC_active`, wording :  
+   _"xdp-domain-routing: yes IGNORÉ sur interface zerocopy — casserait le ZC (×40).  
+   domain-routing actif uniquement en mode SKB/copy."_  
+   L'utilisateur doit savoir que sa conf a été neutralisée, pas juste "accepte la régression".
+
+---
+
+### Détail Commit 3 — benchmark.conf
+
+**Bombe 1 :** `xdp-domain-routing: yes` → `no` + commentaire `!! BENCHMARK TRAP` explicite.  
+**Bombe 2 :** exemples `local-data: 10.0.0.1/10.0.0.2` → `203.0.113.1/203.0.113.2`  
+(RFC 5737 TEST-NET-3, non routé, non bloqué par `private-address`).  
+`private-address: 10.0.0.0/8` conservé (protection anti-rebinding légitime).  
+Ajout commentaire `!! BENCHMARK TRAP` expliquant l'interaction private-address/local-data.
+
+---
+
+### Commit 4 — plan (à coder après feu vert Commit 3)
+
+- Lire `worker.rs` : où et quand `sock.zerocopy` est connu (après bind XSK)
+- Si `sock.zerocopy` accessible depuis `loader.rs::load()` → gate-off sur signal réel
+- Sinon → gate-off sur `XdpMode::Drv` (proxy raisonnable, note 1 ci-dessus)
+- Séparer `requested_domain_routing` (config) vs `actual_routing` (effective)
+- WARN sur `requested` (pas `actual`) avec wording "IGNORÉ" — l'utilisateur doit savoir
+- Garder `domain_routing` fonctionnel en `XdpMode::Skb` (son cas d'usage légitime)
+
+---
+
+## Issue #156 — Monter sur X520 sans casser le ZC (exploratoire, après #155)
+
+### Piste 1 : cross-queue XSK redirect ZC
+- Rediriger RX queue N → XSK queue M en ZC sur ixgbe — à valider en source ixgbe
+- Si faisable → 16→20 cœurs physiques (cœurs 16-19 idle au bench actuel)
+
+### Piste 2 : efficacité par cœur
+- Profiler hot path worker.rs (parse eth/ip/udp/dns → lookup → build réponse → TX)
+- `perf stat -e cache-misses,instructions,cycles` sur worker thread en bench
+- Gain per-cœur → gain global sans toucher NIC
+
+---
+
+## Règles absolues
 
 1. Ne jamais toucher `main` — commits sur `perf/xdp-fastpath` uniquement
-2. ZC (AF_XDP DRV) est sacré — toute régression ZC est inacceptable
-3. Cœurs physiques uniquement via `cpu::physical_cores()` — jamais de siblings HT
-4. Mesure débit bout en bout, jamais de métrique-proxy
+2. ZC (AF_XDP DRV) sacré — toute régression ZC est inacceptable
+3. `cpu::physical_cores()` obligatoire pour tout placement worker/CPUMAP
+4. Mesure débit bout en bout — jamais de métrique-proxy
 5. AGPL-3.0 headers sur tous les nouveaux fichiers
+6. Bench de validation obligatoire avant tout merge dans main :  
+   domain_routing OFF → ≥4.77M qps, ZC actif, cœurs 0-15 physiques uniquement, p99 stable, zéro crash
