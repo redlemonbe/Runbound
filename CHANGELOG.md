@@ -9,6 +9,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.67] — 2026-06-03
+
+### Added
+
+- **EDNS OPT echo in the XDP wire fast path** (#156): the hand-rolled wire builder now parses the query OPT RR and echoes a correct OPT record (advertised UDP payload size) in local-zone A/AAAA answers, so the fast path serves real EDNS traffic instead of falling back to hickory. Queries with DO=1 (DNSSEC) still fall back to hickory.
+
+### Changed
+
+- **Local-zone lookup no longer allocates per packet** (#156): `LocalZoneSet` gained a wire-QNAME index (`WireRecordIndex`, CRC32c-keyed via an identity hasher) holding pre-serialised A/AAAA rdata. The A/AAAA hot path now lowercases the QNAME in place and looks up by hash, eliminating the last per-packet hickory allocations (`Name::read`, `LowerName::from`, the `Vec<&Record>` and RData dispatch). A round-trip test pins the in-place normalisation byte-identical to the load-side serialisation.
+
+### Performance
+
+- Controlled A/B on an X520 10 GbE link (performance governor, warm, 5-run medians): local-zone A/AAAA answer path **~6.80M → ~7.18M qps (+6%)** vs v0.9.66, p50 unchanged (~0.33ms). Note: absolute throughput is CPU-governor dependent — the v0.9.66 figures (~4.6M) were measured without the performance governor pinned; with it pinned both versions run ~7M.
+
+---
+
 ## [0.9.66] — 2026-06-03
 
 ### Added
