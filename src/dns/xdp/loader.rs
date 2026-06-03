@@ -160,6 +160,24 @@ impl XdpHandle {
             governor_backups: Vec::new(),
         };
 
+        // #155 — WARN: domain-routing (CPUMAP) is mutually exclusive with zerocopy.
+        //
+        // bpf_redirect_map(CPUMAP) re-queues the packet on the target CPU's NAPI
+        // backlog (new scheduling context, outside the driver ZC ring) — the frame
+        // is no longer in the original DRV ZC ring → copy/SKB path.  Measured impact:
+        // 4.77 M qps (ZC) → 120 k qps (CPUMAP redirect) = ×40 regression (#155).
+        //
+        // Design decision (architect, 2026-06-03): ZC wins on ZC-capable interfaces.
+        // domain-routing is intentionally left available in SKB/copy mode where its
+        // cache-locality intent still makes sense (Commit 4 will gate it OFF in ZC).
+        if actual_routing && matches!(mode, XdpMode::Drv) {
+            tracing::warn!(
+                iface          = %iface,
+                xdp_mode       = "DRV (zerocopy)",
+                "xdp-domain-routing is enabled on a zerocopy-capable interface.                  CPUMAP redirect exits the ZC ring (bpf_redirect_map re-queues via                  NAPI backlog) — measured throughput drop: 4.77 M → 120 k qps (×40).                  Disable xdp-domain-routing on ZC interfaces or accept the regression.                  (#155 — gate-off enforcement coming in next commit)"
+            );
+        }
+
         // Init CPUMAP entries when domain routing is enabled.
         // Silently skip on any error so the XDP path still works via XSKMAP fallback.
         if actual_routing {
