@@ -79,6 +79,36 @@ const PROTO_UDP: u8 = 17;
 /// to skip XDP entirely without editing the config file. Useful when the host
 /// is unreachable after XDP bricks the network and rescue-mode boot is needed.
 #[allow(clippy::too_many_arguments)]
+
+// ── debug/xdp-tx-multi : per-interface TX instrumentation ─────────────────────
+use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+
+/// Counters shared across all workers of ONE interface.
+/// Logged 1×/sec by a dedicated logger thread; reset after each log.
+pub(crate) struct XdpIfaceCounters {
+    pub iface:           String,
+    pub rx_drained:      AtomicU64,
+    pub answers_built:   AtomicU64,
+    pub tx_enqueued:     AtomicU64,
+    pub tx_kicks:        AtomicU64,
+    pub tx_completed:    AtomicU64,
+    pub tx_free_empty:   AtomicU64,
+}
+impl XdpIfaceCounters {
+    pub fn new(iface: &str) -> Arc<Self> {
+        Arc::new(Self {
+            iface:         iface.to_owned(),
+            rx_drained:    AtomicU64::new(0),
+            answers_built: AtomicU64::new(0),
+            tx_enqueued:   AtomicU64::new(0),
+            tx_kicks:      AtomicU64::new(0),
+            tx_completed:  AtomicU64::new(0),
+            tx_free_empty: AtomicU64::new(0),
+        })
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub fn start_xdp(
     iface: &str,
     zones: Arc<ArcSwap<LocalZoneSet>>,
@@ -421,6 +451,35 @@ fn start_xdp_on_iface(
         }
     }
 
+    // debug/xdp-tx-multi: per-interface instrumentation counters
+    let iface_ctr = XdpIfaceCounters::new(iface);
+    {
+        // Logger thread: logs 6 counters 1×/sec then resets them.
+        let ctr = Arc::clone(&iface_ctr);
+        std::thread::Builder::new()
+            .name(format!("xdp-log-{iface}"))
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let rx  = ctr.rx_drained.swap(0, AOrdering::Relaxed);
+                let ans = ctr.answers_built.swap(0, AOrdering::Relaxed);
+                let enq = ctr.tx_enqueued.swap(0, AOrdering::Relaxed);
+                let kck = ctr.tx_kicks.swap(0, AOrdering::Relaxed);
+                let cmp = ctr.tx_completed.swap(0, AOrdering::Relaxed);
+                let emp = ctr.tx_free_empty.swap(0, AOrdering::Relaxed);
+                tracing::info!(
+                    iface = %ctr.iface,
+                    rx_drained    = rx,
+                    answers_built = ans,
+                    tx_enqueued   = enq,
+                    tx_kicks      = kck,
+                    tx_completed  = cmp,
+                    tx_free_empty = emp,
+                    "[DBG-TX] per-interface counters"
+                );
+            })
+            .ok();
+    }
+
     // #68: build queue→core map for IRQ affinity pinning after thread spawn.
     let mut queue_to_core: Vec<(u32, usize)> = Vec::with_capacity(sockets.len());
     for (q, sock) in sockets {
@@ -442,7 +501,10 @@ fn start_xdp_on_iface(
         let ds = Arc::clone(&domain_stats);
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
-            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cs, q_idx, st, ds, busy_poll))
+            .spawn({
+                let ctr = Arc::clone(&iface_ctr);
+                move || xdp_worker(sock, z, rl, acl, core_id, cs, q_idx, st, ds, busy_poll, ctr)
+            })
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
@@ -639,6 +701,7 @@ fn xdp_worker(
     stats: Arc<crate::stats::Stats>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
     busy_poll: bool,
+    counters: Arc<XdpIfaceCounters>,
 ) {
     use libc::{poll, pollfd, POLLIN};
 
@@ -663,7 +726,15 @@ fn xdp_worker(
     let max_empty_spins: u32 = if busy_poll { 1024 } else { 0 };
 
     loop {
+        let tx_free_before = sock.umem.tx_free.len() as u64;
         sock.umem.reclaim_tx();
+        let tx_free_after = sock.umem.tx_free.len() as u64;
+        if tx_free_after > tx_free_before {
+            counters.tx_completed.fetch_add(tx_free_after - tx_free_before, AOrdering::Relaxed);
+        }
+        if sock.umem.tx_free.is_empty() {
+            counters.tx_free_empty.fetch_add(1, AOrdering::Relaxed);
+        }
 
         rxds.clear();
         sock.rx.consume_rx_into(&mut rxds);
@@ -683,6 +754,7 @@ fn xdp_worker(
         }
         // Ring had data — reset spin counter and process the batch.
         empty_spins = 0;
+        counters.rx_drained.fetch_add(rxds.len() as u64, AOrdering::Relaxed);
 
         let snapshot = zones.load();
         // #60: load the frozen cache snapshot once per batch — zero-lock read.
@@ -815,6 +887,7 @@ fn xdp_worker(
                             crate::dns::cache_snapshot::XDP_WORKER_PKTS[worker_id]
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
+                        counters.answers_built.fetch_add(1, AOrdering::Relaxed);
                         tx_descs.push(XdpDesc {
                             addr: tx_addr,
                             len: tx_len as u32,
@@ -832,6 +905,7 @@ fn xdp_worker(
         sock.umem.fill.enqueue_batch(&rx_addrs);
 
         if !tx_descs.is_empty() {
+            counters.tx_enqueued.fetch_add(tx_descs.len() as u64, AOrdering::Relaxed);
             sock.tx.enqueue_tx(&tx_descs);
 
             // Kick the driver.
@@ -855,6 +929,7 @@ fn xdp_worker(
             // batch, so it is not on the hot path under normal load.
             let need_kick = sock.tx.needs_wakeup() || sock.umem.tx_free.is_empty();
             if need_kick {
+                counters.tx_kicks.fetch_add(1, AOrdering::Relaxed);
                 // SAFETY: `sock.fd` is a valid AF_XDP socket fd owned by `XskSocket`.
                 //         Passing null pointers with length 0 and MSG_DONTWAIT is the
                 //         documented way to kick the TX driver without sending data.
@@ -873,6 +948,7 @@ fn xdp_worker(
             // No new TX this batch but tx_free is exhausted — the kernel is
             // holding frames in the TX ring that it hasn't completed yet.
             // Kick unconditionally to unblock the completion queue.
+            counters.tx_kicks.fetch_add(1, AOrdering::Relaxed);
             // SAFETY: same as above.
             unsafe {
                 libc::sendto(
