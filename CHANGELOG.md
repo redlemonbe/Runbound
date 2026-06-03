@@ -9,6 +9,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.69] — 2026-06-03
+
+### Added
+
+- **Incremental IPv4 header checksum (RFC 1624)** on the XDP wire-builder response path (#156): the response checksum is updated from the request's already-valid checksum (only `total_length` differs between query and reply; the src/dst address swap is checksum-neutral) instead of a full recompute over the header. `ipv4_checksum` was the #2 CPU hotspot (~20% of per-packet CPU) under `perf`; the incremental update removes it. This is a CPU-efficiency and latency improvement. On a 10 GbE link the A/AAAA answer path is RX/NIC-bound (not CPU-bound), so single-link peak throughput is unchanged — the freed headroom matters for CPU-bound or 25 GbE+ deployments. A round-trip test pins the incremental result byte-identical to the full recompute.
+- **`xdp-busy-poll` config option** (default `yes`): the XDP worker drains the RX ring before sleeping (drain-first) and sets the NAPI busy-poll socket hints (`SO_PREFER_BUSY_POLL`, `SO_BUSY_POLL`, `SO_BUSY_POLL_BUDGET`), best-effort with silent fallback on older kernels. This reduces first-packet latency at low/idle load. Under saturation it is a no-op (`poll()` returns immediately when frames are queued, so drain-first and poll-first are equivalent) — peak throughput is unchanged. Set `xdp-busy-poll: no` for the legacy poll-first loop.
+
+### Performance
+
+- Reference benchmark (see `docs/benchmark/v0.9.69.md`): **8.83M qps** on the local-zone A answer path, measured at the receiver NIC counters on a **2013 dual Xeon E5-2690 v2** (16 RSS cores, 53% CPU) under a 10 GbE saturating flood — **~78% of the 10 GbE fibre line-rate**. The receiver is RX/NIC-buffer-bound, not CPU-bound, at this operating point.
+
+---
+
 ## [0.9.68] — 2026-06-03
 
 ### Added
