@@ -438,3 +438,43 @@ icmp {
 | `icmp_rate_limit` | LRU_HASH | 65536 | Per-source-IP token bucket state |
 
 Stats and config are accessible via REST API (see [api.md](api.md)).
+
+---
+
+## Multi-interface XDP (`xdp-interface: nic2,nic3` / `auto`)
+
+Runbound can bind AF_XDP simultaneously on N independent NICs. Each interface
+gets its own socket set, UMEM regions, and worker thread pool.
+
+### Configuration
+
+```yaml
+server:
+    xdp-interface: nic2,nic3   # explicit list (comma-separated, no spaces)
+    # or
+    xdp-interface: auto        # enumerate all eligible physical interfaces
+```
+
+### Auto-detection eligibility
+
+`auto` mode enumerates `/sys/class/net/` and binds all interfaces that are:
+- **UP** (IFF_UP flag set)
+- **Physical** (has `/sys/class/net/<iface>/device` symlink)
+- **Not excluded**: `lo`, `vmbr*`, `br*`, `tap*`, `veth*`
+- **Not bonded** (master bond or slave) — AF_XDP is incompatible with bonding;
+  a WARN is logged: `skipping bonded interface X — XDP incompatible with bonding`
+
+### Bonding incompatibility
+
+XDP zerocopy requires direct access to the NIC's RX ring queues. A bond master
+virtualises these queues, making AF_XDP ZC impossible. Use independent physical
+NICs, never a bond master, for multi-interface XDP.
+
+### Logs
+
+```
+INFO  XDP active on 2 interface(s) interfaces=["nic2", "nic3"]
+INFO  XDP fast path active iface=nic2 mode=Drv
+INFO  XDP fast path active iface=nic3 mode=Drv
+WARN  XDP auto: skipping bonded interface bond0 — XDP incompatible with bonding
+```

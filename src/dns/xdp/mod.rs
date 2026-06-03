@@ -92,6 +92,6 @@ pub(super) mod worker;
 pub use umem::XdpRingSizes;
 
 #[cfg(feature = "xdp")]
-pub use loader::XdpMode;
+pub use loader::{XdpMode, XdpHandle};
 #[cfg(feature = "xdp")]
-pub use worker::start_xdp;
+pub use worker::start_xdp_multi;
