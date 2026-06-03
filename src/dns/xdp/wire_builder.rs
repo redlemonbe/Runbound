@@ -46,6 +46,19 @@ const CLASS_IN: u16 = 1;
 
 // ── Parsed query (stack-only) ─────────────────────────────────────────────────
 
+/// EDNS0 OPT RR info extracted from the query's additional section.
+///
+/// Only populated when arcount>0 and an OPT RR (type=41) is found.
+/// `do_bit=true` means the client requests DNSSEC → caller must fallback to hickory.
+#[derive(Clone, Copy, Debug)]
+pub struct EdnsInfo {
+    /// UDP payload size (class field of OPT RR) — echo in response.
+    pub udp_payload: u16,
+    /// DNSSEC OK bit (bit 15 of OPT TTL extended field).
+    /// If true → caller MUST fallback to hickory (DNSSEC not handled in wire path).
+    pub do_bit: bool,
+}
+
 /// Minimal parsed DNS query — no heap allocation.
 pub struct WireQuery<'a> {
     /// Transaction ID (2 bytes, big-endian from wire).
@@ -57,8 +70,10 @@ pub struct WireQuery<'a> {
     pub qtype: u16,
     /// Query class (should be IN=1 for normal queries).
     pub qclass: u16,
-    /// True if the query has an OPT RR (EDNS0, arcount > 0).
-    pub has_edns: bool,
+    /// EDNS0 info if the query carries an OPT RR (arcount > 0).
+    /// None = no EDNS (dnsmark, legacy clients).
+    /// Some(e) with do_bit=true → DNSSEC requested → fallback hickory.
+    pub edns: Option<EdnsInfo>,
 }
 
 // ── Parse ─────────────────────────────────────────────────────────────────────
@@ -108,59 +123,77 @@ pub fn parse_query(buf: &[u8]) -> Option<WireQuery<'_>> {
     let qtype  = u16::from_be_bytes([buf[qname_end],     buf[qname_end + 1]]);
     let qclass = u16::from_be_bytes([buf[qname_end + 2], buf[qname_end + 3]]);
 
-    // Detect EDNS: scan additional records for an OPT RR (type 41).
-    // We don't parse OPT fully here — just set has_edns for the caller.
-    let has_edns = detect_edns(buf, qname_end + 4, arcount);
+    // Parse EDNS OPT RR if present (arcount > 0).
+    // Extracts udp_payload + do_bit for OPT echo in the response.
+    let edns = parse_opt_rr(buf, qname_end + 4, arcount);
 
     Some(WireQuery {
         id,
         qname_wire: &buf[qname_start..qname_end],
         qtype,
         qclass,
-        has_edns,
+        edns,
     })
 }
 
-/// Scan the additional section for an OPT RR (qtype=41).
-/// Fast path: most queries have arcount=0 → returns immediately.
+/// Parse the additional section for an OPT RR (type=41, RFC 6891).
+///
+/// Fast path: arcount=0 → returns None immediately (no scan).
+/// Returns Some(EdnsInfo) if an OPT RR is found and parseable.
+/// Returns None if no OPT is found or the buffer is truncated.
+///
+/// # Security
+/// All buffer accesses are bounds-checked. A truncated or malformed
+/// additional section yields None without panicking (#156 security review).
 #[inline]
-fn detect_edns(buf: &[u8], mut pos: usize, arcount: u16) -> bool {
+fn parse_opt_rr(buf: &[u8], mut pos: usize, arcount: u16) -> Option<EdnsInfo> {
     if arcount == 0 {
-        return false;
+        return None;
     }
-    // Skip answer + authority sections (ancount=nscount=0 in a query).
-    // Scan arcount RRs looking for OPT.
+    // Scan arcount additional RRs for OPT (ancount=nscount=0 in a query).
     for _ in 0..arcount {
-        // Each RR starts with a name (possibly compressed or root \0).
         if pos >= buf.len() {
             break;
         }
-        // Root label (\0) = 1 byte name. Compressed ptr = 2 bytes (0xC0xx).
+        // Name field: root label (\0, 1B) or compression ptr (0xC0xx, 2B).
+        // OPT MUST use root label per RFC 6891 §6.1.2.
         let name_len = if buf[pos] == 0x00 {
             1usize
         } else if buf[pos] & 0xC0 == 0xC0 {
             2usize
         } else {
-            // Full label scan — rare in queries, bail out conservatively.
-            return false;
+            // Full-label name — OPT never has this; bail conservatively.
+            return None;
         };
         pos += name_len;
+        // Need at least type(2)+class(2) to identify the RR.
         if pos + 4 > buf.len() {
             break;
         }
         let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
         if rtype == QTYPE_OPT {
-            return true;
+            // OPT RR found. Need pos+10 to read class(2)+ttl(4)+rdlen(2).
+            // Guard: pos+10 <= buf.len() (same bound as the security fix).
+            if pos + 10 > buf.len() {
+                // Truncated OPT — treat as no EDNS (conservative).
+                return None;
+            }
+            // class field = requestor's UDP payload size.
+            let udp_payload = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+            // TTL field (4B): bits [31:16]=ext-rcode+version, bit 15=DO.
+            // buf[pos+4] = high byte of TTL = ext-rcode (8b); buf[pos+5] = version (8b).
+            // buf[pos+6] = high byte of flags: bit 7 = DO.
+            let do_bit = buf[pos + 6] & 0x80 != 0;
+            return Some(EdnsInfo { udp_payload, do_bit });
         }
-        // Skip remainder of this RR: type(2) + class(2) + ttl(4) + rdlen(2) + rdata.
-        // Need pos+10 <= len to safely read buf[pos+8] AND buf[pos+9] (#156 sec).
+        // Not OPT — skip this RR. Need pos+10 to read rdlen at pos+8/pos+9.
         if pos + 10 > buf.len() {
             break;
         }
         let rdlen = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
         pos += 10 + rdlen;
     }
-    false
+    None
 }
 
 // ── LowerName from wire QNAME ─────────────────────────────────────────────────
@@ -199,6 +232,30 @@ fn put_u32(buf: &mut [u8], pos: usize, val: u32) -> usize {
     pos + 4
 }
 
+/// Write a minimal OPT RR (RFC 6891) into `buf[pos..]`. Returns pos+11.
+///
+/// Wire layout (11 bytes, rdlen=0):
+/// ```text
+/// \0            (1B  root label — OPT owner name, RFC 6891 §6.1.2)
+/// 0x00 0x29     (2B  type = OPT = 41)
+/// payload(2B)   (2B  class = requestor UDP payload size, echoed)
+/// 0x00 0x00     (2B  ext-rcode=0, EDNS version=0)
+/// 0x00 0x00     (2B  Z flags: DO=0 — DNSSEC handled by hickory only)
+/// 0x00 0x00     (2B  rdlen=0 — no RDATA options)
+/// ```
+/// Total: 1+2+2+4+2 = 11 bytes.
+///
+/// # Precondition
+/// Caller must ensure `buf[pos..]` has at least 11 bytes (pre-checked via total size).
+#[inline(always)]
+fn write_opt_rr(buf: &mut [u8], pos: usize, udp_payload: u16) -> usize {
+    buf[pos] = 0x00;                              // root label (\0)
+    let pos = put_u16(buf, pos + 1, 41);          // type = OPT
+    let pos = put_u16(buf, pos, udp_payload);     // class = UDP payload size (echoed)
+    let pos = put_u32(buf, pos, 0x0000_0000);     // TTL: ext-rcode=0, version=0, DO=0, Z=0
+    put_u16(buf, pos, 0)                          // rdlen = 0
+}
+
 // ── Build A / AAAA response ───────────────────────────────────────────────────
 
 /// Build an authoritative A or AAAA response directly into `out`.
@@ -232,6 +289,7 @@ pub fn build_answer_a_aaaa(
     wq: &WireQuery<'_>,
     out: &mut [u8],
     records: &[&hickory_proto::rr::Record],
+    edns: Option<&EdnsInfo>,
 ) -> Option<usize> {
     // Caller is responsible for non-empty records and correct qtype/qclass.
     debug_assert!(!records.is_empty(), "build_answer_a_aaaa: empty records");
@@ -241,17 +299,20 @@ pub fn build_answer_a_aaaa(
         wq.qtype
     );
 
-    let ancount = records.len();
+    let ancount  = records.len();
     let qname_len = wq.qname_wire.len(); // includes terminating \0
+    let opt_size  = if edns.is_some() { 11 } else { 0 }; // OPT RR
 
     // Compute required output size.
-    // Header(12) + Question(qname + 4) + ancount * (2+2+2+4+2+rdlen)
+    // Header(12) + Question(qname + 4) + ancount * (ptr+type+class+ttl+rdlen+rdata) + OPT?
     let rdata_len: usize = if wq.qtype == QTYPE_A { 4 } else { 16 };
-    let rr_size = 2 + 2 + 2 + 4 + 2 + rdata_len; // ptr + type + class + ttl + rdlen + rdata
-    let total = DNS_HDR + qname_len + 4 + ancount * rr_size;
+    let rr_size = 2 + 2 + 2 + 4 + 2 + rdata_len; // ptr(2)+type(2)+class(2)+ttl(4)+rdlen(2)+rdata
+    let total = DNS_HDR + qname_len + 4 + ancount * rr_size + opt_size;
     if out.len() < total {
         return None; // buffer too small — should not happen (FRAME_SIZE >> DNS max)
     }
+
+    let arcount: u16 = if edns.is_some() { 1 } else { 0 };
 
     // ── Header (12 bytes) ──────────────────────────────────────────────────
     let mut pos = 0;
@@ -260,7 +321,7 @@ pub fn build_answer_a_aaaa(
     pos = put_u16(out, pos, 1);                        // QDCOUNT = 1
     pos = put_u16(out, pos, ancount as u16);           // ANCOUNT
     pos = put_u16(out, pos, 0);                        // NSCOUNT = 0
-    pos = put_u16(out, pos, 0);                        // ARCOUNT = 0
+    pos = put_u16(out, pos, arcount);                  // ARCOUNT (1 if OPT echo)
 
     // ── Question section (echo wire) ───────────────────────────────────────
     out[pos..pos + qname_len].copy_from_slice(wq.qname_wire);
@@ -294,6 +355,11 @@ pub fn build_answer_a_aaaa(
         pos += rdata_len;
     }
 
+    // ── Additional: OPT RR echo (RFC 6891 §7) ─────────────────────────────
+    if let Some(e) = edns {
+        pos = write_opt_rr(out, pos, e.udp_payload);
+    }
+
     Some(pos)
 }
 
@@ -313,23 +379,30 @@ fn write_header_and_question(
     qname:    &[u8],
     qtype:    u16,
     qclass:   u16,
+    edns:     Option<&EdnsInfo>,
 ) -> Option<usize> {
-    let qname_len = qname.len();
-    let total = DNS_HDR + qname_len + 4; // header + qname + qtype(2) + qclass(2)
+    let qname_len  = qname.len();
+    let opt_size   = if edns.is_some() { 11 } else { 0 }; // OPT RR = 11 bytes
+    let total      = DNS_HDR + qname_len + 4 + opt_size;
     if out.len() < total {
         return None;
     }
+    let arcount: u16 = if edns.is_some() { 1 } else { 0 };
     let mut pos = 0;
-    pos = put_u16(out, pos, id);       // ID
-    pos = put_u16(out, pos, flags);    // Flags
-    pos = put_u16(out, pos, 1);        // QDCOUNT = 1
-    pos = put_u16(out, pos, ancount);  // ANCOUNT
-    pos = put_u16(out, pos, 0);        // NSCOUNT = 0
-    pos = put_u16(out, pos, 0);        // ARCOUNT = 0
+    pos = put_u16(out, pos, id);        // ID
+    pos = put_u16(out, pos, flags);     // Flags
+    pos = put_u16(out, pos, 1);         // QDCOUNT = 1
+    pos = put_u16(out, pos, ancount);   // ANCOUNT
+    pos = put_u16(out, pos, 0);         // NSCOUNT = 0
+    pos = put_u16(out, pos, arcount);   // ARCOUNT (1 if OPT echo, 0 otherwise)
     out[pos..pos + qname_len].copy_from_slice(qname);
     pos += qname_len;
-    pos = put_u16(out, pos, qtype);    // QTYPE  (echo)
-    pos = put_u16(out, pos, qclass);   // QCLASS (echo)
+    pos = put_u16(out, pos, qtype);     // QTYPE  (echo)
+    pos = put_u16(out, pos, qclass);    // QCLASS (echo)
+    // Additional section: minimal OPT RR echo (RFC 6891 §7)
+    if let Some(e) = edns {
+        pos = write_opt_rr(out, pos, e.udp_payload);
+    }
     Some(pos)
 }
 
@@ -346,16 +419,8 @@ const FLAGS_REFUSED: u16 = 0x8585;
 /// acceptable, follow-up #156). dig reports `status: NXDOMAIN` correctly.
 ///
 /// Returns `Some(len)` on success, `None` if `out` is too small.
-pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
-    write_header_and_question(
-        out,
-        wq.id,
-        FLAGS_AA_NXDOMAIN,
-        0,
-        wq.qname_wire,
-        wq.qtype,
-        wq.qclass,
-    )
+pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8], edns: Option<&EdnsInfo>) -> Option<usize> {
+    write_header_and_question(out, wq.id, FLAGS_AA_NXDOMAIN, 0, wq.qname_wire, wq.qtype, wq.qclass, edns)
 }
 
 /// Build a NODATA response (NOERROR, ancount=0) directly into `out`.
@@ -370,17 +435,9 @@ pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
 /// currently falls back to hickory for empty-exact-match cases (which may be
 /// wildcards), so this is not yet wired into `answer_dns_wire`. Kept + unit-tested.
 #[allow(dead_code)]
-pub fn build_nodata(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
+pub fn build_nodata(wq: &WireQuery<'_>, out: &mut [u8], edns: Option<&EdnsInfo>) -> Option<usize> {
     // FLAGS_AA_NOERROR = 0x8580 (QR=1 AA=1 RD=1 RA=1 RCODE=0)
-    write_header_and_question(
-        out,
-        wq.id,
-        FLAGS_AA_NOERROR,
-        0,
-        wq.qname_wire,
-        wq.qtype,
-        wq.qclass,
-    )
+    write_header_and_question(out, wq.id, FLAGS_AA_NOERROR, 0, wq.qname_wire, wq.qtype, wq.qclass, edns)
 }
 
 /// Build a REFUSED response directly into `out`.
@@ -390,16 +447,8 @@ pub fn build_nodata(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
 /// AA=0 (not authoritative — we refused to process).
 ///
 /// Returns `Some(len)` on success, `None` if `out` is too small.
-pub fn build_refused(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
-    write_header_and_question(
-        out,
-        wq.id,
-        FLAGS_REFUSED,
-        0,
-        wq.qname_wire,
-        wq.qtype,
-        wq.qclass,
-    )
+pub fn build_refused(wq: &WireQuery<'_>, out: &mut [u8], edns: Option<&EdnsInfo>) -> Option<usize> {
+    write_header_and_question(out, wq.id, FLAGS_REFUSED, 0, wq.qname_wire, wq.qtype, wq.qclass, edns)
 }
 
 
@@ -413,9 +462,9 @@ mod tests {
 
     /// Happy path: arcount=0 → false immediately (no scan).
     #[test]
-    fn detect_edns_no_additional() {
+    fn parse_opt_rr_no_additional() {
         // Buffer content doesn't matter when arcount=0.
-        assert!(!detect_edns(&[0u8; 40], 20, 0));
+        assert!(parse_opt_rr(&[0u8; 40], 20, 0).is_none());
     }
 
     /// Security regression test (#156): truncated non-OPT RR (TSIG, type=250).
@@ -428,7 +477,7 @@ mod tests {
     /// Reading rdlen needs buf[pos+8..pos+9] = buf[8..9] — buf.len()=5 → OOB pre-fix.
     /// Post-fix: `pos+10=10 > 5` → break → returns false without panicking.
     #[test]
-    fn detect_edns_truncated_additional_no_panic() {
+    fn parse_opt_rr_truncated_no_panic() {
         // Non-OPT RR truncated: name(\0) + type(TSIG=250) + class(IN) only — no TTL/rdlen.
         // The function sees rtype=250 ≠ OPT, then tries to read rdlen at pos+8/pos+9.
         // With the fix (pos+10 > len guard), it breaks cleanly and returns false.
@@ -440,13 +489,13 @@ mod tests {
         ];
         // Pre-fix: would panic at buf[pos+8] (index 9, len=5).
         // Post-fix: pos+10 (=11) > 5 → break → false.
-        let result = detect_edns(truncated, 0, 1);
-        assert!(!result, "truncated non-OPT RR must yield false without panicking");
+        let result = parse_opt_rr(truncated, 0, 1);
+        assert!(result.is_none(), "truncated non-OPT RR must yield None without panicking");
     }
 
     /// OPT RR present and well-formed → true.
     #[test]
-    fn detect_edns_opt_present() {
+    fn parse_opt_rr_opt_present() {
         // Minimal well-formed additional RR with type=OPT.
         // \0 (root) + type=41 (0x00,0x29) + class=1232 (0x04,0xD0) +
         // ttl=0 (4B) + rdlen=0 (2B) → total 11 bytes.
@@ -457,12 +506,12 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // ttl (extended RCODE + flags)
             0x00, 0x00,         // rdlen = 0 (no options)
         ];
-        assert!(detect_edns(opt_rr, 0, 1));
+        assert!(parse_opt_rr(opt_rr, 0, 1).is_some());
     }
 
     /// Non-OPT additional RR (e.g. TSIG type=250) → false.
     #[test]
-    fn detect_edns_non_opt_rr() {
+    fn parse_opt_rr_non_opt_rr() {
         // \0 + type=250 (TSIG) + class + ttl + rdlen=0
         let tsig_rr: &[u8] = &[
             0x00,               // root label
@@ -471,18 +520,18 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // ttl
             0x00, 0x00,         // rdlen = 0
         ];
-        assert!(!detect_edns(tsig_rr, 0, 1));
+        assert!(parse_opt_rr(tsig_rr, 0, 1).is_none());
     }
 
     /// Two additional RRs: non-OPT first, OPT second → true.
     #[test]
-    fn detect_edns_opt_second_rr() {
+    fn parse_opt_rr_opt_second_rr() {
         let mut buf = Vec::new();
         // RR 1: TSIG, rdlen=0
         buf.extend_from_slice(&[0x00, 0x00, 0xFA, 0x00, 0x01, 0x00,0x00,0x00,0x00, 0x00,0x00]);
         // RR 2: OPT, rdlen=0
         buf.extend_from_slice(&[0x00, 0x00, 0x29, 0x04, 0xD0, 0x00,0x00,0x00,0x00, 0x00,0x00]);
-        assert!(detect_edns(&buf, 0, 2));
+        assert!(parse_opt_rr(&buf, 0, 2).is_some());
     }
 
     // ── parse_query ──────────────────────────────────────────────────────────
@@ -523,9 +572,9 @@ mod tests {
     #[test]
     fn build_nxdomain_wire_correct() {
         let qname: &[u8] = &[0x01, b'a', 0x04, b't', b'e', b's', b't', 0x00]; // "a.test."
-        let wq = WireQuery { id: 0xABCD, qname_wire: qname, qtype: 1, qclass: 1, has_edns: false };
+        let wq = WireQuery { id: 0xABCD, qname_wire: qname, qtype: 1, qclass: 1, edns: None };
         let mut out = [0u8; 512];
-        let len = build_nxdomain(&wq, &mut out).expect("build_nxdomain failed");
+        let len = build_nxdomain(&wq, &mut out, None).expect("build_nxdomain failed");
 
         // Header: ID=0xABCD, flags=0x8583, qdcount=1, ancount=0, nscount=0, arcount=0
         assert_eq!(&out[0..2],   &[0xAB, 0xCD], "ID mismatch");
@@ -548,9 +597,9 @@ mod tests {
     #[test]
     fn build_nodata_wire_correct() {
         let qname: &[u8] = &[0x01, b'b', 0x04, b't', b'e', b's', b't', 0x00];
-        let wq = WireQuery { id: 0x1234, qname_wire: qname, qtype: 28, qclass: 1, has_edns: false };
+        let wq = WireQuery { id: 0x1234, qname_wire: qname, qtype: 28, qclass: 1, edns: None };
         let mut out = [0u8; 512];
-        let len = build_nodata(&wq, &mut out).expect("build_nodata failed");
+        let len = build_nodata(&wq, &mut out, None).expect("build_nodata failed");
 
         assert_eq!(&out[0..2], &[0x12, 0x34], "ID");
         assert_eq!(&out[2..4], &[0x85, 0x80], "flags must be 0x8580 (AA NOERROR)");
@@ -563,9 +612,9 @@ mod tests {
     #[test]
     fn build_refused_wire_correct() {
         let qname: &[u8] = &[0x04, b't', b'e', b's', b't', 0x00];
-        let wq = WireQuery { id: 0xFFFF, qname_wire: qname, qtype: 1, qclass: 1, has_edns: false };
+        let wq = WireQuery { id: 0xFFFF, qname_wire: qname, qtype: 1, qclass: 1, edns: None };
         let mut out = [0u8; 512];
-        let len = build_refused(&wq, &mut out).expect("build_refused failed");
+        let len = build_refused(&wq, &mut out, None).expect("build_refused failed");
 
         assert_eq!(&out[0..2], &[0xFF, 0xFF], "ID");
         assert_eq!(&out[2..4], &[0x85, 0x85], "flags must be 0x8585 (REFUSED)");
@@ -577,22 +626,99 @@ mod tests {
     #[test]
     fn build_nxdomain_buf_too_small() {
         let qname: &[u8] = &[0x01, b'a', 0x04, b't', b'e', b's', b't', 0x00];
-        let wq = WireQuery { id: 0x0001, qname_wire: qname, qtype: 1, qclass: 1, has_edns: false };
+        let wq = WireQuery { id: 0x0001, qname_wire: qname, qtype: 1, qclass: 1, edns: None };
         let mut out = [0u8; 10]; // too small (need 12+8+4=24)
-        assert!(build_nxdomain(&wq, &mut out).is_none());
+        assert!(build_nxdomain(&wq, &mut out, None).is_none());
     }
 
     /// All three share the same question echo — cross-check qtype=AAAA.
     #[test]
     fn build_negative_echo_qtype_aaaa() {
         let qname: &[u8] = &[0x03, b'f', b'o', b'o', 0x00];
-        let wq = WireQuery { id: 0x0042, qname_wire: qname, qtype: 28, qclass: 1, has_edns: false };
+        let wq = WireQuery { id: 0x0042, qname_wire: qname, qtype: 28, qclass: 1, edns: None };
         let mut out = [0u8; 512];
-        let len = build_nxdomain(&wq, &mut out).unwrap();
+        let len = build_nxdomain(&wq, &mut out, None).unwrap();
         let qtype_off = 12 + qname.len();
         assert_eq!(&out[qtype_off..qtype_off+2], &[0x00, 0x1C], "QTYPE AAAA=28");
         assert_eq!(len, 12 + qname.len() + 4);
     }
 
+
+    // ── EDNS / OPT echo ──────────────────────────────────────────────────────
+
+    /// parse_opt_rr returns correct EdnsInfo for a well-formed OPT RR.
+    #[test]
+    fn parse_opt_rr_returns_edns_info() {
+        // OPT RR: \0 + type=41 + class=1232 (0x04D0) + ttl(DO=0)=0 + rdlen=0
+        let opt: &[u8] = &[
+            0x00,               // root label
+            0x00, 0x29,         // type OPT = 41
+            0x04, 0xD0,         // class = 1232 (dig default payload)
+            0x00, 0x00, 0x00, 0x00, // TTL: ext-rcode=0, version=0, DO=0
+            0x00, 0x00,         // rdlen = 0
+        ];
+        let info = parse_opt_rr(opt, 0, 1).expect("should detect OPT");
+        assert_eq!(info.udp_payload, 1232);
+        assert!(!info.do_bit, "DO=0 expected");
+    }
+
+    /// parse_opt_rr correctly detects DO=1 bit.
+    #[test]
+    fn parse_opt_rr_do_bit_set() {
+        // TTL high bytes: ext-rcode=0, version=0, flags high=0x80 (DO=1)
+        let opt: &[u8] = &[
+            0x00,               // root label
+            0x00, 0x29,         // type OPT
+            0x04, 0xD0,         // class = 1232
+            0x00, 0x00, 0x80, 0x00, // TTL: buf[pos+6] = 0x80 → DO=1
+            0x00, 0x00,         // rdlen = 0
+        ];
+        let info = parse_opt_rr(opt, 0, 1).expect("should detect OPT");
+        assert!(info.do_bit, "DO=1 expected");
+    }
+
+    /// build_nxdomain with EDNS echoes OPT RR: arcount=1, 11 extra bytes.
+    #[test]
+    fn build_nxdomain_with_edns_opt_echo() {
+        let qname: &[u8] = &[5, b'h', b'e', b'l', b'l', b'o', 0]; // "hello."
+        let wq = WireQuery { id: 0x1111, qname_wire: qname, qtype: 1, qclass: 1, edns: None };
+        let edns = EdnsInfo { udp_payload: 1232, do_bit: false };
+
+        let mut out_plain = [0u8; 256];
+        let mut out_edns  = [0u8; 256];
+        let len_plain = build_nxdomain(&wq, &mut out_plain, None).unwrap();
+        let len_edns  = build_nxdomain(&wq, &mut out_edns, Some(&edns)).unwrap();
+
+        // EDNS response must be 11 bytes longer (OPT RR)
+        assert_eq!(len_edns, len_plain + 11, "OPT RR adds 11 bytes");
+
+        // arcount must be 1 in EDNS response, 0 in plain
+        assert_eq!(u16::from_be_bytes([out_plain[10], out_plain[11]]), 0, "plain arcount=0");
+        assert_eq!(u16::from_be_bytes([out_edns[10],  out_edns[11]]),  1, "edns arcount=1");
+
+        // OPT RR starts at len_plain: verify root label + type=41 + payload=1232
+        let opt_start = len_plain;
+        assert_eq!(out_edns[opt_start], 0x00, "OPT root label");
+        assert_eq!(u16::from_be_bytes([out_edns[opt_start+1], out_edns[opt_start+2]]), 41, "OPT type=41");
+        assert_eq!(u16::from_be_bytes([out_edns[opt_start+3], out_edns[opt_start+4]]), 1232, "OPT payload=1232");
+        // DO bit must be 0 (we set DO=0 in all wire responses)
+        assert_eq!(out_edns[opt_start+7] & 0x80, 0, "DO=0 in response");
+        // rdlen must be 0
+        assert_eq!(u16::from_be_bytes([out_edns[opt_start+9], out_edns[opt_start+10]]), 0, "rdlen=0");
+    }
+
+    /// build_nxdomain NXDOMAIN flags unchanged when EDNS present.
+    #[test]
+    fn build_nxdomain_flags_unchanged_with_edns() {
+        let qname: &[u8] = &[3, b'a', b'b', b'c', 0];
+        let wq   = WireQuery { id: 0xBEEF, qname_wire: qname, qtype: 1, qclass: 1, edns: None };
+        let edns = EdnsInfo { udp_payload: 512, do_bit: false };
+        let mut out = [0u8; 256];
+        let _len = build_nxdomain(&wq, &mut out, Some(&edns)).unwrap();
+        // Flags: 0x8583 = QR=1 AA=1 RCODE=3 (NXDOMAIN)
+        assert_eq!(u16::from_be_bytes([out[2], out[3]]), 0x8583, "NXDOMAIN flags");
+        // ancount must be 0 (negative response)
+        assert_eq!(u16::from_be_bytes([out[6], out[7]]), 0, "ancount=0");
+    }
 
 }
