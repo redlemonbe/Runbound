@@ -268,3 +268,67 @@ eBPF hash % 20, ethtool queues=16. Observer :
 3. Levier A : test empirique cross-queue ZC (16→20 queues)
 4. Combiner A + B si les deux tiennent → cible 10M qps
 
+
+---
+
+## #156 — Levier B : bypass hickory wire builder (Livraisons 1-3)
+
+**Date :** 2026-06-03 | **Statut :** L3 commité `98c3379`, en attente validation correctness + bench A/B
+
+### Architecture
+
+```
+process_packet()
+  → answer_dns_wire()   [NEW — wire, ~0 alloc, A/AAAA/NXDOMAIN/NODATA/REFUSED]
+    → answer_dns()       [hickory fallback : EDNS, CNAME, MX, TXT, complex]
+      → answer_from_cache()  [cache snapshot ZC]
+        → drop
+```
+
+### Ce qui est éliminé dans le fast path
+
+| Appel hickory supprimé | Coût estimé |
+|------------------------|-------------|
+| `Message::from_bytes()` | Parse AST complet, ~20 allocs |
+| `LowerName::from(q.name())` | Alloc String |
+| `q.clone()` pour add_query | Clone struct Query |
+| `resp.add_answer(r.clone())` | Clone Record hickory |
+| `resp.emit() / BinEncoder` | Sérialise AST → bytes, Vec intermédiaire |
+
+**Alloc restante :** `wire_qname_to_lower_name()` = `Name::read` hickory pour la clé HashMap de LocalZoneSet. Inévitable sans refactoring local.rs. Follow-up #156 si l'A/B montre que c'est encore le goulot.
+
+### Gating EDNS (bloqueur merge main)
+
+`has_edns=true → None → hickory`. Clients EDNS (dont dig par défaut) servis correctement via fallback. EDNS echo dans le fast path = follow-up après stabilisation.
+
+### Parité ACL/zone-action vs answer_dns()
+
+| Cas | Wire path | Fallback |
+|-----|-----------|---------|
+| A / AAAA, zone Static/Redirect | ✅ `build_answer_a_aaaa` | — |
+| NXDOMAIN (zone NxDomain) | ✅ `build_nxdomain` | — |
+| NODATA (nom existe, mauvais type A/AAAA) | ✅ `build_nodata` | — |
+| REFUSED (ACL Refuse / zone Refuse) | ✅ `build_refused` | — |
+| ACL Deny | ✅ drop (Some(0)) | — |
+| EDNS (arcount>0) | → | ✅ hickory |
+| CNAME, MX, TXT, SRV, ANY | → | ✅ hickory |
+| BlockPage A/AAAA | ✅ ou NXDOMAIN | — |
+| BlockPage CNAME / non-A/AAAA | → | ✅ hickory |
+| Parse fail / malformé | → | ✅ hickory |
+
+### Correctness gate (avant bench — ton côté)
+
+```bash
+dig @<ip> a.bench.test A            # NOERROR, AA=1, bonne IP
+dig @<ip> a.bench.test AAAA         # NOERROR ou NODATA
+dig @<ip> nxdomain.bench.test A     # NXDOMAIN
+dig @<ip> a.bench.test MX           # NODATA (fallback hickory)
+dig @<ip> a.bench.test A            # (defaut = EDNS) → hickory, réponse EDNS valide
+dig @<ip> a.bench.test A +noedns    # wire fast path
+```
+
+### Débit attendu
+
+- Baseline hickory : 5.15M qps (16 workers × 322k/cœur)
+- Cible wire bypass : ~8-10M si hickory est le goulot dominant
+- Si <7M → `wire_qname_to_lower_name` (Name::read) est le prochain goulot → follow-up
