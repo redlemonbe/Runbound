@@ -96,6 +96,32 @@ Dispatch is resolved at init — no per-packet branch overhead. On CPUs without 
 (rare; all x86_64 cores have SSE2 by spec) the scalar fallback is used transparently.
 
 
+## Local-zone wire fast path (v0.9.66, #156)
+
+For local-zone **A / AAAA** answers, the XDP worker bypasses `hickory_proto`
+entirely: `answer_dns_wire()` parses the query and writes the response straight
+into the UMEM TX frame — no `Message` parse/serialize, no heap allocation.
+
+Measured on an X520 10 GbE link (same `a.bench.test A` query, dnsmark v1.2.1):
+
+| | hickory | wire builder | gain |
+|---|---|---|---|
+| Throughput | 4.11 M qps | **6.48 M qps** | **+58 %** |
+| p50 latency | 0.512 ms | **0.335 ms** | **−35 %** |
+
+Everything the wire builder does not cover — NXDOMAIN, NODATA, **wildcard
+local-data**, CNAME/MX/TXT, EDNS (OPT), ACL Deny, ANY, malformed — transparently
+**falls back to hickory**, so behaviour is unchanged outside the A/AAAA answer case.
+See [benchmark/v0.9.66.md](benchmark/v0.9.66.md).
+
+## domain-routing (CPUMAP) and zero-copy (v0.9.66, #155)
+
+`xdp-domain-routing` (CPUMAP per-domain CPU affinity) is **mutually exclusive
+with zero-copy**: a CPUMAP redirect leaves the driver ZC ring, so it is forced
+OFF once zero-copy is confirmed on an interface (it would otherwise collapse
+throughput ~40×). It remains available in SKB/copy mode for cache locality.
+
+
 ## Requirements
 
 | Item | Details |
