@@ -53,7 +53,7 @@ pub struct WireQuery<'a> {
     /// Raw wire QNAME (length-prefixed labels, ends with \0).
     /// Slice into the original query buffer — zero copy.
     pub qname_wire: &'a [u8],
-    /// Byte offset of qtype in the original query buffer.
+    /// Parsed qtype value (e.g. A=1, AAAA=28) from the query wire.
     pub qtype: u16,
     /// Query class (should be IN=1 for normal queries).
     pub qclass: u16,
@@ -153,7 +153,8 @@ fn detect_edns(buf: &[u8], mut pos: usize, arcount: u16) -> bool {
             return true;
         }
         // Skip remainder of this RR: type(2) + class(2) + ttl(4) + rdlen(2) + rdata.
-        if pos + 8 > buf.len() {
+        // Need pos+10 <= len to safely read buf[pos+8] AND buf[pos+9] (#156 sec).
+        if pos + 10 > buf.len() {
             break;
         }
         let rdlen = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
@@ -307,4 +308,106 @@ pub fn build_answer_a_aaaa<'z>(
     }
 
     Some(pos)
+}
+
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── detect_edns ──────────────────────────────────────────────────────────
+
+    /// Happy path: arcount=0 → false immediately (no scan).
+    #[test]
+    fn detect_edns_no_additional() {
+        // Buffer content doesn't matter when arcount=0.
+        assert!(!detect_edns(&[0u8; 40], 20, 0));
+    }
+
+    /// Security regression test (#156): truncated non-OPT RR (TSIG, type=250).
+    ///
+    /// Before the fix, `detect_edns` read `buf[pos+8]` and `buf[pos+9]` to parse rdlen
+    /// after checking only `pos+8 > buf.len()` — allowing `pos+8 == buf.len()` to panic.
+    /// Fix: guard is `pos+10 > buf.len()`.
+    ///
+    /// Layout:  \0(1B) + type=TSIG(2B) + class(2B) = 5 bytes at pos=0.
+    /// Reading rdlen needs buf[pos+8..pos+9] = buf[8..9] — buf.len()=5 → OOB pre-fix.
+    /// Post-fix: `pos+10=10 > 5` → break → returns false without panicking.
+    #[test]
+    fn detect_edns_truncated_additional_no_panic() {
+        // Non-OPT RR truncated: name(\0) + type(TSIG=250) + class(IN) only — no TTL/rdlen.
+        // The function sees rtype=250 ≠ OPT, then tries to read rdlen at pos+8/pos+9.
+        // With the fix (pos+10 > len guard), it breaks cleanly and returns false.
+        let truncated: &[u8] = &[
+            0x00,       // root label (name = \0, name_len = 1) → pos becomes 1
+            0x00, 0xFA, // type = TSIG (250) — NOT OPT, so we proceed to rdlen read
+            0x00, 0x01, // class IN — pos is now at 1, pos+4=5 ≤ 5 ✓ (passes first guard)
+            // ttl and rdlen intentionally absent (buf.len()=5, need pos+10=11 for rdlen)
+        ];
+        // Pre-fix: would panic at buf[pos+8] (index 9, len=5).
+        // Post-fix: pos+10 (=11) > 5 → break → false.
+        let result = detect_edns(truncated, 0, 1);
+        assert!(!result, "truncated non-OPT RR must yield false without panicking");
+    }
+
+    /// OPT RR present and well-formed → true.
+    #[test]
+    fn detect_edns_opt_present() {
+        // Minimal well-formed additional RR with type=OPT.
+        // \0 (root) + type=41 (0x00,0x29) + class=1232 (0x04,0xD0) +
+        // ttl=0 (4B) + rdlen=0 (2B) → total 11 bytes.
+        let opt_rr: &[u8] = &[
+            0x00,               // root label
+            0x00, 0x29,         // type = OPT (41)
+            0x04, 0xD0,         // class (EDNS UDP payload = 1232)
+            0x00, 0x00, 0x00, 0x00, // ttl (extended RCODE + flags)
+            0x00, 0x00,         // rdlen = 0 (no options)
+        ];
+        assert!(detect_edns(opt_rr, 0, 1));
+    }
+
+    /// Non-OPT additional RR (e.g. TSIG type=250) → false.
+    #[test]
+    fn detect_edns_non_opt_rr() {
+        // \0 + type=250 (TSIG) + class + ttl + rdlen=0
+        let tsig_rr: &[u8] = &[
+            0x00,               // root label
+            0x00, 0xFA,         // type = TSIG (250) — not OPT
+            0x00, 0x01,         // class IN
+            0x00, 0x00, 0x00, 0x00, // ttl
+            0x00, 0x00,         // rdlen = 0
+        ];
+        assert!(!detect_edns(tsig_rr, 0, 1));
+    }
+
+    /// Two additional RRs: non-OPT first, OPT second → true.
+    #[test]
+    fn detect_edns_opt_second_rr() {
+        let mut buf = Vec::new();
+        // RR 1: TSIG, rdlen=0
+        buf.extend_from_slice(&[0x00, 0x00, 0xFA, 0x00, 0x01, 0x00,0x00,0x00,0x00, 0x00,0x00]);
+        // RR 2: OPT, rdlen=0
+        buf.extend_from_slice(&[0x00, 0x00, 0x29, 0x04, 0xD0, 0x00,0x00,0x00,0x00, 0x00,0x00]);
+        assert!(detect_edns(&buf, 0, 2));
+    }
+
+    // ── parse_query ──────────────────────────────────────────────────────────
+
+    /// Too-short buffer → None (no panic).
+    #[test]
+    fn parse_query_too_short() {
+        assert!(parse_query(&[0u8; 10]).is_none());
+    }
+
+    /// QR bit set (response, not query) → None.
+    #[test]
+    fn parse_query_rejects_response() {
+        let mut buf = [0u8; 25];
+        buf[2] = 0x80; // QR=1
+        buf[4] = 0; buf[5] = 1; // qdcount=1
+        buf[12] = 0x05; // qname label len=5 (won't find \0 properly but QR check is first)
+        assert!(parse_query(&buf).is_none());
+    }
 }
