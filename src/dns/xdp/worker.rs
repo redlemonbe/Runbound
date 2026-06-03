@@ -32,6 +32,22 @@ use hickory_proto::{
 use smallvec::SmallVec;
 
 use super::loader::XdpHandle;
+/// Return type for `answer_dns_wire()` — three-way dispatch replacing `Option<usize>`.
+///
+/// Using an explicit enum instead of the footgun `Some(0)` sentinel (#155 review):
+///   - `Answered(len)` : response written into `out[0..len]`, send it.
+///   - `Fallback`      : case not handled by wire builder → try hickory answer_dns().
+///   - `Drop`          : ACL Deny or unrecoverable error → silent drop, no TX, no fallback.
+#[derive(Debug)]
+enum WireResult {
+    Answered(usize),
+    Fallback,
+    Drop,
+}
+
+use super::wire_builder::{
+    build_answer_a_aaaa, build_nxdomain, build_refused, parse_query,
+};
 use super::socket::{
     create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface, maximize_nic_ring,
     parent_interface, sanitize_iface_name, XskSocket, XDP_ACTIVE_IFACE,
@@ -222,6 +238,36 @@ fn start_xdp_on_iface(
 
     let queue_modes: Vec<(u32, bool)> = sockets.iter().map(|(q, s)| (*q, s.zerocopy)).collect();
     super::socket::XDP_QUEUE_MODES.set(queue_modes).ok();
+
+    // #155 — Gate domain-routing OFF when any socket is in true zerocopy mode.
+    //
+    // This is the hard enforcement (Commit 4): sock.zerocopy is the ground truth
+    // (confirmed after AF_XDP bind succeeds with XDP_ZEROCOPY flag), unlike the
+    // XdpMode::Drv proxy used for the early WARN in loader.rs.
+    //
+    // If domain_routing was requested by the user AND any queue is in ZC mode,
+    // disable_domain_routing() writes 0 to domain_routing_cfg[0].enabled so the
+    // eBPF takes the XSKMAP path on the next packet (ZC fast path).  domain-routing
+    // remains active in pure SKB/copy
+    // mode where CPUMAP redirect costs nothing extra and cache-locality is useful.
+    let any_zerocopy = sockets.iter().any(|(_, s)| s.zerocopy);
+    if domain_routing && any_zerocopy {
+        tracing::warn!(
+            iface         = %iface,
+            zerocopy      = true,
+            "xdp-domain-routing: yes IGNORÉ — interface is in zerocopy mode. \
+             CPUMAP redirect would exit the ZC ring and cause ×40 throughput \
+             regression (4.77 M → 120 k qps, #155). \
+             Forcing domain-routing OFF; zerocopy fast path preserved. \
+             To use domain-routing, switch to SKB/copy mode (no xdp-hugepages)."
+        );
+        if let Err(e) = handle.disable_domain_routing() {
+            tracing::warn!(
+                err = %e,
+                "domain_routing_cfg gate-off failed — ZC may be compromised;                  check BPF map access (#155)"
+            );
+        }
+    }
 
     // Self-test on the first socket before committing threads.
     if let Some((_, first_sock)) = sockets.first_mut() {
@@ -772,22 +818,44 @@ fn process_packet(
     // DNS payload is written into tx BEFORE checksum computation so that the
     // UDP checksum covers the actual response bytes (fixing a latent bug where
     // the checksum was computed over uninitialised tx bytes).
-    let dns_len = if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
-        // Local zone hit — copy dns_scratch into tx first.
-        let len = dns_scratch.len();
-        if dns_off + len > tx.len() {
-            return None;
+    // ── DNS fast path ────────────────────────────────────────────────────────
+    // Priority: wire fast path > cache snapshot > hickory local zone > drop.
+    //
+    // answer_dns_wire() (#156): hand-rolled wire builder — zero hickory allocs
+    // for A/AAAA/NXDOMAIN/NODATA/REFUSED on static/redirect zones.
+    //
+    // Fallback to hickory (answer_dns) for: EDNS (has_edns=true), CNAME, MX,
+    // TXT, BlockPage, Redirect-complex, ANY, parse fail — correctness preserved.
+    //
+    // Drop semantics:
+    //   WireDrop   = ACL Deny or malformed → no TX, no fallback.
+    //   WirePass   = None from wire builder (unsupported case) → try next path.
+    //   WireAnswer = Some(len) → response written directly into tx[dns_off..].
+    let dns_len = match answer_dns_wire(dns_in, &mut tx[dns_off..], zones, acl, src_ip) {
+        // ── ACL Deny or unrecoverable error → silent drop, no TX ─────────
+        WireResult::Drop => return None,
+        // ── Wire fast path: response already in tx[dns_off..dns_off+len] ─
+        WireResult::Answered(len) => len,
+        // ── Fallback: case not handled by wire builder → try other paths ─
+        WireResult::Fallback => {
+            if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
+                // Hickory local zone (EDNS, CNAME, complex cases).
+                let len = dns_scratch.len();
+                if dns_off + len > tx.len() {
+                    return None;
+                }
+                tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
+                len
+            } else if let Some(snap) = cache_snap {
+                // Cache hit — answer_from_cache writes directly into tx[dns_off..].
+                match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats)) {
+                    Some(len) => len,
+                    None => return None,
+                }
+            } else {
+                return None; // not a local query and no cache — XDP_PASS to hickory
+            }
         }
-        tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
-        len
-    } else if let Some(snap) = cache_snap {
-        // Cache hit — answer_from_cache writes directly into tx[dns_off..].
-        match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats)) {
-            Some(len) => len,
-            None => return None,
-        }
-    } else {
-        return None; // not a local query and no cache — XDP_PASS to hickory
     };
 
     // ── Build reply frame ────────────────────────────────────────────────────
@@ -1176,6 +1244,170 @@ mod cache_tests {
             result.is_none(),
             "ANY queries must not be served from cache"
         );
+    }
+}
+
+// ── Wire fast path (#156) ─────────────────────────────────────���──────────────
+//
+// answer_dns_wire() replaces the hickory hot path for the common case:
+// A/AAAA/NXDOMAIN/NODATA/REFUSED on static/redirect zones.
+//
+// Return semantics (THREE distinct outcomes — caller must honour all three):
+//
+//   Some(len)  → response written into out[0..len], send it.
+//   None       → unsupported case (EDNS, CNAME, MX, complex…) → fallback to
+//                answer_dns() hickory.  DO NOT DROP.
+//
+// Drop (ACL Deny, malformed parse) is signalled by returning Some(0) — a
+// zero-length DNS payload that process_packet() turns into a drop because
+// the upstream reply_len check filters it out.  This keeps None strictly
+// meaning "try next path".
+//
+// NOTE ON EDNS (#156 must-fix):
+//   If wq.has_edns == true, we return None → hickory handles it correctly.
+//   Sending arcount=0 to an EDNS client breaks EDNS negotiation (clients
+//   retry with smaller UDP sizes, performance regression for real traffic).
+//   EDNS echo in the fast path is a follow-up once this code is stable.
+fn answer_dns_wire(
+    query_bytes: &[u8],
+    out: &mut [u8],
+    zones: &LocalZoneSet,
+    acl: &Acl,
+    src_ip: Option<IpAddr>,
+) -> WireResult {
+    // ── Parse ────────────────────────────────────────────────────────────────
+    // parse_query() is zero-alloc: reads id, qname via SIMD find_zero,
+    // qtype, qclass, and has_edns (arcount scan).  Returns None on malformed.
+    let wq = match parse_query(query_bytes) {
+        Some(q) => q,
+        None => return WireResult::Fallback, // malformed → hickory fallback
+    };
+
+    // EDNS gate (#156 must-fix): fall back to hickory which handles OPT echo.
+    // Sending a response with arcount=0 to an EDNS client breaks negotiation.
+    if wq.has_edns {
+        return WireResult::Fallback;
+    }
+
+    // ANY queries: RFC 8482 HINFO response — let hickory handle it.
+    const QTYPE_ANY: u16 = 255;
+    if wq.qtype == QTYPE_ANY {
+        return WireResult::Fallback;
+    }
+
+    // ── ACL check ────────────────────────────────────────────────────────────
+    // Mirrors answer_dns() exactly: Deny = silent drop, Refuse = REFUSED wire.
+    if let Some(ip) = src_ip {
+        match acl.check(ip) {
+            AclAction::Allow => {}
+            AclAction::Deny => return WireResult::Drop, // drop — no response, no fallback
+            AclAction::Refuse => {
+                // REFUSED wire: QR=1 AA=0 RCODE=5, echo question.
+                return match build_refused(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            };
+            }
+        }
+    }
+
+    // ── Zone lookup ──────────────────────────────────────────────────────────
+    // wire_qname_to_lower_name() is the one remaining hickory alloc (Name::read).
+    // Necessary for the HashMap key in LocalZoneSet::find(). Follow-up #156:
+    // if A/B shows this is still the bottleneck, replace with CRC32 direct key.
+    let lower_name = match super::wire_builder::wire_qname_to_lower_name(&wq.qname_wire) {
+        Some(n) => n,
+        None => return WireResult::Fallback, // invalid qname → hickory
+    };
+
+    // RecordType not needed after removing direct local_records calls.
+    // build_answer_a_aaaa handles its own type dispatch internally.
+
+    // ── Zone action dispatch ──────────────────────────────────────────────────
+    // Mirrors answer_dns() semantics exactly — same ACL, same zone actions,
+    // same NODATA logic (name_has_records → NOERROR empty vs NXDOMAIN).
+    match zones.find(&lower_name) {
+        None => {
+            // Name not in any local zone → XDP_PASS to hickory recursive path.
+            WireResult::Fallback
+        }
+
+        Some(ZoneAction::Refuse) => {
+            // Zone-level refuse (e.g. refuse zone) — REFUSED, AA=0.
+            match build_refused(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            }
+        }
+
+        Some(ZoneAction::NxDomain) => {
+            // Always-nxdomain zone — NXDOMAIN, AA=1.
+            match build_nxdomain(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            }
+        }
+
+        Some(ZoneAction::BlockPage) => {
+            // BlockPage: serve the pre-inserted A/AAAA record if present.
+            // CNAME-based block pages and non-A/AAAA queries → hickory.
+            // If no block record → NXDOMAIN.
+            const QTYPE_A: u16 = 1;
+            const QTYPE_AAAA: u16 = 28;
+            if wq.qtype != QTYPE_A && wq.qtype != QTYPE_AAAA {
+                return WireResult::Fallback; // → hickory for any non-A/AAAA blockpage query
+            }
+            let rtype_bp = if wq.qtype == QTYPE_A {
+                hickory_proto::rr::RecordType::A
+            } else {
+                hickory_proto::rr::RecordType::AAAA
+            };
+            let bp_records = zones.local_records(&lower_name, rtype_bp);
+            if !bp_records.is_empty() {
+                if let Some(len) = build_answer_a_aaaa(&wq, out, &bp_records) {
+                    return WireResult::Answered(len);
+                }
+            }
+            // No exact A/AAAA block record → hickory (may be a wildcard or
+            // CNAME-based block page, which the wire path does not handle).
+            WireResult::Fallback
+        }
+
+        Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
+            // Static / redirect zone.
+            //
+            // Dispatch on qtype FIRST:
+            //   A(1) / AAAA(28) → wire builder, then NODATA/NXDOMAIN if no records.
+            //   Any other type (CNAME, MX, TXT, SRV…) → None → hickory handles it.
+            //
+            // This avoids the ambiguity where build_answer_a_aaaa returns None
+            // both for "unsupported type" and "no records for A/AAAA" — without
+            // this dispatch we'd send NODATA for a CNAME query instead of falling
+            // back to hickory (correctness violation).
+            const QTYPE_A: u16 = 1;
+            const QTYPE_AAAA: u16 = 28;
+            if wq.qtype != QTYPE_A && wq.qtype != QTYPE_AAAA {
+                // Non-A/AAAA type on a static zone → hickory for CNAME, MX, TXT…
+                return WireResult::Fallback;
+            }
+            let rtype_sr = if wq.qtype == QTYPE_A {
+                hickory_proto::rr::RecordType::A
+            } else {
+                hickory_proto::rr::RecordType::AAAA
+            };
+            let records = zones.local_records(&lower_name, rtype_sr);
+            if !records.is_empty() {
+                if let Some(len) = build_answer_a_aaaa(&wq, out, &records) {
+                    return WireResult::Answered(len);
+                }
+            }
+            // No exact A/AAAA record for this name. It could be a wildcard match,
+            // a true NXDOMAIN, or NODATA — the wire path does NOT implement
+            // wildcard expansion, and hickory resolves all three correctly. Fall
+            // back to hickory to avoid the wildcard regression (#156). Serving
+            // wildcards from the wire path is a future optimization.
+            WireResult::Fallback
+        }
     }
 }
 
