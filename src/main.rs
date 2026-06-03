@@ -325,12 +325,16 @@ async fn async_main(
             .unwrap()
             .take()
             .expect("IcmpStats ban_cmd_rx already consumed");
-        // Move the primary XDP handle into the poll task — keeps it alive.
-        // Additional handles (multi-interface) are kept alive in _xdp_handles_rest.
-        // DNS workers already have raw socket FDs and do not need these handles.
-        let mut xdp_h = if _xdp_handles.is_empty() { None } else { Some(_xdp_handles.remove(0)) };
-        // Keep remaining handles alive for their Drop (cleans up BPF programs)
-        let _xdp_handles_rest = _xdp_handles;
+        // All XDP handles (primary + additional) are kept alive inside the
+        // tokio::spawn closure below.  The primary (index 0) is used for ICMP
+        // BPF ops; the rest are held passively so their eBPF programs remain
+        // attached for the entire process lifetime.
+        //
+        // CRITICAL: do NOT split the Vec (remove(0) + _rest outside closure).
+        // Variables not referenced inside `async move` are NOT captured — they
+        // are dropped when this outer block closes (~line 432), which calls
+        // XdpHandle::Drop → XDP prog detached → rx_drained=0 on iface1+.
+        let mut xdp_handles_all = _xdp_handles; // entire Vec moved into closure
         // Local set of IPs currently banned in BPF — used to detect delta changes.
         let mut bpf_banned: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut blacklist_reload_rx = blacklist_reload_rx;
@@ -339,8 +343,18 @@ async fn async_main(
             let mut last_enabled = false;
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                let Some(ref mut h) = xdp_h else {
-                    break;
+                // Primary handle (index 0) used for ICMP BPF ops.
+                // xdp_handles_all is moved into this closure — all handles
+                // remain alive, keeping ALL XDP programs attached.
+                // NEVER break here: it would drop the closure → drop all handles
+                // → XDP progs detached → iface1+ gets rx_drained=0.
+                let h = match xdp_handles_all.first_mut() {
+                    Some(h) => h,
+                    None => {
+                        // No XDP handles at all — sleep and retry (no-op).
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
                 };
 
                 // Process ban/unban commands from API and relay handlers
