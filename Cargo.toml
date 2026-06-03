@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 [package]
 name = "runbound"
-version = "0.10.3"
+version = "0.10.4"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "AGPL-3.0-or-later"
@@ -165,6 +165,10 @@ xdp = ["dep:aya"]
 # Expose internal parsing functions for cargo-fuzz targets.
 # Never enabled in the normal release binary.
 fuzz = []
+# Per-interface TX/RX instrumentation counters for debugging XDP multi-interface issues.
+# Adds 6 AtomicU64 per interface + a logger thread — NEVER enable in production benchmarks.
+# Disabled by default (zero cost when off).
+xdp-debug-counters = []
 
 [dependencies.aya]
 version  = "0.13"
