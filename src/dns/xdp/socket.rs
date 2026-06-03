@@ -193,6 +193,36 @@ pub unsafe fn create_xsk_socket(
         ));
     }
 
+
+    // #perf: NAPI busy-poll hints — best-effort, silent fallback on old kernels.
+    // SO_PREFER_BUSY_POLL=1 : tells the kernel to use busy-poll for this socket.
+    // SO_BUSY_POLL=20       : busy-poll time budget in µs per syscall.
+    // SO_BUSY_POLL_BUDGET=64: max packets to process per busy-poll cycle.
+    // All three are best-effort: ENOPROTOOPT / EINVAL on pre-5.11 kernels → ignore.
+    {
+        const SO_PREFER_BUSY_POLL: libc::c_int = 69;
+        const SO_BUSY_POLL:        libc::c_int = 46;
+        const SO_BUSY_POLL_BUDGET: libc::c_int = 70;
+        for (opt, val) in [
+            (SO_PREFER_BUSY_POLL, 1u32),
+            (SO_BUSY_POLL,        20u32),
+            (SO_BUSY_POLL_BUDGET, 64u32),
+        ] {
+            // SAFETY: `fd` is a valid socket fd. `&val` is a valid pointer to a u32.
+            //         We ignore errors — these opts may not exist on older kernels.
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    &val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<u32>() as libc::socklen_t,
+                )
+            };
+            // return value intentionally ignored — best-effort
+        }
+    }
+
     Ok(XskSocket {
         fd,
         umem,
