@@ -365,6 +365,11 @@ pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
 /// AA=1 (we are authoritative for the zone).
 ///
 /// Returns `Some(len)` on success, `None` if `out` is too small.
+///
+/// Reserved for a future wildcard-aware fast path (#156): the wire path
+/// currently falls back to hickory for empty-exact-match cases (which may be
+/// wildcards), so this is not yet wired into `answer_dns_wire`. Kept + unit-tested.
+#[allow(dead_code)]
 pub fn build_nodata(wq: &WireQuery<'_>, out: &mut [u8]) -> Option<usize> {
     // FLAGS_AA_NOERROR = 0x8580 (QR=1 AA=1 RD=1 RA=1 RCODE=0)
     write_header_and_question(

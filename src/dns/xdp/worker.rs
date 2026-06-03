@@ -46,7 +46,7 @@ enum WireResult {
 }
 
 use super::wire_builder::{
-    build_answer_a_aaaa, build_nxdomain, build_nodata, build_refused, parse_query,
+    build_answer_a_aaaa, build_nxdomain, build_refused, parse_query,
 };
 use super::socket::{
     create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface, maximize_nic_ring,
@@ -1368,11 +1368,9 @@ fn answer_dns_wire(
                     return WireResult::Answered(len);
                 }
             }
-            // No A/AAAA block record → NXDOMAIN.
-            match build_nxdomain(&wq, out) {
-                Some(l) => WireResult::Answered(l),
-                None    => WireResult::Fallback,
-            }
+            // No exact A/AAAA block record → hickory (may be a wildcard or
+            // CNAME-based block page, which the wire path does not handle).
+            WireResult::Fallback
         }
 
         Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
@@ -1403,19 +1401,12 @@ fn answer_dns_wire(
                     return WireResult::Answered(len);
                 }
             }
-            // build_answer_a_aaaa returned None (or no records): no A/AAAA for this name.
-            // Distinguish NODATA (name has other-type records) vs NXDOMAIN.
-            if zones.name_has_records(&lower_name) {
-                match build_nodata(&wq, out) {
-                Some(l) => WireResult::Answered(l),
-                None    => WireResult::Fallback,
-            }
-            } else {
-                match build_nxdomain(&wq, out) {
-                Some(l) => WireResult::Answered(l),
-                None    => WireResult::Fallback,
-            }
-            }
+            // No exact A/AAAA record for this name. It could be a wildcard match,
+            // a true NXDOMAIN, or NODATA — the wire path does NOT implement
+            // wildcard expansion, and hickory resolves all three correctly. Fall
+            // back to hickory to avoid the wildcard regression (#156). Serving
+            // wildcards from the wire path is a future optimization.
+            WireResult::Fallback
         }
     }
 }
