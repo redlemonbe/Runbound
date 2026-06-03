@@ -280,6 +280,21 @@ async fn async_main(
             );
         }
     }
+    // ── #158: extract GovernorGuard BEFORE handle is moved into poll task ──────
+    // XdpHandle is moved into a detached tokio::spawn below — its Drop is never
+    // reached on SIGTERM (OS kills the process before unwind).  We extract the
+    // guard here so it can be stored in an Arc<Mutex> and explicitly dropped in
+    // a SIGTERM handler.
+    #[cfg(feature = "xdp")]
+    let _xdp_governor_guard: Option<dns::xdp::governor::GovernorGuard> = {
+        _xdp_handle.as_mut().and_then(|h| h.take_governor_guard())
+    };
+    #[cfg(not(feature = "xdp"))]
+    let _xdp_governor_guard: Option<()> = None;
+
+    // Wrap in Arc<Mutex> for sharing with SIGTERM handler.
+    let governor_arc = std::sync::Arc::new(std::sync::Mutex::new(_xdp_governor_guard));
+
     // Spawn BPF stats poll task — runs every second, updates Rust atomics.
     // Also detects ICMP floods, applies XDP bans, and pushes config changes to BPF.
     #[cfg(feature = "xdp")]
@@ -402,6 +417,47 @@ async fn async_main(
     let (_icmp_stats_keep, _icmp_cfg_keep) = (Arc::clone(&icmp_stats), Arc::clone(&icmp_cfg));
     #[cfg(not(feature = "xdp"))]
     drop(blacklist_reload_rx);
+
+    // ── #158: SIGTERM / SIGINT — graceful shutdown with governor restore ────────
+    // Before this fix, SIGTERM used the OS default (kill) — no unwind, no Drop.
+    // Now: restore the CPU frequency governor explicitly, THEN exit.
+    // exit(0) has the same visible effect as the old kill, but with cleanup.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let gg = std::sync::Arc::clone(&governor_arc);
+        tokio::spawn(async move {
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Cannot install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+            let mut intr = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Cannot install SIGINT handler: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = term.recv() => { info!("SIGTERM received — graceful shutdown"); }
+                _ = intr.recv() => { info!("SIGINT received — graceful shutdown"); }
+            }
+            // Drop the GovernorGuard explicitly: restores the CPU frequency
+            // governor on each XDP core synchronously before exit (#158).
+            // take() ensures idempotency if Drop also runs on a clean path.
+            #[cfg(feature = "xdp")]
+            if let Ok(mut guard) = gg.lock() {
+                if let Some(g) = guard.take() {
+                    drop(g);
+                    info!("CPU governor restored — XDP cores back to original governor");
+                }
+            }
+            std::process::exit(0);
+        });
+    }
 
     // ── io_uring availability detection (#65) ─────────────────────────────────
     if cfg.io_uring {
