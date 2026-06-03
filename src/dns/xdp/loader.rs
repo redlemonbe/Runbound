@@ -92,7 +92,19 @@ impl XdpHandle {
     /// generic (SKB) mode if the driver does not support native XDP.
     pub fn load(iface: &str, nb_workers: u32, domain_routing: bool) -> Result<Self, String> {
         let routing_flag: u32 = if domain_routing { 1 } else { 0 };
-        let effective_workers = nb_workers.max(1);
+
+        // #155: cap NB_WORKERS to physical-core count.
+        // The eBPF global NB_WORKERS is the modulus for the per-domain FNV-1a hash
+        // (`cpu = h % NB_WORKERS`), which is then used as the key into CPUMAP.
+        // On BPF_MAP_TYPE_CPUMAP the key IS the kernel CPU ID — so we must ensure
+        // indices 0..effective_workers-1 all correspond to physical cores (no HT
+        // siblings).  physical_cores() returns them sorted and consecutive from 0
+        // on all supported Intel/AMD layouts (siblings are offset by ncpus/2).
+        // Capping here guarantees NB_WORKERS ≤ physical_core_count regardless of
+        // what the driver reports as queue_count.
+        let phys_cores = crate::cpu::physical_cores();
+        let phys_count = phys_cores.len().max(1) as u32;
+        let effective_workers = nb_workers.max(1).min(phys_count);
 
         // Try full binary (with CPUMAP).
         let bpf_result = load_ebpf_bytes(XDP_PROG, effective_workers, routing_flag);
@@ -243,10 +255,28 @@ impl XdpHandle {
         hash.remove(&ip_be32).map_err(|e| e.to_string())
     }
 
-    /// Initialise CPUMAP entries for `nb_workers` CPUs.
+    /// Initialise CPUMAP entries for `nb_workers` physical CPUs.
     ///
     /// Each entry is initialised with `queue_size=192` packets (enough headroom
     /// for burst traffic) and no chained BPF program.
+    ///
+    /// # #155 — Physical-core guarantee
+    ///
+    /// `BPF_MAP_TYPE_CPUMAP` uses the map key as the kernel CPU ID.  The eBPF
+    /// program computes `cpu = fnv1a(qname) % NB_WORKERS` and calls
+    /// `bpf_redirect_map(&CPUMAP, cpu, XDP_PASS)` — so key `cpu` must map to a
+    /// physical core, never to an HT sibling.
+    ///
+    /// `physical_cores()` returns CPU IDs that are the lowest-numbered member of
+    /// their `thread_siblings_list` group (i.e. the physical representative).
+    /// On Intel/AMD these IDs are 0..ncores-1 (siblings start at ncores), so
+    /// CPUMAP[0..NB_WORKERS-1] == physical cores.  This is correct on the supported
+    /// Intel/AMD layout where physical cores are numbered 0..N-1 contiguous.  On
+    /// non-linear topologies (e.g. NUMA where physicals = [0,2,4,…]) the eBPF hash
+    /// `h % NB_WORKERS` would produce keys 0,1,2,… while CPUMAP only has entries
+    /// at 0,2,4,… → CPUMAP[1] uninitialised → XDP_PASS (silent packet loss).
+    /// A runtime WARN fires on each such mismatch; true robustness requires a
+    /// worker_index→cpu_id indirection map (tracked as #155 follow-up).
     fn init_cpumap(&mut self, nb_workers: u32) -> Result<(), String> {
         let map = self
             .bpf
@@ -254,10 +284,39 @@ impl XdpHandle {
             .ok_or_else(|| "CPUMAP map not found in BPF object".to_string())?;
         let mut cpu_map =
             CpuMap::try_from(map).map_err(|e| format!("CPUMAP is not a CpuMap: {e}"))?;
-        for cpu_idx in 0..nb_workers {
+
+        // #155: use physical_cores() so we never initialise a sibling HT entry.
+        // The eBPF hash `cpu = h % NB_WORKERS` produces keys in [0, NB_WORKERS).
+        // physical_cores() is sorted ascending; the first NB_WORKERS entries are
+        // guaranteed to be physical (NB_WORKERS was already capped in load()).
+        let phys = crate::cpu::physical_cores();
+        let n = (nb_workers as usize).min(phys.len());
+        for i in 0..n {
+            let cpu_id = phys[i] as u32;
+            // Safety net for non-linear CPU numbering: the eBPF hash produces
+            // slot indices 0..N-1; if cpu_id != slot, CPUMAP[slot] will be
+            // uninitialised and bpf_redirect_map returns XDP_PASS (silent loss).
+            // On supported Intel/AMD layouts cpu_id == i — WARN loudly otherwise.
+            if cpu_id != i as u32 {
+                tracing::warn!(
+                    slot      = i,
+                    cpu_id    = cpu_id,
+                    "CPUMAP slot {i} → cpu_id {cpu_id}: non-linear CPU numbering \
+                     detected — eBPF hash will miss this slot, causing silent \
+                     XDP_PASS for ~1/NB_WORKERS traffic. \
+                     True fix: worker_index→cpu_id indirection map (#155 follow-up)"
+                );
+            }
             cpu_map
-                .set(cpu_idx, 192, None, 0)
-                .map_err(|e| format!("CpuMap::set cpu={cpu_idx}: {e}"))?;
+                .set(cpu_id, 192, None, 0)
+                .map_err(|e| format!("CpuMap::set cpu_id={cpu_id} (slot {i}): {e}"))?;
+        }
+        if n < nb_workers as usize {
+            tracing::warn!(
+                requested = nb_workers,
+                physical  = n,
+                "CPUMAP: fewer physical cores than requested workers —                  capped to physical count to prevent HT-sibling routing (#155)"
+            );
         }
         Ok(())
     }
