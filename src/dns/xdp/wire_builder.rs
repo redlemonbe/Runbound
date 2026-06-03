@@ -17,11 +17,11 @@
 //   - Only handles qtype A (1) and AAAA (28) records.
 //   - NXDOMAIN, NODATA, REFUSED, EDNS echo: next deliveries.
 
-use hickory_proto::rr::{RData, RecordType, LowerName, Name};
+use hickory_proto::rr::{RData, LowerName, Name};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use smallvec::SmallVec;
 
-use crate::dns::local::{LocalZoneSet, ZoneAction};
+// LocalZoneSet/ZoneAction used in worker.rs (wire_qname_to_lower_name caller), not in this module.
 use crate::dns::simd;
 
 // ── Wire constants ────────────────────────────────────────────────────────────
@@ -216,43 +216,30 @@ fn put_u32(buf: &mut [u8], pos: usize, val: u32) -> usize {
 /// Does NOT echo OPT RR. Caller must check `wq.has_edns` and fall back to
 /// hickory if EDNS echo is required (until EDNS echo is implemented in
 /// a subsequent delivery).
-pub fn build_answer_a_aaaa<'z>(
+/// Build a DNS A/AAAA answer directly from pre-fetched records.
+///
+/// # #156 perf — single lookup
+/// The caller (`answer_dns_wire` in worker.rs) has already done the zone lookup
+/// and `local_records()` call.  Receiving `records: &[&Record]` directly avoids
+/// the double HashMap lookup that the old `zones: &LocalZoneSet` signature caused
+/// on every hot-path packet.
+///
+/// Caller responsibilities:
+///   - records is non-empty (caller checks and dispatches to build_nodata/build_nxdomain)
+///   - wq.qtype is A (1) or AAAA (28) (caller pre-checks before calling)
+///   - wq.qclass is IN (caller pre-checks)
+pub fn build_answer_a_aaaa(
     wq: &WireQuery<'_>,
     out: &mut [u8],
-    zones: &'z LocalZoneSet,
+    records: &[&hickory_proto::rr::Record],
 ) -> Option<usize> {
-    // Only handle IN class queries.
-    if wq.qclass != CLASS_IN {
-        return None;
-    }
-    // Only A and AAAA in this delivery.
-    if wq.qtype != QTYPE_A && wq.qtype != QTYPE_AAAA {
-        return None;
-    }
-
-    // Build LowerName for zone lookup (one hickory alloc — unavoidable here).
-    let lower = wire_qname_to_lower_name(wq.qname_wire)?;
-
-    // Zone lookup: only Static/Redirect zones are authoritative for A/AAAA.
-    let zone_action = zones.find(&lower)?;
-    match zone_action {
-        ZoneAction::Static | ZoneAction::Redirect => {}
-        _ => return None, // NxDomain, BlockPage, Refuse → handled in next delivery
-    }
-
-    // Fetch matching records (A or AAAA depending on qtype).
-    let rtype = if wq.qtype == QTYPE_A {
-        RecordType::A
-    } else {
-        RecordType::AAAA
-    };
-    let records = zones.local_records(&lower, rtype);
-
-    // Determine ancount: 0 records = NODATA (NOERROR, ancount=0) — handled by
-    // next delivery. Return None for now to fall back to hickory.
-    if records.is_empty() {
-        return None;
-    }
+    // Caller is responsible for non-empty records and correct qtype/qclass.
+    debug_assert!(!records.is_empty(), "build_answer_a_aaaa: empty records");
+    debug_assert!(
+        wq.qtype == QTYPE_A || wq.qtype == QTYPE_AAAA,
+        "build_answer_a_aaaa: unexpected qtype {}",
+        wq.qtype
+    );
 
     let ancount = records.len();
     let qname_len = wq.qname_wire.len(); // includes terminating \0
@@ -282,7 +269,7 @@ pub fn build_answer_a_aaaa<'z>(
     pos = put_u16(out, pos, wq.qclass);                // QCLASS
 
     // ── Answer RRs ────────────────────────────────────────────────────────
-    for r in &records {
+    for r in records.iter() {
         let ttl = (*r).ttl;
 
         let ip_bytes: SmallVec<[u8; 16]> = match (*r).data {
