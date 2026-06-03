@@ -891,21 +891,26 @@ async fn top_domains_handler(
 
 async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
     let mut json = crate::stats::snapshot_to_json(&s.stats_cache.load());
-    let xdp_queues: Vec<serde_json::Value> = crate::dns::xdp::socket::XDP_QUEUE_MODES
-        .get()
-        .map(|modes| {
-            modes
-                .iter()
-                .map(|(id, zc)| {
-                    serde_json::json!({
-                        "id":   id,
-                        "mode": if *zc { "zerocopy" } else { "copy" }
-                    })
-                })
-                .collect()
+    // #159: read from per-interface registry (covers all N interfaces)
+    let xdp_ifaces = crate::dns::xdp::socket::xdp_iface_snapshot();
+    let xdp_queues: Vec<serde_json::Value> = xdp_ifaces.iter().flat_map(|iface| {
+        iface.queue_modes.iter().map(|(id, zc)| {
+            serde_json::json!({
+                "iface": iface.iface,
+                "id":    id,
+                "mode":  if *zc { "zerocopy" } else { "copy" }
+            })
         })
-        .unwrap_or_default();
-    json["xdp_queues"] = serde_json::Value::Array(xdp_queues);
+    }).collect();
+    json["xdp_queues"]  = serde_json::Value::Array(xdp_queues);
+    json["xdp_ifaces"]  = serde_json::json!(
+        xdp_ifaces.iter().map(|s| serde_json::json!({
+            "iface":           s.iface,
+            "nic_rx_ring":     s.nic_rx_ring,
+            "nic_rx_ring_max": s.nic_rx_ring_max,
+            "queues":          s.queue_modes.len(),
+        })).collect::<Vec<_>>()
+    );
     JsonExtract(json)
 }
 
@@ -980,10 +985,11 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
     // #80: NIC ring buffer + drop stats
     let nic_rx_ring = crate::dns::xdp::socket::XDP_NIC_RX_RING.load(Ordering::Relaxed);
     let nic_rx_ring_max = crate::dns::xdp::socket::XDP_NIC_RX_RING_MAX.load(Ordering::Relaxed);
-    let nic_rx_dropped = crate::dns::xdp::socket::XDP_ACTIVE_IFACE
-        .get()
-        .map(|iface| crate::dns::xdp::socket::read_nic_rx_dropped(iface))
-        .unwrap_or(0);
+    // #159: sum rx_dropped across all XDP interfaces
+    let nic_rx_dropped: u64 = crate::dns::xdp::socket::xdp_iface_snapshot()
+        .iter()
+        .map(|s| crate::dns::xdp::socket::read_nic_rx_dropped(&s.iface))
+        .sum();
 
     // #33: upstream racing wins per upstream.
     let upstream_racing_wins: serde_json::Map<String, serde_json::Value> = s
@@ -3229,13 +3235,14 @@ fn render_prometheus_metrics(
         crate::dns::xdp::socket::XDP_NIC_RX_RING_MAX.load(std::sync::atomic::Ordering::Relaxed),
     ));
     {
-        let nic_dropped = crate::dns::xdp::socket::XDP_ACTIVE_IFACE
-            .get()
-            .map(|iface| crate::dns::xdp::socket::read_nic_rx_dropped(iface))
-            .unwrap_or(0);
+        // #159: sum across all XDP interfaces
+        let nic_dropped: u64 = crate::dns::xdp::socket::xdp_iface_snapshot()
+            .iter()
+            .map(|s| crate::dns::xdp::socket::read_nic_rx_dropped(&s.iface))
+            .sum();
         out.push_str(&fmt_counter(
             "runbound_nic_rx_dropped_total",
-            "NIC RX packets dropped before XDP (hardware FIFO overflow)",
+            "NIC RX packets dropped before XDP (hardware FIFO overflow, sum across all ifaces)",
             nic_dropped,
         ));
     }
