@@ -72,9 +72,9 @@ pub struct XdpHandle {
     bpf: Ebpf,
     link_id: Option<XdpLinkId>,
     pub mode: XdpMode,
-    /// #69: (core_id, original_governor) pairs saved before switching to "performance".
-    /// Restored on Drop so the OS scheduler is left in its original state.
-    pub(crate) governor_backups: Vec<(usize, String)>,
+    /// #158: GovernorGuard holds original governors for XDP worker cores.
+    /// Restores them on Drop so the OS scheduler is left in its original state.
+    pub(crate) governor_guard: Option<super::governor::GovernorGuard>,
     /// #155: true iff CPUMAP-based domain routing is actually active at runtime.
     /// Starts as `actual_routing` from load(); can be forced to false by
     /// `disable_domain_routing()` when zerocopy is confirmed on a socket.
@@ -90,13 +90,23 @@ impl Drop for XdpHandle {
                 }
             }
         }
-        for (core_id, original) in &self.governor_backups {
-            crate::cpu::restore_governor(*core_id, original);
-        }
+        // GovernorGuard::drop() restores the original governors automatically.
+        drop(self.governor_guard.take());
     }
 }
 
 impl XdpHandle {
+    /// Extract the `GovernorGuard` from this handle so it can be managed
+    /// independently (e.g. stored in an Arc<Mutex> for SIGTERM restoration).
+    ///
+    /// After this call, `Drop` of `XdpHandle` will no longer restore the
+    /// governor — the caller owns the guard and is responsible for dropping it.
+    /// (#158: handle is moved into a detached tokio task; its Drop is unreachable
+    /// on SIGTERM, so the guard must be extracted before the move.)
+    pub fn take_governor_guard(&mut self) -> Option<super::governor::GovernorGuard> {
+        self.governor_guard.take()
+    }
+
     /// Load and attach the DNS XDP filter to `iface`.
     ///
     /// - `nb_workers`: number of XDP worker threads (injected into the eBPF global
@@ -176,7 +186,7 @@ impl XdpHandle {
             bpf,
             link_id: Some(link_id),
             mode,
-            governor_backups: Vec::new(),
+            governor_guard: None,
             domain_routing_active: actual_routing,
         };
 
