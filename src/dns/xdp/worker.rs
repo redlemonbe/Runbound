@@ -46,7 +46,7 @@ enum WireResult {
 }
 
 use super::wire_builder::{
-    build_answer_a_aaaa, build_nxdomain, build_refused, parse_query, EdnsInfo,
+    build_refused, parse_query, EdnsInfo,
 };
 use super::socket::{
     create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface, maximize_nic_ring,
@@ -1317,104 +1317,64 @@ fn answer_dns_wire(
         }
     }
 
-    // ── Zone lookup ──────────────────────────────────────────────────────────
-    // wire_qname_to_lower_name() is the one remaining hickory alloc (Name::read).
-    // Necessary for the HashMap key in LocalZoneSet::find(). Follow-up #156:
-    // if A/B shows this is still the bottleneck, replace with CRC32 direct key.
-    let lower_name = match super::wire_builder::wire_qname_to_lower_name(&wq.qname_wire) {
-        Some(n) => n,
-        None => return WireResult::Fallback, // invalid qname → hickory
-    };
+    // ── Wire-record fast path (#156 item 3 — Livraison C) ─────────────────────
+    //
+    // Replaces: wire_qname_to_lower_name (Name::read alloc) + zones.find (parent-walk)
+    //           + zones.local_records (Vec<&Record> alloc) + hickory RData dispatch.
+    //
+    // Hot path for bench/prod (local-data A/AAAA exact-match):
+    //   1. normalize_query_qname: copy_lowercase_label on raw wire bytes (SIMD, stack)
+    //   2. hash_wire_qname: CRC32c SSE4.2 + Fibonacci spread -> u64
+    //   3. wire_records.map.get(key): identity-hasher HashMap, 0 re-hash cycles
+    //   4. simd::bytes_eq: anti-collision exact match of wire QNAME
+    //   5. build_answer_a_aaaa_wire: writes RR from pre-serialised WireRdata (no hickory)
+    //
+    // All other cases (NXDOMAIN zone, Refuse zone, BlockPage, wildcard, parent-walk,
+    // CNAME, MX, TXT, non-exact-match) -> Fallback -> answer_dns() hickory handles them.
+    // Correctness is preserved: the wire path is strictly additive over hickory.
+    const QTYPE_A:    u16 = 1;
+    const QTYPE_AAAA: u16 = 28;
 
-    // RecordType not needed after removing direct local_records calls.
-    // build_answer_a_aaaa handles its own type dispatch internally.
+    if wq.qtype == QTYPE_A || wq.qtype == QTYPE_AAAA {
+        // Normalise wire QNAME to lowercase (shared helper = same bytes as load-time index).
+        let qname_lc = super::wire_builder::normalize_query_qname(wq.qname_wire);
 
-    // ── Zone action dispatch ──────────────────────────────────────────────────
-    // Mirrors answer_dns() semantics exactly — same ACL, same zone actions,
-    // same NODATA logic (name_has_records → NOERROR empty vs NXDOMAIN).
-    match zones.find(&lower_name) {
-        None => {
-            // Name not in any local zone → XDP_PASS to hickory recursive path.
-            WireResult::Fallback
-        }
+        // CRC32c hash (SSE4.2 + Fibonacci spread).
+        let key = crate::dns::hasher::hash_wire_qname(&qname_lc);
 
-        Some(ZoneAction::Refuse) => {
-            // Zone-level refuse (e.g. refuse zone) — REFUSED, AA=0.
-            match build_refused(&wq, out, edns_info.as_ref()) {
-                Some(l) => WireResult::Answered(l),
-                None    => WireResult::Fallback,
-            }
-        }
+        // Identity-hashed lookup: 0 re-hash cycles (key IS already a quality hash).
+        if let Some(entry) = zones.wire_records.map.get(&key) {
+            // Anti-collision: verify full wire QNAME bytes match (guards CRC32c collisions).
+            if crate::dns::simd::bytes_eq(&entry.wire_qname, &qname_lc) {
+                let recs = if wq.qtype == QTYPE_A {
+                    entry.a_records.as_slice()
+                } else {
+                    entry.aaaa_records.as_slice()
+                };
 
-        Some(ZoneAction::NxDomain) => {
-            // Always-nxdomain zone — NXDOMAIN, AA=1.
-            match build_nxdomain(&wq, out, edns_info.as_ref()) {
-                Some(l) => WireResult::Answered(l),
-                None    => WireResult::Fallback,
-            }
-        }
-
-        Some(ZoneAction::BlockPage) => {
-            // BlockPage: serve the pre-inserted A/AAAA record if present.
-            // CNAME-based block pages and non-A/AAAA queries → hickory.
-            // If no block record → NXDOMAIN.
-            const QTYPE_A: u16 = 1;
-            const QTYPE_AAAA: u16 = 28;
-            if wq.qtype != QTYPE_A && wq.qtype != QTYPE_AAAA {
-                return WireResult::Fallback; // → hickory for any non-A/AAAA blockpage query
-            }
-            let rtype_bp = if wq.qtype == QTYPE_A {
-                hickory_proto::rr::RecordType::A
-            } else {
-                hickory_proto::rr::RecordType::AAAA
-            };
-            let bp_records = zones.local_records(&lower_name, rtype_bp);
-            if !bp_records.is_empty() {
-                if let Some(len) = build_answer_a_aaaa(&wq, out, &bp_records, edns_info.as_ref()) {
-                    return WireResult::Answered(len);
+                if !recs.is_empty() {
+                    // Build response from pre-serialised WireRdata: zero hickory, zero alloc.
+                    if let Some(len) = super::wire_builder::build_answer_a_aaaa_wire(
+                        &wq, out, recs, edns_info.as_ref(),
+                    ) {
+                        return WireResult::Answered(len);
+                    }
+                    // Buffer too small (extremely unlikely for A/AAAA) -> hickory.
                 }
+                // Exact name match but no A/AAAA records for this qtype
+                // (e.g. AAAA query on an A-only zone) -> Fallback -> hickory NODATA.
             }
-            // No exact A/AAAA block record → hickory (may be a wildcard or
-            // CNAME-based block page, which the wire path does not handle).
-            WireResult::Fallback
+            // CRC32c collision (astronomically rare) -> Fallback -> hickory.
         }
-
-        Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
-            // Static / redirect zone.
-            //
-            // Dispatch on qtype FIRST:
-            //   A(1) / AAAA(28) → wire builder, then NODATA/NXDOMAIN if no records.
-            //   Any other type (CNAME, MX, TXT, SRV…) → None → hickory handles it.
-            //
-            // This avoids the ambiguity where build_answer_a_aaaa returns None
-            // both for "unsupported type" and "no records for A/AAAA" — without
-            // this dispatch we'd send NODATA for a CNAME query instead of falling
-            // back to hickory (correctness violation).
-            const QTYPE_A: u16 = 1;
-            const QTYPE_AAAA: u16 = 28;
-            if wq.qtype != QTYPE_A && wq.qtype != QTYPE_AAAA {
-                // Non-A/AAAA type on a static zone → hickory for CNAME, MX, TXT…
-                return WireResult::Fallback;
-            }
-            let rtype_sr = if wq.qtype == QTYPE_A {
-                hickory_proto::rr::RecordType::A
-            } else {
-                hickory_proto::rr::RecordType::AAAA
-            };
-            let records = zones.local_records(&lower_name, rtype_sr);
-            if !records.is_empty() {
-                if let Some(len) = build_answer_a_aaaa(&wq, out, &records, edns_info.as_ref()) {
-                    return WireResult::Answered(len);
-                }
-            }
-            // No exact A/AAAA record for this name. It could be a wildcard match,
-            // a true NXDOMAIN, or NODATA — the wire path does NOT implement
-            // wildcard expansion, and hickory resolves all three correctly. Fall
-            // back to hickory to avoid the wildcard regression (#156). Serving
-            // wildcards from the wire path is a future optimization.
-            WireResult::Fallback
-        }
+        // No exact wire-record hit -> Fallback -> hickory handles:
+        //   - NxDomain zones, Refuse zones, BlockPage zones
+        //   - parent-walk (local-zone bench.test. without explicit local-data)
+        //   - wildcard zones (*.example.)
+        //   - CNAME, MX, TXT and any non-A/AAAA record type
     }
+    // Non-A/AAAA qtype (MX, TXT, SRV, NS...) -> hickory unconditionally.
+
+    WireResult::Fallback
 }
 
 /// Parse `query_bytes` as a DNS query, look it up in `zones`, write the
