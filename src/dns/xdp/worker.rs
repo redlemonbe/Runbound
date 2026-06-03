@@ -81,10 +81,12 @@ const PROTO_UDP: u8 = 17;
 #[allow(clippy::too_many_arguments)]
 
 // ── debug/xdp-tx-multi : per-interface TX instrumentation ─────────────────────
+#[cfg(feature = "xdp-debug-counters")]
 use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 
 /// Counters shared across all workers of ONE interface.
 /// Logged 1×/sec by a dedicated logger thread; reset after each log.
+#[cfg(feature = "xdp-debug-counters")]
 pub(crate) struct XdpIfaceCounters {
     pub iface:           String,
     pub rx_drained:      AtomicU64,
@@ -94,6 +96,7 @@ pub(crate) struct XdpIfaceCounters {
     pub tx_completed:    AtomicU64,
     pub tx_free_empty:   AtomicU64,
 }
+#[cfg(feature = "xdp-debug-counters")]
 impl XdpIfaceCounters {
     pub fn new(iface: &str) -> Arc<Self> {
         Arc::new(Self {
@@ -451,10 +454,9 @@ fn start_xdp_on_iface(
         }
     }
 
-    // debug/xdp-tx-multi: per-interface instrumentation counters
-    // iface_ctr declared here (before workers) so Arc::clone is valid in spawn closures.
-    // The logger thread is spawned AFTER workers (below) to avoid logging zeros
-    // if the self-test fails and workers are never spawned (#fix/xdp-multi-iface-tx).
+    // debug/xdp-tx-multi: per-interface instrumentation counters (feature-gated).
+    // Enabled with --features xdp-debug-counters; zero cost in production.
+    #[cfg(feature = "xdp-debug-counters")]
     let iface_ctr = XdpIfaceCounters::new(iface);
 
     // #68: build queue→core map for IRQ affinity pinning after thread spawn.
@@ -479,8 +481,12 @@ fn start_xdp_on_iface(
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
             .spawn({
+                #[cfg(feature = "xdp-debug-counters")]
                 let ctr = Arc::clone(&iface_ctr);
-                move || xdp_worker(sock, z, rl, acl, core_id, cs, q_idx, st, ds, busy_poll, ctr)
+                move || xdp_worker(
+                    sock, z, rl, acl, core_id, cs, q_idx, st, ds, busy_poll,
+                    #[cfg(feature = "xdp-debug-counters")] ctr,
+                )
             })
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
@@ -499,9 +505,9 @@ fn start_xdp_on_iface(
     // start_xdp_multi (or start_xdp for mono-iface) to cover the UNION of
     // all interface core blocks.  Return queue_to_core to the caller instead.
 
-    // Spawn the logger thread AFTER workers are confirmed live.
-    // This guarantees that if the self-test caused Ok(None), no logger
-    // thread is left looping and emitting misleading rx_drained=0 (#fix/xdp-multi-iface-tx).
+    // Logger thread: only compiled when xdp-debug-counters feature is active.
+    // Zero cost (no atomics, no thread) in production builds.
+    #[cfg(feature = "xdp-debug-counters")]
     {
         let ctr = Arc::clone(&iface_ctr);
         std::thread::Builder::new()
@@ -712,7 +718,7 @@ fn xdp_worker(
     stats: Arc<crate::stats::Stats>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
     busy_poll: bool,
-    counters: Arc<XdpIfaceCounters>,
+    #[cfg(feature = "xdp-debug-counters")] counters: Arc<XdpIfaceCounters>,
 ) {
     use libc::{poll, pollfd, POLLIN};
 
@@ -741,9 +747,11 @@ fn xdp_worker(
         sock.umem.reclaim_tx();
         let tx_free_after = sock.umem.tx_free.len() as u64;
         if tx_free_after > tx_free_before {
+            #[cfg(feature = "xdp-debug-counters")]
             counters.tx_completed.fetch_add(tx_free_after - tx_free_before, AOrdering::Relaxed);
         }
         if sock.umem.tx_free.is_empty() {
+            #[cfg(feature = "xdp-debug-counters")]
             counters.tx_free_empty.fetch_add(1, AOrdering::Relaxed);
         }
 
@@ -763,7 +771,6 @@ fn xdp_worker(
                     // killing the worker — a dead worker leaves rx_drained=0
                     // and is indistinguishable from "no traffic" (#fix/xdp-multi-iface-tx).
                     tracing::warn!(
-                        iface  = %counters.iface,
                         worker = worker_id,
                         err    = %std::io::Error::last_os_error(),
                         "xdp_worker: poll() error — sleeping 1 ms then retrying"
@@ -777,6 +784,7 @@ fn xdp_worker(
         }
         // Ring had data — reset spin counter and process the batch.
         empty_spins = 0;
+        #[cfg(feature = "xdp-debug-counters")]
         counters.rx_drained.fetch_add(rxds.len() as u64, AOrdering::Relaxed);
 
         let snapshot = zones.load();
@@ -910,6 +918,7 @@ fn xdp_worker(
                             crate::dns::cache_snapshot::XDP_WORKER_PKTS[worker_id]
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
+                        #[cfg(feature = "xdp-debug-counters")]
                         counters.answers_built.fetch_add(1, AOrdering::Relaxed);
                         tx_descs.push(XdpDesc {
                             addr: tx_addr,
@@ -928,6 +937,7 @@ fn xdp_worker(
         sock.umem.fill.enqueue_batch(&rx_addrs);
 
         if !tx_descs.is_empty() {
+            #[cfg(feature = "xdp-debug-counters")]
             counters.tx_enqueued.fetch_add(tx_descs.len() as u64, AOrdering::Relaxed);
             sock.tx.enqueue_tx(&tx_descs);
 
@@ -952,6 +962,7 @@ fn xdp_worker(
             // batch, so it is not on the hot path under normal load.
             let need_kick = sock.tx.needs_wakeup() || sock.umem.tx_free.is_empty();
             if need_kick {
+                #[cfg(feature = "xdp-debug-counters")]
                 counters.tx_kicks.fetch_add(1, AOrdering::Relaxed);
                 // SAFETY: `sock.fd` is a valid AF_XDP socket fd owned by `XskSocket`.
                 //         Passing null pointers with length 0 and MSG_DONTWAIT is the
@@ -971,6 +982,7 @@ fn xdp_worker(
             // No new TX this batch but tx_free is exhausted — the kernel is
             // holding frames in the TX ring that it hasn't completed yet.
             // Kick unconditionally to unblock the completion queue.
+            #[cfg(feature = "xdp-debug-counters")]
             counters.tx_kicks.fetch_add(1, AOrdering::Relaxed);
             // SAFETY: same as above.
             unsafe {
