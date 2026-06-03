@@ -365,4 +365,195 @@ mod tests {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // hash_wire_qname + IdentityHasher tests (Livraison A, #156)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Hot-path normalisation: raw wire buffer → lowercase via SIMD.
+    fn build_wire_qname_hot(name: &str) -> Vec<u8> {
+        use crate::dns::simd;
+        use smallvec::SmallVec;
+        let mut buf = Vec::new();
+        let n = name.trim_end_matches('.');
+        for label in n.split('.') {
+            buf.push(label.len() as u8);
+            let mut lc: SmallVec<[u8; 64]> = SmallVec::new();
+            simd::copy_lowercase_label(&mut lc, label.as_bytes());
+            buf.extend_from_slice(&lc);
+        }
+        buf.push(0u8);
+        buf
+    }
+
+    /// Load-time normalisation: hickory Name iteration → lowercase via SIMD.
+    /// This is the path used when building WireRecordIndex from LocalZoneSet.
+    fn build_wire_qname_load(name_str: &str) -> Vec<u8> {
+        use crate::dns::simd;
+        use hickory_proto::rr::Name;
+        use smallvec::SmallVec;
+        use std::str::FromStr;
+        let name = Name::from_str(name_str).expect("valid name");
+        let mut buf = Vec::new();
+        for label in name.iter() {
+            buf.push(label.len() as u8);
+            let mut lc: SmallVec<[u8; 64]> = SmallVec::new();
+            simd::copy_lowercase_label(&mut lc, label);
+            buf.extend_from_slice(&lc);
+        }
+        buf.push(0u8);
+        buf
+    }
+
+    /// THE mandatory round-trip test.
+    ///
+    /// Verifies that the load-time path (hickory Name iteration + SIMD lowercase)
+    /// and the hot-path (raw wire buffer + SIMD lowercase) produce IDENTICAL wire
+    /// bytes AND identical `hash_wire_qname` keys for all test cases.
+    ///
+    /// If this test fails, WireRecordIndex lookups will NEVER hit → silent no-op.
+    #[test]
+    fn wire_qname_roundtrip() {
+        let cases = [
+            ("a.bench.test.",  "FQDN lowercase"),
+            ("A.BENCH.TEST.",  "FQDN mixed-case"),
+            ("bench.test",     "no trailing dot"),
+            ("x.example.com.", "multi-label"),
+        ];
+        for (name, label) in &cases {
+            let load_wire = build_wire_qname_load(name);
+            let hot_wire  = build_wire_qname_hot(name);
+            assert_eq!(
+                load_wire, hot_wire,
+                "[{}] wire bytes differ: load={:?} hot={:?}",
+                label, load_wire, hot_wire
+            );
+            let k_load = super::hash_wire_qname(&load_wire);
+            let k_hot  = super::hash_wire_qname(&hot_wire);
+            assert_eq!(
+                k_load, k_hot,
+                "[{}] hash mismatch: k_load={:#018x} k_hot={:#018x}",
+                label, k_load, k_hot
+            );
+        }
+    }
+
+    #[test]
+    fn hash_wire_qname_deterministic() {
+        let w = build_wire_qname_hot("a.bench.test.");
+        assert_eq!(super::hash_wire_qname(&w), super::hash_wire_qname(&w));
+    }
+
+    #[test]
+    fn hash_wire_qname_distinct() {
+        let a = build_wire_qname_hot("a.bench.test.");
+        let b = build_wire_qname_hot("b.bench.test.");
+        assert_ne!(super::hash_wire_qname(&a), super::hash_wire_qname(&b));
+    }
+
+    #[test]
+    fn hash_wire_qname_case_invariant() {
+        let lo = build_wire_qname_hot("a.bench.test.");
+        let up = build_wire_qname_hot("A.BENCH.TEST.");
+        assert_eq!(
+            super::hash_wire_qname(&lo),
+            super::hash_wire_qname(&up),
+            "mixed-case must hash identically to lowercase"
+        );
+    }
+
+    #[test]
+    fn len_bytes_not_mangled_by_lowercase() {
+        // DNS label length bytes are 0x01-0x3F (labels 1-63 bytes).
+        // 0x41 = b'A' — first byte copy_lowercase_label would alter.
+        // This proves length bytes survive normalisation unchanged.
+        let w = build_wire_qname_load("a.bench.test.");
+        let mut pos = 0usize;
+        while pos < w.len() {
+            let len = w[pos] as usize;
+            if len == 0 { break; }
+            assert!(len < 0x41,
+                "length byte 0x{:02x} at pos {} >= 0x41, would be corrupted", len, pos);
+            pos += 1 + len;
+        }
+    }
+
+    #[test]
+    fn identity_hasher_passthrough() {
+        use std::hash::{BuildHasher, Hasher};
+        let bh = super::IdentityHasherBuilder;
+        let mut h = bh.build_hasher();
+        h.write_u64(0xDEAD_BEEF_CAFE_1234u64);
+        assert_eq!(h.finish(), 0xDEAD_BEEF_CAFE_1234u64);
+    }
+
+    #[test]
+    fn identity_hasher_in_hashmap() {
+        use std::collections::HashMap;
+        let w = build_wire_qname_hot("a.bench.test.");
+        let key = super::hash_wire_qname(&w);
+        let mut map: HashMap<u64, &str, super::IdentityHasherBuilder> =
+            HashMap::with_hasher(super::IdentityHasherBuilder);
+        map.insert(key, "hit");
+        assert_eq!(map.get(&key), Some(&"hit"));
+        let other = super::hash_wire_qname(&build_wire_qname_hot("other.test."));
+        assert!(map.get(&other).is_none());
+    }
+
+}
+
+// ── Wire-QNAME fast hash (for WireRecordIndex) ────────────────────────────
+
+/// Hash a DNS wire-format QNAME (lowercase, uncompressed, labels length-prefixed,
+/// root \0 terminal) for use in `WireRecordIndex`.
+///
+/// Uses the same CRC32c SSE4.2 + Fibonacci-spread as `DnsHasher` — identical
+/// quality and hardware path, callable directly on `&[u8]` without Hasher trait
+/// overhead (~1 virtual dispatch saved per hot-path lookup).
+///
+/// # Normalisation contract
+/// Caller MUST pass a lowercase wire-QNAME produced by `simd::copy_lowercase_label`.
+/// `tests::wire_qname_roundtrip` enforces byte-for-byte equivalence between the
+/// load-time (hickory Name) and hot-path (raw wire) normalisation paths.
+#[inline]
+pub fn hash_wire_qname(wire_qname: &[u8]) -> u64 {
+    let mut h = DnsHasherBuilder::new().build_hasher();
+    h.write(wire_qname);
+    h.finish()
+}
+
+// ── Identity BuildHasher (for HashMap<u64, _, IdentityHasherBuilder>) ────
+
+/// `BuildHasher` that passes a `u64` key through as its own hash (identity).
+///
+/// Used for `WireRecordIndex::map: HashMap<u64, _, IdentityHasherBuilder>` where
+/// keys are already high-quality 64-bit hashes from `hash_wire_qname`.
+/// Re-hashing a CRC32c Fibonacci-spread u64 wastes ~3 cycles/lookup; this removes
+/// that overhead.
+///
+/// # Safety
+/// Only correct when keys have uniform 64-bit entropy (`hash_wire_qname` guarantees
+/// this).  Do NOT use with low-entropy or sequential keys.
+#[derive(Clone, Default)]
+pub struct IdentityHasherBuilder;
+
+pub struct IdentityHasher(u64);
+
+impl std::hash::Hasher for IdentityHasher {
+    /// Non-u64 write fallback (FNV-1a mix) — not called on the hot path.
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x0000_0100_0000_01B3); }
+        self.0 = h;
+    }
+    #[inline(always)]
+    fn write_u64(&mut self, k: u64) { self.0 = k; }
+    #[inline(always)]
+    fn finish(&self) -> u64 { self.0 }
+}
+
+impl std::hash::BuildHasher for IdentityHasherBuilder {
+    type Hasher = IdentityHasher;
+    #[inline(always)]
+    fn build_hasher(&self) -> IdentityHasher { IdentityHasher(0) }
 }
