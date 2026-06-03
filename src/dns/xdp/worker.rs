@@ -223,6 +223,36 @@ fn start_xdp_on_iface(
     let queue_modes: Vec<(u32, bool)> = sockets.iter().map(|(q, s)| (*q, s.zerocopy)).collect();
     super::socket::XDP_QUEUE_MODES.set(queue_modes).ok();
 
+    // #155 — Gate domain-routing OFF when any socket is in true zerocopy mode.
+    //
+    // This is the hard enforcement (Commit 4): sock.zerocopy is the ground truth
+    // (confirmed after AF_XDP bind succeeds with XDP_ZEROCOPY flag), unlike the
+    // XdpMode::Drv proxy used for the early WARN in loader.rs.
+    //
+    // If domain_routing was requested by the user AND any queue is in ZC mode,
+    // disable_domain_routing() writes 0 to domain_routing_cfg[0].enabled so the
+    // eBPF takes the XSKMAP path on the next packet (ZC fast path).  domain-routing
+    // remains active in pure SKB/copy
+    // mode where CPUMAP redirect costs nothing extra and cache-locality is useful.
+    let any_zerocopy = sockets.iter().any(|(_, s)| s.zerocopy);
+    if domain_routing && any_zerocopy {
+        tracing::warn!(
+            iface         = %iface,
+            zerocopy      = true,
+            "xdp-domain-routing: yes IGNORÉ — interface is in zerocopy mode. \
+             CPUMAP redirect would exit the ZC ring and cause ×40 throughput \
+             regression (4.77 M → 120 k qps, #155). \
+             Forcing domain-routing OFF; zerocopy fast path preserved. \
+             To use domain-routing, switch to SKB/copy mode (no xdp-hugepages)."
+        );
+        if let Err(e) = handle.disable_domain_routing() {
+            tracing::warn!(
+                err = %e,
+                "domain_routing_cfg gate-off failed — ZC may be compromised;                  check BPF map access (#155)"
+            );
+        }
+    }
+
     // Self-test on the first socket before committing threads.
     if let Some((_, first_sock)) = sockets.first_mut() {
         if let Err(msg) = xdp_fill_ring_self_test(iface, first_sock) {
