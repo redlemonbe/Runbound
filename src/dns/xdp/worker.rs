@@ -290,24 +290,34 @@ fn start_xdp_on_iface(
             cores[q as usize % cores.len()]
         };
         queue_to_core.push((q, core_id));
-        // #69: save original governor before the worker switches to "performance"
-        if cpu_governor {
-            if let Some(gov) = crate::cpu::read_governor(core_id) {
-                handle.governor_backups.push((core_id, gov));
-            }
-        }
         let q_idx = q as usize;
         let st = Arc::clone(&stats);
         let ds = Arc::clone(&domain_stats);
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
-            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cpu_governor, cs, q_idx, st, ds))
+            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cs, q_idx, st, ds))
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
     // #68: pin NIC queue IRQs to their XDP worker cores to avoid cross-core cache misses.
     if irq_affinity {
         crate::cpu::set_irq_affinity(iface, &queue_to_core);
+    }
+
+    // #158: pin CPU governor to 'performance' on XDP worker cores if requested.
+    // Uses GovernorGuard: reads current governor, writes 'performance', restores on Drop.
+    // Best-effort: WARNs on EACCES or missing cpufreq sysfs (VMs/containers), never fatal.
+    if cpu_governor {
+        let xdp_cores: Vec<usize> = {
+            let mut seen = std::collections::HashSet::new();
+            queue_to_core.iter()
+                .map(|(_, c)| *c)
+                .filter(|c| seen.insert(*c))
+                .collect()
+        };
+        handle.governor_guard = Some(
+            super::governor::pin_performance(&xdp_cores)
+        );
     }
 
     Ok(Some(handle))
@@ -490,7 +500,6 @@ fn xdp_worker(
     rate_limiter: Arc<RateLimiter>,
     acl: Arc<Acl>,
     core_id: usize,
-    cpu_governor: bool,
     cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
     worker_id: usize,
     stats: Arc<crate::stats::Stats>,
@@ -502,11 +511,6 @@ fn xdp_worker(
     // Migrate UMEM pages to the local NUMA node now that the thread is pinned.
     #[cfg(target_os = "linux")]
     super::umem::rebind_to_local_numa(sock.umem.area, sock.umem.area_len);
-    // #69: switch to performance governor after pinning to the target core
-    if cpu_governor {
-        crate::cpu::set_performance_governor(core_id);
-    }
-
     // Pre-allocate scratch buffers outside the hot loop to avoid per-batch
     // heap allocations.  Each Vec retains its capacity across iterations;
     // clear() resets length without releasing memory.

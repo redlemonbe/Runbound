@@ -294,6 +294,48 @@ cat /proc/irq/$(grep -m1 eth0 /proc/interrupts | cut -d: -f1 | tr -d ' ')/smp_af
 
 ---
 
+## CPU governor pinning (`xdp-cpu-governor`, #158)
+
+By default, Linux uses `schedutil` or `powersave` governors which ramp CPU frequency
+up/down based on utilisation. DNS traffic is inherently bursty at microsecond scale —
+the frequency ramp-up latency (~50–200 µs depending on the platform) adds measurable
+jitter to the first packets of each burst, visible as p99 spikes.
+
+`xdp-cpu-governor: performance` pins each XDP worker core to the `performance` governor
+for the lifetime of the process and restores the original governor on clean shutdown:
+
+```
+server:
+    xdp-cpu-governor: performance   # none (default) | performance
+```
+
+**Behaviour:**
+- Reads `/sys/devices/system/cpu/cpuN/cpufreq/scaling_governor` for each worker core,
+  saves the value, writes `performance`.
+- On shutdown (clean or signal), the original governor is restored via `Drop`
+  (same discipline as XDP program detach).
+- **Silent no-op** when `cpufreq` sysfs is absent (KVM/VMs without host CPU pass-through,
+  containers). A `WARN` is emitted but startup continues normally.
+- Requires root or `CAP_SYS_ADMIN` to write `scaling_governor`. Individual cores that
+  cannot be pinned are skipped with a `WARN`; others are pinned normally.
+
+**Verify:**
+```bash
+# While Runbound is running — should show 'performance' on XDP cores:
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+# → performance
+
+# After shutdown — restored to original:
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+# → schedutil
+```
+
+**When to use:** bare-metal deployments with variable load where `schedutil` is the default.
+Not useful in VMs (no cpufreq control) or when the host is already pinned to `performance`
+via a system-level tuning profile (e.g. `tuned -p throughput-performance`).
+
+---
+
 ## NIC ring buffer auto-sizing
 
 Intel ixgbe cards (X520, X540, X710) ship with a default RX ring of **512 descriptors**.
