@@ -102,12 +102,17 @@ For local-zone **A / AAAA** answers, the XDP worker bypasses `hickory_proto`
 entirely: `answer_dns_wire()` parses the query and writes the response straight
 into the UMEM TX frame — no `Message` parse/serialize, no heap allocation.
 
-Measured on an X520 10 GbE link (same `a.bench.test A` query, dnsmark v1.2.1):
+Measured on an X520 10 GbE link (same `a.bench.test A` query, dnsmark v1.2.1,
+controlled back-to-back A/B, 5 runs each, medians):
 
 | | hickory | wire builder | gain |
 |---|---|---|---|
-| Throughput | 4.11 M qps | **6.48 M qps** | **+58 %** |
-| p50 latency | 0.512 ms | **0.335 ms** | **−35 %** |
+| Throughput (median) | ~3.80 M qps | ~4.63 M qps | **+21 %** |
+| p50 latency | 0.52 ms | 0.34 ms | **−35 %** |
+
+(The p50 latency improvement is the most consistent metric; absolute throughput
+is CPU-frequency / host-state dependent, so the back-to-back ratio is the
+reliable figure.)
 
 Everything the wire builder does not cover — NXDOMAIN, NODATA, **wildcard
 local-data**, CNAME/MX/TXT, EDNS (OPT), ACL Deny, ANY, malformed — transparently
