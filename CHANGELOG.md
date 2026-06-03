@@ -9,6 +9,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.10.0] — 2026-06-04
+
+### Added
+
+- **Multi-interface XDP fast path** — runbound can now attach XDP to N interfaces simultaneously. `xdp-interface` accepts: a single name (unchanged), a comma-separated list (`nic2,nic3`), or `auto` (all eligible interfaces). `auto` skips loopback, virtual (`vmbr*`/`tap*`/`veth*`) and **bonded** interfaces (XDP is incompatible with bonding — WARN + skip). Absent + `xdp: yes` keeps the legacy single-interface auto-detect; `xdp: no` (pure hickory slow path) is unchanged. Each interface gets its own independent XSK sockets, workers, and eBPF program. Worker CPU-core assignment is offset per interface (distinct core block per NIC, no cross-interface collision); the performance governor is pinned across all XDP interfaces' cores and restored on SIGTERM/SIGINT.
+  - Measured (2× Intel X520 10 GbE, Threadripper receiver, dnsmark generator): **~17–18M qps aggregate on dual-fibre at ~13% CPU**, near-zero NIC drops. Generator-limited — the receiver had large headroom. See `docs/benchmark/v0.10.0.md`.
+
+### Fixed
+
+- **Multi-interface XDP programs now stay attached for the process lifetime** (critical): non-primary `XdpHandle`s were dropped right after setup, and `XdpHandle::Drop` calls `detach()` — silently removing the 2nd+ interface's XDP program from the NIC. The interface received packets at the NIC but never redirected them to its AF_XDP sockets (workers drained 0). The full handle set is now captured by the long-lived task and never dropped while the process runs. Verified at the kernel level (`bpftool net show` shows a program on every XDP interface).
+- XDP worker no longer exits silently on a transient `poll()` error — it warns and continues instead of breaking out of the loop.
+
+### Internal
+
+- Per-interface debug counters (`[DBG-TX]`) are gated behind the `xdp-debug-counters` cargo feature (off by default) — zero hot-path cost in release builds; rebuild with `--features "xdp xdp-debug-counters"` to re-enable.
+
+---
+
 ## [0.9.69] — 2026-06-03
 
 ### Added
