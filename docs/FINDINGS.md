@@ -332,3 +332,52 @@ dig @<ip> a.bench.test A +noedns    # wire fast path
 - Baseline hickory : 5.15M qps (16 workers × 322k/cœur)
 - Cible wire bypass : ~8-10M si hickory est le goulot dominant
 - Si <7M → `wire_qname_to_lower_name` (Name::read) est le prochain goulot → follow-up
+
+---
+
+## Session perf/xdp-wire-followup — EDNS OPT Echo (Item 2, priorité 1)
+
+**Date :** 2026-06-03 | **Commit :** 78e06a0
+
+### Constat hickory OPT echo (source primaire)
+
+Chemin slow path `answer_dns()` (`worker.rs` lignes 1422-1520) : construit la réponse via
+`Message::new` + `resp.emit()` **sans OPT echo**. Le seul chemin RFC 6891 §7 conforme
+est le handler Tokio complet (catalog.rs → `MessageResponseBuilder::new(queries, response_edns)`)
+qui est le chemin kernel (non-XDP). **Les deux chemins XDP (wire fast path et hickory fallback
+`answer_dns()`) violaient RFC 6891 §7 avant cette livraison.**
+
+→ `answer_dns()` slow path est une dette séparée (follow-up, hors scope livraison EDNS wire).
+
+### Ce qui a été livré (78e06a0)
+
+| Composant | Avant | Après |
+|-----------|-------|-------|
+| `detect_edns()` → `bool` | Présence OPT seulement | `parse_opt_rr()` → `Option<EdnsInfo>` : extrait `udp_payload` + `do_bit` |
+| `WireQuery.has_edns` | bool | `wq.edns: Option<EdnsInfo>` |
+| Gate EDNS dans `answer_dns_wire` | `has_edns → Fallback` (100% trafic réel → hickory) | `do_bit=1 → Fallback` ; EDNS sans DNSSEC → fast path avec OPT echo |
+| `build_*()` fonctions | `arcount=0` toujours | `edns: Option<&EdnsInfo>` → `arcount=1` + OPT RR 11B si EDNS |
+| `write_opt_rr()` | absent | root `\0` + type=41 + udp_payload echo + DO=0 + rdlen=0 (11B) |
+| Tests | 12 | 16 (+4 EDNS) |
+
+### Correctness gate (à valider sur le récepteur)
+
+```bash
+# Fast path EDNS (dig par défaut = EDNS)
+dig @<ip> a.bench.test A               # NOERROR AA=1 + OPT PSEUDOSECTION présente
+dig @<ip> absent.bench.test A          # NXDOMAIN + OPT PSEUDOSECTION
+dig @<ip> a.bench.test A +noedns       # NOERROR sans OPT (legacy path inchangé)
+
+# DO=1 → fallback hickory
+dig @<ip> a.bench.test A +dnssec       # NOERROR + OPT avec DO=1 (hickory répond)
+
+# ACL Deny → timeout (unchanged)
+```
+
+### Impact perf attendu
+
+Le gate `has_edns → Fallback` (v0.9.66) faisait tomber 100% du trafic réel (dig, clients)
+vers hickory. Avec `do_bit=1 → Fallback`, seules les requêtes DNSSEC tombent en hickory.
+Le trafic de bench dnsmark (arcount=0, pas d'EDNS) est inchangé. **La mesure A/B production
+est maintenant possible** sur des clients envoyant EDNS sans DNSSEC.
+
