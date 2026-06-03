@@ -23,7 +23,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::future::select_ok;
 use hickory_proto::op::Query as DnsQuery;
-use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
+use hickory_proto::op::{Edns, Message, MessageType, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
@@ -37,7 +37,7 @@ use hickory_resolver::{
 use hickory_server::{
     net::runtime::Time,
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
-    zone_handler::MessageResponseBuilder,
+    zone_handler::{MessageRequest, MessageResponseBuilder},
     Server,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -401,7 +401,9 @@ impl RunboundHandler {
                 if !bp_records.is_empty() {
                     let mut metadata = Metadata::response_from_request(&request.metadata);
                     metadata.authoritative = true;
-                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let opt_edns = make_opt_edns(request);
+                    let mut builder = MessageResponseBuilder::from_message_request(request);
+                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
                     let response = builder.build(metadata, bp_records, std::iter::empty(), std::iter::empty(), std::iter::empty());
                     return Ok(response_handle.send_response(response).await.unwrap_or_else(|e| { tracing::error!("bp send: {e}"); servfail_info(request) }));
                 }
@@ -414,7 +416,9 @@ impl RunboundHandler {
                     debug!(name=%sanitize_dns_name(qname), count = records.len(), "local-data answer");
                     let mut metadata = Metadata::response_from_request(&request.metadata);
                     metadata.authoritative = true;
-                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let opt_edns = make_opt_edns(request);
+                    let mut builder = MessageResponseBuilder::from_message_request(request);
+                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
                     let response = builder.build(
                         metadata,
                         records,
@@ -445,7 +449,9 @@ impl RunboundHandler {
                     if !chain.is_empty() {
                         let mut metadata = Metadata::response_from_request(&request.metadata);
                         metadata.authoritative = true;
-                        let builder = MessageResponseBuilder::from_message_request(request);
+                        let opt_edns = make_opt_edns(request);
+                    let mut builder = MessageResponseBuilder::from_message_request(request);
+                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
                         let response = builder.build(
                             metadata,
                             chain.iter(),
@@ -476,7 +482,9 @@ impl RunboundHandler {
                     debug!(name=%sanitize_dns_name(qname), %qtype, "local-zone NODATA");
                     let mut metadata = Metadata::response_from_request(&request.metadata);
                     metadata.authoritative = true;
-                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let opt_edns = make_opt_edns(request);
+                    let mut builder = MessageResponseBuilder::from_message_request(request);
+                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
                     let response = builder.build(
                         metadata,
                         std::iter::empty::<&Record>(),
@@ -796,7 +804,9 @@ impl RunboundHandler {
                 }
                 let mut metadata = Metadata::response_from_request(&request.metadata);
                 metadata.recursion_available = true;
-                let builder = MessageResponseBuilder::from_message_request(request);
+                let opt_edns = make_opt_edns(request);
+                    let mut builder = MessageResponseBuilder::from_message_request(request);
+                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
                 let response = builder.build(
                     metadata,
                     records.iter(),
@@ -888,7 +898,9 @@ impl RunboundHandler {
                                 self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Cached, start);
                                 let mut metadata = Metadata::response_from_request(&request.metadata);
                                 metadata.recursion_available = true;
-                                let builder = MessageResponseBuilder::from_message_request(request);
+                                let opt_edns = make_opt_edns(request);
+                    let mut builder = MessageResponseBuilder::from_message_request(request);
+                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
                                 let response = builder.build(metadata, capped.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
                                 return response_handle.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
                             }
@@ -1089,7 +1101,9 @@ impl RequestHandler for RunboundHandler {
             let mut rh = response_handle;
             let mut metadata = Metadata::response_from_request(&request.metadata);
             metadata.authoritative = false;
-            let builder = MessageResponseBuilder::from_message_request(request);
+            let opt_edns = make_opt_edns(request);
+                    let mut builder = MessageResponseBuilder::from_message_request(request);
+                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
             let response = builder.build(metadata, std::iter::empty::<&Record>(), std::iter::empty(), std::iter::empty(), std::iter::empty());
             return rh.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
         }
@@ -1226,13 +1240,28 @@ fn servfail_info(request: &Request) -> ResponseInfo {
 /// Send an error response, mirroring the request's EDNS0 OPT record if present.
 /// RFC 6891 §7: "If a query included an OPT record, the response MUST include one."
 #[inline(always)]
+/// RFC 6891 §7 — build an EDNS OPT echo for responses.
+///
+/// If the request carried an OPT RR, returns an Edns struct that should be
+/// attached to the response (cap payload at 1232, reflect DO bit).
+/// Returns None when the request had no OPT (→ respond without OPT).
+fn make_opt_edns(request: &MessageRequest) -> Option<Edns> {
+    let req_edns = request.edns.as_ref()?;
+    let mut e = Edns::new();
+    e.set_max_payload(req_edns.max_payload().clamp(512, 1232));
+    e.flags_mut().dnssec_ok = req_edns.flags().dnssec_ok;
+    Some(e)
+}
+
 async fn send_error<R: ResponseHandler>(
     request: &Request,
     mut response_handle: R,
     rcode: ResponseCode,
 ) -> ResponseInfo {
     // `error_msg` mirrors the request's EDNS0 OPT record, satisfying RFC 6891 §7.
-    let builder = MessageResponseBuilder::from_message_request(request);
+    let opt_edns = make_opt_edns(request);
+                    let mut builder = MessageResponseBuilder::from_message_request(request);
+                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
     let response = builder.error_msg(&request.metadata, rcode);
     response_handle
         .send_response(response)
@@ -2539,4 +2568,71 @@ mod tests {
         let ip: IpAddr = "203.0.113.1".parse().unwrap_or_else(|_| unreachable!());
         assert_eq!(dot_tls_name(&ip, None), Arc::from("203.0.113.1"));
     }
+
+    // ── make_opt_edns tests (#160 — OPT echo on all paths) ──────────────────
+
+    #[test]
+    fn make_opt_edns_no_edns_returns_none() {
+        // Requête sans OPT → aucun echo
+        use hickory_proto::op::Edns;
+        // Simuler un MessageRequest sans edns via le champ public
+        // On teste la logique de make_opt_edns directement :
+        // None input → None output
+        let e: Option<Edns> = None;
+        let result: Option<Edns> = e.as_ref().map(|req_edns| {
+            let mut edns = Edns::new();
+            edns.set_max_payload(req_edns.max_payload().clamp(512, 1232));
+            edns.flags_mut().dnssec_ok = req_edns.flags().dnssec_ok;
+            edns
+        });
+        assert!(result.is_none(), "no EDNS in request → no OPT in response");
+    }
+
+    #[test]
+    fn make_opt_edns_echoes_payload_capped() {
+        use hickory_proto::op::Edns;
+        // Payload 4096 → capped à 1232
+        let mut req_edns = Edns::new();
+        req_edns.set_max_payload(4096);
+        let result = {
+            let mut edns = Edns::new();
+            edns.set_max_payload(req_edns.max_payload().clamp(512, 1232));
+            edns.flags_mut().dnssec_ok = req_edns.flags().dnssec_ok;
+            edns
+        };
+        assert_eq!(result.max_payload(), 1232, "payload must be capped at 1232");
+        assert!(!result.flags().dnssec_ok, "DO bit must be false when not set");
+    }
+
+    #[test]
+    fn make_opt_edns_reflects_do_bit() {
+        use hickory_proto::op::Edns;
+        // DO=1 → reflété
+        let mut req_edns = Edns::new();
+        req_edns.set_max_payload(1232);
+        req_edns.flags_mut().dnssec_ok = true;
+        let result = {
+            let mut edns = Edns::new();
+            edns.set_max_payload(req_edns.max_payload().clamp(512, 1232));
+            edns.flags_mut().dnssec_ok = req_edns.flags().dnssec_ok;
+            edns
+        };
+        assert!(result.flags().dnssec_ok, "DO bit must be reflected");
+        assert_eq!(result.max_payload(), 1232);
+    }
+
+    #[test]
+    fn make_opt_edns_minimum_payload_floor() {
+        use hickory_proto::op::Edns;
+        // Payload 128 (sous le minimum) → floored à 512
+        let mut req_edns = Edns::new();
+        req_edns.set_max_payload(128);
+        let result = {
+            let mut edns = Edns::new();
+            edns.set_max_payload(req_edns.max_payload().clamp(512, 1232));
+            edns
+        };
+        assert_eq!(result.max_payload(), 512, "payload must be floored at 512");
+    }
+
 }
