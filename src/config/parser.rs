@@ -819,7 +819,11 @@ fn parse_server_directive(
         "cpu-affinity" => cfg.cpu_affinity = val.trim_matches('"') != "no",
         "xdp" => cfg.xdp = val.trim_matches('"') != "no",
         "xdp-interface" => cfg.xdp_interface = Some(val.trim_matches('"').to_string()),
-        "xdp-cpu-governor" => cfg.xdp_cpu_governor = val.trim_matches('"') == "yes",
+        "xdp-cpu-governor" => {
+            // Accept "performance" (documented value) and "yes" (legacy);
+            // anything else (none / no / absent) leaves the feature disabled.
+            cfg.xdp_cpu_governor = matches!(val.trim_matches('"'), "performance" | "yes");
+        }
         "xdp-irq-affinity" => cfg.xdp_irq_affinity = val.trim_matches('"') == "yes",
         "xdp-hugepages" => cfg.xdp_hugepages = val.trim_matches('"') != "no",
         "xdp-cache-snapshot" => cfg.xdp_cache_snapshot = val.trim_matches('"') != "no",
@@ -1058,4 +1062,35 @@ mod tests {
         let cfg = parse_str("server:\n  xdp-rx-ring-size: 65536\n").unwrap();
         assert_eq!(cfg.xdp_rx_ring_size, 65536);
     }
+
+    // --- #158 xdp-cpu-governor parser coverage ---
+
+    #[test]
+    fn xdp_cpu_governor_performance_enables_feature() {
+        let cfg = parse_str("server:\n  xdp-cpu-governor: performance\n").unwrap();
+        assert!(cfg.xdp_cpu_governor,
+            "xdp-cpu-governor: performance must set xdp_cpu_governor = true");
+    }
+
+    #[test]
+    fn xdp_cpu_governor_yes_enables_feature() {
+        let cfg = parse_str("server:\n  xdp-cpu-governor: yes\n").unwrap();
+        assert!(cfg.xdp_cpu_governor,
+            "xdp-cpu-governor: yes must set xdp_cpu_governor = true (legacy compat)");
+    }
+
+    #[test]
+    fn xdp_cpu_governor_none_disables_feature() {
+        let cfg = parse_str("server:\n  xdp-cpu-governor: none\n").unwrap();
+        assert!(!cfg.xdp_cpu_governor,
+            "xdp-cpu-governor: none must leave xdp_cpu_governor = false");
+    }
+
+    #[test]
+    fn xdp_cpu_governor_absent_defaults_false() {
+        let cfg = parse_str("server:\n  xdp: yes\n").unwrap();
+        assert!(!cfg.xdp_cpu_governor,
+            "absent xdp-cpu-governor must default to false");
+    }
+
 }
