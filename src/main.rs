@@ -228,6 +228,7 @@ async fn async_main(
                     cfg.xdp_hugepages,
                     xdp_cache_snapshot.clone(),
                     cfg.xdp_domain_routing,
+                    cfg.xdp_busy_poll,
                     cfg.xdp_ring_size,
                     xdp_ring_sizes,
                     Arc::clone(&global_stats),

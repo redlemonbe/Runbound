@@ -194,6 +194,10 @@ pub struct UnboundConfig {
     /// Improves XDP cache locality for repeated lookups of the same domain.
     /// Default: false. Falls back silently to RSS if CPUMAP is unavailable.
     pub xdp_domain_routing: bool,
+    /// Drain RX ring before sleeping (busy-drain loop + NAPI busy-poll hints).
+    /// Eliminates rx_missed_errors under flood by processing all queued descriptors
+    /// before calling poll(). Default: true.
+    pub xdp_busy_poll: bool,
     /// NIC ring buffer size for AF_XDP (#80).
     /// `None` = "auto" — maximize to hardware max via SIOCETHTOOL (default).
     /// `Some(n)` = set ring to exactly n descriptors (capped at hardware max).
@@ -384,6 +388,7 @@ impl UnboundConfig {
             cpu_affinity: true,
             xdp: true,
             xdp_hugepages: true,
+            xdp_busy_poll: true,
             xdp_cache_snapshot: true,
             xdp_cache_snapshot_size: 10_000,
             cache_min_entries: 2048,
@@ -829,6 +834,7 @@ fn parse_server_directive(
         "xdp-cache-snapshot" => cfg.xdp_cache_snapshot = val.trim_matches('"') != "no",
         "xdp-cache-snapshot-size" => cfg.xdp_cache_snapshot_size = val.parse().unwrap_or(10_000),
         "xdp-domain-routing" => cfg.xdp_domain_routing = val.trim_matches('"') == "yes",
+        "xdp-busy-poll" => cfg.xdp_busy_poll = val.trim_matches('"') != "no",
         "xdp-ring-size" => {
             let v = val.trim_matches('"').trim();
             cfg.xdp_ring_size = if v == "auto" {
@@ -1091,6 +1097,24 @@ mod tests {
         let cfg = parse_str("server:\n  xdp: yes\n").unwrap();
         assert!(!cfg.xdp_cpu_governor,
             "absent xdp-cpu-governor must default to false");
+    }
+
+    #[test]
+    fn xdp_busy_poll_yes_enables_feature() {
+        let cfg = parse_str("server:\n  xdp-busy-poll: yes\n").unwrap();
+        assert!(cfg.xdp_busy_poll, "xdp-busy-poll: yes must be true");
+    }
+
+    #[test]
+    fn xdp_busy_poll_no_disables_feature() {
+        let cfg = parse_str("server:\n  xdp-busy-poll: no\n").unwrap();
+        assert!(!cfg.xdp_busy_poll, "xdp-busy-poll: no must be false");
+    }
+
+    #[test]
+    fn xdp_busy_poll_absent_defaults_true() {
+        let cfg = parse_str("server:\n  xdp: yes\n").unwrap();
+        assert!(cfg.xdp_busy_poll, "absent xdp-busy-poll must default to true");
     }
 
 }
