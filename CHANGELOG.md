@@ -9,6 +9,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.66] — 2026-06-03
+
+### Added
+
+- **XDP wire-format response builder for local-zone A/AAAA queries** (#156): `answer_dns_wire()` parses the query and writes the response directly into the UMEM TX frame, bypassing `hickory_proto::Message` parse/serialize and all heap allocation on the answer hot path.
+  - Measured on an X520 10 GbE link (controlled back-to-back A/B, 5 runs each, medians): local-zone A answer path **+21% throughput** (~3.80M → ~4.63M qps) and **−35% p50 latency** (0.52ms → 0.34ms).
+  - Everything not covered — NXDOMAIN, NODATA, wildcards, CNAME/MX/TXT, EDNS, ACL Deny, ANY, malformed — transparently falls back to hickory. No behaviour change, no regression.
+  - See `docs/benchmark/v0.9.66.md` and `docs/xdp.md`.
+
+### Fixed
+
+- **`xdp-domain-routing` (CPUMAP) no longer breaks zero-copy** (#155): enabling CPUMAP domain-routing on a zero-copy interface collapsed throughput ~40× (4.77M → 120k qps) and routed packets onto HyperThread siblings.
+  - `DOMAIN_ROUTING_ENABLED` moved from a frozen `volatile const` to a runtime map flag (`domain_routing_cfg`), forced OFF once zero-copy is confirmed on a socket → the XDP program falls through to the XSK zero-copy path.
+  - CPUMAP indices now map to physical cores only (`cpu::physical_cores()`), never HT siblings.
+  - domain-routing remains available in SKB/copy mode (cache locality).
+
+---
+
 ## [0.9.58] — 2026-05-26
 
 ### Added
