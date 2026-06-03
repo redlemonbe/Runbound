@@ -41,6 +41,21 @@ pub struct IcmpCfgEntry {
 // SAFETY: IcmpCfgEntry is a plain C struct with no pointers.
 unsafe impl aya::Pod for IcmpCfgEntry {}
 
+/// #155 — BPF map entry mirroring `struct domain_routing_cfg_entry` in dns_xdp.c.
+/// Replaces `volatile const DOMAIN_ROUTING_ENABLED` (frozen .rodata) with a
+/// runtime-writable Array map so the gate-off can happen AFTER zerocopy bind.
+/// Must match the C struct layout exactly (repr(C), same padding).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct DomainRoutingCfgEntry {
+    /// 1 = CPUMAP domain routing active; 0 = XSKMAP RSS/ZC fast path.
+    pub enabled: u8,
+    pub _pad: [u8; 3],
+}
+
+// SAFETY: DomainRoutingCfgEntry is a plain C struct with no pointers.
+unsafe impl aya::Pod for DomainRoutingCfgEntry {}
+
 /// XDP attachment mode — reported by GET /api/system as `xdp_mode`.
 #[derive(Clone, Copy, Debug)]
 pub enum XdpMode {
@@ -60,6 +75,10 @@ pub struct XdpHandle {
     /// #69: (core_id, original_governor) pairs saved before switching to "performance".
     /// Restored on Drop so the OS scheduler is left in its original state.
     pub(crate) governor_backups: Vec<(usize, String)>,
+    /// #155: true iff CPUMAP-based domain routing is actually active at runtime.
+    /// Starts as `actual_routing` from load(); can be forced to false by
+    /// `disable_domain_routing()` when zerocopy is confirmed on a socket.
+    pub(crate) domain_routing_active: bool,
 }
 
 impl Drop for XdpHandle {
@@ -158,6 +177,7 @@ impl XdpHandle {
             link_id: Some(link_id),
             mode,
             governor_backups: Vec::new(),
+            domain_routing_active: actual_routing,
         };
 
         // #155 — WARN: domain-routing (CPUMAP) is mutually exclusive with zerocopy.
@@ -168,14 +188,30 @@ impl XdpHandle {
         // 4.77 M qps (ZC) → 120 k qps (CPUMAP redirect) = ×40 regression (#155).
         //
         // Design decision (architect, 2026-06-03): ZC wins on ZC-capable interfaces.
-        // domain-routing is intentionally left available in SKB/copy mode where its
-        // cache-locality intent still makes sense (Commit 4 will gate it OFF in ZC).
-        if actual_routing && matches!(mode, XdpMode::Drv) {
+        // domain-routing is silently gated OFF when zerocopy is confirmed on any
+        // socket (worker.rs, after bind); this WARN uses `domain_routing` (the raw
+        // user config) rather than `actual_routing` so the operator always sees it,
+        // even after the gate-off has already forced actual_routing=false.
+        // XdpMode::Drv is a proxy for ZC-capable here; the true gate uses
+        // sock.zerocopy (confirmed after bind) in worker.rs.
+        if domain_routing && matches!(mode, XdpMode::Drv) {
             tracing::warn!(
                 iface          = %iface,
                 xdp_mode       = "DRV (zerocopy)",
-                "xdp-domain-routing is enabled on a zerocopy-capable interface.                  CPUMAP redirect exits the ZC ring (bpf_redirect_map re-queues via                  NAPI backlog) — measured throughput drop: 4.77 M → 120 k qps (×40).                  Disable xdp-domain-routing on ZC interfaces or accept the regression.                  (#155 — gate-off enforcement coming in next commit)"
+                "xdp-domain-routing: yes IGNORÉ sur cette interface zerocopy. \
+                 CPUMAP redirect exits the ZC ring (bpf_redirect_map re-queues via \
+                 NAPI backlog) — measured: 4.77 M → 120 k qps (×40 regression). \
+                 domain-routing is forced OFF once ZC is confirmed on any socket \
+                 (worker.rs); it remains available in SKB/copy mode only. (#155)"
             );
+        }
+
+        // #155 — Initialise domain_routing_cfg Array map (runtime-flippable flag).
+        // Must happen before init_cpumap so the eBPF flag is consistent with the
+        // CPUMAP entries.  worker.rs will flip to 0 after ZC bind if any sock is ZC.
+        if let Err(e) = handle.init_domain_routing_cfg(actual_routing) {
+            tracing::warn!(err=%e, "domain_routing_cfg init failed — domain routing disabled");
+            handle.domain_routing_active = false;
         }
 
         // Init CPUMAP entries when domain routing is enabled.
@@ -189,6 +225,54 @@ impl XdpHandle {
         }
 
         Ok(handle)
+    }
+
+    /// #155 — Force domain-routing OFF when zerocopy is confirmed on any socket.
+    ///
+    /// Called from `worker.rs` after AF_XDP sockets are bound and `sock.zerocopy`
+    /// is the ground truth.  Writes `enabled=0` into the `domain_routing_cfg`
+    /// BPF Array map so the eBPF program takes the XSKMAP path on the NEXT packet.
+    ///
+    /// # Why not clear CPUMAP entries?
+    /// The former approach cleared CPUMAP entries but left `DOMAIN_ROUTING_ENABLED=1`
+    /// (frozen .rodata) — the eBPF still entered the CPUMAP branch →
+    /// `bpf_redirect_map` on an empty map → `XDP_PASS` → slow-path kernel socket,
+    /// NOT the ZC XSK.  Writing 0 to the Array map flag is the only correct gate (#155).
+    ///
+    /// # Errors
+    /// Returns `Err(String)` if the map write fails; caller logs and handles.
+    pub fn disable_domain_routing(&mut self) -> Result<(), String> {
+        let map = self
+            .bpf
+            .map_mut("domain_routing_cfg")
+            .ok_or_else(|| "domain_routing_cfg map not found".to_string())?;
+        let mut arr = Array::<_, DomainRoutingCfgEntry>::try_from(map)
+            .map_err(|e| e.to_string())?;
+        arr.set(0, DomainRoutingCfgEntry { enabled: 0, _pad: [0; 3] }, 0)
+            .map_err(|e| format!("domain_routing_cfg.set(0): {e}"))?;
+        self.domain_routing_active = false;
+        tracing::info!(
+            "domain_routing_cfg[0].enabled → 0: CPUMAP path disabled, ZC XSKMAP fast path preserved (#155)"
+        );
+        Ok(())
+    }
+
+    /// #155 — Initialise the `domain_routing_cfg` BPF Array map at load time.
+    /// Sets `enabled` to 1 if `active`, 0 otherwise.
+    fn init_domain_routing_cfg(&mut self, active: bool) -> Result<(), String> {
+        let map = self
+            .bpf
+            .map_mut("domain_routing_cfg")
+            .ok_or_else(|| "domain_routing_cfg map not found".to_string())?;
+        let mut arr = Array::<_, DomainRoutingCfgEntry>::try_from(map)
+            .map_err(|e| e.to_string())?;
+        arr.set(
+            0,
+            DomainRoutingCfgEntry { enabled: active as u8, _pad: [0; 3] },
+            0,
+        )
+        .map_err(|e| format!("domain_routing_cfg.set(0): {e}"))?;
+        Ok(())
     }
 
     /// Update the ICMP config BPF map live — no reload required (#89).

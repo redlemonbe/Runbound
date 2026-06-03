@@ -170,9 +170,27 @@ static __always_inline __u16 csum16_add(__u16 a, __u16 b)
 
 volatile const __u32 NB_WORKERS = 1;
 
-// Set to 1 by Rust when xdp-domain-routing: yes is configured.
-// When 0 (default), the CPUMAP path is skipped and XSKMAP (RSS) is used.
-volatile const __u32 DOMAIN_ROUTING_ENABLED = 0;
+// #155 — domain-routing runtime flag: BPF_MAP_TYPE_ARRAY (1 entry, key=0).
+//
+// Replaces volatile const DOMAIN_ROUTING_ENABLED which is .rodata — frozen at
+// eBPF load time and cannot be flipped post-bind.  Using an Array map allows
+// worker.rs to write 0 AFTER zerocopy bind succeeds (when sock.zerocopy is
+// the ground truth), preserving the ZC fast path.
+//
+// Layout mirrors struct domain_routing_cfg_entry in loader.rs (repr(C)):
+//   u8  enabled   — 0 = use XSKMAP (RSS/ZC fast path), 1 = use CPUMAP routing
+//   u8  _pad[3]   — alignment padding
+struct domain_routing_cfg_entry {
+    __u8  enabled;
+    __u8  _pad[3];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,   __u32);
+    __type(value, struct domain_routing_cfg_entry);
+} domain_routing_cfg SEC(".maps");
 
 // FNV-1a hash over the first 64 bytes of the DNS QNAME.
 //
@@ -446,7 +464,13 @@ int dns_xdp(struct xdp_md *ctx)
     // qname_off is computed from known constant header sizes — IHL=5 was
     // verified above, IPv6 header is always fixed 40 bytes — so no packet
     // pointer arithmetic is needed here (BPF verifier forbids ptr-ptr subtraction).
-    if (DOMAIN_ROUTING_ENABLED) {
+    // #155 — runtime flag: read domain_routing_cfg[0].enabled (Array map).
+    // Returns XDP_PASS (→ ZC XSKMAP path below) if map lookup fails or enabled=0.
+    {
+        __u32 dr_key = 0;
+        struct domain_routing_cfg_entry *dr_cfg =
+            bpf_map_lookup_elem(&domain_routing_cfg, &dr_key);
+        if (dr_cfg && dr_cfg->enabled) {
 #ifndef NO_CPUMAP
         __u32 nb = NB_WORKERS;
         if (nb > 1) {
@@ -465,7 +489,8 @@ int dns_xdp(struct xdp_md *ctx)
             return bpf_redirect_map(&CPUMAP, cpu, XDP_PASS);
         }
 #endif
-    }
+        } // if (dr_cfg && dr_cfg->enabled)
+    } // domain_routing_cfg lookup
 
     // ── Default path: redirect to AF_XDP socket for this NIC queue ────────────
     // XDP_PASS fallback: if queue not yet registered (e.g. during startup)
