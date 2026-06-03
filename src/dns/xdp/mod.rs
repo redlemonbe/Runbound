@@ -81,6 +81,8 @@ pub mod socket;
 pub mod umem;
 
 #[cfg(feature = "xdp")]
+pub mod governor;
+#[cfg(feature = "xdp")]
 pub mod loader;
 #[cfg(feature = "xdp")]
 pub mod wire_builder;
