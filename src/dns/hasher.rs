@@ -369,20 +369,24 @@ mod tests {
     // hash_wire_qname + IdentityHasher tests (Livraison A, #156)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Hot-path normalisation: raw wire buffer → lowercase via SIMD.
+    /// Hot-path normalisation: delegates to the REAL `wire_builder::normalize_query_qname`.
+    ///
+    /// # No-op killer guard (#156 item 3, Livraison C)
+    /// This function is used by `wire_qname_roundtrip` to represent the hot-path side.
+    /// By calling the actual production function (not an inline copy), the round-trip
+    /// test covers the real production path -- divergence = test failure, not silent no-op.
     fn build_wire_qname_hot(name: &str) -> Vec<u8> {
-        use crate::dns::simd;
-        use smallvec::SmallVec;
-        let mut buf = Vec::new();
+        use crate::dns::xdp::wire_builder::normalize_query_qname;
+        // Build raw wire QNAME as a DNS query would (may be mixed-case).
         let n = name.trim_end_matches('.');
+        let mut raw: Vec<u8> = Vec::new();
         for label in n.split('.') {
-            buf.push(label.len() as u8);
-            let mut lc: SmallVec<[u8; 64]> = SmallVec::new();
-            simd::copy_lowercase_label(&mut lc, label.as_bytes());
-            buf.extend_from_slice(&lc);
+            raw.push(label.len() as u8);
+            raw.extend_from_slice(label.as_bytes());
         }
-        buf.push(0u8);
-        buf
+        raw.push(0u8);
+        // normalize_query_qname = the single shared production normalisation path.
+        normalize_query_qname(&raw).to_vec()
     }
 
     /// Load-time normalisation: delegates to the REAL `local::name_to_wire_qname`.
