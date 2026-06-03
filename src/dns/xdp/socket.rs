@@ -580,3 +580,202 @@ pub fn read_nic_rx_dropped(iface: &str) -> u64 {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
+
+/// Returns true if `iface` is a bonded interface (master bond OR slave of a bond).
+/// XDP is incompatible with bonding — frames may arrive on the bond master but
+/// the XSK bind must target the slave NIC's queue directly, which AF_XDP does
+/// not support in zerocopy through a bond master.
+pub fn is_bonded_interface(iface: &str) -> bool {
+    let iface = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None => return false,
+    };
+    // Check if this iface IS a bond master (/sys/class/net/<iface>/bonding)
+    if std::path::Path::new(&format!("/sys/class/net/{iface}/bonding")).exists() {
+        return true;
+    }
+    // Check if this iface is a slave OF a bond (its master is a bond)
+    let master_path = format!("/sys/class/net/{iface}/master");
+    if let Ok(target) = std::fs::read_link(&master_path) {
+        if let Some(master_name) = target.file_name() {
+            let master = master_name.to_string_lossy();
+            if std::path::Path::new(&format!("/sys/class/net/{master}/bonding")).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Enumerate all network interfaces eligible for XDP binding (mode: auto).
+///
+/// Eligibility criteria:
+///   - Interface is UP (IFF_UP flag set)
+///   - Not a loopback interface
+///   - Not a virtual interface (no /sys/class/net/<iface>/device → virtual)
+///   - Not a bonded interface (master bond or slave) — XDP incompatible with bonding
+///   - Not explicitly excluded by prefix: lo, vmbr*, br*, tap*, veth*
+///
+/// Returns a Vec of eligible interface names, or an empty Vec if none found.
+/// Logs WARN for each skipped bonded interface.
+pub fn list_eligible_interfaces() -> Vec<String> {
+    let mut result = Vec::new();
+    let sysfs_net = "/sys/class/net";
+
+    let entries = match std::fs::read_dir(sysfs_net) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!("XDP auto: cannot read {sysfs_net}: {err}");
+            return result;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        // Exclude loopback and explicitly virtual prefixes
+        if name == "lo" {
+            continue;
+        }
+        for prefix in &["vmbr", "br", "tap", "veth"] {
+            if name.starts_with(prefix) {
+                tracing::debug!(iface = %name, "XDP auto: skipping virtual interface");
+                // continue outer — use a label
+            }
+        }
+        if name.starts_with("vmbr") || name.starts_with("br")
+            || name.starts_with("tap") || name.starts_with("veth")
+        {
+            tracing::debug!(iface = %name, "XDP auto: skipping virtual-prefix interface");
+            continue;
+        }
+
+        // Check bonding BEFORE is_virtual_interface (bonds have no /device symlink)
+        if is_bonded_interface(&name) {
+            tracing::warn!(
+                iface = %name,
+                "XDP auto: skipping bonded interface — XDP incompatible with bonding"
+            );
+            continue;
+        }
+
+        // Check virtual (no /sys/class/net/<iface>/device symlink)
+        if is_virtual_interface(&name) {
+            tracing::debug!(iface = %name, "XDP auto: skipping virtual interface (no device symlink)");
+            continue;
+        }
+
+        // Check UP flag via /sys/class/net/<iface>/operstate or flags
+        let flags_path = format!("{sysfs_net}/{name}/flags");
+        let flags: u64 = std::fs::read_to_string(&flags_path)
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        const IFF_UP: u64 = 0x1;
+        if flags & IFF_UP == 0 {
+            tracing::debug!(iface = %name, "XDP auto: skipping interface (not UP)");
+            continue;
+        }
+
+        tracing::debug!(iface = %name, "XDP auto: eligible interface found");
+        result.push(name);
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_bonded_interface ───────────────────────────────────────────────
+    // These tests run without real hardware; they verify the sysfs-path logic
+    // using the /sys/class/net filesystem of the CI worker.
+
+    #[test]
+    fn loopback_is_not_bonded() {
+        // lo never has a bonding directory or a master symlink to a bond
+        assert!(!is_bonded_interface("lo"));
+    }
+
+    #[test]
+    fn nonexistent_iface_is_not_bonded() {
+        // A nonexistent interface has no sysfs paths → not bonded
+        assert!(!is_bonded_interface("nonexistent_xdp_test_iface_xyz"));
+    }
+
+    #[test]
+    fn iface_name_with_path_traversal_rejected() {
+        // sanitize_iface_name must reject names containing '/' or '..'
+        // so a crafted path cannot escape /sys/class/net/
+        assert!(!is_bonded_interface("../../../etc/bond"));
+        assert!(!is_bonded_interface("eth0/../../bond0"));
+    }
+
+    // ── list_eligible_interfaces ──────────────────────────────────────────
+    #[test]
+    fn eligible_list_excludes_loopback() {
+        // lo must never appear in the eligible list
+        let list = list_eligible_interfaces();
+        assert!(
+            !list.contains(&"lo".to_string()),
+            "loopback must be excluded from eligible interfaces"
+        );
+    }
+
+    #[test]
+    fn eligible_list_excludes_virtual_prefixes() {
+        let list = list_eligible_interfaces();
+        for name in &list {
+            for prefix in &["vmbr", "br", "tap", "veth"] {
+                assert!(
+                    !name.starts_with(prefix),
+                    "eligible list must not contain virtual-prefix interface: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eligible_list_excludes_bonded() {
+        // Every interface in the eligible list must NOT be bonded
+        let list = list_eligible_interfaces();
+        for name in &list {
+            assert!(
+                !is_bonded_interface(name),
+                "bonded interface must be excluded from eligible list: {name}"
+            );
+        }
+    }
+
+    // ── iface_list parsing logic (mirrors main.rs resolution) ────────────
+    #[test]
+    fn csv_split_produces_correct_names() {
+        let explicit = "nic2,nic3";
+        let parts: Vec<String> = explicit
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(parts, vec!["nic2", "nic3"]);
+    }
+
+    #[test]
+    fn csv_split_trims_whitespace() {
+        let explicit = " nic2 , nic3 ";
+        let parts: Vec<String> = explicit
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(parts, vec!["nic2", "nic3"]);
+    }
+
+    #[test]
+    fn single_iface_no_comma() {
+        let explicit = "nic3";
+        assert!(!explicit.contains(','));
+        let parts: Vec<String> = vec![explicit.to_string()];
+        assert_eq!(parts, vec!["nic3"]);
+    }
+}
