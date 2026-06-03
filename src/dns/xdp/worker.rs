@@ -834,8 +834,27 @@ fn xdp_worker(
         if !tx_descs.is_empty() {
             sock.tx.enqueue_tx(&tx_descs);
 
-            // Kick the driver if it set the NEED_WAKEUP flag.
-            if sock.tx.needs_wakeup() {
+            // Kick the driver.
+            //
+            // Primary path: XDP_USE_NEED_WAKEUP — kernel sets the flag when it
+            // needs userspace to wake it up.  Under moderate load this avoids the
+            // sendto() syscall when the driver is already draining the TX ring.
+            //
+            // Secondary path (fix/xdp-multi-iface-tx): unconditional kick when
+            // the TX free pool is empty.  This breaks the deadlock that stalls one
+            // interface under flood:
+            //
+            //   tx_free exhausted → 0 frames enqueued → tx_descs.is_empty() → no
+            //   sendto() → kernel never drains TX ring → CQ never updated →
+            //   reclaim_tx() returns nothing → tx_free stays empty → ∞ stall.
+            //
+            // At bas-débit the pool never exhausts so the deadlock never triggers
+            // (explains the "works at low QPS, stalls under flood" symptom).
+            // The unconditional kick here is a sendto(MSG_DONTWAIT) — cheap
+            // (~150 ns) and only emitted when tx_free was actually exhausted this
+            // batch, so it is not on the hot path under normal load.
+            let need_kick = sock.tx.needs_wakeup() || sock.umem.tx_free.is_empty();
+            if need_kick {
                 // SAFETY: `sock.fd` is a valid AF_XDP socket fd owned by `XskSocket`.
                 //         Passing null pointers with length 0 and MSG_DONTWAIT is the
                 //         documented way to kick the TX driver without sending data.
@@ -849,6 +868,21 @@ fn xdp_worker(
                         0,
                     );
                 }
+            }
+        } else if sock.umem.tx_free.is_empty() {
+            // No new TX this batch but tx_free is exhausted — the kernel is
+            // holding frames in the TX ring that it hasn't completed yet.
+            // Kick unconditionally to unblock the completion queue.
+            // SAFETY: same as above.
+            unsafe {
+                libc::sendto(
+                    sock.fd,
+                    std::ptr::null(),
+                    0,
+                    libc::MSG_DONTWAIT,
+                    std::ptr::null(),
+                    0,
+                );
             }
         }
     }
