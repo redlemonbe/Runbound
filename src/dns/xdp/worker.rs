@@ -46,7 +46,7 @@ enum WireResult {
 }
 
 use super::wire_builder::{
-    build_answer_a_aaaa, build_nxdomain, build_refused, parse_query,
+    build_answer_a_aaaa, build_nxdomain, build_refused, parse_query, EdnsInfo,
 };
 use super::socket::{
     create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface, maximize_nic_ring,
@@ -1283,10 +1283,16 @@ fn answer_dns_wire(
         None => return WireResult::Fallback, // malformed → hickory fallback
     };
 
-    // EDNS gate (#156 must-fix): fall back to hickory which handles OPT echo.
-    // Sending a response with arcount=0 to an EDNS client breaks negotiation.
-    if wq.has_edns {
-        return WireResult::Fallback;
+    // EDNS gate (#156): DO=1 (DNSSEC) → hickory; otherwise handle with OPT echo.
+    // RFC 6891 §7: "If a query included an OPT record, the response MUST include one."
+    // The wire path echoes a minimal OPT RR (DO=0, rdlen=0) for non-DNSSEC queries.
+    // DO=1 → fallback hickory (DNSSEC validation required, wire path cannot handle).
+    let edns_info: Option<EdnsInfo> = wq.edns;
+    if let Some(ref e) = edns_info {
+        if e.do_bit {
+            return WireResult::Fallback; // DNSSEC → hickory
+        }
+        // else: non-DNSSEC EDNS — continue, wire path will echo OPT in response
     }
 
     // ANY queries: RFC 8482 HINFO response — let hickory handle it.
@@ -1303,7 +1309,7 @@ fn answer_dns_wire(
             AclAction::Deny => return WireResult::Drop, // drop — no response, no fallback
             AclAction::Refuse => {
                 // REFUSED wire: QR=1 AA=0 RCODE=5, echo question.
-                return match build_refused(&wq, out) {
+                return match build_refused(&wq, out, edns_info.as_ref()) {
                 Some(l) => WireResult::Answered(l),
                 None    => WireResult::Fallback,
             };
@@ -1334,7 +1340,7 @@ fn answer_dns_wire(
 
         Some(ZoneAction::Refuse) => {
             // Zone-level refuse (e.g. refuse zone) — REFUSED, AA=0.
-            match build_refused(&wq, out) {
+            match build_refused(&wq, out, edns_info.as_ref()) {
                 Some(l) => WireResult::Answered(l),
                 None    => WireResult::Fallback,
             }
@@ -1342,7 +1348,7 @@ fn answer_dns_wire(
 
         Some(ZoneAction::NxDomain) => {
             // Always-nxdomain zone — NXDOMAIN, AA=1.
-            match build_nxdomain(&wq, out) {
+            match build_nxdomain(&wq, out, edns_info.as_ref()) {
                 Some(l) => WireResult::Answered(l),
                 None    => WireResult::Fallback,
             }
@@ -1364,7 +1370,7 @@ fn answer_dns_wire(
             };
             let bp_records = zones.local_records(&lower_name, rtype_bp);
             if !bp_records.is_empty() {
-                if let Some(len) = build_answer_a_aaaa(&wq, out, &bp_records) {
+                if let Some(len) = build_answer_a_aaaa(&wq, out, &bp_records, edns_info.as_ref()) {
                     return WireResult::Answered(len);
                 }
             }
@@ -1397,7 +1403,7 @@ fn answer_dns_wire(
             };
             let records = zones.local_records(&lower_name, rtype_sr);
             if !records.is_empty() {
-                if let Some(len) = build_answer_a_aaaa(&wq, out, &records) {
+                if let Some(len) = build_answer_a_aaaa(&wq, out, &records, edns_info.as_ref()) {
                     return WireResult::Answered(len);
                 }
             }
