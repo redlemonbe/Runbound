@@ -89,6 +89,7 @@ pub fn start_xdp(
     hugepages: bool,
     cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
     domain_routing: bool,
+    busy_poll: bool,
     ring_size: Option<u32>,
     xdp_ring_sizes: XdpRingSizes,
     stats: Arc<crate::stats::Stats>,
@@ -115,6 +116,7 @@ pub fn start_xdp(
                     hugepages,
                     cache_snapshot,
                     domain_routing,
+                    busy_poll,
                     ring_size,
                     xdp_ring_sizes,
                     stats,
@@ -145,6 +147,7 @@ pub fn start_xdp(
         hugepages,
         cache_snapshot,
         domain_routing,
+        busy_poll,
         ring_size,
         xdp_ring_sizes,
         stats,
@@ -163,6 +166,7 @@ fn start_xdp_on_iface(
     hugepages: bool,
     cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
     domain_routing: bool,
+    busy_poll: bool,
     ring_size: Option<u32>,
     xdp_ring_sizes: XdpRingSizes,
     stats: Arc<crate::stats::Stats>,
@@ -295,7 +299,7 @@ fn start_xdp_on_iface(
         let ds = Arc::clone(&domain_stats);
         std::thread::Builder::new()
             .name(format!("xdp-{iface}-q{q}"))
-            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cs, q_idx, st, ds))
+            .spawn(move || xdp_worker(sock, z, rl, acl, core_id, cs, q_idx, st, ds, busy_poll))
             .map_err(|e| format!("thread spawn: {e}"))?;
     }
 
@@ -504,6 +508,7 @@ fn xdp_worker(
     worker_id: usize,
     stats: Arc<crate::stats::Stats>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
+    busy_poll: bool,
 ) {
     use libc::{poll, pollfd, POLLIN};
 
@@ -519,29 +524,35 @@ fn xdp_worker(
     let mut rx_addrs: Vec<u64> = Vec::with_capacity(sock.rx.size as usize);
     let mut dns_scratch: Vec<u8> = Vec::with_capacity(512);
 
+    // perf: busy-drain loop — drain first, sleep only when ring is durably empty.
+    // Under flood (ring never empty) this eliminates poll() from the hot path entirely.
+    // At idle, after MAX_EMPTY_SPINS consecutive empty drains we call poll(1 ms) to
+    // release the CPU; empty_spins resets to 0 after each sleep so we never spin ∞.
+    let mut empty_spins: u32 = 0;
+    // busy_poll=false → max_empty_spins=0 → poll immédiat (comportement legacy)
+    let max_empty_spins: u32 = if busy_poll { 1024 } else { 0 };
+
     loop {
         sock.umem.reclaim_tx();
 
-        let mut pfd = pollfd {
-            fd: sock.fd,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `&mut pfd` is a valid pointer to a single `pollfd`.
-        //         nfds=1 matches the array length. timeout=1 ms is a valid
-        //         non-negative timeout.
-        let ret = unsafe {
-            poll(&mut pfd, 1, 1 /* ms timeout */)
-        };
-        if ret < 0 {
-            break;
-        }
-
         rxds.clear();
         sock.rx.consume_rx_into(&mut rxds);
+
         if rxds.is_empty() {
+            empty_spins += 1;
+            if empty_spins >= max_empty_spins {
+                // Ring durably empty — sleep to avoid 100% CPU at idle.
+                let mut pfd = pollfd { fd: sock.fd, events: POLLIN, revents: 0 };
+                // SAFETY: `&mut pfd` is a valid pointer to a single `pollfd`.
+                //         nfds=1 matches the array length. timeout=1 ms is valid.
+                let ret = unsafe { poll(&mut pfd, 1, 1 /* ms */) };
+                if ret < 0 { break; }
+                empty_spins = 0;
+            }
             continue;
         }
+        // Ring had data — reset spin counter and process the batch.
+        empty_spins = 0;
 
         let snapshot = zones.load();
         // #60: load the frozen cache snapshot once per batch — zero-lock read.
