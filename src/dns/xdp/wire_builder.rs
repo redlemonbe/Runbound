@@ -23,6 +23,7 @@ use smallvec::SmallVec;
 
 // LocalZoneSet/ZoneAction used in worker.rs (wire_qname_to_lower_name caller), not in this module.
 use crate::dns::simd;
+use crate::dns::local::WireRdata;
 
 // ── Wire constants ────────────────────────────────────────────────────────────
 
@@ -214,6 +215,26 @@ pub fn wire_qname_to_lower_name(qname_wire: &[u8]) -> Option<LowerName> {
     let mut decoder = BinDecoder::new(qname_wire);
     let name = Name::read(&mut decoder).ok()?;
     Some(LowerName::from(name))
+}
+
+/// Normalise a raw wire-format QNAME from a DNS query into a lowercase
+/// `SmallVec<[u8;64]>` suitable for hashing with `hash_wire_qname`.
+///
+/// # Shared normalisation contract (#156 item 3, Livraison C)
+/// This is the SINGLE normalisation routine used by:
+///   - `answer_dns_wire()` hot path (worker.rs)
+///   - The `wire_qname_roundtrip` test in `hasher.rs`
+/// Both call this function, never an inline copy, so the round-trip test
+/// covers the real production path (the no-op-killer guard).
+///
+/// Safety: `copy_lowercase_label` only touches 0x41-0x5A bytes ('A'-'Z').
+/// Wire length bytes are 0x00-0x3F, never in that range -> safe to process
+/// the entire buffer (including length prefixes) in a single pass.
+#[inline]
+pub fn normalize_query_qname(wire: &[u8]) -> SmallVec<[u8; 64]> {
+    let mut buf: SmallVec<[u8; 64]> = SmallVec::new();
+    simd::copy_lowercase_label(&mut buf, wire);
+    buf
 }
 
 // ── Write helpers ─────────────────────────────────────────────────────────────
@@ -419,6 +440,70 @@ const FLAGS_REFUSED: u16 = 0x8585;
 /// acceptable, follow-up #156). dig reports `status: NXDOMAIN` correctly.
 ///
 /// Returns `Some(len)` on success, `None` if `out` is too small.
+/// Build an A/AAAA answer from pre-serialised `WireRdata` entries (from `WireRecordIndex`).
+///
+/// Unlike `build_answer_a_aaaa()` which takes `&[&Record]` and calls hickory RData,
+/// this function works entirely from pre-serialised bytes (`WireRdata.rdata`) --
+/// zero hickory in the hot path. (#156 item 3, Livraison C)
+///
+/// `recs` must be non-empty (caller's responsibility, filtered by qtype in `answer_dns_wire`).
+/// Returns `None` if `out` is too small (caller falls back to hickory).
+pub fn build_answer_a_aaaa_wire(
+    wq: &WireQuery<'_>,
+    out: &mut [u8],
+    recs: &[WireRdata],
+    edns: Option<&EdnsInfo>,
+) -> Option<usize> {
+    debug_assert!(!recs.is_empty(), "build_answer_a_aaaa_wire: empty records");
+
+    let qname_len    = wq.qname_wire.len();
+    let question_len = qname_len + 4;          // qname + qtype(2) + qclass(2)
+    let rr_fixed     = 2 + 2 + 2 + 4 + 2;     // ptr(2)+type(2)+class(2)+ttl(4)+rdlen(2)
+    let ancount      = recs.len();
+    let rdata_total: usize = recs.iter().map(|r| r.rdata.len()).sum();
+    let opt_size     = if edns.is_some() { 11 } else { 0 }; // OPT RR
+    let total = DNS_HDR + question_len + rr_fixed * ancount + rdata_total + opt_size;
+
+    if out.len() < total {
+        return None;
+    }
+
+    // Header (12 bytes)
+    let flags_aa: u16 = 0x8580; // QR=1 AA=1 RD=1 RA=1 RCODE=0
+    let arcount: u16  = if edns.is_some() { 1 } else { 0 };
+    let mut p = 0;
+    p = put_u16(out, p, wq.id);
+    p = put_u16(out, p, flags_aa);
+    p = put_u16(out, p, 1);               // qdcount
+    p = put_u16(out, p, ancount as u16);  // ancount
+    p = put_u16(out, p, 0);               // nscount
+    p = put_u16(out, p, arcount);         // arcount
+
+    // Question (echo)
+    out[p..p + qname_len].copy_from_slice(wq.qname_wire);
+    p += qname_len;
+    p = put_u16(out, p, wq.qtype);
+    p = put_u16(out, p, wq.qclass);
+
+    // Answer RRs (from pre-serialised WireRdata)
+    for rec in recs {
+        p = put_u16(out, p, 0xC00C);                      // compression ptr -> offset 12
+        p = put_u16(out, p, wq.qtype);                    // type A or AAAA
+        p = put_u16(out, p, 1);                           // class IN
+        p = put_u32(out, p, rec.ttl);                     // TTL
+        p = put_u16(out, p, rec.rdata.len() as u16);      // rdlength
+        out[p..p + rec.rdata.len()].copy_from_slice(&rec.rdata);
+        p += rec.rdata.len();
+    }
+
+    // OPT RR (EDNS echo, 11 bytes)
+    if let Some(ei) = edns {
+        p = write_opt_rr(out, p, ei.udp_payload);
+    }
+
+    Some(p)
+}
+
 pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8], edns: Option<&EdnsInfo>) -> Option<usize> {
     write_header_and_question(out, wq.id, FLAGS_AA_NXDOMAIN, 0, wq.qname_wire, wq.qtype, wq.qclass, edns)
 }
