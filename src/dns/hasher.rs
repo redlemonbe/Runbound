@@ -385,23 +385,15 @@ mod tests {
         buf
     }
 
-    /// Load-time normalisation: hickory Name iteration → lowercase via SIMD.
-    /// This is the path used when building WireRecordIndex from LocalZoneSet.
+    /// Load-time normalisation: delegates to the REAL `local::name_to_wire_qname`.
+    /// This is the production function used by WireRecordIndex::build().
+    /// The round-trip test now validates the actual code, not an inline copy.
     fn build_wire_qname_load(name_str: &str) -> Vec<u8> {
-        use crate::dns::simd;
+        use crate::dns::local::name_to_wire_qname;
         use hickory_proto::rr::Name;
-        use smallvec::SmallVec;
         use std::str::FromStr;
         let name = Name::from_str(name_str).expect("valid name");
-        let mut buf = Vec::new();
-        for label in name.iter() {
-            buf.push(label.len() as u8);
-            let mut lc: SmallVec<[u8; 64]> = SmallVec::new();
-            simd::copy_lowercase_label(&mut lc, label);
-            buf.extend_from_slice(&lc);
-        }
-        buf.push(0u8);
-        buf
+        name_to_wire_qname(&name).to_vec()
     }
 
     /// THE mandatory round-trip test.
