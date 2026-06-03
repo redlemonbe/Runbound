@@ -32,6 +32,19 @@ use hickory_proto::{
 use smallvec::SmallVec;
 
 use super::loader::XdpHandle;
+/// Return type for `answer_dns_wire()` — three-way dispatch replacing `Option<usize>`.
+///
+/// Using an explicit enum instead of the footgun `Some(0)` sentinel (#155 review):
+///   - `Answered(len)` : response written into `out[0..len]`, send it.
+///   - `Fallback`      : case not handled by wire builder → try hickory answer_dns().
+///   - `Drop`          : ACL Deny or unrecoverable error → silent drop, no TX, no fallback.
+#[derive(Debug)]
+enum WireResult {
+    Answered(usize),
+    Fallback,
+    Drop,
+}
+
 use super::wire_builder::{
     build_answer_a_aaaa, build_nxdomain, build_nodata, build_refused, parse_query,
 };
@@ -818,27 +831,31 @@ fn process_packet(
     //   WireDrop   = ACL Deny or malformed → no TX, no fallback.
     //   WirePass   = None from wire builder (unsupported case) → try next path.
     //   WireAnswer = Some(len) → response written directly into tx[dns_off..].
-    let dns_len = if let Some(len) =
-        answer_dns_wire(dns_in, &mut tx[dns_off..], zones, acl, src_ip)
-    {
-        // Wire fast path: response already written into tx — zero extra copy.
-        len
-    } else if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
-        // Hickory fallback (local zone, EDNS, CNAME, complex cases).
-        let len = dns_scratch.len();
-        if dns_off + len > tx.len() {
-            return None;
+    let dns_len = match answer_dns_wire(dns_in, &mut tx[dns_off..], zones, acl, src_ip) {
+        // ── ACL Deny or unrecoverable error → silent drop, no TX ─────────
+        WireResult::Drop => return None,
+        // ── Wire fast path: response already in tx[dns_off..dns_off+len] ─
+        WireResult::Answered(len) => len,
+        // ── Fallback: case not handled by wire builder → try other paths ─
+        WireResult::Fallback => {
+            if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
+                // Hickory local zone (EDNS, CNAME, complex cases).
+                let len = dns_scratch.len();
+                if dns_off + len > tx.len() {
+                    return None;
+                }
+                tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
+                len
+            } else if let Some(snap) = cache_snap {
+                // Cache hit — answer_from_cache writes directly into tx[dns_off..].
+                match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats)) {
+                    Some(len) => len,
+                    None => return None,
+                }
+            } else {
+                return None; // not a local query and no cache — XDP_PASS to hickory
+            }
         }
-        tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
-        len
-    } else if let Some(snap) = cache_snap {
-        // Cache hit — answer_from_cache writes directly into tx[dns_off..].
-        match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats)) {
-            Some(len) => len,
-            None => return None,
-        }
-    } else {
-        return None; // not a local query and no cache — XDP_PASS to hickory
     };
 
     // ── Build reply frame ────────────────────────────────────────────────────
@@ -1257,25 +1274,25 @@ fn answer_dns_wire(
     zones: &LocalZoneSet,
     acl: &Acl,
     src_ip: Option<IpAddr>,
-) -> Option<usize> {
+) -> WireResult {
     // ── Parse ────────────────────────────────────────────────────────────────
     // parse_query() is zero-alloc: reads id, qname via SIMD find_zero,
     // qtype, qclass, and has_edns (arcount scan).  Returns None on malformed.
     let wq = match parse_query(query_bytes) {
         Some(q) => q,
-        None => return None, // malformed → hickory fallback
+        None => return WireResult::Fallback, // malformed → hickory fallback
     };
 
     // EDNS gate (#156 must-fix): fall back to hickory which handles OPT echo.
     // Sending a response with arcount=0 to an EDNS client breaks negotiation.
     if wq.has_edns {
-        return None;
+        return WireResult::Fallback;
     }
 
     // ANY queries: RFC 8482 HINFO response — let hickory handle it.
     const QTYPE_ANY: u16 = 255;
     if wq.qtype == QTYPE_ANY {
-        return None;
+        return WireResult::Fallback;
     }
 
     // ── ACL check ────────────────────────────────────────────────────────────
@@ -1283,10 +1300,13 @@ fn answer_dns_wire(
     if let Some(ip) = src_ip {
         match acl.check(ip) {
             AclAction::Allow => {}
-            AclAction::Deny => return Some(0), // drop — no response, no fallback
+            AclAction::Deny => return WireResult::Drop, // drop — no response, no fallback
             AclAction::Refuse => {
                 // REFUSED wire: QR=1 AA=0 RCODE=5, echo question.
-                return build_refused(&wq, out);
+                return match build_refused(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            };
             }
         }
     }
@@ -1297,7 +1317,7 @@ fn answer_dns_wire(
     // if A/B shows this is still the bottleneck, replace with CRC32 direct key.
     let lower_name = match super::wire_builder::wire_qname_to_lower_name(&wq.qname_wire) {
         Some(n) => n,
-        None => return None, // invalid qname → hickory
+        None => return WireResult::Fallback, // invalid qname → hickory
     };
 
     // RecordType not needed after removing direct local_records calls.
@@ -1309,17 +1329,23 @@ fn answer_dns_wire(
     match zones.find(&lower_name) {
         None => {
             // Name not in any local zone → XDP_PASS to hickory recursive path.
-            None
+            WireResult::Fallback
         }
 
         Some(ZoneAction::Refuse) => {
             // Zone-level refuse (e.g. refuse zone) — REFUSED, AA=0.
-            build_refused(&wq, out)
+            match build_refused(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            }
         }
 
         Some(ZoneAction::NxDomain) => {
             // Always-nxdomain zone — NXDOMAIN, AA=1.
-            build_nxdomain(&wq, out)
+            match build_nxdomain(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            }
         }
 
         Some(ZoneAction::BlockPage) => {
@@ -1329,13 +1355,24 @@ fn answer_dns_wire(
             const QTYPE_A: u16 = 1;
             const QTYPE_AAAA: u16 = 28;
             if wq.qtype != QTYPE_A && wq.qtype != QTYPE_AAAA {
-                return None; // → hickory for any non-A/AAAA blockpage query
+                return WireResult::Fallback; // → hickory for any non-A/AAAA blockpage query
             }
-            if let Some(len) = build_answer_a_aaaa(&wq, out, zones) {
-                return Some(len);
+            let rtype_bp = if wq.qtype == QTYPE_A {
+                hickory_proto::rr::RecordType::A
+            } else {
+                hickory_proto::rr::RecordType::AAAA
+            };
+            let bp_records = zones.local_records(&lower_name, rtype_bp);
+            if !bp_records.is_empty() {
+                if let Some(len) = build_answer_a_aaaa(&wq, out, &bp_records) {
+                    return WireResult::Answered(len);
+                }
             }
             // No A/AAAA block record → NXDOMAIN.
-            build_nxdomain(&wq, out)
+            match build_nxdomain(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            }
         }
 
         Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
@@ -1353,17 +1390,31 @@ fn answer_dns_wire(
             const QTYPE_AAAA: u16 = 28;
             if wq.qtype != QTYPE_A && wq.qtype != QTYPE_AAAA {
                 // Non-A/AAAA type on a static zone → hickory for CNAME, MX, TXT…
-                return None;
+                return WireResult::Fallback;
             }
-            if let Some(len) = build_answer_a_aaaa(&wq, out, zones) {
-                return Some(len);
+            let rtype_sr = if wq.qtype == QTYPE_A {
+                hickory_proto::rr::RecordType::A
+            } else {
+                hickory_proto::rr::RecordType::AAAA
+            };
+            let records = zones.local_records(&lower_name, rtype_sr);
+            if !records.is_empty() {
+                if let Some(len) = build_answer_a_aaaa(&wq, out, &records) {
+                    return WireResult::Answered(len);
+                }
             }
-            // build_answer_a_aaaa returned None: no A/AAAA records for this name.
+            // build_answer_a_aaaa returned None (or no records): no A/AAAA for this name.
             // Distinguish NODATA (name has other-type records) vs NXDOMAIN.
             if zones.name_has_records(&lower_name) {
-                build_nodata(&wq, out) // NOERROR, ancount=0 — name exists, wrong type
+                match build_nodata(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            }
             } else {
-                build_nxdomain(&wq, out) // NXDOMAIN, AA=1 — name not in zone
+                match build_nxdomain(&wq, out) {
+                Some(l) => WireResult::Answered(l),
+                None    => WireResult::Fallback,
+            }
             }
         }
     }
