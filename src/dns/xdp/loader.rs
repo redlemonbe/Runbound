@@ -96,6 +96,17 @@ impl Drop for XdpHandle {
 }
 
 impl XdpHandle {
+    /// Extract the `GovernorGuard` from this handle so it can be managed
+    /// independently (e.g. stored in an Arc<Mutex> for SIGTERM restoration).
+    ///
+    /// After this call, `Drop` of `XdpHandle` will no longer restore the
+    /// governor — the caller owns the guard and is responsible for dropping it.
+    /// (#158: handle is moved into a detached tokio task; its Drop is unreachable
+    /// on SIGTERM, so the guard must be extracted before the move.)
+    pub fn take_governor_guard(&mut self) -> Option<super::governor::GovernorGuard> {
+        self.governor_guard.take()
+    }
+
     /// Load and attach the DNS XDP filter to `iface`.
     ///
     /// - `nb_workers`: number of XDP worker threads (injected into the eBPF global
