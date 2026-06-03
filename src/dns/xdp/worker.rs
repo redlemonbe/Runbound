@@ -155,6 +155,77 @@ pub fn start_xdp(
     )
 }
 
+/// Start XDP fast path on multiple interfaces simultaneously.
+///
+/// Each interface gets its own set of XskSockets + worker threads, fully
+/// independent — mirroring a single-interface start but ×N.
+/// Returns a Vec of XdpHandles (one per successfully bound interface).
+/// Interfaces that fail to attach log WARN and are skipped (non-fatal).
+#[allow(clippy::too_many_arguments)]
+pub fn start_xdp_multi(
+    ifaces: &[&str],
+    zones: Arc<ArcSwap<LocalZoneSet>>,
+    rate_limiter: Arc<RateLimiter>,
+    acl: Arc<Acl>,
+    cpu_governor: bool,
+    irq_affinity: bool,
+    hugepages: bool,
+    cache_snapshot: Option<crate::dns::cache_snapshot::SharedCacheSnapshot>,
+    domain_routing: bool,
+    busy_poll: bool,
+    ring_size: Option<u32>,
+    xdp_ring_sizes: XdpRingSizes,
+    stats: Arc<crate::stats::Stats>,
+    domain_stats: Arc<crate::domain_stats::DomainStats>,
+) -> Vec<XdpHandle> {
+    let mut handles = Vec::new();
+    for &iface in ifaces {
+        match start_xdp(
+            iface,
+            Arc::clone(&zones),
+            Arc::clone(&rate_limiter),
+            Arc::clone(&acl),
+            cpu_governor,
+            irq_affinity,
+            hugepages,
+            cache_snapshot.clone(),
+            domain_routing,
+            busy_poll,
+            ring_size,
+            xdp_ring_sizes,
+            Arc::clone(&stats),
+            Arc::clone(&domain_stats),
+        ) {
+            Ok(Some(h)) => {
+                tracing::info!(
+                    iface = %iface,
+                    mode  = ?h.mode,
+                    "XDP fast path active"
+                );
+                handles.push(h);
+            }
+            Ok(None) => {
+                tracing::warn!(iface = %iface, "XDP: skipped (virtual / self-test)");
+            }
+            Err(e) => {
+                tracing::warn!(iface = %iface, err = %e, "XDP attach failed — skipping interface");
+            }
+        }
+    }
+    if handles.is_empty() {
+        tracing::warn!("XDP: no interface could be bound — fast path disabled");
+    } else {
+        tracing::info!(
+            count = handles.len(),
+            interfaces = ?ifaces,
+            "XDP active on {} interface(s)",
+            handles.len()
+        );
+    }
+    handles
+}
+
+
 #[allow(clippy::too_many_arguments)]
 fn start_xdp_on_iface(
     iface: &str,
