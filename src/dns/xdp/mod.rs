@@ -83,6 +83,8 @@ pub mod umem;
 #[cfg(feature = "xdp")]
 pub mod loader;
 #[cfg(feature = "xdp")]
+pub mod wire_builder;
+#[cfg(feature = "xdp")]
 pub(super) mod worker;
 
 pub use umem::XdpRingSizes;
