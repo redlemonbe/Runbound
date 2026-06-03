@@ -171,10 +171,15 @@ pub struct UnboundConfig {
     /// Enable AF/XDP kernel-bypass fast path. Default: true (when compiled with xdp feature).
     /// Set to `no` in unbound.conf, or pass `--no-xdp` on the command line, to disable.
     pub xdp: bool,
-    /// Explicit XDP network interface name (#79).
-    /// `None`        = auto-detect first non-loopback interface (default, backward-compatible).
-    /// `Some("none")` = disable XDP via interface override (useful when `xdp: yes` is shared).
-    /// `Some("eth1")` = pin XDP to eth1 regardless of `interface:` directives.
+    /// XDP network interface configuration.
+    /// - `None`              = auto-detect single interface from listen address (default, backward-compatible)
+    /// - `Some("none")`      = disable XDP via interface override (useful when `xdp: yes` is shared)
+    /// - `Some("eth1")`      = bind XDP to eth1 only (single explicit interface, backward-compatible)
+    /// - `Some("nic2,nic3")` = bind XDP on nic2 AND nic3 simultaneously (multi-NIC, comma-separated)
+    /// - `Some("auto")`      = enumerate and bind ALL eligible interfaces (UP, physical, non-bonded)
+    ///
+    /// Multi-NIC mode: each interface gets its own XskSocket set + worker threads, fully independent.
+    /// AF_XDP is incompatible with bonding — bonded interfaces are skipped with a WARN in auto mode.
     pub xdp_interface: Option<String>,
     /// Set scaling governor to 'performance' on XDP worker cores. Default: false.
     /// Eliminates frequency-scaling ramp-up jitter on DNS burst traffic.
@@ -1115,6 +1120,48 @@ mod tests {
     fn xdp_busy_poll_absent_defaults_true() {
         let cfg = parse_str("server:\n  xdp: yes\n").unwrap();
         assert!(cfg.xdp_busy_poll, "absent xdp-busy-poll must default to true");
+    }
+
+
+    // ── #feat/xdp-multi-interface: xdp-interface parsing tests ───────────────
+
+    #[test]
+    fn xdp_interface_single() {
+        let cfg = parse_str("server:\n  xdp-interface: nic3\n").unwrap();
+        assert_eq!(cfg.xdp_interface.as_deref(), Some("nic3"));
+    }
+
+    #[test]
+    fn xdp_interface_multi_csv() {
+        let cfg = parse_str("server:\n  xdp-interface: nic2,nic3\n").unwrap();
+        let val = cfg.xdp_interface.as_deref().unwrap();
+        assert!(val.contains(','), "multi-interface must contain comma");
+        let parts: Vec<_> = val.split(',').collect();
+        assert_eq!(parts, vec!["nic2", "nic3"]);
+    }
+
+    #[test]
+    fn xdp_interface_auto() {
+        let cfg = parse_str("server:\n  xdp-interface: auto\n").unwrap();
+        assert_eq!(cfg.xdp_interface.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn xdp_interface_absent_is_none() {
+        let cfg = parse_str("server:\n  xdp: yes\n").unwrap();
+        assert!(cfg.xdp_interface.is_none(), "absent xdp-interface must be None");
+    }
+
+    #[test]
+    fn xdp_interface_none_disables() {
+        let cfg = parse_str("server:\n  xdp-interface: none\n").unwrap();
+        assert_eq!(cfg.xdp_interface.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn xdp_no_disables_fast_path() {
+        let cfg = parse_str("server:\n  xdp: no\n").unwrap();
+        assert!(!cfg.xdp, "xdp: no must disable fast path");
     }
 
 }
