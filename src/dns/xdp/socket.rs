@@ -17,7 +17,7 @@
 
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::dns::xdp::umem::{
     get_rx_tx_offsets, mmap_desc_ring, DescRing, SockaddrXdp, Umem, XdpRingSizes, SOL_XDP,
@@ -56,15 +56,68 @@ struct IfReqEthtool {
     _pad: [u8; 16],
 }
 
-// ── NIC ring-buffer stats, populated by maximize_nic_ring ─────────────────
+// ── Per-interface XDP state (#159: replaces singleton globals) ────────────
+//
+// Previously XDP_ACTIVE_IFACE / XDP_QUEUE_MODES were OnceLock<_> — only the
+// first interface could register (subsequent .set() calls were silently
+// ignored).  XDP_NIC_RX_RING / XDP_NIC_RX_RING_MAX were AtomicU32 scalars
+// overwritten by each interface.
+//
+// Replaced by a Vec registry: each start_xdp_on_iface() pushes one
+// XdpIfaceState.  The API reads the full Vec → metrics cover ALL interfaces.
 
-/// Applied NIC RX ring size (0 = ethtool unavailable or not yet called).
+/// Per-interface XDP metadata stored at bind time.
+#[derive(Debug, Clone)]
+pub struct XdpIfaceState {
+    /// NIC interface name.
+    pub iface:       String,
+    /// Per-queue modes: (queue_id, zerocopy).
+    pub queue_modes: Vec<(u32, bool)>,
+    /// Applied RX ring descriptor count (0 = ethtool unavailable).
+    pub nic_rx_ring: u32,
+    /// Hardware maximum RX ring descriptor count (0 = unavailable).
+    pub nic_rx_ring_max: u32,
+}
+
+/// All active XDP interfaces, registered by start_xdp_on_iface().
+/// OnceLock<Mutex<Vec<_>>> so the inner Vec is append-only after first init.
+pub static XDP_IFACE_REGISTRY: OnceLock<Mutex<Vec<XdpIfaceState>>> = OnceLock::new();
+
+/// Register (or append) one interface's XDP state. Called once per interface at bind.
+pub fn register_xdp_iface(state: XdpIfaceState) {
+    let registry = XDP_IFACE_REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut guard) = registry.lock() {
+        guard.push(state);
+    }
+}
+
+/// Read a snapshot of all registered XDP interface states (cheap clone).
+pub fn xdp_iface_snapshot() -> Vec<XdpIfaceState> {
+    XDP_IFACE_REGISTRY
+        .get()
+        .and_then(|m| m.lock().ok())
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+// ── Legacy compat shims (read from registry, first iface) ─────────────────
+// Kept so existing API code compiles without a rewrite in this commit.
+// A follow-up can migrate callers to xdp_iface_snapshot() directly.
+
+/// Returns the first registered active XDP interface name (compat shim).
+pub fn xdp_active_iface_first() -> Option<String> {
+    xdp_iface_snapshot().into_iter().next().map(|s| s.iface)
+}
+
+// Deprecated singleton globals — kept for API callers, populated from registry.
+// These now aggregate (first iface) or sum across all ifaces.
+/// Applied NIC RX ring size for the first XDP interface (0 = unavailable).
 pub static XDP_NIC_RX_RING: AtomicU32 = AtomicU32::new(0);
-/// Hardware maximum NIC RX ring size (0 = unavailable).
+/// Hardware maximum NIC RX ring size for the first XDP interface.
 pub static XDP_NIC_RX_RING_MAX: AtomicU32 = AtomicU32::new(0);
-/// Active XDP interface, set once at startup. Used to read sysfs rx_dropped.
+/// First active XDP interface (compat, use xdp_active_iface_first() instead).
 pub static XDP_ACTIVE_IFACE: OnceLock<String> = OnceLock::new();
-/// Per-queue mode set once after all AF_XDP sockets bind. Each entry is (queue_id, zerocopy).
+/// Per-queue modes for the first XDP interface (compat).
 pub static XDP_QUEUE_MODES: OnceLock<Vec<(u32, bool)>> = OnceLock::new();
 
 pub const AF_XDP: libc::c_int = 44;
