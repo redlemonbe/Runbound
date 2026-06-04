@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hickory_proto::{
-    op::{Message, MessageType, OpCode, ResponseCode},
+    op::{Edns, Message, MessageType, OpCode, ResponseCode},
     rr::LowerName,
     serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
 };
@@ -49,8 +49,8 @@ use super::wire_builder::{
     build_refused, parse_query, EdnsInfo,
 };
 use super::socket::{
-    create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface, maximize_nic_ring,
-    parent_interface, sanitize_iface_name, XskSocket, XDP_ACTIVE_IFACE,
+    create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface,
+    parent_interface, sanitize_iface_name, XskSocket,
 };
 use super::umem::{XdpDesc, XdpRingSizes, FRAME_SIZE};
 use crate::dns::acl::{Acl, AclAction};
@@ -349,8 +349,8 @@ fn start_xdp_on_iface(
 
     // #80: maximize NIC ring buffers before attaching XDP to prevent hardware
     // FIFO overflow at ≥10M QPS. Silent fallback on EOPNOTSUPP / EPERM.
-    let _ = XDP_ACTIVE_IFACE.set(iface.to_owned());
-    maximize_nic_ring(iface, ring_size);
+    // XDP_ACTIVE_IFACE + maximize_nic_ring are now set via register_xdp_iface()
+    // after socket bind (post-bind state is authoritative). (#159)
 
     // Bug B: check MTU before attach — virtio-net refuses DRV mode when MTU > 3506.
     // Falling back to SKB mode is acceptable but must be visible to the operator.
@@ -414,7 +414,20 @@ fn start_xdp_on_iface(
     }
 
     let queue_modes: Vec<(u32, bool)> = sockets.iter().map(|(q, s)| (*q, s.zerocopy)).collect();
+    // #159: register per-interface state in the Vec registry (works for N interfaces).
+    // Also feed compat singleton (first iface wins, subsequent skipped silently).
+    let (nic_rx_ring, nic_rx_ring_max) = super::socket::maximize_nic_ring(iface, None);
+    super::socket::register_xdp_iface(super::socket::XdpIfaceState {
+        iface:           iface.to_owned(),
+        queue_modes:     queue_modes.clone(),
+        nic_rx_ring,
+        nic_rx_ring_max,
+    });
+    // Compat shims — first iface only (existing API callers unchanged).
     super::socket::XDP_QUEUE_MODES.set(queue_modes).ok();
+    let _ = super::socket::XDP_ACTIVE_IFACE.set(iface.to_owned());
+    super::socket::XDP_NIC_RX_RING.store(nic_rx_ring, std::sync::atomic::Ordering::Relaxed);
+    super::socket::XDP_NIC_RX_RING_MAX.store(nic_rx_ring_max, std::sync::atomic::Ordering::Relaxed);
 
     // #155 — Gate domain-routing OFF when any socket is in true zerocopy mode.
     //
@@ -1690,6 +1703,8 @@ fn answer_dns(
         Ok(m) => m,
         Err(_) => return false,
     };
+    // #160 RFC 6891 §7: must echo OPT RR in response if query carries one.
+    let req_edns: Option<Edns> = msg.edns.clone();
     if msg.message_type != MessageType::Query {
         return false;
     }
@@ -1770,6 +1785,13 @@ fn answer_dns(
         None => return false,
     }
 
+    // #160 RFC 6891 §7: echo OPT RR — client payload capped to 1232, DO bit reflected.
+    if let Some(req_opt) = req_edns {
+        let mut resp_edns = Edns::new();
+        resp_edns.set_max_payload(req_opt.max_payload().min(1232).max(512));
+        resp_edns.flags_mut().dnssec_ok = req_opt.flags().dnssec_ok;
+        resp.set_edns(resp_edns);
+    }
     let mut enc = BinEncoder::new(out);
     resp.emit(&mut enc).is_ok()
 }
@@ -2101,4 +2123,79 @@ mod tests {
         assert_eq!(all_xdp_cores, vec![0usize, 1, 2, 3]);
     }
 
+}
+
+#[cfg(test)]
+mod tests_edns_160 {
+    //! #160 — OPT echo in answer_dns() slow path (RFC 6891 §7).
+
+    use hickory_proto::{
+        op::{Edns, Message, MessageType, OpCode},
+        rr::RecordType,
+        serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
+    };
+    use crate::config::parser::{LocalData, LocalZone};
+    use crate::dns::local::LocalZoneSet;
+    use crate::dns::acl::Acl;
+
+    fn build_query(name: &str, rtype: RecordType, udp_payload: Option<u16>) -> Vec<u8> {
+        use hickory_proto::{op::Query, rr::Name};
+        let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query(Query::query(Name::from_utf8(name).unwrap(), rtype));
+        if let Some(payload) = udp_payload {
+            let mut edns = Edns::new();
+            edns.set_max_payload(payload);
+            msg.set_edns(edns);
+        }
+        let mut buf = Vec::new();
+        let mut enc = BinEncoder::new(&mut buf);
+        msg.emit(&mut enc).unwrap();
+        buf
+    }
+
+    fn parse_opt_payload(wire: &[u8]) -> Option<u16> {
+        let msg = Message::from_bytes(wire).ok()?;
+        msg.edns.map(|e| e.max_payload())
+    }
+
+    fn make_zones() -> LocalZoneSet {
+        let zones = vec![LocalZone { name: "bench.test.".to_string(), zone_type: "static".to_string() }];
+        let data  = vec![LocalData { rr: "a.bench.test. 60 IN A 203.0.113.1".to_string() }];
+        LocalZoneSet::from_config(&zones, &data)
+    }
+
+    fn make_acl() -> Acl {
+        Acl::from_config(&[])
+    }
+
+    #[test]
+    fn edns_query_gets_opt_echoed() {
+        let (zones, acl) = (make_zones(), make_acl());
+        let q = build_query("a.bench.test.", RecordType::A, Some(1232));
+        let mut out = Vec::new();
+        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out));
+        let payload = parse_opt_payload(&out);
+        assert_eq!(payload, Some(1232), "OPT must be echoed with client payload");
+    }
+
+    #[test]
+    fn non_edns_query_gets_no_opt() {
+        let (zones, acl) = (make_zones(), make_acl());
+        let q = build_query("a.bench.test.", RecordType::A, None);
+        let mut out = Vec::new();
+        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out));
+        let payload = parse_opt_payload(&out);
+        assert_eq!(payload, None, "no OPT expected for non-EDNS query");
+    }
+
+    #[test]
+    fn edns_payload_capped_at_1232() {
+        let (zones, acl) = (make_zones(), make_acl());
+        let q = build_query("a.bench.test.", RecordType::A, Some(4096)); // oversized
+        let mut out = Vec::new();
+        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out));
+        let payload = parse_opt_payload(&out);
+        assert_eq!(payload, Some(1232), "payload must be capped to 1232");
+    }
 }
