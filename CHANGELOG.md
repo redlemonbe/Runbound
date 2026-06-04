@@ -9,6 +9,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.10.1] — 2026-06-04
+
+### Fixed
+
+- **EDNS OPT echo on every response path** (#160, RFC 6891 §7): runbound now includes an OPT RR in responses to EDNS queries on **all** response paths — local-zone static/redirect, blockpage, CNAME chains, `NXDOMAIN`/`SERVFAIL`/`REFUSED` errors, serve-stale, HTTPS suppression, and forwarded/recursive answers — not just the XDP wire fast path. A shared `make_opt_edns()` helper applies the echo (advertised UDP payload clamped to [512, 1232], DO bit reflected) at all 8 emission sites in `server.rs` plus the XDP slow-path fallback (`answer_dns`). A query **without** an OPT gets a response without OPT (unchanged). Validated on the authoritative (UDP + TCP), error, and forward paths.
+
+### Changed
+
+- **Per-interface XDP metrics** (#159): `XDP_ACTIVE_IFACE` / `XDP_QUEUE_MODES` and the NIC ring-size counters were process-global `OnceLock`/`Atomic`s that only ever captured the **first** interface. They are now per-interface (a registry keyed by interface name), and `/api/stats`, `/api/system`, `/api/metrics` report **all** active XDP interfaces instead of just the first. Metrics only — no data-path impact.
+
+---
+
 ## [0.10.0] — 2026-06-04
 
 ### Added
