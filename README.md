@@ -54,7 +54,7 @@ Most existing `unbound.conf` files work as-is. Non-standard or exotic directives
 ### One-line install
 
 ```bash
-curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/redlemonbe/Runbound/main/install.sh | sudo bash
 ```
 
 That's it. The script:
@@ -111,7 +111,7 @@ Then re-run the install command.
 ### Uninstall
 
 ```bash
-curl -fsSL https://github.com/redlemonbe/Runbound/releases/latest/download/install.sh | sudo bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/redlemonbe/Runbound/main/install.sh | sudo bash -s -- --uninstall
 ```
 
 Your config and data in `/etc/runbound` and `/var/lib/runbound` are kept.
