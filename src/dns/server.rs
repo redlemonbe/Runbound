@@ -861,7 +861,8 @@ impl RunboundHandler {
                     }
                     _ => {
                         if !is_dnssec_bogus {
-                            warn!(name=%sanitize_dns_name(qname), err=%e, "resolver error → SERVFAIL");
+                            // was warn! per query → log-spam under SERVFAIL-heavy load.
+                            debug!(name=%sanitize_dns_name(qname), err=%e, "resolver error → SERVFAIL");
                         }
                         ResponseCode::ServFail
                     }
