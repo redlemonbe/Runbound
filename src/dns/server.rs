@@ -2446,6 +2446,12 @@ pub async fn run_dns_server(
                     BufDnsStreamHandle::new(self.peer);
                 let mut rh = ResponseHandle::new(self.peer, stream_handle, DnsProtocol::Udp);
                 let info = rh.send_response(response).await?;
+                // Drop rh (and its stream_handle/sender) BEFORE draining.
+                // Without this, the mpsc sender stays open → receiver.next().await
+                // blocks forever after the first message (deadlock on recursion).
+                // RFC: futures::channel::mpsc receiver yields None only when all
+                // senders are dropped; drop(rh) closes the last sender here.
+                drop(rh);
                 // Drain the channel — there should be exactly one SerialMessage.
                 use futures_util::StreamExt;
                 while let Some(serial_msg) = receiver.next().await {
