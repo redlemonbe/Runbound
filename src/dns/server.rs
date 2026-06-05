@@ -2361,6 +2361,11 @@ pub async fn run_dns_server(
     // xdp:yes → XDP workers own the UDP path; kernel loop would pin OS threads
     // on the SAME cores as XDP workers → CPU contention → ~2.5x throughput regression.
     // xdp:no  → kernel loop handles all UDP, hickory handles TCP + fallback only.
+    // #fix(xdp-recursion): fallback channel created unconditionally so XDP-mode
+    // misses also reach the hickory recursion reader (forward upstream + fill cache).
+    let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel::<FallbackMsg>(4096);
+    let _ = crate::dns::kernel_loop::XDP_FALLBACK_TX.set(fallback_tx.clone());
+
     if !cfg.xdp {
         // SO_REUSEPORT: the fast-loop sockets and the hickory sockets share the
         // same port.  The kernel balances across ALL sockets by 4-tuple hash, so
@@ -2377,9 +2382,7 @@ pub async fn run_dns_server(
         // Reserve at least 2 physical cores for hickory fallback/TCP/API.
         let _n_hickory = (crate::cpu::physical_cores().len().saturating_sub(n_fast)).max(2);
 
-        // Channel: fast-loop → hickory fallback.  Capacity 4096 — small enough to
-        // detect back-pressure, large enough to absorb bursts.
-        let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel::<FallbackMsg>(4096);
+        // Channel + XDP_FALLBACK_TX global created before this guard.
 
         // ── kernel fast loop : build real cache snapshot + START THE THREADS ─────
         // Build a SharedCacheSnapshot from the mutable cache map (same pattern as
@@ -2417,6 +2420,7 @@ pub async fn run_dns_server(
             addr = %kernel_loop_bind,
             "kernel UDP fast loop started (hickory handles TCP + fallback only)"
         );
+    } // end kernel fast loop guard — kernel UDP threads only (#fix: reader is now unconditional)
 
 
     // ── Step 3b: real hickory fallback reader ────────────────────────────────
@@ -2514,7 +2518,6 @@ pub async fn run_dns_server(
             }
         });
     }
-    } // end kernel fast loop guard (!cfg.xdp)
 
     // Step 3b: hickory no longer has UDP sockets — fast loop covers all cores.
     // Hickory handles recursion/TSIG/AXFR via the fallback channel only.
