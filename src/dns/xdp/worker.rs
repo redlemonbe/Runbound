@@ -39,7 +39,7 @@ use super::loader::XdpHandle;
 ///   - `Fallback`      : case not handled by wire builder → try hickory answer_dns().
 ///   - `Drop`          : ACL Deny or unrecoverable error → silent drop, no TX, no fallback.
 #[derive(Debug)]
-enum WireResult {
+pub(crate) enum WireResult {
     Answered(usize),
     Fallback,
     Drop,
@@ -1298,6 +1298,36 @@ fn wire_qname_to_str(wire: &[u8]) -> String {
 ///   Allow  → proceed with cache lookup.
 ///   Deny   → silent drop (return None, no TX frame crafted).
 ///   Refuse → return None (let hickory send a proper REFUSED response).
+
+/// Public (crate-visible) wrapper for `answer_dns_wire` — used by `kernel_loop.rs`.
+/// Maps internal `WireResult` to `WireResultPub` (identical enum, re-exported).
+pub(crate) use WireResult as WireResultPub;
+
+#[inline(always)]
+pub(crate) fn answer_dns_wire_pub(
+    query_bytes: &[u8],
+    out: &mut [u8],
+    zones: &LocalZoneSet,
+    acl: &Acl,
+    src_ip: Option<IpAddr>,
+) -> WireResult {
+    answer_dns_wire(query_bytes, out, zones, acl, src_ip)
+}
+
+/// Public (crate-visible) wrapper for `answer_from_cache` — used by `kernel_loop.rs`.
+#[inline(always)]
+pub(crate) fn answer_from_cache_pub(
+    query_bytes: &[u8],
+    cache_snap: &crate::dns::cache_snapshot::CacheSnapshot,
+    acl: &Acl,
+    src_ip: Option<IpAddr>,
+    tx_dns: &mut [u8],
+    stats: Option<&Arc<crate::stats::Stats>>,
+    domain_stats: Option<&Arc<crate::domain_stats::DomainStats>>,
+) -> Option<usize> {
+    answer_from_cache(query_bytes, cache_snap, acl, src_ip, tx_dns, stats, domain_stats)
+}
+
 fn answer_from_cache(
     query_bytes: &[u8],
     cache_snap: &crate::dns::cache_snapshot::CacheSnapshot,
