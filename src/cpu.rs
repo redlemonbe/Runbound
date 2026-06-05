@@ -241,3 +241,34 @@ mod simd_tests {
         assert_eq!(simd_level(), simd_level());
     }
 }
+
+/// Return the NUMA node of a NIC interface.
+/// Reads /sys/class/net/<iface>/device/numa_node.
+/// Returns 0 if the file is absent (single-NUMA, VM, or loopback).
+pub fn nic_numa_node(iface: &str) -> usize {
+    let path = format!("/sys/class/net/{}/device/numa_node", iface);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .map(|n| if n < 0 { 0 } else { n as usize })
+        .unwrap_or(0)
+}
+
+/// Return all physical cores sorted NUMA-first: cores on `nic_node` first,
+/// then cores on all other nodes.  HT siblings are never included.
+/// Used by both the XDP path and the kernel UDP fast loop.
+pub fn physical_cores_numa_sorted(nic_node: usize) -> Vec<usize> {
+    let all = physical_cores();
+    // Check if a core belongs to a given NUMA node via sysfs.
+    let on_node = |core: &usize, node: usize| -> bool {
+        std::path::Path::new(&format!(
+            "/sys/devices/system/cpu/cpu{}/node{}",
+            core, node
+        ))
+        .exists()
+    };
+    let (mut local, mut remote): (Vec<usize>, Vec<usize>) =
+        all.into_iter().partition(|c| on_node(c, nic_node));
+    local.append(&mut remote);
+    local
+}
