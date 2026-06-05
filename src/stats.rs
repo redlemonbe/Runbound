@@ -449,7 +449,13 @@ pub async fn qps_update_loop(stats: Arc<Stats>, snapshot_cache: SharedSnapshot) 
 
     loop {
         interval.tick().await;
-        let total = stats.total.load(Ordering::Relaxed);
+        // #perf: XDP-served packets are counted per-worker (XDP_WORKER_PKTS,
+        // contention-free) instead of on the line-rate cache hot path. Sum them with
+        // the slow-path total so QPS stays accurate without any contended atomic.
+        let total = stats.total.load(Ordering::Relaxed)
+            + crate::dns::cache_snapshot::XDP_WORKER_PKTS.iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .sum::<u64>();
         let qps = total.saturating_sub(prev_total);
         prev_total = total;
 
