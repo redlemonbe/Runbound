@@ -1131,6 +1131,18 @@ fn extract_src_ip(rx: &[u8]) -> Option<IpAddr> {
 /// `dns_scratch` is a caller-supplied buffer (cleared before each call) used
 /// for DNS response serialisation.  Passing a pre-allocated Vec avoids a heap
 /// allocation on every packet.
+/// `FallbackMsg.socket` is unused by the fallback reader (it replies via its own
+/// bound socket); XDP workers have no arrival socket, so we hand it a shared dummy.
+fn xdp_fallback_dummy_sock() -> std::sync::Arc<std::net::UdpSocket> {
+    static D: std::sync::OnceLock<std::sync::Arc<std::net::UdpSocket>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(D.get_or_init(|| {
+        std::sync::Arc::new(
+            std::net::UdpSocket::bind("0.0.0.0:0").expect("xdp fallback dummy socket"),
+        )
+    }))
+}
+
 fn process_packet(
     rx: &[u8],
     tx: &mut [u8],
@@ -1234,14 +1246,31 @@ fn process_packet(
                 }
                 tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
                 len
-            } else if let Some(snap) = cache_snap {
-                // Cache hit — answer_from_cache writes directly into tx[dns_off..].
-                match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats)) {
-                    Some(len) => len,
-                    None => return None,
-                }
             } else {
-                return None; // not a local query and no cache — XDP_PASS to hickory
+                // Not answerable locally. Try the XDP cache; on a MISS, recurse via
+                // the hickory fallback channel (#fix(xdp-recursion): forward upstream
+                // + fill the cache; the fallback reader replies from its own bound
+                // socket). Both the cache-enabled miss AND the cache-disabled case
+                // reach here — previously both dropped silently, so XDP-mode
+                // recursion never worked.
+                let cached = cache_snap.and_then(|snap| {
+                    answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats))
+                });
+                match cached {
+                    Some(len) => len,
+                    None => {
+                        if let (Some(tx_ch), Some(ip)) =
+                            (crate::dns::kernel_loop::XDP_FALLBACK_TX.get(), src_ip)
+                        {
+                            let _ = tx_ch.try_send(crate::dns::kernel_loop::FallbackMsg {
+                                query: dns_in.to_vec(),
+                                peer: std::net::SocketAddr::new(ip, src_port),
+                                socket: xdp_fallback_dummy_sock(),
+                            });
+                        }
+                        return None;
+                    }
+                }
             }
         }
     };
