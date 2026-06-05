@@ -165,9 +165,6 @@ pub struct UnboundConfig {
     pub hsm_store_key_label: Option<String>,
 
     // ── Performance ───────────────────────────────────────────────────────────
-    /// Pin each tokio worker thread to a distinct physical core (HT excluded).
-    /// Default: true. Set to `no` to disable (e.g. in containers without CAP_SYS_NICE).
-    pub cpu_affinity: bool,
     /// Enable AF/XDP kernel-bypass fast path. Default: true (when compiled with xdp feature).
     /// Set to `no` in unbound.conf, or pass `--no-xdp` on the command line, to disable.
     pub xdp: bool,
@@ -390,7 +387,6 @@ impl UnboundConfig {
             sync_interval: 30,
             log_retention: 1000,
             log_client_ip: false,
-            cpu_affinity: true,
             xdp: true,
             xdp_hugepages: true,
             xdp_busy_poll: true,
@@ -826,7 +822,9 @@ fn parse_server_directive(
         "hsm-api-key-label" => cfg.hsm_api_key_label = Some(val.trim_matches('"').to_string()),
         "hsm-store-key-label" => cfg.hsm_store_key_label = Some(val.trim_matches('"').to_string()),
         "udp-busy-poll" => cfg.udp_busy_poll = val.trim_matches('"') == "yes",
-        "cpu-affinity" => cfg.cpu_affinity = val.trim_matches('"') != "no",
+        "cpu-affinity" => tracing::warn!(
+            "cpu-affinity is deprecated and ignored â CPU placement is now automatic (#163)"
+        ),
         "xdp" => cfg.xdp = val.trim_matches('"') != "no",
         "xdp-interface" => cfg.xdp_interface = Some(val.trim_matches('"').to_string()),
         "xdp-cpu-governor" => {
