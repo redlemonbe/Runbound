@@ -1221,57 +1221,64 @@ fn process_packet(
     // ── DNS fast path ────────────────────────────────────────────────────────
     // Priority: wire fast path > cache snapshot > hickory local zone > drop.
     //
-    // answer_dns_wire() (#156): hand-rolled wire builder — zero hickory allocs
-    // for A/AAAA/NXDOMAIN/NODATA/REFUSED on static/redirect zones.
-    //
-    // Fallback to hickory (answer_dns) for: EDNS (has_edns=true), CNAME, MX,
-    // TXT, BlockPage, Redirect-complex, ANY, parse fail — correctness preserved.
-    //
-    // Drop semantics:
-    //   WireDrop   = ACL Deny or malformed → no TX, no fallback.
-    //   WirePass   = None from wire builder (unsupported case) → try next path.
-    //   WireAnswer = Some(len) → response written directly into tx[dns_off..].
-    let dns_len = match answer_dns_wire(dns_in, &mut tx[dns_off..], zones, acl, src_ip) {
-        // ── ACL Deny or unrecoverable error → silent drop, no TX ─────────
-        WireResult::Drop => return None,
-        // ── Wire fast path: response already in tx[dns_off..dns_off+len] ─
-        WireResult::Answered(len) => len,
-        // ── Fallback: case not handled by wire builder → try other paths ─
-        WireResult::Fallback => {
-            if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
-                // Hickory local zone (EDNS, CNAME, complex cases).
-                let len = dns_scratch.len();
-                if dns_off + len > tx.len() {
-                    return None;
-                }
-                tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
-                len
-            } else {
-                // Not answerable locally. Try the XDP cache; on a MISS, recurse via
-                // the hickory fallback channel (#fix(xdp-recursion): forward upstream
-                // + fill the cache; the fallback reader replies from its own bound
-                // socket). Both the cache-enabled miss AND the cache-disabled case
-                // reach here — previously both dropped silently, so XDP-mode
-                // recursion never worked.
-                let cached = cache_snap.and_then(|snap| {
-                    answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats))
-                });
-                match cached {
-                    Some(len) => len,
-                    None => {
-                        if let (Some(tx_ch), Some(ip)) =
-                            (crate::dns::kernel_loop::XDP_FALLBACK_TX.get(), src_ip)
-                        {
-                            let _ = tx_ch.try_send(crate::dns::kernel_loop::FallbackMsg {
-                                query: dns_in.to_vec(),
-                                peer: std::net::SocketAddr::new(ip, src_port),
-                                socket: xdp_fallback_dummy_sock(),
-                            });
-                        }
-                        return None;
+    // ── SINGLE-LOOKUP HOT PATH ────────────────────────────────────────────────
+    // 1. Cache (local-data preloaded + recursive hits) — ONE ASM lookup (CRC32c + identity).
+    //    ACL Deny → silent drop (answer_from_cache checks ACL first).
+    // 2. answer_dns (hickory) — wildcard, CNAME, EDNS-DO, BlockPage, NXDOMAIN, parent-walk.
+    // 3. XDP_FALLBACK_TX — upstream recursion, fills the cache for next hit.
+    let dns_len = if let Some(snap) = cache_snap {
+        match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats)) {
+            Some(len) => len,
+            None => {
+                // Cache miss (or ACL Deny → None returned, no TX).
+                // Check ACL explicitly for the Deny case — answer_from_cache returns None for both
+                // miss AND Deny. We re-check to avoid forwarding denied clients upstream.
+                if let Some(ip) = src_ip {
+                    if let crate::dns::acl::AclAction::Deny = acl.check(ip) {
+                        return None; // ACL Deny — silent drop
                     }
                 }
+                // Try hickory for wildcard/CNAME/EDNS/BlockPage/NXDOMAIN authoritative.
+                if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
+                    let len = dns_scratch.len();
+                    if dns_off + len > tx.len() {
+                        return None;
+                    }
+                    tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
+                    len
+                } else {
+                    // Not authoritative — send upstream for recursion.
+                    if let (Some(tx_ch), Some(ip)) =
+                        (crate::dns::kernel_loop::XDP_FALLBACK_TX.get(), src_ip)
+                    {
+                        let _ = tx_ch.try_send(crate::dns::kernel_loop::FallbackMsg {
+                            query: dns_in.to_vec(),
+                            peer: std::net::SocketAddr::new(ip, src_port),
+                            socket: xdp_fallback_dummy_sock(),
+                        });
+                    }
+                    return None;
+                }
             }
+        }
+    } else {
+        // No cache — fall through to hickory (covers xdp-cache-snapshot: no).
+        if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
+            let len = dns_scratch.len();
+            if dns_off + len > tx.len() { return None; }
+            tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
+            len
+        } else {
+            if let (Some(tx_ch), Some(ip)) =
+                (crate::dns::kernel_loop::XDP_FALLBACK_TX.get(), src_ip)
+            {
+                let _ = tx_ch.try_send(crate::dns::kernel_loop::FallbackMsg {
+                    query: dns_in.to_vec(),
+                    peer: std::net::SocketAddr::new(ip, src_port),
+                    socket: xdp_fallback_dummy_sock(),
+                });
+            }
+            return None;
         }
     };
 

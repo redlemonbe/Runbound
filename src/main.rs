@@ -261,6 +261,15 @@ async fn async_main(
             handles
         }
     };
+    // Preload local-data A/AAAA into the XDP cache for the single-lookup fast path.
+    // Must run after start_xdp_multi (handles live) and after zones + cache are ready.
+    // Sentinel expires_at ensures local-data survives every snapshot rebuild.
+    #[cfg(feature = "xdp")]
+    if let Some(ref cache) = xdp_cache_mutable {
+        let zones_snap = zones.load();
+        dns::local::preload_into_cache(&zones_snap, cache);
+    }
+
     // ── ICMP BPF init + stats poll task (#89) ──────────────────────────────
     // Multi-iface: ICMP BPF ops target the primary handle (index 0).
     #[cfg(feature = "xdp")]
