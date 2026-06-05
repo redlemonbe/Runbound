@@ -423,6 +423,9 @@ fn start_xdp_on_iface(
         nic_rx_ring,
         nic_rx_ring_max,
     });
+    // #164 — Xeon v2 + X520 bus-ceiling hint (one-time at bind).
+    super::socket::maybe_warn_xeon_v2_x520(iface);
+
     // Compat shims — first iface only (existing API callers unchanged).
     super::socket::XDP_QUEUE_MODES.set(queue_modes).ok();
     let _ = super::socket::XDP_ACTIVE_IFACE.set(iface.to_owned());
@@ -517,6 +520,44 @@ fn start_xdp_on_iface(
     // fix/xdp-multi-iface-affinity: governor is now pinned centrally in
     // start_xdp_multi (or start_xdp for mono-iface) to cover the UNION of
     // all interface core blocks.  Return queue_to_core to the caller instead.
+
+    // #164 — Health monitor thread: log rx_missed_errors + rx_no_dma every 60s.
+    // Always compiled (prod observability — NOT behind xdp-debug-counters).
+    // Distinguishes NIC/bus-bound (high rx_missed, low CPU) from CPU-bound.
+    {
+        let iface_health = iface.to_owned();
+        std::thread::Builder::new()
+            .name(format!("xdp-health-{iface}"))
+            .spawn(move || {
+                let mut last_missed: u64 = 0;
+                let mut last_no_dma: u64 = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    let missed  = super::socket::read_nic_rx_missed(&iface_health);
+                    let no_dma  = super::socket::read_nic_rx_no_dma(&iface_health);
+                    let d_missed = missed.saturating_sub(last_missed);
+                    let d_no_dma = no_dma.saturating_sub(last_no_dma);
+                    last_missed = missed;
+                    last_no_dma = no_dma;
+                    if d_missed > 0 || d_no_dma > 0 {
+                        tracing::warn!(
+                            iface        = %iface_health,
+                            rx_missed    = d_missed,
+                            rx_no_dma    = d_no_dma,
+                            "[XDP-HEALTH] NIC dropping frames — likely NIC/PCIe-bus-bound                              (rx_missed_errors={d_missed}/60s, rx_no_dma={d_no_dma}/60s).                              CPU headroom does not help here; the bottleneck is the NIC ring                              or PCIe bus. See #164."
+                        );
+                    } else {
+                        tracing::debug!(
+                            iface     = %iface_health,
+                            rx_missed = d_missed,
+                            rx_no_dma = d_no_dma,
+                            "[XDP-HEALTH] no NIC drops in last 60s"
+                        );
+                    }
+                }
+            })
+            .ok();
+    }
 
     // Logger thread: only compiled when xdp-debug-counters feature is active.
     // Zero cost (no atomics, no thread) in production builds.

@@ -478,3 +478,82 @@ INFO  XDP fast path active iface=nic2 mode=Drv
 INFO  XDP fast path active iface=nic3 mode=Drv
 WARN  XDP auto: skipping bonded interface bond0 — XDP incompatible with bonding
 ```
+
+---
+
+## #162 — Kernel path scaling and RPS guidance (X520/ixgbe)
+
+### Kernel path (xdp: no) — no XDP caps applied
+
+When running without XDP (`xdp: no`), Runbound uses Tokio's multi-thread
+runtime with one thread per physical core (HT excluded). No queue cap derived
+from XDP is applied to the kernel path — it scales to all available cores.
+
+### RSS hardware limit on X520/82599
+
+The Intel X520 (82599 chip) supports a maximum of **16 RSS RX queues** in
+hardware. In XDP mode, Runbound auto-detects this and binds up to 16 XSK
+sockets (one per queue). No manual configuration is required.
+
+On other NICs (e.g. Intel E810, Mellanox CX-5, AMD) with more than 16 queues,
+Runbound scales automatically to the available queue count.
+
+### RPS must NOT be enabled on X520 (kernel path)
+
+**Measured regression: −46% throughput (1.33M → 720k qps) when RPS is active
+on X520.**
+
+RPS (Receive Packet Steering) is a software mechanism to distribute RX softirqs
+across CPUs. On X520, the hardware RSS already distributes packets efficiently
+across 16 queues — adding RPS introduces IPI (inter-processor interrupts) and
+cache-bounce overhead without benefit, because the softirq processing was not
+the bottleneck.
+
+```bash
+# Verify RPS is OFF on X520 (all queues should show 0 or 00000000)
+cat /sys/class/net/<iface>/queues/rx-*/rps_cpus
+# Expected: 00000000 (or 0) for all queues — DO NOT set to fff...
+```
+
+If RPS was previously enabled:
+```bash
+for f in /sys/class/net/<iface>/queues/rx-*/rps_cpus; do echo 0 > $f; done
+```
+
+### cpu-affinity default changed to 'no' (#163)
+
+Measured on Xeon E5-2690 v2 + X520 (kernel path, 5-run medians):
+- `cpu-affinity: yes` (old default): **630k qps**
+- `cpu-affinity: no` (new default):  **874k qps** (+39%)
+- `taskset 0-19` (physical):         **713k qps**
+
+The floating scheduler (OS-managed) outperforms naive thread pinning on this
+architecture because Tokio's work-stealing adapts to load imbalance dynamically.
+The new default is `cpu-affinity: no`.
+
+### #164 — NIC/bus-bound detection (rx_missed_errors)
+
+On Xeon v2 + X520, XDP can saturate at ~16 cores while still showing
+significant CPU headroom. This is a **NIC/PCIe-bus ceiling**, not a software
+limit. The indicator is `rx_missed_errors` rising while CPU stays below 60%.
+
+Runbound exposes these counters in `/api/system`:
+```json
+{
+  "nic_rx_missed": 5700000,
+  "nic_rx_no_dma": 0,
+  "nic_rx_dropped": 5700000
+}
+```
+
+A WARN is logged every 60 seconds when `rx_missed_errors > 0`:
+```
+WARN [XDP-HEALTH] NIC dropping frames — likely NIC/PCIe-bus-bound
+     iface=nic3 rx_missed=5700000/60s rx_no_dma=0/60s
+```
+
+At startup on Xeon v2 + X520:
+```
+WARN host likely NIC/PCIe-bus-bound (Xeon v2 + X520 ~16-core bus ceiling) —
+     CPU headroom is expected; rx_missed_errors is the real throughput wall.
+```

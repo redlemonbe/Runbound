@@ -991,6 +991,16 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         .map(|s| crate::dns::xdp::socket::read_nic_rx_dropped(&s.iface))
         .sum();
 
+    // #164: rx_missed_errors + rx_no_dma_resources per interface (NIC/bus-bound detection)
+    let nic_rx_missed: u64 = crate::dns::xdp::socket::xdp_iface_snapshot()
+        .iter()
+        .map(|s| crate::dns::xdp::socket::read_nic_rx_missed(&s.iface))
+        .sum();
+    let nic_rx_no_dma: u64 = crate::dns::xdp::socket::xdp_iface_snapshot()
+        .iter()
+        .map(|s| crate::dns::xdp::socket::read_nic_rx_no_dma(&s.iface))
+        .sum();
+
     // #33: upstream racing wins per upstream.
     let upstream_racing_wins: serde_json::Map<String, serde_json::Value> = s
         .racing_wins
@@ -1031,6 +1041,8 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         "nic_rx_ring":     nic_rx_ring,
         "nic_rx_ring_max": nic_rx_ring_max,
         "nic_rx_dropped":  nic_rx_dropped,
+        "nic_rx_missed":   nic_rx_missed,
+        "nic_rx_no_dma":   nic_rx_no_dma,
         "upstream_racing":      s.cfg.upstream_racing,
         "upstream_racing_wins": upstream_racing_wins,
             "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
