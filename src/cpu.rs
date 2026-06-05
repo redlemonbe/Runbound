@@ -90,6 +90,28 @@ pub fn physical_cores_numa_local(numa_node: usize) -> Vec<usize> {
     if local.is_empty() { all } else { local }
 }
 
+
+/// Returns physical cores (SMT filtered) sorted NUMA-first for a given NIC node.
+///
+/// Order: cores local to `nic_node` first (lowest latency), then remote cores,
+/// all physical (never HT siblings). This gives optimal XDP worker placement:
+/// local cores fill first, remote cores used only when cap requires it.
+///
+/// Example — dual Xeon v2 (10+10 physical), NIC on node 0:
+///   → [0,2,4,6,8,10,12,14,16,18,  1,3,5,7,9,11,13,15,17,19]
+///      ↑ 10 NUMA-local              ↑ 10 NUMA-remote
+pub fn physical_cores_numa_sorted(nic_node: usize) -> Vec<usize> {
+    let all = physical_cores();
+    let (mut local, mut remote): (Vec<usize>, Vec<usize>) = all.into_iter().partition(|&cpu_id| {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu_id}/node{nic_node}");
+        std::path::Path::new(&path).exists()
+    });
+    local.sort_unstable();
+    remote.sort_unstable();
+    local.extend(remote);
+    local
+}
+
 pub fn set_irq_affinity(iface: &str, queue_to_core: &[(u32, usize)]) {
     #[cfg(target_os = "linux")]
     {
