@@ -104,7 +104,7 @@ async fn async_main(
     let mut xdp_cache_mutable: Option<dns::cache_snapshot::MutableCacheMap> = None;
     #[cfg(feature = "xdp")]
     if cfg.xdp && cfg.xdp_cache_snapshot {
-        let mutable = Arc::new(dashmap::DashMap::new());
+        let mutable = dns::cache_snapshot::new_mutable_cache();
         let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
             dns::cache_snapshot::CacheSnapshot::default(),
         )));
@@ -261,6 +261,15 @@ async fn async_main(
             handles
         }
     };
+    // Preload local-data A/AAAA into the XDP cache for the single-lookup fast path.
+    // Must run after start_xdp_multi (handles live) and after zones + cache are ready.
+    // Sentinel expires_at ensures local-data survives every snapshot rebuild.
+    #[cfg(feature = "xdp")]
+    if let Some(ref cache) = xdp_cache_mutable {
+        let zones_snap = zones.load();
+        dns::local::preload_into_cache(&zones_snap, cache);
+    }
+
     // ── ICMP BPF init + stats poll task (#89) ──────────────────────────────
     // Multi-iface: ICMP BPF ops target the primary handle (index 0).
     #[cfg(feature = "xdp")]
