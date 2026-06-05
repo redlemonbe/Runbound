@@ -2492,29 +2492,41 @@ pub async fn run_dns_server(
         };
 
         let handler_fb = std::sync::Arc::clone(&handler_arc2);
+        // #fix(xdp-recursion): process fallbacks CONCURRENTLY. A sequential await
+        // serialises every upstream resolution (DoT TLS handshake ~100ms) → ~1 qps,
+        // which made XDP-mode cache warm-up unusable. Bound with a Semaphore.
+        let fb_sema = std::sync::Arc::new(tokio::sync::Semaphore::new(1024));
         tokio::spawn(async move {
             while let Some(msg) = fallback_rx.recv().await {
-                // Decode raw bytes into a hickory Request.
-                let request = match Request::from_bytes(
-                    msg.query.to_vec(),
-                    msg.peer,
-                    DnsProtocol::Udp,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!("fallback: could not decode request: {e}");
-                        continue;
-                    }
+                let permit = match std::sync::Arc::clone(&fb_sema).acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
                 };
-                let resp_handler = UdpResponseHandler {
-                    socket: std::sync::Arc::clone(&fb_sock),
-                    peer:   msg.peer,
-                };
-                // Full hickory handler — recursion, TSIG, AXFR, CNAME, EDNS DO=1...
-                handler_fb.handle_request::<UdpResponseHandler, hickory_server::net::runtime::TokioTime>(
-                    &request,
-                    resp_handler,
-                ).await;
+                let handler_c = std::sync::Arc::clone(&handler_fb);
+                let sock_c = std::sync::Arc::clone(&fb_sock);
+                tokio::spawn(async move {
+                    let _permit = permit; // released when this task ends
+                    let request = match Request::from_bytes(
+                        msg.query.to_vec(),
+                        msg.peer,
+                        DnsProtocol::Udp,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::debug!("fallback: could not decode request: {e}");
+                            return;
+                        }
+                    };
+                    let resp_handler = UdpResponseHandler {
+                        socket: sock_c,
+                        peer:   msg.peer,
+                    };
+                    // Full hickory handler — recursion, TSIG, AXFR, CNAME, EDNS DO=1...
+                    handler_c.handle_request::<UdpResponseHandler, hickory_server::net::runtime::TokioTime>(
+                        &request,
+                        resp_handler,
+                    ).await;
+                });
             }
         });
     }
