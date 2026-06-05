@@ -912,6 +912,56 @@ impl RunboundHandler {
                 }
 
                 self.record_query(client_ip, qname, qtype, rcode, err_action, start);
+
+                // #166: negative-cache NXDOMAIN (RFC 2308).
+                // NXDOMAIN = authoritative non-existence -> safe to cache.
+                // SERVFAIL = transient under load (measured: 5.77% -> 0.71% after warmup)
+                //            -> do NOT cache (false negatives would mask real domains).
+                // Insert is SYNCHRONOUS (tokio::spawn may not execute under saturated runtime).
+                if rcode == ResponseCode::NXDomain {
+                    if let Some(ref cache) = self.xdp_cache {
+                        let ttl = 30u32
+                            .max(self.cache_min_ttl)
+                            .min(self.cache_max_ttl);
+                        // Build wire-format name key (same pattern as positive-cache insert).
+                        let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
+                        let mut name_enc = BinEncoder::new(&mut name_tmp);
+                        if Name::from(qname).emit(&mut name_enc).is_ok() {
+                            let wire_name: SmallVec<[u8; 64]> =
+                                SmallVec::from_slice(&name_tmp);
+                            let key = super::cache_snapshot::QuestionKey {
+                                name:   wire_name,
+                                qtype:  u16::from(qtype),
+                                qclass: 1u16, // IN
+                            };
+                            // Build a minimal NXDOMAIN wire response.
+                            let mut wire: Vec<u8> = Vec::with_capacity(64);
+                            let mut neg_msg = Message::new(
+                                0,
+                                MessageType::Response,
+                                OpCode::Query,
+                            );
+                            neg_msg.metadata.response_code = ResponseCode::NXDomain;
+                            neg_msg.metadata.recursion_available = true;
+                            neg_msg.add_query(DnsQuery::query(
+                                Name::from(qname), qtype,
+                            ));
+                            let mut enc = BinEncoder::new(&mut wire);
+                            if neg_msg.emit(&mut enc).is_ok() {
+                                let entry = super::cache_snapshot::CacheEntry {
+                                    wire_payload: Bytes::from(wire),
+                                    expires_at: std::time::Instant::now()
+                                        + std::time::Duration::from_secs(ttl as u64),
+                                };
+                                // SYNCHRONOUS insert (no spawn).
+                                super::cache_snapshot::cache_insert(
+                                    cache, key, entry, self.cache_max_entries,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 send_error(request, response_handle, rcode).await
             }
         }
