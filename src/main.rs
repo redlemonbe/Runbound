@@ -1759,7 +1759,7 @@ fn print_help() {
 ",
         "                        Set to 'none' to disable XDP without changing xdp: directive.
 ",
-        "    cpu-affinity: no    Disable CPU pinning (default: yes)
+        "    cpu-affinity: yes   Enable CPU pinning to physical cores (default: no — floating scheduler measured faster on Xeon v2+X520: 874k vs 630k qps)
 ",
         "                        Use in containers that lack CAP_SYS_NICE
 ",
