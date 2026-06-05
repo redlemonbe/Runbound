@@ -45,7 +45,7 @@ enum WireResult {
     Drop,
 }
 
-use super::wire_builder::{
+use crate::dns::wire_builder::{
     build_refused, parse_query, EdnsInfo,
 };
 use super::socket::{
@@ -1685,7 +1685,7 @@ fn answer_dns_wire(
 
     if wq.qtype == QTYPE_A || wq.qtype == QTYPE_AAAA {
         // Normalise wire QNAME to lowercase (shared helper = same bytes as load-time index).
-        let qname_lc = super::wire_builder::normalize_query_qname(wq.qname_wire);
+        let qname_lc = crate::dns::wire_builder::normalize_query_qname(wq.qname_wire);
 
         // CRC32c hash (SSE4.2 + Fibonacci spread).
         let key = crate::dns::hasher::hash_wire_qname(&qname_lc);
@@ -1702,7 +1702,7 @@ fn answer_dns_wire(
 
                 if !recs.is_empty() {
                     // Build response from pre-serialised WireRdata: zero hickory, zero alloc.
-                    if let Some(len) = super::wire_builder::build_answer_a_aaaa_wire(
+                    if let Some(len) = crate::dns::wire_builder::build_answer_a_aaaa_wire(
                         &wq, out, recs, edns_info.as_ref(),
                     ) {
                         return WireResult::Answered(len);
