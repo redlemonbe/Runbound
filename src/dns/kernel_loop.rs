@@ -69,6 +69,7 @@ fn bind_kernel_udp(addr: &str) -> anyhow::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_port(true)?;
+    sock.set_reuse_address(true)?; // #167b: coexist 0.0.0.0:53 (reply) + 127.0.0.1:53 (lo)
     sock.set_recv_buffer_size(RCVBUF_SIZE)?;
     sock.set_send_buffer_size(RCVBUF_SIZE)?;
 
