@@ -1960,6 +1960,19 @@ fn build_tls_config(
 // is driven by a separate tokio task on a separate thread, giving true
 // multi-core parallelism without any userspace load-balancing overhead.
 #[cfg(unix)]
+/// #167: bind a blocking std UDP socket on the server port with SO_REUSEPORT so
+/// the XDP recursion-miss fallback can reply FROM the server port. We only ever
+/// send on it; SO_REUSEPORT lets it coexist with the XDP/hickory port bindings.
+fn bind_xdp_reply_sock(port: u16) -> anyhow::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse()?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
 fn bind_reuseport_udp(addr: &str, busy_poll_usec: u32) -> anyhow::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock_addr: std::net::SocketAddr = addr
@@ -2366,6 +2379,21 @@ pub async fn run_dns_server(
     // misses also reach the hickory recursion reader (forward upstream + fill cache).
     let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel::<FallbackMsg>(4096);
     let _ = crate::dns::kernel_loop::XDP_FALLBACK_TX.set(fallback_tx.clone());
+
+    // #167: in XDP mode the workers have no kernel arrival socket; recursive-miss
+    // fallback replies must leave from the server port (:53), not an ephemeral one
+    // (clients reject mismatched source ports -> silent timeout). Bind a shared
+    // SO_REUSEPORT UDP socket on the server port for the reader to reply through.
+    if cfg.xdp {
+        match bind_xdp_reply_sock(cfg.port) {
+            Ok(s) => {
+                let _ = crate::dns::kernel_loop::XDP_FALLBACK_REPLY_SOCK
+                    .set(std::sync::Arc::new(s));
+                tracing::info!(port = cfg.port, "XDP fallback reply socket bound — recursion-miss replies leave from server port (#167)");
+            }
+            Err(e) => tracing::warn!("XDP fallback reply socket bind failed: {e} — recursive misses in XDP mode will time out"),
+        }
+    }
 
     if !cfg.xdp {
         // SO_REUSEPORT: the fast-loop sockets and the hickory sockets share the
