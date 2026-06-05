@@ -224,8 +224,28 @@ pub fn start_xdp_multi(
     stats: Arc<crate::stats::Stats>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
 ) -> Vec<XdpHandle> {
-    let physical_cores = crate::cpu::physical_cores();
+    // #162/#163: NUMA-local core selection + Xeon-v2-only cap of 16.
+    // Use the NUMA node of the FIRST interface as representative (multi-iface
+    // on the same NUMA node is the common case; mixed-NUMA = separate start_xdp_multi calls).
+    let nic_numa_node = ifaces.first()
+        .map(|iface| crate::cpu::nic_numa_node(iface))
+        .unwrap_or(0);
+    let numa_local_cores = crate::cpu::physical_cores_numa_local(nic_numa_node);
+
+    // Cap at 16 ONLY on Xeon v2 + X520 (PCIe bus ceiling, auto-detected).
+    let is_xeon_v2 = ifaces.first()
+        .map(|iface| super::socket::is_xeon_v2_x520_host(iface))
+        .unwrap_or(false);
+    let core_cap: usize = if is_xeon_v2 { 16 } else { numa_local_cores.len() };
+    let physical_cores: Vec<usize> = numa_local_cores.iter().copied().take(core_cap).collect();
     let total_phys = physical_cores.len().max(1);
+
+    tracing::info!(
+        numa_node  = nic_numa_node,
+        cores      = physical_cores.len(),
+        cap        = if is_xeon_v2 { "16 (Xeon v2 + X520)" } else { "none" },
+        "XDP: worker core pool selected"
+    );
 
     // fix/xdp-multi-iface-affinity: assign each interface a contiguous block
     // of physical cores starting at core_base, accumulated across interfaces.
@@ -246,7 +266,7 @@ pub fn start_xdp_multi(
                 core_base,
                 queue_count,
                 physical_cores = total_phys,
-                "fix/xdp-multi-iface-affinity: total queues exceed physical cores —                  wrapping core assignment via modulo. Consider reducing queue count                  or using a machine with more physical cores."
+                "XDP multi-iface: total queues exceed physical cores —                  wrapping core assignment via modulo. Consider reducing queue count                  or using a machine with more physical cores."
             );
         }
         // Collect the cores this interface will use (before potential wrap)
@@ -544,7 +564,7 @@ fn start_xdp_on_iface(
                             iface        = %iface_health,
                             rx_missed    = d_missed,
                             rx_no_dma    = d_no_dma,
-                            "[XDP-HEALTH] NIC dropping frames — likely NIC/PCIe-bus-bound                              (rx_missed_errors={d_missed}/60s, rx_no_dma={d_no_dma}/60s).                              CPU headroom does not help here; the bottleneck is the NIC ring                              or PCIe bus. See #164."
+                            "[XDP-HEALTH] NIC dropping frames — likely NIC/PCIe-bus-bound                              (rx_missed_errors={d_missed}/60s, rx_no_dma={d_no_dma}/60s).                              CPU headroom does not help here; bottleneck is NIC ring or PCIe bus. (#164)"
                         );
                     } else {
                         tracing::debug!(
