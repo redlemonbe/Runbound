@@ -1470,35 +1470,9 @@ fn answer_from_cache(
         return None;
     }
 
-    // Bulk lowercase: one SIMD call covering all labels + length bytes + root.
-    let mut name_buf: SmallVec<[u8; 64]> = SmallVec::new();
-    crate::dns::simd::copy_lowercase_label(&mut name_buf, &qname_region[..qname_wire_len]);
+    // Bulk lowercase: one SIMD call — same helper as answer_dns_wire.
+    let qname_lc = crate::dns::wire_builder::normalize_query_qname(&qname_region[..qname_wire_len]);
 
-    // Validate label structure on local (L1-cached) name_buf: no compression
-    // pointers (0xC0+), labels within bounds, proper termination.
-    let mut vpos = 0usize;
-    loop {
-        if vpos >= name_buf.len() {
-            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
-        let lb = name_buf[vpos];
-        if lb & 0xC0 == 0xC0 {
-            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
-        if lb == 0 {
-            break;
-        }
-        vpos += 1 + lb as usize;
-        if vpos >= name_buf.len() {
-            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
-    }
     let pos = 12 + qname_wire_len;
 
     // QTYPE(2) + QCLASS(2) follow the QNAME.
@@ -1516,14 +1490,21 @@ fn answer_from_cache(
         return None;
     }
 
-    let key = crate::dns::cache_snapshot::QuestionKey {
-        name: name_buf,
-        qtype,
-        qclass,
-    };
+    // CRC32c hash (SSE4.2 + Fibonacci spread) mixed with qtype — same as answer_dns_wire.
+    // Mix qtype into the upper 16 bits so A and AAAA for the same name have distinct keys.
+    let raw_key = crate::dns::hasher::hash_wire_qname(&qname_lc);
+    let key: u64 = raw_key ^ ((qtype as u64) << 48);
 
     let now = std::time::Instant::now();
     if let Some(entry) = cache_snap.get(&key) {
+        // Anti-collision: verify wire QNAME bytes (guards CRC32c collisions, same as answer_dns_wire).
+        if !entry.wire_qname.is_empty()
+            && !crate::dns::simd::bytes_eq(&entry.wire_qname, &qname_lc)
+        {
+            crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None; // CRC32c collision — treat as miss
+        }
         if entry.expires_at > now && entry.wire_payload.len() >= 2 {
             let wire = &entry.wire_payload;
             // Bail out if the TX frame slice is too small to hold the response.
@@ -1586,18 +1567,16 @@ mod cache_tests {
         pkt
     }
 
-    fn make_cache_key(name: &str, qtype: u16) -> QuestionKey {
-        let mut name_buf: SmallVec<[u8; 64]> = SmallVec::new();
+    fn make_cache_key(name: &str, qtype: u16) -> (u64, bytes::Bytes) {
+        let mut name_buf: Vec<u8> = Vec::new();
         for label in name.trim_end_matches('.').split('.') {
             name_buf.push(label.len() as u8);
             name_buf.extend_from_slice(label.to_ascii_lowercase().as_bytes());
         }
         name_buf.push(0); // root
-        QuestionKey {
-            name: name_buf,
-            qtype,
-            qclass: 1,
-        }
+        let raw = crate::dns::hasher::hash_wire_qname(&name_buf);
+        let key: u64 = raw ^ ((qtype as u64) << 48);
+        (key, bytes::Bytes::copy_from_slice(&name_buf))
     }
 
     fn make_wire_response(id: u16) -> Vec<u8> {
@@ -1620,16 +1599,18 @@ mod cache_tests {
     }
 
     fn make_snap_with_entry(
-        key: QuestionKey,
+        key: u64,
+        wire_qname: bytes::Bytes,
         payload: Vec<u8>,
         expires_at: Instant,
     ) -> CacheSnapshot {
-        let mut snap = CacheSnapshot::default();
+        let mut snap = CacheSnapshot::with_hasher(crate::dns::hasher::IdentityHasherBuilder);
         snap.insert(
             key,
             CacheEntry {
                 wire_payload: Bytes::from(payload),
                 expires_at,
+                wire_qname,
             },
         );
         snap
@@ -1637,11 +1618,11 @@ mod cache_tests {
 
     #[test]
     fn cache_hit_patches_qid() {
-        let key = make_cache_key("example.com", 1);
+        let (key, wq) = make_cache_key("example.com", 1);
         // Store with QID=0
         let mut stored = make_wire_response(0);
         stored.extend_from_slice(&[0u8; 4]); // padding so len > 2
-        let snap = make_snap_with_entry(key, stored, Instant::now() + Duration::from_secs(300));
+        let snap = make_snap_with_entry(key, wq, stored, Instant::now() + Duration::from_secs(300));
         let acl = crate::dns::acl::Acl::from_config(&[]);
         let query = make_query(0xBEEF, "example.com", 1);
         let mut tx_dns = vec![0u8; 512];
@@ -1653,9 +1634,9 @@ mod cache_tests {
 
     #[test]
     fn cache_hit_case_insensitive() {
-        let key = make_cache_key("example.com", 1); // lowercase key
+        let (key, wq) = make_cache_key("example.com", 1); // lowercase key
         let snap = make_snap_with_entry(
-            key,
+            key, wq,
             make_wire_response(0),
             Instant::now() + Duration::from_secs(300),
         );
@@ -1669,9 +1650,9 @@ mod cache_tests {
 
     #[test]
     fn cache_miss_on_expired_entry() {
-        let key = make_cache_key("old.example.com", 1);
+        let (key, wq) = make_cache_key("old.example.com", 1);
         let snap = make_snap_with_entry(
-            key,
+            key, wq,
             make_wire_response(0),
             Instant::now() - Duration::from_secs(1), // already expired
         );
@@ -1684,9 +1665,9 @@ mod cache_tests {
 
     #[test]
     fn any_query_not_cached() {
-        let key = make_cache_key("example.com", 255);
+        let (key, wq) = make_cache_key("example.com", 255);
         let snap = make_snap_with_entry(
-            key,
+            key, wq,
             make_wire_response(0),
             Instant::now() + Duration::from_secs(300),
         );

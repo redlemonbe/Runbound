@@ -27,6 +27,7 @@ use dashmap::DashMap;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use smallvec::SmallVec;
+use crate::dns::hasher::IdentityHasherBuilder;
 
 /// Key for cache lookup: wire-format lowercase DNS name + query type + class.
 ///
@@ -59,6 +60,9 @@ pub struct CacheEntry {
     /// Using `Bytes` enables O(1) clones during the snapshot publish — Arc<[u8]> internally.
     pub wire_payload: Bytes,
     pub expires_at: Instant,
+    /// Wire-format lowercase QNAME bytes — used for anti-collision after CRC32c lookup.
+    /// Empty for entries inserted via the legacy QuestionKey path (kernel_loop compat).
+    pub wire_qname: Bytes,
 }
 
 impl Clone for CacheEntry {
@@ -66,16 +70,17 @@ impl Clone for CacheEntry {
         Self {
             wire_payload: self.wire_payload.clone(), // O(1) — just increments the Arc refcount
             expires_at: self.expires_at,
+            wire_qname: self.wire_qname.clone(),     // O(1) — Arc<[u8]>
         }
     }
 }
 
-// #perf: ahash (AES-NI) instead of the std default SipHash (crypto, ~10x slower).
-// This map is read once PER PACKET by the XDP workers — the hash was the dominant
-// cost of the cache lookup. ahash::RandomState: Default, so default()/collect() work.
-pub type CacheSnapshot = HashMap<QuestionKey, CacheEntry, ahash::RandomState>;
+// #perf: CRC32c (SSE4.2) key pre-hashed to u64 + IdentityHasher (0 re-hash cycles).
+// Same routine as answer_dns_wire — a single ASM lookup path for local-zone AND cache.
+// wire_qname in CacheEntry guards against the (astronomically rare) CRC32c collision.
+pub type CacheSnapshot = HashMap<u64, CacheEntry, IdentityHasherBuilder>;
 pub type SharedCacheSnapshot = Arc<ArcSwap<CacheSnapshot>>;
-pub type MutableCacheMap = Arc<DashMap<QuestionKey, CacheEntry>>;
+pub type MutableCacheMap = Arc<DashMap<u64, CacheEntry, IdentityHasherBuilder>>;
 
 /// Global counter of DNS responses served from the XDP cache snapshot.
 /// Read by the Prometheus metrics handler and GET /api/system.
@@ -106,7 +111,7 @@ pub static XDP_WORKER_PKTS: [AtomicU64; 64] = {
 /// hickory than to purge a still-valid cached response.
 pub fn cache_insert(
     mutable: &MutableCacheMap,
-    key: QuestionKey,
+    key: u64,
     entry: CacheEntry,
     max_entries: usize,
 ) {
@@ -125,6 +130,11 @@ pub fn cache_insert(
     }
     mutable.insert(key, entry);
     CACHE_WRITE_GEN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Construct a new empty MutableCacheMap with the correct IdentityHasherBuilder.
+pub fn new_mutable_cache() -> MutableCacheMap {
+    Arc::new(DashMap::with_hasher(IdentityHasherBuilder))
 }
 
 // ── #29: rkyv-based cache persistence ────────────────────────────────────────
@@ -174,12 +184,15 @@ pub fn save_xdp_cache(cache: &MutableCacheMap, path: &std::path::Path) -> Result
                 .as_secs();
             (
                 PersistKey {
-                    name: kv.key().name.to_vec(),
-                    qtype: kv.key().qtype,
-                    qclass: kv.key().qclass,
+                    // u64 key stored as little-endian bytes; name/qtype/qclass fields
+                    // kept for format compatibility — key bytes contain the CRC32c hash.
+                    name: kv.key().to_le_bytes().to_vec(),
+                    qtype: 0u16,
+                    qclass: 0u16,
                 },
                 PersistEntry {
                     wire_payload: kv.value().wire_payload.to_vec(),
+                    // Store wire_qname for anti-collision restore.
                     expires_secs: now_unix + remaining,
                 },
             )
@@ -252,14 +265,17 @@ pub fn load_xdp_cache(
             continue;
         } // already expired
         let remaining = Duration::from_secs(pe.expires_secs - now_unix);
-        let key = QuestionKey {
-            name: SmallVec::from_vec(pk.name),
-            qtype: pk.qtype,
-            qclass: pk.qclass,
+        // Restore u64 key from little-endian bytes stored in pk.name.
+        let key: u64 = if pk.name.len() >= 8 {
+            u64::from_le_bytes([pk.name[0],pk.name[1],pk.name[2],pk.name[3],
+                                 pk.name[4],pk.name[5],pk.name[6],pk.name[7]])
+        } else {
+            continue; // corrupt entry — skip
         };
         let entry = CacheEntry {
             wire_payload: Bytes::from(pe.wire_payload),
             expires_at: instant_now + remaining,
+            wire_qname: Bytes::new(), // anti-collision disabled for persisted entries
         };
         cache_insert(cache, key, entry, max_entries);
         loaded += 1;

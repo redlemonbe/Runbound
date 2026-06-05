@@ -751,12 +751,10 @@ impl RunboundHandler {
                         let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
                         let mut name_enc = BinEncoder::new(&mut name_tmp);
                         if Name::from(qname).emit(&mut name_enc).is_ok() {
-                            let wire_name: SmallVec<[u8; 64]> = SmallVec::from_slice(&name_tmp);
-                            let key = super::cache_snapshot::QuestionKey {
-                                name: wire_name,
-                                qtype: u16::from(qtype),
-                                qclass: 1u16, // IN class
-                            };
+                            // CRC32c key (same as answer_dns_wire hot path).
+                            let qname_lc = crate::dns::wire_builder::normalize_query_qname(&name_tmp);
+                            let raw_key = crate::dns::hasher::hash_wire_qname(&qname_lc);
+                            let key: u64 = raw_key ^ ((u16::from(qtype) as u64) << 48);
                             let mut wire: Vec<u8> = Vec::with_capacity(512);
                             let mut cache_msg =
                                 Message::new(0, MessageType::Response, OpCode::Query);
@@ -773,6 +771,7 @@ impl RunboundHandler {
                                 let entry = super::cache_snapshot::CacheEntry {
                                     wire_payload: Bytes::from(wire),
                                     expires_at,
+                                    wire_qname: bytes::Bytes::copy_from_slice(&qname_lc),
                                 };
                                 let cache_ref = Arc::clone(cache);
                                 let max_ent = self.cache_max_entries;
@@ -927,13 +926,10 @@ impl RunboundHandler {
                         let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
                         let mut name_enc = BinEncoder::new(&mut name_tmp);
                         if Name::from(qname).emit(&mut name_enc).is_ok() {
-                            let wire_name: SmallVec<[u8; 64]> =
-                                SmallVec::from_slice(&name_tmp);
-                            let key = super::cache_snapshot::QuestionKey {
-                                name:   wire_name,
-                                qtype:  u16::from(qtype),
-                                qclass: 1u16, // IN
-                            };
+                            // CRC32c key — same routine as answer_dns_wire.
+                            let qname_lc_neg = crate::dns::wire_builder::normalize_query_qname(&name_tmp);
+                            let raw_key_neg = crate::dns::hasher::hash_wire_qname(&qname_lc_neg);
+                            let key: u64 = raw_key_neg ^ ((u16::from(qtype) as u64) << 48);
                             // Build a minimal NXDOMAIN wire response.
                             let mut wire: Vec<u8> = Vec::with_capacity(64);
                             let mut neg_msg = Message::new(
@@ -952,6 +948,7 @@ impl RunboundHandler {
                                     wire_payload: Bytes::from(wire),
                                     expires_at: std::time::Instant::now()
                                         + std::time::Duration::from_secs(ttl as u64),
+                                    wire_qname: bytes::Bytes::copy_from_slice(&qname_lc_neg),
                                 };
                                 // SYNCHRONOUS insert (no spawn).
                                 super::cache_snapshot::cache_insert(
