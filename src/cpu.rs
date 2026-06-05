@@ -61,6 +61,57 @@ pub fn physical_cores() -> Vec<usize> {
 /// Reads /proc/interrupts to find IRQs for `iface` (patterns: `{iface}-TxRx-N`,
 /// `{iface}-rx-N`, `{iface}-N`), then writes the core bitmask to
 /// `/proc/irq/<irq>/smp_affinity_list`. Silent no-op on any failure.
+
+/// Returns the NUMA node of a NIC (`/sys/class/net/<iface>/device/numa_node`).
+/// Returns 0 (fallback) if the file is absent (VM, container, non-NUMA).
+pub fn nic_numa_node(iface: &str) -> usize {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/device/numa_node"))
+        .ok()
+        .and_then(|s| s.trim().parse::<isize>().ok())
+        .map(|n| if n < 0 { 0 } else { n as usize })  // -1 → 0 (non-NUMA or VM)
+        .unwrap_or(0)
+}
+
+/// Returns physical cores (SMT filtered) that belong to `numa_node`.
+/// Falls back to all physical cores when NUMA topology is unavailable.
+///
+/// NUMA node of a CPU = the node symlink under
+/// `/sys/devices/system/cpu/cpu<N>/` (e.g. `node0` → node 0).
+pub fn physical_cores_numa_local(numa_node: usize) -> Vec<usize> {
+    let all = physical_cores();
+    let local: Vec<usize> = all.iter().copied().filter(|&cpu_id| {
+        // Read the node<N> symlink directory present under the cpu topology dir.
+        // /sys/devices/system/cpu/cpu<N>/node<M> exists iff cpu belongs to node M.
+        let path = format!(
+            "/sys/devices/system/cpu/cpu{cpu_id}/node{numa_node}"
+        );
+        std::path::Path::new(&path).exists()
+    }).collect();
+    if local.is_empty() { all } else { local }
+}
+
+
+/// Returns physical cores (SMT filtered) sorted NUMA-first for a given NIC node.
+///
+/// Order: cores local to `nic_node` first (lowest latency), then remote cores,
+/// all physical (never HT siblings). This gives optimal XDP worker placement:
+/// local cores fill first, remote cores used only when cap requires it.
+///
+/// Example — dual Xeon v2 (10+10 physical), NIC on node 0:
+///   → [0,2,4,6,8,10,12,14,16,18,  1,3,5,7,9,11,13,15,17,19]
+///      ↑ 10 NUMA-local              ↑ 10 NUMA-remote
+pub fn physical_cores_numa_sorted(nic_node: usize) -> Vec<usize> {
+    let all = physical_cores();
+    let (mut local, mut remote): (Vec<usize>, Vec<usize>) = all.into_iter().partition(|&cpu_id| {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu_id}/node{nic_node}");
+        std::path::Path::new(&path).exists()
+    });
+    local.sort_unstable();
+    remote.sort_unstable();
+    local.extend(remote);
+    local
+}
+
 pub fn set_irq_affinity(iface: &str, queue_to_core: &[(u32, usize)]) {
     #[cfg(target_os = "linux")]
     {
@@ -240,35 +291,4 @@ mod simd_tests {
         // Two calls must return the same value (OnceLock)
         assert_eq!(simd_level(), simd_level());
     }
-}
-
-/// Return the NUMA node of a NIC interface.
-/// Reads /sys/class/net/<iface>/device/numa_node.
-/// Returns 0 if the file is absent (single-NUMA, VM, or loopback).
-pub fn nic_numa_node(iface: &str) -> usize {
-    let path = format!("/sys/class/net/{}/device/numa_node", iface);
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .map(|n| if n < 0 { 0 } else { n as usize })
-        .unwrap_or(0)
-}
-
-/// Return all physical cores sorted NUMA-first: cores on `nic_node` first,
-/// then cores on all other nodes.  HT siblings are never included.
-/// Used by both the XDP path and the kernel UDP fast loop.
-pub fn physical_cores_numa_sorted(nic_node: usize) -> Vec<usize> {
-    let all = physical_cores();
-    // Check if a core belongs to a given NUMA node via sysfs.
-    let on_node = |core: &usize, node: usize| -> bool {
-        std::path::Path::new(&format!(
-            "/sys/devices/system/cpu/cpu{}/node{}",
-            core, node
-        ))
-        .exists()
-    };
-    let (mut local, mut remote): (Vec<usize>, Vec<usize>) =
-        all.into_iter().partition(|c| on_node(c, nic_node));
-    local.append(&mut remote);
-    local
 }
