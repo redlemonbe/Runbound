@@ -109,6 +109,23 @@ pub static XDP_WORKER_PKTS: [AtomicU64; 64] = {
 /// entry found.  If no expired entry exists we skip the insert (backpressure)
 /// rather than evicting live entries — better to let the entry be served by
 /// hickory than to purge a still-valid cached response.
+
+/// Sentinel `expires_at` for local-data entries that must NEVER expire or be
+/// evicted.  Local-data is static (loaded at startup); only a full zone reload
+/// replaces it.  Value = 100 years from process start (Instant cannot be const).
+#[allow(dead_code)]
+pub fn sentinel_expires() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(100 * 365 * 24 * 3600)
+}
+
+/// Returns true if this entry was inserted as local-data (never expires).
+/// Used by cache_insert to skip eviction of sentinel entries.
+#[inline]
+pub fn is_sentinel(entry: &CacheEntry) -> bool {
+    // Entries inserted more than 50 years in the future are sentinels.
+    entry.expires_at > std::time::Instant::now() + std::time::Duration::from_secs(50 * 365 * 24 * 3600)
+}
+
 pub fn cache_insert(
     mutable: &MutableCacheMap,
     key: u64,
@@ -119,7 +136,7 @@ pub fn cache_insert(
         let now = Instant::now();
         let to_remove = mutable
             .iter()
-            .find(|kv| kv.value().expires_at <= now)
+            .find(|kv| kv.value().expires_at <= now && !is_sentinel(kv.value()))
             .map(|kv| kv.key().clone());
         match to_remove {
             Some(k) => {
@@ -132,6 +149,19 @@ pub fn cache_insert(
     CACHE_WRITE_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
+
+/// Insert a local-data (preloaded) entry into the cache.
+/// Uses a sentinel `expires_at` so the entry is never evicted by TTL logic.
+/// Sentinel entries survive every snapshot rebuild because `is_sentinel()` guards eviction.
+pub fn cache_insert_local(
+    mutable: &MutableCacheMap,
+    key: u64,
+    entry: CacheEntry,
+) {
+    // Local-data entries always win — overwrite if key already exists.
+    mutable.insert(key, entry);
+    CACHE_WRITE_GEN.fetch_add(1, Ordering::Relaxed);
+}
 /// Construct a new empty MutableCacheMap with the correct IdentityHasherBuilder.
 pub fn new_mutable_cache() -> MutableCacheMap {
     Arc::new(DashMap::with_hasher(IdentityHasherBuilder))
