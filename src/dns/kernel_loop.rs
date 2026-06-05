@@ -48,6 +48,13 @@ pub struct FallbackMsg {
 pub static XDP_FALLBACK_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<FallbackMsg>> =
     std::sync::OnceLock::new();
 
+/// Shared reply socket for XDP-mode recursion-miss fallbacks (#167). XDP workers
+/// have no kernel arrival socket, so replies must leave from a socket bound to
+/// the server port (:53) — NOT an ephemeral port, which clients reject (silent
+/// timeout). Set once by run_dns_server() when cfg.xdp is true.
+pub static XDP_FALLBACK_REPLY_SOCK: std::sync::OnceLock<std::sync::Arc<std::net::UdpSocket>> =
+    std::sync::OnceLock::new();
+
 /// Handle returned by `start_kernel_fast_loop`.
 /// Dropping it signals shutdown to the worker threads (best-effort via flag).
 pub struct KernelLoopHandle {
@@ -62,6 +69,7 @@ fn bind_kernel_udp(addr: &str) -> anyhow::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_port(true)?;
+    sock.set_reuse_address(true)?; // #167b: coexist 0.0.0.0:53 (reply) + 127.0.0.1:53 (lo)
     sock.set_recv_buffer_size(RCVBUF_SIZE)?;
     sock.set_send_buffer_size(RCVBUF_SIZE)?;
 

@@ -2007,6 +2007,19 @@ fn build_tls_config(
 // is driven by a separate tokio task on a separate thread, giving true
 // multi-core parallelism without any userspace load-balancing overhead.
 #[cfg(unix)]
+/// #167: bind a blocking std UDP socket on the server port with SO_REUSEPORT so
+/// the XDP recursion-miss fallback can reply FROM the server port. We only ever
+/// send on it; SO_REUSEPORT lets it coexist with the XDP/hickory port bindings.
+fn bind_xdp_reply_sock(port: u16) -> anyhow::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse()?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
 fn bind_reuseport_udp(addr: &str, busy_poll_usec: u32) -> anyhow::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock_addr: std::net::SocketAddr = addr
@@ -2413,6 +2426,56 @@ pub async fn run_dns_server(
     // misses also reach the hickory recursion reader (forward upstream + fill cache).
     let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel::<FallbackMsg>(4096);
     let _ = crate::dns::kernel_loop::XDP_FALLBACK_TX.set(fallback_tx.clone());
+
+    // #167: in XDP mode the workers have no kernel arrival socket; recursive-miss
+    // fallback replies must leave from the server port (:53), not an ephemeral one
+    // (clients reject mismatched source ports -> silent timeout). Bind a shared
+    // SO_REUSEPORT UDP socket on the server port for the reader to reply through.
+    if cfg.xdp {
+        // #167: reply socket on the server port for recursive-miss fallbacks to LAN
+        // clients (their queries arrive via XDP; replies must leave from :port).
+        match bind_xdp_reply_sock(cfg.port) {
+            Ok(s) => {
+                let _ = crate::dns::kernel_loop::XDP_FALLBACK_REPLY_SOCK
+                    .set(std::sync::Arc::new(s));
+                tracing::info!(port = cfg.port, "XDP fallback reply socket bound — recursion-miss replies leave from server port (#167)");
+            }
+            Err(e) => tracing::warn!("XDP fallback reply socket bind failed: {e} — recursive misses in XDP mode will time out"),
+        }
+        // #167b: 127.0.0.1 is slowpath (kernel), NEVER XDP (XDP only owns the
+        // physical NIC). Serve loopback queries with ONE kernel UDP thread bound to
+        // 127.0.0.1 so local resolution works in XDP mode. The kernel routes lo:port
+        // to this specific bind, not the 0.0.0.0 reply socket. One core => no real
+        // contention with the XDP workers.
+        let lo_snapshot: Option<super::cache_snapshot::SharedCacheSnapshot> =
+            xdp_cache_for_kloop.as_ref().map(|mutable| {
+                let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+                    super::cache_snapshot::CacheSnapshot::default(),
+                )));
+                let snap2 = Arc::clone(&snapshot);
+                let mut2 = Arc::clone(mutable);
+                tokio::spawn(super::cache_snapshot::publish_loop(snap2, mut2));
+                snapshot
+            });
+        let lo_cores: Vec<usize> = crate::cpu::physical_cores().into_iter().take(1).collect();
+        let lo_bind = format!("127.0.0.1:{}", cfg.port);
+        match crate::dns::kernel_loop::start_kernel_fast_loop(
+            &lo_bind,
+            &lo_cores,
+            Arc::clone(&zones_for_kloop),
+            Arc::clone(&acl_for_kloop),
+            fallback_tx.clone(),
+            lo_snapshot,
+            Some(Arc::clone(&stats_for_kloop)),
+            Some(Arc::clone(&domain_stats_for_kloop)),
+        ) {
+            Ok(h) => {
+                std::mem::forget(h); // keep the loopback listener alive for the process lifetime
+                tracing::info!(addr = %lo_bind, "XDP mode: loopback slowpath kernel listener started (#167b)");
+            }
+            Err(e) => tracing::warn!("XDP mode loopback listener failed to start: {e} — 127.0.0.1 DNS will time out in XDP mode"),
+        }
+    }
 
     if !cfg.xdp {
         // SO_REUSEPORT: the fast-loop sockets and the hickory sockets share the

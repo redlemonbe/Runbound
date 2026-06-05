@@ -1134,6 +1134,12 @@ fn extract_src_ip(rx: &[u8]) -> Option<IpAddr> {
 /// `FallbackMsg.socket` is unused by the fallback reader (it replies via its own
 /// bound socket); XDP workers have no arrival socket, so we hand it a shared dummy.
 fn xdp_fallback_dummy_sock() -> std::sync::Arc<std::net::UdpSocket> {
+    // #167: prefer the shared :port reply socket so recursive-miss responses
+    // leave from the server port (clients accept them). The ephemeral dummy is a
+    // last resort only if the reply socket was never set (replies then dropped).
+    if let Some(s) = crate::dns::kernel_loop::XDP_FALLBACK_REPLY_SOCK.get() {
+        return std::sync::Arc::clone(s);
+    }
     static D: std::sync::OnceLock<std::sync::Arc<std::net::UdpSocket>> =
         std::sync::OnceLock::new();
     std::sync::Arc::clone(D.get_or_init(|| {
