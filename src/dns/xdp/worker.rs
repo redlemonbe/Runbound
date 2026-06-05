@@ -39,13 +39,13 @@ use super::loader::XdpHandle;
 ///   - `Fallback`      : case not handled by wire builder → try hickory answer_dns().
 ///   - `Drop`          : ACL Deny or unrecoverable error → silent drop, no TX, no fallback.
 #[derive(Debug)]
-enum WireResult {
+pub(crate) enum WireResult {
     Answered(usize),
     Fallback,
     Drop,
 }
 
-use super::wire_builder::{
+use crate::dns::wire_builder::{
     build_refused, parse_query, EdnsInfo,
 };
 use super::socket::{
@@ -224,8 +224,47 @@ pub fn start_xdp_multi(
     stats: Arc<crate::stats::Stats>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
 ) -> Vec<XdpHandle> {
-    let physical_cores = crate::cpu::physical_cores();
+    // #162/#163: NUMA-local core selection + Xeon-v2-only cap of 16.
+    // Use the NUMA node of the FIRST interface as representative (multi-iface
+    // on the same NUMA node is the common case; mixed-NUMA = separate start_xdp_multi calls).
+    let nic_numa_node = ifaces.first()
+        .map(|iface| crate::cpu::nic_numa_node(iface))
+        .unwrap_or(0);
+    let numa_sorted_cores = crate::cpu::physical_cores_numa_sorted(nic_numa_node);
+    let local_count = numa_sorted_cores.iter().filter(|&&cpu_id| {
+        std::path::Path::new(&format!(
+            "/sys/devices/system/cpu/cpu{cpu_id}/node{nic_numa_node}"
+        )).exists()
+    }).count();
+
+    // Cap at 16 ONLY on Xeon v2 + X520 (PCIe bus ceiling ~16 cores, auto-detected).
+    // Other arches: use NUMA-local count only (no artificial cap).
+    let is_xeon_v2 = ifaces.first()
+        .map(|iface| super::socket::is_xeon_v2_x520_host(iface))
+        .unwrap_or(false);
+    let core_cap: usize = if is_xeon_v2 { 16 } else { local_count.max(1) };
+    let physical_cores: Vec<usize> = numa_sorted_cores.iter().copied().take(core_cap).collect();
+    let remote_count = core_cap.saturating_sub(local_count);
     let total_phys = physical_cores.len().max(1);
+
+    if is_xeon_v2 {
+        tracing::info!(
+            numa_node    = nic_numa_node,
+            cores        = physical_cores.len(),
+            local_cores  = local_count,
+            remote_cores = remote_count,
+            cap          = "16 (Xeon v2 + X520 PCIe bus ceiling)",
+            "XDP: worker core pool selected"
+        );
+    } else {
+        tracing::info!(
+            numa_node   = nic_numa_node,
+            cores       = physical_cores.len(),
+            local_cores = local_count,
+            cap         = "none",
+            "XDP: worker core pool selected"
+        );
+    }
 
     // fix/xdp-multi-iface-affinity: assign each interface a contiguous block
     // of physical cores starting at core_base, accumulated across interfaces.
@@ -246,7 +285,7 @@ pub fn start_xdp_multi(
                 core_base,
                 queue_count,
                 physical_cores = total_phys,
-                "fix/xdp-multi-iface-affinity: total queues exceed physical cores —                  wrapping core assignment via modulo. Consider reducing queue count                  or using a machine with more physical cores."
+                "XDP multi-iface: total queues exceed physical cores —                  wrapping core assignment via modulo. Consider reducing queue count                  or using a machine with more physical cores."
             );
         }
         // Collect the cores this interface will use (before potential wrap)
@@ -423,6 +462,9 @@ fn start_xdp_on_iface(
         nic_rx_ring,
         nic_rx_ring_max,
     });
+    // #164 — Xeon v2 + X520 bus-ceiling hint (one-time at bind).
+    super::socket::maybe_warn_xeon_v2_x520(iface);
+
     // Compat shims — first iface only (existing API callers unchanged).
     super::socket::XDP_QUEUE_MODES.set(queue_modes).ok();
     let _ = super::socket::XDP_ACTIVE_IFACE.set(iface.to_owned());
@@ -517,6 +559,42 @@ fn start_xdp_on_iface(
     // fix/xdp-multi-iface-affinity: governor is now pinned centrally in
     // start_xdp_multi (or start_xdp for mono-iface) to cover the UNION of
     // all interface core blocks.  Return queue_to_core to the caller instead.
+
+    // #164 — Health monitor thread: log rx_missed_errors + rx_no_dma every 60s.
+    // Always compiled (prod observability — NOT behind xdp-debug-counters).
+    // Distinguishes NIC/bus-bound (high rx_missed, low CPU) from CPU-bound.
+    {
+        let iface_health = iface.to_owned();
+        std::thread::Builder::new()
+            .name(format!("xdp-health-{iface}"))
+            .spawn(move || {
+                let mut last_missed: u64 = 0;
+                let mut last_no_dma: u64 = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    let missed  = super::socket::read_nic_rx_missed(&iface_health);
+                    let no_dma  = super::socket::read_nic_rx_no_dma(&iface_health);
+                    let d_missed = missed.saturating_sub(last_missed);
+                    let d_no_dma = no_dma.saturating_sub(last_no_dma);
+                    last_missed = missed;
+                    last_no_dma = no_dma;
+                    if d_missed > 0 || d_no_dma > 0 {
+                        tracing::warn!(
+                            iface = %iface_health, rx_missed = d_missed, rx_no_dma = d_no_dma,
+                            "[XDP-HEALTH] NIC dropping: rx_missed={d_missed}/60s rx_no_dma={d_no_dma}/60s. Bottleneck=NIC/PCIe bus, not CPU. (#164)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            iface     = %iface_health,
+                            rx_missed = d_missed,
+                            rx_no_dma = d_no_dma,
+                            "[XDP-HEALTH] no NIC drops in last 60s"
+                        );
+                    }
+                }
+            })
+            .ok();
+    }
 
     // Logger thread: only compiled when xdp-debug-counters feature is active.
     // Zero cost (no atomics, no thread) in production builds.
@@ -1257,6 +1335,36 @@ fn wire_qname_to_str(wire: &[u8]) -> String {
 ///   Allow  → proceed with cache lookup.
 ///   Deny   → silent drop (return None, no TX frame crafted).
 ///   Refuse → return None (let hickory send a proper REFUSED response).
+
+/// Public (crate-visible) wrapper for `answer_dns_wire` — used by `kernel_loop.rs`.
+/// Maps internal `WireResult` to `WireResultPub` (identical enum, re-exported).
+pub(crate) use WireResult as WireResultPub;
+
+#[inline(always)]
+pub(crate) fn answer_dns_wire_pub(
+    query_bytes: &[u8],
+    out: &mut [u8],
+    zones: &LocalZoneSet,
+    acl: &Acl,
+    src_ip: Option<IpAddr>,
+) -> WireResult {
+    answer_dns_wire(query_bytes, out, zones, acl, src_ip)
+}
+
+/// Public (crate-visible) wrapper for `answer_from_cache` — used by `kernel_loop.rs`.
+#[inline(always)]
+pub(crate) fn answer_from_cache_pub(
+    query_bytes: &[u8],
+    cache_snap: &crate::dns::cache_snapshot::CacheSnapshot,
+    acl: &Acl,
+    src_ip: Option<IpAddr>,
+    tx_dns: &mut [u8],
+    stats: Option<&Arc<crate::stats::Stats>>,
+    domain_stats: Option<&Arc<crate::domain_stats::DomainStats>>,
+) -> Option<usize> {
+    answer_from_cache(query_bytes, cache_snap, acl, src_ip, tx_dns, stats, domain_stats)
+}
+
 fn answer_from_cache(
     query_bytes: &[u8],
     cache_snap: &crate::dns::cache_snapshot::CacheSnapshot,
@@ -1644,7 +1752,7 @@ fn answer_dns_wire(
 
     if wq.qtype == QTYPE_A || wq.qtype == QTYPE_AAAA {
         // Normalise wire QNAME to lowercase (shared helper = same bytes as load-time index).
-        let qname_lc = super::wire_builder::normalize_query_qname(wq.qname_wire);
+        let qname_lc = crate::dns::wire_builder::normalize_query_qname(wq.qname_wire);
 
         // CRC32c hash (SSE4.2 + Fibonacci spread).
         let key = crate::dns::hasher::hash_wire_qname(&qname_lc);
@@ -1661,7 +1769,7 @@ fn answer_dns_wire(
 
                 if !recs.is_empty() {
                     // Build response from pre-serialised WireRdata: zero hickory, zero alloc.
-                    if let Some(len) = super::wire_builder::build_answer_a_aaaa_wire(
+                    if let Some(len) = crate::dns::wire_builder::build_answer_a_aaaa_wire(
                         &wq, out, recs, edns_info.as_ref(),
                     ) {
                         return WireResult::Answered(len);

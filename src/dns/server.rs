@@ -35,11 +35,12 @@ use hickory_resolver::{
     TokioResolver,
 };
 use hickory_server::{
-    net::runtime::Time,
-    server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
+    net::{BufDnsStreamHandle, runtime::Time},
+    server::{Request, RequestHandler, ResponseHandle, ResponseHandler, ResponseInfo},
     zone_handler::{MessageRequest, MessageResponseBuilder},
     Server,
 };
+use hickory_server::net::xfer::Protocol as DnsProtocol;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use smallvec::SmallVec;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -49,6 +50,7 @@ use tracing::{debug, error, info, warn};
 use super::acl::{Acl, AclAction, PrivateAddressSet};
 use super::local::{LocalZoneSet, ZoneAction};
 use super::ratelimit::RateLimiter;
+use super::kernel_loop::FallbackMsg;
 use crate::config::parser::TlsConfig;
 use crate::config::parser::UnboundConfig;
 use crate::logbuffer::{LogAction, SharedLogBuffer};
@@ -2262,6 +2264,13 @@ pub async fn run_dns_server(
         });
     }
 
+    // Clone for kernel fast loop (must happen before acl/zones are moved into handler).
+    let acl_for_kloop   = Arc::clone(&acl);
+    let zones_for_kloop = Arc::clone(&zones);
+    let stats_for_kloop        = Arc::clone(&stats);
+    let domain_stats_for_kloop = Arc::clone(&domain_stats);
+    let xdp_cache_for_kloop    = xdp_cache.as_ref().map(Arc::clone);
+
     let handler = RunboundHandler::new(
         Arc::clone(&zones),
         Arc::clone(&resolver),
@@ -2309,9 +2318,31 @@ pub async fn run_dns_server(
             }).collect()
         },
     );
-    let mut server = Server::new(handler);
+    // Step 3b: wrap handler in Arc for sharing between Server and fallback reader.
+    let handler_arc = std::sync::Arc::new(handler);
+    let handler_arc2 = std::sync::Arc::clone(&handler_arc);
 
-    let ncpus = crate::cpu::physical_cores().len().max(1);
+    let mut server = Server::new({
+        // Server takes ownership. We implement RequestHandler for Arc<RunboundHandler>
+        // by delegating. Since we cannot implement foreign trait on foreign type,
+        // we pass handler_arc2 directly but Server needs T: RequestHandler + 'static.
+        // The cleanest approach: implement RequestHandler for Arc<RunboundHandler>.
+        // RunboundHandler: RequestHandler already, Arc<T>: RequestHandler via deref.
+        // hickory_server does not blanket impl RequestHandler for Arc<T>.
+        // → Use a thin wrapper struct.
+        struct ArcHandler(std::sync::Arc<RunboundHandler>);
+        #[async_trait::async_trait]
+        impl hickory_server::server::RequestHandler for ArcHandler {
+            async fn handle_request<R: hickory_server::server::ResponseHandler, T: hickory_server::net::runtime::Time>(
+                &self,
+                request: &hickory_server::server::Request,
+                response_handle: R,
+            ) -> hickory_server::server::ResponseInfo {
+                self.0.handle_request::<R, T>(request, response_handle).await
+            }
+        }
+        ArcHandler(std::sync::Arc::clone(&handler_arc2))
+    });
 
     let port = cfg.port;
     let interfaces: Vec<String> = if cfg.interfaces.is_empty() {
@@ -2319,6 +2350,170 @@ pub async fn run_dns_server(
     } else {
         cfg.interfaces.clone()
     };
+
+    // ── Kernel UDP fast loop (#kernel-fastloop) ─────────────────────────────
+    // One blocking OS thread per physical NUMA-local core.  Handles local-zone
+    // A/AAAA + cache hits with zero hickory allocs (wire builder + SIMD).
+    // Fallback queries (CNAME, MX, TSIG, recursion…) are sent to hickory via
+    // the fallback channel below.
+    //
+    // SO_REUSEPORT: the fast-loop sockets and the hickory sockets share the
+    // same port.  The kernel balances across ALL sockets by 4-tuple hash, so
+    // fast-loop threads see their fair share of the traffic without RPS/steering.
+    //
+    // cfg.xdp is irrelevant here — kernel_fast_loop is a kernel-UDP feature,
+    // not an AF_XDP feature.  It activates whenever xdp: no (or xdp not compiled).
+    let kernel_loop_iface = interfaces.first().map(|s| s.as_str()).unwrap_or("0.0.0.0");
+    let fast_cores = {
+        let nic_node = crate::cpu::nic_numa_node(kernel_loop_iface);
+        crate::cpu::physical_cores_numa_sorted(nic_node)
+    };
+    let n_fast = fast_cores.len().max(1);
+    // Reserve at least 2 physical cores for hickory fallback/TCP/API.
+    let _n_hickory = (crate::cpu::physical_cores().len().saturating_sub(n_fast)).max(2);
+
+    // Channel: fast-loop → hickory fallback.  Capacity 4096 — small enough to
+    // detect back-pressure, large enough to absorb bursts.
+    let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel::<FallbackMsg>(4096);
+
+    // ── kernel fast loop : build real cache snapshot + START THE THREADS ─────
+    // Build a SharedCacheSnapshot from the mutable cache map (same pattern as
+    // main.rs for the XDP path).  If xdp_cache is None (cache disabled), we
+    // pass None — the fast loop skips answer_from_cache and falls back.
+    let kloop_cache_snapshot: Option<super::cache_snapshot::SharedCacheSnapshot> =
+        xdp_cache_for_kloop.as_ref().map(|mutable| {
+            let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+                super::cache_snapshot::CacheSnapshot::default(),
+            )));
+            // Spawn publish loop so the snapshot stays up-to-date.
+            let snap2 = Arc::clone(&snapshot);
+            let mut2  = Arc::clone(mutable);
+            tokio::spawn(super::cache_snapshot::publish_loop(snap2, mut2));
+            snapshot
+        });
+
+    // Start one kernel UDP thread per fast core.
+    // MULTI-INTERFACE NOTE: currently binds to interfaces[0] only.
+    // If multiple interfaces are configured, the additional interfaces have no
+    // kernel fast loop — they fall back to hickory UDP (future follow-up).
+    let kernel_loop_bind = format!("{}:{}", kernel_loop_iface, cfg.port);
+    let _kloop_handle = crate::dns::kernel_loop::start_kernel_fast_loop(
+        &kernel_loop_bind,
+        &fast_cores,
+        Arc::clone(&zones_for_kloop),
+        Arc::clone(&acl_for_kloop),
+        fallback_tx.clone(),
+        kloop_cache_snapshot,
+        Some(Arc::clone(&stats_for_kloop)),
+        Some(Arc::clone(&domain_stats_for_kloop)),
+    )?;
+    info!(
+        threads = fast_cores.len(),
+        addr = %kernel_loop_bind,
+        "kernel UDP fast loop started (hickory handles TCP + fallback only)"
+    );
+
+
+    // ── Step 3b: real hickory fallback reader ────────────────────────────────
+    // UdpResponseHandler: implements hickory ResponseHandler for UDP.
+    // Uses BufDnsStreamHandle channel internally, then drains it synchronously
+    // to send via the bound std::net::UdpSocket.
+    {
+        /// Wraps a bound UDP socket + peer addr; implements hickory ResponseHandler.
+        /// send_response encodes the reply into wire bytes and sends via sendto.
+        #[derive(Clone)]
+        struct UdpResponseHandler {
+            socket: std::sync::Arc<std::net::UdpSocket>,
+            peer:   std::net::SocketAddr,
+        }
+
+        #[async_trait::async_trait]
+        impl ResponseHandler for UdpResponseHandler {
+            async fn send_response<'a>(
+                &mut self,
+                response: hickory_server::zone_handler::MessageResponse<
+                    '_,
+                    'a,
+                    impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+                    impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+                    impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+                    impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+                >,
+            ) -> Result<ResponseInfo, hickory_server::net::NetError> {
+                // Encode into wire bytes using the existing ResponseHandle pattern.
+                // We create a throwaway BufDnsStreamHandle, encode, then drain.
+                let (mut stream_handle, mut receiver) =
+                    BufDnsStreamHandle::new(self.peer);
+                let mut rh = ResponseHandle::new(self.peer, stream_handle, DnsProtocol::Udp);
+                let info = rh.send_response(response).await?;
+                // Drop rh (and its stream_handle/sender) BEFORE draining.
+                // Without this, the mpsc sender stays open → receiver.next().await
+                // blocks forever after the first message (deadlock on recursion).
+                // RFC: futures::channel::mpsc receiver yields None only when all
+                // senders are dropped; drop(rh) closes the last sender here.
+                drop(rh);
+                // Drain the channel — there should be exactly one SerialMessage.
+                use futures_util::StreamExt;
+                while let Some(serial_msg) = receiver.next().await {
+                    let (bytes, dst) = serial_msg.into_parts();
+                    let _ = self.socket.send_to(&bytes, dst);
+                }
+                Ok(info)
+            }
+        }
+
+        // Bind a std UDP socket for fallback replies (SO_REUSEPORT, same port).
+        let fb_port = cfg.port;
+        let fb_bind = interfaces.first().map(|s| s.as_str()).unwrap_or("0.0.0.0");
+        let fb_sock = {
+            use socket2::{Domain, Protocol as S2Protocol, Socket as S2Socket, Type};
+            let domain = if fb_bind.contains(':') { Domain::IPV6 } else { Domain::IPV4 };
+            let s = S2Socket::new(domain, Type::DGRAM, Some(S2Protocol::UDP))
+                .expect("fallback UDP socket");
+            #[cfg(unix)] {
+                s.set_reuse_port(true).ok();
+            }
+            s.set_reuse_address(true).ok();
+            s.set_nonblocking(false).ok();
+            let addr: std::net::SocketAddr =
+                format!("{}:{}", fb_bind, fb_port).parse().unwrap();
+            s.bind(&addr.into()).expect("fallback UDP bind");
+            let std_sock: std::net::UdpSocket = s.into();
+            std::sync::Arc::new(std_sock)
+        };
+
+        let handler_fb = std::sync::Arc::clone(&handler_arc2);
+        tokio::spawn(async move {
+            while let Some(msg) = fallback_rx.recv().await {
+                // Decode raw bytes into a hickory Request.
+                let request = match Request::from_bytes(
+                    msg.query.to_vec(),
+                    msg.peer,
+                    DnsProtocol::Udp,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!("fallback: could not decode request: {e}");
+                        continue;
+                    }
+                };
+                let resp_handler = UdpResponseHandler {
+                    socket: std::sync::Arc::clone(&fb_sock),
+                    peer:   msg.peer,
+                };
+                // Full hickory handler — recursion, TSIG, AXFR, CNAME, EDNS DO=1...
+                handler_fb.handle_request::<UdpResponseHandler, hickory_server::net::runtime::TokioTime>(
+                    &request,
+                    resp_handler,
+                ).await;
+            }
+        });
+    }
+
+    // Step 3b: hickory no longer has UDP sockets — fast loop covers all cores.
+    // Hickory handles recursion/TSIG/AXFR via the fallback channel only.
+    // TCP is kept intact (low volume, handled by run_tcp_with_limit).
+    let port = cfg.port;
 
     // FIX 6.2: shared per-IP TCP connection tracker (across all interfaces)
     let tcp_tracker = TcpConnTracker::new();
@@ -2328,24 +2523,9 @@ pub async fn run_dns_server(
         let udp_addr = format!("{}:{}", iface, port);
         let tcp_addr = format!("{}:{}", iface, port);
 
-        // Bind one UDP socket per CPU with SO_REUSEPORT.
-        // The kernel distributes packets across sockets via a flow hash,
-        // giving near-linear QPS scaling with core count.
-        #[cfg(unix)]
-        for i in 0..ncpus {
-            let busy_poll = if cfg.udp_busy_poll { 50 } else { 0 };
-            let udp = bind_reuseport_udp(&udp_addr, busy_poll)
-                .map_err(|e| anyhow::anyhow!("UDP SO_REUSEPORT socket {i}: {e}"))?;
-            server.register_socket(udp);
-        }
-        #[cfg(not(unix))]
-        {
-            let udp = UdpSocket::bind(&udp_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("UDP bind {udp_addr}: {e}"))?;
-            server.register_socket(udp);
-        }
-        info!(addr=%udp_addr, sockets=ncpus, "DNS UDP listening (SO_REUSEPORT)");
+        // UDP sockets are now owned by the kernel fast loop (Step 3b).
+        // Hickory no longer binds UDP sockets — it serves only TCP + fallback channel.
+        info!(addr=%udp_addr, "DNS UDP handled by kernel fast loop (hickory=TCP+fallback only)");
 
         // FIX 6.2: public-facing TCP listener feeds our per-IP accept gate.
         // hickory-server gets a loopback relay listener so its internal accept
