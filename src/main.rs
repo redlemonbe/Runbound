@@ -104,7 +104,7 @@ async fn async_main(
     let mut xdp_cache_mutable: Option<dns::cache_snapshot::MutableCacheMap> = None;
     #[cfg(feature = "xdp")]
     if cfg.xdp && cfg.xdp_cache_snapshot {
-        let mutable = Arc::new(dashmap::DashMap::new());
+        let mutable = dns::cache_snapshot::new_mutable_cache();
         let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
             dns::cache_snapshot::CacheSnapshot::default(),
         )));
