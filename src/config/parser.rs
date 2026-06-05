@@ -390,7 +390,7 @@ impl UnboundConfig {
             sync_interval: 30,
             log_retention: 1000,
             log_client_ip: false,
-            cpu_affinity: true,
+            cpu_affinity: false, // #163: floating scheduler outperforms naive pinning (measured: 874k vs 630k qps on Xeon v2)
             xdp: true,
             xdp_hugepages: true,
             xdp_busy_poll: true,
