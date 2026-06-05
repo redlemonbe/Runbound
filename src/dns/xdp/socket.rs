@@ -659,9 +659,24 @@ pub fn read_nic_rx_no_dma(iface: &str) -> u64 {
         Some(n) => n,
         None => return 0,
     };
-    // /sys/kernel/debug/ixgbe/<iface>/rx_no_dma_resources (requires debugfs mount)
-    if let Ok(v) = std::fs::read_to_string(format!("/sys/kernel/debug/ixgbe/{iface}/rx_no_dma_resources")) {
-        if let Ok(n) = v.trim().parse::<u64>() { return n; }
+    // debugfs path (/sys/kernel/debug/ixgbe/<PCI_BDF>/...) requires the PCI BDF,
+    // not the interface name — unreliable to resolve at runtime.  Use ethtool -S
+    // instead, which is universally available on ixgbe and other drivers.
+    let out = std::process::Command::new("ethtool")
+        .args(["-S", &iface])
+        .output();
+    if let Ok(o) = out {
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with("rx_no_dma_resources:") {
+                if let Some(val) = line.split(':').nth(1) {
+                    if let Ok(n) = val.trim().parse::<u64>() {
+                        return n;
+                    }
+                }
+            }
+        }
     }
     0
 }
@@ -701,7 +716,7 @@ pub fn maybe_warn_xeon_v2_x520(iface: &str) {
     if is_xeon_v2_x520_host(iface) {
         tracing::warn!(
             iface = %iface,
-            "host likely NIC/PCIe-bus-bound (Xeon v2 + X520 ~16-core bus ceiling) —              CPU headroom is expected; rx_missed_errors is the real throughput wall.              This is not a Runbound bug — it is a hardware architectural limit."
+            "host likely NIC/PCIe-bus-bound (Xeon v2 + X520 ~16-core bus ceiling) —              CPU headroom is expected; read rx_missed_errors for the real wall.              XDP workers are capped to 16 NUMA-local physical cores on this arch."
         );
     }
 }
