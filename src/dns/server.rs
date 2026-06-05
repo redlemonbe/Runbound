@@ -2357,61 +2357,66 @@ pub async fn run_dns_server(
     // Fallback queries (CNAME, MX, TSIG, recursion…) are sent to hickory via
     // the fallback channel below.
     //
-    // SO_REUSEPORT: the fast-loop sockets and the hickory sockets share the
-    // same port.  The kernel balances across ALL sockets by 4-tuple hash, so
-    // fast-loop threads see their fair share of the traffic without RPS/steering.
-    //
-    // cfg.xdp is irrelevant here — kernel_fast_loop is a kernel-UDP feature,
-    // not an AF_XDP feature.  It activates whenever xdp: no (or xdp not compiled).
-    let kernel_loop_iface = interfaces.first().map(|s| s.as_str()).unwrap_or("0.0.0.0");
-    let fast_cores = {
-        let nic_node = crate::cpu::nic_numa_node(kernel_loop_iface);
-        crate::cpu::physical_cores_numa_sorted(nic_node)
-    };
-    let n_fast = fast_cores.len().max(1);
-    // Reserve at least 2 physical cores for hickory fallback/TCP/API.
-    let _n_hickory = (crate::cpu::physical_cores().len().saturating_sub(n_fast)).max(2);
+    // Kernel UDP fast loop: ONLY when XDP is NOT managing this NIC.
+    // xdp:yes → XDP workers own the UDP path; kernel loop would pin OS threads
+    // on the SAME cores as XDP workers → CPU contention → ~2.5x throughput regression.
+    // xdp:no  → kernel loop handles all UDP, hickory handles TCP + fallback only.
+    if !cfg.xdp {
+        // SO_REUSEPORT: the fast-loop sockets and the hickory sockets share the
+        // same port.  The kernel balances across ALL sockets by 4-tuple hash, so
+        // fast-loop threads see their fair share of the traffic without RPS/steering.
+        //
+        // kernel_fast_loop is a kernel-UDP feature (not AF_XDP).
+        // This block only runs when cfg.xdp == false (see outer guard).
+        let kernel_loop_iface = interfaces.first().map(|s| s.as_str()).unwrap_or("0.0.0.0");
+        let fast_cores = {
+            let nic_node = crate::cpu::nic_numa_node(kernel_loop_iface);
+            crate::cpu::physical_cores_numa_sorted(nic_node)
+        };
+        let n_fast = fast_cores.len().max(1);
+        // Reserve at least 2 physical cores for hickory fallback/TCP/API.
+        let _n_hickory = (crate::cpu::physical_cores().len().saturating_sub(n_fast)).max(2);
 
-    // Channel: fast-loop → hickory fallback.  Capacity 4096 — small enough to
-    // detect back-pressure, large enough to absorb bursts.
-    let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel::<FallbackMsg>(4096);
+        // Channel: fast-loop → hickory fallback.  Capacity 4096 — small enough to
+        // detect back-pressure, large enough to absorb bursts.
+        let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel::<FallbackMsg>(4096);
 
-    // ── kernel fast loop : build real cache snapshot + START THE THREADS ─────
-    // Build a SharedCacheSnapshot from the mutable cache map (same pattern as
-    // main.rs for the XDP path).  If xdp_cache is None (cache disabled), we
-    // pass None — the fast loop skips answer_from_cache and falls back.
-    let kloop_cache_snapshot: Option<super::cache_snapshot::SharedCacheSnapshot> =
-        xdp_cache_for_kloop.as_ref().map(|mutable| {
-            let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
-                super::cache_snapshot::CacheSnapshot::default(),
-            )));
-            // Spawn publish loop so the snapshot stays up-to-date.
-            let snap2 = Arc::clone(&snapshot);
-            let mut2  = Arc::clone(mutable);
-            tokio::spawn(super::cache_snapshot::publish_loop(snap2, mut2));
-            snapshot
-        });
+        // ── kernel fast loop : build real cache snapshot + START THE THREADS ─────
+        // Build a SharedCacheSnapshot from the mutable cache map (same pattern as
+        // main.rs for the XDP path).  If xdp_cache is None (cache disabled), we
+        // pass None — the fast loop skips answer_from_cache and falls back.
+        let kloop_cache_snapshot: Option<super::cache_snapshot::SharedCacheSnapshot> =
+            xdp_cache_for_kloop.as_ref().map(|mutable| {
+                let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+                    super::cache_snapshot::CacheSnapshot::default(),
+                )));
+                // Spawn publish loop so the snapshot stays up-to-date.
+                let snap2 = Arc::clone(&snapshot);
+                let mut2  = Arc::clone(mutable);
+                tokio::spawn(super::cache_snapshot::publish_loop(snap2, mut2));
+                snapshot
+            });
 
-    // Start one kernel UDP thread per fast core.
-    // MULTI-INTERFACE NOTE: currently binds to interfaces[0] only.
-    // If multiple interfaces are configured, the additional interfaces have no
-    // kernel fast loop — they fall back to hickory UDP (future follow-up).
-    let kernel_loop_bind = format!("{}:{}", kernel_loop_iface, cfg.port);
-    let _kloop_handle = crate::dns::kernel_loop::start_kernel_fast_loop(
-        &kernel_loop_bind,
-        &fast_cores,
-        Arc::clone(&zones_for_kloop),
-        Arc::clone(&acl_for_kloop),
-        fallback_tx.clone(),
-        kloop_cache_snapshot,
-        Some(Arc::clone(&stats_for_kloop)),
-        Some(Arc::clone(&domain_stats_for_kloop)),
-    )?;
-    info!(
-        threads = fast_cores.len(),
-        addr = %kernel_loop_bind,
-        "kernel UDP fast loop started (hickory handles TCP + fallback only)"
-    );
+        // Start one kernel UDP thread per fast core.
+        // MULTI-INTERFACE NOTE: currently binds to interfaces[0] only.
+        // If multiple interfaces are configured, the additional interfaces have no
+        // kernel fast loop — they fall back to hickory UDP (future follow-up).
+        let kernel_loop_bind = format!("{}:{}", kernel_loop_iface, cfg.port);
+        let _kloop_handle = crate::dns::kernel_loop::start_kernel_fast_loop(
+            &kernel_loop_bind,
+            &fast_cores,
+            Arc::clone(&zones_for_kloop),
+            Arc::clone(&acl_for_kloop),
+            fallback_tx.clone(),
+            kloop_cache_snapshot,
+            Some(Arc::clone(&stats_for_kloop)),
+            Some(Arc::clone(&domain_stats_for_kloop)),
+        )?;
+        info!(
+            threads = fast_cores.len(),
+            addr = %kernel_loop_bind,
+            "kernel UDP fast loop started (hickory handles TCP + fallback only)"
+        );
 
 
     // ── Step 3b: real hickory fallback reader ────────────────────────────────
@@ -2509,6 +2514,7 @@ pub async fn run_dns_server(
             }
         });
     }
+    } // end kernel fast loop guard (!cfg.xdp)
 
     // Step 3b: hickory no longer has UDP sockets — fast loop covers all cores.
     // Hickory handles recursion/TSIG/AXFR via the fallback channel only.
