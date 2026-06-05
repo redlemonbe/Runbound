@@ -85,7 +85,7 @@ pub mod governor;
 #[cfg(feature = "xdp")]
 pub mod loader;
 #[cfg(feature = "xdp")]
-pub mod wire_builder;
+// wire_builder moved to src/dns/wire_builder.rs (#kernel-fastloop — transport-agnostic)
 #[cfg(feature = "xdp")]
 pub(super) mod worker;
 
