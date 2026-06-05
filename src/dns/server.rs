@@ -2385,6 +2385,8 @@ pub async fn run_dns_server(
     // (clients reject mismatched source ports -> silent timeout). Bind a shared
     // SO_REUSEPORT UDP socket on the server port for the reader to reply through.
     if cfg.xdp {
+        // #167: reply socket on the server port for recursive-miss fallbacks to LAN
+        // clients (their queries arrive via XDP; replies must leave from :port).
         match bind_xdp_reply_sock(cfg.port) {
             Ok(s) => {
                 let _ = crate::dns::kernel_loop::XDP_FALLBACK_REPLY_SOCK
@@ -2392,6 +2394,39 @@ pub async fn run_dns_server(
                 tracing::info!(port = cfg.port, "XDP fallback reply socket bound — recursion-miss replies leave from server port (#167)");
             }
             Err(e) => tracing::warn!("XDP fallback reply socket bind failed: {e} — recursive misses in XDP mode will time out"),
+        }
+        // #167b: 127.0.0.1 is slowpath (kernel), NEVER XDP (XDP only owns the
+        // physical NIC). Serve loopback queries with ONE kernel UDP thread bound to
+        // 127.0.0.1 so local resolution works in XDP mode. The kernel routes lo:port
+        // to this specific bind, not the 0.0.0.0 reply socket. One core => no real
+        // contention with the XDP workers.
+        let lo_snapshot: Option<super::cache_snapshot::SharedCacheSnapshot> =
+            xdp_cache_for_kloop.as_ref().map(|mutable| {
+                let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+                    super::cache_snapshot::CacheSnapshot::default(),
+                )));
+                let snap2 = Arc::clone(&snapshot);
+                let mut2 = Arc::clone(mutable);
+                tokio::spawn(super::cache_snapshot::publish_loop(snap2, mut2));
+                snapshot
+            });
+        let lo_cores: Vec<usize> = crate::cpu::physical_cores().into_iter().take(1).collect();
+        let lo_bind = format!("127.0.0.1:{}", cfg.port);
+        match crate::dns::kernel_loop::start_kernel_fast_loop(
+            &lo_bind,
+            &lo_cores,
+            Arc::clone(&zones_for_kloop),
+            Arc::clone(&acl_for_kloop),
+            fallback_tx.clone(),
+            lo_snapshot,
+            Some(Arc::clone(&stats_for_kloop)),
+            Some(Arc::clone(&domain_stats_for_kloop)),
+        ) {
+            Ok(h) => {
+                std::mem::forget(h); // keep the loopback listener alive for the process lifetime
+                tracing::info!(addr = %lo_bind, "XDP mode: loopback slowpath kernel listener started (#167b)");
+            }
+            Err(e) => tracing::warn!("XDP mode loopback listener failed to start: {e} — 127.0.0.1 DNS will time out in XDP mode"),
         }
     }
 
