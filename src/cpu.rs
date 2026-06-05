@@ -61,6 +61,35 @@ pub fn physical_cores() -> Vec<usize> {
 /// Reads /proc/interrupts to find IRQs for `iface` (patterns: `{iface}-TxRx-N`,
 /// `{iface}-rx-N`, `{iface}-N`), then writes the core bitmask to
 /// `/proc/irq/<irq>/smp_affinity_list`. Silent no-op on any failure.
+
+/// Returns the NUMA node of a NIC (`/sys/class/net/<iface>/device/numa_node`).
+/// Returns 0 (fallback) if the file is absent (VM, container, non-NUMA).
+pub fn nic_numa_node(iface: &str) -> usize {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/device/numa_node"))
+        .ok()
+        .and_then(|s| s.trim().parse::<isize>().ok())
+        .map(|n| if n < 0 { 0 } else { n as usize })  // -1 → 0 (non-NUMA or VM)
+        .unwrap_or(0)
+}
+
+/// Returns physical cores (SMT filtered) that belong to `numa_node`.
+/// Falls back to all physical cores when NUMA topology is unavailable.
+///
+/// NUMA node of a CPU = the node symlink under
+/// `/sys/devices/system/cpu/cpu<N>/` (e.g. `node0` → node 0).
+pub fn physical_cores_numa_local(numa_node: usize) -> Vec<usize> {
+    let all = physical_cores();
+    let local: Vec<usize> = all.iter().copied().filter(|&cpu_id| {
+        // Read the node<N> symlink directory present under the cpu topology dir.
+        // /sys/devices/system/cpu/cpu<N>/node<M> exists iff cpu belongs to node M.
+        let path = format!(
+            "/sys/devices/system/cpu/cpu{cpu_id}/node{numa_node}"
+        );
+        std::path::Path::new(&path).exists()
+    }).collect();
+    if local.is_empty() { all } else { local }
+}
+
 pub fn set_irq_affinity(iface: &str, queue_to_core: &[(u32, usize)]) {
     #[cfg(target_os = "linux")]
     {
