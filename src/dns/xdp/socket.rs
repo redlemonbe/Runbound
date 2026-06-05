@@ -634,6 +634,78 @@ pub fn read_nic_rx_dropped(iface: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Read rx_missed_errors for `iface` from ethtool-style sysfs.
+/// This counter increments when the NIC RX ring is full and incoming frames
+/// are dropped by the NIC/DMA before reaching the kernel — the key indicator
+/// of NIC/bus-bound saturation (as opposed to CPU-bound).
+/// Falls back to 0 when unavailable (virtual NIC, old kernel).
+pub fn read_nic_rx_missed(iface: &str) -> u64 {
+    let iface = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None => return 0,
+    };
+    // Primary: sysfs statistics (available on most NICs including ixgbe)
+    if let Ok(v) = std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/rx_missed_errors")) {
+        if let Ok(n) = v.trim().parse::<u64>() { return n; }
+    }
+    0
+}
+
+/// Read rx_no_dma_resources for `iface` — ixgbe-specific counter indicating
+/// that the DMA engine ran out of descriptors (RX ring starved).
+/// Only available via ethtool -S or debugfs; falls back to 0 gracefully.
+pub fn read_nic_rx_no_dma(iface: &str) -> u64 {
+    let iface = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None => return 0,
+    };
+    // /sys/kernel/debug/ixgbe/<iface>/rx_no_dma_resources (requires debugfs mount)
+    if let Ok(v) = std::fs::read_to_string(format!("/sys/kernel/debug/ixgbe/{iface}/rx_no_dma_resources")) {
+        if let Ok(n) = v.trim().parse::<u64>() { return n; }
+    }
+    0
+}
+
+/// Detect if this host is a Xeon v2 (Ivy Bridge-EP, family=6 model=62) +
+/// X520/ixgbe combination — the specific architecture where the PCIe bus
+/// ceiling limits effective XDP workers to ~16 physical cores.
+/// On any other CPU/NIC combo this returns false → no artificial cap applied.
+pub fn is_xeon_v2_x520_host(iface: &str) -> bool {
+    // Check CPU: family 6 model 62 = Ivy Bridge-EP (Xeon E5-2600 v2)
+    let is_xeon_v2 = std::fs::read_to_string("/proc/cpuinfo")
+        .map(|s| {
+            let has_family6 = s.lines().any(|l| l.starts_with("cpu family") && l.contains(": 6"));
+            let has_model62 = s.lines().any(|l| l.starts_with("model") && l.contains(": 62"));
+            has_family6 && has_model62
+        })
+        .unwrap_or(false);
+    if !is_xeon_v2 { return false; }
+
+    // Check NIC driver: ixgbe = X520/82599
+    let iface_clean = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None => return false,
+    };
+    let driver_path = format!("/sys/class/net/{iface_clean}/device/driver/module");
+    let is_ixgbe = std::fs::read_link(&driver_path)
+        .map(|p| p.to_string_lossy().contains("ixgbe"))
+        .unwrap_or(false);
+
+    is_xeon_v2 && is_ixgbe
+}
+
+/// Emit a one-time startup hint when running on Xeon v2 + X520 (NIC/bus-bound arch).
+/// On this platform, XDP saturates at ~16 cores due to PCIe bus ceiling,
+/// and rx_missed_errors will be non-zero even with CPU headroom — that is expected.
+pub fn maybe_warn_xeon_v2_x520(iface: &str) {
+    if is_xeon_v2_x520_host(iface) {
+        tracing::warn!(
+            iface = %iface,
+            "host likely NIC/PCIe-bus-bound (Xeon v2 + X520 ~16-core bus ceiling) —              CPU headroom is expected; rx_missed_errors is the real throughput wall.              This is not a Runbound bug — it is a hardware architectural limit."
+        );
+    }
+}
+
 /// Returns true if `iface` is a bonded interface (master bond OR slave of a bond).
 /// XDP is incompatible with bonding — frames may arrive on the bond master but
 /// the XSK bind must target the slave NIC's queue directly, which AF_XDP does
