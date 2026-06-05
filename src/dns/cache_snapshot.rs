@@ -70,7 +70,10 @@ impl Clone for CacheEntry {
     }
 }
 
-pub type CacheSnapshot = HashMap<QuestionKey, CacheEntry>;
+// #perf: ahash (AES-NI) instead of the std default SipHash (crypto, ~10x slower).
+// This map is read once PER PACKET by the XDP workers — the hash was the dominant
+// cost of the cache lookup. ahash::RandomState: Default, so default()/collect() work.
+pub type CacheSnapshot = HashMap<QuestionKey, CacheEntry, ahash::RandomState>;
 pub type SharedCacheSnapshot = Arc<ArcSwap<CacheSnapshot>>;
 pub type MutableCacheMap = Arc<DashMap<QuestionKey, CacheEntry>>;
 

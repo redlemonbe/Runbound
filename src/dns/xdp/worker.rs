@@ -1537,26 +1537,13 @@ fn answer_from_cache(
             // Patch QID (bytes [0..2]) with the client's actual transaction ID.
             tx_dns[0] = qid[0];
             tx_dns[1] = qid[1];
-            // #perf: these per-packet stats (a String alloc in domain_stats + a
-            // GLOBAL atomic hammered by all 16 workers) were a ~50x throughput
-            // regression on the cache hot path — added v0.9.9 (169092b), they made
-            // the CACHE slower than the zero-alloc local-zone path (answer_dns_wire).
-            // Sample 1/N per-thread (contention-free) and scale the exact counters by
-            // N so totals stay accurate; qtype/domain distributions stay proportional.
-            const STAT_N: u64 = 64;
-            thread_local! { static HIT_SAMPLE: std::cell::Cell<u64> = std::cell::Cell::new(0); }
-            let sampled = HIT_SAMPLE.with(|c| { let n = c.get().wrapping_add(1); c.set(n); n % STAT_N == 0 });
-            if sampled {
-                use std::sync::atomic::Ordering::Relaxed;
-                crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS.fetch_add(STAT_N, Relaxed);
-                if let Some(s) = stats {
-                    s.total.fetch_add(STAT_N, Relaxed);
-                    let tc = qtype as usize;
-                    if tc < s.qtype_counts.len() { s.qtype_counts[tc].fetch_add(STAT_N, Relaxed); }
-                    else { s.qtype_high.fetch_add(STAT_N, Relaxed); }
-                }
-                if let Some(ds) = domain_stats { ds.inc(&wire_qname_to_str(&key.name)); }
-            }
+            // #perf: ZERO per-packet stats on the cache hot path. A server at line
+            // rate does not count per-packet cache stats (the v0.9.9 instrumentation
+            // made the cache SLOWER than the zero-alloc local-zone path). Total served
+            // is already counted per-worker in the worker loop (XDP_WORKER_PKTS,
+            // contention-free) and summed by qps_update_loop. This path is now as lean
+            // as answer_dns_wire.
+            let _ = (stats, domain_stats); // intentionally unused on the hot path
             return Some(wire.len());
         }
     }
