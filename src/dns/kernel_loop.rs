@@ -42,6 +42,12 @@ pub struct FallbackMsg {
     pub socket: Arc<UdpSocket>,
 }
 
+/// Global sender so XDP workers (no kernel arrival socket) can hand
+/// recursion/complex misses to the same hickory fallback reader.
+/// Set once by run_dns_server(); None until then (early-startup misses dropped).
+pub static XDP_FALLBACK_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<FallbackMsg>> =
+    std::sync::OnceLock::new();
+
 /// Handle returned by `start_kernel_fast_loop`.
 /// Dropping it signals shutdown to the worker threads (best-effort via flag).
 pub struct KernelLoopHandle {
