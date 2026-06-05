@@ -238,11 +238,17 @@ pub fn start_xdp_multi(
     }).count();
 
     // Cap at 16 ONLY on Xeon v2 + X520 (PCIe bus ceiling ~16 cores, auto-detected).
-    // Other arches: use NUMA-local count only (no artificial cap).
+    // On AMD / Xeon v3+: allow the full sorted pool so queue_count <= cores avoids
+    // modulo wrap (e.g. 16 queues, NPS-8 node of 8 local cores → take 16 = 8 local +
+    // 8 from neighbour node, 1 queue/core, no wrap, negligible cross-NUMA UMEM cost).
     let is_xeon_v2 = ifaces.first()
         .map(|iface| super::socket::is_xeon_v2_x520_host(iface))
         .unwrap_or(false);
-    let core_cap: usize = if is_xeon_v2 { 16 } else { local_count.max(1) };
+    let core_cap: usize = if is_xeon_v2 {
+        16 // X520 PCIe bus ceiling — inchangé
+    } else {
+        numa_sorted_cores.len() // full pool, local-first; no wrap while queues <= cores
+    };
     let physical_cores: Vec<usize> = numa_sorted_cores.iter().copied().take(core_cap).collect();
     let remote_count = core_cap.saturating_sub(local_count);
     let total_phys = physical_cores.len().max(1);
@@ -258,10 +264,11 @@ pub fn start_xdp_multi(
         );
     } else {
         tracing::info!(
-            numa_node   = nic_numa_node,
-            cores       = physical_cores.len(),
-            local_cores = local_count,
-            cap         = "none",
+            numa_node    = nic_numa_node,
+            cores        = physical_cores.len(),
+            local_cores  = local_count,
+            remote_cores = remote_count,
+            cap          = "none (full NUMA-sorted pool)",
             "XDP: worker core pool selected"
         );
     }
