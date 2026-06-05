@@ -5,6 +5,7 @@ pub mod ddns;
 pub mod acl;
 pub mod cache_snapshot;
 pub mod hasher;
+pub mod wire_builder;
 pub mod local;
 pub mod axfr;
 pub mod prefetch;
