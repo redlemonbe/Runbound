@@ -62,31 +62,13 @@ fn main() -> Result<()> {
     let cores = cpu::physical_cores();
     let core_count = cores.len();
 
-    let runtime = if cfg.cpu_affinity && !cores.is_empty() {
-        info!(
-            cores = core_count,
-            "CPU affinity enabled — physical cores (HT excluded)"
-        );
-        let cores_arc = Arc::new(cores);
-        let thread_index = Arc::new(AtomicUsize::new(0));
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(core_count)
-            .on_thread_start(move || {
-                let idx = thread_index.fetch_add(1, Ordering::Relaxed) % core_count;
-                cpu::pin_to_cpu(cores_arc[idx]);
-            })
-            .enable_all()
-            .build()?
-    } else {
-        if cfg.cpu_affinity {
-            info!("CPU affinity disabled (fallback: /sys unavailable)");
-        } else {
-            info!("CPU affinity disabled (cpu-affinity: no)");
-        }
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-    };
+    // #163: CPU placement is fully automatic.
+    // Kernel slow path: OS scheduler floats on all cores (+39% vs naive pin, Xeon v2+X520).
+    // XDP fast path: workers auto-pinned to NUMA-local physical cores in start_xdp_on_iface().
+    info!(cores = core_count, "CPU placement: automatic (OS scheduler + XDP NUMA-local pin)");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
 
     runtime.block_on(async_main(cfg, base_dir, cfg_path))
 }
@@ -1758,10 +1740,6 @@ fn print_help() {
         "                        Use in dual-NIC setups to pin XDP to the DNS-facing NIC.
 ",
         "                        Set to 'none' to disable XDP without changing xdp: directive.
-",
-        "    cpu-affinity: yes   Enable CPU pinning to physical cores (default: no — floating scheduler measured faster on Xeon v2+X520: 874k vs 630k qps)
-",
-        "                        Use in containers that lack CAP_SYS_NICE
 ",
         "    api-key: <secret>   REST API key (overridden by RUNBOUND_API_KEY env var)
 ",
