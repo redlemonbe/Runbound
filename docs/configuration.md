@@ -1403,3 +1403,109 @@ They exist to bound memory usage and protect against authenticated DoS.
 | **Max DNS entries (API)** | 10,000 | Maximum number of DNS records that can be added via `POST /dns`. Feed-loaded blocklist entries are not counted here. |
 | **Max blacklist entries (API)** | 100,000 | Maximum number of manual blacklist entries via `POST /blacklist`. |
 | **Max feed subscriptions** | 100 | Maximum number of concurrent feed subscriptions via `POST /feeds`. |
+
+---
+
+## Additional directives reference
+
+Directives below are supported by the parser but were previously undocumented.
+Defaults reflect the code. Booleans accept `yes`/`no`. All live in the `server:` block
+unless a section header is shown.
+
+### Cache & TTL
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `cache-min-ttl` | (unset) | Minimum TTL (seconds) advertised for cached answers — floor enforcement. |
+| `cache-flush-cooldown` | `60` | Minimum seconds between two cache flushes (anti-abuse). |
+
+### Serve-stale (RFC 8767)
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `serve-stale` | `yes` | Serve expired cached answers while a refresh is in flight. Set `no` to disable. |
+| `stale-answer-ttl` | `30` | TTL (seconds) sent with a stale answer. |
+| `stale-max-age` | `86400` | Maximum age (seconds) a stale entry may be served. |
+
+### Rate-limit tuning
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `rate-limit-prefix-v4` | `24` | IPv4 prefix length used to bucket per-source rate limiting. |
+| `rate-limit-prefix-v6` | `48` | IPv6 prefix length used to bucket per-source rate limiting. |
+| `udp-busy-poll` | `no` | Enable UDP socket busy-polling on the kernel slow path (lower latency, higher CPU). |
+
+### Block page (NXDOMAIN landing page)
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `block-page` | `no` | Serve an HTTP block page for blocked domains instead of plain NXDOMAIN. |
+| `block-page-port` | `8083` | TCP port for the block page server. |
+| `block-page-title` | (brand) | Title shown on the block page. |
+| `block-page-org` | (brand) | Organisation name shown on the block page. |
+| `block-page-redirect-ip` | (unset) | IP returned for blocked names so clients reach the block page. |
+| `block-page-allow-bypass` | `no` | Allow a user to bypass a block with a PIN. |
+| `block-page-bypass-pin` | (unset) | PIN required when `block-page-allow-bypass` is enabled. |
+
+### Other server directives
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `pidfile` | (unset) | Path to write the process PID file. |
+| `allow-update` | `yes` | Allow live record updates via the REST API. Set `no` for read-only. |
+| `audit-checkpoint-every` | `10000` | Write an audit-log checkpoint every N entries (fast crash recovery). `0` disables. |
+| `sync-allow-private-relay` | `no` | Master: accept slave relay hosts in RFC 1918 / ULA ranges (local deployments). |
+| `tsig-key` | — | AXFR/IXFR TSIG key: `tsig-key: "name" <algorithm> "base64secret"`. May repeat. |
+
+### XDP fine-tuning
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `xdp-busy-poll` | `yes` | Drain the RX ring before sleeping + NAPI busy-poll hints (lower idle latency). |
+| `xdp-cache-snapshot-size` | `10000` | Max entries in the XDP cache snapshot. |
+| `xdp-fill-ring-size` / `xdp-comp-ring-size` / `xdp-rx-ring-size` / `xdp-tx-ring-size` | `auto` | Per-ring AF_XDP sizes; `auto` derives them from the NIC hardware ring. |
+
+### WebUI TLS / ACME / branding
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `ui-ca-cert` / `ui-ca-key` | (auto) | CA cert/key used to sign the self-signed WebUI certificate. |
+| `ui-acme-domain` | (unset) | Domain for an ACME-issued WebUI certificate (`ui-tls: acme`). |
+| `ui-acme-email` | (unset) | ACME account contact email for the WebUI cert. |
+| `ui-acme-dns` | (unset) | ACME DNS-01 provider (e.g. `cloudflare`) for the WebUI cert. |
+| `ui-acme-cf-token` | (unset) | Cloudflare API token for ACME DNS-01. |
+| `ui-acme-hook` | (unset) | External hook command for ACME DNS-01. |
+| `ui-brand-name` | `RUNBOUND` | White-label brand name shown in the WebUI header. |
+| `ui-brand-logo-url` | (unset) | Logo URL for white-label branding. |
+| `ui-accent-color` | `#22d3ee` | Accent colour (hex) for the WebUI theme. |
+| `ui-favicon-url` | (unset) | Favicon URL for white-label branding. |
+
+### Webhook target (in the `server:` block, repeatable)
+
+A webhook is declared by a `webhook` line, optionally followed by its sub-directives:
+
+```
+server:
+    webhook:         "https://hooks.slack.com/services/..."
+    webhook-format:  slack          # slack | discord | ntfy | generic-json
+    webhook-token:   "secret"       # optional bearer/token
+    webhook-events:  "domain_blocked qps_spike slave_disconnect"   # or "all"
+```
+
+### `api-key-extra:` section (scoped API keys)
+
+```
+api-key-extra:
+    label: "ci-readonly"
+    key:   "env:CI_API_KEY"        # literal, or env:VAR to read from environment
+    role:  read                    # read | dns | operator | admin
+```
+
+### `split-horizon:` section (per-subnet answers)
+
+```
+split-horizon:
+    name:       "office"
+    subnet:     "10.0.0.0/8"        # may repeat
+    local-data: "intra.corp. A 10.0.0.5"   # may repeat
+```
