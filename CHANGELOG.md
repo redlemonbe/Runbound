@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.13.0] — 2026-06-06
+
+### Added
+
+- **Split-horizon DNS configurable via API + WebUI** (#10): new `/api/split-horizon` CRUD endpoints (GET / POST / DELETE) and a WebUI tab to manage per-subnet answer zones (name, subnets, local-data). Entries are persisted to `runbound.conf` (config-writer) and applied on the next service restart — the resolver's split-horizon table is built at boot, so the slow path is untouched. Slave nodes are read-only (503).
+- **XDP cache-hit-rate counter restored for `xdp: yes`**: a per-worker miss counter (`XDP_WORKER_MISS`) mirrors the existing served counter (`XDP_WORKER_PKTS` = hits). The hot-path hit branch is unchanged — only the already-slow fallback branch gains one increment — and the rate is computed in Rust off the hot path. The WebUI cache-hit rate is now meaningful in XDP mode (previously slow-path-only).
+
+---
+
 ## [0.12.0] — 2026-06-06
 
 ### Added
