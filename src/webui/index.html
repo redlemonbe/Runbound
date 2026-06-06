@@ -59,6 +59,15 @@
      ══════════════════════════════════════════════ */
   *,*::before,*::after{box-sizing:border-box}
   html,body{margin:0;padding:0}
+  /* Background ported from the RunIA login page (deep-space navy + drifting orbs) */
+  html{min-height:100%;background:radial-gradient(ellipse at 20% 50%,rgba(56,189,248,.07) 0%,transparent 50%),radial-gradient(ellipse at 80% 20%,rgba(167,139,250,.07) 0%,transparent 50%),#080d1c}
+  body{background:transparent}
+  .bg-orbs{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none}
+  .orb{position:absolute;border-radius:50%;pointer-events:none;will-change:transform}
+  .orb-1{width:700px;height:700px;background:radial-gradient(circle,rgba(56,189,248,.18) 0%,transparent 70%);top:-250px;left:-200px;animation:floatOrb 28s ease-in-out infinite;filter:blur(1px)}
+  .orb-2{width:600px;height:600px;background:radial-gradient(circle,rgba(167,139,250,.15) 0%,transparent 70%);bottom:-200px;right:-150px;animation:floatOrb 22s ease-in-out infinite reverse;filter:blur(1px)}
+  .orb-3{width:400px;height:400px;background:radial-gradient(circle,rgba(52,211,153,.1) 0%,transparent 70%);top:60%;left:55%;animation:floatOrb 35s ease-in-out infinite;filter:blur(2px);opacity:.6}
+  @keyframes floatOrb{0%,100%{transform:translate(0,0) scale(1)}25%{transform:translate(40px,-30px) scale(1.05)}50%{transform:translate(-20px,25px) scale(.97)}75%{transform:translate(15px,35px) scale(1.03)}}
   button{font-family:inherit;background:transparent;border:0;padding:0;cursor:pointer;color:inherit}
   svg{max-width:100%}
   /* Display */
@@ -235,7 +244,8 @@
   }
   </style>
 </head>
-<body class="bg-gray-950 text-gray-200 min-h-screen pb-8">
+<body class="text-gray-200 min-h-screen pb-8">
+<div class="bg-orbs"><div class="orb orb-1"></div><div class="orb orb-2"></div><div class="orb orb-3"></div></div>
 
 <!-- Banner -->
 <div class="bg-gray-950 border-b border-gray-800/60 px-5 py-2.5 flex flex-wrap items-center gap-3 shadow-lg shadow-black/40">
