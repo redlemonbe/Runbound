@@ -35,7 +35,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "tls-port" | "https-port" | "quic-port"
                 | "tls-cert-hostname" | "server-hostname" | "dot-client-auth-ca"
                 | "rate-limit" | "rate-limit-prefix-v4" | "rate-limit-prefix-v6"
-                | "api-key" | "api-port"
+                | "api-key" | "api-port" | "api-socket"
                 | "cache-max-ttl" | "cache-min-ttl" | "cache-min-entries"
                 | "private-address"
                 | "dnssec-validation" | "dnssec-log-bogus"
@@ -125,6 +125,7 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.rate_limit_prefix_v6 != d.rate_limit_prefix_v6 { o.push_str(&format!("    rate-limit-prefix-v6: {}\n", cfg.rate_limit_prefix_v6)); }
     if let Some(v) = &cfg.api_key { o.push_str(&format!("    api-key: \"{v}\"\n")); }
     if let Some(v) = cfg.api_port { o.push_str(&format!("    api-port: {v}\n")); }
+    if let Some(v) = &cfg.api_socket { o.push_str(&format!("    api-socket: \"{v}\"\n")); }
     if let Some(v) = cfg.cache_max_ttl { o.push_str(&format!("    cache-max-ttl: {v}\n")); }
     if let Some(v) = cfg.cache_min_ttl { o.push_str(&format!("    cache-min-ttl: {v}\n")); }
     if cfg.cache_min_entries != d.cache_min_entries { o.push_str(&format!("    cache-min-entries: {}\n", cfg.cache_min_entries)); }
