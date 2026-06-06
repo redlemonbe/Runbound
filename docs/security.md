@@ -530,7 +530,7 @@ See [systemd.md](systemd.md) for the full unit file.
 | VUL-3.4 | Low | API error bodies exposed file-system paths — `sanitize_error()` added at 8 sites | v0.4.16 |
 | VUL-3.2 | Low | `/reload` endpoint not independently rate-limited — dedicated 2 RPS token bucket added | v0.4.16 |
 
-See [security-audit.md](security-audit.md) for the full white-box audit report.
+See the [security audit report](security-audit/SECURITY-AUDIT.md) for the full white-box audit.
 
 ---
 
@@ -593,7 +593,7 @@ make audit-full  # all three + cargo outdated
 
 → Full audit process, release procedure, and manual review areas: [docs/audit.md](audit.md)
 
-→ Full Rust code audit (quality, performance, architecture): [docs/code-audit.md](code-audit.md)
+→ Architecture & performance internals: [docs/internals.md](internals.md)
 
 ---
 
