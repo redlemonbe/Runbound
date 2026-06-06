@@ -1,6 +1,6 @@
 # Runbound
 
-## The World's First ASM-Accelerated DNS Server
+## ASM-accelerated, Unbound-compatible DNS server — live REST API + XDP fast path
 
 **Unbound-compatible DNS server — REST API, XDP kernel-bypass, no restart ever.**
 

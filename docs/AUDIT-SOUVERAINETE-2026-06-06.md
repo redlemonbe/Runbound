@@ -1,3 +1,25 @@
+> ## ⚠️ Maintainer review (verified against the code, 2026-06-06)
+>
+> This document is a **raw AI audit (Nexus / Gemini × Qwen)**. It was reviewed against the
+> source before action. Several **code** findings were **verified false or overstated** and
+> are **DISPUTED** — do not act on them:
+>
+> | Nexus finding | Verdict | Evidence |
+> |---|---|---|
+> | DNS-over-TCP bypasses the blacklist | **DISPUTED (false)** | The blacklist runs on the slow path (`src/dns/server.rs`, local-zone lookup), shared by UDP **and** TCP — not XDP/UDP-only. |
+> | IP-fragmentation bypass | **DISPUTED (false)** | Fragments are reassembled by the kernel and handled by the slow path, which filters. |
+> | systemd hardening / privilege model missing | **DISPUTED (false)** | `runbound.service` already sets `User=runbound` (non-root), a restricted `CapabilityBoundingSet`/`AmbientCapabilities`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`. |
+> | "No RRL → DNS amplifier" | **OVERSTATED** | ANY queries are blocked (RFC 8482, `server.rs`) and per-IP query rate limiting exists. Strict RRL (RFC 5358) is a future enhancement, not an open hole. |
+>
+> **Valid findings retained** (see `docs/ROADMAP-SOUVERAINETE.md` for status): the
+> "World's First" marketing claim (removed), the absence of `SECURITY.md` /
+> `THREAT_MODEL.md`, third-party human audit, reproducible build + binary signatures,
+> strict RRL, SIEM-ready logs, API over a Unix socket, and a formal SBOM.
+>
+> TLS uses **rustls 0.23 (TLS 1.2/1.3 only)** — modern and safe, just undocumented.
+>
+> ---
+
 # RUNBOUND — RAPPORT D'AUDIT SENIOR
 **Architecte Systeme Defense/Souverainete + Securite Offensive**  
 **Nexus / 2026-06-06**
