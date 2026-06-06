@@ -22,7 +22,7 @@ All numbers in the raw results tables are ✅ MEASURED (dnsmark 0.4.5 output, AM
 
 | Claim | Value | Status | Action |
 |-------|-------|--------|--------|
-| QPS ceiling — all three servers | 128 000 QPS | ✅ MEASURED | Leave |
+| QPS ceiling — all three servers (comparative run, generator-limited — not the 195k Runbound cache-warm figure) | 128 000 QPS | ✅ MEASURED | Leave |
 | Runbound sustained p99 | 0.232 ms | ✅ MEASURED | Leave |
 | BIND9 sustained p99 | 0.210 ms | ✅ MEASURED | Leave |
 | Unbound sustained p99 | 0.078 ms | ✅ MEASURED | Leave |
