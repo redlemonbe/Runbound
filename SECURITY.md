@@ -20,9 +20,18 @@ Only the **latest released version** receives security fixes — there is no LTS
 Please report privately via **GitHub Private Vulnerability Reporting**:
 <https://github.com/redlemonbe/Runbound/security/advisories/new>
 
-Do **not** open a public issue for security problems. We aim to acknowledge within
-7 days. (A maintainer contact email and a firm disclosure SLA will be added as the
-project matures.)
+Do **not** open a public issue for security problems.
+
+**Disclosure timeline (best-effort policy):**
+- **Acknowledgement:** within **7 days** of the report.
+- **Triage & fix target:** within **90 days** for the latest released version.
+- **Coordinated public disclosure:** at the fix release, or **90 days** after the
+  report — whichever comes first.
+
+> Runbound is distributed under **AGPL-3.0 with no warranty** (see `LICENSE`,
+> sections 15–16): the timeline above is a **voluntary best-effort** policy, not a
+> legal or contractual obligation. **Commercial-license** customers receive firm,
+> contractual SLAs defined in their agreement.
 
 ## Cryptography
 
