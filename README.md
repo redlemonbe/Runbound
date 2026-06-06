@@ -164,24 +164,15 @@ curl -s -X POST http://localhost:8080/api/feeds \
 
 ## Performance
 
-Numbers below are the **hard** figures — RX-drained / served at the receiver NIC counters (not the TX-bytes estimate, not a self-reported round-trip) — and link to the full report.
+Official benchmarks are being **re-run under a documented, reproducible methodology**
+— see [docs/benchmark/](docs/benchmark/). Previous ad-hoc numbers were removed to
+avoid stale or non-comparable claims.
 
-| Path | Hardware | Measured | Report |
-|------|----------|----------|--------|
-| AF_XDP fast path — local-zone A, **dual-fibre** | Threadripper 5995WX, 2× Intel X520 10 GbE | **~16–17M qps** RX-drained / served at the receiver NIC, **~13% CPU** — generator-limited, receiver not saturated | [benchmark/v0.10.0](docs/benchmark/v0.10.0.md) |
-| AF_XDP fast path — local-zone A, single-fibre | 2013 dual Xeon E5-2690 v2, X520 10 GbE | **8.83M qps** — ~78% of 10 GbE line-rate, PCIe-bus-bound | [benchmark/v0.9.69](docs/benchmark/v0.9.69.md) |
-| Userspace — `SO_REUSEPORT`, no XDP | loopback, cache-warm | **195k qps** (vs BIND9 56k / Unbound 52k under stress) | [benchmark/v0.9.46](docs/benchmark/v0.9.46.md) |
-
-The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC hardware, huge pages are self-provisioned, and NIC queues scale to the CPU automatically (kept at the driver default on bus-bound Xeon v2 + X520). The architecture is built for linear scaling — `SO_REUSEPORT`, `ArcSwap` lock-free config, per-core affinity, and a single-lookup ASM hot path (CRC32c + SIMD label handling).
-
-| Query path | Latency |
-|------------|---------|
-| XDP fast path (local zone) | **< 1 ms** (below the load generator's resolution) |
-| Slow path — upstream forward | upstream RTT + ~50 µs |
-
-Full methodology and current numbers: [docs/performance.md](docs/performance.md) · timing budget: [docs/internals.md](docs/internals.md).
-
----
+The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC
+hardware, huge pages are self-provisioned, and NIC queues scale to the CPU
+automatically (kept at the driver default on bus-bound Xeon v2 + X520). The
+architecture targets linear scaling — `SO_REUSEPORT`, `ArcSwap` lock-free config,
+per-core affinity, and a single-lookup ASM hot path (CRC32c + SIMD).
 
 ## AF/XDP Fast Path
 
