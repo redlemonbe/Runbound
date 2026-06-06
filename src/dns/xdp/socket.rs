@@ -166,16 +166,57 @@ pub unsafe fn create_xsk_socket(
         ));
     }
 
+    // Auto-size the AF_XDP rings to the NIC hardware ring. A fill ring SMALLER
+    // than the HW RX ring starves the driver => rx_no_dma drops. We only
+    // auto-upgrade values left at the default (<= 4096); explicit larger config
+    // is kept. This removes the need to hand-tune xdp-*-ring-size per NIC.
+    //
+    // DETERMINISTIC read: query the HW ring HERE (ifindex -> name -> GRINGPARAM)
+    // instead of a global atomic. The atomic is only populated AFTER the socket
+    // loop, so early queues used to read 0 and stayed at fill=4096 (half the
+    // queues starved -> rx_no_dma). Reading per-socket is race-free for any path.
+    let hw_max: u32 = {
+        let mut nbuf = [0u8; libc::IF_NAMESIZE];
+        // SAFETY: if_indextoname writes a NUL-terminated name (<= IF_NAMESIZE)
+        //         into nbuf, or returns null on error.
+        let p = unsafe { libc::if_indextoname(ifindex, nbuf.as_mut_ptr() as *mut libc::c_char) };
+        if p.is_null() {
+            0
+        } else {
+            let nm = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned();
+            // GET-ONLY read (no SRINGPARAM): never reconfigure the HW ring while
+            // AF_XDP sockets are attached — that resets the datapath (TX dies).
+            hw_rx_ring_max(&nm)
+        }
+    };
+    let auto_ring = |configured: u32| -> u32 {
+        if configured <= 4096 && hw_max >= 4096 {
+            hw_max.saturating_mul(2).next_power_of_two().clamp(8192, 65536)
+        } else {
+            configured
+        }
+    };
+    let eff = XdpRingSizes {
+        fill: auto_ring(sizes.fill),
+        comp: auto_ring(sizes.comp),
+        rx: auto_ring(sizes.rx),
+        tx: auto_ring(sizes.tx),
+    };
+    if (eff.fill, eff.rx, eff.tx, eff.comp) != (sizes.fill, sizes.rx, sizes.tx, sizes.comp) {
+        tracing::info!(hw_rx_ring = hw_max, fill = eff.fill, rx = eff.rx, tx = eff.tx,
+            "XDP rings auto-sized from NIC hardware ring (no manual xdp-*-ring-size needed)");
+    }
+
     // 2. Allocate and register UMEM (also maps fill + completion rings)
     // SAFETY: `fd` is a valid AF_XDP socket fd returned by `socket(2)` above.
-    let umem = unsafe { Umem::new(fd, hugepages, sizes) }.inspect_err(|_| {
+    let umem = unsafe { Umem::new(fd, hugepages, &eff) }.inspect_err(|_| {
         // SAFETY: `fd` is a valid open file descriptor not yet transferred
         //         to any owner. We close it here on the error path only.
         unsafe { libc::close(fd) };
     })?;
 
     // 3. Set RX and TX ring sizes
-    for (opt, sz) in [(XDP_RX_RING, sizes.rx), (XDP_TX_RING, sizes.tx)] {
+    for (opt, sz) in [(XDP_RX_RING, eff.rx), (XDP_TX_RING, eff.tx)] {
         // SAFETY: `fd` is a valid AF_XDP socket fd. `&sz` points to an
         //         initialised u32 on the stack. The socklen matches sizeof(u32).
         let rc = unsafe {
@@ -203,13 +244,13 @@ pub unsafe fn create_xsk_socket(
     let (rx_off, tx_off) = unsafe { get_rx_tx_offsets(fd) }?;
     // SAFETY: `fd` is valid; `rx_off` contains the offsets returned by the kernel.
     let rx =
-        unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, sizes.rx) }.inspect_err(|_| {
+        unsafe { mmap_desc_ring(fd, XDP_PGOFF_RX_RING, &rx_off, eff.rx) }.inspect_err(|_| {
             // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
             unsafe { libc::close(fd) };
         })?;
     // SAFETY: `fd` is valid; `tx_off` contains the offsets returned by the kernel.
     let tx =
-        unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, sizes.tx) }.inspect_err(|_| {
+        unsafe { mmap_desc_ring(fd, XDP_PGOFF_TX_RING, &tx_off, eff.tx) }.inspect_err(|_| {
             // SAFETY: `fd` is valid and not yet owned by `XskSocket`.
             unsafe { libc::close(fd) };
         })?;
@@ -515,6 +556,40 @@ fn first_physical_bridge_port(bridge: &str) -> Option<String> {
 /// Stores results in `XDP_NIC_RX_RING` / `XDP_NIC_RX_RING_MAX`.
 /// On any error (EOPNOTSUPP, EPERM, virtual NIC, …) emits a `warn!` and returns
 /// `(0, 0)` — startup is never aborted.
+/// Read the NIC's hardware MAX RX ring depth (ETHTOOL_GRINGPARAM) WITHOUT
+/// changing anything. Used to auto-size the AF_XDP rings at socket creation.
+/// Returns 0 on any error (caller then keeps the configured default).
+fn hw_rx_ring_max(iface: &str) -> u32 {
+    let iface_safe = match sanitize_iface_name(iface) {
+        Some(s) => s,
+        None => return 0,
+    };
+    // SAFETY: AF_INET/SOCK_DGRAM socket used only as an ioctl handle.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return 0;
+    }
+    // SAFETY: zeroed() is valid for this plain repr(C) struct of u32 fields.
+    let mut ring: EthtoolRingParam = unsafe { std::mem::zeroed() };
+    ring.cmd = ETHTOOL_GRINGPARAM;
+    let mut ifr = build_ifreq(iface_safe, (&mut ring as *mut EthtoolRingParam).cast());
+    // SAFETY: fd valid; ifr fully initialised with a valid ifr_data pointer.
+    let rc = unsafe {
+        libc::ioctl(
+            fd,
+            SIOCETHTOOL as _,
+            (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>(),
+        )
+    };
+    // SAFETY: fd is a valid open descriptor we own; closed exactly once here.
+    unsafe { libc::close(fd) };
+    if rc < 0 {
+        0
+    } else {
+        ring.rx_max_pending
+    }
+}
+
 pub fn maximize_nic_ring(iface: &str, target: Option<u32>) -> (u32, u32) {
     match maximize_nic_ring_inner(iface, target) {
         Ok(pair) => pair,
