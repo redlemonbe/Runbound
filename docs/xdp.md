@@ -120,7 +120,7 @@ reliable figure.)
 Everything the wire builder does not cover — NXDOMAIN, NODATA, **wildcard
 local-data**, CNAME/MX/TXT, EDNS (OPT), ACL Deny, ANY, malformed — transparently
 **falls back to hickory**, so behaviour is unchanged outside the A/AAAA answer case.
-See benchmark/v0.9.66.md.
+See [benchmark/](benchmark/) for the current benchmark methodology.
 
 ## domain-routing (CPUMAP) and zero-copy (v0.9.66, #155)
 
