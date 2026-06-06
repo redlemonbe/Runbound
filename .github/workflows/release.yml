@@ -88,6 +88,13 @@ jobs:
           RING_HOST_CC: gcc
         run: cargo build --release --target aarch64-unknown-linux-musl
 
+      # ── SBOM (CycloneDX) ──
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json
+          mv runbound.cdx.json sbom.cdx.json
+
       # ── Package ──────────────────────────────────────────────────────────
       - name: Package binaries
         run: |
@@ -100,6 +107,7 @@ jobs:
             runbound-x86_64-linux-musl \
             runbound-aarch64-linux-gnu \
             runbound-aarch64-linux-musl \
+            sbom.cdx.json \
             > SHA256SUMS
 
       # ── Changelog fragment ───────────────────────────────────────────────
@@ -140,4 +148,5 @@ jobs:
             runbound-x86_64-linux-musl \
             runbound-aarch64-linux-gnu \
             runbound-aarch64-linux-musl \
-            SHA256SUMS
+            SHA256SUMS \
+            sbom.cdx.json
