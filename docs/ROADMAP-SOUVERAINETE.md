@@ -10,9 +10,9 @@ document and are **not** listed here.
 - [x] Maintainer review appended to the raw AI audit, disputing the false code findings.
 
 ## Documentation (no code change)
-- [ ] **SECURITY.md** — supported versions, crypto (rustls, TLS 1.2/1.3), HMAC audit log, CVE contact + disclosure SLA.
-- [ ] **THREAT_MODEL.md** — assets, trust boundaries, modeled attackers, in-scope / out-of-scope, current mitigations (ANY-block RFC 8482, per-IP rate limit, ACL, DNS-rebinding guard, systemd hardening) and known limits.
-- [ ] Clarify the 128k (3-server comparative ceiling) vs 195k (Runbound cache-warm) figures so they are not read as contradictory.
+- [x] **SECURITY.md** — supported versions, crypto (rustls, TLS 1.2/1.3), HMAC audit log, CVE contact + disclosure SLA.
+- [x] **THREAT_MODEL.md** — assets, trust boundaries, modeled attackers, in-scope / out-of-scope, current mitigations (ANY-block RFC 8482, per-IP rate limit, ACL, DNS-rebinding guard, systemd hardening) and known limits.
+- [x] Clarify the 128k (3-server comparative ceiling) vs 195k (Runbound cache-warm) figures so they are not read as contradictory.
 - [ ] Document the AGPL §13 vs commercial-license boundary for integrators.
 - [ ] Document an offline/air-gap mode (internal PKI instead of ACME, offline blocklist updates).
 
