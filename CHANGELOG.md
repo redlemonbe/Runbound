@@ -9,6 +9,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.11.1] — 2026-06-06
+
+### Added
+
+- **WebUI latency shows min / average / max** instead of p50/p95/p99. Percentiles are dominated by upstream and DNS-path variance, so they were misleading on the dashboard; min/avg/max are the honest, readable signal. The backend now tracks exact min/avg/max in `record_latency_us`; Prometheus `/metrics` keeps the percentiles for compatibility.
+- **Default-password prompt on connect** (#webui): a new authenticated endpoint `GET /api/webui/password-status` reports whether the WebUI still uses the default `admin`/`admin` credentials (argon2-verified). The dashboard shows a one-time modal nudging the operator to change them, with a shortcut to the change-password form. No-op once the password has been changed.
+
+### Fixed
+
+- **Cluster node aggregation for rates**: `cache_hit_rate` and `blocked_percent` used a flat mean across nodes, so a node at 0%% and one at 100%% displayed 50%%. They are now weighted by resolution volume (`total`) — idle nodes (`total=0`) are excluded and a busier node counts proportionally; for a rate this equals `Σhits / Σtotal`. Cluster latency is min/max over active nodes with a volume-weighted average.
+
+---
+
 ## [0.11.0] — 2026-06-06
 
 ### Added
