@@ -281,7 +281,7 @@
       <div class="card"><div class="text-xs text-gray-600 mb-1">Blocked</div><div id="ov-blocked" class="text-2xl text-red-400 tabular-nums">—</div><div id="ov-blocked-pct" class="text-xs text-gray-700 mt-0.5"></div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">Forwarded</div><div id="ov-forwarded" class="text-2xl tabular-nums">—</div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">SERVFAIL</div><div id="ov-servfail" class="text-2xl text-yellow-500 tabular-nums">—</div></div>
-      <div class="card"><div class="text-xs text-gray-600 mb-1">Latency p50</div><div id="ov-latency" class="text-2xl tabular-nums">—</div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">Latency avg</div><div id="ov-latency" class="text-2xl tabular-nums">—</div></div>
       <div id="ov-nodes-tile" class="card hidden"><div class="text-xs text-gray-600 mb-1">Nodes</div><div id="ov-nodes-count" class="text-2xl text-cyan-400 tabular-nums">—</div><div id="ov-nodes-detail" class="text-xs text-gray-700 mt-0.5"></div></div>
       <div id="ov-uptime-tile" class="card"><div class="text-xs text-gray-600 mb-1">Uptime</div><div id="ov-uptime" class="text-2xl">—</div></div>
     </div>
@@ -289,9 +289,9 @@
       <div class="card">
         <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Latency</div>
         <div class="space-y-2 text-sm">
-          <div class="flex justify-between"><span class="text-gray-500">p50</span><span id="ov-p50" class="text-green-400 tabular-nums">—</span></div>
-          <div class="flex justify-between"><span class="text-gray-500">p95</span><span id="ov-p95" class="text-yellow-500 tabular-nums">—</span></div>
-          <div class="flex justify-between"><span class="text-gray-500">p99</span><span id="ov-p99" class="text-red-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">min</span><span id="ov-lmin" class="text-green-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">average</span><span id="ov-lavg" class="text-cyan-400 tabular-nums">—</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">max</span><span id="ov-lmax" class="text-red-400 tabular-nums">—</span></div>
         </div>
       </div>
       <div class="card">
@@ -966,15 +966,20 @@ function aggregateStats() {
   if (!ns.length) return null;
   const sum = k => ns.reduce((a,n)=>(a+(n.stats[k]??0)),0);
   const avg = k => { const v=ns.filter(n=>n.stats[k]!=null); return v.length?v.reduce((a,n)=>a+(n.stats[k]??0),0)/v.length:null; };
+  // Weighted by resolution volume (total). Excludes idle nodes (total=0). For a
+  // rate this equals sum(hits)/sum(total) — never the flat mean of two nodes.
+  const wavg = k => { const v=ns.filter(n=>n.stats[k]!=null && (n.stats.total??0)>0); const w=v.reduce((a,n)=>a+(n.stats.total??0),0); return w?v.reduce((a,n)=>a+(n.stats[k]??0)*(n.stats.total??0),0)/w:null; };
+  const actMin = ns.filter(n=>(n.stats.total??0)>0 && n.stats.latency_min_ms!=null).map(n=>n.stats.latency_min_ms);
+  const actMax = ns.filter(n=>(n.stats.total??0)>0 && n.stats.latency_max_ms!=null).map(n=>n.stats.latency_max_ms);
   const s0 = ns[0].stats;
   return {
     total: sum('total'), blocked: sum('blocked'), forwarded: sum('forwarded'),
     servfail: sum('servfail'), cache_entries: sum('cache_entries'),
     local_hits: sum('local_hits'), nxdomain: sum('nxdomain'), refused: sum('refused'),
     qps_1m: sum('qps_1m'), qps_5m: sum('qps_5m'), qps_peak: sum('qps_peak'),
-    latency_p50_ms: avg('latency_p50_ms'), latency_p95_ms: avg('latency_p95_ms'), latency_p99_ms: avg('latency_p99_ms'),
-    cache_hit_rate: avg('cache_hit_rate'),
-    blocked_percent: avg('blocked_percent'),
+    latency_min_ms: actMin.length?Math.min(...actMin):null, latency_avg_ms: wavg('latency_avg_ms'), latency_max_ms: actMax.length?Math.max(...actMax):null,
+    cache_hit_rate: wavg('cache_hit_rate'),
+    blocked_percent: wavg('blocked_percent'),
     uptime_secs: Math.max(...ns.map(n=>n.stats.uptime_secs??0)),
     xdp_cache_hits: sum('xdp_cache_hits'),
     upstreams_healthy: sum('upstreams_healthy'), upstreams_total: sum('upstreams_total'),
@@ -1071,8 +1076,8 @@ function renderStats(s) {
   const sec  = n => { if(n==null)return'—'; const d=Math.floor(n/86400),hh=Math.floor((n%86400)/3600),m=Math.floor((n%3600)/60); return d?`${d}d ${hh}h`:hh?`${hh}h ${m}m`:`${m}m`; };
   set('ov-qps',fmtf(s.qps_1m)); set('ov-total',fmt(s.total)); set('ov-cache',pct(s.cache_hit_rate));
   set('ov-blocked',fmt(s.blocked)); set('ov-blocked-pct',s.blocked_percent!=null?fmtf(s.blocked_percent)+'% of total':'');
-  set('ov-forwarded',fmt(s.forwarded)); set('ov-servfail',fmt(s.servfail)); set('ov-latency',ms(s.latency_p50_ms)); set('ov-uptime',sec(s.uptime_secs));
-  set('ov-p50',ms(s.latency_p50_ms)); set('ov-p95',ms(s.latency_p95_ms)); set('ov-p99',ms(s.latency_p99_ms));
+  set('ov-forwarded',fmt(s.forwarded)); set('ov-servfail',fmt(s.servfail)); set('ov-latency',ms(s.latency_avg_ms)); set('ov-uptime',sec(s.uptime_secs));
+  set('ov-lmin',ms(s.latency_min_ms)); set('ov-lavg',ms(s.latency_avg_ms)); set('ov-lmax',ms(s.latency_max_ms));
   set('ov-qps1m',fmtf(s.qps_1m)+' /s'); set('ov-qps5m',fmtf(s.qps_5m)+' /s'); set('ov-qpspeak',fmt(s.qps_peak)+' /s');
   set('ov-nxdomain',fmt(s.nxdomain)); set('ov-refused',fmt(s.refused)); set('ov-local',fmt(s.local_hits));
   set('ov-cache-entries',fmt(s.cache_entries)); set('ov-cache-rate',pct(s.cache_hit_rate));
