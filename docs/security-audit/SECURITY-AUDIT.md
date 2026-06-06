@@ -19,7 +19,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [D](#audit-status--v0944) | v0.9.43–v0.9.44 | — | — | **Pending** |
 | [E](#cycle-e--v0946v0948-asm-hotpath--webui) | v0.9.46–v0.9.48 | 2026-05-26 | AI-INTERNAL | 0 open (2 fixed, 3 accepted, 2 info) |
 | [F](#cycle-f--v0120-sovereigntydefense) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
-| [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) | 1 open (1 fixed, 3 disputed) |
+| [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
 
 ---
 
@@ -705,7 +705,7 @@ Remediation items are the OPEN-F findings listed above. Verdict: real XDP perfor
 ## Cycle G — v0.15.0 (Two-AI competitive audit)
 
 **Date:** 2026-06-06
-**Sources:** `[AI-INTERNAL]` Claude (Opus 4.8) · `[AI-ADVERSARIAL]` Qwen3-Coder-30B (local, on-GPU; no cloud — private repo never left the LAN)
+**Sources:** `[AI-INTERNAL]` Claude (Opus 4.8) · `[AI-ADVERSARIAL]` Qwen3-Coder-30B (local, on-GPU; no cloud — private repo never left the LAN) · `[AI-ADVERSARIAL]` Gemini 2.5 Pro (cloud, maintainer-authorised; critical files only)
 **Method:** Independent passes (each model audited the source without seeing the other's output) followed by an adversarial cross-refutation round. Auditor #2 (Qwen) swept all 52 source files; Auditor #1 (Claude) reviewed the security-critical paths and then adjudicated every Auditor-#2 finding against the code and the BPF-verifier guarantees.
 
 ### Method outcome (recorded for honesty)
@@ -746,3 +746,20 @@ Auditor #2 rated the `NoCertVerifier` a HIGH MITM risk. Adjudication: it is **no
 ### Cycle G summary
 
 5 genuine findings, all LOW/INFO: **1 Fixed** (SEC-G1), **3 Disputed** (SEC-G3/G4/G5), **1 Open** (SEC-G2). **No Accepted** — residual items are either disputed as non-vulnerabilities or tracked Open for hardening. No CRITICAL/HIGH/MEDIUM confirmed. ~10 representative Auditor-#2 CRITICAL/HIGH findings explicitly **Disputed** as false positives. No active vulnerability identified in this cycle.
+
+### Third auditor — Gemini 2.5 Pro (added)
+
+A third independent adversarial pass was run with **`[AI-ADVERSARIAL]` Gemini 2.5 Pro** (cloud, maintainer-authorised, **critical files only** to bound exposure of the private repo). It was markedly more precise than Auditor #2: **18 findings** (1 CRITICAL, 5 HIGH, 8 MEDIUM, 4 LOW), **zero false eBPF bounds findings** (it was told the BPF verifier statically proves packet bounds). It **independently corroborated SEC-G2** (relay TLS, rated CRITICAL), strengthening the case to close the TOFU bootstrap window. It surfaced three items the other passes missed:
+
+| ID | Severity | Location | Finding | Status |
+|----|----------|----------|---------|--------|
+| SEC-G6 | LOW | `src/dns/xdp/wire_builder.rs` (fast path) | A TSIG-signed A/AAAA query is answered by the wire fast path without TSIG validation. | **Disputed** — Runbound authorises queries by source-IP ACL, not TSIG (TSIG gates AXFR/updates, handled off the fast path); answering a public A record while ignoring an attached TSIG grants nothing beyond the ACL. Defensive note: fall back to hickory when a non-OPT additional record (e.g. TSIG, type 250) is present. |
+| SEC-G7 | LOW | `src/sync.rs:306` (`record_slave`) | `connected_slaves` map has no eviction → slow unbounded growth. | **Open** — HMAC-gated (only authenticated slaves; keyed by IP, so bounded by distinct slave IPs) and the live view already filters to last-seen ≤ 5 min, but the backing map is never pruned. Harden: drop entries older than the window. |
+| SEC-G8 | MEDIUM | `src/api/mod.rs` (`backup_import_handler`) | `std::fs::write(tmp, …)` follows a symlink pre-planted at the predictable tmp path → arbitrary file overwrite (precondition: write access to the service data dir + admin-authenticated import). | **Fixed** — tmp is now opened with `create_new` (`O_CREAT\|O_EXCL`); a planted symlink makes the write fail instead of being followed. Verified by build + manual review. |
+
+The `axfr` "unbounded allocation" (raised by Auditors #2 and #3) remains **Disputed**: the buffered data is the server's own operator-loaded zone, and AXFR is gated by the `axfr-allow` CIDR list — not attacker-controlled in size.
+
+### Cycle G final tally (three models)
+
+8 genuine findings: **2 Fixed** (SEC-G1, SEC-G8), **4 Disputed** (G3, G4, G5, G6), **2 Open** (G2, G7). **No Accepted** (per maintainer convention: residuals are tracked Open or disputed as non-vulnerabilities, never "accepted"). No CRITICAL/HIGH stands after adjudication — the single CRITICAL (relay TLS) is the documented TOFU bootstrap window, tracked **Open** (SEC-G2). Recall vs precision: Qwen 181 raw → ~5 genuine; Gemini 18 raw → 3 net-new genuine; Claude adjudicated all and confirmed the critical-path defenses (constant-time key/HMAC compares, TOFU pinning, path-traversal guards, fast-path rate-limit + ACL, 4096 inflight cap).
+
