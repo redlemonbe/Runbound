@@ -184,3 +184,10 @@ The full policy is in [`deny.toml`](../deny.toml) at the repository root:
 - **`[licenses]`** — enforces the permit list above; exempts `runbound` itself (AGPL-3.0-or-later)
 - **`[bans]`** — warns on multiple major versions of the same crate; bans wildcard version specs; skip-list for known transitive duplicates (rand/getrandom ecosystem, windows-sys, rcgen)
 - **`[sources]`** — restricts to crates.io only; blocks unknown registries and git sources
+
+## SBOM
+
+A **CycloneDX SBOM** (`sbom.cdx.json`, all crates + versions) is generated in CI by
+`cargo-cyclonedx` and attached to every GitHub release alongside the binaries and
+`SHA256SUMS`. It is not committed to the repository (it would go stale); fetch it
+from the release matching your binary.
