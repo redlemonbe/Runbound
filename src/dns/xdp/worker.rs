@@ -1029,6 +1029,11 @@ fn xdp_worker(
                         });
                     }
                     None => {
+                        // Cache miss / not served by XDP — count per-worker (rate computed in Rust, off hot path)
+                        if worker_id < crate::dns::cache_snapshot::XDP_WORKER_MISS.len() {
+                            crate::dns::cache_snapshot::XDP_WORKER_MISS[worker_id]
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         sock.umem.tx_free.push_back(tx_addr);
                     }
                 }
