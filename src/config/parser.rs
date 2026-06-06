@@ -354,6 +354,10 @@ pub struct UnboundConfig {
     // ── Webhooks (#11) ────────────────────────────────────────────────────────
     /// List of webhook targets for system event notifications.
     pub webhooks: Vec<crate::webhooks::WebhookTarget>,
+    /// Verbatim lines the writer does NOT regenerate (Unbound tuning knobs
+    /// accepted-but-unused + unknown directives), as (section, line). Re-emitted
+    /// on full config regeneration so nothing is silently dropped.
+    pub raw_passthrough: Vec<(String, String)>,
 }
 
 
@@ -495,6 +499,13 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
         // Do NOT strip quotes globally — directives like local-zone have complex quoted values.
         // Each handler strips its own quotes where needed.
         let val = val.trim();
+
+        // Capture directives the writer does not regenerate (accepted-but-unused
+        // tuning knobs + unknown lines) so full config regeneration never drops them.
+        if !crate::config::writer::is_managed_directive(&current_section, key) {
+            cfg.raw_passthrough.push((current_section.clone(), line.to_string()));
+            continue;
+        }
 
         match current_section.as_str() {
             "server" => parse_server_directive(&mut cfg, key, val, lineno + 1)?,
