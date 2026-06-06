@@ -570,6 +570,15 @@
       </div>
       <div id="sys-slaves-list" class="text-sm text-gray-600 italic">—</div>
     </div>
+    <div class="card max-w-4xl mx-auto mb-3">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Full backup / restore</div>
+      <p class="text-xs text-gray-700 mb-3">Export the complete state (config + DNS entries + blacklist + feeds + upstreams + users + keys/certs) as one file. Restoring requires a service restart to apply. <span class="text-yellow-500">The backup contains secrets — store it securely.</span></p>
+      <div class="flex gap-2 flex-wrap items-center">
+        <button onclick="backupExport()" class="btn-primary text-xs">⤓ Download full backup</button>
+        <label class="btn-secondary text-xs cursor-pointer">⤒ Restore from file<input id="backup-file" type="file" accept="application/json,.json" style="display:none" onchange="backupImport(this)"/></label>
+      </div>
+      <div id="backup-msg" class="text-xs text-gray-600 mt-2"></div>
+    </div>
   </div>
 
   <!-- ═══ PROTECTION ═══ -->
@@ -1440,6 +1449,27 @@ async function loadSlaves(){
     }).join('')+'</div>';
     set('sys-refreshed','updated '+new Date().toLocaleTimeString());
   }catch(_){if(el)el.innerHTML='<span class="text-gray-700 italic">Slave info unavailable.</span>';}
+}
+async function backupExport(){
+  try{
+    const r=await fetch('/api/backup/export',{credentials:'same-origin'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const blob=await r.blob();const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='runbound-backup-'+new Date().toISOString().slice(0,10)+'.json';
+    document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+    toast('Full backup downloaded');
+  }catch(e){toast('Backup failed: '+e.message,true);}
+}
+async function backupImport(input){
+  const f=input.files&&input.files[0];if(!f){return;}
+  if(!confirm('Restore from "'+f.name+'"? This overwrites the current config and state. A service restart is required to apply.')){input.value='';return;}
+  try{
+    const data=JSON.parse(await f.text());
+    const r=await api('POST','/backup/import',data);
+    document.getElementById('backup-msg').textContent='Restored '+(r.restored??0)+' files — restart the service to apply.';
+    toast('Restored — restart required');
+  }catch(e){toast('Restore failed: '+e.message,true);}
+  input.value='';
 }
 async function cacheFlush(){const btn=document.getElementById('btn-flush');try{const r=await api('POST','/cache/flush');toast(`Cache flushed — ${r.flushed_entries??0} entries cleared`);if(btn){btn.disabled=true;btn.classList.add('opacity-30','cursor-not-allowed');setTimeout(()=>{btn.disabled=false;btn.classList.remove('opacity-30','cursor-not-allowed');},60000);}loadSystem();}catch(e){toast(e.message.includes('FLUSH_COOLDOWN')||e.message.includes('429')?'Cache flush on cooldown (60 s)':'Flush failed: '+e.message,true);}}
 async function doReload(){try{await api('POST','/reload');toast('Config reloaded');}catch(e){toast('Reload: '+e.message,true);}}

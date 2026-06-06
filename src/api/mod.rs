@@ -689,6 +689,8 @@ pub fn router(state: AppState) -> Router {
         // Backup & restore
         .route("/backup", get(list_backups_handler).post(backup_handler))
         .route("/backup/restore", post(restore_handler))
+        .route("/backup/export", get(backup_export_handler))
+        .route("/backup/import", post(backup_import_handler))
         .route("/backup/:id", delete(delete_backup_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -4164,7 +4166,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -4203,7 +4205,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -4236,7 +4238,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -4265,7 +4267,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     // Deliberately omit Content-Length
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -4313,7 +4315,7 @@ mod tests {
                     .uri("/api/upstreams")
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -4334,7 +4336,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -4355,7 +4357,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -4377,7 +4379,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -5373,7 +5375,7 @@ mod tests {
                     .uri("/api/upstreams/some-id")
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -5752,7 +5754,7 @@ mod tests {
                     .header(k, &v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -5804,7 +5806,7 @@ mod tests {
                     .header(k, &v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -5829,7 +5831,7 @@ mod tests {
                     .header(k, &v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -6063,7 +6065,7 @@ mod tests {
                     .uri("/api/dns/lookup")
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -6084,7 +6086,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -6107,7 +6109,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -6136,7 +6138,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -6160,7 +6162,7 @@ mod tests {
                     .header(k, v)
                     .header("Content-Type", "application/json")
                     .header("Content-Length", body.len().to_string())
-                    .body(Body::from(body))
+                    .body(axum::body::Body::from(body))
                     .unwrap(),
             )
             .await
@@ -6415,6 +6417,90 @@ async fn delete_blocked_ip(
 
 fn runbound_backup_dir(s: &AppState) -> std::path::PathBuf {
     s.base_dir.join("backups")
+}
+
+/// Files included in a full backup, relative to base_dir. The main config
+/// (runbound.conf) is handled separately via cfg_path. Excludes regenerable or
+/// huge artifacts (backups/, feed_cache/, audit.log) and stale *.bak-* copies.
+const BACKUP_STATE_FILES: &[&str] = &[
+    "dns_entries.json", "dns_entries.mac",
+    "blacklist.json", "blacklist.mac",
+    "feeds.json", "feeds.mac",
+    "upstreams.json", "upstreams.mac",
+    "alert-blocks.json", "icmp.json", "slaves.json",
+    "api.key", "webui-auth.conf",
+    "sync-cert.pem", "sync-key.pem", "sync-master.fingerprint",
+    "webui-ca-cert.pem", "webui-ca-key.pem",
+];
+
+/// GET /api/backup/export — full backup (admin). Returns a JSON document with the
+/// config and every state/secret file, base64-encoded, as a downloadable attachment.
+/// NOTE: contains secrets (API key, sync key, WebUI auth, private keys) — store securely.
+async fn backup_export_handler(State(s): State<AppState>) -> Response {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut files = serde_json::Map::new();
+    if let Ok(c) = std::fs::read(&s.cfg_path) {
+        files.insert("runbound.conf".into(), serde_json::Value::String(b64.encode(c)));
+    }
+    for f in BACKUP_STATE_FILES {
+        if let Ok(c) = std::fs::read(s.base_dir.join(f)) {
+            files.insert((*f).into(), serde_json::Value::String(b64.encode(c)));
+        }
+    }
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let body = serde_json::json!({
+        "format": "runbound-backup-v1",
+        "version": env!("CARGO_PKG_VERSION"),
+        "created": ts,
+        "files": files,
+    }).to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"runbound-backup.json\"")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response())
+}
+
+/// POST /api/backup/import — restore a full backup (admin; slave read-only). Writes
+/// each whitelisted file atomically (tmp + rename). Restart the service to apply.
+async fn backup_import_handler(
+    State(s): State<AppState>,
+    axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use base64::Engine as _;
+    if s.slave_mode {
+        return (StatusCode::SERVICE_UNAVAILABLE, JsonExtract(serde_json::json!({"error":"SLAVE_READONLY"})));
+    }
+    if body.get("format").and_then(|v| v.as_str()) != Some("runbound-backup-v1") {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_FORMAT","details":"expected runbound-backup-v1"})));
+    }
+    let files = match body.get("files").and_then(|v| v.as_object()) {
+        Some(f) => f,
+        None => return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"NO_FILES"}))),
+    };
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut restored = 0u32;
+    for (name, val) in files {
+        // Security: only whitelisted names, never a path component.
+        let allowed = name == "runbound.conf" || BACKUP_STATE_FILES.contains(&name.as_str());
+        if !allowed || name.contains('/') || name.contains('\\') || name.contains("..") { continue; }
+        let data = match val.as_str().and_then(|t| b64.decode(t).ok()) { Some(d) => d, None => continue };
+        let dest: std::path::PathBuf = if name == "runbound.conf" {
+            std::path::PathBuf::from(&s.cfg_path)
+        } else {
+            s.base_dir.join(name)
+        };
+        let tmp = dest.with_extension("restore-tmp");
+        if std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, &dest).is_ok() {
+            restored += 1;
+        }
+    }
+    s.audit.send(AuditEvent::ConfigReload);
+    info!(restored, "full backup restored via API");
+    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","restored":restored,"note":"restart the service to apply the restored configuration"})))
 }
 
 async fn backup_handler(
