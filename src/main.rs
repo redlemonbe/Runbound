@@ -879,10 +879,23 @@ async fn build_and_launch(
 
     // ── Upstream health monitor ────────────────────────────────────────────
     let upstreams = upstreams::init_upstreams(cfg);
-    // FIX #43: merge any upstreams persisted via the API (API entry wins on duplicate)
+    // #webui: runbound.conf is now the single source of truth for upstreams.
+    // One-shot migration: if a legacy upstreams.json (API-added upstreams) exists,
+    // merge it into the live set, regenerate the config so those upstreams survive,
+    // then archive the store. Afterwards the file is authoritative and manual edits
+    // to the forward-zone take effect on restart.
     {
-        let saved = upstreams::load_upstreams(&base_dir);
-        upstreams::merge_persisted(&upstreams, saved);
+        let store = base_dir.join("upstreams.json");
+        if store.exists() {
+            let saved = upstreams::load_upstreams(&base_dir);
+            upstreams::merge_persisted(&upstreams, saved);
+            let mut c = cfg.clone();
+            c.forward_zones = upstreams::rebuild_forward_zones(&upstreams);
+            if crate::config::writer::write_config_atomic(&c, std::path::Path::new(&cfg_path)).is_ok() {
+                let _ = std::fs::rename(&store, base_dir.join("upstreams.json.migrated"));
+                tracing::info!(path = %cfg_path, "migrated upstreams.json into the config — file is now the source of truth");
+            }
+        }
     }
     {
         let ups = Arc::clone(&upstreams);
