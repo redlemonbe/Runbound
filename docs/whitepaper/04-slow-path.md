@@ -1,31 +1,54 @@
 # 04 — The slow path (hickory-server)
 
-> **Status: draft outline.** Chapters 01–03 are written against the source line-by-line.
-> This chapter states what is structurally true today; the line-level detail will be
-> filled in from `src/dns/server.rs` (≈3000 lines) and `src/upstreams.rs`. Anything not
-> yet verified against the code is marked **"to verify."**
+The slow path is a full [hickory](https://github.com/hickory-dns/hickory-dns) stack
+(`hickory-server`/`-resolver`/`-proto` 0.26) in `src/dns/server.rs`. It handles everything
+the fast paths decline. Its per-request pipeline (`src/dns/server.rs:5`):
 
-The slow path is a full [hickory-server](https://github.com/hickory-dns/hickory-dns)
-(`hickory-server`/`-resolver`/`-proto` 0.26). It handles everything the fast paths
-deliberately decline:
+1. **ACL check** per source IP (from `unbound.conf`) — `src/dns/acl.rs`.
+2. **Rate limit** per source IP, token bucket, default 200 qps (`RATE_LIMIT_QPS_DEFAULT`,
+   `src/dns/server.rs`).
+3. **Local zones** (local-data, blacklist, feeds) in memory → instant answer.
+4. Otherwise → **recursive resolver** (hickory-resolver), UDP+TCP on the configured port.
 
-- **Recursion / forwarding** — cache miss resolved upstream. Upstream racing
-  (`upstream-racing: yes`) queries multiple upstreams in parallel and takes the first
-  answer (`src/upstreams.rs`, to verify).
-- **TCP, DoT (853), DoH, DoQ** — TLS via `rustls` 0.23 (tls12+tls13). `XDP_PASS` ensures
-  these reach the kernel and hence hickory.
-- **DNSSEC validation** — DO-bit queries are routed here (the wire path returns
-  `Fallback`).
-- **Complex record types** — CNAME, MX, TXT, NS, SOA, SRV, CAA, TSIG, AXFR.
-- **serve-stale** (#108) — serve expired cache entries when upstreams are unreachable,
-  per the stale cache in `server.rs` (to verify the exact TTL policy).
-- **resolv.conf emergency fallback** (#94).
+## 4.1 Backpressure against flood — a hard inflight cap
 
-The slow path is demoted to a fallback by Tiers 1–2 (chapter 01). The instruction-count
-motivation (1.78× vs Unbound on the naïve path) is in §1.2.
+hickory-server spawns one Tokio task per incoming request **with no backpressure**; under
+a flood this exhausts RAM. Runbound bounds it with a semaphore of `MAX_INFLIGHT_REQUESTS =
+4096` (`src/dns/server.rs:62`). A **non-blocking** `try_acquire` returns `REFUSED`
+instantly without allocating, so the bound holds even at line rate. This is a deliberate
+availability trade-off: shed load rather than OOM.
 
-## To expand
-- Exact dispatch from `FallbackMsg` to the hickory handler.
-- Negative caching (RFC 2308) state machine — see #166: NXDOMAIN cached vs SERVFAIL
-  transient (must NOT be cached long, false-negative trap).
-- Upstream selection, health, and DoT reconnect logic.
+## 4.2 Recursion, racing, and the hard timeout
+
+- **Upstream racing** (`upstream-racing: yes`): the resolver issues queries to multiple
+  upstreams in parallel and takes the first success via `futures_util::future::select_ok`
+  (`src/dns/server.rs`).
+- **Hard lookup timeout** (#83): resolver lookups are wrapped in a hard timeout to prevent
+  a stuck upstream from pinning a task/Tokio worker indefinitely (a deadlock root cause
+  that was measured and fixed).
+- **TLS** via `rustls` 0.23 (TLS 1.2 + 1.3) for DoT/DoH/DoQ.
+- **TSIG** supported (`hickory_proto::rr::rdata::tsig`).
+
+## 4.3 Upstream health monitoring
+
+`src/upstreams.rs` probes upstreams every 30 s (2 s timeout):
+
+- **UDP upstreams**: a 28-byte DNS probe for `. IN A` carrying an EDNS0 OPT RR with the
+  **DO bit set** (`DNS_PROBE_PACKET`, `src/upstreams.rs:39`). The reply confirms liveness
+  and the **AD bit** reveals whether the upstream does DNSSEC validation.
+- **DoT upstreams**: a TCP+TLS connect+handshake (no DNS query needed).
+- **Backoff** on failure: 30 → 60 → 120 → 300 s cap, so a dead upstream does not spam
+  logs; recovery resets the backoff and logs an INFO line.
+
+## 4.4 Caching hand-off
+
+A cache hit on the slow path is currently inferred from latency: a lookup under
+`CACHE_HIT_THRESHOLD_US` counts as a hit (`src/dns/server.rs`, `crate::stats`). This is why
+the master node's hit-rate metric is meaningful only with `xdp: no`. The authoritative XDP
+cache accounting uses dedicated counters (chapter 05).
+
+## To expand (verify against code)
+- Negative caching state machine (RFC 2308, #166): NXDOMAIN cached vs SERVFAIL treated as
+  transient (must not be cached long — false-negative trap).
+- serve-stale (#108) exact TTL policy.
+- resolv.conf emergency fallback (#94).
