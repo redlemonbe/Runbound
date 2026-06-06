@@ -11,6 +11,15 @@
   burst tokens) and a userspace flood detector that bans source IPs via a BPF map
   (`ebpf/dns_xdp.c`).
 - **Firewall integration.** `src/firewall/` manages backend rules automatically.
+- **Availability under flood.** A hard inflight cap (`MAX_INFLIGHT_REQUESTS = 4096`,
+  non-blocking semaphore → instant `REFUSED`, `src/dns/server.rs:62`) bounds memory even at
+  line rate, because hickory spawns one task per request with no backpressure. Per-source-IP
+  token-bucket rate limiting (default 200 qps) sits in front.
+- **Relay trust model (honest).** Relay auth = HMAC-SHA256 (timestamped, anti-replay ±30 s);
+  TLS provides confidentiality but the client verifier does **not** validate the cert chain
+  (`NoCertVerifier`, `src/api/relay.rs:35`) — identity is TOFU fingerprint pinning. Trust
+  rests on the HMAC key + fingerprint, not a CA. A reviewer must confirm the TOFU
+  enforcement point.
 - **Supply-chain integrity (#171, #172).**
   - **Reproducible build** — `docs/BUILD.md`: pinned toolchain + `Cargo.lock`; `SHA256SUMS`
     published per release.
