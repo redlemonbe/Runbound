@@ -85,6 +85,12 @@ pub struct Stats {
 
     // Latency histogram — fixed 10 buckets, zero alloc per query
     pub lat_hist: Vec<AtomicU64>,
+    // Exact min/avg/max latency (#webui: percentiles are upstream/path-dependent
+    // and meaningless here — show min/average/max instead).
+    pub lat_min_us: AtomicU64,
+    pub lat_max_us: AtomicU64,
+    pub lat_sum_us: AtomicU64,
+    pub lat_count: AtomicU64,
 
     // QPS ring buffer — 300 one-second slots
     pub qps_ring: Vec<AtomicU64>,
@@ -135,6 +141,10 @@ impl Stats {
             servfail: AtomicU64::new(0),
             started_at: Instant::now(),
             lat_hist: (0..HIST_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+            lat_min_us: AtomicU64::new(u64::MAX),
+            lat_max_us: AtomicU64::new(0),
+            lat_sum_us: AtomicU64::new(0),
+            lat_count: AtomicU64::new(0),
             qps_ring: (0..QPS_RING_SIZE).map(|_| AtomicU64::new(0)).collect(),
             qps_head: CachePadded(AtomicU64::new(0)),
             qps_peak: CachePadded(AtomicU64::new(0)),
@@ -228,6 +238,10 @@ impl Stats {
         // i.e. the first bucket whose upper bound is ≥ the measured latency.
         let bucket = HIST_BOUNDS_US.partition_point(|&b| us > b);
         self.lat_hist[bucket].fetch_add(1, Ordering::Relaxed);
+        self.lat_min_us.fetch_min(us, Ordering::Relaxed);
+        self.lat_max_us.fetch_max(us, Ordering::Relaxed);
+        self.lat_sum_us.fetch_add(us, Ordering::Relaxed);
+        self.lat_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a completed forwarded lookup and update cache metrics.
@@ -343,6 +357,9 @@ impl Stats {
             latency_p50_ms: self.percentile_ms(50.0),
             latency_p95_ms: self.percentile_ms(95.0),
             latency_p99_ms: self.percentile_ms(99.0),
+            latency_min_ms: { let c = self.lat_count.load(Ordering::Relaxed); if c > 0 { self.lat_min_us.load(Ordering::Relaxed) as f64 / 1000.0 } else { 0.0 } },
+            latency_avg_ms: { let c = self.lat_count.load(Ordering::Relaxed); if c > 0 { self.lat_sum_us.load(Ordering::Relaxed) as f64 / c as f64 / 1000.0 } else { 0.0 } },
+            latency_max_ms: { let c = self.lat_count.load(Ordering::Relaxed); if c > 0 { self.lat_max_us.load(Ordering::Relaxed) as f64 / 1000.0 } else { 0.0 } },
             cache_hit_rate,
             cache_entries: self.cache_entries.load(Ordering::Relaxed),
             local_hits: self.local_hits.load(Ordering::Relaxed),
@@ -390,6 +407,9 @@ pub struct StatsSnapshot {
     pub latency_p50_ms: f64,
     pub latency_p95_ms: f64,
     pub latency_p99_ms: f64,
+    pub latency_min_ms: f64,
+    pub latency_avg_ms: f64,
+    pub latency_max_ms: f64,
     pub cache_hit_rate: f64,
     pub cache_entries: u64,
     pub local_hits: u64,
@@ -423,6 +443,9 @@ pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
         "latency_p50_ms":   snap.latency_p50_ms,
         "latency_p95_ms":   snap.latency_p95_ms,
         "latency_p99_ms":   snap.latency_p99_ms,
+        "latency_min_ms":   snap.latency_min_ms,
+        "latency_avg_ms":   snap.latency_avg_ms,
+        "latency_max_ms":   snap.latency_max_ms,
         "cache_hit_rate":   snap.cache_hit_rate,
         "cache_entries":    snap.cache_entries,
         "dnssec": {
