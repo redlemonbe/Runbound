@@ -268,9 +268,13 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
     @keyframes glow-pulse{{0%,100%{{opacity:.6}}50%{{opacity:1}}}}
     @keyframes fade-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
     @keyframes blink{{0%,100%{{opacity:1}}50%{{opacity:0}}}}
-    body{color:#e2e8f0;font-family:'SF Mono','Fira Code','Consolas',monospace;background-color:#060b14;background-image:radial-gradient(circle at 1px 1px,rgba(34,211,238,.055) 1px,transparent 0);background-size:30px 30px;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;overflow:hidden;position:relative}
-    body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 150% 65% at 50% -20%,rgba(14,102,128,.28) 0%,transparent 62%);pointer-events:none;animation:glow-pulse 6s ease-in-out infinite}
-    body::after{content:'';position:fixed;bottom:-20%;left:50%;transform:translateX(-50%);width:60%;height:40%;background:radial-gradient(ellipse at center,rgba(14,102,128,.08) 0%,transparent 70%);pointer-events:none;animation:glow-pulse 8s ease-in-out infinite reverse}
+    body{color:#e2e8f0;font-family:'SF Mono','Fira Code','Consolas',monospace;background:radial-gradient(ellipse at 20% 50%,rgba(56,189,248,.07) 0%,transparent 50%),radial-gradient(ellipse at 80% 20%,rgba(167,139,250,.07) 0%,transparent 50%),#080d1c;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;overflow:hidden;position:relative}
+    .bg-orbs{position:fixed;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+    .orb{position:absolute;border-radius:50%;pointer-events:none;will-change:transform}
+    .orb-1{width:700px;height:700px;background:radial-gradient(circle,rgba(56,189,248,.18) 0%,transparent 70%);top:-250px;left:-200px;animation:floatOrb 28s ease-in-out infinite;filter:blur(1px)}
+    .orb-2{width:600px;height:600px;background:radial-gradient(circle,rgba(167,139,250,.15) 0%,transparent 70%);bottom:-200px;right:-150px;animation:floatOrb 22s ease-in-out infinite reverse;filter:blur(1px)}
+    .orb-3{width:400px;height:400px;background:radial-gradient(circle,rgba(52,211,153,.1) 0%,transparent 70%);top:60%;left:55%;animation:floatOrb 35s ease-in-out infinite;filter:blur(2px);opacity:.6}
+    @keyframes floatOrb{0%,100%{transform:translate(0,0) scale(1)}25%{transform:translate(40px,-30px) scale(1.05)}50%{transform:translate(-20px,25px) scale(.97)}75%{transform:translate(15px,35px) scale(1.03)}}
     .card{position:relative;z-index:1;background:rgba(6,11,20,.94);backdrop-filter:blur(14px);border:1px solid rgba(34,211,238,.1);border-top:1px solid rgba(34,211,238,.28);border-radius:12px;padding:38px;width:100%;max-width:380px;box-sizing:border-box;margin:0 16px;box-shadow:0 32px 64px rgba(0,0,0,.65),0 0 0 1px rgba(34,211,238,.03);animation:fade-in .35s ease-out}
     .logo{color:#22d3ee;font-size:20px;font-weight:700;letter-spacing:.14em;display:inline-block}
     .cursor{display:inline-block;color:#22d3ee;animation:blink 1.1s step-end infinite;margin-left:1px}
@@ -283,6 +287,7 @@ const LOGIN_HTML: &str = r#"<!DOCTYPE html>
   </style>
 </head>
 <body>
+  <div class="bg-orbs"><div class="orb orb-1"></div><div class="orb orb-2"></div><div class="orb orb-3"></div></div>
   <div class="card">
     <div style="text-align:center;margin-bottom:34px">
       <div><span class="logo">RUNBOUND</span><span class="cursor">_</span></div>
