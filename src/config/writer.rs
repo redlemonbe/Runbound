@@ -400,4 +400,71 @@ mod roundtrip_tests {
         };
         assert_eq!(key(&ups1), key(&ups2), "upstreams deformed by forward-zone rebuild");
     }
+    /// Unused Unbound tuning knobs and unknown directives must survive verbatim
+    /// (raw_passthrough), and the config must round-trip. Guards #177.
+    #[test]
+    fn roundtrip_preserves_passthrough_and_unused() {
+        let cfg = "server:\n    interface: 0.0.0.0\n    num-threads: 4\n    cache-size: 256m\n    x-unknown-directive: hello world\n    dnssec-validation: yes\n";
+        let c1 = parse_str(cfg).unwrap();
+        let rendered = render_config(&c1);
+        assert!(rendered.contains("num-threads: 4"), "num-threads dropped:\n{rendered}");
+        assert!(rendered.contains("cache-size: 256m"), "cache-size dropped:\n{rendered}");
+        assert!(rendered.contains("x-unknown-directive: hello world"), "unknown directive dropped:\n{rendered}");
+        let c2 = parse_str(&rendered).unwrap();
+        assert_eq!(format!("{:#?}", c1), format!("{:#?}", c2), "passthrough round-trip mismatch:\n{rendered}");
+    }
+
+    /// Exercise a wide spread of directives and every section in one config.
+    /// Guards #177 against writer gaps not covered by the example files.
+    #[test]
+    fn roundtrip_kitchen_sink() {
+        let cfg = concat!(
+            "server:\n",
+            "    interface: 0.0.0.0\n",
+            "    port: 5353\n",
+            "    do-ip6: no\n",
+            "    dnssec-validation: yes\n",
+            "    serve-stale: no\n",
+            "    cache-min-ttl: 60\n",
+            "    rate-limit: 5000\n",
+            "    rate-limit-prefix-v4: 28\n",
+            "    block-page: yes\n",
+            "    block-page-port: 8083\n",
+            "    block-page-title: \"Blocked\"\n",
+            "    udp-busy-poll: yes\n",
+            "    serve-stale: no\n",
+            "    stale-answer-ttl: 15\n",
+            "    ui-enabled: yes\n",
+            "    ui-acme-domain: dns.example.com\n",
+            "    ui-brand-name: ACME\n",
+            "    ui-accent-color: \"#ff8800\"\n",
+            "    webhook: \"https://hooks.example.com/x\"\n",
+            "    webhook-format: slack\n",
+            "    webhook-events: \"domain_blocked qps_spike\"\n",
+            "    tsig-key: \"k1\" hmac-sha256 \"c2VjcmV0\"\n",
+            "    num-threads: 8\n",
+            "    local-zone: \"corp.\" static\n",
+            "    local-data: \"a.corp. A 10.0.0.9\"\n",
+            "forward-zone:\n",
+            "    name: \".\"\n",
+            "    forward-addr: 1.1.1.1@853\n",
+            "    forward-tls-upstream: yes\n",
+            "api-key-extra:\n",
+            "    label: \"ro\"\n",
+            "    key: \"abcdef0123\"\n",
+            "    role: read\n",
+            "split-horizon:\n",
+            "    name: \"office\"\n",
+            "    subnet: \"10.0.0.0/8\"\n",
+            "    local-data: \"intra. A 10.0.0.5\"\n",
+            "alert:\n",
+            "    name: \"qps\"\n",
+            "    metric: \"client-qps\"\n",
+            "    threshold: 1000\n",
+        );
+        let c1 = parse_str(cfg).unwrap();
+        let rendered = render_config(&c1);
+        let c2 = parse_str(&rendered).unwrap();
+        assert_eq!(format!("{:#?}", c1), format!("{:#?}", c2), "kitchen-sink round-trip mismatch. rendered:\n{rendered}");
+    }
 }
