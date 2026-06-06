@@ -103,6 +103,16 @@ pub static XDP_WORKER_PKTS: [AtomicU64; 64] = {
     [ZERO; 64]
 };
 
+// Per-worker XDP cache MISS counter (packet not served by the fast path -> fallback).
+// Paired with XDP_WORKER_PKTS (served = hits) to compute the XDP cache-hit rate in
+// Rust, off the hot path. The hit path is unchanged (it already bumps XDP_WORKER_PKTS);
+// this only adds one increment on the already-slow miss/fallback branch.
+#[allow(clippy::declare_interior_mutable_const)]
+pub static XDP_WORKER_MISS: [AtomicU64; 64] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; 64]
+};
+
 /// Insert a cache entry, respecting the max-entries cap.
 ///
 /// If the map is full and the incoming key is new, we evict the first expired
