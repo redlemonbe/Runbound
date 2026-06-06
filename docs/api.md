@@ -1418,6 +1418,44 @@ Response:
 
 ---
 
+### Split-horizon
+
+Editable split-horizon entries (per-client-network answer sets, #10). CRUD persists to
+`runbound.conf`; changes apply on the **next service restart** (the resolver's split-horizon
+table is built at boot). Slave nodes are read-only (`503`).
+
+Entry shape:
+
+```json
+{ "name": "internal", "subnets": ["10.0.0.0/8", "192.168.0.0/16"], "local_data": ["intra.example. A 10.0.0.5"] }
+```
+
+#### `GET /api/split-horizon`
+
+List all entries.
+
+```bash
+curl -s http://127.0.0.1:8080/api/split-horizon -H "Authorization: Bearer $KEY"
+```
+
+#### `POST /api/split-horizon`
+
+Add (or replace by name) an entry.
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/api/split-horizon -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"internal","subnets":["10.0.0.0/8"],"local_data":["intra.example. A 10.0.0.5"]}'
+```
+
+#### `DELETE /api/split-horizon/:name`
+
+Remove an entry by name.
+
+```bash
+curl -s -X DELETE http://127.0.0.1:8080/api/split-horizon/internal -H "Authorization: Bearer $KEY"
+```
+
 ## HTTP status codes
 
 | Code | Meaning |
