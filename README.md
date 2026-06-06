@@ -195,7 +195,7 @@ Disable without editing config: `RUNBOUND_DISABLE_XDP=1` — useful if the host 
 
 Full index: **[docs/index.md](docs/index.md)**
 
-Quick links: [Quick Start](docs/quick-start.md) · [Configuration](docs/configuration.md) · [REST API](docs/api.md) · [XDP](docs/xdp.md) · [Internals](docs/internals.md) · [Systemd](docs/systemd.md) · [Security Audit](docs/security-audit/SECURITY-AUDIT.md) · [Security Policy](SECURITY.md) · [Threat Model](THREAT_MODEL.md)
+Quick links: [Quick Start](docs/quick-start.md) · [Configuration](docs/configuration.md) · [REST API](docs/api.md) · [XDP](docs/xdp.md) · [Internals](docs/internals.md) · [Systemd](docs/systemd.md) · [Security Audit](docs/security-audit/SECURITY-AUDIT.md) · [Building & Verifying](docs/BUILD.md) · [Security Policy](SECURITY.md) · [Threat Model](THREAT_MODEL.md)
 
 ---
 
