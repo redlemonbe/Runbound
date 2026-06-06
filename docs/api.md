@@ -1434,3 +1434,43 @@ Response:
 | `500` | Internal server error |
 | `503` | Service unavailable — slave node (read-only), write operation rejected |
 
+
+---
+
+## Additional endpoints
+
+These endpoints are served by the API but were previously undocumented. All require
+the `Authorization: Bearer <api-key>` header (admin role unless noted). The API binds
+to localhost only.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/help` | Machine-readable list of all API endpoints (method, path, description). |
+| `GET` | `/api/clients` | List observed client IPs with per-client query counters. |
+| `GET` | `/api/clients/{ip}` | Detail for one client IP (counts, last seen). |
+| `GET` | `/api/clients/{ip}/logs` | Recent query log entries for one client IP. |
+| `GET` | `/api/audit/tail` | Tail of the HMAC-chained audit log (most recent entries). |
+| `POST` | `/api/upstreams/{id}/probe` | Trigger an immediate health probe of one upstream. |
+| `POST` | `/api/webhooks/test` | Send a synthetic test event to the configured webhook targets. |
+| `POST` | `/api/users/{id}/rotate-key` | Rotate (regenerate) the API key of a specific user. |
+| `GET` | `/api/backup` | List existing backups in `base_dir/backups/`. |
+| `POST` | `/api/backup` | Create a snapshot (config + DNS entries + blacklist + feeds). |
+| `POST` | `/api/backup/restore` | Restore from a backup snapshot. |
+| `DELETE` | `/api/backup/{id}` | Delete a backup snapshot. |
+
+### Examples
+
+```bash
+TOKEN="your-api-key"
+
+# Probe one upstream immediately
+curl -s -X POST http://localhost:8080/api/upstreams/<id>/probe \
+  -H "Authorization: Bearer $TOKEN"
+
+# Create a backup, then list backups
+curl -s -X POST http://localhost:8080/api/backup -H "Authorization: Bearer $TOKEN"
+curl -s        http://localhost:8080/api/backup -H "Authorization: Bearer $TOKEN"
+
+# Tail the audit log
+curl -s http://localhost:8080/api/audit/tail -H "Authorization: Bearer $TOKEN"
+```
