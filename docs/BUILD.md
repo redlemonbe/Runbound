@@ -42,15 +42,15 @@ sha256sum -c SHA256SUMS
 
 ```bash
 # RUNBOUND_PUBKEY is published below / in the release notes
-minisign -Vm runbound-x86_64-linux-gnu -P "RWQHTbP57y/xH3OD6tvg2oi8LeyuQ9YYxVen+oeOCyKqTXfV2cCypAk0"
-minisign -Vm SHA256SUMS               -P "RWQHTbP57y/xH3OD6tvg2oi8LeyuQ9YYxVen+oeOCyKqTXfV2cCypAk0"
+minisign -Vm runbound-x86_64-linux-gnu -P "RWT4uccC0fq9zgcaMtMsdH90azvmKpsNI1xlZrzlBuGH7xx1nDftTFJr"
+minisign -Vm SHA256SUMS               -P "RWT4uccC0fq9zgcaMtMsdH90azvmKpsNI1xlZrzlBuGH7xx1nDftTFJr"
 ```
 
 The signing public key:
 
 ```
 untrusted comment: Runbound release signing key (minisign)
-RWQHTbP57y/xH3OD6tvg2oi8LeyuQ9YYxVen+oeOCyKqTXfV2cCypAk0
+RWT4uccC0fq9zgcaMtMsdH90azvmKpsNI1xlZrzlBuGH7xx1nDftTFJr
 ```
 
 ## Enabling signing (maintainer, one-time)
