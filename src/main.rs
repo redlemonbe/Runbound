@@ -1318,6 +1318,42 @@ async fn build_and_launch(
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("API runtime: {e}"))?;
+    // #174: optional Unix-domain socket (mode 0600), in addition to localhost TCP.
+    // axum 0.7 serve() is TCP-only, so the socket is served via a small hyper-util loop.
+    if let Some(sock_path) = cfg.api_socket.clone() {
+        let app_unix = app.clone();
+        let _ = std::fs::remove_file(&sock_path);
+        match tokio::net::UnixListener::bind(&sock_path) {
+            Ok(listener) => {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
+                info!(socket = %sock_path, "REST API also listening on Unix socket (mode 0600)");
+                api_rt.spawn(async move {
+                    loop {
+                        let (stream, _) = match listener.accept().await {
+                            Ok(s) => s,
+                            Err(e) => { tracing::warn!(%e, "API unix accept failed"); break; }
+                        };
+                        let app_conn = app_unix.clone();
+                        tokio::spawn(async move {
+                            let io = hyper_util::rt::TokioIo::new(stream);
+                            let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                                let mut app_req = app_conn.clone();
+                                async move {
+                                    let req = req.map(axum::body::Body::new);
+                                    tower::Service::call(&mut app_req, req).await
+                                }
+                            });
+                            let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                                .serve_connection(io, svc)
+                                .await;
+                        });
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(%e, path = %sock_path, "API Unix socket bind failed"),
+        }
+    }
     api_rt.spawn(async move {
         let listener =
             tokio::net::TcpListener::from_std(std_listener).expect("TcpListener::from_std failed");
