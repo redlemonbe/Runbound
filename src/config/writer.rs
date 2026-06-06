@@ -380,4 +380,24 @@ mod roundtrip_tests {
         }
         assert!(failures.is_empty(), "config round-trip mismatch: {:?}", failures);
     }
+    /// Upstreams must survive the persistence round-trip: rebuild_forward_zones
+    /// (used by persist_config) must invert init_upstreams. Guards bug #2 — that
+    /// writing upstreams to the config file does not deform them.
+    #[test]
+    fn upstreams_persistence_roundtrip() {
+        use crate::upstreams::{init_upstreams, rebuild_forward_zones};
+        let cfg = parse_str("server:\n    do-udp: yes\nforward-zone:\n    name: \".\"\n    forward-addr: 1.1.1.1@853\n    forward-addr: 9.9.9.9@853\n    forward-tls-upstream: yes\n").unwrap();
+        let ups1 = init_upstreams(&cfg);
+        let fz = rebuild_forward_zones(&ups1);
+        let mut cfg2 = parse_str("server:\n").unwrap();
+        cfg2.forward_zones = fz;
+        let ups2 = init_upstreams(&cfg2);
+        let key = |u: &crate::upstreams::SharedUpstreams| {
+            let mut v: Vec<(String, u16, String, String)> = u.read().unwrap().iter()
+                .map(|x| (x.addr.clone(), x.port, x.protocol.clone(), x.zone.clone())).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(key(&ups1), key(&ups2), "upstreams deformed by forward-zone rebuild");
+    }
 }
