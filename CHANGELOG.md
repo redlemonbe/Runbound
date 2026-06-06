@@ -128,7 +128,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ### Added
 
 - **Multi-interface XDP fast path** — runbound can now attach XDP to N interfaces simultaneously. `xdp-interface` accepts: a single name (unchanged), a comma-separated list (`nic2,nic3`), or `auto` (all eligible interfaces). `auto` skips loopback, virtual (`vmbr*`/`tap*`/`veth*`) and **bonded** interfaces (XDP is incompatible with bonding — WARN + skip). Absent + `xdp: yes` keeps the legacy single-interface auto-detect; `xdp: no` (pure hickory slow path) is unchanged. Each interface gets its own independent XSK sockets, workers, and eBPF program. Worker CPU-core assignment is offset per interface (distinct core block per NIC, no cross-interface collision); the performance governor is pinned across all XDP interfaces' cores and restored on SIGTERM/SIGINT.
-  - Measured (2× Intel X520 10 GbE, Threadripper receiver, dnsmark generator): **~17–18M qps aggregate on dual-fibre at ~13% CPU**, near-zero NIC drops. Generator-limited — the receiver had large headroom. See `docs/benchmark/v0.10.0.md`.
+  - Measured (2× Intel X520 10 GbE, Threadripper receiver, dnsmark generator): **~17–18M qps aggregate on dual-fibre at ~13% CPU**, near-zero NIC drops. Generator-limited — the receiver had large headroom. See `docs/benchmark/`.
 
 ### Fixed
 
@@ -150,7 +150,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ### Performance
 
-- Reference benchmark (see `docs/benchmark/v0.9.69.md`): **8.83M qps** on the local-zone A answer path, measured at the receiver NIC counters on a **2013 dual Xeon E5-2690 v2** (16 RSS cores, 53% CPU) under a 10 GbE saturating flood — **~78% of the 10 GbE fibre line-rate**. The receiver is RX/NIC-buffer-bound, not CPU-bound, at this operating point.
+- Reference benchmark (see `docs/benchmark/`): **8.83M qps** on the local-zone A answer path, measured at the receiver NIC counters on a **2013 dual Xeon E5-2690 v2** (16 RSS cores, 53% CPU) under a 10 GbE saturating flood — **~78% of the 10 GbE fibre line-rate**. The receiver is RX/NIC-buffer-bound, not CPU-bound, at this operating point.
 
 ---
 
@@ -189,7 +189,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - **XDP wire-format response builder for local-zone A/AAAA queries** (#156): `answer_dns_wire()` parses the query and writes the response directly into the UMEM TX frame, bypassing `hickory_proto::Message` parse/serialize and all heap allocation on the answer hot path.
   - Measured on an X520 10 GbE link (controlled back-to-back A/B, 5 runs each, medians): local-zone A answer path **+21% throughput** (~3.80M → ~4.63M qps) and **−35% p50 latency** (0.52ms → 0.34ms).
   - Everything not covered — NXDOMAIN, NODATA, wildcards, CNAME/MX/TXT, EDNS, ACL Deny, ANY, malformed — transparently falls back to hickory. No behaviour change, no regression.
-  - See `docs/benchmark/v0.9.66.md` and `docs/xdp.md`.
+  - See `docs/benchmark/` and `docs/xdp.md`.
 
 ### Fixed
 
