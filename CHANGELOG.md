@@ -9,6 +9,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.15.0] — 2026-06-06
+
+### Added
+
+- **REST API Unix-domain socket** (#174): optional `api-socket: "/path.sock"` directive. The API also listens on a mode-`0600`, owner-only Unix socket **in addition to** the localhost TCP port — a file-permission-gated transport that avoids the bearer token travelling over localhost HTTP. The TCP listener stays active (the socket is additive). axum 0.7 `serve()` is TCP-only, so the socket is served through a small hyper-util accept loop adapting the axum `Router` via `tower::Service`.
+
+### Security
+
+- **Signed releases (#171).** Every release artifact (the four binaries + SBOM + `SHA256SUMS`) is now signed with minisign using a passphrase-protected key. Verify with the public key published in `docs/BUILD.md`, e.g. `minisign -Vm runbound-x86_64-linux-gnu -P <pubkey>`. Reproducible-build instructions are documented alongside it.
+- **Two-AI security audit (Cycle G).** Independent + adversarial review by Claude and a local Qwen3-Coder-30B (private repo never left the LAN). No active vulnerability identified. Fixed **SEC-G1** (LOW): in `axfr.rs`, an AXFR-allow entry with a `/0` prefix computed `1u32 << 32` (panic in debug builds, fail-closed in release); `/0` now correctly matches all addresses. Full cycle in `docs/security-audit/SECURITY-AUDIT.md`.
+
+### Documentation
+
+- **Technical whitepaper** under `docs/whitepaper/` (ten chapters): architecture, the XDP fast path, SIMD & hand-written assembly, the slow path, caching, the control plane, security, performance methodology, and design rationale — written against the source with `file:line` references.
+
+---
+
 ## [0.14.0] — 2026-06-06
 
 ### Added
