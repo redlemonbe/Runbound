@@ -27,8 +27,7 @@ Do **not** open a public issue for security problems. Reports are handled on a
 > sections 15–16): under the open-source license there is no legal or contractual
 > obligation to fix or disclose within a fixed timeframe. **Commercial-license**
 > customers receive firm, contractual SLAs (e.g. critical fixes within 48 h — see
-> [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)). A formal open-source disclosure
-> policy is being defined (issue #178).
+> [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)).
 
 ## Cryptography
 
