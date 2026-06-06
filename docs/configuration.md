@@ -175,6 +175,19 @@ api-port: 9090       # optional — default 8080
 The environment variable takes priority over the config file value.  
 The API always binds to `127.0.0.1` (localhost only) regardless of `api-port`.
 
+### Unix-domain socket (`api-socket`)
+
+```
+api-socket: "/run/runbound/api.sock"   # optional — off by default
+```
+
+When set, the REST API **also** listens on this Unix-domain socket (mode `0600`,
+owner-only) **in addition to** the localhost TCP port. It is a file-permission-gated
+transport: who can talk to the API is then governed by filesystem permissions, not
+only the bearer token — useful for sidecars or hardened hosts that want to avoid the
+token travelling over localhost HTTP. The API key is still required on the socket.
+The TCP listener (`api-port`) stays active; the socket is purely additive.
+
 ### HSM key storage (PKCS#11)
 
 Store the API key and store HMAC key in a Hardware Security Module instead of
