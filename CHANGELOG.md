@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.14.0] — 2026-06-06
+
+### Added
+
+- **Full backup & restore.** `GET /api/backup/export` downloads the **complete** state as one base64 JSON: `runbound.conf` + every store (`dns_entries`, `blacklist`, `feeds`, `upstreams`, `alert-blocks`, `icmp`, `slaves`) with their `.mac` integrity files + secrets/certs (`api.key`, `webui-auth.conf`, sync & CA keys). `POST /api/backup/import` restores it — whitelisted filenames, path-traversal-safe, atomic writes — applied on the next service restart. New **Full backup / restore** controls in the WebUI **System** tab. Admin-only; slave nodes are read-only. The backup contains secrets — store it securely.
+
+---
+
 ## [0.13.0] — 2026-06-06
 
 ### Added
