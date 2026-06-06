@@ -1457,6 +1457,8 @@ to localhost only.
 | `POST` | `/api/backup` | Create a snapshot (config + DNS entries + blacklist + feeds). |
 | `POST` | `/api/backup/restore` | Restore from a backup snapshot. |
 | `DELETE` | `/api/backup/{id}` | Delete a backup snapshot. |
+| `GET` | `/api/backup/export` | **Full backup** download (JSON): config + all state/secret files, base64-encoded. Contains secrets — store securely. |
+| `POST` | `/api/backup/import` | **Full restore** from an exported backup; writes whitelisted files atomically. Restart to apply. Admin only; slave 503. |
 
 ### Examples
 
