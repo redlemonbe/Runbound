@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.12.0] — 2026-06-06
+
+### Added
+
+- **Config persistence to `runbound.conf`** (fixes the DNSSEC-toggle-not-saved and upstreams-not-in-config bugs): WebUI/API changes to **DNSSEC validation** and **upstreams** are now written back to `runbound.conf` via a faithful full-regeneration writer. The writer is round-trip tested on every shipped example config; unmanaged/unknown directives are preserved verbatim (`raw_passthrough`); writes are atomic (render → re-parse validation gate → rename). The DNSSEC toggle now survives a restart, and upstreams live in — and are editable from — the config file. A legacy `upstreams.json` store is migrated into the config once at boot, then archived. Slow path (hickory) untouched.
+- **Deep-space WebUI background** ported from the RunIA login page (navy `#080d1c` + radial gradients + three drifting orbs), applied to both the dashboard and the login page.
+
+---
+
 ## [0.11.1] — 2026-06-06
 
 ### Added
