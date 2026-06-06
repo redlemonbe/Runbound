@@ -6494,7 +6494,17 @@ async fn backup_import_handler(
             s.base_dir.join(name)
         };
         let tmp = dest.with_extension("restore-tmp");
-        if std::fs::write(&tmp, &data).is_ok() && std::fs::rename(&tmp, &dest).is_ok() {
+        // SEC-G8: create_new (O_CREAT|O_EXCL) so a symlink pre-planted at `tmp`
+        // cannot be followed to overwrite an arbitrary file. Clear any stale tmp
+        // first; if creation still fails (race / planted symlink), skip this file.
+        let _ = std::fs::remove_file(&tmp);
+        use std::io::Write as _;
+        let wrote = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(&data));
+        if wrote.is_ok() && std::fs::rename(&tmp, &dest).is_ok() {
             restored += 1;
         }
     }
