@@ -59,6 +59,9 @@ Open `https://<server-ip>:8091` and enter your credentials.
 Default username is `admin`. The password is set during install or changed via
 Settings → Change Password. Sessions expire after 8 hours (30-minute idle timeout).
 
+If the WebUI is still on the default `admin`/`admin` credentials, the dashboard
+shows a one-time prompt on connect to change them (it disappears once changed).
+
 Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
 
 ---
@@ -67,7 +70,7 @@ Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
 
 | Tab | What you can do |
 |---|---|
-| **Overview** | Real-time stats: QPS, cache hit rate, blocked, SERVFAIL, latency percentiles (p50/p95/p99); live 60-second QPS sparkline; top-10 queried domains |
+| **Overview** | Real-time stats: QPS, cache hit rate, blocked, SERVFAIL, latency **min / average / max**; live 60-second QPS sparkline; top-10 queried domains |
 | **DNS** | Add / delete local A, AAAA, CNAME, TXT, MX, PTR, SRV records; DNS Lookup panel with cache hit indicator |
 | **Blacklist** | Add / delete blocked domains (`nxdomain` or `refuse` action) |
 | **Feeds** | Add / delete blocklist feed URLs (hosts or adblock format); preset list; entry count; error text on refresh failure |
@@ -88,7 +91,9 @@ QPS / query count / uptime, node pills for multi-node selection, **↺ Reload** 
 
 When slaves are registered via the relay, node pills appear in the header. Click a
 node to scope Overview stats to that node, or keep **all** selected for cluster-wide
-aggregation.
+aggregation. Cluster rates (cache hit, blocked %) and latency are **weighted by each
+node's resolution volume** — idle nodes are excluded, so a node serving 50 queries
+weighs ten times one serving 5 (never a flat average of the nodes).
 
 ---
 
