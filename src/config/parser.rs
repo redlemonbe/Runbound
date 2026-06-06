@@ -94,6 +94,10 @@ pub struct UnboundConfig {
     pub split_horizon: Vec<SplitHorizonEntry>,
     /// REST API port. Default: 8081.
     pub api_port: Option<u16>,
+    /// Optional Unix-domain socket for the REST API (#174). When set, the API also
+    /// listens there (mode 0600) in addition to localhost TCP — a file-perm-gated
+    /// transport avoiding the cleartext bearer over localhost HTTP.
+    pub api_socket: Option<String>,
     /// Maximum TTL cap for cached records (seconds). Default: 86400 (24 h).
     pub cache_max_ttl: Option<u32>,
     /// #164: minimum TTL to advertise for cached answers (floor enforcement).
@@ -790,6 +794,7 @@ fn parse_server_directive(
             cfg.api_key = Some(val.trim_matches('"').to_string());
         }
         "api-port" => cfg.api_port = val.parse().ok(),
+        "api-socket" => cfg.api_socket = Some(val.trim_matches('"').to_string()),
         "cache-max-ttl" => cfg.cache_max_ttl = val.parse().ok(),
         "cache-min-ttl" => cfg.cache_min_ttl = val.parse().ok(),
         "cache-min-entries" => cfg.cache_min_entries = val.parse::<usize>().unwrap_or(2048).max(1),
