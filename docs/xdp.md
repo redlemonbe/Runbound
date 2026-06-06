@@ -386,6 +386,23 @@ server:
 
 ---
 
+## Automatic queue scaling (#169, v0.11.0)
+
+Before attaching XDP, Runbound sets the NIC's `combined` queue count so the workers
+spread across the available CPU cores — no manual `ethtool -L` required.
+
+- **Modern CPUs** — the queue count is raised to the NIC hardware maximum
+  (`ETHTOOL_SCHANNELS`), capped by the number of physical cores and the AF_XDP /
+  XSKMAP per-NIC budget.
+- **Xeon v2 + X520** (Ivy Bridge-EP + Intel 82599) — the `ixgbe` driver default
+  (~16) is kept. This platform is PCIe-bus-bound at roughly 16 cores; adding more
+  queues there only adds cross-core contention without raising throughput.
+  Detection is automatic (CPU family 6 / model 62 + the `ixgbe` driver).
+
+The change is applied once at startup, before the XDP program is attached (a queue
+change resets the NIC). If the driver does not support `ETHTOOL_SCHANNELS`, Runbound
+leaves the queue count untouched and continues.
+
 ## Expected QPS
 
 | Hardware | Mode | Estimated peak |
