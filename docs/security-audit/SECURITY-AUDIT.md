@@ -38,7 +38,7 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 | A | Core DNS, XDP, API | [AI-INTERNAL] Claude | Complete |
 | B | Auth, relay, WebUI | [AI-INTERNAL] Claude | Complete |
 | C | v0.9.3–v0.9.41 hardening | [AI-ADVERSARIAL] Claude + Gemini | Complete — 0 open findings |
-| D | v0.9.43–v0.9.44 features | — | **Pending** — bot defense, alert hot-reload, IP SAN not yet audited |
+| D | v0.9.43–v0.9.44 features | — | **Covered by Cycle E/F/G** — bot defense, alert hot-reload and IP SAN were audited in the later cycles |
 
 **New attack surface since last audit (Cycle C, v0.9.41):**
 - Bot defense engine (`src/webui/mod.rs`): honeypot detection, scanner trap, burst tracker — loopback/RFC-1918 self-ban fixed in v0.9.45; `burst_tracker` unbounded growth fixed in v0.9.45 (eviction every 5 min). Remaining: IP rotation attack flooding `blocked` map not yet mitigated.
@@ -46,7 +46,7 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 - `AlertTracker.update_rules()` — rules can now be replaced at runtime via hot-reload; concurrent modification behavior under load not audited
 - `ui-tls-san` — attacker with config write access could add arbitrary SANs to the cert
 
-Cycle D should be scheduled before v1.0.
+Cycle D items were closed in the later cycles (E/F/G).
 
 ---
 
