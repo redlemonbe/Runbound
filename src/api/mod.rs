@@ -1253,6 +1253,7 @@ async fn patch_config_handler(
         }
         s.audit.send(AuditEvent::ConfigReload);
         info!(dnssec = v, "DNSSEC validation toggled via API");
+        persist_config(&s);
         // Propagate DNSSEC toggle to all registered slaves
         if let Some(ref j) = s.sync_journal {
             if let Some(ref k) = s.sync_key {
@@ -2213,6 +2214,21 @@ fn default_protocol() -> String {
     "udp".into()
 }
 
+/// Persist the effective config (boot config + live runtime overrides: the DNSSEC
+/// toggle and the current upstream set) back to runbound.conf via the atomic
+/// writer. No-op on slaves (their config is driven by the master). Errors are
+/// logged and swallowed so a write failure never breaks the API response.
+fn persist_config(s: &AppState) {
+    if s.slave_mode { return; }
+    let mut c = (*s.cfg).clone();
+    c.dnssec_validation = s.dnssec_enabled.load(Ordering::Relaxed);
+    c.forward_zones = upstreams::rebuild_forward_zones(&s.upstreams);
+    match crate::config::writer::write_config_atomic(&c, std::path::Path::new(&s.cfg_path)) {
+        Ok(()) => info!(path = %s.cfg_path, "config persisted to runbound.conf"),
+        Err(e) => warn!(%e, path = %s.cfg_path, "failed to persist config to runbound.conf"),
+    }
+}
+
 async fn add_upstream_handler(
     State(s): State<AppState>,
     ApiJson(req): ApiJson<AddUpstreamRequest>,
@@ -2333,6 +2349,7 @@ async fn add_upstream_handler(
     rebuild_racing_resolvers(&s);
     // FIX #43: persist after successful add
     upstreams::save_upstreams(&s.upstreams, &s.base_dir);
+    persist_config(&s);
 
     info!(id = %entry.id, addr = %entry.addr, port = entry.port, protocol = %entry.protocol, "upstream added via API");
     if let (Some(ref j), Some(ref k)) = (&s.sync_journal, &s.sync_key) {
@@ -2428,6 +2445,7 @@ async fn delete_upstream_handler(
             rebuild_racing_resolvers(&s);
             // FIX #43: persist after successful delete
             upstreams::save_upstreams(&s.upstreams, &s.base_dir);
+            persist_config(&s);
             info!(id = %id, addr = %removed.addr, "upstream deleted via API");
             if let (Some(ref j), Some(ref k)) = (&s.sync_journal, &s.sync_key) {
                 j.push(SyncOp::DeleteUpstream { id: id.clone() });
@@ -2661,6 +2679,7 @@ async fn patch_upstream_handler(
     match updated {
         Some(u) => {
             upstreams::save_upstreams(&s.upstreams, &s.base_dir);
+            persist_config(&s);
             info!(id = %id, "upstream patched via PATCH");
             (
                 StatusCode::OK,
