@@ -63,7 +63,7 @@ Complete reference for Runbound. Each page targets the current stable release an
 
 | Page | What you will find |
 |------|--------------------|
-| performance.md | Official benchmark — methodology, results, hardware, comparison with BIND9 and Unbound |
+| [benchmark/](benchmark/) | Official benchmark methodology, template and reports |
 
 ---
 

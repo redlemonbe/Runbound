@@ -29,7 +29,7 @@
 | Malicious co-located local process | ⚠️ partial | API is localhost-only, but the bearer token is readable by a same-uid process — Unix-socket/mTLS is on the roadmap |
 | Local **root** attacker | ❌ out of scope | A root attacker owns the host (standard assumption) |
 | Volumetric DDoS **upstream of the NIC** | ❌ out of scope | Needs network/ISP-level mitigation; Runbound protects from the NIC inward |
-| Supply-chain (crate compromise) | ⚠️ partial | `cargo-deny`/`cargo-audit` in CI; formal SBOM + reproducible build + signatures on the roadmap |
+| Supply-chain (crate compromise) | ⚠️ partial | `cargo-deny`/`cargo-audit` in CI; CycloneDX SBOM, reproducible-build doc and minisign-signed releases shipped (v0.15.0) |
 
 ## Out of scope (today)
 

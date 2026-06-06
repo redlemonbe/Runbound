@@ -316,6 +316,9 @@ server:
     serve-expired-ttl: 86400       # Max age of stale entries in seconds. 0 = unlimited.
     serve-expired-reply-ttl: 30    # TTL returned to clients for stale answers.
 ```
+> `serve-expired*` are accepted as **Unbound-compatible aliases**. The native names are
+> `serve-stale`, `stale-max-age` (= `serve-expired-ttl`) and `stale-answer-ttl`
+> (= `serve-expired-reply-ttl`) — either spelling works.
 
 ### Prefetch
 

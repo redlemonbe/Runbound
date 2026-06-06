@@ -870,7 +870,7 @@ fn parse_server_directive(
         "cache-flush-cooldown" => cfg.cache_flush_cooldown = val.parse().unwrap_or(60),
         "upstream-racing" => cfg.upstream_racing = val.trim_matches('"') == "yes",
         "resolv-fallback" => cfg.resolv_fallback = val.trim_matches('"') != "no",
-        "serve-stale" => cfg.serve_stale = val.trim_matches('"') != "no",
+        "serve-stale" | "serve-expired" => cfg.serve_stale = val.trim_matches('"') != "no",
         "allow-update" => cfg.allow_update = val.trim_matches('"') != "no",
         "block-https-record" => cfg.block_https_record = val.trim_matches('"') == "yes",
         "block-page" => cfg.block_page = val.trim_matches('"') == "yes",
@@ -890,8 +890,8 @@ fn parse_server_directive(
                 cfg.tsig_keys.push((name, alg, sec));
             }
         }
-        "stale-answer-ttl" => cfg.stale_answer_ttl = val.parse().unwrap_or(30),
-        "stale-max-age" => cfg.stale_max_age = val.parse().unwrap_or(86400),
+        "stale-answer-ttl" | "serve-expired-reply-ttl" => cfg.stale_answer_ttl = val.parse().unwrap_or(30),
+        "stale-max-age" | "serve-expired-ttl" => cfg.stale_max_age = val.parse().unwrap_or(86400),
         "firewall-manage" => cfg.firewall_manage = val.trim_matches('"') == "yes",
         "firewall-backend" => cfg.firewall_backend = Some(val.trim_matches('"').to_owned()),
         "firewall-tag" => cfg.firewall_tag = val.trim_matches('"').to_owned(),
