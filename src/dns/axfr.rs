@@ -27,7 +27,8 @@ fn cidr_matches(cidr: &str, ip: IpAddr) -> bool {
         let Ok(prefix) = prefix_str.parse::<u8>() else { return false; };
         match (ip, IpAddr::from_str(addr_str).ok()) {
             (IpAddr::V4(client), Some(IpAddr::V4(net))) => {
-                let mask = if prefix >= 32 { u32::MAX } else { !((1u32 << (32 - prefix)) - 1) };
+                // SEC-G1: prefix 0 = match-all (mask 0); avoids `1u32 << 32` (debug panic / release fail-closed).
+                let mask = if prefix == 0 { 0 } else if prefix >= 32 { u32::MAX } else { !((1u32 << (32 - prefix)) - 1) };
                 (u32::from(client) & mask) == (u32::from(net) & mask)
             }
             (IpAddr::V6(client), Some(IpAddr::V6(net))) => {
@@ -129,4 +130,30 @@ pub async fn handle_axfr<R: ResponseHandler>(
         tracing::error!("AXFR send_response error: {e}");
         error_info(request, ResponseCode::ServFail)
     })
+}
+
+#[cfg(test)]
+mod axfr_tests {
+    use super::cidr_matches;
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    #[test]
+    fn cidr_zero_matches_all_v4() {
+        // SEC-G1: /0 must match any IPv4 (previously matched nothing / debug-panicked).
+        assert!(cidr_matches("0.0.0.0/0", IpAddr::from_str("8.8.8.8").unwrap()));
+        assert!(cidr_matches("0.0.0.0/0", IpAddr::from_str("192.168.1.1").unwrap()));
+    }
+    #[test]
+    fn cidr_normal_v4() {
+        assert!(cidr_matches("192.168.0.0/16", IpAddr::from_str("192.168.5.5").unwrap()));
+        assert!(!cidr_matches("192.168.0.0/16", IpAddr::from_str("10.0.0.1").unwrap()));
+        assert!(cidr_matches("10.1.2.3/32", IpAddr::from_str("10.1.2.3").unwrap()));
+        assert!(!cidr_matches("10.1.2.3/32", IpAddr::from_str("10.1.2.4").unwrap()));
+    }
+    #[test]
+    fn cidr_malformed_fails_closed() {
+        assert!(!cidr_matches("not-a-cidr", IpAddr::from_str("1.2.3.4").unwrap()));
+        assert!(!cidr_matches("1.2.3.4/abc", IpAddr::from_str("1.2.3.4").unwrap()));
+    }
 }
