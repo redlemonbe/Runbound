@@ -63,4 +63,4 @@ minisign -G -W                   # generates (no passphrase: required for unatte
 ```
 
 Once `MINISIGN_SECRET` is set, the release workflow signs every artifact automatically.
-Until then, releases ship with `SHA256SUMS` only (no `.minisig`).
+Since v0.15.0 the signing key is configured, so every release is signed automatically.

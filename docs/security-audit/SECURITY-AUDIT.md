@@ -25,7 +25,7 @@ This document consolidates all security and performance audit cycles conducted o
 
 ## Current Open Findings
 
-Through Cycle E (v0.9.50) all tracked findings were fixed, accepted, or classified as false positives. **Cycle F (v0.12.0)** adds enhancement-class **Open** findings (OPEN-F1..F5: third-party audit, reproducible build + signatures, strict RRL, SIEM logs, SBOM) — see Cycle F. These are hardening roadmap items, not active vulnerabilities.
+Through Cycle E (v0.9.50) all tracked findings were fixed, accepted, or classified as false positives. **Cycle F (v0.12.0)** opened enhancement-class findings OPEN-F1..F5. As of v0.15.0: OPEN-F2 (reproducible build + signatures), OPEN-F4 (SIEM JSON logs) and OPEN-F5 (CycloneDX SBOM) are **Fixed**; OPEN-F1 (third-party human audit, #170) remains **Open**; OPEN-F3 (strict RRL) is **not planned**. None were active vulnerabilities.
 
 All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
 
@@ -693,10 +693,10 @@ Description: POST /api/webhooks/test is protected by the same auth middleware as
 | SEC-F4 | MEDIUM | **Accepted (overstated)** | "No RRL → DNS amplifier." `ANY` queries are refused (RFC 8482) and per-IP query rate limiting exists. Strict Response Rate Limiting (RFC 5358) is tracked as an enhancement (OPEN-F3). |
 | ACC-F1 | LOW | **Accepted** | The REST API uses a bearer token over localhost HTTP. Localhost-only binding mitigates; a Unix socket / localhost mTLS is tracked (roadmap). |
 | OPEN-F1 | — | **Open** | No third-party human security audit yet (the AI pentester does not replace it). |
-| OPEN-F2 | — | **Open** | No reproducible build / signed release binaries. |
+| OPEN-F2 | — | **Fixed (v0.15.0)** | Reproducible-build doc + minisign-signed releases (docs/BUILD.md, #171). |
 | OPEN-F3 | — | **Open** | Strict RRL (RFC 5358) not implemented (ANY-block + per-IP limiting only). |
-| OPEN-F4 | — | **Open** | SIEM-ready structured logs (JSON/CEF) not implemented. |
-| OPEN-F5 | — | **Open** | No formal SBOM (CycloneDX) published (`cargo-deny`/`cargo-audit` run in CI). |
+| OPEN-F4 | — | **Fixed** | `log-format: json` structured logs (#175). |
+| OPEN-F5 | — | **Fixed (v0.15.0)** | CycloneDX SBOM generated in CI + attached to each release (#172). |
 
 **Cryptography (documented during this cycle):** transport TLS via rustls 0.23 (TLS 1.2/1.3 only); WebUI argon2id; relay HMAC-SHA256 + anti-replay; optional HMAC-chained audit log.
 
@@ -743,7 +743,7 @@ Auditor #2 rated the `NoCertVerifier` a HIGH MITM risk. Adjudication: it is **no
 | `src/alerts.rs:120` "`epoch - now_epoch` overflow" | HIGH | `if epoch <= now_epoch { continue }` guard immediately above. |
 | `src/blockpage.rs:61` "HTTP over-read/injection" | HIGH | Bounded `[u8; 4096]` read, `from_utf8_lossy`, slice `[..n]`. |
 
-### Cycle G summary
+### Cycle G — two-model tally (Claude × Qwen; see three-model final tally below)
 
 5 genuine findings, all LOW/INFO: **1 Fixed** (SEC-G1), **3 Disputed** (SEC-G3/G4/G5), **1 Open** (SEC-G2). **No Accepted** — residual items are either disputed as non-vulnerabilities or tracked Open for hardening. No CRITICAL/HIGH/MEDIUM confirmed. ~10 representative Auditor-#2 CRITICAL/HIGH findings explicitly **Disputed** as false positives. No active vulnerability identified in this cycle.
 

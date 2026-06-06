@@ -1,7 +1,7 @@
 # Runbound Internals — Packet Lifecycle & Architecture
 
 Audience: kernel/network engineers, performance analysts, contributors.  
-Version: v0.9.50.
+Version: v0.15.0.
 
 ---
 

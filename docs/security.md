@@ -1,7 +1,7 @@
 # Security Architecture
 
 This document covers the security model, defensive layers, and all audit findings
-fixed across Runbound releases through v0.9.41.
+fixed across Runbound releases through v0.15.0 (see docs/security-audit/SECURITY-AUDIT.md for the per-cycle history).
 
 ---
 
