@@ -1258,6 +1258,7 @@ async fn build_and_launch(
     let (blacklist_reload_tx, blacklist_reload_rx) = tokio::sync::mpsc::channel::<Vec<String>>(8);
 
     let state = AppState {
+        split_horizon: std::sync::Arc::new(std::sync::Mutex::new(cfg.split_horizon.clone())),
         zones: Arc::clone(&zones),
         tls_cfg: Arc::clone(&tls_cfg),
         rate_limiter: api::ApiRateLimiter::new_public(),
