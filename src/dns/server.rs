@@ -563,17 +563,43 @@ impl RunboundHandler {
                         let r = Arc::clone(r);
                         let n = name.clone();
                         let addr = addr.clone();
-                        Box::pin(async move { timed_lookup(&r, n, qtype).await.map(|l| (l, addr)) })
+                        Box::pin(async move {
+                            let res = timed_lookup(&r, n, qtype).await;
+                            // #179: a DEFINITIVE result must win the race immediately — an
+                            // answer (Ok) OR an authoritative negative (NXDOMAIN / NODATA,
+                            // which hickory returns as Err(NoRecordsFound)). select_ok only
+                            // short-circuits on Ok, so without mapping the negative to a
+                            // "win" the race would wait for the slowest/stalled upstream up
+                            // to the 2.5s fuse, pushing the negative reply past the client
+                            // timeout (~18% NXDOMAIN loss, issue #179). Only TRANSIENT errors
+                            // (timeout / connection / SERVFAIL / REFUSED) stay Err so we fail
+                            // over to the other upstreams.
+                            let definitive = match &res {
+                                Ok(_) => true,
+                                Err(NetError::Dns(DnsError::NoRecordsFound(NoRecords {
+                                    response_code, ..
+                                }))) => matches!(
+                                    response_code,
+                                    ResponseCode::NXDomain | ResponseCode::NoError
+                                ),
+                                _ => false,
+                            };
+                            if definitive {
+                                Ok((res, addr))
+                            } else {
+                                Err(res.unwrap_err())
+                            }
+                        })
                     })
                     .collect();
                 match select_ok(futs).await {
-                    Ok(((lookup, winner), _rest)) => {
-                        // Record win for the upstream that answered first.
+                    Ok(((res, winner), _rest)) => {
+                        // Record win for the upstream that produced the first definitive result.
                         self.racing_wins
                             .entry(winner)
                             .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
                             .fetch_add(1, Ordering::Relaxed);
-                        Ok(lookup)
+                        res
                     }
                     Err(e) => Err(e),
                 }
@@ -1140,16 +1166,19 @@ impl RequestHandler for RunboundHandler {
 
         // ── 3c. Block ANY queries (RFC 8482 — amplification vector) ────
         if qtype == RecordType::ANY {
-            debug!(%client_ip, "ANY query blocked (RFC 8482)");
+            // #180: refuse ANY to mitigate amplification. Use REFUSED (RCODE 5) — the
+            // OPCODE (QUERY) IS implemented, only QTYPE=ANY is declined, so NOTIMP was
+            // semantically wrong and some clients treat it as "server broken".
+            debug!(%client_ip, "ANY query refused (amplification mitigation)");
             self.record_query(
                 client_ip,
                 qname,
                 qtype,
-                ResponseCode::NotImp,
+                ResponseCode::Refused,
                 LogAction::Refused,
                 start,
             );
-            return send_error(request, response_handle, ResponseCode::NotImp).await;
+            return send_error(request, response_handle, ResponseCode::Refused).await;
         }
 
         // ── 3d. block-https-record: suppress HTTPS type-65 hints (QUIC/HTTP3 guard) ──
