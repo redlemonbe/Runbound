@@ -116,17 +116,27 @@ jobs:
       - name: Sign release artifacts (minisign)
         env:
           MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           if [ -z "${MINISIGN_SECRET}" ]; then
             echo "MINISIGN_SECRET not set — skipping signatures (SHA256SUMS still published)."
             exit 0
           fi
           sudo apt-get update && sudo apt-get install -y minisign
-          printf '%s' "${MINISIGN_SECRET}" > "${RUNNER_TEMP}/minisign.key"
+          # Trailing newline: minisign secret key files are 2 lines (comment + key).
+          printf '%s\n' "${MINISIGN_SECRET}" > "${RUNNER_TEMP}/minisign.key"
+          # Key may be passphrase-protected (recommended) or passwordless (-W).
+          sign_one() {
+            if [ -n "${MINISIGN_PASSWORD}" ]; then
+              printf '%s\n' "${MINISIGN_PASSWORD}" | minisign -S -s "${RUNNER_TEMP}/minisign.key" -m "$1"
+            else
+              minisign -S -s "${RUNNER_TEMP}/minisign.key" -m "$1" </dev/null
+            fi
+          }
           for f in runbound-x86_64-linux-gnu runbound-x86_64-linux-musl \
                    runbound-aarch64-linux-gnu runbound-aarch64-linux-musl \
                    SHA256SUMS sbom.cdx.json; do
-            [ -f "$f" ] && minisign -S -s "${RUNNER_TEMP}/minisign.key" -m "$f"
+            [ -f "$f" ] && sign_one "$f"
           done
           rm -f "${RUNNER_TEMP}/minisign.key"
 
