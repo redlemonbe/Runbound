@@ -1,7 +1,7 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.9.50  
-**Last updated:** 2026-05-26  
+**Current version:** v0.12.0  
+**Last updated:** 2026-06-06  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
 This document consolidates all security and performance audit cycles conducted on Runbound. Individual per-cycle files in this directory are historical records; this file is the authoritative status reference.
@@ -18,12 +18,13 @@ This document consolidates all security and performance audit cycles conducted o
 | [C](#cycle-c--v0938) | v0.9.15 → v0.9.38 | 2026-05-25 | AI-ADVERSARIAL + AI-ADVERSARIAL (Gemini 2.5 Pro) | 0 (all fixed, accepted, or disputed) |
 | [D](#audit-status--v0944) | v0.9.43–v0.9.44 | — | — | **Pending** |
 | [E](#cycle-e--v0946v0948-asm-hotpath--webui) | v0.9.46–v0.9.48 | 2026-05-26 | AI-INTERNAL | 0 open (2 fixed, 3 accepted, 2 info) |
+| [F](#cycle-f--v0120-sovereigntydefense) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
 
 ---
 
 ## Current Open Findings
 
-As of v0.9.50, **zero findings remain open**. All tracked findings have been fixed, accepted, or classified as false positives.
+Through Cycle E (v0.9.50) all tracked findings were fixed, accepted, or classified as false positives. **Cycle F (v0.12.0)** adds enhancement-class **Open** findings (OPEN-F1..F5: third-party audit, reproducible build + signatures, strict RRL, SIEM logs, SBOM) — see Cycle F. These are hardening roadmap items, not active vulnerabilities.
 
 All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
 
@@ -671,3 +672,31 @@ Description: POST /api/webhooks/test is protected by the same auth middleware as
 | E-002 | INFO | Unbounded delivery queue | Accepted |
 | E-003 | INFO | config-reloaded silently dropped under lock | Accepted |
 | E-004 | INFO | /webhooks/test without targets | No finding |
+
+
+---
+
+## Cycle F — v0.12.0 (Sovereignty / Defense)
+
+**Source:** [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder 30B), 2026-06-06.
+**Scope:** documentation rigor, sovereignty/military deployment readiness, offensive attack surface.
+**Maintainer review:** every *code* finding was verified against the source before classification. The raw AI report over-reported — three code findings are refuted below. The original report is preserved in git history (commit `90ef187`).
+
+| ID | Claimed severity | Status | Finding |
+|----|------------------|--------|---------|
+| DOC-F1 | INFO | **Fixed** | "World's First ASM-Accelerated DNS Server" — unverifiable marketing claim removed from the README (Knot DNS has native XDP since 2020; dnsdist has DPDK). |
+| DOC-F2 | LOW | **Fixed** | `SECURITY.md` and `THREAT_MODEL.md` were absent — both added. |
+| SEC-F1 | HIGH | **Disputed (false)** | "DNS-over-TCP bypasses the blacklist." Refuted: the blacklist runs on the slow path (`src/dns/server.rs` local-zone lookup), shared by UDP **and** TCP — not XDP/UDP-only. |
+| SEC-F2 | MEDIUM | **Disputed (false)** | "IP fragmentation bypass." Refuted: fragments are reassembled by the kernel and handled by the filtering slow path. |
+| SEC-F3 | HIGH | **Disputed (false)** | "systemd hardening / privilege model missing." Refuted: the shipped `runbound.service` runs as non-root `runbound` with a scoped `CapabilityBoundingSet`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`. |
+| SEC-F4 | MEDIUM | **Accepted (overstated)** | "No RRL → DNS amplifier." `ANY` queries are refused (RFC 8482) and per-IP query rate limiting exists. Strict Response Rate Limiting (RFC 5358) is tracked as an enhancement (OPEN-F3). |
+| ACC-F1 | LOW | **Accepted** | The REST API uses a bearer token over localhost HTTP. Localhost-only binding mitigates; a Unix socket / localhost mTLS is tracked (roadmap). |
+| OPEN-F1 | — | **Open** | No third-party human security audit yet (the AI pentester does not replace it). |
+| OPEN-F2 | — | **Open** | No reproducible build / signed release binaries. |
+| OPEN-F3 | — | **Open** | Strict RRL (RFC 5358) not implemented (ANY-block + per-IP limiting only). |
+| OPEN-F4 | — | **Open** | SIEM-ready structured logs (JSON/CEF) not implemented. |
+| OPEN-F5 | — | **Open** | No formal SBOM (CycloneDX) published (`cargo-deny`/`cargo-audit` run in CI). |
+
+**Cryptography (documented during this cycle):** transport TLS via rustls 0.23 (TLS 1.2/1.3 only); WebUI argon2id; relay HMAC-SHA256 + anti-replay; optional HMAC-chained audit log.
+
+Remediation is tracked in [ROADMAP-SOUVERAINETE.md](../ROADMAP-SOUVERAINETE.md). Verdict: real XDP performance and a sound Rust architecture; the gap to state-grade use is trust paperwork (audit, reproducible build, SBOM), not code.
