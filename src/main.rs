@@ -629,16 +629,16 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
     let mut unbound_cfg = config::load(&cfg_path)?;
 
     // Init tracing: RUST_LOG env var > verbosity: directive > WARN.
-    if std::env::var_os("RUST_LOG").is_some() {
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_env("RUST_LOG"))
-            .init();
+    // log-format: json emits structured (SIEM-ready) logs; default is text.
+    let log_filter = if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::EnvFilter::from_env("RUST_LOG")
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(verbosity_to_filter(
-                unbound_cfg.verbosity,
-            )))
-            .init();
+        tracing_subscriber::EnvFilter::new(verbosity_to_filter(unbound_cfg.verbosity))
+    };
+    if unbound_cfg.log_format == "json" {
+        tracing_subscriber::fmt().json().with_env_filter(log_filter).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(log_filter).init();
     }
 
     runtime::BASE_DIR
