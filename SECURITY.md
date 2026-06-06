@@ -42,7 +42,7 @@ Do **not** open a public issue for security problems. Reports are handled on a
 
 ## Built-in hardening
 
-- **DNS amplification:** `ANY` queries are refused (RFC 8482); per-source-IP query
+- **DNS amplification:** `ANY` queries are refused (REFUSED) to mitigate amplification; per-source-IP query
   rate limiting (`rate-limit`, with configurable v4/v6 prefix bucketing).
 - **DNS rebinding:** `private-address` CIDRs are stripped from upstream answers.
 - **Access control:** `access-control` ACLs; the REST API binds to localhost only

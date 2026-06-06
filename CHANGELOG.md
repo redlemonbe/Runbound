@@ -9,6 +9,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.15.2] — 2026-06-06
+
+### Fixed
+
+- **ANY queries return REFUSED** (#180) instead of NOTIMP — NOTIMP was semantically wrong (the OPCODE is implemented; only QTYPE=ANY is declined) and some clients treat it as a broken server. Amplification is still mitigated (no large answer).
+- **API auth lockout without self-DoS** (#182): after 20 consecutive invalid bearer tokens the API returns `429`; a **valid** key always passes (it resets the failure counter before that branch), so a legitimate caller is never locked out.
+
+### Added
+
+- **`RUNBOUND_API_KEY_FILE`** (#181): the API key can be read from a 0600 file whose *path* is in the environment, so the key **value** is never exposed in `/proc/<pid>/environ`. Set `RUNBOUND_API_KEY_FILE=/path` (and drop `RUNBOUND_API_KEY=<value>`) to harden the deployment.
+
+### Improved (not fully resolved)
+
+- **#179 (negative-answer forwarding):** racing now short-circuits on the first **definitive** result — an answer *or* an authoritative NXDOMAIN/NODATA — instead of waiting for the slowest/stalled upstream, lowering NXDOMAIN tail latency. This is a **partial** improvement: an intermittent negative-response loss remains under cache-miss bursts and its root cause is not yet pinned. **#179 stays open.** `upstream-racing: yes` is a recommended partial mitigation.
+
+---
+
 ## [0.15.0] — 2026-06-06
 
 ### Added
