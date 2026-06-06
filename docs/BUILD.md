@@ -42,21 +42,21 @@ sha256sum -c SHA256SUMS
 
 ```bash
 # RUNBOUND_PUBKEY is published below / in the release notes
-minisign -Vm runbound-x86_64-linux-gnu -P "<RUNBOUND_MINISIGN_PUBLIC_KEY>"
-minisign -Vm SHA256SUMS               -P "<RUNBOUND_MINISIGN_PUBLIC_KEY>"
+minisign -Vm runbound-x86_64-linux-gnu -P "RWQHTbP57y/xH3OD6tvg2oi8LeyuQ9YYxVen+oeOCyKqTXfV2cCypAk0"
+minisign -Vm SHA256SUMS               -P "RWQHTbP57y/xH3OD6tvg2oi8LeyuQ9YYxVen+oeOCyKqTXfV2cCypAk0"
 ```
 
 The signing public key:
 
 ```
-# TODO(maintainer): paste the minisign public key here after generating the key
-# (minisign -G), and add the private key as the GitHub repo secret MINISIGN_SECRET.
+untrusted comment: Runbound release signing key (minisign)
+RWQHTbP57y/xH3OD6tvg2oi8LeyuQ9YYxVen+oeOCyKqTXfV2cCypAk0
 ```
 
 ## Enabling signing (maintainer, one-time)
 
 ```bash
-minisign -G                      # generates minisign.key (private) + minisign.pub (public)
+minisign -G -W                   # generates (no passphrase: required for unattended CI signing) minisign.key (private) + minisign.pub (public)
 # 1. Add the *private* key file contents as repo secret MINISIGN_SECRET (Settings → Secrets → Actions)
 # 2. Paste the *public* key (minisign.pub) into the block above and commit
 ```
