@@ -3,9 +3,8 @@
 ## Status
 
 Runbound is **experimental** and has **not** undergone an external human security
-audit. It is not yet recommended for production deployments handling sensitive
-traffic. See [METHODOLOGY.md](METHODOLOGY.md) for the development approach and
-docs/ROADMAP-SOUVERAINETE.md for planned hardening.
+audit. See [METHODOLOGY.md](METHODOLOGY.md) for the development approach and
+[THREAT_MODEL.md](THREAT_MODEL.md) for the threat model and planned hardening.
 
 ## Supported versions
 
@@ -13,8 +12,8 @@ Only the **latest released version** receives security fixes — there is no LTS
 
 | Version | Supported |
 |---------|-----------|
-| 0.12.x  | ✅ |
-| < 0.12  | ❌ |
+| 0.15.x  | ✅ |
+| < 0.15  | ❌ |
 
 ## Reporting a vulnerability
 
@@ -46,12 +45,15 @@ project matures.)
   `CapabilityBoundingSet` (`CAP_NET_BIND_SERVICE`, `CAP_NET_RAW`, `CAP_NET_ADMIN`,
   `CAP_BPF`), `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`.
 - **Bot/scanner defense:** honeypot trap routes with configurable banning.
+- **Supply chain:** release binaries are signed with **minisign** and ship a
+  **CycloneDX SBOM** plus `SHA256SUMS`; reproducible-build and signature-verification
+  steps are in [docs/BUILD.md](docs/BUILD.md). `cargo audit` / `cargo deny` run in CI.
 
 ## Known limitations
 
 - No external human security audit yet.
-- No reproducible build or signed release binaries yet.
 - Strict Response Rate Limiting (RFC 5358) is not implemented (ANY-block + per-IP
   query limiting only).
-- The REST API uses a bearer token over localhost HTTP (a Unix socket / localhost
-  mTLS is on the roadmap).
+- The REST API default transport is a bearer token over localhost HTTP; an
+  owner-only Unix socket (mode 0600, `api-socket`) is available as a hardened
+  alternative (localhost mTLS is on the roadmap).

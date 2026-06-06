@@ -18,7 +18,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [C](#cycle-c--v0938) | v0.9.15 → v0.9.38 | 2026-05-25 | AI-ADVERSARIAL + AI-ADVERSARIAL (Gemini 2.5 Pro) | 0 (all fixed, accepted, or disputed) |
 | [D](#audit-status--v0944) | v0.9.43–v0.9.44 | — | — | **Pending** |
 | [E](#cycle-e--v0946v0948-asm-hotpath--webui) | v0.9.46–v0.9.48 | 2026-05-26 | AI-INTERNAL | 0 open (2 fixed, 3 accepted, 2 info) |
-| [F](#cycle-f--v0120-sovereigntydefense) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
+| [F](#cycle-f--v0120-defense-in-depth-hardening) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
 
 ---
@@ -677,10 +677,10 @@ Description: POST /api/webhooks/test is protected by the same auth middleware as
 
 ---
 
-## Cycle F — v0.12.0 (Sovereignty / Defense)
+## Cycle F — v0.12.0 (Defense-in-depth hardening)
 
 **Source:** [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder 30B), 2026-06-06.
-**Scope:** documentation rigor, sovereignty/military deployment readiness, offensive attack surface.
+**Scope:** documentation rigor, deployment hardening readiness, offensive attack surface.
 **Maintainer review:** every *code* finding was verified against the source before classification. The raw AI report over-reported — three code findings are refuted below. The original report is preserved in git history (commit `90ef187`).
 
 | ID | Claimed severity | Status | Finding |
@@ -700,7 +700,7 @@ Description: POST /api/webhooks/test is protected by the same auth middleware as
 
 **Cryptography (documented during this cycle):** transport TLS via rustls 0.23 (TLS 1.2/1.3 only); WebUI argon2id; relay HMAC-SHA256 + anti-replay; optional HMAC-chained audit log.
 
-Remediation items are the OPEN-F findings listed above. Verdict: real XDP performance and a sound Rust architecture; the gap to state-grade use is trust paperwork (audit, reproducible build, SBOM), not code.
+Remediation items are the OPEN-F findings listed above. Verdict: real XDP performance and a sound Rust architecture; the remaining gap is trust paperwork (audit, reproducible build, SBOM), not code.
 
 ## Cycle G — v0.15.0 (Two-AI competitive audit)
 
