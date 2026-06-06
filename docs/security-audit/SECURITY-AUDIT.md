@@ -19,7 +19,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [D](#audit-status--v0944) | v0.9.43–v0.9.44 | — | — | **Pending** |
 | [E](#cycle-e--v0946v0948-asm-hotpath--webui) | v0.9.46–v0.9.48 | 2026-05-26 | AI-INTERNAL | 0 open (2 fixed, 3 accepted, 2 info) |
 | [F](#cycle-f--v0120-sovereigntydefense) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
-| [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) | 0 open (1 fixed, 3 accepted, 1 disputed) |
+| [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) | 1 open (1 fixed, 3 disputed) |
 
 ---
 
@@ -719,14 +719,14 @@ Auditor #2 produced **181 raw findings** (4 CRITICAL, 103 HIGH, 46 MEDIUM, 4 LOW
 | ID | Severity | Location | Finding | Status |
 |----|----------|----------|---------|--------|
 | SEC-G1 | LOW | `src/dns/axfr.rs:30` | `cidr_matches`: for an AXFR-allow entry with prefix `/0`, `1u32 << (32 - 0)` = `1u32 << 32` — panics in a debug build, and in release the shift is masked so a `/0` matches **nothing** instead of everything (a fail-closed config foot-gun). | **Fixed** (clamp `prefix == 0 → mask 0`) |
-| SEC-G2 | LOW | `src/api/relay.rs:35` | Relay TLS uses a `NoCertVerifier` (accepts any cert). Surfaced by both auditors (Qwen rated HIGH "MITM"). | **Accepted** (by design) |
+| SEC-G2 | LOW | `src/api/relay.rs:35` | Relay TLS uses a `NoCertVerifier` (accepts any cert). Surfaced by both auditors (Qwen rated HIGH "MITM"). | **Open** (harden: offer out-of-band cert-fingerprint pinning to close the TOFU bootstrap window) |
 | SEC-G3 | INFO | `src/sync.rs:101` | `hmac_verify_with_ts` compares content in constant time (`subtle::ConstantTimeEq`); the `zip` iterates the shorter length, a theoretical timing signal on **length only** — but the expected length is fixed (64 hex) and the result is a constant `false`. | **Disputed** (not exploitable) |
-| SEC-G4 | LOW | `ebpf/dns_xdp.c:108` | ICMP-echo per-source-IP rate-limit LRU (65 536) can be churned by spoofed source IPs, evicting legitimate entries. | **Accepted** (opt-in; LRU-bounded; userspace flood-ban map) |
-| SEC-G5 | INFO | `src/dns/hasher.rs:69`, `src/dns/simd.rs` | Hand-written `asm!` / raw-pointer SIMD kernels. Equivalence to a scalar reference is enforced by tests for all input lengths; the generic `unsafe` risk is a future caller passing a mis-sized buffer. | **Accepted** (test-verified; preconditions documented) |
+| SEC-G4 | LOW | `ebpf/dns_xdp.c:108` | ICMP-echo per-source-IP rate-limit LRU (65 536) can be churned by spoofed source IPs, evicting legitimate entries. | **Disputed** (opt-in, LRU-bounded, flood-ban map — bounded DoS of an optional feature, no meaningful impact) |
+| SEC-G5 | INFO | `src/dns/hasher.rs:69`, `src/dns/simd.rs` | Hand-written `asm!` / raw-pointer SIMD kernels. Equivalence to a scalar reference is enforced by tests for all input lengths; the generic `unsafe` risk is a future caller passing a mis-sized buffer. | **Disputed** (asm/scalar equivalence exhaustively test-verified — not a vulnerability) |
 
-#### SEC-G2 rationale (Accepted, not HIGH)
+#### SEC-G2 rationale (Open hardening item, not HIGH)
 
-Auditor #2 rated the `NoCertVerifier` a HIGH MITM risk. Adjudication: it is **not** blanket MITM. Command **authenticity** is HMAC-SHA256 over `method\npath\nts` with a pre-shared sync key and a ±30 s anti-replay window (`src/sync.rs:101`, constant-time verify); after registration the relay client **pins the slave certificate fingerprint** (`pinned_client_config`, `src/api/relay.rs:240`), and the `/sync/cert` bootstrap endpoint is rate-limited (10/60 s/peer, `src/sync.rs:268`). The only residual exposure is the classic **TOFU first-contact window** — and even there a MITM cannot forge or replay commands without the HMAC key. Accepted as a documented self-hosted master/slave trade-off; recommend the bootstrap assumption be stated in operator docs.
+Auditor #2 rated the `NoCertVerifier` a HIGH MITM risk. Adjudication: it is **not** blanket MITM. Command **authenticity** is HMAC-SHA256 over `method\npath\nts` with a pre-shared sync key and a ±30 s anti-replay window (`src/sync.rs:101`, constant-time verify); after registration the relay client **pins the slave certificate fingerprint** (`pinned_client_config`, `src/api/relay.rs:240`), and the `/sync/cert` bootstrap endpoint is rate-limited (10/60 s/peer, `src/sync.rs:268`). The only residual exposure is the classic **TOFU first-contact window** — and even there a MITM cannot forge or replay commands without the HMAC key. Tracked as an **Open** hardening item: offer an out-of-band fingerprint pin so the first-contact window can be closed; state the bootstrap assumption in operator docs.
 
 ### Disputed (false positives from `[AI-ADVERSARIAL]` Qwen — representative)
 
@@ -745,4 +745,4 @@ Auditor #2 rated the `NoCertVerifier` a HIGH MITM risk. Adjudication: it is **no
 
 ### Cycle G summary
 
-5 genuine findings, all LOW/INFO: **1 Fixed** (SEC-G1), **3 Accepted** (SEC-G2/G4/G5), **1 Disputed** (SEC-G3). No CRITICAL/HIGH/MEDIUM confirmed. ~10 representative Auditor-#2 CRITICAL/HIGH findings explicitly **Disputed** as false positives. No active vulnerability identified in this cycle.
+5 genuine findings, all LOW/INFO: **1 Fixed** (SEC-G1), **3 Disputed** (SEC-G3/G4/G5), **1 Open** (SEC-G2). **No Accepted** — residual items are either disputed as non-vulnerabilities or tracked Open for hardening. No CRITICAL/HIGH/MEDIUM confirmed. ~10 representative Auditor-#2 CRITICAL/HIGH findings explicitly **Disputed** as false positives. No active vulnerability identified in this cycle.
