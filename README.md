@@ -168,7 +168,8 @@ Numbers below are measured at the **receiver NIC counters** (not a self-reported
 
 | Path | Hardware | Measured | Report |
 |------|----------|----------|--------|
-| AF_XDP fast path — local-zone A | 2013 dual Xeon E5-2690 v2, 10 GbE `ixgbe` | **8.83M qps** — ~78% of 10 GbE line-rate, RX/NIC-bound | [benchmark/v0.9.69](docs/benchmark/v0.9.69.md) |
+| AF_XDP fast path — local-zone A, **dual-fibre** | Threadripper 5995WX, 2× Intel X520 10 GbE | **~17–18M qps** aggregate at **~13% CPU** — generator-limited, near-zero NIC drops | [benchmark/v0.10.0](docs/benchmark/v0.10.0.md) |
+| AF_XDP fast path — local-zone A, single-fibre | 2013 dual Xeon E5-2690 v2, X520 10 GbE | **8.83M qps** — ~78% of 10 GbE line-rate, PCIe-bus-bound | [benchmark/v0.9.69](docs/benchmark/v0.9.69.md) |
 | Userspace — `SO_REUSEPORT`, no XDP | loopback, cache-warm | **195k qps** (vs BIND9 56k / Unbound 52k under stress) | [benchmark/v0.9.46](docs/benchmark/v0.9.46.md) |
 
 The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC hardware, huge pages are self-provisioned, and NIC queues scale to the CPU automatically (kept at the driver default on bus-bound Xeon v2 + X520). The architecture is built for linear scaling — `SO_REUSEPORT`, `ArcSwap` lock-free config, per-core affinity, and a single-lookup ASM hot path (CRC32c + SIMD label handling).
