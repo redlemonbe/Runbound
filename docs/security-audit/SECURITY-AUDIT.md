@@ -16,7 +16,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [A](#cycle-a--v0910) | v0.8.2 → v0.9.10 | 2026-05-25 | AI-INTERNAL | 0 (all fixed or accepted) |
 | [B](#cycle-b--v0915) | v0.9.10 → v0.9.15 | 2026-05-25 | AI-ADVERSARIAL | 0 (all fixed or accepted) |
 | [C](#cycle-c--v0938) | v0.9.15 → v0.9.38 | 2026-05-25 | AI-ADVERSARIAL + AI-ADVERSARIAL (Gemini 2.5 Pro) | 0 (all fixed, accepted, or disputed) |
-| [D](#audit-status--v0944) | v0.9.43–v0.9.44 | — | — | **Pending** |
+| [D](#audit-status--v0944) | v0.9.43–v0.9.44 | — | — | **Covered by Cycle E/F/G** |
 | [E](#cycle-e--v0946v0948-asm-hotpath--webui) | v0.9.46–v0.9.48 | 2026-05-26 | AI-INTERNAL | 0 open (2 fixed, 3 accepted, 2 info) |
 | [F](#cycle-f--v0120-defense-in-depth-hardening) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
