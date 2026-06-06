@@ -9,6 +9,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.11.0] — 2026-06-06
+
+### Added
+
+- **Automatic NIC queue scaling on the XDP fast path** (#169): before attaching XDP, runbound raises the NIC's `combined` queue count to the hardware maximum (`ETHTOOL_SCHANNELS`), capped by the physical core count and the AF_XDP / XSKMAP per-NIC budget. On a **Xeon v2 + X520** host — PCIe-bus-bound at ~16 cores — the call is a deliberate no-op (the `ixgbe` driver default is kept), because adding queues there only adds cross-core contention. On any modern CPU the workers spread across every NIC queue automatically, with no manual `ethtool -L`. CPU/NIC detection reuses `is_xeon_v2_x520_host()` (CPU family 6 / model 62 + `ixgbe`). Slow path (hickory) unchanged.
+
+---
+
+## [0.10.5] — 2026-06-06
+
+### Added
+
+- **Negative caching on the XDP fast path** (#166, RFC 2308): `NODATA` (NOERROR with no answer) and `NXDOMAIN` responses are now cached as wire answers, keyed by name + type, with a TTL derived from the SOA `MINIMUM` field (clamped to `[60, 900]` s). `SERVFAIL` is deliberately never cached — it is a transient condition. On a Tranco top-10000 real-corpus run this eliminated a **17% cache-miss rate**, dominated by repeated `NODATA` / `AAAA` lookups, bringing the steady-state miss rate down to ~0.2%.
+
+---
+
+## [0.10.4] — 2026-06-06
+
+### Added
+
+- **Self-configuring AF_XDP** — automatic rings and huge pages: the fill / completion / RX / TX ring sizes are derived from the NIC's hardware ring depth (read per-socket via a GET-only `ethtool` ioctl), and huge pages are self-provisioned at startup (2 MiB, falling back to 1 GiB, then to normal pages). No manual `xdp-*-ring-size` tuning or `nr_hugepages` setup is required for typical deployments.
+
+---
+
+## [0.10.3] — 2026-06-05
+
+### Fixed
+
+- **XDP recursion-miss replies now leave from the server port, not an ephemeral one** (#167): cache-miss queries recursed in XDP mode were answered from an ephemeral socket, so some clients rejected the reply on a source-port mismatch. Fallback answers now leave from the bound `:53` socket.
+- **Loopback (`127.0.0.1`) served via the kernel slow-path listener in XDP mode** (#167b): queries to the loopback address are handled by the normal kernel listener instead of the XDP fast path, fixing local `dig @127.0.0.1` under `xdp: yes`.
+
+### Changed
+
+- **Unified XDP cache ↔ local-data lookup on a single ASM path**: the per-packet hot path now performs a single CRC32c + identity-hash lookup (replacing the previous `SmallVec` + `QuestionKey` + ahash chain), and per-packet cache statistics were removed from the hot path — a CPU-efficiency improvement on the fast path.
+
+---
+
+## [0.10.2] — 2026-06-05
+
+### Fixed
+
+- **XDP cache-misses now recurse instead of being silently dropped** (critical): in `xdp: yes` mode, a cache-miss for a non-local name was dropped instead of being forwarded to the recursive resolver, so the first query for any uncached name timed out. Misses now fall through to the hickory slow path concurrently, bounded by a 1024-permit semaphore. Production deployments running `xdp: no` were unaffected.
+- Log hygiene on the XDP fallback path.
+
+---
+
 ## [0.10.1] — 2026-06-04
 
 ### Fixed

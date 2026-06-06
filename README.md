@@ -164,21 +164,21 @@ curl -s -X POST http://localhost:8080/api/feeds \
 
 ## Performance
 
-| Hardware | Mode | QPS | Notes |
-|----------|------|-----|-------|
-| Any CPU | SO_REUSEPORT (no XDP) | scales linearly with cores | |
-| Intel 10 GbE ixgbe | AF_XDP kernel-bypass fast path | ~1M QPS/core (theoretical) — see docs/internals.md for timing budget |
+Numbers below are measured at the **receiver NIC counters** (not a self-reported figure) and link to the full report.
 
-Architecture designed for linear scaling with core count — SO_REUSEPORT, ArcSwap lock-free config, per-core CPU affinity, and adaptive cache. See docs/performance.md for current benchmark data.
+| Path | Hardware | Measured | Report |
+|------|----------|----------|--------|
+| AF_XDP fast path — local-zone A | 2013 dual Xeon E5-2690 v2, 10 GbE `ixgbe` | **8.83M qps** — ~78% of 10 GbE line-rate, RX/NIC-bound | [benchmark/v0.9.69](docs/benchmark/v0.9.69.md) |
+| Userspace — `SO_REUSEPORT`, no XDP | loopback, cache-warm | **195k qps** (vs BIND9 56k / Unbound 52k under stress) | [benchmark/v0.9.46](docs/benchmark/v0.9.46.md) |
 
-**Userspace benchmark (v0.9.46):** 195k QPS (loopback, cache-warm, SIMD asm-hotpath) · 147k QPS (v0.9.45 baseline) · 68k QPS under stress (Phase B, c=100) vs BIND9 56k / Unbound 52k. XDP disabled. +33% QPS from SIMD optimisations (CRC32c hashing, SSE2/AVX2 label lowercasing, SSE2 QuestionKey equality). See [`docs/performance.md`](docs/performance.md).
+The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC hardware, huge pages are self-provisioned, and NIC queues scale to the CPU automatically (kept at the driver default on bus-bound Xeon v2 + X520). The architecture is built for linear scaling — `SO_REUSEPORT`, `ArcSwap` lock-free config, per-core affinity, and a single-lookup ASM hot path (CRC32c + SIMD label handling).
 
 | Query path | Latency |
 |------------|---------|
-| XDP fast path (local zone) | **<1 ms** (below dnsmark resolution) |
-| Tokio slow path — upstream forward | RTT + ~50 µs |
+| XDP fast path (local zone) | **< 1 ms** (below the load generator's resolution) |
+| Slow path — upstream forward | upstream RTT + ~50 µs |
 
-Full timing breakdown and theoretical analysis: [docs/internals.md](docs/internals.md).
+Full methodology and current numbers: [docs/performance.md](docs/performance.md) · timing budget: [docs/internals.md](docs/internals.md).
 
 ---
 
@@ -187,6 +187,8 @@ Full timing breakdown and theoretical analysis: [docs/internals.md](docs/interna
 > **Commercial license required** to activate at runtime. Open-source (AGPL v3) builds include the code — the fast path is disabled without a commercial license.
 
 An eBPF XDP program attaches to the NIC at startup. UDP/53 packets for local zones and cache hits are answered in user space at driver level — zero syscalls on the hot path. All other queries pass through to the normal resolver via `XDP_PASS`.
+
+Negative answers (`NODATA` / `NXDOMAIN`) are cached on the fast path too (RFC 2308). AF_XDP ring sizes, huge pages, and NIC queue counts are **configured automatically** at startup — see [docs/xdp.md](docs/xdp.md).
 
 ```bash
 # Verify XDP is active
