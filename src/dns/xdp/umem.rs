@@ -285,30 +285,78 @@ impl DescRing {
 
 // ── UMEM ──────────────────────────────────────────────────────────────────
 
-/// Allocate the UMEM backing memory.
-/// Tries 2 MiB huge pages first (when `hugepages` is true) to reduce TLB pressure
-/// at high packet rates. Falls back to standard 4 KiB pages on any failure.
+/// Best-effort: grow the 2 MiB huge-page pool by `extra` pages so the UMEM can
+/// use huge pages WITHOUT the operator pre-allocating them by hand. Requires root.
+/// Targets the 2 MiB pool EXPLICITLY (not /proc/sys/vm/nr_hugepages, which controls
+/// the DEFAULT size — 1 GiB on hosts with default_hugepagesz=1G). Runtime growth is
+/// best-effort (fragmentation may cap it); for guaranteed huge pages pre-allocate at
+/// boot. Documented so a sysop knows runbound self-provisions and won't blame perf
+/// on a forgotten `vm.nr_hugepages`.
+#[cfg(target_os = "linux")]
+fn try_reserve_2mb_hugepages(extra: usize) -> bool {
+    const NR: &str = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
+    let cur: usize = std::fs::read_to_string(NR)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    std::fs::write(NR, (cur + extra).to_string()).is_ok()
+}
+
+/// Allocate the UMEM backing memory — AUTO-ADAPTIVE to available huge pages.
+/// Order: 2 MiB huge pages -> (if none) auto-reserve 2 MiB pages and retry ->
+/// 1 GiB huge pages -> standard 4 KiB pages (LOUD warning). Operators never need
+/// to manually enable/size huge pages. Boot logs `UMEM: huge pages active` /
+/// `UMEM: NO huge pages` confirm what was used.
 fn alloc_umem_area(size: usize, hugepages: bool) -> Result<*mut libc::c_void, String> {
     #[cfg(target_os = "linux")]
     if hugepages {
-        // MAP_HUGE_2MB = 21 << MAP_HUGE_SHIFT (MAP_HUGE_SHIFT = 26)
-        // SAFETY: mmap with MAP_HUGETLB|MAP_ANONYMOUS allocates huge pages.
-        //         fd=-1 is required with MAP_ANONYMOUS. size is page-aligned.
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                size,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_ANONYMOUS | libc::MAP_HUGETLB | (21 << libc::MAP_HUGE_SHIFT),
-                -1,
-                0,
-            )
+        // SAFETY: mmap with MAP_HUGETLB|MAP_ANONYMOUS allocates huge pages;
+        //         fd=-1 required with MAP_ANONYMOUS; `size` is page-aligned.
+        let mmap_huge = |bytes: usize, huge_flag: i32| -> *mut libc::c_void {
+            unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    bytes,
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS | libc::MAP_HUGETLB | (huge_flag << libc::MAP_HUGE_SHIFT),
+                    -1,
+                    0,
+                )
+            }
         };
+        // 1) 2 MiB huge pages (MAP_HUGE_2MB = 21 << MAP_HUGE_SHIFT).
+        let mut ptr = mmap_huge(size, 21);
+        // 2) None available -> AUTO-RESERVE enough 2 MiB pages (+slack) and retry.
+        if ptr == MAP_FAILED {
+            let need = size / (2 * 1024 * 1024) + 16;
+            if try_reserve_2mb_hugepages(need) {
+                ptr = mmap_huge(size, 21);
+                if ptr != MAP_FAILED {
+                    tracing::info!(size, pages = need, "UMEM: huge pages active (2 MiB, auto-reserved by runbound)");
+                    return Ok(ptr);
+                }
+            }
+        }
         if ptr != MAP_FAILED {
-            tracing::info!(size, "UMEM allocated with huge pages");
+            tracing::info!(size, "UMEM: huge pages active (2 MiB)");
             return Ok(ptr);
         }
-        tracing::debug!("huge pages unavailable, falling back to standard pages");
+        // 3) Some hosts only configure 1 GiB huge pages — try those (round up).
+        let gib = 1usize << 30;
+        let aligned = size.div_ceil(gib) * gib;
+        let ptr = mmap_huge(aligned, 30); // MAP_HUGE_1GB = 30 << MAP_HUGE_SHIFT
+        if ptr != MAP_FAILED {
+            tracing::info!(size = aligned, "UMEM: huge pages active (1 GiB)");
+            return Ok(ptr);
+        }
+        // 4) Give up on huge pages — LOUD, actionable warning (not silent debug).
+        tracing::warn!(
+            size,
+            "UMEM: NO huge pages available and auto-reserve failed (not running as root?). \
+             Falling back to standard 4 KiB pages — EXPECT rx_no_dma drops and lower \
+             throughput under flood. Run runbound as root (it self-provisions huge pages) \
+             or pre-allocate at boot: sysctl -w vm.nr_hugepages=<N>."
+        );
     }
 
     // Standard 4 KiB pages (also used when hugepages=false)
