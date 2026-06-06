@@ -143,6 +143,7 @@ pub fn router(
         .route("/login",  get(serve_login).post(handle_login))
         .route("/logout", get(handle_logout).post(handle_logout))
         .route("/api/webui/password", post(change_password))
+        .route("/api/webui/password-status", get(password_status))
         .route("/favicon.ico", get(serve_favicon))
         .route("/webui/auth-events", get(auth_events_handler))
         .route("/api/webui/auth-events", get(auth_events_handler))
@@ -579,6 +580,28 @@ async fn handle_logout(
 // POST /api/webui/password — change WebUI credentials (authenticated)
 #[derive(Deserialize)]
 struct ChangePasswordPayload { username: String, password: String }
+
+/// GET /api/webui/password-status — authenticated. Reports whether the WebUI still
+/// uses the default admin/admin credentials, so the dashboard can prompt the
+/// operator to change them on connect.
+async fn password_status(State(state): State<Arc<WebUiState>>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, "not authenticated").into_response();
+    }
+    let cred = state.creds.lock().unwrap_or_else(|e| e.into_inner());
+    let is_default = cred.username == "admin"
+        && PasswordHash::new(&cred.hash)
+            .ok()
+            .map(|ph| Argon2::default().verify_password(b"admin", &ph).is_ok())
+            .unwrap_or(false);
+    drop(cred);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        format!("{{\"default\":{is_default}}}"),
+    )
+        .into_response()
+}
 
 async fn change_password(
     State(state): State<Arc<WebUiState>>,
