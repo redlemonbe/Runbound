@@ -58,6 +58,7 @@ RWQHTbP57y/xH3OD6tvg2oi8LeyuQ9YYxVen+oeOCyKqTXfV2cCypAk0
 ```bash
 minisign -G -W                   # generates (no passphrase: required for unattended CI signing) minisign.key (private) + minisign.pub (public)
 # 1. Add the *private* key file contents as repo secret MINISIGN_SECRET (Settings → Secrets → Actions)
+# 1b. If the key has a passphrase (recommended), also add it as repo secret MINISIGN_PASSWORD
 # 2. Paste the *public* key (minisign.pub) into the block above and commit
 ```
 
