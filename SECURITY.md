@@ -5,7 +5,7 @@
 Runbound is **experimental** and has **not** undergone an external human security
 audit. It is not yet recommended for production deployments handling sensitive
 traffic. See [METHODOLOGY.md](METHODOLOGY.md) for the development approach and
-[docs/ROADMAP-SOUVERAINETE.md](docs/ROADMAP-SOUVERAINETE.md) for planned hardening.
+docs/ROADMAP-SOUVERAINETE.md for planned hardening.
 
 ## Supported versions
 
