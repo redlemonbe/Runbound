@@ -114,6 +114,9 @@ controlled back-to-back A/B, 5 runs each, medians):
 is CPU-frequency / host-state dependent, so the back-to-back ratio is the
 reliable figure.)
 
+> These are component-level micro-benchmarks. End-to-end numbers follow the formal
+> methodology in [benchmark/README.md](benchmark/README.md).
+
 Everything the wire builder does not cover — NXDOMAIN, NODATA, **wildcard
 local-data**, CNAME/MX/TXT, EDNS (OPT), ACL Deny, ANY, malformed — transparently
 **falls back to hickory**, so behaviour is unchanged outside the A/AAAA answer case.
