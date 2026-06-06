@@ -1,6 +1,6 @@
 # How Runbound was built
 
-I'm not a software engineer by training. My background is ASM, PHP, HTML — hardware and networks are where I'm most comfortable. Self-taught on Linux Debian, Nginx, Proxmox, SMTP. I learned the basics of Rust in a few hours, enough to read and understand it, not enough to write it from scratch.
+I'm not a software engineer by training. My background is ASM, PHP, HTML — hardware and networks are where I'm most comfortable. Self-taught on Linux Debian, Nginx, Proxmox, SMTP. I came to Rust as a systems person rather than a Rust programmer — enough to read, review and direct the code; the implementation itself is handled by AI agents under my architectural direction and review.
 
 This project started from frustration: I was tired of editing Unbound config files by hand every week. The original idea was just a REST API wrapper around Unbound. Then I realized that with the right prompts, I could go much further.
 
