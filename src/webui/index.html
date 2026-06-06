@@ -269,6 +269,7 @@
   <button role="tab" aria-selected="false" aria-controls="tab-blacklist"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
   <button role="tab" aria-selected="false" aria-controls="tab-feeds"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
   <button role="tab" aria-selected="false" aria-controls="tab-upstreams"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-splithz" class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('splithz',this)">Split-Horizon</button>
   <button role="tab" aria-selected="false" aria-controls="tab-logs"       class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
   <button role="tab" aria-selected="false" aria-controls="tab-protection" class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('protection',this)">Protection</button>
   <button role="tab" aria-selected="false" aria-controls="tab-users"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('users',this)">Users</button>
@@ -494,6 +495,19 @@
   </div>
 
   <!-- ═══ LOGS ═══ -->
+  <div id="tab-splithz" class="hidden fade">
+    <div class="card mb-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Split-Horizon — per-subnet answers</div>
+      <p class="text-xs text-gray-700 mb-3">Return different DNS answers depending on the client subnet. Persisted to runbound.conf; applied on the next service restart.</p>
+      <div class="space-y-3 max-w-lg" style="padding-left:3px">
+        <div><label class="text-xs text-gray-500 block mb-1">Name</label><input id="sh-name" class="input w-full" placeholder="office"/></div>
+        <div><label class="text-xs text-gray-500 block mb-1">Subnets (comma-separated)</label><input id="sh-subnets" class="input w-full" placeholder="10.0.0.0/8, 192.168.0.0/16"/></div>
+        <div><label class="text-xs text-gray-500 block mb-1">Local-data (one RR per line)</label><textarea id="sh-data" class="input w-full" rows="3" placeholder="intra.corp. A 10.0.0.5"></textarea></div>
+        <button onclick="shAdd()" class="btn-primary mt-1">Add / update entry</button>
+      </div>
+    </div>
+    <div id="sh-list" class="text-sm text-gray-600 italic">—</div>
+  </div>
   <div id="tab-logs" class="hidden fade">
     <div class="flex gap-3 mb-4 flex-wrap items-center">
       <button onclick="loadLogs()" class="btn-secondary">↻ Refresh</button>
@@ -1265,6 +1279,22 @@ async function loadPresets(){
   }catch(_){document.getElementById('feed-presets').innerHTML='<span class="text-gray-700 italic text-xs">Presets unavailable.</span>';}
 }
 async function feedAddPreset(i){const p=presetsCache[i];if(!p)return;try{const r=await api('POST','/feeds',{name:p.name,url:p.url,format:p.format??'hosts',action:p.action??'nxdomain',enabled:true});toast(`"${p.name}" added`);const id=r.feed?.id;if(id){updatingFeeds.add(id);loadPresets();loadFeeds();try{await api('POST','/feeds/'+id+'/update');}catch(_){}pollFeedUpdate(id,null);}else{loadPresets();loadFeeds();}}catch(e){toast('Add failed: '+e.message,true);}}
+async function loadSplitHorizon(){
+  const el=document.getElementById('sh-list');
+  try{
+    const d=await api('GET','/split-horizon');const items=d.split_horizon??[];
+    if(!items.length){el.innerHTML='<span class="text-gray-700 italic">No split-horizon entries.</span>';return;}
+    el.innerHTML=items.map(e=>`<div class="row gap-2 items-start"><div class="flex-1 min-w-0"><span class="text-cyan-400 font-mono">${esc(e.name)}</span><div class="text-xs text-gray-600">subnets: ${(e.subnets||[]).map(esc).join(', ')}</div><div class="text-xs text-gray-700">${(e.local_data||[]).map(esc).join('<br>')}</div></div><button class="del shrink-0" onclick="shDelete('${esc(e.name)}')">✕</button></div>`).join('');
+  }catch(e){el.textContent='Error: '+e.message;}
+}
+async function shAdd(){
+  const name=document.getElementById('sh-name').value.trim();
+  const subnets=document.getElementById('sh-subnets').value.split(',').map(x=>x.trim()).filter(Boolean);
+  const local_data=document.getElementById('sh-data').value.split('\n').map(x=>x.trim()).filter(Boolean);
+  if(!name||!subnets.length)return toast('Name and at least one subnet required',true);
+  try{await api('POST','/split-horizon',{name,subnets,local_data});toast('Saved — applied on next restart');document.getElementById('sh-name').value='';document.getElementById('sh-subnets').value='';document.getElementById('sh-data').value='';loadSplitHorizon();}catch(e){toast('Add: '+e.message,true);}
+}
+async function shDelete(name){if(!confirm('Delete split-horizon "'+name+'"?'))return;try{await api('DELETE','/split-horizon/'+encodeURIComponent(name));toast('Deleted — applied on next restart');loadSplitHorizon();}catch(e){toast('Delete: '+e.message,true);}}
 async function loadFeeds(){
   try{
     const d=await api('GET','/feeds'),feeds=d.feeds??[];
@@ -1446,7 +1476,7 @@ function toast(msg,err=false){const el=document.getElementById('toast');el.textC
 function showTab(name,btn){
   if(name!=='logs'){clearInterval(logsTimer);logsTimer=null;const cb=document.getElementById('logs-auto');if(cb)cb.checked=false;}
   if(name!=='protection'){clearInterval(protectionTimer);protectionTimer=null;}
-  ['overview','dns','blacklist','feeds','upstreams','logs','system','protection','about','settings','users'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
+  ['overview','dns','blacklist','feeds','upstreams','splithz','logs','system','protection','about','settings','users'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
   document.querySelectorAll('.tab-active').forEach(b=>{b.classList.remove('tab-active');b.setAttribute('aria-selected','false');});
   const el=document.getElementById('tab-'+name);el.classList.remove('hidden');el.classList.add('fade');
   btn.classList.add('tab-active');btn.setAttribute('aria-selected','true');
@@ -1454,6 +1484,7 @@ function showTab(name,btn){
   if(name==='blacklist')loadBlacklist();
   if(name==='feeds'){loadPresets();loadFeeds();}
   if(name==='upstreams'){loadUpstreamPresets();loadUpstreams();}
+  if(name==='splithz')loadSplitHorizon();
   if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
   if(name==='protection'){loadProtection();protectionTimer=setInterval(loadProtection,4000);}
