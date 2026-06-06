@@ -296,6 +296,36 @@ fn parse_addr_port(addr: &str, default_port: u16) -> (String, u16) {
 }
 
 // ── Initialise from config ─────────────────────────────────────────────────
+/// Rebuild forward-zone config blocks from the live upstream set — the inverse of
+/// `init_upstreams`. Groups upstreams by (zone, protocol); each group becomes one
+/// forward-zone with `tls = protocol == "dot"` and `addr@port` forward-addrs.
+/// Used to persist runtime upstream changes back into runbound.conf. Temporary
+/// (probe) upstreams are excluded.
+pub fn rebuild_forward_zones(upstreams: &SharedUpstreams) -> Vec<crate::config::parser::ForwardZone> {
+    use crate::config::parser::ForwardZone;
+    use std::collections::BTreeMap;
+    let list = upstreams
+        .read()
+        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in rebuild_forward_zones: {e}"));
+    let mut groups: BTreeMap<(String, bool), ForwardZone> = BTreeMap::new();
+    for u in list.iter() {
+        if u.temporary { continue; }
+        let tls = u.protocol == "dot";
+        let zone = if u.zone.is_empty() { ".".to_string() } else { u.zone.clone() };
+        let fz = groups.entry((zone.clone(), tls)).or_insert_with(|| ForwardZone {
+            name: zone.clone(),
+            addrs: Vec::new(),
+            tls,
+            tls_hostname: None,
+        });
+        fz.addrs.push(format!("{}@{}", u.addr, u.port));
+        if fz.tls_hostname.is_none() {
+            fz.tls_hostname = u.tls_hostname.clone();
+        }
+    }
+    groups.into_values().collect()
+}
+
 pub fn init_upstreams(cfg: &UnboundConfig) -> SharedUpstreams {
     let mut statuses = Vec::new();
     for fz in &cfg.forward_zones {
