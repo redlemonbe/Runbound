@@ -30,7 +30,7 @@ Every release publishes:
 - the four static binaries (`runbound-{x86_64,aarch64}-linux-{gnu,musl}`),
 - **`SHA256SUMS`** — checksums of all binaries + the SBOM,
 - **`sbom.cdx.json`** — CycloneDX SBOM (all crates + versions),
-- **`*.minisig`** — [minisign](https://jedisct1.github.io/minisign/) signatures, **when the project has a signing key configured**.
+- **`*.minisig`** — [minisign](https://jedisct1.github.io/minisign/) signatures. Every release since **v0.15.0** is signed; verify with the public key below.
 
 ### Verify checksums
 
