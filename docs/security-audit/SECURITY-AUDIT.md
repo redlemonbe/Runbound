@@ -699,4 +699,4 @@ Description: POST /api/webhooks/test is protected by the same auth middleware as
 
 **Cryptography (documented during this cycle):** transport TLS via rustls 0.23 (TLS 1.2/1.3 only); WebUI argon2id; relay HMAC-SHA256 + anti-replay; optional HMAC-chained audit log.
 
-Remediation is tracked in [ROADMAP-SOUVERAINETE.md](../ROADMAP-SOUVERAINETE.md). Verdict: real XDP performance and a sound Rust architecture; the gap to state-grade use is trust paperwork (audit, reproducible build, SBOM), not code.
+Remediation items are the OPEN-F findings listed above. Verdict: real XDP performance and a sound Rust architecture; the gap to state-grade use is trust paperwork (audit, reproducible build, SBOM), not code.
