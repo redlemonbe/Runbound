@@ -77,7 +77,7 @@ Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
 | **Upstreams** | Add / delete resolvers; 9 built-in presets; health dots, DNSSEC badge, latency sparkline, DoT SNI config; **↺ Reconnect DoT** button |
 | **Logs** | Query ring buffer with 3-second auto-refresh; WebUI auth activity log |
 | **Protection** | ICMP XDP flood protection: enable/disable per node; rate / burst / ban-threshold config; per-node stats cards; DDoS alert and blocked-IP log |
-| **System** | Runtime info (version, XDP mode, memory, CPU); slave list with sync status and version; cache flush button |
+| **System** | Runtime info (version, XDP mode, memory, CPU); slave list with sync status and version; full backup download / restore; cache flush button |
 | **Settings** | DNSSEC validation toggle; CA certificate download; password change; session info; recent auth event log |
 | **About** | Version badge, uptime, feature list, GitHub links, credits |
 
