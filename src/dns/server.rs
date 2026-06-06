@@ -851,19 +851,22 @@ impl RunboundHandler {
                     }
                 }
 
-                let rcode = match &e {
+                let (rcode, neg_ttl_secs) = match &e {
                     NetError::Dns(DnsError::NoRecordsFound(NoRecords {
-                        response_code, ..
+                        response_code, negative_ttl, ..
                     })) => {
                         debug!(name=%sanitize_dns_name(qname), ?response_code, "no records from resolver");
-                        *response_code
+                        // RFC 2308: negative TTL from the SOA MINIMUM (hickory pre-computes
+                        // it into negative_ttl). Clamp prudently [60, 900]s so a flood of
+                        // random sub-domains under an existing zone cannot bloat the cache.
+                        (*response_code, negative_ttl.unwrap_or(300).clamp(60, 900))
                     }
                     _ => {
                         if !is_dnssec_bogus {
                             // was warn! per query → log-spam under SERVFAIL-heavy load.
                             debug!(name=%sanitize_dns_name(qname), err=%e, "resolver error → SERVFAIL");
                         }
-                        ResponseCode::ServFail
+                        (ResponseCode::ServFail, 0)
                     }
                 };
                 let err_action = match rcode {
@@ -917,11 +920,15 @@ impl RunboundHandler {
                 // SERVFAIL = transient under load (measured: 5.77% -> 0.71% after warmup)
                 //            -> do NOT cache (false negatives would mask real domains).
                 // Insert is SYNCHRONOUS (tokio::spawn may not execute under saturated runtime).
-                if rcode == ResponseCode::NXDomain {
+                // #166: negative-cache NXDOMAIN (RFC 2308) AND NODATA (NOERROR-empty).
+                // Both are authoritative non-existence facts, stable for the SOA TTL, and
+                // otherwise re-recurse on every query — under flood that drowns the Rust
+                // fallback (measured 17% drop). SERVFAIL is transient -> neg_ttl_secs=0 -> skip.
+                if (rcode == ResponseCode::NXDomain || rcode == ResponseCode::NoError)
+                    && neg_ttl_secs > 0
+                {
                     if let Some(ref cache) = self.xdp_cache {
-                        let ttl = 30u32
-                            .max(self.cache_min_ttl)
-                            .min(self.cache_max_ttl);
+                        let ttl = neg_ttl_secs;
                         // Build wire-format name key (same pattern as positive-cache insert).
                         let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
                         let mut name_enc = BinEncoder::new(&mut name_tmp);
@@ -937,7 +944,7 @@ impl RunboundHandler {
                                 MessageType::Response,
                                 OpCode::Query,
                             );
-                            neg_msg.metadata.response_code = ResponseCode::NXDomain;
+                            neg_msg.metadata.response_code = rcode;
                             neg_msg.metadata.recursion_available = true;
                             neg_msg.add_query(DnsQuery::query(
                                 Name::from(qname), qtype,
