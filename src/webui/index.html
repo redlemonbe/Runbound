@@ -1709,7 +1709,20 @@ function resetIdleTimer() {
 }
 ['click','keydown','mousemove','touchstart'].forEach(ev => document.addEventListener(ev, resetIdleTimer, {passive:true}));
 
-window.onload=()=>{ applyBranding(); loadAll(); resetIdleTimer(); };
+async function checkDefaultPassword(){
+  try{
+    const r = await fetch('/api/webui/password-status', {credentials:'same-origin'});
+    if(!r.ok) return;
+    const d = await r.json();
+    if(d && d.default) document.getElementById('default-pw-modal').style.display='flex';
+  }catch(e){}
+}
+function goChangePassword(){
+  document.getElementById('default-pw-modal').style.display='none';
+  showTab('settings', document.querySelector('button[aria-controls="tab-settings"]'));
+  setTimeout(()=>{const u=document.getElementById('set-new-pass'); if(u){u.scrollIntoView({behavior:'smooth',block:'center'}); u.focus();}},150);
+}
+window.onload=()=>{ applyBranding(); loadAll(); resetIdleTimer(); checkDefaultPassword(); };
 async function applyBranding() {
   try {
     const b = await fetch('/webui/branding').then(r => r.json());
@@ -1893,6 +1906,16 @@ function showApiKey(key) {
     <div class="flex gap-2 justify-end">
       <button class="btn-secondary" onclick="modalCancel()">Cancel</button>
       <button class="btn-primary" onclick="modalConfirm()">OK</button>
+    </div>
+  </div>
+</div>
+<div id="default-pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:9999;align-items:center;justify-content:center">
+  <div class="card border border-yellow-700" style="max-width:420px;margin:1rem">
+    <div class="text-yellow-400 font-bold mb-2">⚠ Default password in use</div>
+    <p class="text-sm text-gray-300 mb-4">The <span class="font-mono text-cyan-400">admin</span> account still uses the default password (<span class="font-mono">admin</span>). Change it now to secure dashboard access.</p>
+    <div class="flex gap-2 justify-end">
+      <button onclick="document.getElementById('default-pw-modal').style.display='none'" class="btn-secondary text-xs">Later</button>
+      <button onclick="goChangePassword()" class="btn-primary text-xs">Change now</button>
     </div>
   </div>
 </div>
