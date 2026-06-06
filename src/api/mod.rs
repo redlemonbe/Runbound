@@ -178,6 +178,15 @@ const MAX_FEEDS: usize = 100;
 pub fn init_api_key(config_key: Option<String>) -> String {
     let key = crate::hsm::api_key()
         .map(|k| k.to_string())
+        // #181: read the key from a 0600 file whose PATH is in the env, so the secret
+        // VALUE is never exported into the process environment (/proc/<pid>/environ).
+        .or_else(|| {
+            std::env::var("RUNBOUND_API_KEY_FILE")
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| std::env::var("RUNBOUND_API_KEY").ok())
         .or(config_key)
         .unwrap_or_else(|| {
@@ -527,6 +536,16 @@ async fn security_middleware(
                         warn!(failures, "Repeated API authentication failures — check RUNBOUND_API_KEY");
                     }
                 });
+                // #182: after repeated INVALID attempts, lock out the brute-forcer
+                // with 429. A VALID key never reaches this branch — it resets
+                // AUTH_FAILURES and proceeds — so a legitimate caller is never locked out.
+                if failures >= 20 {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(axum::http::header::RETRY_AFTER, "30")],
+                        "Too many authentication failures",
+                    ).into_response();
+                }
                 return (
                     StatusCode::UNAUTHORIZED,
                     [(axum::http::header::WWW_AUTHENTICATE, "Bearer realm=\"runbound\"")],
