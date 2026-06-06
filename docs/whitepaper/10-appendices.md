@@ -22,6 +22,6 @@ TOFU, SO_REUSEPORT, cgroup v2 `memory.max`.
 
 ## E. Verifying a release
 ```
-minisign -Vm runbound-x86_64-linux-gnu -P "RWQHTbP57y/xH3OD6tvg2oi8LeyuQ9YYxVen+oeOCyKqTXfV2cCypAk0"
+minisign -Vm runbound-x86_64-linux-gnu -P "RWT4uccC0fq9zgcaMtMsdH90azvmKpsNI1xlZrzlBuGH7xx1nDftTFJr"
 sha256sum -c SHA256SUMS
 ```
