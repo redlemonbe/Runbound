@@ -326,6 +326,10 @@ pub struct AppState {
     /// #153: Channel to send the current blacklist domain list to the XDP poll task
     /// for fast-path NXDOMAIN blocking. None when XDP is disabled.
     pub blacklist_reload_tx: Option<tokio::sync::mpsc::Sender<Vec<String>>>,
+    /// #10: editable split-horizon entries. CRUD via /api/split-horizon persists to
+    /// runbound.conf; applied to the resolver on the next service restart (the live
+    /// resolver's split-horizon table is built at boot and not hot-swapped).
+    pub split_horizon: Arc<std::sync::Mutex<Vec<crate::config::parser::SplitHorizonEntry>>>,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -623,6 +627,8 @@ pub fn router(state: AppState) -> Router {
             get(list_blacklist_handler).post(add_blacklist_handler),
         )
         .route("/blacklist/:id", delete(delete_blacklist_handler))
+        .route("/split-horizon", get(list_split_horizon).post(add_split_horizon))
+        .route("/split-horizon/:name", delete(delete_split_horizon))
         // Feeds
         .route("/feeds", get(get_feeds_handler).post(add_feed_handler))
         .route("/feeds/presets", get(feed_presets_handler))
@@ -2214,6 +2220,81 @@ fn default_protocol() -> String {
     "udp".into()
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SplitHorizonView {
+    name: String,
+    subnets: Vec<String>,
+    #[serde(default)]
+    local_data: Vec<String>,
+}
+impl SplitHorizonView {
+    fn from_entry(e: &crate::config::parser::SplitHorizonEntry) -> Self {
+        Self {
+            name: e.name.clone(),
+            subnets: e.subnets.clone(),
+            local_data: e.local_data.iter().map(|d| d.rr.clone()).collect(),
+        }
+    }
+    fn into_entry(self) -> crate::config::parser::SplitHorizonEntry {
+        crate::config::parser::SplitHorizonEntry {
+            name: self.name,
+            subnets: self.subnets,
+            local_data: self.local_data.into_iter()
+                .map(|rr| crate::config::parser::LocalData { rr }).collect(),
+        }
+    }
+}
+
+/// GET /api/split-horizon — list editable split-horizon entries.
+async fn list_split_horizon(State(s): State<AppState>) -> impl IntoResponse {
+    let v: Vec<SplitHorizonView> = s.split_horizon
+        .lock().unwrap_or_else(|e| e.into_inner())
+        .iter().map(SplitHorizonView::from_entry).collect();
+    JsonExtract(serde_json::json!({ "split_horizon": v }))
+}
+
+/// POST /api/split-horizon — add or replace (by name) a split-horizon entry.
+/// Persisted to runbound.conf; applied on the next service restart.
+async fn add_split_horizon(
+    State(s): State<AppState>,
+    ApiJson(req): ApiJson<SplitHorizonView>,
+) -> impl IntoResponse {
+    if s.slave_mode {
+        return (StatusCode::SERVICE_UNAVAILABLE, JsonExtract(serde_json::json!({"error":"SLAVE_READONLY"})));
+    }
+    if req.name.trim().is_empty() || req.subnets.is_empty() {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID","details":"name and at least one subnet are required"})));
+    }
+    let name = req.name.clone();
+    {
+        let mut g = s.split_horizon.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|e| e.name != name);
+        g.push(req.into_entry());
+    }
+    persist_config(&s);
+    info!(name = %name, "split-horizon entry added/updated via API");
+    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","name":name,"note":"applied on next service restart"})))
+}
+
+/// DELETE /api/split-horizon/:name — remove a split-horizon entry by name.
+async fn delete_split_horizon(
+    State(s): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if s.slave_mode {
+        return (StatusCode::SERVICE_UNAVAILABLE, JsonExtract(serde_json::json!({"error":"SLAVE_READONLY"})));
+    }
+    let before;
+    {
+        let mut g = s.split_horizon.lock().unwrap_or_else(|e| e.into_inner());
+        before = g.len();
+        g.retain(|e| e.name != name);
+    }
+    persist_config(&s);
+    info!(name = %name, "split-horizon entry deleted via API");
+    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","removed": before, "note":"applied on next service restart"})))
+}
+
 /// Persist the effective config (boot config + live runtime overrides: the DNSSEC
 /// toggle and the current upstream set) back to runbound.conf via the atomic
 /// writer. No-op on slaves (their config is driven by the master). Errors are
@@ -2223,6 +2304,7 @@ fn persist_config(s: &AppState) {
     let mut c = (*s.cfg).clone();
     c.dnssec_validation = s.dnssec_enabled.load(Ordering::Relaxed);
     c.forward_zones = upstreams::rebuild_forward_zones(&s.upstreams);
+    c.split_horizon = s.split_horizon.lock().unwrap_or_else(|e| e.into_inner()).clone();
     match crate::config::writer::write_config_atomic(&c, std::path::Path::new(&s.cfg_path)) {
         Ok(()) => info!(path = %s.cfg_path, "config persisted to runbound.conf"),
         Err(e) => warn!(%e, path = %s.cfg_path, "failed to persist config to runbound.conf"),
@@ -3697,6 +3779,7 @@ mod tests {
         let stats = crate::stats::Stats::new();
         let stats_cache = crate::stats::new_snapshot_cache(&stats);
         let state = AppState {
+            split_horizon: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             zones: Arc::clone(&zones),
             zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
             tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
@@ -5866,6 +5949,7 @@ mod tests {
         let stats = crate::stats::Stats::new();
         let stats_cache = crate::stats::new_snapshot_cache(&stats);
         let state = AppState {
+            split_horizon: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             zones: Arc::clone(&zones),
             zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
             tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
