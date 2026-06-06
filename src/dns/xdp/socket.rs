@@ -30,8 +30,23 @@ use crate::dns::xdp::umem::{
 const SIOCETHTOOL: libc::c_ulong = 0x8946;
 const ETHTOOL_GRINGPARAM: u32 = 0x0000_0010;
 const ETHTOOL_SRINGPARAM: u32 = 0x0000_0011;
+const ETHTOOL_GCHANNELS: u32 = 0x0000_003c;
+const ETHTOOL_SCHANNELS: u32 = 0x0000_003d;
 
 /// Matches `struct ethtool_ringparam` in <linux/ethtool.h>.
+#[repr(C)]
+struct EthtoolChannels {
+    cmd: u32,
+    max_rx: u32,
+    max_tx: u32,
+    max_other: u32,
+    max_combined: u32,
+    rx_count: u32,
+    tx_count: u32,
+    other_count: u32,
+    combined_count: u32,
+}
+
 #[repr(C)]
 struct EthtoolRingParam {
     cmd: u32,
@@ -546,6 +561,62 @@ fn first_physical_bridge_port(bridge: &str) -> Option<String> {
 }
 
 // ── NIC ring-buffer tuning (#80) ──────────────────────────────────────────
+
+/// Auto-tune NIC combined queues before XDP attach. On a Xeon v2 + X520 host
+/// (PCIe-bus-bound at ~16 cores) keep the driver default. On any modern CPU,
+/// raise `combined` queues to the hardware maximum, capped by physical cores and
+/// `budget` (the AF-XDP / XSKMAP per-NIC limit), so XDP spreads over all cores
+/// instead of the 16-queue ixgbe default. Must run BEFORE attaching XDP (a queue
+/// change resets the NIC). No-op (returns current count) on Xeon v2 or any error.
+pub fn auto_tune_nic_queues(iface: &str, budget: u32) -> u32 {
+    if is_xeon_v2_x520_host(iface) {
+        tracing::info!(iface = %iface, "XDP queues: Xeon v2 + X520 detected — keeping default (bus-bound ~16c)");
+        return get_rx_queue_count(iface);
+    }
+    let iface_safe = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None => return get_rx_queue_count(iface),
+    };
+    // SAFETY: AF_INET/DGRAM socket used only as an ioctl handle.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return get_rx_queue_count(iface);
+    }
+    // SAFETY: zeroed() valid for this plain repr(C) struct of u32 fields.
+    let mut ch: EthtoolChannels = unsafe { std::mem::zeroed() };
+    ch.cmd = ETHTOOL_GCHANNELS;
+    let mut ifr = build_ifreq(iface_safe.clone(), (&mut ch as *mut EthtoolChannels).cast());
+    // SAFETY: fd valid; ifr fully initialised with a valid ifr_data pointer.
+    let get_rc = unsafe {
+        libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>())
+    };
+    if get_rc < 0 {
+        // Driver doesn't support GCHANNELS (some NICs) — leave queues as-is.
+        unsafe { libc::close(fd) };
+        return get_rx_queue_count(iface);
+    }
+    let hw_max = ch.max_combined.max(ch.max_rx);
+    let cores = crate::cpu::physical_cores().len() as u32;
+    let target = hw_max.min(cores).min(budget.max(1)).max(1);
+    if target > ch.combined_count {
+        let mut sch: EthtoolChannels = unsafe { std::mem::zeroed() };
+        sch.cmd = ETHTOOL_SCHANNELS;
+        sch.combined_count = target;
+        let mut sifr = build_ifreq(iface_safe, (&mut sch as *mut EthtoolChannels).cast());
+        // SAFETY: same as the GET call above.
+        let set_rc = unsafe {
+            libc::ioctl(fd, SIOCETHTOOL as _, (&mut sifr as *mut IfReqEthtool).cast::<libc::c_void>())
+        };
+        if set_rc >= 0 {
+            tracing::info!(iface = %iface, from = ch.combined_count, to = target, hw_max, cores,
+                "XDP queues: auto-debrided to hardware max (non-Xeon-v2 host)");
+        } else {
+            tracing::warn!(iface = %iface, target, "XDP queues: SCHANNELS failed — keeping current");
+        }
+    }
+    unsafe { libc::close(fd) };
+    get_rx_queue_count(iface)
+}
 
 /// Maximize the NIC RX/TX ring buffers via `SIOCETHTOOL` before XDP attachment.
 ///
