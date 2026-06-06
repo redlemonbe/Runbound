@@ -9,6 +9,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.15.3] - 2026-06-07
+
+### Fixed
+- **#179** — Intermittent NXDOMAIN / cache-miss query loss (~20%) under load on the
+  kernel UDP fast path (xdp:no). Root cause: a fallback reply socket was bound to
+  the listen port with SO_REUSEPORT but never recv()'d; the kernel reuseport hash
+  therefore steered ~1/N of inbound queries to it, filling its (default-sized)
+  receive buffer and silently dropping them (UdpRcvbufErrors). The fallback reader
+  now replies through the per-message arrival socket (the drained per-core 8 MiB
+  socket the query actually came in on; the #167 reply socket under XDP), and the
+  phantom socket is no longer bound. Hot path unchanged. Verified at runtime:
+  50/50 sequential NXDOMAIN answered, UdpRcvbufErrors stays 0 under burst.
+
 ## [0.15.2] — 2026-06-06
 
 ### Fixed

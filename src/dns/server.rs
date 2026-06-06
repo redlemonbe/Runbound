@@ -2618,25 +2618,12 @@ pub async fn run_dns_server(
             }
         }
 
-        // Bind a std UDP socket for fallback replies (SO_REUSEPORT, same port).
-        let fb_port = cfg.port;
-        let fb_bind = interfaces.first().map(|s| s.as_str()).unwrap_or("0.0.0.0");
-        let fb_sock = {
-            use socket2::{Domain, Protocol as S2Protocol, Socket as S2Socket, Type};
-            let domain = if fb_bind.contains(':') { Domain::IPV6 } else { Domain::IPV4 };
-            let s = S2Socket::new(domain, Type::DGRAM, Some(S2Protocol::UDP))
-                .expect("fallback UDP socket");
-            #[cfg(unix)] {
-                s.set_reuse_port(true).ok();
-            }
-            s.set_reuse_address(true).ok();
-            s.set_nonblocking(false).ok();
-            let addr: std::net::SocketAddr =
-                format!("{}:{}", fb_bind, fb_port).parse().unwrap();
-            s.bind(&addr.into()).expect("fallback UDP bind");
-            let std_sock: std::net::UdpSocket = s.into();
-            std::sync::Arc::new(std_sock)
-        };
+        // #179: reply via the per-message arrival socket (msg.socket), which is the
+        // DRAINED socket the query came in on (kernel-loop: the worker's 8 MiB
+        // SO_REUSEPORT socket; XDP: the #167 reply socket). A separate fb_sock bound
+        // to :port with SO_REUSEPORT but NEVER recv()'d used to steal ~1/N of incoming
+        // queries via the reuseport hash, filling its (default-sized) buffer and
+        // dropping them (RcvbufErrors) -> intermittent NXDOMAIN/cache-miss timeouts.
 
         let handler_fb = std::sync::Arc::clone(&handler_arc2);
         // #fix(xdp-recursion): process fallbacks CONCURRENTLY. A sequential await
@@ -2650,7 +2637,7 @@ pub async fn run_dns_server(
                     Err(_) => break,
                 };
                 let handler_c = std::sync::Arc::clone(&handler_fb);
-                let sock_c = std::sync::Arc::clone(&fb_sock);
+                let sock_c = std::sync::Arc::clone(&msg.socket);
                 tokio::spawn(async move {
                     let _permit = permit; // released when this task ends
                     let request = match Request::from_bytes(
