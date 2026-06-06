@@ -1,7 +1,7 @@
 # Runbound — Sovereignty / Defense Remediation Roadmap
 
 Tracking of the **valid** items from the 2026-06-06 sovereignty audit
-([AUDIT-SOUVERAINETE-2026-06-06.md](AUDIT-SOUVERAINETE-2026-06-06.md)),
+([security-audit/SECURITY-AUDIT.md, Cycle F](security-audit/SECURITY-AUDIT.md#cycle-f--v0120-sovereigntydefense)),
 after maintainer review. False/overstated code findings are disputed in that
 document and are **not** listed here.
 
