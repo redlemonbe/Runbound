@@ -110,6 +110,26 @@ jobs:
             sbom.cdx.json \
             > SHA256SUMS
 
+      # ── Sign artifacts (minisign, optional) ──────────────────────────────
+      # Set the MINISIGN_SECRET repo secret to enable signing. Without it the step
+      # is a no-op (SHA256SUMS still ships). Public key + verification: docs/BUILD.md.
+      - name: Sign release artifacts (minisign)
+        env:
+          MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET }}
+        run: |
+          if [ -z "${MINISIGN_SECRET}" ]; then
+            echo "MINISIGN_SECRET not set — skipping signatures (SHA256SUMS still published)."
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          printf '%s' "${MINISIGN_SECRET}" > "${RUNNER_TEMP}/minisign.key"
+          for f in runbound-x86_64-linux-gnu runbound-x86_64-linux-musl \
+                   runbound-aarch64-linux-gnu runbound-aarch64-linux-musl \
+                   SHA256SUMS sbom.cdx.json; do
+            [ -f "$f" ] && minisign -S -s "${RUNNER_TEMP}/minisign.key" -m "$f"
+          done
+          rm -f "${RUNNER_TEMP}/minisign.key"
+
       # ── Changelog fragment ───────────────────────────────────────────────
       - name: Extract changelog fragment
         run: |
@@ -150,3 +170,15 @@ jobs:
             runbound-aarch64-linux-musl \
             SHA256SUMS \
             sbom.cdx.json
+
+      - name: Upload signatures (if any)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          sigs=(*.minisig)
+          if [ ${#sigs[@]} -gt 0 ]; then
+            gh release upload "${GITHUB_REF_NAME}" --clobber "${sigs[@]}"
+          else
+            echo "no signatures to upload"
+          fi
