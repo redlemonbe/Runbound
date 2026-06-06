@@ -335,7 +335,13 @@ impl Stats {
         let nxdomain = self.nxdomain.load(Ordering::Relaxed);
         let ch = self.cache_hits.load(Ordering::Relaxed);
         let cm = self.cache_misses.load(Ordering::Relaxed);
-        let cache_hit_rate = if ch + cm > 0 {
+        // XDP fast path counts served packets (hits) per-worker and now misses too.
+        // When XDP is active use those; otherwise fall back to the slow-path counters.
+        let xh: u64 = crate::dns::cache_snapshot::XDP_WORKER_PKTS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let xm: u64 = crate::dns::cache_snapshot::XDP_WORKER_MISS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let cache_hit_rate = if xh + xm > 0 {
+            (xh as f64 / (xh + xm) as f64 * 1000.0).round() / 10.0
+        } else if ch + cm > 0 {
             (ch as f64 / (ch + cm) as f64 * 1000.0).round() / 10.0
         } else {
             0.0
