@@ -70,6 +70,8 @@ pub struct UnboundConfig {
     pub local_data: Vec<LocalData>,
     pub forward_zones: Vec<ForwardZone>,
     pub verbosity: u8,
+    /// Log output format: "text" (default) or "json" (SIEM-ready structured logs).
+    pub log_format: String,
     pub logfile: Option<String>,
     pub pidfile: Option<String>,
     pub do_ipv4: bool,
@@ -798,6 +800,7 @@ fn parse_server_directive(
             }
         }
         "dnssec-validation" => cfg.dnssec_validation = val.trim_matches('"') == "yes",
+        "log-format" => cfg.log_format = val.trim_matches('"').trim().to_lowercase(),
         "dnssec-log-bogus" => cfg.dnssec_log_bogus = val.trim_matches('"') == "yes",
         "log-retention" => cfg.log_retention = val.parse().unwrap_or(1000),
         "log-client-ip" => cfg.log_client_ip = val.trim_matches('"') != "no",

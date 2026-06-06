@@ -29,7 +29,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
         "server" => matches!(
             key,
             "interface" | "port" | "access-control" | "local-zone" | "local-data"
-                | "verbosity" | "logfile" | "pidfile"
+                | "verbosity" | "logfile" | "pidfile" | "log-format"
                 | "do-ip4" | "do-ip6" | "do-udp" | "do-tcp"
                 | "tls-service-pem" | "tls-cert-bundle" | "tls-service-key"
                 | "tls-port" | "https-port" | "quic-port"
@@ -101,6 +101,7 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     for x in &cfg.access_control { o.push_str(&format!("    access-control: {x}\n")); }
     if cfg.port != d.port { o.push_str(&format!("    port: {}\n", cfg.port)); }
     if cfg.verbosity != d.verbosity { o.push_str(&format!("    verbosity: {}\n", cfg.verbosity)); }
+    if cfg.log_format != d.log_format { o.push_str(&format!("    log-format: {}\n", cfg.log_format)); }
     if let Some(v) = &cfg.logfile { o.push_str(&format!("    logfile: \"{v}\"\n")); }
     if let Some(v) = &cfg.pidfile { o.push_str(&format!("    pidfile: \"{v}\"\n")); }
     if cfg.do_ipv4 != d.do_ipv4 { o.push_str(&format!("    do-ip4: {}\n", b(cfg.do_ipv4))); }
