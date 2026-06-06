@@ -49,7 +49,7 @@ use crate::dns::wire_builder::{
     build_refused, parse_query, EdnsInfo,
 };
 use super::socket::{
-    create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface,
+    auto_tune_nic_queues, create_xsk_socket, get_rx_queue_count, iface_index, is_virtual_interface,
     parent_interface, sanitize_iface_name, XskSocket,
 };
 use super::umem::{XdpDesc, XdpRingSizes, FRAME_SIZE};
@@ -415,6 +415,10 @@ fn start_xdp_on_iface(
         }
     }
 
+    // #169 auto-queues: debride NIC combined queues before attach. Xeon v2 + X520
+    // → keep default (16, PCIe-bus-bound); any modern CPU → raise to HW max, capped
+    // to 32 (XSKMAP=64 / 2-NIC budget) — the bench-validated 32-queue config.
+    let _tuned = auto_tune_nic_queues(iface, 32);
     let queue_count = get_rx_queue_count(iface).max(1);
     let mut handle = XdpHandle::load(iface, queue_count, domain_routing)?;
     let num_cpus = crate::cpu::physical_cores().len().max(1);
