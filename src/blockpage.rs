@@ -52,7 +52,7 @@ pub async fn start(cfg: Arc<BlockPageConfig>) {
     };
     tokio::spawn(async move {
         loop {
-            if let Ok((mut socket, peer)) = listener.accept().await {
+            if let Ok((mut socket, _peer)) = listener.accept().await {
                 let cfg = Arc::clone(&cfg);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];

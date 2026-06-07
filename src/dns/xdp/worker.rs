@@ -29,7 +29,6 @@ use hickory_proto::{
     rr::LowerName,
     serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
 };
-use smallvec::SmallVec;
 
 use super::loader::XdpHandle;
 /// Return type for `answer_dns_wire()` — three-way dispatch replacing `Option<usize>`.
@@ -386,7 +385,7 @@ fn start_xdp_on_iface(
     domain_routing: bool,
     busy_poll: bool,
     core_base: usize,
-    ring_size: Option<u32>,
+    _ring_size: Option<u32>,
     xdp_ring_sizes: XdpRingSizes,
     stats: Arc<crate::stats::Stats>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
@@ -1376,7 +1375,6 @@ pub(crate) use WireResult as WireResultPub;
 /// ignored until the window rolls over (anti-DDoS; mirrors `deny` ACL — silent drop, no
 /// REFUSED). A thread-local shadow cache skips the shared bucket lock for 99%+ of
 /// known-IP traffic (allowed TTL 10ms, denied 100ms).
-#[inline]
 pub(crate) fn rl_should_drop(rate_limiter: &RateLimiter, ip: IpAddr) -> bool {
     if !rate_limiter.enabled() {
         return false; // rate-limit: 0 → no gate, zero per-packet cost
@@ -1511,7 +1509,7 @@ fn answer_from_cache(
         return None;
     }
     let qtype = u16::from_be_bytes([query_bytes[pos], query_bytes[pos + 1]]);
-    let qclass = u16::from_be_bytes([query_bytes[pos + 2], query_bytes[pos + 3]]);
+    let _qclass = u16::from_be_bytes([query_bytes[pos + 2], query_bytes[pos + 3]]);
 
     // ANY queries are not cached (hickory returns NOTIMP per RFC 8482).
     const QTYPE_ANY: u16 = 255;
