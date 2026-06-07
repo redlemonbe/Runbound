@@ -2364,6 +2364,7 @@ pub async fn run_dns_server(
     // Clone for kernel fast loop (must happen before acl/zones are moved into handler).
     let acl_for_kloop   = Arc::clone(&acl);
     let zones_for_kloop = Arc::clone(&zones);
+    let rl_for_kloop    = Arc::clone(&rate_limiter);
     let stats_for_kloop        = Arc::clone(&stats);
     let domain_stats_for_kloop = Arc::clone(&domain_stats);
     let xdp_cache_for_kloop    = xdp_cache.as_ref().map(Arc::clone);
@@ -2500,6 +2501,7 @@ pub async fn run_dns_server(
             &lo_cores,
             Arc::clone(&zones_for_kloop),
             Arc::clone(&acl_for_kloop),
+            Arc::clone(&rl_for_kloop),
             fallback_tx.clone(),
             lo_snapshot,
             Some(Arc::clone(&stats_for_kloop)),
@@ -2569,6 +2571,7 @@ pub async fn run_dns_server(
             &fast_cores,
             Arc::clone(&zones_for_kloop),
             Arc::clone(&acl_for_kloop),
+            Arc::clone(&rl_for_kloop),
             fallback_tx.clone(),
             kloop_cache_snapshot,
             Some(Arc::clone(&stats_for_kloop)),
