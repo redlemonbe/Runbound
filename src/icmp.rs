@@ -40,6 +40,8 @@ pub enum BanSource {
 pub struct BanEntry {
     pub ts: Instant,
     pub src: BanSource,
+    /// Permanent ("blacklisted") ban — never auto-expires in cleanup.
+    pub permanent: bool,
 }
 
 /// Command sent to the XDP poll task to apply/remove a kernel-level ban.
@@ -70,6 +72,9 @@ pub struct IcmpStats {
     pub ban_cmd_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<IcmpBanCmd>>>,
     /// Set once by build_and_launch to propagate new bans to slaves via relay.
     pub ban_propagate_tx: OnceLock<tokio::sync::mpsc::UnboundedSender<IpAddr>>,
+    /// Cheap presence flag so the per-packet data-path check is ~free when no IP
+    /// is banned (the common case): a single relaxed load, no DashMap hashing.
+    pub banned_present: std::sync::atomic::AtomicBool,
 }
 
 impl IcmpStats {
@@ -84,15 +89,32 @@ impl IcmpStats {
             ban_cmd_tx: tx,
             ban_cmd_rx: Mutex::new(Some(rx)),
             ban_propagate_tx: OnceLock::new(),
+            banned_present: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub fn ban(&self, ip: IpAddr, src: BanSource) {
-        self.banned.insert(ip, BanEntry { ts: Instant::now(), src });
+        self.banned.insert(ip, BanEntry { ts: Instant::now(), src, permanent: false });
+        self.banned_present.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Permanent ban ("blacklist") — survives expiry cleanup. Used by the API
+    /// blacklist action; still propagated to slaves like any other ban.
+    pub fn ban_permanent(&self, ip: IpAddr) {
+        self.banned.insert(ip, BanEntry { ts: Instant::now(), src: BanSource::Manual, permanent: true });
+        self.banned_present.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Per-packet data-path check (XDP enforces via the BPF `icmp_banned` map;
+    /// the kernel slow path calls this so bans also drop in `xdp: no`).
+    #[inline]
+    pub fn is_banned(&self, ip: IpAddr) -> bool {
+        self.banned_present.load(std::sync::atomic::Ordering::Relaxed) && self.banned.contains_key(&ip)
     }
 
     pub fn unban(&self, ip: IpAddr) {
         self.banned.remove(&ip);
+        self.banned_present.store(!self.banned.is_empty(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Remove ban entries older than  and unban from XDP fast path.
@@ -101,13 +123,14 @@ impl IcmpStats {
         let now = std::time::Instant::now();
         let mut to_unban: Vec<IpAddr> = Vec::new();
         self.banned.retain(|ip, entry| {
-            if now.duration_since(entry.ts).as_secs() < ttl_secs {
+            if entry.permanent || now.duration_since(entry.ts).as_secs() < ttl_secs {
                 true
             } else {
                 to_unban.push(*ip);
                 false
             }
         });
+        self.banned_present.store(!self.banned.is_empty(), std::sync::atomic::Ordering::Relaxed);
         for ip in to_unban {
             if let IpAddr::V4(ipv4) = ip {
                 let _ = self.ban_cmd_tx.send(IcmpBanCmd::Unban(ipv4));
@@ -124,6 +147,7 @@ impl IcmpStats {
                 "ip": ip.to_string(),
                 "source": format!("{:?}", entry.src),
                 "banned_ago_s": now.duration_since(entry.ts).as_secs(),
+                "permanent": entry.permanent,
             })
         }).collect()
     }

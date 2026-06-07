@@ -139,6 +139,7 @@ pub fn start_kernel_fast_loop(
     zones: Arc<ArcSwap<LocalZoneSet>>,
     acl: Arc<Acl>,
     rate_limiter: Arc<crate::dns::ratelimit::RateLimiter>,
+    icmp_stats: Arc<crate::icmp::IcmpStats>,
     fallback_tx: tokio::sync::mpsc::Sender<FallbackMsg>,
     cache_snapshot: Option<Arc<arc_swap::ArcSwap<crate::dns::cache_snapshot::CacheSnapshot>>>,
     stats: Option<Arc<crate::stats::Stats>>,
@@ -158,6 +159,7 @@ pub fn start_kernel_fast_loop(
         let zones2       = Arc::clone(&zones);
         let acl2         = Arc::clone(&acl);
         let rl2          = Arc::clone(&rate_limiter);
+        let icmp2        = Arc::clone(&icmp_stats);
         let fallback_tx2 = fallback_tx.clone();
         let cache2       = cache_snapshot.clone();
         let stats2       = stats.clone();
@@ -187,6 +189,7 @@ pub fn start_kernel_fast_loop(
                     zones2,
                     acl2,
                     rl2,
+                    icmp2,
                     fallback_tx2,
                     cache2,
                     stats2,
@@ -210,6 +213,7 @@ fn worker_loop(
     zones: Arc<ArcSwap<LocalZoneSet>>,
     acl: Arc<Acl>,
     rate_limiter: Arc<crate::dns::ratelimit::RateLimiter>,
+    icmp_stats: Arc<crate::icmp::IcmpStats>,
     fallback_tx: tokio::sync::mpsc::Sender<FallbackMsg>,
     cache_snapshot: Option<Arc<arc_swap::ArcSwap<crate::dns::cache_snapshot::CacheSnapshot>>>,
     stats: Option<Arc<crate::stats::Stats>>,
@@ -304,6 +308,12 @@ fn worker_loop(
             };
             let query = &rx_bufs[i][..len];
             let src_ip: Option<IpAddr> = Some(peer.ip());
+
+            // Banned source -> drop (same authoritative set as the XDP
+            // icmp_banned map; enforced here so bans work in xdp:no too).
+            if icmp_stats.is_banned(peer.ip()) {
+                continue;
+            }
 
             // Shared rate-limit gate (same helper + RateLimiter as the XDP
             // fast path): over-limit source IPs are ignored until the window

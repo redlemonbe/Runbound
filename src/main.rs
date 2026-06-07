@@ -541,6 +541,7 @@ async fn async_main(
         domain_stats,
         Arc::clone(&alert_tracker),
         Arc::clone(&dnssec_enabled),
+        icmp_stats,
     )
     .await;
     fw_cleanup.close();
