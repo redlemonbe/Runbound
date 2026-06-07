@@ -25,24 +25,29 @@ any figure not yet re-measured.
 - The naïve hickory slow path measured **1.78× Unbound's instructions/query** — the reason
   the fast paths exist (§1.2).
 
-## Slow path vs fast path — measured (v0.15.3, 5995WX, single X520, warm cache)
+## Slow path vs fast path — measured (v0.16.0, 5995WX, single X520, warm cache)
 
-The kernel slow path (`xdp: no`) runs the **same** SIMD/ASM `answer_from_cache` wire
-responder as the AF_XDP fast path — only the I/O source differs (kernel UDP socket vs
-AF_XDP ring). On the same host and NIC, no local-data:
+The kernel slow path (`xdp: no`) runs the **same** SIMD/ASM cache wire responder as the
+AF_XDP fast path — only the I/O source differs (kernel UDP socket vs AF_XDP ring). Measured
+back-to-back on the same host and NIC (Intel X520 / 82599, PCIe 2.0 x8), warm cache, no
+local-data, with only the `xdp:` line changed. Throughput is the receiver NIC PHY counter
+(`tx_pkts_nic`), not the generator round-trip.
 
-| path | served QPS | p50 | p99 | receiver CPU |
-|------|-----------:|----:|----:|-------------:|
-| AF_XDP fast path (`xdp: yes`) | ~8.8 M | ~0.2 ms | - | 8 % |
-| kernel slow path (`xdp: no`)  | ~6.1 M | 0.565 ms | 0.783 ms | 45 % |
+| path | max served | NIC drops at max | receiver CPU | latency (low load) |
+|------|-----------:|-----------------:|-------------:|--------------------|
+| AF_XDP fast path (`xdp: yes`) | **~10.1 M** | 0 (NIC line-rate limited) | **~21 %** | p50 0.042 ms (AF_XDP RTT) |
+| kernel slow path (`xdp: no`)  | **~6.9 M**  | ~5 M (`rx_no_dma` + `rx_missed`) | ~61 % | p50 0.019 ms (receiver wire) |
 
-Same order of throughput, the same sub-millisecond latency; the paths differ in **CPU
-cost, not served rate or latency** — the slow path pays the per-packet kernel-UDP syscall
-the fast path avoids. Both are bounded by the X520 PCIe 2.0 RX (~10 M received, ~1 M
-`rx_no_dma_resources`), not by Runbound (the slow path keeps 55 % CPU headroom) — a NIC
-without that bus cap would scale both far higher. Reports:
-[fast path](../benchmark/RUNBOUND-v0.15.3-threadripper-single-2026-06-07.md),
-[slow path](../benchmark/RUNBOUND-v0.15.3-threadripper-single-noxdp-2026-06-07.md).
+The fast path tracks offered load 1:1 with **zero drops** up to the X520 line rate (8 M
+served at 6.7 % CPU), then answers ~10.1 M of the ~10.7 M the NIC can receive, at ~21 %
+CPU — bounded by the X520 PCIe 2.0 **RX** path, not by Runbound (~79 % CPU idle at the
+maximum). The slow path reaches the same order of magnitude (~6.9 M served) but pays a
+per-packet kernel-UDP syscall: ~61 % CPU, ~5 M packets dropped at the NIC under the same
+firehose, and an earlier latency knee — its rate under a sub-millisecond median SLO is
+~4.6 M served (p50 0.746 ms). A NIC without the PCIe 2.0 RX cap would scale both higher;
+the magnitude of that headroom is not measured here. Reports:
+[fast path](../benchmark/RUNBOUND-v0.16.0-threadripper-5995wx-x520-xdp-2026-06-07.md),
+[slow path](../benchmark/RUNBOUND-v0.16.0-threadripper-5995wx-x520-noxdp-2026-06-07.md).
 
 > The slow path serves from cache only since the #183 fix: the racing resolvers were built
 > cache-less and the cache snapshot was built for `xdp: yes` only, leaving `xdp: no`
