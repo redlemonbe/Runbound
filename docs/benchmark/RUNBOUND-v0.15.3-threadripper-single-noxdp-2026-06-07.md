@@ -7,7 +7,7 @@
 
 With `xdp: no` (kernel slow path), over a single 10 GbE fibre (Intel X520 / 82599,
 PCIe 2.0 x8), Runbound v0.15.3 (+ the #183 slow-path cache fix) served a sustained
-**~7.8 M real DNS QPS** from a warm cache, at **45 % receiver CPU** (headroom remaining),
+**~6.1 M real DNS QPS** from a warm cache, at **45 % receiver CPU** (headroom remaining),
 with **sub-millisecond latency across the board — p50 0.565 ms, p95 0.722 ms,
 p99 0.783 ms, p999 0.930 ms** and **99.84 % NOERROR**. On the *same* host and NIC the XDP
 fast path served **~8.8 M QPS at 8 % CPU**. The two datapaths reach the same order of
@@ -30,7 +30,7 @@ path's hot code and trades only CPU for the same served rate and latency.
   MTU 1500), kernel 7.0.6-2-pve, Runbound v0.15.3 + #183, **`xdp: no`** (kernel fast
   loop: one SO_REUSEPORT UDP socket per physical core minus one reserved → 63 `kloop`
   threads; even socket distribution via an `SO_ATTACH_REUSEPORT_CBPF` by-CPU program +
-  RPS; recvmmsg/sendmmsg batched; `answer_from_cache` SIMD/ASM responder — the same one
+  RPS; `answer_from_cache` SIMD/ASM responder — the same one
   the XDP fast path uses). Real `forward-zone`, **no local-data**, `cache-min-ttl 3600`.
 - **Generator (dnsmark):** dual Intel Xeon E5-2690 v2 (20c/40t), dnsmark v2.1.3, AF_XDP.
   Throughput: `dnsmark -s <recv> -d top-10000-domains.txt --xdp -Q 0 --max-outstanding 0`.
@@ -47,7 +47,7 @@ path's hot code and trades only CPU for the same served rate and latency.
 | Offered (on the wire) | ~13 M QPS (10 GbE line rate) | generator `tx_pkts_nic` |
 | Received by NIC | ~9.97 M QPS | receiver `rx_pkts_nic` |
 | NIC drops (PCIe 2.0 RX) | ~0.98 M QPS `rx_no_dma_resources` | receiver `ethtool -S` |
-| **Max sustained served QPS** | **~7.8 M** | receiver `tx_pkts_nic` (responses on the wire) |
+| **Max sustained served QPS** | **~6.1 M** | receiver `tx_pkts_nic` (responses on the wire) |
 | Latency p50 / p95 / p99 / p999 | **0.565 / 0.722 / 0.783 / 0.930 ms** | dnsmark round-trip histogram |
 | Success / error rate | 99.84 % NOERROR / 0.00 % SERVFAIL | dnsmark rcode breakdown |
 | Receiver CPU | **45 % busy** (55 % idle) | `/proc/stat` over the window |
@@ -56,7 +56,7 @@ path's hot code and trades only CPU for the same served rate and latency.
 
 ## 5. Interpretation
 
-- **Slow path ≈ fast path, at higher CPU.** 7.8 M @ 45 % CPU (slow) vs 8.8 M @ 8 % CPU
+- **Slow path ≈ fast path, at higher CPU.** 6.1 M @ 45 % CPU (slow) vs 8.8 M @ 8 % CPU
   (fast) on the same NIC, **both sub-millisecond** (slow path p99 0.783 ms). The slow path
   runs the shared SIMD/ASM `answer_from_cache` responder; the difference is the per-packet
   syscall cost of the kernel UDP socket (the fast path has none), not the serving logic or
