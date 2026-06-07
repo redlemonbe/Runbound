@@ -964,41 +964,11 @@ fn xdp_worker(
                 // but deny-by-default is the correct posture if they do.
                 let src_ip = extract_src_ip(rx_frame);
 
-                // PERF-5 (#137): thread-local shadow rate-limit cache.
-                // Cache hit skips the DashMap shard lock for 99%+ of known-IP traffic.
-                // Allowed TTL = 10ms (token depletion visible within one refill window);
-                // denied TTL = 100ms (flood IPs never reach the DashMap).
-                thread_local! {
-                    static TL_RL: std::cell::RefCell<
-                        std::collections::HashMap<std::net::IpAddr, (bool, std::time::Instant)>
-                    > = std::cell::RefCell::new(
-                        std::collections::HashMap::with_capacity(1024)
-                    );
-                }
-                if src_ip.map(|ip| {
-                    let now = std::time::Instant::now();
-                    let cached = TL_RL.with(|c| {
-                        c.borrow()
-                            .get(&ip)
-                            .and_then(|&(ok, until)| (now < until).then_some(!ok))
-                    });
-                    if let Some(drop_pkt) = cached {
-                        drop_pkt
-                    } else {
-                        let ok = rate_limiter.check(ip);
-                        TL_RL.with(|c| {
-                            let mut cache = c.borrow_mut();
-                            if cache.len() >= 1024 { cache.clear(); }
-                            let ttl = if ok {
-                                std::time::Duration::from_millis(10)
-                            } else {
-                                std::time::Duration::from_millis(100)
-                            };
-                            cache.insert(ip, (ok, now + ttl));
-                        });
-                        !ok
-                    }
-                }).unwrap_or(true) {
+                // Shared rate-limit gate — same helper + same RateLimiter as the
+                // kernel slow-path loop, so one mechanism governs both routes.
+                // Over-limit source IPs are ignored until the window rolls over;
+                // unparseable-source frames are dropped (deny-by-default).
+                if src_ip.map(|ip| rl_should_drop(&rate_limiter, ip)).unwrap_or(true) {
                     sock.umem.tx_free.push_back(tx_addr);
                     continue;
                 }
@@ -1400,6 +1370,39 @@ fn wire_qname_to_str(wire: &[u8]) -> String {
 pub(crate) use WireResult as WireResultPub;
 
 #[inline(always)]
+/// Shared per-source rate-limit gate for BOTH datapaths (the AF_XDP fast path and
+/// the kernel slow-path loop). Returns `true` when the datagram must be dropped: the
+/// source IP exceeded the configured `rate-limit` QPS for the current window, so it is
+/// ignored until the window rolls over (anti-DDoS; mirrors `deny` ACL — silent drop, no
+/// REFUSED). A thread-local shadow cache skips the shared bucket lock for 99%+ of
+/// known-IP traffic (allowed TTL 10ms, denied 100ms).
+#[inline]
+pub(crate) fn rl_should_drop(rate_limiter: &RateLimiter, ip: IpAddr) -> bool {
+    thread_local! {
+        static TL_RL: std::cell::RefCell<
+            std::collections::HashMap<IpAddr, (bool, std::time::Instant)>
+        > = std::cell::RefCell::new(std::collections::HashMap::with_capacity(1024));
+    }
+    let now = std::time::Instant::now();
+    if let Some(drop_pkt) = TL_RL.with(|c| {
+        c.borrow().get(&ip).and_then(|&(ok, until)| (now < until).then_some(!ok))
+    }) {
+        return drop_pkt;
+    }
+    let ok = rate_limiter.check(ip);
+    TL_RL.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= 1024 { cache.clear(); }
+        let ttl = if ok {
+            std::time::Duration::from_millis(10)
+        } else {
+            std::time::Duration::from_millis(100)
+        };
+        cache.insert(ip, (ok, now + ttl));
+    });
+    !ok
+}
+
 pub(crate) fn answer_dns_wire_pub(
     query_bytes: &[u8],
     out: &mut [u8],
