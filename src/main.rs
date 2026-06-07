@@ -32,7 +32,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -978,6 +978,7 @@ async fn build_and_launch(
 
     // icmp state hoisted here so NodeRelay (slave relay) can reference it
     let icmp_stats = IcmpStats::new();
+    icmp_stats.load_blacklist();
 
     // SEC-C3: periodic cleanup of expired ICMP ban entries (24h TTL, runs hourly).
     {

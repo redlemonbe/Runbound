@@ -42,7 +42,6 @@ use hickory_server::{
 };
 use hickory_server::net::xfer::Protocol as DnsProtocol;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use smallvec::SmallVec;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
@@ -829,8 +828,14 @@ impl RunboundHandler {
                 if let Some(ref tracker) = self.prefetch_tracker {
                     tracker.increment(&qname.to_string());
                 }
+                // DNSSEC: set the AD (authentic_data) flag when validation is on and
+                // the answer is Secure (hickory per-record proof). Bogus already
+                // SERVFAILed above; Insecure/unsigned -> AD stays clear.
+                let dnssec_ad = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                    && records.iter().any(|r| r.proof.is_secure());
                 let mut metadata = Metadata::response_from_request(&request.metadata);
                 metadata.recursion_available = true;
+                metadata.authentic_data = dnssec_ad;
                 let opt_edns = make_opt_edns(request);
                     let mut builder = MessageResponseBuilder::from_message_request(request);
                     if let Some(ref opt) = opt_edns { builder.edns(opt); }
@@ -2444,7 +2449,7 @@ pub async fn run_dns_server(
         ArcHandler(std::sync::Arc::clone(&handler_arc2))
     });
 
-    let port = cfg.port;
+    let _port = cfg.port;
     let interfaces: Vec<String> = if cfg.interfaces.is_empty() {
         vec!["0.0.0.0".into()]
     } else {
@@ -2617,7 +2622,7 @@ pub async fn run_dns_server(
             ) -> Result<ResponseInfo, hickory_server::net::NetError> {
                 // Encode into wire bytes using the existing ResponseHandle pattern.
                 // We create a throwaway BufDnsStreamHandle, encode, then drain.
-                let (mut stream_handle, mut receiver) =
+                let (stream_handle, mut receiver) =
                     BufDnsStreamHandle::new(self.peer);
                 let mut rh = ResponseHandle::new(self.peer, stream_handle, DnsProtocol::Udp);
                 let info = rh.send_response(response).await?;
