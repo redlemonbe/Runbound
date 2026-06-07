@@ -1,7 +1,7 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.15.0  
-**Last updated:** 2026-06-06  
+**Current version:** v0.16.4  
+**Last updated:** 2026-06-08  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
 This document consolidates all security and performance audit cycles conducted on Runbound. Individual per-cycle files in this directory are historical records; this file is the authoritative status reference.
@@ -20,6 +20,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [E](#cycle-e--v0946v0948-asm-hotpath--webui) | v0.9.46–v0.9.48 | 2026-05-26 | AI-INTERNAL | 0 open (2 fixed, 3 accepted, 2 info) |
 | [F](#cycle-f--v0120-defense-in-depth-hardening) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
+| [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 3 open (LOW); 2 fixed, 4 accepted, 2 disputed |
 
 ---
 
@@ -763,3 +764,135 @@ The `axfr` "unbounded allocation" (raised by Auditors #2 and #3) remains **Dispu
 
 8 genuine findings: **2 Fixed** (SEC-G1, SEC-G8), **4 Disputed** (G3, G4, G5, G6), **2 Open** (G2, G7). **No Accepted** (per maintainer convention: residuals are tracked Open or disputed as non-vulnerabilities, never "accepted"). No CRITICAL/HIGH stands after adjudication — the single CRITICAL (relay TLS) is the documented TOFU bootstrap window, tracked **Open** (SEC-G2). Recall vs precision: Qwen 181 raw → ~5 genuine; Gemini 18 raw → 3 net-new genuine; Claude adjudicated all and confirmed the critical-path defenses (constant-time key/HMAC compares, TOFU pinning, path-traversal guards, fast-path rate-limit + ACL, 4096 inflight cap).
 
+---
+
+## Cycle H — v0.16.0→v0.16.4 (two-AI adversarial — rate-limit/ban both-paths, DNSSEC AD, persistence)
+
+**Date:** 2026-06-08
+**Version audited:** v0.16.4
+**Sources:**
+- [AI-ADVERSARIAL: Claude Opus 4.8] — intra-model Red-team vs Blue-team "fighter" exchange, reasoned separately from implementation.
+
+> **Honesty note (convention: re-audit = different model/session).** This cycle is a
+> single-model Red/Blue adversarial exchange, **not** an independent second model. The
+> empirical findings are grounded in live probing of the running master/slave + bench
+> (auth, HMAC relay, input fuzzing, DNS robustness, resource limits). A genuinely
+> independent model/human pass on the Open items below is still recommended (tracked with
+> OPEN-F1, #170).
+
+**Scope:** the attack surface added/changed in v0.16.x — per-source rate-limit on the
+kernel slow path, banned-IP enforcement on both datapaths + the `/api/protection/banned`
++ blacklist API + master→slave propagation, persistent IP blacklist, the DNSSEC AD flag,
+and the new `recvmmsg`/`sockaddr` unsafe receive path.
+
+### SEC-H1 — `/health` is unauthenticated and discloses the exact version
+**Severity:** LOW
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** `src/api/mod.rs` (health route), live: `GET /health → 200`
+**Status:** 🟡 Open (remediation proposed, maintainer approval pending)
+**⚔️ Red:** `GET /health` (no auth) returns `{"version":"0.16.4","cache_entries":42,"uptime_secs":362,"upstreams_total":4,"xdp_active":false,...}`. I fingerprint the exact build to target version-specific bugs and read operational state (cache size, uptime, upstream count) without credentials.
+**🛡️ Blue:** `/health` is the only unauthenticated route (every `/api/*` and `/metrics` returns 401, verified). It exposes no secrets, keys, query data or client IPs — only liveness/operational counters, by design for load-balancer probes.
+**Verdict:** Real but low-value disclosure. **Remediation proposed:** drop `version` (and detailed counters) from the unauthenticated `/health`, or gate them behind auth, keeping a bare `{"status":"ok"}` for probes.
+**Residual risk:** Version fingerprinting via behavioural differences remains possible regardless.
+
+### SEC-H2 — API bearer key timing side-channel
+**Severity:** —
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** `src/api/mod.rs:509,590`
+**Status:** ⛔ Disputed (false positive)
+**⚔️ Red:** Byte-by-byte `==` on the bearer token leaks length/prefix via response timing → recover the key.
+**🛡️ Blue:** The comparison is `constant_time_eq(auth, expected)` backed by `subtle::ConstantTimeEq` (`ct_eq`). No early-exit; timing is independent of the match position.
+**Verdict:** Not vulnerable. Red's premise refuted by code review.
+
+### SEC-H3 — Relay TLS TOFU: first-connection MITM
+**Severity:** MEDIUM
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** `src/api/relay.rs` (TOFU cert fingerprint pinning)
+**Status:** 🔵 Accepted (defense-in-depth mitigates)
+**⚔️ Red:** Relay TLS pins the slave cert on first sight (TOFU). If I MITM the very first master↔slave handshake, I pin my own cert and become the relay channel.
+**🛡️ Blue:** Even a MITM'd TLS session cannot forge relay operations: every relay request also carries an `HMAC-SHA256(sync_key, method+path+ts)` with a ±30 s replay window, verified constant-time (`hmac_verify_with_ts`). The attacker does not hold `sync_key`, so the TLS layer being compromised does not yield command injection — only observation of already-authenticated traffic.
+**Verdict:** Accepted residual: a first-contact MITM can observe relay traffic but not forge it. **Remediation (optional):** out-of-band fingerprint provisioning to remove the TOFU window.
+**Residual risk:** Confidentiality (not integrity) of relay traffic during a first-contact MITM.
+
+### SEC-H4 — Forge / replay of relay commands (ban poisoning, config injection)
+**Severity:** —
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8] — empirical
+**File:** `src/sync.rs:103,1592` (`hmac_verify_with_ts`), slave relay listener `:8082`
+**Status:** ⛔ Disputed (false positive — empirically rejected)
+**⚔️ Red:** POST forged `/relay/alerts/blocked/<ip>` to the slave to ban arbitrary IPs (DoS legit clients) or push config. Tried: no headers, forged sig, replayed old timestamp, empty sig, plain-HTTP.
+**🛡️ Blue (measured on the live slave):** no headers → 401; forged `x-runbound-sig` → 401; replay (ts=1e9) → 401; empty sig → 401; plain HTTP on `:8082` → connection refused (TLS required). The forged IP **never** appeared in the slave's `/api/protection/banned` (`count:0`).
+**Verdict:** Not vulnerable. All forge/replay vectors rejected.
+
+### SEC-H5 — Rate-limit / ban table exhaustion via spoofed-source flood
+**Severity:** LOW
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** `src/dns/ratelimit.rs` (MAX_RATE_LIMIT_BUCKETS), `ebpf/dns_xdp.c` (`icmp_banned` LRU 65536)
+**Status:** 🔵 Accepted (bounded)
+**⚔️ Red:** Flood from a huge set of spoofed source IPs to inflate the per-source rate-limit bucket map and the ban map → memory exhaustion, or eviction of legitimate clients' buckets.
+**🛡️ Blue:** Rate-limit buckets are capped (`MAX_RATE_LIMIT_BUCKETS`) with aggressive idle-eviction *before* refusing a new IP, and a time-based GC retains only buckets seen in the last 60 s. The ban map is a fixed `BPF_MAP_TYPE_LRU_HASH` (65536). Memory is bounded by design.
+**Verdict:** Accepted. Bounded memory; under an extreme spoofed-IP flood a transient eviction of cold buckets is possible (a deliberate availability-over-fairness trade-off).
+
+### SEC-H6 — DNSSEC AD flag never set (validation not signalled to clients)
+**Severity:** MEDIUM
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** `src/dns/server.rs` (forward response builder)
+**Status:** ✅ Fixed in v0.16.3
+**⚔️ Red:** You advertise `dnssec-validation: yes` and return RRSIGs, but the response header never sets `AD`. A DNSSEC-aware client cannot distinguish validated data from spoofed/insecure data → silent downgrade.
+**🛡️ Blue:** Fixed v0.16.3 — the forward path now sets `authentic_data` when validation is on **and** the answer is `Secure` (hickory per-record proof; Bogus already SERVFAILs). Verified live: `ietf.org` → `ad`; unsigned `google.com` → no `ad`; a node with validation off correctly omits it.
+**Verdict:** Fixed. AD now faithfully reflects validation state.
+
+### SEC-H7 — Rate-limit and bans not enforced on the kernel slow path (xdp:no)
+**Severity:** HIGH (pre-fix)
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** `src/dns/kernel_loop.rs`, `src/dns/xdp/worker.rs` (shared `rl_should_drop`), `src/icmp.rs` (`is_banned`)
+**Status:** ✅ Fixed in v0.16.2
+**⚔️ Red:** In `xdp: no` (the production mode), the kernel fast loop served cache hits through the wire/cache responder without consulting the rate-limiter *or* the ban set. A single source floods cached answers unthrottled (1000 queries → 928 served at `rate-limit:200`), and a "banned" IP keeps being served (ban evasion / DoS).
+**🛡️ Blue:** Fixed v0.16.2/v0.16.4 — a shared `rl_should_drop` gate and `icmp_stats.is_banned()` are now called on **both** datapaths driven by the same `RateLimiter`/ban set (one mechanism, two routes, like the blacklist). Verified: 1000 → ~100–200 served; banned source's `dig` → dropped; unban → restored. Zero per-packet cost when disabled (atomic short-circuit).
+**Verdict:** Fixed. This was the most serious finding of the cycle; it predated v0.16 (rate-limit) and was XDP-only for bans.
+
+### SEC-H8 — New `unsafe` receive path (`recvmmsg` + `sockaddr` parse)
+**Severity:** LOW
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** `src/dns/kernel_loop.rs` (recvmmsg batch, `sockaddr_to_std`)
+**Status:** 🟡 Open (hardening proposed)
+**⚔️ Red:** v0.16.1 added `unsafe` libc `recvmmsg` + raw `sockaddr_storage` parsing on the hot path. A crafted/edge source address or short message could trigger UB or a panic-DoS.
+**🛡️ Blue:** Review found no exploitable path: buffers are fixed `DNS_BUF_SIZE`, `iov_len` bounds the copy, `sockaddr_to_std` accepts only `AF_INET`/`AF_INET6` (else `None` → datagram skipped), and `MSG_WAITFORONE` avoids partial-batch stalls. No attacker-controlled length reaches beyond the buffer.
+**Verdict:** No proven vulnerability, but it is new `unsafe` surface. **Remediation proposed:** add a fuzz target (cargo-fuzz) and a MIRI run over `sockaddr_to_std` + the batch loop.
+**Residual risk:** Unreviewed `unsafe` edge cases until fuzzed.
+
+### SEC-H9 — Persistent IP blacklist file permissions / growth
+**Severity:** LOW
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** `src/icmp.rs` (`persist_blacklist` / `load_blacklist`, `<base>/ip-blacklist.json`)
+**Status:** 🟡 Open (hardening proposed)
+**⚔️ Red:** The blacklist is written with default permissions (world-readable 0644) and reloaded at boot — a local unprivileged user can read the ban list; an API caller can blacklist unbounded IPs growing the file; a local writer could inject bans.
+**🛡️ Blue:** Writing requires the `runbound` user (local), and entries are validated IPs parsed on load (no injection of arbitrary content). It is not a remote vector beyond the already-authenticated API.
+**Verdict:** Low. **Remediation proposed:** write the file `0600`, and cap the persisted entry count.
+**Residual risk:** Local read of the ban list; file growth under sustained authenticated blacklisting.
+
+### SEC-H10 — Slave runs without DNSSEC validation
+**Severity:** INFO
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**File:** slave `runbound.conf` (no `dnssec-validation`)
+**Status:** 🔵 Accepted (configuration)
+**⚔️ Red:** The slave forwards without validating; it can serve spoofed-upstream data and never sets `AD`.
+**🛡️ Blue:** Configuration choice; the slave forwards to validating DoT upstreams. Enable `dnssec-validation: yes` on the slave for end-to-end validation + `AD`.
+**Verdict:** Accepted; operator action recommended.
+
+### SEC-H11 — L3 flood saturating the NIC (PCIe-2.0 RX)
+**Severity:** INFO
+**Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
+**Status:** 🔵 Accepted (out of application scope)
+**⚔️ Red:** A raw packet flood saturates the X520 RX (PCIe 2.0 ceiling ~10 M pps) and legitimate queries are dropped at the NIC before any app logic runs.
+**🛡️ Blue:** Per-source rate-limit and bans shed abusive *DNS* sources, but a network-layer volumetric flood is mitigated upstream (filtering / DDoS scrubbing), not by the resolver.
+**Verdict:** Accepted; network-layer concern outside the DNS application.
+
+### Cycle H summary
+| Status | Findings |
+|--------|----------|
+| ✅ Fixed | SEC-H6 (DNSSEC AD), SEC-H7 (rate-limit/ban both-paths) |
+| 🔵 Accepted | SEC-H3 (relay TOFU), SEC-H5 (table exhaustion), SEC-H10 (slave DNSSEC), SEC-H11 (L3 flood) |
+| 🟡 Open | SEC-H1 (health version), SEC-H8 (unsafe recvmmsg — fuzz), SEC-H9 (blacklist file 0600 + cap) |
+| ⛔ Disputed (false) | SEC-H2 (key timing — constant-time), SEC-H4 (relay forge/replay — rejected) |
+
+No CRITICAL or HIGH finding is open. The two pre-existing serious issues (SEC-H6, SEC-H7) were fixed in v0.16.2/v0.16.3. Three LOW Open items have proposed remediations awaiting maintainer approval. Strengths confirmed by probing: constant-time bearer auth, HMAC+TLS relay (forge/replay rejected), least-privilege systemd unit (non-root `runbound` user, minimal capabilities, `NoNewPrivileges`/`ProtectSystem=strict`), bounded rate-limit/ban tables, and only `/health` unauthenticated.
