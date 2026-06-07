@@ -75,3 +75,5 @@ ip neigh replace <receiver-ip> lladdr <receiver-mac> dev <nic> nud permanent
 dnsmark -s <ip-A> -s <ip-B> -d top-10000-domains.txt -p 53 --xdp -Q 0 --max-outstanding 0 -l 18
 mpstat 1 2     # on the receiver
 ```
+
+> Receiver config used: [runbound-receiver-bench.conf](runbound-receiver-bench.conf) (rb-dual: forwarding resolver + cache, xdp:yes, rate-limit:0, no local-data).
