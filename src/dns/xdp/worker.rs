@@ -1332,24 +1332,6 @@ fn process_packet(
     Some(reply_len)
 }
 
-fn wire_qname_to_str(wire: &[u8]) -> String {
-    let mut s = String::with_capacity(wire.len());
-    let mut pos = 0;
-    let mut first = true;
-    while pos < wire.len() {
-        let len = wire[pos] as usize;
-        pos += 1;
-        if len == 0 { break; }
-        if !first { s.push('.'); }
-        first = false;
-        if pos + len <= wire.len() {
-            s.push_str(std::str::from_utf8(&wire[pos..pos + len]).unwrap_or("?"));
-        }
-        pos += len;
-    }
-    s
-}
-
 /// Look up `query_bytes` in the frozen XDP cache snapshot.
 /// On a hit, writes the wire response directly into `tx_dns` (a slice of the TX
 /// UMEM frame starting at the DNS payload offset) and returns `Some(len)`.
