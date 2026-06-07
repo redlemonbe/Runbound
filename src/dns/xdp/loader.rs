@@ -461,33 +461,6 @@ impl XdpHandle {
         Ok(count)
     }
 
-    /// Clear all entries from the XDP blacklist map.
-    pub fn blacklist_clear(&mut self) -> Result<(), String> {
-        let map_ref = self
-            .bpf
-            .map_mut("dns_blacklist")
-            .ok_or_else(|| "dns_blacklist map not found".to_string())?;
-        let mut map = HashMap::<_, [u8; 256], u8>::try_from(map_ref)
-            .map_err(|e| e.to_string())?;
-        let keys: Vec<[u8; 256]> = map.keys().filter_map(|r| r.ok()).collect();
-        for key in &keys {
-            let _ = map.remove(key);
-        }
-        Ok(())
-    }
-
-    /// Read the total number of packets blocked by the XDP blacklist.
-    /// Sums all per-CPU slots from block_stats[0].
-    pub fn block_stats_read(&mut self) -> Result<u64, String> {
-        let map_ref = self
-            .bpf
-            .map_mut("block_stats")
-            .ok_or_else(|| "block_stats map not found".to_string())?;
-        let arr = PerCpuArray::<_, u64>::try_from(map_ref).map_err(|e| e.to_string())?;
-        let vals = arr.get(&0u32, 0).map_err(|e| e.to_string())?;
-        Ok(vals.iter().sum())
-    }
-
     /// Register an AF_XDP socket with the XSKMAP at the given queue index.
     ///
     /// Must be called after `create_xsk_socket` so the kernel can redirect

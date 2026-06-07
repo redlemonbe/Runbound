@@ -2061,60 +2061,6 @@ fn bind_xdp_reply_sock(port: u16) -> anyhow::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
-fn bind_reuseport_udp(addr: &str, busy_poll_usec: u32) -> anyhow::Result<UdpSocket> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let sock_addr: std::net::SocketAddr = addr
-        .parse()
-        .map_err(|e| anyhow::anyhow!("parse addr {addr}: {e}"))?;
-    let domain = if sock_addr.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .map_err(|e| anyhow::anyhow!("socket new: {e}"))?;
-    socket
-        .set_reuse_port(true)
-        .map_err(|e| anyhow::anyhow!("SO_REUSEPORT: {e}"))?;
-    socket
-        .bind(&sock_addr.into())
-        .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
-    socket
-        .set_nonblocking(true)
-        .map_err(|e| anyhow::anyhow!("nonblocking: {e}"))?;
-    // #20: SO_BUSY_POLL — spin in kernel context for `busy_poll_usec` µs before
-    // sleeping. Reduces scheduler wake-up latency at the cost of CPU burn.
-    // Only useful on dedicated servers; harmless but wasteful on shared hosts.
-    // SO_PREFER_BUSY_POLL (kernel 5.11+) is hardcoded as 69 — silently ignored
-    // on older kernels (ENOPROTOOPT).
-    if busy_poll_usec > 0 {
-        use std::os::unix::io::AsRawFd;
-        let fd = socket.as_raw_fd();
-        let usec = busy_poll_usec as libc::c_int;
-        let one: libc::c_int = 1;
-        // SAFETY: fd is a valid DGRAM socket; both options take a c_int value.
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_BUSY_POLL,
-                (&usec as *const libc::c_int).cast::<libc::c_void>(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-            // SO_PREFER_BUSY_POLL = 69 (Linux 5.11+, ENOPROTOOPT on older kernels — ignored)
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                69,
-                (&one as *const libc::c_int).cast::<libc::c_void>(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-    let std_socket: std::net::UdpSocket = socket.into();
-    UdpSocket::from_std(std_socket).map_err(|e| anyhow::anyhow!("tokio from_std: {e}"))
-}
-
 // ── FIX 6.2: Per-IP TCP connection cap ────────────────────────────────────────
 
 /// Max concurrent TCP DNS connections from a single source IP (or /48 for IPv6).
