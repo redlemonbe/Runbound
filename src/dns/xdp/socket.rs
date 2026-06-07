@@ -92,6 +92,8 @@ pub struct XdpIfaceState {
     pub nic_rx_ring: u32,
     /// Hardware maximum RX ring descriptor count (0 = unavailable).
     pub nic_rx_ring_max: u32,
+    /// XSK fds of this interface, for live XDP_STATISTICS reads (read-only).
+    pub xsk_fds: Vec<RawFd>,
 }
 
 /// All active XDP interfaces, registered by start_xdp_on_iface().
@@ -778,6 +780,35 @@ pub fn read_nic_rx_dropped(iface: &str) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// AF_XDP per-socket statistics — Linux UAPI (`linux/if_xdp.h`), read via
+/// getsockopt(SOL_XDP, XDP_STATISTICS). VALID under zero-copy (unlike the ethtool
+/// rx_packets counters, which are blind to XDP_REDIRECT->XSK). Defined from the
+/// public kernel ABI — no third-party (bpftool) code, AGPL-clean.
+pub const XDP_STATISTICS: libc::c_int = 7;
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct XdpStatistics {
+    pub rx_dropped: u64,
+    pub rx_invalid_descs: u64,
+    pub tx_invalid_descs: u64,
+    pub rx_ring_full: u64,
+    pub rx_fill_ring_empty_descs: u64,
+    pub tx_ring_empty_descs: u64,
+}
+
+/// Read XDP_STATISTICS for one XSK fd (read-only, thread-safe — the socket is
+/// owned by its worker thread; getsockopt does not mutate it). None on error.
+pub fn read_xsk_statistics(fd: RawFd) -> Option<XdpStatistics> {
+    let mut st = XdpStatistics::default();
+    let mut len = std::mem::size_of::<XdpStatistics>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(fd, SOL_XDP, XDP_STATISTICS,
+            &mut st as *mut _ as *mut libc::c_void, &mut len)
+    };
+    if rc == 0 { Some(st) } else { None }
 }
 
 /// Read rx_missed_errors for `iface` from ethtool-style sysfs.
