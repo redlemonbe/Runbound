@@ -1,7 +1,13 @@
-# Runbound Benchmark — v0.15.3 — Threadripper PRO 5995WX receiver — 2026-06-07
+# Runbound CPU-headroom PROBE (not a methodology-compliant benchmark) — v0.15.3 — Threadripper PRO 5995WX receiver — 2026-06-07
 
-> Follows [README.md](README.md). Measured data only. Where a value is uncertain,
-> it is marked **"I cannot confirm this."**
+> **NOT a methodology-compliant run.** This is a preliminary CPU-headroom *probe*,
+> not the benchmark defined in [README.md](README.md). It deviates on three core
+> points: (1) it uses open-loop **flood** (`--max-outstanding 0`), not the required
+> warm-up + **ramp-to-saturation**; (2) it does **not** measure at NIC HW counters
+> (XDP zero-copy made `ethtool -S` blind and the HW-register read was not resolved);
+> (3) latency is dnsmark throughput-mode, not `tcpdump`-anchored. The official
+> #176 result must be produced under README.md (ramp, NIC counters, tcpdump) — see
+> §5. Values that could not be measured are marked **"I cannot confirm this."**
 
 ## 1. Executive Summary
 
