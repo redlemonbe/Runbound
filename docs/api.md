@@ -1292,6 +1292,55 @@ curl -X DELETE http://localhost:8080/api/alerts/blocked/203.0.113.42 \
 
 Returns `{"unblocked": false}` if the IP was not blocked.
 
+### `GET /api/protection/banned`
+
+Current banned source IPs — the authoritative set enforced on **both** datapaths: the
+XDP fast path drops them in eBPF (the `icmp_banned` map, `XDP_DROP`, IPv4), and the
+kernel slow path (`xdp: no`) drops them in the data loop. Sources: `IcmpFlood` (flood
+detector), `Manual` (API), `Relay` (pushed from the master).
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/protection/banned
+```
+
+```json
+{
+  "count": 1,
+  "entries": [
+    {"ip": "203.0.113.42", "source": "Manual", "banned_ago_s": 12, "permanent": false}
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `source` | `IcmpFlood` \| `Manual` \| `Relay` |
+| `banned_ago_s` | Seconds since the ban was applied |
+| `permanent` | `true` = blacklisted (never auto-expires); `false` bans expire after `bot-ban-duration-secs` |
+
+### `POST /api/protection/banned/:ip/blacklist`
+
+Promote a ban to **permanent** ("blacklist"): it no longer auto-expires. Propagated to
+slaves via the HMAC relay like any other ban. To ban/unban, use `PUT`/`DELETE
+/api/alerts/blocked/:ip` (above).
+
+```bash
+curl -X POST http://localhost:8080/api/protection/banned/203.0.113.42/blacklist \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY"
+```
+
+```json
+{"blacklisted": true, "ip": "203.0.113.42"}
+```
+
+> **Enforcement (v0.16.2+).** Banned IPs and the per-source `rate-limit` are enforced on
+> **both** the XDP fast path and the kernel slow path (`xdp: no`). The `rate-limit` drops a
+> source's *excess* queries for the current 1-second window (transient throttle — no ban);
+> a ban drops *all* of a source's queries until it expires (or forever if blacklisted).
+> Exceeding the DNS `rate-limit` does **not** ban; only the ICMP flood detector
+> (`ban-threshold`) or a manual/blacklist action bans. Bans are in-memory and reset on
+> restart.
+
 ---
 
 ## Slave mode — read-only

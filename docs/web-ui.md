@@ -70,13 +70,13 @@ Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
 
 | Tab | What you can do |
 |---|---|
-| **Overview** | Real-time stats: QPS, cache hit rate, blocked, SERVFAIL, latency **min / average / max**; live 60-second QPS sparkline; top-10 queried domains |
+| **Overview** | Real-time stats: QPS, cache hit rate, blocked, SERVFAIL, latency **min / average / max**; live 60-second QPS sparkline; top-10 queried domains  Includes a **Banned IPs** count tile. |
 | **DNS** | Add / delete local A, AAAA, CNAME, TXT, MX, PTR, SRV records; DNS Lookup panel with cache hit indicator |
 | **Blacklist** | Add / delete blocked domains (`nxdomain` or `refuse` action) |
 | **Feeds** | Add / delete blocklist feed URLs (hosts or adblock format); preset list; entry count; error text on refresh failure |
 | **Upstreams** | Add / delete resolvers; 9 built-in presets; health dots, DNSSEC badge, latency sparkline, DoT SNI config; **↺ Reconnect DoT** button |
 | **Logs** | Query ring buffer with 3-second auto-refresh; WebUI auth activity log |
-| **Protection** | ICMP XDP flood protection: enable/disable per node; rate / burst / ban-threshold config; per-node stats cards; DDoS alert and blocked-IP log |
+| **Protection** | ICMP XDP flood protection (enable/disable per node; rate / burst / ban-threshold; per-node stats cards); **Banned source IPs** table (IP, source, age) with per-row **Blacklist** (make permanent) and **Unban** buttons; DDoS alerts log. Bans are enforced on both the XDP fast path and the kernel slow path. |
 | **System** | Runtime info (version, XDP mode, memory, CPU); slave list with sync status and version; full backup download / restore; cache flush button |
 | **Settings** | DNSSEC validation toggle; CA certificate download; password change; session info; recent auth event log |
 | **About** | Version badge, uptime, feature list, GitHub links, credits |
