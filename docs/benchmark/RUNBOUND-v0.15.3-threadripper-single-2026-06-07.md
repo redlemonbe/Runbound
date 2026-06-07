@@ -8,7 +8,7 @@
 Over single X520 10 GbE fibre, with a warm resolver cache (real cache-hit fast path —
 **no synthetic local-data**), the dnsmark v2.1.1 generator offered **12.46 M qps**
 (its own ceiling on this Xeon E5-2690 v2). Runbound v0.15.3 on an AMD Threadripper
-PRO 5995WX answered them (NOERROR 99.87%) while consuming **98.4** idle CPU — i.e.
+PRO 5995WX answered them (NOERROR 99.87%) at **98.4% idle** CPU — i.e.
 **~1.6% busy**. Runbound was **not saturated**; no
 saturation point exists within the generator's reach, so its true ceiling is **not
 measurable on this rig** ("I cannot confirm this"). The bottleneck is the generator,
