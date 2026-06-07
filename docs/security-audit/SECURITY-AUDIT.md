@@ -896,3 +896,18 @@ and the new `recvmmsg`/`sockaddr` unsafe receive path.
 | ⛔ Disputed (false) | SEC-H2 (key timing — constant-time), SEC-H4 (relay forge/replay — rejected) |
 
 No CRITICAL or HIGH finding is open. The two pre-existing serious issues (SEC-H6, SEC-H7) were fixed in v0.16.2/v0.16.3. Three LOW Open items have proposed remediations awaiting maintainer approval. Strengths confirmed by probing: constant-time bearer auth, HMAC+TLS relay (forge/replay rejected), least-privilege systemd unit (non-root `runbound` user, minimal capabilities, `NoNewPrivileges`/`ProtectSystem=strict`), bounded rate-limit/ban tables, and only `/health` unauthenticated.
+
+### Cycle H — independent second-model pass (Qwen3-Coder-30B, local)
+
+**Date:** 2026-06-08
+**Source:** [AI-ADVERSARIAL: Qwen3-Coder-30B-A3B — local, llama.cpp on an RTX 5080], independent of the Claude implementation/audit. Fed the `v0.16.0..HEAD` diff of the security-sensitive files; five findings, each cross-checked against the code by [AI-INTERNAL: Claude Opus 4.8] (every claim verified, not taken at face value).
+
+| Qwen finding | Qwen sev | Cross-check verdict |
+|---|---|---|
+| Q1 — unsafe `recvmmsg` sockaddr parse | HIGH | Overstated. `ss_family` is validated (`AF_INET`/`AF_INET6` else `None`) and the path is fuzzed (1M iters, SEC-H8). Accepted as generic `unsafe`, not HIGH. |
+| Q2 — `load_blacklist` has no entry cap | MEDIUM | **Valid (LOW) → Fixed v0.16.6.** The write path was capped (100k) but the load path was not; load now also caps at 100k. Independent model caught a real defense-in-depth gap. |
+| Q3 — `banned_present` atomic race | MEDIUM | Accepted (benign): a sub-microsecond fail-open window; worst case one query from a just-banned IP slips through before the flag settles. |
+| Q4 — blacklist file permissions | LOW | Already handled: `set_permissions(0o600)` runs after the write (verified `-rw-------`). |
+| Q5 — `is_banned` logic error | MEDIUM | Disputed (false): `banned_present && contains_key` is correct — the flag is a fast-skip hint, the map is authoritative. |
+
+**Outcome:** the independent model **confirmed SEC-H8** and surfaced **one genuine gap (Q2)**, fixed in v0.16.6. The other four were overstated, already-handled, or false on cross-check — consistent with the known local-model false-positive rate; every claim was verified against the code and the live system, none accepted blindly.
