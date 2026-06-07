@@ -86,43 +86,6 @@ fn bind_kernel_udp(addr: &str) -> anyhow::Result<UdpSocket> {
 
     let addr: std::net::SocketAddr = addr.parse()?;
     sock.bind(&addr.into())?;
-
-    // #183: spread incoming datagrams EVENLY across the SO_REUSEPORT group by the CPU
-    // that processes them, instead of the kernel's default 4-tuple hash (which is uneven
-    // for a benchmark's few flows → some sockets overflow while others idle, dropping
-    // packets even with spare CPU). The 2-insn cBPF returns SKF_AD_CPU; the kernel maps
-    // socket = cpu % nsockets. Combined with RPS (softirq spread across all cores) this
-    // gives a flat per-socket load. Best-effort: ignore errors on kernels without it.
-    {
-        use std::os::fd::AsRawFd;
-        #[repr(C)]
-        struct SockFilter { code: u16, jt: u8, jf: u8, k: u32 }
-        #[repr(C)]
-        struct SockFprog { len: u16, filter: *const SockFilter }
-        const SKF_AD_OFF: u32 = 0xffff_f000; // -0x1000
-        const SKF_AD_CPU: u32 = 36;
-        const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
-        const BPF_RET_A: u16 = 0x16;    // BPF_RET | BPF_A
-        const SO_ATTACH_REUSEPORT_CBPF: libc::c_int = 51;
-        let prog = [
-            SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: SKF_AD_OFF + SKF_AD_CPU },
-            SockFilter { code: BPF_RET_A,    jt: 0, jf: 0, k: 0 },
-        ];
-        let fprog = SockFprog { len: prog.len() as u16, filter: prog.as_ptr() };
-        let rc = unsafe {
-            libc::setsockopt(
-                sock.as_raw_fd(),
-                libc::SOL_SOCKET,
-                SO_ATTACH_REUSEPORT_CBPF,
-                &fprog as *const SockFprog as *const libc::c_void,
-                std::mem::size_of::<SockFprog>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            debug!("SO_ATTACH_REUSEPORT_CBPF (by-CPU) not applied: {}", std::io::Error::last_os_error());
-        }
-    }
-
     Ok(sock.into())
 }
 
