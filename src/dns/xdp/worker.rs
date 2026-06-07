@@ -472,6 +472,7 @@ fn start_xdp_on_iface(
         queue_modes:     queue_modes.clone(),
         nic_rx_ring,
         nic_rx_ring_max,
+        xsk_fds: sockets.iter().map(|(_, sk)| sk.fd).collect(),
     });
     // #164 — Xeon v2 + X520 bus-ceiling hint (one-time at bind).
     super::socket::maybe_warn_xeon_v2_x520(iface);
