@@ -290,6 +290,7 @@
       <div class="card"><div class="text-xs text-gray-600 mb-1">Total queries</div><div id="ov-total" class="text-2xl text-white tabular-nums">—</div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">Cache hit rate</div><div id="ov-cache" class="text-2xl text-green-400 tabular-nums">—</div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">Blocked</div><div id="ov-blocked" class="text-2xl text-red-400 tabular-nums">—</div><div id="ov-blocked-pct" class="text-xs text-gray-700 mt-0.5"></div></div>
+      <div class="card"><div class="text-xs text-gray-600 mb-1">Banned IPs</div><div id="ov-banned" class="text-2xl text-red-400 tabular-nums">—</div><div class="text-xs text-gray-700 mt-0.5">XDP + slow-path</div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">Forwarded</div><div id="ov-forwarded" class="text-2xl tabular-nums">—</div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">SERVFAIL</div><div id="ov-servfail" class="text-2xl text-yellow-500 tabular-nums">—</div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">Latency avg</div><div id="ov-latency" class="text-2xl tabular-nums">—</div></div>
@@ -611,6 +612,15 @@
 
     <!-- Stats par nœud -->
     <div id="prot-nodes-grid" class="mb-4"></div>
+
+    <!-- Banned source IPs (XDP fast path + kernel slow path) -->
+    <div class="card mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">Banned source IPs <span id="prot-banned-count" class="text-gray-700"></span></span>
+        <button onclick="loadBannedList()" class="btn-secondary text-xs">↻ Refresh</button>
+      </div>
+      <div id="prot-banned" style="max-height:280px;overflow-y:auto"><span class="text-gray-700 italic text-sm">—</span></div>
+    </div>
 
     <!-- DDoS Alerts -->
     <div class="card">
@@ -1109,6 +1119,7 @@ function renderStats(s) {
   const sec  = n => { if(n==null)return'—'; const d=Math.floor(n/86400),hh=Math.floor((n%86400)/3600),m=Math.floor((n%3600)/60); return d?`${d}d ${hh}h`:hh?`${hh}h ${m}m`:`${m}m`; };
   set('ov-qps',fmtf(s.qps_1m)); set('ov-total',fmt(s.total)); set('ov-cache',pct(s.cache_hit_rate));
   set('ov-blocked',fmt(s.blocked)); set('ov-blocked-pct',s.blocked_percent!=null?fmtf(s.blocked_percent)+'% of total':'');
+  api('GET','/protection/banned').then(d=>set('ov-banned',fmt(d.count))).catch(()=>{});
   set('ov-forwarded',fmt(s.forwarded)); set('ov-servfail',fmt(s.servfail)); set('ov-latency',ms(s.latency_avg_ms)); set('ov-uptime',sec(s.uptime_secs));
   set('ov-lmin',ms(s.latency_min_ms)); set('ov-lavg',ms(s.latency_avg_ms)); set('ov-lmax',ms(s.latency_max_ms));
   set('ov-qps1m',fmtf(s.qps_1m)+' /s'); set('ov-qps5m',fmtf(s.qps_5m)+' /s'); set('ov-qpspeak',fmt(s.qps_peak)+' /s');
@@ -1607,6 +1618,7 @@ async function loadProtection() {
     renderBlockedIps(a.blocked_clients ?? []);
     renderAlertsList(a.recent_alerts ?? []);
   } catch(_) {}
+  loadBannedList();
 }
 
 async function toggleIcmp() {
@@ -1662,6 +1674,39 @@ function renderBlockedIps(list) {
       <button onclick="unblockIp(${JSON.stringify(ip)})" class="btn-secondary text-xs">Unblock</button>
     </div>`;
   }).join('');
+}
+
+async function loadBannedList() {
+  try {
+    const d = await api('GET', '/protection/banned');
+    const list = d.entries ?? [];
+    set('ov-banned', fmt(d.count));
+    const cnt = document.getElementById('prot-banned-count');
+    if (cnt) cnt.textContent = d.count ? `(${d.count})` : '';
+    const el = document.getElementById('prot-banned');
+    if (!el) return;
+    if (!list.length) { el.innerHTML = '<span class="text-gray-700 italic text-sm">No banned IPs</span>'; return; }
+    el.innerHTML = list.map(b => {
+      const ip = b.ip, src = esc(b.source ?? '?');
+      const age = b.banned_ago_s != null ? b.banned_ago_s + 's ago' : '';
+      const perm = !!b.permanent;
+      const tag = perm ? ' · <span class="text-yellow-500">blacklisted</span>' : '';
+      const blBtn = perm ? '' : `<button onclick='blacklistIp(${JSON.stringify(ip)})' class="btn-secondary text-xs">Blacklist</button>`;
+      return `<div class="flex items-center justify-between py-1.5 border-b border-gray-800/40 text-sm">
+        <span class="font-mono text-red-400">${esc(ip)}</span>
+        <span class="text-xs text-gray-600 mx-3">${src} · ${age}${tag}</span>
+        <span class="flex gap-2">${blBtn}<button onclick='unblockIp(${JSON.stringify(ip)})' class="btn-secondary text-xs">Unban</button></span>
+      </div>`;
+    }).join('');
+  } catch(_) {}
+}
+
+async function blacklistIp(ip) {
+  try {
+    await api('POST', '/protection/banned/' + encodeURIComponent(ip) + '/blacklist');
+    toast('Blacklisted ' + ip);
+    loadBannedList();
+  } catch(e) { toast('Blacklist failed: ' + e.message, true); }
 }
 
 function renderAlertsList(list) {
