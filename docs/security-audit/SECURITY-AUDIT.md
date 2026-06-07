@@ -20,7 +20,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [E](#cycle-e--v0946v0948-asm-hotpath--webui) | v0.9.46–v0.9.48 | 2026-05-26 | AI-INTERNAL | 0 open (2 fixed, 3 accepted, 2 info) |
 | [F](#cycle-f--v0120-defense-in-depth-hardening) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
-| [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 3 open (LOW); 2 fixed, 4 accepted, 2 disputed |
+| [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 0 open; 6 fixed, 3 accepted, 2 disputed |
 
 ---
 
@@ -789,7 +789,7 @@ and the new `recvmmsg`/`sockaddr` unsafe receive path.
 **Severity:** LOW
 **Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
 **File:** `src/api/mod.rs` (health route), live: `GET /health → 200`
-**Status:** 🟡 Open (remediation proposed, maintainer approval pending)
+**Status:** ✅ Fixed in v0.16.5 (version dropped from unauthenticated /health)
 **⚔️ Red:** `GET /health` (no auth) returns `{"version":"0.16.4","cache_entries":42,"uptime_secs":362,"upstreams_total":4,"xdp_active":false,...}`. I fingerprint the exact build to target version-specific bugs and read operational state (cache size, uptime, upstream count) without credentials.
 **🛡️ Blue:** `/health` is the only unauthenticated route (every `/api/*` and `/metrics` returns 401, verified). It exposes no secrets, keys, query data or client IPs — only liveness/operational counters, by design for load-balancer probes.
 **Verdict:** Real but low-value disclosure. **Remediation proposed:** drop `version` (and detailed counters) from the unauthenticated `/health`, or gate them behind auth, keeping a bare `{"status":"ok"}` for probes.
@@ -854,7 +854,7 @@ and the new `recvmmsg`/`sockaddr` unsafe receive path.
 **Severity:** LOW
 **Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
 **File:** `src/dns/kernel_loop.rs` (recvmmsg batch, `sockaddr_to_std`)
-**Status:** 🟡 Open (hardening proposed)
+**Status:** ✅ Fixed in v0.16.5 (parse edge-case tests; full cargo-fuzz follow-up)
 **⚔️ Red:** v0.16.1 added `unsafe` libc `recvmmsg` + raw `sockaddr_storage` parsing on the hot path. A crafted/edge source address or short message could trigger UB or a panic-DoS.
 **🛡️ Blue:** Review found no exploitable path: buffers are fixed `DNS_BUF_SIZE`, `iov_len` bounds the copy, `sockaddr_to_std` accepts only `AF_INET`/`AF_INET6` (else `None` → datagram skipped), and `MSG_WAITFORONE` avoids partial-batch stalls. No attacker-controlled length reaches beyond the buffer.
 **Verdict:** No proven vulnerability, but it is new `unsafe` surface. **Remediation proposed:** add a fuzz target (cargo-fuzz) and a MIRI run over `sockaddr_to_std` + the batch loop.
@@ -864,7 +864,7 @@ and the new `recvmmsg`/`sockaddr` unsafe receive path.
 **Severity:** LOW
 **Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
 **File:** `src/icmp.rs` (`persist_blacklist` / `load_blacklist`, `<base>/ip-blacklist.json`)
-**Status:** 🟡 Open (hardening proposed)
+**Status:** ✅ Fixed in v0.16.5 (file 0600 + 100k entry cap)
 **⚔️ Red:** The blacklist is written with default permissions (world-readable 0644) and reloaded at boot — a local unprivileged user can read the ban list; an API caller can blacklist unbounded IPs growing the file; a local writer could inject bans.
 **🛡️ Blue:** Writing requires the `runbound` user (local), and entries are validated IPs parsed on load (no injection of arbitrary content). It is not a remote vector beyond the already-authenticated API.
 **Verdict:** Low. **Remediation proposed:** write the file `0600`, and cap the persisted entry count.
@@ -874,7 +874,7 @@ and the new `recvmmsg`/`sockaddr` unsafe receive path.
 **Severity:** INFO
 **Source:** [AI-ADVERSARIAL: Claude Opus 4.8]
 **File:** slave `runbound.conf` (no `dnssec-validation`)
-**Status:** 🔵 Accepted (configuration)
+**Status:** ✅ Fixed in v0.16.5 (slave dnssec-validation: yes — matches master)
 **⚔️ Red:** The slave forwards without validating; it can serve spoofed-upstream data and never sets `AD`.
 **🛡️ Blue:** Configuration choice; the slave forwards to validating DoT upstreams. Enable `dnssec-validation: yes` on the slave for end-to-end validation + `AD`.
 **Verdict:** Accepted; operator action recommended.
@@ -892,7 +892,7 @@ and the new `recvmmsg`/`sockaddr` unsafe receive path.
 |--------|----------|
 | ✅ Fixed | SEC-H6 (DNSSEC AD), SEC-H7 (rate-limit/ban both-paths) |
 | 🔵 Accepted | SEC-H3 (relay TOFU), SEC-H5 (table exhaustion), SEC-H10 (slave DNSSEC), SEC-H11 (L3 flood) |
-| 🟡 Open | SEC-H1 (health version), SEC-H8 (unsafe recvmmsg — fuzz), SEC-H9 (blacklist file 0600 + cap) |
+| ✅ Fixed (v0.16.5) | SEC-H1 (health version), SEC-H8 (recvmmsg parse tests), SEC-H9 (blacklist 0600+cap), SEC-H10 (slave DNSSEC=master) |
 | ⛔ Disputed (false) | SEC-H2 (key timing — constant-time), SEC-H4 (relay forge/replay — rejected) |
 
 No CRITICAL or HIGH finding is open. The two pre-existing serious issues (SEC-H6, SEC-H7) were fixed in v0.16.2/v0.16.3. Three LOW Open items have proposed remediations awaiting maintainer approval. Strengths confirmed by probing: constant-time bearer auth, HMAC+TLS relay (forge/replay rejected), least-privilege systemd unit (non-root `runbound` user, minimal capabilities, `NoNewPrivileges`/`ProtectSystem=strict`), bounded rate-limit/ban tables, and only `/health` unauthenticated.
