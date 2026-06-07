@@ -931,12 +931,26 @@ async fn stats_handler(State(s): State<AppState>) -> impl IntoResponse {
     }).collect();
     json["xdp_queues"]  = serde_json::Value::Array(xdp_queues);
     json["xdp_ifaces"]  = serde_json::json!(
-        xdp_ifaces.iter().map(|s| serde_json::json!({
+        xdp_ifaces.iter().map(|s| {
+            let (mut rx_dropped, mut fill_empty, mut ring_full, mut rx_inval) = (0u64,0u64,0u64,0u64);
+            for &fd in &s.xsk_fds {
+                if let Some(st) = crate::dns::xdp::socket::read_xsk_statistics(fd) {
+                    rx_dropped += st.rx_dropped;
+                    fill_empty += st.rx_fill_ring_empty_descs;
+                    ring_full  += st.rx_ring_full;
+                    rx_inval   += st.rx_invalid_descs;
+                }
+            }
+            serde_json::json!({
             "iface":           s.iface,
             "nic_rx_ring":     s.nic_rx_ring,
             "nic_rx_ring_max": s.nic_rx_ring_max,
             "queues":          s.queue_modes.len(),
-        })).collect::<Vec<_>>()
+            "xsk_rx_dropped":          rx_dropped,
+            "xsk_rx_fill_ring_empty":  fill_empty,
+            "xsk_rx_ring_full":        ring_full,
+            "xsk_rx_invalid_descs":    rx_inval,
+        })}).collect::<Vec<_>>()
     );
     JsonExtract(json)
 }
