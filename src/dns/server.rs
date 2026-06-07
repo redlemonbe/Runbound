@@ -1374,7 +1374,7 @@ pub fn build_per_upstream_resolvers(
     for (addr_str, port, use_tls, tls_hostname) in addrs {
         let single = build_resolver_from_addrs(
             &[(addr_str.clone(), *port, *use_tls, tls_hostname.clone())],
-            0, // no hickory-cache needed for racing path
+            cache_size_from_meminfo(), // #183: per-upstream cache so the racing slow path serves from cache (was 0 — only the fast path cached)
             dnssec,
         )?;
         result.push((addr_str.clone(), Arc::new(single)));
