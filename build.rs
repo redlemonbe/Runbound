@@ -37,7 +37,7 @@ fn compress_webui() {
     fs::write(out_dir.join("index.html.gz"), &gz).expect("write index.html.gz");
 
     println!(
-        "cargo:warning=WebUI gzip: {}B → {}B ({:.0}% of original)",
+        "WebUI gzip: {}B → {}B ({:.0}% of original)",
         html.len(), gz.len(),
         gz.len() as f64 / html.len() as f64 * 100.0
     );
@@ -122,7 +122,7 @@ fn compile_ebpf() {
     run_clang_compile(&base_flags, &src, &dst_minimal, &["-DNO_CPUMAP"]);
 
     println!(
-        "cargo:warning=eBPF programs compiled: {} + {}",
+        "eBPF programs compiled: {} + {}",
         dst.display(),
         dst_minimal.display(),
     );
