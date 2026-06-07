@@ -161,7 +161,13 @@ pub fn start_kernel_fast_loop(
     Ok(KernelLoopHandle { _threads: handles })
 }
 
-/// Tight recv→dispatch→send loop for one socket/core.
+/// Tight recv→dispatch→send loop for one socket/core, BATCHED with recvmmsg/sendmmsg.
+///
+/// The XDP fast path has zero syscalls; the kernel-UDP slow path cannot, but it can
+/// amortise the syscall cost over a whole batch. Single-packet recv_from/send_to cost
+/// ~2 syscalls/packet and capped a busy core near ~195 k qps (saturated at 100 % CPU
+/// in pure syscall overhead). recvmmsg/sendmmsg move ~BATCH packets per syscall pair,
+/// and the cache snapshot guard is taken once per batch instead of per packet.
 fn worker_loop(
     _thread_idx: usize,
     _core_id: usize,
@@ -173,72 +179,165 @@ fn worker_loop(
     stats: Option<Arc<crate::stats::Stats>>,
     domain_stats: Option<Arc<crate::domain_stats::DomainStats>>,
 ) {
-    // Stack-allocated I/O buffers — never heap on the hot path.
-    let mut rx_buf = [0u8; DNS_BUF_SIZE];
-    let mut tx_buf = [0u8; DNS_BUF_SIZE];
+    use std::net::Ipv4Addr;
+    use std::os::fd::AsRawFd;
+
+    const BATCH: usize = 64;
+    let fd = sock.as_raw_fd();
+    let storage_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let sin_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+    // Per-thread, heap-stable buffers — allocated once, never reallocated or moved.
+    let mut rx_bufs: Vec<[u8; DNS_BUF_SIZE]> = vec![[0u8; DNS_BUF_SIZE]; BATCH];
+    let mut tx_bufs: Vec<[u8; DNS_BUF_SIZE]> = vec![[0u8; DNS_BUF_SIZE]; BATCH];
+    let mut rx_addrs: Vec<libc::sockaddr_storage> =
+        (0..BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut tx_addrs: Vec<libc::sockaddr_storage> =
+        (0..BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
+
+    let mut rx_iov: Vec<libc::iovec> = (0..BATCH)
+        .map(|i| libc::iovec {
+            iov_base: rx_bufs[i].as_mut_ptr() as *mut libc::c_void,
+            iov_len: DNS_BUF_SIZE,
+        })
+        .collect();
+    let mut tx_iov: Vec<libc::iovec> = (0..BATCH)
+        .map(|i| libc::iovec {
+            iov_base: tx_bufs[i].as_mut_ptr() as *mut libc::c_void,
+            iov_len: 0,
+        })
+        .collect();
+
+    let mut rx_msgs: Vec<libc::mmsghdr> = (0..BATCH)
+        .map(|i| unsafe {
+            let mut m: libc::mmsghdr = std::mem::zeroed();
+            m.msg_hdr.msg_iov = &mut rx_iov[i] as *mut libc::iovec;
+            m.msg_hdr.msg_iovlen = 1;
+            m.msg_hdr.msg_name = &mut rx_addrs[i] as *mut _ as *mut libc::c_void;
+            m.msg_hdr.msg_namelen = storage_len;
+            m
+        })
+        .collect();
+    let mut tx_msgs: Vec<libc::mmsghdr> = (0..BATCH)
+        .map(|i| unsafe {
+            let mut m: libc::mmsghdr = std::mem::zeroed();
+            m.msg_hdr.msg_iov = &mut tx_iov[i] as *mut libc::iovec;
+            m.msg_hdr.msg_iovlen = 1;
+            m.msg_hdr.msg_name = &mut tx_addrs[i] as *mut _ as *mut libc::c_void;
+            m.msg_hdr.msg_namelen = sin_len;
+            m
+        })
+        .collect();
 
     loop {
-        // ── Receive ──────────────────────────────────────────────────────────
-        let (len, peer) = match sock.recv_from(&mut rx_buf) {
-            Ok(r) => r,
-            Err(e) => {
-                // EAGAIN/EINTR are benign; anything else is worth logging.
-                if e.kind() != std::io::ErrorKind::WouldBlock
-                    && e.kind() != std::io::ErrorKind::Interrupted
-                {
-                    warn!("kloop recv_from: {e}");
-                }
+        // Reset the per-message name length (recvmmsg overwrites it with the actual).
+        for m in rx_msgs.iter_mut() {
+            m.msg_hdr.msg_namelen = storage_len;
+        }
+
+        let n = unsafe {
+            libc::recvmmsg(
+                fd,
+                rx_msgs.as_mut_ptr(),
+                BATCH as libc::c_uint,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if n <= 0 {
+            continue;
+        }
+        let n = n as usize;
+
+        // Snapshot guards taken ONCE per batch, not per packet.
+        let zones_snap = zones.load();
+        let cache_guard = cache_snapshot.as_ref().map(|c| c.load_full());
+
+        let mut nsend = 0usize;
+        for i in 0..n {
+            let len = rx_msgs[i].msg_len as usize;
+            if len == 0 {
                 continue;
             }
-        };
-        let query = &rx_buf[..len];
-        let src_ip: Option<IpAddr> = Some(peer.ip());
 
-        // ── Fast path A: wire builder (zero hickory, zero alloc) ─────────────
-        // answer_dns_wire: parse_query + WireRecordIndex CRC32c lookup +
-        // build_answer_a_aaaa_wire — all SIMD, stack-only.
-        {
-            let zones_snap = zones.load();
-            use crate::dns::xdp::worker::{answer_dns_wire_pub, WireResultPub};
-            match answer_dns_wire_pub(query, &mut tx_buf, &zones_snap, &acl, src_ip) {
-                WireResultPub::Answered(resp_len) => {
-                    let _ = sock.send_to(&tx_buf[..resp_len], peer);
+            // Source IP/port from the recvmmsg name (bind is IPv4).
+            let (src_ip, peer) = unsafe {
+                let sa = &rx_addrs[i] as *const libc::sockaddr_storage as *const libc::sockaddr_in;
+                let ip = Ipv4Addr::from(u32::from_be((*sa).sin_addr.s_addr));
+                let port = u16::from_be((*sa).sin_port);
+                (IpAddr::V4(ip), SocketAddr::new(IpAddr::V4(ip), port))
+            };
+
+            // ── Fast path A: wire builder (zero hickory, zero alloc) ─────────
+            {
+                use crate::dns::xdp::worker::{answer_dns_wire_pub, WireResultPub};
+                match answer_dns_wire_pub(
+                    &rx_bufs[i][..len],
+                    &mut tx_bufs[nsend],
+                    &zones_snap,
+                    &acl,
+                    Some(src_ip),
+                ) {
+                    WireResultPub::Answered(resp_len) => {
+                        tx_iov[nsend].iov_len = resp_len;
+                        tx_addrs[nsend] = rx_addrs[i];
+                        tx_msgs[nsend].msg_hdr.msg_namelen = sin_len;
+                        nsend += 1;
+                        continue;
+                    }
+                    WireResultPub::Drop => continue,
+                    WireResultPub::Fallback => {}
+                }
+            }
+
+            // ── Fast path B: cache snapshot (SIMD lookup, zero hickory) ──────
+            if let Some(ref snap) = cache_guard {
+                use crate::dns::xdp::worker::answer_from_cache_pub;
+                if let Some(resp_len) = answer_from_cache_pub(
+                    &rx_bufs[i][..len],
+                    snap,
+                    &acl,
+                    Some(src_ip),
+                    &mut tx_bufs[nsend],
+                    stats.as_ref(),
+                    domain_stats.as_ref(),
+                ) {
+                    tx_iov[nsend].iov_len = resp_len;
+                    tx_addrs[nsend] = rx_addrs[i];
+                    tx_msgs[nsend].msg_hdr.msg_namelen = sin_len;
+                    nsend += 1;
                     continue;
                 }
-                WireResultPub::Drop => continue, // ACL Deny — silent drop
-                WireResultPub::Fallback => {}     // try cache, then hickory
+            }
+
+            // ── Slow path: hickory fallback (CNAME, MX, TSIG, recursion…) ────
+            let msg = FallbackMsg {
+                query: rx_bufs[i][..len].to_vec(),
+                peer,
+                socket: Arc::clone(&sock),
+            };
+            if fallback_tx.try_send(msg).is_err() {
+                debug!("kloop fallback channel full — dropping query from {peer}");
             }
         }
 
-        // ── Fast path B: cache snapshot (SIMD lookup, zero hickory) ──────────
-        if let Some(ref cache_arc) = cache_snapshot {
-            let snap = cache_arc.load_full();
-            use crate::dns::xdp::worker::answer_from_cache_pub;
-            if let Some(resp_len) = answer_from_cache_pub(
-                query,
-                &snap,
-                &acl,
-                src_ip,
-                &mut tx_buf,
-                stats.as_ref(),
-                domain_stats.as_ref(),
-            ) {
-                let _ = sock.send_to(&tx_buf[..resp_len], peer);
-                continue;
+        // ── Send the whole batch in one syscall ──────────────────────────────
+        if nsend > 0 {
+            let mut sent = 0usize;
+            while sent < nsend {
+                let r = unsafe {
+                    libc::sendmmsg(
+                        fd,
+                        tx_msgs[sent..].as_mut_ptr(),
+                        (nsend - sent) as libc::c_uint,
+                        0,
+                    )
+                };
+                if r <= 0 {
+                    break; // EAGAIN/error — drop the rest rather than block the loop
+                }
+                sent += r as usize;
             }
-        }
-
-        // ── Slow path: hickory fallback (CNAME, MX, TSIG, recursion…) ────────
-        // Clone the query bytes and send to the async hickory handler.
-        // The handler replies directly on sock_clone.
-        let msg = FallbackMsg {
-            query:  query.to_vec(), // one alloc per fallback query — acceptable
-            peer,
-            socket: Arc::clone(&sock),
-        };
-        if fallback_tx.try_send(msg).is_err() {
-            // Channel full — drop rather than block the fast loop.
-            debug!("kloop fallback channel full — dropping query from {peer}");
         }
     }
 }
