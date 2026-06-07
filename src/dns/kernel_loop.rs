@@ -252,7 +252,7 @@ fn worker_loop(
                     fd,
                     msgs.as_mut_ptr(),
                     BATCH as libc::c_uint,
-                    libc::MSG_WAITFORONE,
+                    libc::MSG_WAITFORONE as _,
                     std::ptr::null_mut(),
                 )
             };
