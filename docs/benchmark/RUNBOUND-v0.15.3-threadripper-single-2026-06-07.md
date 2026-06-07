@@ -50,9 +50,9 @@ link vs NIC/bus).
 | Received by NIC | ~11.8 M QPS | receiver `rx_pkts_nic` |
 | NIC drops (PCIe 2.0 RX descriptor pressure) | ~0.9 M QPS `rx_no_dma_resources` (0.00 `rx_missed_errors`) | receiver `ethtool -S` |
 | **Max sustained served QPS** | **~8.2 M** (7.4–9.3 M across 4 runs) | receiver `tx_pkts_nic` (responses on the wire) |
-| Latency p50 / p95 / p99 @ 6.4 M offered | 0.079 / 0.108 / 0.155 ms | dnsmark `--ramp` (DSS), per-step window |
-| Max offered under p50<1 ms SLO | ~11.27 M qps (p50 0.944 ms) | dnsmark DSS binary-search convergence |
-| Latency knee (p50 crosses 1 ms) | between 11.3 M and 12.4 M offered (p50 0.94 → 1.78 ms) | dnsmark DSS |
+| Latency p50 / p95 / p99 @ 6.4 M offered | 0.079 / 0.108 / 0.155 ms | dnsmark `--ramp` (DSD), per-step window |
+| Max offered under p50<1 ms SLO | ~11.27 M qps (p50 0.944 ms) | dnsmark DSD binary-search convergence |
+| Latency knee (p50 crosses 1 ms) | between 11.3 M and 12.4 M offered (p50 0.94 → 1.78 ms) | dnsmark DSD |
 | Success / error rate | 99.88 % NOERROR | dnsmark rcode breakdown |
 | Receiver CPU | 8.7 % busy / **91.3 % idle** | `/proc/stat` over the window |
 | Receiver RAM | 125 GB total; cache 8192 entries (capped under memory pressure) | `free`, `/api/stats` |
@@ -88,7 +88,7 @@ link vs NIC/bus).
   NIC (`rx_no_dma`) without delaying the answered queries, so the served subset keeps
   sub-millisecond latency until the receive queue finally builds at ~12 M offered. The
   low-QPS steps show ~9 ms p95/p99 outliers — the ~0.5 % forwarded cache-misses, which is
-  why DSS uses the median (p50), not the tail, as its saturation signal.
+  why DSD uses the median (p50), not the tail, as its saturation signal.
 
 ## 6. Appendix — exact commands & configuration
 
