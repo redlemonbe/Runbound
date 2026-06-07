@@ -1026,21 +1026,19 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
     // #80: NIC ring buffer + drop stats
     let nic_rx_ring = crate::dns::xdp::socket::XDP_NIC_RX_RING.load(Ordering::Relaxed);
     let nic_rx_ring_max = crate::dns::xdp::socket::XDP_NIC_RX_RING_MAX.load(Ordering::Relaxed);
-    // #159: sum rx_dropped across all XDP interfaces
-    let nic_rx_dropped: u64 = crate::dns::xdp::socket::xdp_iface_snapshot()
-        .iter()
-        .map(|s| crate::dns::xdp::socket::read_nic_rx_dropped(&s.iface))
-        .sum();
-
-    // #164: rx_missed_errors + rx_no_dma_resources per interface (NIC/bus-bound detection)
-    let nic_rx_missed: u64 = crate::dns::xdp::socket::xdp_iface_snapshot()
-        .iter()
-        .map(|s| crate::dns::xdp::socket::read_nic_rx_missed(&s.iface))
-        .sum();
-    let nic_rx_no_dma: u64 = crate::dns::xdp::socket::xdp_iface_snapshot()
-        .iter()
-        .map(|s| crate::dns::xdp::socket::read_nic_rx_no_dma(&s.iface))
-        .sum();
+    // AF_XDP per-socket RX stats (kernel ABI, getsockopt XDP_STATISTICS) — VALID
+    // under zero-copy, unlike the old ethtool/sysfs nic_rx_* reads which are blind
+    // to XDP_REDIRECT->XSK. (Slow-path stats are computed elsewhere, untouched.)
+    let (mut xsk_rx_dropped, mut xsk_fill_ring_empty, mut xsk_rx_ring_full) = (0u64, 0u64, 0u64);
+    for st_if in crate::dns::xdp::socket::xdp_iface_snapshot() {
+        for fd in st_if.xsk_fds {
+            if let Some(xs) = crate::dns::xdp::socket::read_xsk_statistics(fd) {
+                xsk_rx_dropped      += xs.rx_dropped;
+                xsk_fill_ring_empty += xs.rx_fill_ring_empty_descs;
+                xsk_rx_ring_full    += xs.rx_ring_full;
+            }
+        }
+    }
 
     // #33: upstream racing wins per upstream.
     let upstream_racing_wins: serde_json::Map<String, serde_json::Value> = s
@@ -1081,9 +1079,9 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
             .collect::<Vec<u64>>(),
         "nic_rx_ring":     nic_rx_ring,
         "nic_rx_ring_max": nic_rx_ring_max,
-        "nic_rx_dropped":  nic_rx_dropped,
-        "nic_rx_missed":   nic_rx_missed,
-        "nic_rx_no_dma":   nic_rx_no_dma,
+        "xsk_rx_dropped":         xsk_rx_dropped,
+        "xsk_rx_fill_ring_empty": xsk_fill_ring_empty,
+        "xsk_rx_ring_full":       xsk_rx_ring_full,
         "upstream_racing":      s.cfg.upstream_racing,
         "upstream_racing_wins": upstream_racing_wins,
             "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
