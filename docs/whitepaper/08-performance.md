@@ -25,7 +25,7 @@ any figure not yet re-measured.
 - The naïve hickory slow path measured **1.78× Unbound's instructions/query** — the reason
   the fast paths exist (§1.2).
 
-## Slow path vs fast path — measured (v0.16.0, 5995WX, single X520, warm cache)
+## Slow path vs fast path — measured (v0.16.1, 5995WX, single X520, warm cache)
 
 The kernel slow path (`xdp: no`) runs the **same** SIMD/ASM cache wire responder as the
 AF_XDP fast path — only the I/O source differs (kernel UDP socket vs AF_XDP ring). Measured
@@ -35,8 +35,8 @@ local-data, with only the `xdp:` line changed. Throughput is the receiver NIC PH
 
 | path | max served | NIC drops at max | receiver CPU | latency (low load) |
 |------|-----------:|-----------------:|-------------:|--------------------|
-| AF_XDP fast path (`xdp: yes`) | **~10.1 M** | 0 (NIC line-rate limited) | **~21 %** | p50 0.133 ms / p99 0.254 ms (ramp, AF_XDP RTT) |
-| kernel slow path (`xdp: no`)  | **~6.9 M**  | ~5 M (`rx_no_dma` + `rx_missed`) | ~61 % | p50 ~0.10 ms (ramp, no-loss region) |
+| AF_XDP fast path (`xdp: yes`) | **~10.1 M** | 0 (NIC line-rate limited) | **~11 %** (8 M served @ 10.6 %) | p50 0.062 ms / p99 0.088 ms (ramp, AF_XDP RTT) |
+| kernel slow path (`xdp: no`)  | **~7.3 M**  | ~4.6 M (`rx_no_dma` + `rx_missed`) | ~70 cores busy | p50 0.065-0.089 ms (ramp, no-loss region) |
 
 The fast path tracks offered load 1:1 with **zero drops** up to the X520 line rate (8 M
 served at 6.7 % CPU), then answers ~10.1 M of the ~10.7 M the NIC can receive, at ~21 %
@@ -46,8 +46,8 @@ per-packet kernel-UDP syscall: ~61 % CPU, ~5 M packets dropped at the NIC under 
 firehose, and an earlier latency knee — its rate under a sub-millisecond median SLO is
 ~4.6 M served (p50 0.746 ms). A NIC without the PCIe 2.0 RX cap would scale both higher;
 the magnitude of that headroom is not measured here. Reports:
-[fast path](../benchmark/RUNBOUND-v0.16.0-threadripper-5995wx-x520-xdp-2026-06-07.md),
-[slow path](../benchmark/RUNBOUND-v0.16.0-threadripper-5995wx-x520-noxdp-2026-06-07.md).
+[fast path](../benchmark/RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md),
+[slow path](../benchmark/RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md).
 
 > The slow path serves from cache only since the #183 fix: the racing resolvers were built
 > cache-less and the cache snapshot was built for `xdp: yes` only, leaving `xdp: no`
