@@ -35,8 +35,8 @@ local-data, with only the `xdp:` line changed. Throughput is the receiver NIC PH
 
 | path | max served | NIC drops at max | receiver CPU | latency (low load) |
 |------|-----------:|-----------------:|-------------:|--------------------|
-| AF_XDP fast path (`xdp: yes`) | **~10.1 M** | 0 (NIC line-rate limited) | **~21 %** | p50 0.042 ms (AF_XDP RTT) |
-| kernel slow path (`xdp: no`)  | **~6.9 M**  | ~5 M (`rx_no_dma` + `rx_missed`) | ~61 % | p50 0.019 ms (receiver wire) |
+| AF_XDP fast path (`xdp: yes`) | **~10.1 M** | 0 (NIC line-rate limited) | **~21 %** | p50 0.133 ms / p99 0.254 ms (ramp, AF_XDP RTT) |
+| kernel slow path (`xdp: no`)  | **~6.9 M**  | ~5 M (`rx_no_dma` + `rx_missed`) | ~61 % | p50 ~0.10 ms (ramp, no-loss region) |
 
 The fast path tracks offered load 1:1 with **zero drops** up to the X520 line rate (8 M
 served at 6.7 % CPU), then answers ~10.1 M of the ~10.7 M the NIC can receive, at ~21 %
