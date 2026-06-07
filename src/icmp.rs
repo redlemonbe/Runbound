@@ -103,6 +103,7 @@ impl IcmpStats {
     pub fn ban_permanent(&self, ip: IpAddr) {
         self.banned.insert(ip, BanEntry { ts: Instant::now(), src: BanSource::Manual, permanent: true });
         self.banned_present.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.persist_blacklist();
     }
 
     /// Per-packet data-path check (XDP enforces via the BPF `icmp_banned` map;
@@ -115,6 +116,7 @@ impl IcmpStats {
     pub fn unban(&self, ip: IpAddr) {
         self.banned.remove(&ip);
         self.banned_present.store(!self.banned.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        self.persist_blacklist();
     }
 
     /// Remove ban entries older than  and unban from XDP fast path.
@@ -135,6 +137,47 @@ impl IcmpStats {
             if let IpAddr::V4(ipv4) = ip {
                 let _ = self.ban_cmd_tx.send(IcmpBanCmd::Unban(ipv4));
             }
+        }
+    }
+
+    /// Path of the persisted permanent-ban ("blacklist") list.
+    fn blacklist_path() -> std::path::PathBuf {
+        crate::runtime::base_dir().join("ip-blacklist.json")
+    }
+
+    /// Persist the permanent ("blacklisted") IPs to disk so they survive a restart.
+    pub fn persist_blacklist(&self) {
+        let ips: Vec<String> = self
+            .banned
+            .iter()
+            .filter(|e| e.value().permanent)
+            .map(|e| e.key().to_string())
+            .collect();
+        if let Ok(j) = serde_json::to_string(&ips) {
+            let _ = std::fs::write(Self::blacklist_path(), j);
+        }
+    }
+
+    /// Load persisted permanent bans at startup and re-apply them (store + XDP map).
+    pub fn load_blacklist(&self) {
+        let data = match std::fs::read_to_string(Self::blacklist_path()) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let ips: Vec<String> = serde_json::from_str(&data).unwrap_or_default();
+        let mut n = 0u32;
+        for ip_s in ips {
+            if let Ok(ip) = ip_s.parse::<IpAddr>() {
+                self.banned.insert(ip, BanEntry { ts: Instant::now(), src: BanSource::Manual, permanent: true });
+                if let IpAddr::V4(v4) = ip {
+                    let _ = self.ban_cmd_tx.send(IcmpBanCmd::Ban(v4));
+                }
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.banned_present.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(count = n, "loaded persisted IP blacklist");
         }
     }
 

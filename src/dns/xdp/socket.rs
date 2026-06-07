@@ -587,7 +587,7 @@ pub fn auto_tune_nic_queues(iface: &str, budget: u32) -> u32 {
     // SAFETY: zeroed() valid for this plain repr(C) struct of u32 fields.
     let mut ch: EthtoolChannels = unsafe { std::mem::zeroed() };
     ch.cmd = ETHTOOL_GCHANNELS;
-    let mut ifr = build_ifreq(iface_safe.clone(), (&mut ch as *mut EthtoolChannels).cast());
+    let mut ifr = build_ifreq(iface_safe, (&mut ch as *mut EthtoolChannels).cast());
     // SAFETY: fd valid; ifr fully initialised with a valid ifr_data pointer.
     let get_rc = unsafe {
         libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>())

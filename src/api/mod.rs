@@ -603,7 +603,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 async fn slave_guard_middleware(
     State(state): State<AppState>,
-    mut req: Request<axum::body::Body>,
+    req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     if state.slave_mode && req.method() != axum::http::Method::GET {

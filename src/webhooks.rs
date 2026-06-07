@@ -162,7 +162,7 @@ pub struct WebhookDispatcher {
 }
 
 impl WebhookDispatcher {
-    pub fn new(targets: Arc<tokio::sync::RwLock<Vec<WebhookTarget>>>) -> Self {
+    pub fn new(_targets: Arc<tokio::sync::RwLock<Vec<WebhookTarget>>>) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(WebhookTarget, WebhookEvent)>();
         tokio::spawn(async move {
             let client = reqwest::Client::builder()
