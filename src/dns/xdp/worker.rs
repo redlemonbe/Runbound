@@ -1378,6 +1378,9 @@ pub(crate) use WireResult as WireResultPub;
 /// known-IP traffic (allowed TTL 10ms, denied 100ms).
 #[inline]
 pub(crate) fn rl_should_drop(rate_limiter: &RateLimiter, ip: IpAddr) -> bool {
+    if !rate_limiter.enabled() {
+        return false; // rate-limit: 0 → no gate, zero per-packet cost
+    }
     thread_local! {
         static TL_RL: std::cell::RefCell<
             std::collections::HashMap<IpAddr, (bool, std::time::Instant)>

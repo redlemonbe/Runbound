@@ -79,6 +79,10 @@ impl RateLimiter {
         })
     }
 
+    /// Cheap disabled-check (rps==0) so hot paths can skip the gate entirely.
+    #[inline]
+    pub fn enabled(&self) -> bool { self.rps != 0 }
+
     #[inline]
     pub fn check(&self, ip: IpAddr) -> bool {
         if self.rps == 0 {
