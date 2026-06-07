@@ -2261,6 +2261,7 @@ pub async fn run_dns_server(
     domain_stats: Arc<crate::domain_stats::DomainStats>,
     alert_tracker: Arc<crate::alerts::AlertTracker>,
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
+    icmp_stats: Arc<crate::icmp::IcmpStats>,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -2365,6 +2366,7 @@ pub async fn run_dns_server(
     let acl_for_kloop   = Arc::clone(&acl);
     let zones_for_kloop = Arc::clone(&zones);
     let rl_for_kloop    = Arc::clone(&rate_limiter);
+    let icmp_for_kloop  = Arc::clone(&icmp_stats);
     let stats_for_kloop        = Arc::clone(&stats);
     let domain_stats_for_kloop = Arc::clone(&domain_stats);
     let xdp_cache_for_kloop    = xdp_cache.as_ref().map(Arc::clone);
@@ -2502,6 +2504,7 @@ pub async fn run_dns_server(
             Arc::clone(&zones_for_kloop),
             Arc::clone(&acl_for_kloop),
             Arc::clone(&rl_for_kloop),
+            Arc::clone(&icmp_for_kloop),
             fallback_tx.clone(),
             lo_snapshot,
             Some(Arc::clone(&stats_for_kloop)),
@@ -2572,6 +2575,7 @@ pub async fn run_dns_server(
             Arc::clone(&zones_for_kloop),
             Arc::clone(&acl_for_kloop),
             Arc::clone(&rl_for_kloop),
+            Arc::clone(&icmp_for_kloop),
             fallback_tx.clone(),
             kloop_cache_snapshot,
             Some(Arc::clone(&stats_for_kloop)),

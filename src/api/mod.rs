@@ -698,6 +698,8 @@ pub fn router(state: AppState) -> Router {
         .route("/alerts", get(get_alerts))
         .route("/webhooks/test", post(post_webhook_test))
         .route("/alerts/blocked/:ip", delete(delete_blocked_ip).put(put_blocked_ip))
+        .route("/protection/banned", get(banned_list_handler))
+        .route("/protection/banned/:ip/blacklist", post(blacklist_ip_handler))
         // Administration
         .route("/rotate-key", post(rotate_key_handler))
         // Multi-user management
@@ -6397,6 +6399,42 @@ async fn get_alerts(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 // PUT /api/alerts/blocked/:ip — manually block an IP (XDP + AlertTracker)
+// GET /api/protection/banned — current banned source IPs (flood / manual / relay /
+// blacklisted), the same authoritative set the XDP `icmp_banned` map and the kernel
+// slow path enforce. (#protection-bans)
+async fn banned_list_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let entries = s.icmp_stats.banned_snapshot();
+    (StatusCode::OK, JsonExtract(serde_json::json!({
+        "count": entries.len(),
+        "entries": entries,
+    }))).into_response()
+}
+
+// POST /api/protection/banned/:ip/blacklist — promote a ban to a permanent one
+// ("blacklist"): it no longer auto-expires, is dropped on both datapaths, and is
+// propagated to slaves like any other ban.
+async fn blacklist_ip_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(ip_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match ip_str.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            state.icmp_stats.ban_permanent(ip);
+            if let std::net::IpAddr::V4(ipv4) = ip {
+                let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+            }
+            if let (Some(ref j), Some(ref k)) = (&state.sync_journal, &state.sync_key) {
+                crate::api::relay::push_to_slaves(
+                    j, k, axum::http::Method::PUT,
+                    format!("alerts/blocked/{ip_str}"), bytes::Bytes::new(),
+                );
+            }
+            (StatusCode::OK, JsonExtract(serde_json::json!({"blacklisted": true, "ip": ip_str}))).into_response()
+        }
+        Err(_) => (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error": "invalid IP"}))).into_response(),
+    }
+}
+
 async fn put_blocked_ip(
     State(state): State<AppState>,
     axum::extract::Path(ip_str): axum::extract::Path<String>,
