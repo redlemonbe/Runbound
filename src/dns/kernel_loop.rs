@@ -406,6 +406,21 @@ mod sockaddr_parse_tests {
     }
 
     #[test]
+    fn fuzz_sockaddr_to_std_never_panics() {
+        // 1M fully-random sockaddr_storage byte patterns must yield Some/None without
+        // panic or UB (the recvmmsg source-addr parser). #SEC-H8.
+        let mut st: u64 = 0x1234_5678_9abc_def0;
+        let mut rng = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        let sz = std::mem::size_of::<libc::sockaddr_storage>();
+        for _ in 0..1_000_000 {
+            let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let p = &mut ss as *mut libc::sockaddr_storage as *mut u8;
+            for i in 0..sz { unsafe { *p.add(i) = (rng() & 0xff) as u8; } }
+            let _ = sockaddr_to_std(&ss);
+        }
+    }
+
+    #[test]
     fn ipv4_round_trips() {
         let ss = v4(Ipv4Addr::new(1, 2, 3, 4), 53);
         assert_eq!(sockaddr_to_std(&ss), Some("1.2.3.4:53".parse().unwrap()));
