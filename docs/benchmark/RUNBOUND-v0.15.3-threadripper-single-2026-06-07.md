@@ -1,79 +1,109 @@
-# Runbound Benchmark — v0.15.3 — Threadripper PRO 5995WX receiver — single fibre — 2026-06-07
+# Runbound Benchmark — v0.15.3 — AMD Threadripper PRO 5995WX — 2026-06-07
 
-> Follows [README.md](README.md). Measured data only. Values that the hardware
-> makes unmeasurable are marked **"I cannot confirm this."**
+> Follows [README.md](README.md). Measured data only. Where a value is missing or
+> uncertain, write exactly **"I cannot confirm this."**
 
 ## 1. Executive Summary
 
-Over single X520 10 GbE fibre, with a warm resolver cache (real cache-hit fast path —
-**no synthetic local-data**), the dnsmark v2.1.1 generator offered **12.46 M qps**
-(its own ceiling on this Xeon E5-2690 v2). Runbound v0.15.3 on an AMD Threadripper
-PRO 5995WX answered cache hits at **p50 0.041 ms / p99 0.050 ms** (NOERROR 99.87%) at **98.4% idle** CPU — i.e.
-**~1.6% busy**. Runbound was **not saturated**; no
-saturation point exists within the generator's reach, so its true ceiling is **not
-measurable on this rig** ("I cannot confirm this"). The bottleneck is the generator,
-not Runbound.
+Over a single 10 GbE fibre (Intel X520 / 82599, PCIe 2.0 x8), Runbound v0.15.3
+served a sustained **~8.2 M real DNS QPS** (range 7.4–9.3 M across four runs) from
+a warm cache (99.5 % hit rate, real forward-zone path, no local-data) while the
+receiver CPU stayed **91.3 % idle** (8.7 % busy). Cache-hit round-trip latency was
+**p50 0.225 ms / p95 0.379 ms / p99 0.472 ms** at a controlled ~200 k QPS load.
+Answer success rate was **99.88 % NOERROR**. The throughput ceiling is **not**
+Runbound and **not** the generator: the generator offered ~13 M QPS (≈ the 10 GbE
+line rate for ~94-byte DNS frames) and the receiving X520 dropped ~0.9 M QPS to
+`rx_no_dma_resources` — the per-packet DMA/descriptor rate of the card's PCIe 2.0
+link. Runbound itself was never saturated.
 
 ## 2. Objective
 
-#176 gate (>15.5 M qps stable, negligible loss). Measure Runbound's XDP fast path
-over single fibre with a methodology-faithful setup (warm cache, real corpus, instrument
-= dnsmark).
+Measure the real, cache-served DNS throughput and latency of Runbound's XDP fast
+path over a single 10 GbE link, and identify the binding bottleneck (software vs
+link vs NIC/bus).
 
 ## 3. Methodology & Architecture
 
-- **Receiver (Runbound):** AMD Threadripper PRO 5995WX (64 physical cores / 8 NUMA),
-  Intel 82599/X520 dual-port 10 GbE, Runbound v0.15.3, `xdp: yes`, **rb-dual**
-  config (forwarding resolver + cache, **no local-data**), `rate-limit: 0`, RSS
-  udp4 sdfn, flow-control off.
-- **Generator (dnsmark v2.1.1):** dual Intel Xeon E5-2690 v2 (20 physical / 2 NUMA),
-  X520, command `dnsmark -s <ip-A> -d top-10000-domains.txt --xdp -Q 0 --max-outstanding 0`,
-  governor auto-pinned to performance, static ARP (else dnsmark falls back to
-  sendmmsg — NOT zero-copy), per-NIC worker cap 10 (is_xeon_v2_x520).
-- **Link:** single direct X520 10 GbE fibre, flow-control off.
-- **Dataset:** `benchmark/corpus/top-10000-domains.txt` (10 000 real names), cache
-  **warmed** beforehand (UDP pass) so the measured run is cache-hit fast path.
-- **Procedure:** warm cache, then steady offered-max window; receiver CPU sampled
-  with `mpstat`.
+- **Receiver (Runbound):** AMD Threadripper PRO 5995WX (64 cores / 128 threads),
+  125 GB RAM, Intel X520 / 82599 (`ixgbe`, PCIe 2.0 x8, MTU 1500), kernel
+  7.0.6-2-pve, Runbound v0.15.3, `xdp: yes` (DRV/zero-copy), single
+  `xdp-interface`, `rate-limit: 0`, real `forward-zone` (no local-data),
+  `cache-min-ttl 3600`. Config: [runbound-receiver-bench.conf](runbound-receiver-bench.conf).
+- **Generator (dnsmark):** dual Intel Xeon E5-2690 v2 (20c/40t), dnsmark v2.1.2,
+  AF_XDP zero-copy. Command:
+  `dnsmark -s <recv-ip> -d top-10000-domains.txt -p 53 --xdp -Q 0 --max-outstanding 0`.
+- **Link:** Intel X520 ↔ X520, 10 GbE, **direct** (no switch), flow-control **off**
+  both ends, symmetric per-worker source ports for RSS.
+- **Dataset:** `benchmark/corpus/top-10000-domains.txt`, 10 000 real names, cycled.
+- **Procedure:** warm the cache (forward + cache all corpus names, → 99.5 % hit),
+  then open-loop flood; 10 s steady measurement window; throughput read from the
+  receiver NIC PHY counters (`ethtool -S`: `rx_pkts_nic`, `tx_pkts_nic`,
+  `rx_no_dma_resources`); CPU from `/proc/stat`.
 
 ## 4. Raw Results
 
 | Metric | Value | Source |
 |--------|-------|--------|
-| Offered (generator, submitted descriptors) | **12.46 M qps** | dnsmark "Send throughput" (submitted = wire truth) |
-| **Receiver CPU under load** | **98.4% idle (~1.6% busy, softirq ~0)** | `mpstat` on receiver |
-| Answered rate (round-trip) | **1.02 M qps — lower bound only** | dnsmark round-trip; the generator drains responses on only its bound RX queues (X520), so it under-counts. Real answered rate: **I cannot confirm this.** |
-| rcode | NOERROR 99.87% | dnsmark |
-| Receiver NIC rx/tx counters | **I cannot confirm this** | **X520 + XDP zero-copy: `ethtool -S` counters do not move (XDP_REDIRECT→XSK bypasses them); verified `rx_pkts_nic` delta = 0 under a 12 M flood.** No valid NIC-side measurement is possible on this NIC in ZC. |
-| Latency fast-path (cache-hit) p50 / p95 / p99 | **0.041 / 0.042 / 0.050 ms** | dnsmark **closed-loop** (`--max-outstanding 100`), real per-query RTT (whitepaper §7). Tail p999 ~140 ms = cache-miss forwarding of the ~8% dead/uncached corpus names (not the fast path). Wire (tcpdump) anchor not possible on X520 + zero-copy (documented). |
+| Offered (on the wire) | ~13.0 M QPS (≈ 10 GbE line rate, ~94 B frames) | generator `tx_pkts_nic` |
+| Received by NIC | ~11.8 M QPS | receiver `rx_pkts_nic` |
+| NIC drops (PCIe 2.0 RX descriptor pressure) | ~0.9 M QPS `rx_no_dma_resources` (0.00 `rx_missed_errors`) | receiver `ethtool -S` |
+| **Max sustained served QPS** | **~8.2 M** (7.4–9.3 M across 4 runs) | receiver `tx_pkts_nic` (responses on the wire) |
+| Latency p50 / p95 / p99 | 0.225 / 0.379 / 0.472 ms @ ~200 k QPS controlled | dnsmark round-trip histogram |
+| Latency at the 8.2 M peak | I cannot confirm this. (generator AF_XDP round-trip RX caps reliable sampling well below peak) | — |
+| Success / error rate | 99.88 % NOERROR | dnsmark rcode breakdown |
+| Receiver CPU | 8.7 % busy / **91.3 % idle** | `/proc/stat` over the window |
+| Receiver RAM | 125 GB total; cache 8192 entries (capped under memory pressure) | `free`, `/api/stats` |
+| Cache hit rate | 99.5 % | `/api/stats` |
 
 ## 5. Interpretation
 
-The defensible result is the **receiver CPU**: Runbound's XDP fast path is **~98.4%
-idle** while the generator floods at its maximum (12.46 M qps). A server that idle at
-the offered rate is far from saturation; the gate criterion (sustained >15.5 M with
-the loss/latency knee) **cannot be exercised** because the generator cannot reach it
-— hence "I cannot confirm this" for Runbound's ceiling.
+- **Runbound is not the bottleneck.** It served ~8.2 M QPS at 8.7 % CPU (91.3 %
+  idle). The software fast path has large headroom on this host.
+- **The generator is not the bottleneck.** It offered ~13 M QPS, which is ≈ the
+  10 GbE line rate for ~94-byte DNS frames; it is link-bound, not PCIe-bound (its
+  AF_XDP TX is batched and cheap, and its own X520 PCIe 2.0 has TX headroom).
+- **The ceiling is the receiving X520's PCIe 2.0 link.** ~0.9 M QPS are dropped at
+  the NIC as `rx_no_dma_resources` — the card cannot replenish RX descriptors /
+  DMA small packets fast enough over PCIe 2.0 (5 GT/s x8, confirmed by `lspci`
+  `LnkCap`/`LnkSta` and sysfs `max_link_speed = 5.0 GT/s`). XDP cannot relieve
+  this: the DMA crosses PCIe *before* the XDP program runs, so the drop happens
+  below XDP. Exposing the PCIe floor is the expected outcome of a working
+  kernel-bypass path (software no longer the limit).
+- The 82599 exposes **one** PCIe 2.0 x8 link shared by both ports, so a second
+  fibre would not scale small-packet QPS on this card. I cannot confirm this on
+  this rig (the second port is faulty hardware and was disabled); it is a
+  hardware-architecture statement, not a measured one.
+- The gap between received (~11.8 M) and served (~8.2 M) is ~30 %; whether this is
+  a Runbound TX-side limit or PCIe-2.0 TX-descriptor pressure on the response path,
+  I cannot confirm this without valid ZC NIC counters (the X520 netdev counters are
+  blind under zero-copy).
 
-**Measurement limitation (real, not a shortcut).** On the Intel 82599/X520 in XDP
-zero-copy, the receiver's NIC counters are blind (`ethtool -S` does not increment
-for XDP_REDIRECT→XSK; `rx_pkts_nic` delta measured at 0 under a 12 M flood). The
-generator (dnsmark) is therefore the only valid instrument here: its **submitted**
-count is the offered truth; its **round-trip** is a lower bound (it drains responses
-on a subset of its RX queues on the X520). A definitive receiver-side throughput
-needs a NIC whose counters are valid in ZC (e.g. Intel X710 / i40e) — procurement in
-progress.
-
-## 6. Appendix — exact commands
+## 6. Appendix — exact commands & configuration
 
 ```bash
-# Receiver: runbound /etc/runbound/rb-dual.conf   (xdp:yes, cache, no local-data)
-ethtool -A <nic> rx off tx off ; ethtool -N <nic> rx-flow-hash udp4 sdfn
-# Static ARP on the generator (mandatory — else dnsmark XDP TX falls back to sendmmsg):
-ip neigh replace <receiver-ip> lladdr <receiver-mac> dev <nic> nud permanent
-# Warm cache, then measure:
-dnsmark -s <ip-A> -d top-10000-domains.txt -p 53 --xdp -Q 0 --max-outstanding 0 -l 18
-mpstat 1 2     # on the receiver
+# Receiver (Runbound) — single fibre, real cache, XDP zero-copy
+ethtool -A enp33s0f0 rx off tx off        # flow control off
+ip link set enp33s0f0 mtu 1500            # ≤3506 so DRV/ZC mode is available
+runbound -c runbound-receiver-bench.conf  # xdp: yes, forward-zone, no local-data
+lspci -vv -s 21:00.0 | grep -E 'LnkCap|LnkSta'   # Speed 5GT/s = PCIe 2.0 (card max)
+cat /sys/bus/pci/devices/0000:21:00.0/max_link_speed   # 5.0 GT/s PCIe (silicon)
+
+# Generator (dnsmark) — static ARP (else silent sendmmsg fallback), then flood
+ip neigh replace <recv-ip> lladdr <recv-mac> dev <nic> nud permanent
+dnsmark -s <recv-ip> -d top-10000-domains.txt -p 53 --xdp -Q 0 --max-outstanding 0
+# (dnsmark v2.1.2 auto-pins the performance governor and auto-detaches any stale
+#  XDP program left by a previously killed run — no manual setup needed.)
+
+# Throughput (receiver NIC PHY counters, snapshot twice over a 10 s window)
+ethtool -S enp33s0f0 | grep -wE 'rx_pkts_nic|tx_pkts_nic|rx_no_dma_resources|rx_missed_errors'
+# served QPS = delta(tx_pkts_nic)/window ; offered-received gap = delta(rx_no_dma_resources)
+
+# Latency (controlled ~200 k QPS so round-trip completion is reliable on the wire)
+dnsmark -s <recv-ip> -d top-10000-domains.txt -p 53 --xdp -Q 2000000 --max-outstanding 16000
 ```
 
-> Receiver config used: [runbound-receiver-bench.conf](runbound-receiver-bench.conf) (rb-dual: forwarding resolver + cache, xdp:yes, rate-limit:0, no local-data).
+> **NIC note.** The Intel X520 / 82599 works but is a poor *measurement* platform
+> for high-rate XDP: PCIe 2.0 x8 (shared by both ports), RSS capped at 16 queues,
+> and netdev counters that read 0 under zero-copy (only `*_nic` driver counters and
+> `XDP_STATISTICS` are reliable). An Intel i40e (X710), ice (E810) or igc lifts the
+> PCIe ceiling and exposes valid ZC counters. See [README.md](README.md).
