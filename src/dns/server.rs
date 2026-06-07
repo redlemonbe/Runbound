@@ -2523,7 +2523,19 @@ pub async fn run_dns_server(
         let kernel_loop_iface = interfaces.first().map(|s| s.as_str()).unwrap_or("0.0.0.0");
         let fast_cores = {
             let nic_node = crate::cpu::nic_numa_node(kernel_loop_iface);
-            crate::cpu::physical_cores_numa_sorted(nic_node)
+            let phys_sorted = crate::cpu::physical_cores_numa_sorted(nic_node);
+            let total = phys_sorted.len().max(1);
+            // #183: honour the same core budget as the XDP fast path.
+            //  - Xeon v2 + X520: the X520 PCIe bus is served by ~16 cores
+            //    (10 NIC-local + 6 cross-NUMA); past that the QPI/bus collapses.
+            //  - otherwise: NUMA-sorted physical cores, but keep one for hickory
+            //    fallback / TCP / API / the rest of the program.
+            let cap = if crate::dns::xdp::socket::is_xeon_v2_x520_host(kernel_loop_iface) {
+                16.min(total)
+            } else {
+                total.saturating_sub(1).max(1)
+            };
+            phys_sorted.into_iter().take(cap).collect::<Vec<usize>>()
         };
         let n_fast = fast_cores.len().max(1);
         // Reserve at least 2 physical cores for hickory fallback/TCP/API.
