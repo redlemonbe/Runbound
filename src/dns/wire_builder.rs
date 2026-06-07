@@ -30,15 +30,19 @@ const DNS_HDR: usize = 12;
 const FLAGS_AA_NOERROR: u16 = 0x8580;
 
 /// RR name-compression pointer to offset 12 (start of question section).
+#[allow(dead_code)]
 const COMPRESSION_PTR: [u8; 2] = [0xC0, 0x0C];
 
 /// DNS qtype A
+#[allow(dead_code)]
 const QTYPE_A: u16 = 1;
 /// DNS qtype AAAA
+#[allow(dead_code)]
 const QTYPE_AAAA: u16 = 28;
 /// DNS qtype OPT (EDNS)
 const QTYPE_OPT: u16 = 41;
 /// Class IN
+#[allow(dead_code)]
 const CLASS_IN: u16 = 1;
 
 // ── Parsed query (stack-only) ─────────────────────────────────────────────────
@@ -207,6 +211,7 @@ fn parse_opt_rr(buf: &[u8], mut pos: usize, arcount: u16) -> Option<EdnsInfo> {
 /// mapping has a known limitation (see FINDINGS.md #155 follow-up).
 /// This function has no such constraint — it is topology-agnostic.
 #[inline]
+#[allow(dead_code)]
 pub fn wire_qname_to_lower_name(qname_wire: &[u8]) -> Option<LowerName> {
     let mut decoder = BinDecoder::new(qname_wire);
     let name = Name::read(&mut decoder).ok()?;
@@ -302,6 +307,7 @@ fn write_opt_rr(buf: &mut [u8], pos: usize, udp_payload: u16) -> usize {
 ///   - records is non-empty (caller checks and dispatches to build_nodata/build_nxdomain)
 ///   - wq.qtype is A (1) or AAAA (28) (caller pre-checks before calling)
 ///   - wq.qclass is IN (caller pre-checks)
+#[allow(dead_code)]
 pub fn build_answer_a_aaaa(
     wq: &WireQuery<'_>,
     out: &mut [u8],
@@ -424,6 +430,7 @@ fn write_header_and_question(
 }
 
 /// QR=1 AA=1 RD=1 RA=1 RCODE=3 (NXDOMAIN)
+#[allow(dead_code)]
 const FLAGS_AA_NXDOMAIN: u16 = 0x8583;
 
 /// QR=1 AA=0 RD=1 RA=1 RCODE=5 (REFUSED)
@@ -500,6 +507,7 @@ pub fn build_answer_a_aaaa_wire(
     Some(p)
 }
 
+#[allow(dead_code)]
 pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8], edns: Option<&EdnsInfo>) -> Option<usize> {
     write_header_and_question(out, wq.id, FLAGS_AA_NXDOMAIN, 0, wq.qname_wire, wq.qtype, wq.qclass, edns)
 }

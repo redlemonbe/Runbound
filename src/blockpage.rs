@@ -17,6 +17,7 @@ use tracing::{info, warn};
 #[derive(Debug, Clone)]
 pub struct BlockPageConfig {
     /// IP to return in DNS answers for blocked domains. Default: 0.0.0.0 (NXDOMAIN fallback)
+    #[allow(dead_code)]
     pub redirect_ip: Option<IpAddr>,
     /// Port to listen on for block page HTTP. Default: 8083.
     pub port: u16,
