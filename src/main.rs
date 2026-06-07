@@ -102,8 +102,12 @@ async fn async_main(
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
     let mut xdp_cache_snapshot: Option<dns::cache_snapshot::SharedCacheSnapshot> = None;
     let mut xdp_cache_mutable: Option<dns::cache_snapshot::MutableCacheMap> = None;
+    // #183: build the cache snapshot whenever xdp-cache-snapshot is on — it feeds
+    // BOTH the XDP fast path (xdp: yes) AND the kernel fast loop (xdp: no). Gating it
+    // on cfg.xdp left the kernel fast loop with no snapshot -> every slow-path query
+    // fell back to hickory instead of the shared ASM answer_from_cache path.
     #[cfg(feature = "xdp")]
-    if cfg.xdp && cfg.xdp_cache_snapshot {
+    if cfg.xdp_cache_snapshot {
         let mutable = dns::cache_snapshot::new_mutable_cache();
         let snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(
             dns::cache_snapshot::CacheSnapshot::default(),
