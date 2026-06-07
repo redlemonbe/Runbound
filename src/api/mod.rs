@@ -815,7 +815,6 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
     };
     JsonExtract(serde_json::json!({
         "status":            status,
-        "version":           env!("CARGO_PKG_VERSION"),
         "uptime_secs":       snap.uptime_secs,
         "xdp_active":        xdp_active,
         "upstreams_healthy": upstreams_healthy,
