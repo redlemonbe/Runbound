@@ -776,7 +776,7 @@ The `axfr` "unbounded allocation" (raised by Auditors #2 and #3) remains **Dispu
 > **Honesty note (convention: re-audit = different model/session).** This cycle is a
 > single-model Red/Blue adversarial exchange, **not** an independent second model. The
 > empirical findings are grounded in live probing of the running master/slave + bench
-> (auth, HMAC relay, input fuzzing, DNS robustness, resource limits). A genuinely
+> (auth, HMAC relay, input fuzzing, DNS malformed-input handling, resource limits). A genuinely
 > independent model/human pass on the Open items below is still recommended (tracked with
 > OPEN-F1, #170).
 
