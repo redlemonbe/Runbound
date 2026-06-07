@@ -388,3 +388,36 @@ fn sockaddr_to_std(ss: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> 
         _ => None,
     }
 }
+
+
+#[cfg(test)]
+mod sockaddr_parse_tests {
+    use super::sockaddr_to_std;
+    use std::net::Ipv4Addr;
+
+    fn v4(ip: Ipv4Addr, port: u16) -> libc::sockaddr_storage {
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        // SAFETY: writing the sockaddr_in view of a zeroed sockaddr_storage.
+        let sin = unsafe { &mut *(&mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in) };
+        sin.sin_family = libc::AF_INET as libc::sa_family_t;
+        sin.sin_port = port.to_be();
+        sin.sin_addr.s_addr = u32::from(ip).to_be();
+        ss
+    }
+
+    #[test]
+    fn ipv4_round_trips() {
+        let ss = v4(Ipv4Addr::new(1, 2, 3, 4), 53);
+        assert_eq!(sockaddr_to_std(&ss), Some("1.2.3.4:53".parse().unwrap()));
+    }
+
+    #[test]
+    fn unspec_and_unknown_family_are_rejected() {
+        // AF_UNSPEC (zeroed) and a garbage family must yield None (never panic / UB).
+        let zero: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        assert_eq!(sockaddr_to_std(&zero), None);
+        let mut garbage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        garbage.ss_family = 4242;
+        assert_eq!(sockaddr_to_std(&garbage), None);
+    }
+}

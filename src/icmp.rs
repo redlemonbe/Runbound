@@ -147,14 +147,22 @@ impl IcmpStats {
 
     /// Persist the permanent ("blacklisted") IPs to disk so they survive a restart.
     pub fn persist_blacklist(&self) {
+        // Cap persisted entries (anti unbounded growth) and write 0600 (the ban list
+        // is not world-readable). #SEC-H9.
+        const MAX_PERSISTED_BLACKLIST: usize = 100_000;
         let ips: Vec<String> = self
             .banned
             .iter()
             .filter(|e| e.value().permanent)
             .map(|e| e.key().to_string())
+            .take(MAX_PERSISTED_BLACKLIST)
             .collect();
+        let path = Self::blacklist_path();
         if let Ok(j) = serde_json::to_string(&ips) {
-            let _ = std::fs::write(Self::blacklist_path(), j);
+            if std::fs::write(&path, j).is_ok() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
         }
     }
 
