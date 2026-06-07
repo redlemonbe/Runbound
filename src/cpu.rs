@@ -179,6 +179,7 @@ impl SimdLevel {
 
 /// Detected CPU instruction-set features.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CpuFeatures {
     pub sse2:    bool,
     pub sse4_2:  bool,

@@ -111,6 +111,7 @@ impl XdpIfaceCounters {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub fn start_xdp(
     iface: &str,
     zones: Arc<ArcSwap<LocalZoneSet>>,

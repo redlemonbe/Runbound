@@ -122,6 +122,7 @@ pub fn xdp_iface_snapshot() -> Vec<XdpIfaceState> {
 // A follow-up can migrate callers to xdp_iface_snapshot() directly.
 
 /// Returns the first registered active XDP interface name (compat shim).
+#[allow(dead_code)]
 pub fn xdp_active_iface_first() -> Option<String> {
     xdp_iface_snapshot().into_iter().next().map(|s| s.iface)
 }
@@ -515,6 +516,7 @@ pub fn is_virtual_interface(iface: &str) -> bool {
 ///   1. `lower_*` sysfs entries — ipvlan / macvlan parent
 ///   2. `master` symlink — bond slave or bridge port
 ///   3. `brif/` directory — ports of a bridge interface
+#[allow(dead_code)]
 pub fn parent_interface(iface: &str) -> Option<String> {
     let iface = sanitize_iface_name(iface)?;
     let sysfs = format!("/sys/class/net/{iface}");
@@ -549,6 +551,7 @@ pub fn parent_interface(iface: &str) -> Option<String> {
     first_physical_bridge_port(iface)
 }
 
+#[allow(dead_code)]
 fn first_physical_bridge_port(bridge: &str) -> Option<String> {
     let bridge = sanitize_iface_name(bridge)?;
     let brif = format!("/sys/class/net/{bridge}/brif");

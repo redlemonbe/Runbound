@@ -189,6 +189,7 @@ unsafe fn copy_lowercase_avx2(dst: &mut SmallVec<[u8; 64]>, src: &[u8]) {
 /// Test byte-slice equality using SIMD (early exit on first chunk mismatch).
 /// Runtime dispatch: AVX2 (32 bytes/iter) → SSE2 (16 bytes/iter) → scalar.
 #[inline]
+#[allow(unreachable_code)]
 pub fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

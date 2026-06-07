@@ -36,6 +36,7 @@ pub fn init() {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
+#[allow(dead_code)]
 unsafe fn crc32c_sse42(crc: u32, bytes: &[u8]) -> u32 {
     use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
     let mut crc64 = crc as u64;

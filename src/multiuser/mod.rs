@@ -12,6 +12,8 @@
 // reloaded on POST /reload. UserRegistry uses DashMap for O(1) key lookup on
 // the hot auth path.
 
+#![allow(dead_code)] // auth/multi-user API surface kept for future use
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
