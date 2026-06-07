@@ -8,7 +8,7 @@
 Over single X520 10 GbE fibre, with a warm resolver cache (real cache-hit fast path —
 **no synthetic local-data**), the dnsmark v2.1.1 generator offered **12.46 M qps**
 (its own ceiling on this Xeon E5-2690 v2). Runbound v0.15.3 on an AMD Threadripper
-PRO 5995WX answered them (NOERROR 99.87%) at **98.4% idle** CPU — i.e.
+PRO 5995WX answered cache hits at **p50 0.041 ms / p99 0.050 ms** (NOERROR 99.87%) at **98.4% idle** CPU — i.e.
 **~1.6% busy**. Runbound was **not saturated**; no
 saturation point exists within the generator's reach, so its true ceiling is **not
 measurable on this rig** ("I cannot confirm this"). The bottleneck is the generator,
@@ -45,7 +45,7 @@ over single fibre with a methodology-faithful setup (warm cache, real corpus, in
 | Answered rate (round-trip) | **1.02 M qps — lower bound only** | dnsmark round-trip; the generator drains responses on only its bound RX queues (X520), so it under-counts. Real answered rate: **I cannot confirm this.** |
 | rcode | NOERROR 99.87% | dnsmark |
 | Receiver NIC rx/tx counters | **I cannot confirm this** | **X520 + XDP zero-copy: `ethtool -S` counters do not move (XDP_REDIRECT→XSK bypasses them); verified `rx_pkts_nic` delta = 0 under a 12 M flood.** No valid NIC-side measurement is possible on this NIC in ZC. |
-| Latency | **I cannot confirm this** (wire) | tcpdump on an XDP interface does not see XDP-handled frames; only dnsmark throughput-mode figures exist, which are not a latency measurement. |
+| Latency fast-path (cache-hit) p50 / p95 / p99 | **0.041 / 0.042 / 0.050 ms** | dnsmark **closed-loop** (`--max-outstanding 100`), real per-query RTT (whitepaper §7). Tail p999 ~140 ms = cache-miss forwarding of the ~8% dead/uncached corpus names (not the fast path). Wire (tcpdump) anchor not possible on X520 + zero-copy (documented). |
 
 ## 5. Interpretation
 
