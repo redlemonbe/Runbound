@@ -141,6 +141,30 @@ throughput ~40×). It remains available in SKB/copy mode for cache locality.
 | NIC (optimal) | Intel ixgbe / i40e / ice / igc (native zero-copy) |
 | NIC (supported) | virtio, any NIC with XDP copy-mode support |
 
+### NIC note: Intel X520 / 82599 (ixgbe) — works, but not recommended for high-rate XDP
+
+The X520 (82599 controller, `ixgbe` driver) runs the XDP fast path correctly, but
+several hardware-level limitations make it a poor choice when XDP throughput — or
+*measuring* that throughput — matters:
+
+- **Zero-copy counters are blind.** Under `XDP_REDIRECT` -> AF_XDP zero-copy the
+  standard `ethtool -S` netdev counters (`rx_packets`, `rx_missed_errors`,
+  `tx_packets`/`tx_bytes`) do not advance — their delta reads 0 under load, so
+  served throughput cannot be observed from them. Only `rx_no_dma_resources`
+  (drops) and the per-socket `XDP_STATISTICS` (getsockopt `SOL_XDP` /
+  `XDP_STATISTICS`, surfaced by Runbound in `/api/system`) are reliable in ZC mode.
+- **PCIe 2.0.** The 82599 is a PCIe 2.0 device; its effective host bandwidth sits
+  below PCIe 3.0+ NICs of the same nominal 10 GbE line rate.
+- **16-queue RETA cap.** RSS is capped at 16 queues in hardware regardless of core
+  count. On a dual-socket host the *useful* queue count is further limited by
+  cross-NUMA / QPI cost, capping practical throughput well under what the CPU could
+  serve.
+
+For new deployments prefer Intel **i40e** (X710/XL710), **ice** (E810) or **igc**:
+they expose valid zero-copy counters and avoid the 82599 PCIe 2.0 / 16-queue
+limits. The X520 stays perfectly fine for ordinary (non-XDP or low-rate)
+DNS serving.
+
 All requirements are configured automatically by `install.sh`.
 
 ## Startup log
