@@ -174,7 +174,9 @@ impl IcmpStats {
         };
         let ips: Vec<String> = serde_json::from_str(&data).unwrap_or_default();
         let mut n = 0u32;
-        for ip_s in ips {
+        // #SEC-H(Qwen-Q2): cap entries applied on load too (defense-in-depth vs a
+        // tampered/oversized file), mirroring persist_blacklist.
+        for ip_s in ips.into_iter().take(100_000) {
             if let Ok(ip) = ip_s.parse::<IpAddr>() {
                 self.banned.insert(ip, BanEntry { ts: Instant::now(), src: BanSource::Manual, permanent: true });
                 if let IpAddr::V4(v4) = ip {
