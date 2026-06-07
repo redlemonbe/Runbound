@@ -34,7 +34,7 @@ AF_XDP ring). On the same host and NIC, no local-data:
 | path | served QPS | p50 | p99 | receiver CPU |
 |------|-----------:|----:|----:|-------------:|
 | AF_XDP fast path (`xdp: yes`) | ~8.8 M | ~0.2 ms | - | 8 % |
-| kernel slow path (`xdp: no`)  | ~7.8 M | 0.565 ms | 0.783 ms | 45 % |
+| kernel slow path (`xdp: no`)  | ~6.1 M | 0.565 ms | 0.783 ms | 45 % |
 
 Same order of throughput, the same sub-millisecond latency; the paths differ in **CPU
 cost, not served rate or latency** — the slow path pays the per-packet kernel-UDP syscall
