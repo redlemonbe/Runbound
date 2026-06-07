@@ -138,6 +138,7 @@ pub fn start_kernel_fast_loop(
     cores: &[usize],           // physical NUMA-local cores (from cpu::physical_cores_numa_sorted)
     zones: Arc<ArcSwap<LocalZoneSet>>,
     acl: Arc<Acl>,
+    rate_limiter: Arc<crate::dns::ratelimit::RateLimiter>,
     fallback_tx: tokio::sync::mpsc::Sender<FallbackMsg>,
     cache_snapshot: Option<Arc<arc_swap::ArcSwap<crate::dns::cache_snapshot::CacheSnapshot>>>,
     stats: Option<Arc<crate::stats::Stats>>,
@@ -156,6 +157,7 @@ pub fn start_kernel_fast_loop(
         let addr = bind_addr.to_owned();
         let zones2       = Arc::clone(&zones);
         let acl2         = Arc::clone(&acl);
+        let rl2          = Arc::clone(&rate_limiter);
         let fallback_tx2 = fallback_tx.clone();
         let cache2       = cache_snapshot.clone();
         let stats2       = stats.clone();
@@ -184,6 +186,7 @@ pub fn start_kernel_fast_loop(
                     Arc::clone(&sock_arc),
                     zones2,
                     acl2,
+                    rl2,
                     fallback_tx2,
                     cache2,
                     stats2,
@@ -206,6 +209,7 @@ fn worker_loop(
     sock: Arc<UdpSocket>,
     zones: Arc<ArcSwap<LocalZoneSet>>,
     acl: Arc<Acl>,
+    rate_limiter: Arc<crate::dns::ratelimit::RateLimiter>,
     fallback_tx: tokio::sync::mpsc::Sender<FallbackMsg>,
     cache_snapshot: Option<Arc<arc_swap::ArcSwap<crate::dns::cache_snapshot::CacheSnapshot>>>,
     stats: Option<Arc<crate::stats::Stats>>,
@@ -300,6 +304,13 @@ fn worker_loop(
             };
             let query = &rx_bufs[i][..len];
             let src_ip: Option<IpAddr> = Some(peer.ip());
+
+            // Shared rate-limit gate (same helper + RateLimiter as the XDP
+            // fast path): over-limit source IPs are ignored until the window
+            // rolls over.
+            if crate::dns::xdp::worker::rl_should_drop(&rate_limiter, peer.ip()) {
+                continue;
+            }
 
             // ── Fast path A: wire builder (zero hickory, zero alloc) ─────────
             // answer_dns_wire: parse_query + WireRecordIndex CRC32c lookup +
