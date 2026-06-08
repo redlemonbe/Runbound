@@ -15,6 +15,40 @@ ok()   { echo -e "${GREEN}[OK]${NC}  $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 fail() { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
 
+usage() {
+    cat <<'USAGE'
+Runbound installer — https://github.com/redlemonbe/Runbound
+
+Usage:
+  install.sh [OPTION]
+  curl -fsSL .../install.sh | sudo bash [-s -- OPTION]
+
+Options:
+  (none)        Install: download the latest release, verify it, install and start Runbound.
+  --uninstall   Remove the service and binary; KEEP /etc/runbound and /var/lib/runbound.
+  --purge       Remove everything: service, binary, config, data, and the runbound user/group.
+  -h, --help    Show this help and exit.
+
+A normal install:
+  1. Detects CPU arch (x86_64 / aarch64) and fetches the latest GitHub release.
+  2. Verifies the binary: SHA256 against SHA256SUMS, plus the minisign signature if minisign
+     is installed (public key embedded).
+  3. Creates the runbound system user/group and /etc/runbound, /var/lib/runbound.
+  4. Writes a default config (forwarding to 1.1.1.1 over DNS-over-TLS) if none exists.
+  5. Generates a random API key in /etc/runbound/env if none exists.
+  6. Installs and starts the systemd service.
+
+Requires port 53 to be free — stop unbound / bind9 / systemd-resolved / dnsmasq first.
+Full guide: https://github.com/redlemonbe/Runbound/blob/main/docs/INSTALL.md
+USAGE
+}
+
+case "${1:-}" in
+    -h|--help)               usage; exit 0 ;;
+    ""|--uninstall|--purge)  ;;
+    *)                       fail "Unknown option: $1 (try --help)" ;;
+esac
+
 [ "$(id -u)" -eq 0 ] || fail "Run as root: sudo bash install.sh"
 
 if [[ "${1:-}" == "--uninstall" || "${1:-}" == "--purge" ]]; then
