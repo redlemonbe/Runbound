@@ -25,7 +25,7 @@ any figure not yet re-measured.
 - The naïve hickory slow path measured **1.78× Unbound's instructions/query** — the reason
   the fast paths exist (§1.2).
 
-## Slow path vs fast path — measured (v0.16.1, 5995WX, single X520, warm cache)
+## Slow path vs fast path — measured (v0.16.6, 5995WX, single X520, warm cache)
 
 The kernel slow path (`xdp: no`) runs the **same** SIMD/ASM cache wire responder as the
 AF_XDP fast path — only the I/O source differs (kernel UDP socket vs AF_XDP ring). Measured
@@ -41,8 +41,9 @@ local-data, with only the `xdp:` line changed. Throughput is the receiver NIC PH
 The fast path tracks offered load 1:1 with **zero drops** up to the X520 line rate (8 M
 served at 6.7 % CPU), then answers ~10.1 M of the ~10.7 M the NIC can receive, at ~21 %
 CPU — bounded by the X520 PCIe 2.0 **RX** path, not by Runbound (~79 % CPU idle at the
-maximum). The slow path reaches the same order of magnitude (~6.9 M served) but pays a
-per-packet kernel-UDP syscall: ~61 % CPU, ~5 M packets dropped at the NIC under the same
+maximum). The slow path reaches the same order of magnitude (~6.9 M served) but pays the kernel-UDP
+syscall cost; batched `recvmmsg` receive (§4.0) keeps it efficient (~54 % CPU at 7 M
+offered, ~70 cores engaged), ~5 M packets dropped at the NIC under the same
 firehose, and an earlier latency knee — its rate under a sub-millisecond median SLO is
 ~4.6 M served (p50 0.746 ms). A NIC without the PCIe 2.0 RX cap would scale both higher;
 the magnitude of that headroom is not measured here. Reports:
@@ -53,6 +54,18 @@ the magnitude of that headroom is not measured here. Reports:
 > cache-less and the cache snapshot was built for `xdp: yes` only, leaving `xdp: no`
 > forwarding every query since v0.6.12. The "1.78x hickory" note below is the *fallback*
 > path (cache misses, CNAME/MX/TSIG); cache hits now take the shared ASM responder.
+
+## Independent cross-validation (dnsperf)
+
+The same `xdp: no` receiver was measured by an independent third-party tool — `dnsperf
+2.14.0` (DNS-OARC) — to confirm the figures are not a generator artifact. NIC-confirmed:
+served = received with **zero drops**, 99.85 % NOERROR, ~0.09–0.12 ms latency, at **3.4 %
+receiver CPU**. dnsperf plateaus at **~238 k QPS** regardless of added clients/threads — a
+closed-loop, kernel-UDP, single-process generator is bounded there, exercising only ~3–4 %
+of the AF_XDP-measured ceiling while the receiver is far from saturation. The tools agree on
+correctness, latency and NIC-truth; dnsperf is generator-bound, as expected — which is why
+an open-loop AF_XDP generator is needed to reach the receiver's actual saturation point.
+Full report in the dnsmark repository (`docs/cross-validation-dnsperf.md`).
 
 ## To expand
 - The official v0.15.0 benchmark report once run under supervision.
