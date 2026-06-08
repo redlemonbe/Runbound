@@ -4759,8 +4759,8 @@ mod tests {
             "health status must be ok/degraded/error; got: {status}"
         );
         assert!(
-            json["version"].is_string(),
-            "health must include version field"
+            json.get("version").is_none(),
+            "health must not disclose the version field (anti-fingerprinting, since v0.16.5)"
         );
         assert!(
             json.get("hsm").is_none(),
