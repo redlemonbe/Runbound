@@ -16,11 +16,14 @@ no local-data, governor `performance`, flow-control off, RSS `udp4 sdfn`.
 |--------|-----------------------:|--------------|------------------------:|--------|
 | **Runbound `xdp: yes`** (AF_XDP fast path) | **~10.1 M QPS** | ~31 | 0.062 ms | [report](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md) |
 | **Runbound `xdp: no`** (kernel slow path) | **~7.3 M QPS** | ~70 | ~0.09 ms | [report](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md) |
-| unbound 1.22.0 | ~3.68 M QPS | 64 | 0.194 ms | [baseline](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md) |
-| BIND 9.20.23 | ~3.39 M QPS | 128 (all) | 0.192 ms | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md) |
+| unbound 1.22.0 | ~3.59 M QPS | 64 (~65% CPU) | 0.195 ms | [baseline](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md) |
+| BIND 9.20.23 | ~2.98 M QPS | 128 (all, 100%) | 0.068 ms | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md) |
 
-On this rig Runbound's kernel slow path serves roughly **2×** the two reference resolvers,
-and its AF_XDP fast path roughly **2.7–3×**, at lower latency and far fewer engaged cores.
+On this rig Runbound's kernel slow path serves roughly **2–2.5×** the two reference
+resolvers, and its AF_XDP fast path roughly **2.8–3.4×**, at lower latency and far fewer
+engaged cores. Both baselines were measured with an explicit offered-load ramp (the
+built-in `--ramp` yields no RTT samples against a flooded kernel-UDP server); see each
+report for the full curve and the saturation knee.
 
 ## The ceiling on this rig is the NIC bus, not Runbound
 
