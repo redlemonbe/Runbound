@@ -145,8 +145,17 @@ fi
 
 # ── API key ───────────────────────────────────────────────────────────────────
 ENV_FILE="$CONFIG_DIR/env"
+gen_api_key() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+    elif [ -r /dev/urandom ]; then
+        head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n"
+    fi
+}
 if [ ! -f "$ENV_FILE" ]; then
-    echo "RUNBOUND_API_KEY=$(openssl rand -hex 32)" > "$ENV_FILE"
+    API_KEY_GEN="$(gen_api_key)"
+    [ ${#API_KEY_GEN} -ge 32 ] || fail "Could not generate API key (need openssl or a readable /dev/urandom)"
+    echo "RUNBOUND_API_KEY=${API_KEY_GEN}" > "$ENV_FILE"
     chown "$RUN_USER:$RUN_GROUP" "$ENV_FILE"
     chmod 640 "$ENV_FILE"
     ok "API key generated: $ENV_FILE"
