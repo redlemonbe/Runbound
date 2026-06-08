@@ -462,7 +462,7 @@ RCODE=NOERROR
 
 ## 6. Timing budget summary
 
-> Latency estimates below are **theoretical** (derived from instruction counts and hardware data sheets). See docs/performance.md for measured results.
+> Latency estimates below are **theoretical** (derived from instruction counts and hardware data sheets). See [benchmark/INDEX.md](benchmark/INDEX.md) and [whitepaper/08-performance.md](whitepaper/08-performance.md) for measured results.
 
 | Stage | Implemented | Latency |
 |-------|-------------|---------|

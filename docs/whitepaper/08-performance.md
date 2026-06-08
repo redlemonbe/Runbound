@@ -1,9 +1,9 @@
 # 08 — Performance
 
-> **Status: draft outline** — governed by `docs/benchmark/README.md` (the methodology) and
+> **Status: current (v0.16.6)** — governed by `docs/benchmark/README.md` (the methodology) and
 > the per-run reports under `docs/benchmark/`.
 
-This chapter will hold **only measured numbers produced under the documented methodology**.
+This chapter holds **only measured numbers produced under the documented methodology**.
 Until a run is completed under that methodology at the current version, this chapter states
 the methodology and the known ceilings, and explicitly says **"I cannot confirm this"** for
 any figure not yet re-measured.
