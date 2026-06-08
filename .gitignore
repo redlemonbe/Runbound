@@ -50,3 +50,5 @@ CLAUDE.md
 # Internal work files
 AUDIT_SECURITE.txt
 RAPPORT_*.txt
+target/
+fuzz/target/

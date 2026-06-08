@@ -1,4 +1,0 @@
-cargo:rerun-if-changed=ebpf/dns_xdp.c
-cargo:rerun-if-changed=src/webui/index.html
-WebUI gzip: 136193B → 33043B (24% of original)
-eBPF programs compiled: /root/Runbound/fuzz/target/x86_64-unknown-linux-gnu/release/build/runbound-00417dde60f85f03/out/dns_xdp.o + /root/Runbound/fuzz/target/x86_64-unknown-linux-gnu/release/build/runbound-00417dde60f85f03/out/dns_xdp_minimal.o
