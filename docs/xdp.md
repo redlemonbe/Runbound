@@ -110,6 +110,8 @@ controlled back-to-back A/B, 5 runs each, medians):
 | Throughput (median) | ~3.80 M qps | ~4.63 M qps | **+21 %** |
 | p50 latency | 0.52 ms | 0.34 ms | **−35 %** |
 
+*(Micro-benchmark; generator Xeon E5-2690 v2 — see [benchmark/](benchmark/) for the full rig.)*
+
 (The p50 latency improvement is the most consistent metric; absolute throughput
 is CPU-frequency / host-state dependent, so the back-to-back ratio is the
 reliable figure.)
@@ -435,7 +437,7 @@ leaves the queue count untouched and continues.
 | Hardware | Mode | Estimated peak |
 |---|---|---|
 | VM virtio (Proxmox/KVM) | copy mode | ~500k–1M QPS (theoretical) |
-| Bare metal Intel 10GbE | native zero-copy | TBD — benchmark in progress (results coming in v0.8) |
+| Bare metal Intel 10GbE | native zero-copy | **~10.1 M QPS measured** (single X520, PCIe-2.0 RX-bound) — see [benchmark/INDEX.md](benchmark/INDEX.md) |
 
 Wire speed on 10GbE = ~14.88M 64-byte packets/second (physical limit, not yet validated end-to-end).
 
