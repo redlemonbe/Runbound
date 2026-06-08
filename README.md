@@ -64,6 +64,8 @@ That's it. The script:
 4. Generates a random API key in `/etc/runbound/env`
 5. Installs and starts the systemd service
 
+See **[docs/INSTALL.md](docs/INSTALL.md)** for every option (`--uninstall`, `--purge`, `--help`), integrity verification (SHA256 + minisign), file locations and troubleshooting.
+
 At the end you'll see:
 
 ```
