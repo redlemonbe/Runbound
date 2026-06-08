@@ -111,10 +111,14 @@ Then re-run the install command.
 ### Uninstall
 
 ```bash
+# Remove Runbound, keep your config and data
 curl -fsSL https://raw.githubusercontent.com/redlemonbe/Runbound/main/install.sh | sudo bash -s -- --uninstall
+
+# Remove everything: config, data, and the runbound user/group
+curl -fsSL https://raw.githubusercontent.com/redlemonbe/Runbound/main/install.sh | sudo bash -s -- --purge
 ```
 
-Your config and data in `/etc/runbound` and `/var/lib/runbound` are kept.
+`--uninstall` keeps your config and data in `/etc/runbound` and `/var/lib/runbound`; `--purge` deletes them (and the `runbound` system user/group) as well.
 
 ---
 
