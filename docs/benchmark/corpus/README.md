@@ -20,7 +20,7 @@ Build an A-record corpus from the name list:
 
 ```bash
 awk '{print $0 " A"}' top-10000-domains.txt > corpus-a.txt
-dnsmark -s 10.10.10.2 -d corpus-a.txt -c 16 -l 30
+dnsmark -s 10.0.0.3 -d corpus-a.txt -c 16 -l 30
 ```
 
 For an all-types corpus, append the desired type per line

@@ -1639,7 +1639,7 @@ fn build_resolver(cfg: &UnboundConfig, cache_size: usize, dnssec: bool) -> anyho
 
     // No forward-zone configured — fall back to Cloudflare.
     // WARNING: This sends all DNS queries to a third-party cloud resolver.
-    // For sensitive or nation-state deployments, configure explicit forward-zone
+    // For privacy-sensitive or high-threat deployments, configure explicit forward-zone
     // blocks with trusted upstream resolvers. This fallback should never trigger
     // in production; it exists only to make Runbound usable out of the box.
     if resolver_cfg.name_servers().is_empty() {
