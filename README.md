@@ -182,8 +182,6 @@ per-core affinity, and a single-lookup ASM hot path (CRC32c + SIMD).
 
 ## AF/XDP Fast Path
 
-> **Commercial license required** to activate at runtime. Open-source (AGPL v3) builds include the code — the fast path is disabled without a commercial license.
-
 An eBPF XDP program attaches to the NIC at startup. UDP/53 packets for local zones and cache hits are answered in user space at driver level — zero syscalls on the hot path. All other queries pass through to the normal resolver via `XDP_PASS`.
 
 Negative answers (`NODATA` / `NXDOMAIN`) are cached on the fast path too (RFC 2308). AF_XDP ring sizes, huge pages, and NIC queue counts are **configured automatically** at startup — see [docs/xdp.md](docs/xdp.md).

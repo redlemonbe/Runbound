@@ -91,8 +91,6 @@ Runbound is licensed under AGPL v3. Organizations that cannot comply with the
 AGPL (proprietary products, SaaS deployments without source disclosure) can
 obtain a commercial license.
 
-The AF_XDP fast path is available under the commercial license only.
-
 Contact: [redlemonbe@codix.be]
 
 ---
