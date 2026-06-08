@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "runbound"
-version = "0.16.6"
+version = "0.16.7"
 dependencies = [
  "ahash",
  "anyhow",
