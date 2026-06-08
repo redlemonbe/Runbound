@@ -9,6 +9,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.16.7] - 2026-06-08
+
+> No server code changes — the resolver binary is functionally identical to 0.16.6 (verified: identical `.text` section, same machine code as the benchmarked build). This release packages installer hardening, CI, and documentation corrections.
+
+### Added
+- **`install.sh` integrity verification**: the downloaded binary is checked against the release `SHA256SUMS` (enforced when `sha256sum` is present) and, when `minisign` is installed, the `SHA256SUMS` signature is verified against the published key. Degrades to a warning only if the tools/assets are absent.
+- **`install.sh --purge`**: full removal (service, binary, `/etc/runbound`, `/var/lib/runbound`, and the `runbound` user/group). `--uninstall` still keeps config and data.
+- **`install.sh --help`** and rejection of unknown options.
+- **`docs/INSTALL.md`**: end-to-end installer guide (options, integrity, file locations, env vars, port-53 handling, troubleshooting).
+- **CI workflow** (`.github/workflows/ci.yml`): `cargo build --release`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on every push to `main` and every pull request.
+
+### Changed
+- `cargo clippy --all-targets -- -D warnings` is now clean (annotations only; the compiled binary is byte-for-byte unchanged — no perf/behaviour impact).
+- Benchmark baselines (unbound 1.22.0, BIND 9.20.23) re-measured under the documented offered-load ramp and reformatted to the report template, consolidated under `docs/benchmark/`.
+
+### Fixed
+- **`install.sh` API key** is no longer silently empty when `openssl` is absent (`/dev/urandom` fallback + hard length check).
+- **`install.sh` port-53 conflict** now aborts with the exact `systemctl disable --now <svc>` command instead of failing cryptically at startup; cleaner start-failure message.
+- **Docs**: removed the incorrect claim that the AF/XDP fast path requires a commercial license — it is part of the default feature set and always active in AGPL builds (dual-licensing to waive AGPL obligations is unchanged). Corrected stale version/perf references (`docs/xdp.md`, `docs/internals.md`, `SECURITY.md`, the security-audit header, the whitepaper) and backfilled the missing `0.9.61`/`0.9.62`/`0.9.63` CHANGELOG sections.
+- **`test(api)`**: `health_schema` aligned with the version-less `/health` contract (0.16.5 anti-fingerprinting).
+
+---
+
 ## [0.16.6] - 2026-06-08
 
 ### Security
