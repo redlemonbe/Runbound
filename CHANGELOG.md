@@ -301,6 +301,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.63] — 2026-05-27
+
+### Added
+- **Split-horizon DNS (#10).** Per-subnet zone overrides: different `local-data` answers based on source IP. Config via `split-horizon:` blocks with `subnet:` and `local-data:` directives; queries from a matching subnet check the override zone before the global zones. Multiple blocks supported, first matching subnet wins. (Later exposed via the `/api/split-horizon` CRUD endpoints and a WebUI tab in v0.13.0.)
+
+---
+
+## [0.9.62] — 2026-05-27
+
+### Added
+- **RBAC (#13).** API-key roles `read` / `dns` / `operator` / `admin`, configured through `api-key-extra` config blocks, so a key can be scoped to read-only, DNS-only, operational or full-admin access.
+
+---
+
+## [0.9.61] — 2026-05-27
+
+### Added
+- **White-label UI branding (#25).** `ui-brand-name` / `ui-brand-logo` / `ui-brand-accent` / `ui-brand-favicon` config directives, a `/webui/branding` endpoint and dynamic JS that applies the brand at load — the WebUI can be re-skinned without rebuilding.
+
+---
+
 ## [0.9.58] — 2026-05-26
 
 ### Added
