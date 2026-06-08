@@ -1,14 +1,44 @@
 # 04 — The slow path (hickory-server)
 
-The slow path is a full [hickory](https://github.com/hickory-dns/hickory-dns) stack
-(`hickory-server`/`-resolver`/`-proto` 0.26) in `src/dns/server.rs`. It handles everything
-the fast paths decline. Its per-request pipeline (`src/dns/server.rs:5`):
+In `xdp: no` mode the receive side is the **kernel fast loop** (§4.0), not hickory: it
+serves cache hits through the same wire responder the AF_XDP fast path uses, and only
+genuine misses (recursion, CNAME/MX/TSIG, DNSSEC) reach the full
+[hickory](https://github.com/hickory-dns/hickory-dns) stack
+(`hickory-server`/`-resolver`/`-proto` 0.26, `src/dns/server.rs`) described below. The
+hickory **fallback** pipeline:
 
 1. **ACL check** per source IP (from `unbound.conf`) — `src/dns/acl.rs`.
 2. **Rate limit** per source IP, token bucket, default 200 qps (`RATE_LIMIT_QPS_DEFAULT`,
    `src/dns/server.rs`).
 3. **Local zones** (local-data, blacklist, feeds) in memory → instant answer.
 4. Otherwise → **recursive resolver** (hickory-resolver), UDP+TCP on the configured port.
+
+## 4.0 The kernel fast loop — the real `xdp: no` hot path
+
+`xdp: no` is **not** "one hickory task per query". The receive side is a tight kernel loop
+(`src/dns/kernel_loop.rs`) that mirrors the AF_XDP worker without eBPF:
+
+- **One `SO_REUSEPORT` UDP socket per physical core** (minus one reserved for the rest of
+  the process; capped at 16 on a Xeon-v2 + X520 host). The kernel's default 4-tuple hash is
+  uneven for a few flows, so an `SO_ATTACH_REUSEPORT_CBPF` *by-CPU* program (returning
+  `SKF_AD_CPU`) plus RPS spreads datagrams evenly across the group — flat per-socket load.
+- **Batched receive with `recvmmsg`** (`MSG_WAITFORONE`): one syscall drains up to 32
+  datagrams instead of one syscall per datagram. Per-packet `recv_from` cannot keep the
+  socket buffer empty under burst — the overflow shows up as `UdpRcvbufErrors`, not a NIC
+  drop. `MSG_WAITFORONE` returns as soon as ≥1 datagram is ready, so a lone query (e.g.
+  `dig`) is still answered immediately — no batching latency for single queries.
+- **The shared per-source gate.** Every datagram passes the *same* gate the XDP path uses,
+  driven by the *same* objects: `rl_should_drop()` (the memoized per-source rate-limit) and
+  `icmp_stats.is_banned()` (the ban set). One mechanism governs both routes, exactly like
+  the blacklist — so rate-limit and bans are enforced in `xdp: no` too, not only in XDP
+  (§07). The ban check is a single relaxed atomic load when nothing is banned (the common
+  case), so it is free on the hot path.
+- **Then the shared SIMD/ASM responder** — `answer_dns_wire` (local-data / wire) and
+  `answer_from_cache` (cache snapshot, §05). Only `WireResult::Fallback` (cache miss,
+  CNAME/MX/DNSSEC DO=1, ANY) is handed to the hickory fallback via a bounded channel.
+
+The net effect: in `xdp: no` the cache-hit path is the same hand-written wire builder as
+XDP, on a kernel UDP socket; hickory only sees the genuine misses.
 
 ## 4.1 Backpressure against flood — a hard inflight cap
 
@@ -42,10 +72,13 @@ availability trade-off: shed load rather than OOM.
 
 ## 4.4 Caching hand-off
 
-A cache hit on the slow path is currently inferred from latency: a lookup under
-`CACHE_HIT_THRESHOLD_US` counts as a hit (`src/dns/server.rs`, `crate::stats`). This is why
-the master node's hit-rate metric is meaningful only with `xdp: no`. The authoritative XDP
-cache accounting uses dedicated counters (chapter 05).
+In `xdp: no` the kernel fast loop (§4.0) answers cache hits directly from the **same
+cache snapshot** the AF_XDP path reads (`answer_from_cache`, chapter 05) — built in both
+modes since the #183 fix. Before that fix the snapshot was built only for `xdp: yes` and
+the racing resolvers carried no cache, so `xdp: no` forwarded *every* query (cache-hit ≈
+0 %) — the production-relevant regression that motivated the unified slow-path cache. The
+hickory **fallback** still infers a hit from latency (a lookup under
+`CACHE_HIT_THRESHOLD_US`, `crate::stats`).
 
 ## To expand (verify against code)
 - Negative caching state machine (RFC 2308, #166): NXDOMAIN cached vs SERVFAIL treated as
