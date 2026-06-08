@@ -37,7 +37,7 @@ offered load does unbound saturate, what does it serve at the knee, and at what 
   the latency point. `DNSMARK_SPORT_SPREAD=4096`. Exact commands in §6.
 - **Link:** single Intel X520 (82599) 10 GbE, **direct fibre** generator↔receiver (no
   switch), **flow-control off** both ends, RSS `udp4 sdfn`, NIC IRQs pinned to the NIC's
-  NUMA-local cores, static ARP. `ss -ulpn` confirms only unbound owns `10.10.20.1:53`
+  NUMA-local cores, static ARP. `ss -ulpn` confirms only unbound owns `10.0.0.1:53`
   (64 SO_REUSEPORT sockets).
 - **Dataset:** `docs/benchmark/corpus/top-10000-domains.txt`, 10 000 names, random read,
   cache warmed (25 s pre-pass before the measured ramp).
@@ -109,21 +109,21 @@ offered load does unbound saturate, what does it serve at the knee, and at what 
 aa-complain /usr/sbin/unbound
 unbound-checkconf /etc/unbound/unbound-bench.conf
 unbound -c /etc/unbound/unbound-bench.conf        # num-threads swept 16..64, so-reuseport yes
-ss -ulpn | grep 10.10.20.1:53 | wc -l             # rule 5: 64 sockets, only unbound owns :53
+ss -ulpn | grep 10.0.0.1:53 | wc -l             # rule 5: 64 sockets, only unbound owns :53
 
 # Host (receiver): governor + flow-control + RSS + ring + ARP
 cpupower frequency-set -g performance
 ethtool -A enp33s0f0 rx off tx off
 ethtool -N enp33s0f0 rx-flow-hash udp4 sdfn
 ethtool -G enp33s0f0 rx 8192
-# NIC IRQs pinned to NIC-NUMA-local cores; static ARP for 10.10.20.2
+# NIC IRQs pinned to NIC-NUMA-local cores; static ARP for 10.0.0.2
 
-# Generator (dragonsage) — offered-load ramp, AF_XDP open-loop, per step:
-DNSMARK_SPORT_SPREAD=4096 dnsmark -s 10.10.20.1 -p 53 \
+# Generator (the generator host) — offered-load ramp, AF_XDP open-loop, per step:
+DNSMARK_SPORT_SPREAD=4096 dnsmark -s 10.0.0.1 -p 53 \
   -d docs/benchmark/corpus/top-10000-domains.txt --xdp -Q <1e6..9e6> --max-outstanding 0 -l 16
 
 # Generator — latency point (closed-loop, below the knee):
-DNSMARK_SPORT_SPREAD=4096 dnsmark -s 10.10.20.1 -p 53 \
+DNSMARK_SPORT_SPREAD=4096 dnsmark -s 10.0.0.1 -p 53 \
   -d docs/benchmark/corpus/top-10000-domains.txt --xdp -Q 800000 --max-outstanding 1500 -l 10
 
 # Throughput truth = receiver NIC PHY counters, 6 s steady window per step

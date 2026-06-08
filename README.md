@@ -217,6 +217,10 @@ Pull requests welcome. By submitting a PR you agree to the [CLA](CLA.md).
 
 ---
 
+*Not affiliated with the NLnet Labs Unbound project.*
+
+---
+
 ## Support the project
 
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor%20on%20GitHub)](https://github.com/sponsors/redlemonbe)
@@ -229,7 +233,3 @@ Pull requests welcome. By submitting a PR you agree to the [CLA](CLA.md).
 ## License
 
 AGPL v3 — see [LICENSE](LICENSE). Commercial license available for organizations that need to deploy without AGPL obligations: [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
-
----
-
-*Not affiliated with the NLnet Labs Unbound project.*
