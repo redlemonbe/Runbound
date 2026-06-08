@@ -120,7 +120,7 @@ Highest step holding p50 < 1 ms = ~8.8 M target; wire egress there ≈ 6.35 M. p
 ## 6. Appendix — exact commands & configuration
 
 ```bash
-# --- Receiver (dragonrage, AMD 5995WX) ---
+# --- Receiver (the receiver host, AMD 5995WX) ---
 ethtool -A enp33s0f0 rx off tx off
 ethtool -N enp33s0f0 rx-flow-hash udp4 sdfn
 ethtool -G enp33s0f0 rx 8192
@@ -131,12 +131,12 @@ for irq in $(grep enp33s0f0 /proc/interrupts|awk '{print $1}'|tr -d :); do echo 
 cpupower frequency-set -g performance
 runbound -c /etc/runbound/rb-single-noxdp.conf      # v0.16.1, recvmmsg (RUNBOUND_NO_RECVMMSG=1 disables)
 
-# --- Generator (dragonsage, dual Xeon E5-2690 v2), dnsmark 2.1.3 ---
+# --- Generator (the generator host, dual Xeon E5-2690 v2), dnsmark 2.1.3 ---
 ethtool -A nic2 rx off tx off
-ip neigh replace 10.10.20.1 lladdr <recv-mac> dev nic2 nud permanent
-dnsmark -s 10.10.20.1 -p 53 -d top-10000-domains.txt --xdp -Q 100000 -l 15       # warm
-DNSMARK_SPORT_SPREAD=4096 dnsmark -s 10.10.20.1 -p 53 -d top-10000-domains.txt --xdp --ramp --max-outstanding 0
-DNSMARK_SPORT_SPREAD=4096 dnsmark -s 10.10.20.1 -p 53 -d top-10000-domains.txt --xdp -Q <2e6..7e6> --max-outstanding 0 -l 12
+ip neigh replace 10.0.0.1 lladdr <recv-mac> dev nic2 nud permanent
+dnsmark -s 10.0.0.1 -p 53 -d top-10000-domains.txt --xdp -Q 100000 -l 15       # warm
+DNSMARK_SPORT_SPREAD=4096 dnsmark -s 10.0.0.1 -p 53 -d top-10000-domains.txt --xdp --ramp --max-outstanding 0
+DNSMARK_SPORT_SPREAD=4096 dnsmark -s 10.0.0.1 -p 53 -d top-10000-domains.txt --xdp -Q <2e6..7e6> --max-outstanding 0 -l 12
 
 # --- Throughput truth (receiver) ---
 ethtool -S enp33s0f0 | grep -wE 'rx_pkts_nic|tx_pkts_nic|rx_no_dma_resources|rx_missed_errors'
