@@ -9,6 +9,7 @@ Complete reference for Runbound. Each page targets the current stable release an
 | Page | What you will find |
 |------|--------------------|
 | [quick-start.md](quick-start.md) | Install, configure, and run Runbound in under 10 minutes |
+| [INSTALL.md](INSTALL.md) | The `install.sh` script in depth — options, integrity verification (SHA256 + minisign), file locations, uninstall vs purge, troubleshooting |
 | [unbound-migration.md](unbound-migration.md) | Drop-in migration from an existing Unbound deployment |
 | [configuration.md](configuration.md) | Every directive in `runbound.conf`, with defaults and examples |
 
