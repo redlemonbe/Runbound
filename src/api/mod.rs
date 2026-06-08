@@ -5063,6 +5063,7 @@ mod tests {
             .iter()
             .filter(|&&s| s == StatusCode::TOO_MANY_REQUESTS)
             .count();
+        #[allow(unused_variables)]
         let other: Vec<_> = statuses
             .iter()
             .filter(|&&s| s != StatusCode::OK && s != StatusCode::TOO_MANY_REQUESTS)
