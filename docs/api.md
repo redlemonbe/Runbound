@@ -1205,7 +1205,7 @@ Returns the updated config:
 ## Alert thresholds
 
 Monitor client query rates and automatically block abusive sources.
-Alert rules are defined in `runbound.conf` (see [Configuration](configuration.md#alert-thresholds)).
+Alert rules are defined in `runbound.conf` (see [Configuration](configuration.md#alert-directives)).
 As of v0.9.44, alert rules are reloaded by `POST /api/reload` — a full restart is no longer required to update them.
 
 ### `GET /api/alerts`
