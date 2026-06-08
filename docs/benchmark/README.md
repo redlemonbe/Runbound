@@ -1,5 +1,7 @@
 # Runbound — DNS Benchmarking Methodology
 
+> **Results & links:** see [INDEX.md](INDEX.md) for a summary of every run.
+
 This directory defines the **standard methodology** for every Runbound performance
 benchmark. Each run produces one report file following [TEMPLATE.md](TEMPLATE.md).
 Previous ad-hoc reports were removed; all future numbers are produced under this
