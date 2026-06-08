@@ -47,11 +47,19 @@ ASSET="runbound-${ARCH_TAG}-linux-musl"
 DIRECT_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
 echo "Installing Runbound ${VERSION} (${ARCH_TAG})…"
 
-# ── Conflicting services ──────────────────────────────────────────────────────
-for svc in unbound bind9 systemd-resolved dnsmasq; do
-    systemctl is-active --quiet "$svc" 2>/dev/null \
-        && warn "$svc is running — may conflict on port 53"
+# ── Conflicting services on :53 — hard stop with guidance ─────────────────────
+_conflict=""
+for svc in unbound bind9 named systemd-resolved dnsmasq; do
+    systemctl is-active --quiet "$svc" 2>/dev/null && _conflict="$_conflict $svc"
 done
+if [ -n "$_conflict" ]; then
+    echo "" >&2
+    fail "Port 53 is already held by another DNS service:${_conflict}
+       Runbound needs port 53. Disable the current resolver, then re-run this installer:
+$(for s in $_conflict; do echo "         sudo systemctl disable --now $s"; done)
+       If you disable systemd-resolved, point /etc/resolv.conf at a real nameserver:
+         echo 'nameserver 1.1.1.1' | sudo tee /etc/resolv.conf"
+fi
 
 # ── Download (with API fallback if direct URL fails) ─────────────────────────
 TMP_BIN="$(mktemp)"
@@ -84,6 +92,39 @@ if [ "$_download_ok" -eq 0 ]; then
 fi
 
 [ "$_download_ok" -eq 1 ] || fail "Download failed: $DIRECT_URL"
+
+# ── Integrity: SHA256 (enforced when tools present) + minisign authenticity ───
+MINISIGN_PUBKEY="RWT4uccC0fq9zgcaMtMsdH90azvmKpsNI1xlZrzlBuGH7xx1nDftTFJr"
+BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+TMP_SUMS="$(mktemp)"; TMP_SIG="$(mktemp)"
+_fetch() {  # $1 url  $2 dest
+    if command -v curl &>/dev/null; then curl -fsSL "$1" -o "$2" 2>/dev/null
+    else wget -qO "$2" "$1" 2>/dev/null; fi
+}
+_fetch "${BASE_URL}/SHA256SUMS" "$TMP_SUMS" || true
+
+if command -v minisign >/dev/null 2>&1; then
+    if _fetch "${BASE_URL}/SHA256SUMS.minisig" "$TMP_SIG" && [ -s "$TMP_SIG" ]; then
+        minisign -Vm "$TMP_SUMS" -x "$TMP_SIG" -P "$MINISIGN_PUBKEY" >/dev/null 2>&1 \
+            || { rm -f "$TMP_SUMS" "$TMP_SIG" "$TMP_BIN"; fail "minisign signature check FAILED for SHA256SUMS — aborting (possible tampering)"; }
+        ok "Signature verified (minisign)"
+    else
+        warn "SHA256SUMS.minisig unavailable — skipping signature check"
+    fi
+else
+    warn "minisign not installed — skipping signature authenticity (sha256 still enforced)"
+fi
+
+if command -v sha256sum >/dev/null 2>&1 && [ -s "$TMP_SUMS" ]; then
+    EXPECTED="$(grep -E "[ *]${ASSET}\$" "$TMP_SUMS" | awk "{print \$1}" | head -1)"
+    [ -n "$EXPECTED" ] || { rm -f "$TMP_SUMS" "$TMP_SIG" "$TMP_BIN"; fail "No SHA256 entry for ${ASSET} in SHA256SUMS"; }
+    ACTUAL="$(sha256sum "$TMP_BIN" | awk "{print \$1}")"
+    [ "$EXPECTED" = "$ACTUAL" ] || { rm -f "$TMP_SUMS" "$TMP_SIG" "$TMP_BIN"; fail "SHA256 mismatch for ${ASSET}: expected ${EXPECTED}, got ${ACTUAL}"; }
+    ok "SHA256 verified"
+else
+    warn "sha256sum or SHA256SUMS unavailable — binary integrity NOT verified"
+fi
+rm -f "$TMP_SUMS" "$TMP_SIG"
 
 chmod 755 "$TMP_BIN"
 "$TMP_BIN" --version >/dev/null 2>&1 || fail "Binary failed --version check"
@@ -205,7 +246,7 @@ ok "Systemd unit installed"
 # ── Start ─────────────────────────────────────────────────────────────────────
 systemctl daemon-reload
 systemctl enable runbound 2>/dev/null || true
-systemctl restart runbound
+systemctl restart runbound || true
 sleep 2
 
 systemctl is-active --quiet runbound || fail "Runbound failed to start — check: journalctl -u runbound -n 50"
