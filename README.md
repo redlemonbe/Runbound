@@ -4,7 +4,7 @@
 
 **Unbound-compatible DNS server — REST API, XDP kernel-bypass, no restart ever.**
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial License](https://img.shields.io/badge/license-commercial-green.svg)](COMMERCIAL_LICENSE.md)
+[![CI](https://github.com/redlemonbe/Runbound/actions/workflows/ci.yml/badge.svg)](https://github.com/redlemonbe/Runbound/actions/workflows/ci.yml) [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial License](https://img.shields.io/badge/license-commercial-green.svg)](COMMERCIAL_LICENSE.md)
 [![GitHub release](https://img.shields.io/github/v/release/redlemonbe/Runbound)](https://github.com/redlemonbe/Runbound/releases/latest)
 [![cargo audit](https://img.shields.io/badge/cargo_audit-clean-brightgreen.svg)](docs/audit.md) [![GitHub Sponsors](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor)](https://github.com/sponsors/redlemonbe)
 
@@ -205,9 +205,12 @@ Quick links: [Quick Start](docs/quick-start.md) · [Configuration](docs/configur
 
 ## Contributing
 
+CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request — build, clippy and tests must all be green:
+
 ```bash
-cargo clippy --all-targets --features xdp   # zero warnings
-cargo test                                   # all tests must pass
+cargo build --release                       # xdp is in the default feature set
+cargo clippy --all-targets -- -D warnings   # must be warning-free
+cargo test                                  # all tests must pass
 ```
 
 Pull requests welcome. By submitting a PR you agree to the [CLA](CLA.md).
