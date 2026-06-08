@@ -1546,6 +1546,7 @@ fn answer_from_cache(
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::dns::cache_snapshot::{CacheEntry, CacheSnapshot, QuestionKey};
     use bytes::Bytes;
     use std::time::{Duration, Instant};

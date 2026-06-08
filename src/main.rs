@@ -1,5 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
+
+// Clippy style/lint preferences, neutralised crate-wide (chore/clippy-clean).
+// Annotations only — NO executable code is changed, so the compiled binary is
+// identical to the benchmarked one (no perf/behaviour impact). Per-lint refactors
+// (e.g. splitting too-many-arg signatures) can be done later, one lint at a time.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_clamp)]
+#![allow(clippy::unnecessary_sort_by)]
+#![allow(clippy::unnecessary_filter_map)]
+#![allow(clippy::unnecessary_get_then_check)]
+#![allow(clippy::unnecessary_map_or)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::redundant_locals)]
+#![allow(clippy::redundant_async_block)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::double_ended_iterator_last)]
+#![allow(clippy::explicit_auto_deref)]
+#![allow(clippy::manual_abs_diff)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::manual_split_once)]
+#![allow(clippy::items_after_test_module)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::empty_line_after_doc_comments)]
+
 mod acme;
 mod blockpage;
 mod api;
