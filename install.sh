@@ -17,12 +17,19 @@ fail() { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || fail "Run as root: sudo bash install.sh"
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+if [[ "${1:-}" == "--uninstall" || "${1:-}" == "--purge" ]]; then
     systemctl stop runbound    2>/dev/null || true
     systemctl disable runbound 2>/dev/null || true
     rm -f /etc/systemd/system/runbound.service "$BINARY_DST"
     systemctl daemon-reload
-    ok "Runbound uninstalled. Config in $CONFIG_DIR and $DATA_DIR were kept."
+    if [[ "${1:-}" == "--purge" ]]; then
+        rm -rf "$CONFIG_DIR" "$DATA_DIR"
+        getent passwd "$RUN_USER"  >/dev/null 2>&1 && userdel  "$RUN_USER"  2>/dev/null || true
+        getent group  "$RUN_GROUP" >/dev/null 2>&1 && groupdel "$RUN_GROUP" 2>/dev/null || true
+        ok "Runbound purged: service, binary, $CONFIG_DIR, $DATA_DIR and the $RUN_USER user/group removed."
+    else
+        ok "Runbound uninstalled. Config in $CONFIG_DIR and $DATA_DIR were kept (use --purge to remove them)."
+    fi
     exit 0
 fi
 
