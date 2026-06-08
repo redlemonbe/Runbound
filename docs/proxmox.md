@@ -2,14 +2,9 @@
 
 ## License
 
-The AF/XDP fast path requires the **commercial license**.
-
-Open-source builds (AGPL v3) include the XDP code path but it is disabled at
-runtime — the server self-tests at startup and falls back automatically to the
-standard `SO_REUSEPORT` kernel UDP path if no commercial license is present.
-
-To enable the AF/XDP fast path in production, contact the maintainer for a
-commercial license.
+Runbound is AGPL-3.0 and the AF/XDP fast path is included and enabled by default.
+A commercial license is available to deploy without AGPL obligations — see
+[COMMERCIAL_LICENSE.md](../COMMERCIAL_LICENSE.md).
 
 ---
 
