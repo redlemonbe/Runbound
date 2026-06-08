@@ -18,7 +18,7 @@ and at what receiver CPU/RAM. No adjectives.>
   version, `xdp:` mode, relevant config (rate-limit, queues, governor).
 - **Generator (dnsmark):** host, dnsmark version, exact command.
 - **Link:** NIC model, speed, direct vs switched, flow-control state, RSS config.
-- **Dataset:** corpus file (`benchmark/corpus/top-10000-domains.txt`), 10 000 names,
+- **Dataset:** corpus file (`docs/benchmark/corpus/top-10000-domains.txt`), 10 000 names,
   random read.
 - **Procedure:** warmup duration; ramp steps; measurement window; saturation criterion.
 

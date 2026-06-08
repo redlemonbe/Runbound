@@ -23,7 +23,7 @@ context.
   `ss -ulpn` confirms only named owns `:53`.
 - **Generator (dnsmark):** dual Intel Xeon E5-2690 v2 (20c/40t), dnsmark, AF_XDP open-loop
   firehose, source-port spread 4096.
-- **Dataset:** `benchmark/corpus/top-10000-domains.txt`, cache warmed (2 passes; 99.79 %
+- **Dataset:** `docs/benchmark/corpus/top-10000-domains.txt`, cache warmed (2 passes; 99.79 %
   NOERROR, p50 0.192 ms warm).
 - **Procedure:** warm, then open-loop flood; **truth = receiver NIC PHY counters**
   (`tx_pkts_nic` served, `rx_pkts_nic` received, `rx_no_dma_resources` + `rx_missed_errors`
