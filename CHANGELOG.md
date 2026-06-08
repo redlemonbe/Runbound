@@ -9,6 +9,77 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.16.6] - 2026-06-08
+
+### Security
+- Independent second-model audit pass (Qwen3-Coder-30B, local): `load_blacklist` now caps entries on read as well as write (defense-in-depth against a tampered/oversized `ip-blacklist.json`). The other findings from the pass were cross-checked and dismissed. See `docs/security-audit/SECURITY-AUDIT.md` (Cycle H).
+
+---
+
+## [0.16.5] - 2026-06-08
+
+### Security
+- `/health` no longer discloses the build version (anti-fingerprinting); it keeps `status` + operational counters.
+- The persistent IP blacklist (`ip-blacklist.json`) is written `0600` and capped at 100 000 entries.
+- Added unit tests for the `unsafe` `recvmmsg` source-address parser (`sockaddr_to_std`): IPv4 round-trip; `AF_UNSPEC`/unknown family rejected without panic/UB.
+- The slave runs `dnssec-validation: yes` to match the master (operator config), so both nodes signal `AD`.
+
+### Changed
+- WebUI tagline → **ASM-Accelerated XDP DNS Server**.
+
+---
+
+## [0.16.4] - 2026-06-08
+
+### Changed
+- Release profile tuned for performance: `lto = "fat"` + `codegen-units = 1` (tighter inlining, smaller binary; no `target-cpu=native`, binaries stay portable).
+
+### Removed
+- Dead-code cleanup; **zero build warnings** on all targets (x86_64/aarch64, gnu/musl).
+
+---
+
+## [0.16.3] - 2026-06-07
+
+### Fixed
+- **DNSSEC `AD` flag.** Forwarded answers now set the `AD` (authentic_data) flag when `dnssec-validation: yes` and the answer validates as `Secure` (hickory per-record proof); previously `AD` was never set. Signed domains return `ad`; unsigned do not.
+
+### Added
+- Persistent IP blacklist: permanent ("blacklisted") bans are saved to `<base>/ip-blacklist.json` and reloaded at startup (re-applied to the in-memory set and the XDP `icmp_banned` map).
+
+---
+
+## [0.16.2] - 2026-06-07
+
+### Security
+- **Rate-limit and IP bans are now enforced on the kernel slow path too (`xdp: no`).** They were applied on the AF_XDP fast path and the hickory path, but the kernel slow loop served cache hits with neither check (a single source could flood cached answers unthrottled, and banned IPs were only dropped in XDP). A shared per-source gate (`rl_should_drop` + `is_banned`) driven by the same objects now governs both routes — one mechanism, like the blacklist. Over-limit/banned sources are dropped on both paths.
+- New `GET /api/protection/banned` (list) and `POST /api/protection/banned/:ip/blacklist` (permanent ban); ban/unban remain `PUT`/`DELETE /api/alerts/blocked/:ip`, all propagated to slaves via the HMAC relay.
+
+### Added
+- WebUI: banned-IP count tile in the Overview; banned-IP table in the Protection tab with per-row Blacklist + Unban buttons.
+
+### Fixed
+- Zero per-packet cost when `rate-limit: 0` (atomic short-circuit before the gate).
+
+---
+
+## [0.16.1] - 2026-06-07
+
+### Performance
+- Batched `recvmmsg` receive on the kernel slow loop, with `MSG_WAITFORONE` so a lone query (e.g. `dig`) is still answered immediately. One syscall drains up to 32 datagrams, reducing `UdpRcvbufErrors` under burst and the number of saturated cores for the same served rate. Escape hatch: `RUNBOUND_NO_RECVMMSG=1`.
+
+---
+
+## [0.16.0] - 2026-06-07
+
+### Fixed
+- **#183 — the slow path served nothing from cache.** With `upstream-racing: yes`, the per-upstream resolvers were built cache-less and the cache snapshot was built for `xdp: yes` only, so `xdp: no` forwarded **every** query (cache hit ≈ 0 %) since v0.6.12. The racing resolvers now carry a cache and the snapshot is built in both modes, so the kernel fast loop serves cache hits through the same SIMD/ASM responder as the XDP fast path.
+
+### Performance
+- Even `SO_REUSEPORT` distribution via a by-CPU `SO_ATTACH_REUSEPORT_CBPF` program (with RPS), so the kernel slow path engages all cores instead of a hashed subset.
+
+---
+
 ## [0.15.3] - 2026-06-07
 
 ### Fixed

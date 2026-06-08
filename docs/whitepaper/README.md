@@ -24,13 +24,13 @@ Each chapter is a standalone Markdown file. Line references point at real source
 
 | # | Chapter | What it covers |
 |---|---------|----------------|
-| 01 | [Architecture](01-architecture.md) | The dual-path model (XDP fast path / hickory slow path), process model, packet life-cycle |
+| 01 | [Architecture](01-architecture.md) | The dual-path model (XDP fast path / kernel slow path), process model, packet life-cycle, the shared wire answer routine |
 | 02 | [The XDP fast path](02-fast-path-xdp.md) | eBPF program, AF_XDP zero-copy, XSKMAP/CPUMAP routing, the zero-alloc wire response builder |
 | 03 | [SIMD & hand-written assembly](03-simd-and-asm.md) | CRC32c domain hashing, AVX2/SSE2 label lowercasing & comparison, the eBPF FNV-vs-CRC verifier story |
-| 04 | [The slow path](04-slow-path.md) | hickory-server, recursion, DoT/DoH, DNSSEC, serve-stale, negative caching |
+| 04 | [The slow path](04-slow-path.md) | the `xdp:no` kernel fast loop (SO_REUSEPORT per core, by-CPU cBPF + RPS, batched recvmmsg, shared rate-limit/ban gate, shared wire responder); hickory fallback (recursion, DoT/DoH, DNSSEC AD, serve-stale) |
 | 05 | [Caching](05-cache.md) | Cache sizing under cgroup v2, stale serving, negative cache |
 | 06 | [Control plane](06-control-plane.md) | REST API (axum), config-writer (atomic full-regen), web UI, HMAC relay, SSE, split-horizon, Unix socket |
-| 07 | [Security](07-security.md) | Threat model, transport crypto, firewall, reproducible build + signatures, SBOM |
+| 07 | [Security](07-security.md) | rate-limit + bans on both datapaths (one shared gate), DNSSEC AD, constant-time auth, least-privilege systemd, HMAC relay, reproducible build + signatures, SBOM, audit discipline |
 | 08 | [Performance](08-performance.md) | Benchmark methodology, measured ceilings, lessons learned |
 | 09 | [Design decisions](09-design-decisions.md) | Rust, aya, hickory, XDP DRV vs SKB — the trade-offs and the why |
 | 10 | [Appendices](10-appendices.md) | Config reference, API reference, glossary |
@@ -44,8 +44,10 @@ NXDOMAIN) **without ever entering the kernel network stack**: an XDP eBPF progra
 redirects UDP/53 frames into AF_XDP sockets, and user-space worker threads parse the
 query and forge the reply directly inside the NIC ring buffer (zero copy, zero syscall
 on the hot path). Everything the fast path cannot answer — recursion, TCP, DoT/DoH/DoQ,
-DNSSEC validation, anything non-trivial — falls through to a full
-[hickory-server](https://github.com/hickory-dns/hickory-dns) slow path. The two paths
+DNSSEC validation, anything non-trivial — falls through to the kernel slow path. In `xdp: no` that slow path is itself a tight
+kernel-UDP loop that serves cache hits through the *same* hand-written wire responder
+(behind the same per-source rate-limit/ban gate), routing only genuine misses to the full
+[hickory-server](https://github.com/hickory-dns/hickory-dns) stack. All paths
 share a single normalisation and hashing contract so that a name resolves identically
 whichever path serves it. The control plane (REST API, web UI, relay) is isolated on a
 separate Tokio runtime so that DNS load cannot starve management, and vice-versa.
