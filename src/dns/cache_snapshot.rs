@@ -35,7 +35,7 @@ use crate::dns::hasher::IdentityHasherBuilder;
 /// Lowercase is guaranteed by the caller (LowerName or equivalent).
 /// 64 bytes is enough for names up to ~60 chars without heap allocation.
 #[derive(Hash, Eq, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::derived_hash_with_manual_eq)]
 pub struct QuestionKey {
     /// Wire-format DNS name, lowercased (matches QNAME bytes from the client).
     pub name: SmallVec<[u8; 64]>,

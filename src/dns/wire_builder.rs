@@ -644,6 +644,7 @@ mod tests {
 
     /// Helper: build a minimal wire query for tests.
     /// Returns (buf, WireQuery) for a standard A query of "a.test." (7 wire bytes).
+    #[allow(dead_code, unused_mut)]
     fn make_wire_query_a() -> ([u8; 512], Vec<u8>) {
         // Wire QNAME for "a.test.": \x01 a \x04 test \x00
         let qname: Vec<u8> = vec![0x01, b'a', 0x04, b't', b'e', b's', b't', 0x00];
