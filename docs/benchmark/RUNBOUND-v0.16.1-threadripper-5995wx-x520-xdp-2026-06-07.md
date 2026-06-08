@@ -42,7 +42,7 @@ NIC — only the `xdp:` line differs. Companion:
   **AF_XDP** (symmetric XDP-vs-XDP), source-port spread 4096.
 - **Link:** X520 ↔ X520, 10 GbE, direct fibre, flow-control off both ends, RSS `udp4 sdfn`,
   static ARP both ways. Ping RTT 0.118 ms.
-- **Dataset:** `benchmark/corpus/top-10000-domains.txt`, warmed (two passes).
+- **Dataset:** `docs/benchmark/corpus/top-10000-domains.txt`, warmed (two passes).
 - **Procedure:** **warmup, then `dnsmark --ramp`** (methodology execution model). Truth =
   receiver **NIC PHY counters** (`rx_pkts_nic` / `tx_pkts_nic` / `rx_no_dma_resources` /
   `rx_missed_errors`) — in XDP zero-copy the software counters do not reflect the datapath.

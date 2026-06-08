@@ -45,7 +45,7 @@ the `xdp:` line differs. Companion:
   AF_XDP, source-port spread 4096 (`DNSMARK_SPORT_SPREAD=4096`).
 - **Link:** X520 ↔ X520, 10 GbE, direct fibre, flow-control off both ends, RSS
   `rx-flow-hash udp4 sdfn`, static ARP both ways. Ping RTT 0.118 ms.
-- **Dataset:** `benchmark/corpus/top-10000-domains.txt`, warmed (two passes).
+- **Dataset:** `docs/benchmark/corpus/top-10000-domains.txt`, warmed (two passes).
 - **Procedure:** **warmup, then `dnsmark --ramp`** (methodology execution model). Two
   truths cross-checked: (1) latency = ramp round-trip p50/p95/p99; (2) throughput =
   receiver **NIC PHY counters** (`ethtool -S`). Same two stated limits as the fast-path
