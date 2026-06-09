@@ -94,6 +94,12 @@ pub static XDP_CACHE_SNAPSHOT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 /// when no new entries have been inserted since the previous snapshot (PERF-1 / #135).
 pub static CACHE_WRITE_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// #186: process-wide handle to the shared mutable XDP cache, published once at
+/// startup. API write handlers use it to evict stale forwarded entries on
+/// local-zone writes so edits take effect live on the fast path. Unset when the
+/// XDP cache is disabled. Read-only after the single startup `set`.
+pub static XDP_CACHE_FOR_API: std::sync::OnceLock<MutableCacheMap> = std::sync::OnceLock::new();
+
 // ── Per-worker packet distribution (#67) ─────────────────────────────────────
 // 64 slots (one per NIC queue / worker thread). Incremented by xdp_worker
 // threads and read by GET /api/system. Kept in this always-compiled module so
