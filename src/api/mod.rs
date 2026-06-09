@@ -1220,6 +1220,51 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
 
 // ── POST /reload ────────────────────────────────────────────────────────────
 
+/// #186: write-path XDP cache coherency.
+///
+/// The XDP fast path checks the shared cache snapshot BEFORE the live local zone,
+/// so a stale *forwarded* answer that was cached before a rule was written keeps
+/// shadowing that rule until its TTL expires or the service restarts — breaking
+/// the no-restart guarantee for local-data, and silently defeating freshly-added
+/// blacklist/feed blocks (a security issue for a DNS filter). The hickory slow
+/// path checks the live zone first and is unaffected.
+///
+/// Fix entirely on the rare WRITE path (zero added per-query work, hot paths
+/// untouched): evict every name that changed — old union new zone keys, which
+/// also covers deletions — from the shared mutable cache by wire-qname (all
+/// qtypes), then re-preload the current local-data. `publish_loop` refreezes the
+/// XDP snapshot via `CACHE_WRITE_GEN`.
+///
+/// MUST be called BEFORE `s.zones.store(..)` so `s.zones` still holds the old set.
+fn resync_xdp_cache(s: &AppState, new_zones: &LocalZoneSet) {
+    let Some(cache) = crate::dns::cache_snapshot::XDP_CACHE_FOR_API.get() else { return };
+    resync_xdp_cache_inner(cache, &s.zones.load_full(), new_zones);
+}
+
+/// Pure core of `resync_xdp_cache`, decoupled from the global cache handle and
+/// `AppState` so it can be unit-tested. Evicts every changed name (old union new
+/// zone keys, which also covers deletions) by wire-qname (all qtypes), then
+/// re-preloads the current local-data.
+fn resync_xdp_cache_inner(
+    cache: &crate::dns::cache_snapshot::MutableCacheMap,
+    old_zones: &LocalZoneSet,
+    new_zones: &LocalZoneSet,
+) {
+    let mut affected: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::with_capacity(old_zones.zones.len() + new_zones.zones.len());
+    for n in old_zones.zones.keys().chain(new_zones.zones.keys()) {
+        affected.insert(crate::dns::local::name_to_wire_qname(n).to_vec());
+    }
+    if !affected.is_empty() {
+        cache.retain(|_k, e| !affected.contains(e.wire_qname.as_ref()));
+    }
+    // Re-insert the current local-data A/AAAA (overwrites any evicted-then-changed
+    // record; no-op for pure blacklist/feed/delete writes).
+    crate::dns::local::preload_into_cache(new_zones, cache);
+    crate::dns::cache_snapshot::CACHE_WRITE_GEN
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
     // FIX 3.2: independent 2 RPS cap — prevents authenticated DoS via rapid reloads.
     if !s.reload_limiter.check() {
@@ -1234,6 +1279,7 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
     match crate::config::load(&s.cfg_path) {
         Ok(new_cfg) => {
             let new_zones = crate::build_zone_set(&new_cfg);
+            resync_xdp_cache(&s, &new_zones);
             s.zones.store(std::sync::Arc::new(new_zones));
             // #149: hot-reload alert rules without restart
             let alert_rules_count = new_cfg.alerts.len();
@@ -1514,6 +1560,7 @@ async fn persist_and_swap(
             .entry(name.clone())
             .or_insert(ZoneAction::Static);
         new_zones.records.entry(name).or_default().push(record);
+        resync_xdp_cache(s, &new_zones);
         s.zones.store(Arc::new(new_zones));
     }
     info!(id=%entry.id, name=%entry.name, r#type=?entry.entry_type, "DNS entry added");
@@ -1615,6 +1662,7 @@ async fn delete_dns_handler(
                     new_zones.zones.remove(&name);
                 }
             }
+            resync_xdp_cache(&s, &new_zones);
             s.zones.store(Arc::new(new_zones));
         }
     }
@@ -1898,6 +1946,7 @@ async fn add_blacklist_handler(
         if !is_scheduled || entry.schedule.as_ref().map_or(true, |s| s.is_active_now()) {
             new_zones.override_zone(&req.domain, ZoneAction::from(&req.action));
         }
+        resync_xdp_cache(&s, &new_zones);
         s.zones.store(Arc::new(new_zones));
 
         entry
@@ -1979,6 +2028,7 @@ async fn delete_blacklist_handler(
     let current = s.zones.load_full();
     let mut new_zones = (*current).clone();
     new_zones.remove_zone(&removed.domain);
+    resync_xdp_cache(&s, &new_zones);
     s.zones.store(Arc::new(new_zones));
 
     info!(id=%id, domain=%removed.domain, "Blacklist entry deleted");
@@ -2125,6 +2175,7 @@ async fn update_feeds_handler(State(s): State<AppState>) -> impl IntoResponse {
             let errors = results.iter().filter(|r| r.status == "error").count();
             // Rebuild zone set so newly downloaded feed domains are immediately active.
             let new_zones = crate::build_zone_set(&s.cfg);
+            resync_xdp_cache(&s, &new_zones);
             s.zones.store(std::sync::Arc::new(new_zones));
             info!(updated, errors, "Feed update complete — zones rebuilt");
             (
@@ -2156,6 +2207,7 @@ async fn update_one_feed_handler(
         Ok(result) => {
             // Rebuild zone set immediately so the refreshed feed is active without a reload.
             let new_zones = crate::build_zone_set(&s.cfg);
+            resync_xdp_cache(&s, &new_zones);
             s.zones.store(std::sync::Arc::new(new_zones));
             if result.error.is_none() {
                 if let (Some(j), Some(url)) = (s.sync_journal.as_ref(), feed_url) {
@@ -2306,8 +2358,9 @@ async fn add_split_horizon(
         g.push(req.into_entry());
     }
     persist_config(&s);
-    info!(name = %name, "split-horizon entry added/updated via API");
-    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","name":name,"note":"applied on next service restart"})))
+    apply_split_horizon_live(&s.split_horizon.lock().unwrap_or_else(|e| e.into_inner()));
+    info!(name = %name, "split-horizon entry added/updated via API (live)");
+    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","name":name,"note":"applied live (no restart)"})))
 }
 
 /// DELETE /api/split-horizon/:name — remove a split-horizon entry by name.
@@ -2325,14 +2378,41 @@ async fn delete_split_horizon(
         g.retain(|e| e.name != name);
     }
     persist_config(&s);
-    info!(name = %name, "split-horizon entry deleted via API");
-    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","removed": before, "note":"applied on next service restart"})))
+    apply_split_horizon_live(&s.split_horizon.lock().unwrap_or_else(|e| e.into_inner()));
+    info!(name = %name, "split-horizon entry deleted via API (live)");
+    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","removed": before, "note":"applied live (no restart)"})))
 }
 
 /// Persist the effective config (boot config + live runtime overrides: the DNSSEC
 /// toggle and the current upstream set) back to runbound.conf via the atomic
 /// writer. No-op on slaves (their config is driven by the master). Errors are
 /// logged and swallowed so a write failure never breaks the API response.
+/// #10/#186: recompile the editable split-horizon entries into the live resolver
+/// table (hot-swap, no restart) AND evict those names from the XDP cache so the
+/// fast path falls through to the slow path where the per-subnet view applies.
+fn apply_split_horizon_live(entries: &[crate::config::parser::SplitHorizonEntry]) {
+    let table = crate::dns::server::compile_split_horizon(entries);
+    // Fast-path coherency: evict split-horizon names from the shared cache so a
+    // stale forwarded answer cannot shadow the per-subnet view.
+    if let Some(cache) = crate::dns::cache_snapshot::XDP_CACHE_FOR_API.get() {
+        let mut affected: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for (_subnets, zs) in &table {
+            for n in zs.zones.keys() {
+                affected.insert(crate::dns::local::name_to_wire_qname(n).to_vec());
+            }
+        }
+        if !affected.is_empty() {
+            cache.retain(|_k, e| !affected.contains(e.wire_qname.as_ref()));
+            crate::dns::cache_snapshot::CACHE_WRITE_GEN
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    // Slow path: hot-swap the live resolver table (picked up on the next query).
+    if let Some(live) = crate::dns::server::SPLIT_HORIZON_LIVE.get() {
+        live.store(std::sync::Arc::new(table));
+    }
+}
+
 fn persist_config(s: &AppState) {
     if s.slave_mode { return; }
     let mut c = (*s.cfg).clone();
@@ -6724,5 +6804,104 @@ async fn delete_backup_handler(
     match std::fs::remove_dir_all(&bdir) {
         Ok(_) => (StatusCode::OK, JsonExtract(serde_json::json!({"ok": true, "deleted": id}))).into_response(),
         Err(_) => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error": "Backup not found"}))).into_response(),
+    }
+}
+
+
+#[cfg(test)]
+mod resync_xdp_cache_tests {
+    //! #186 regression: a write to the local zone must evict any stale *forwarded*
+    //! cache entry for the affected name, so edits (local-data / blacklist / feed /
+    //! delete) take effect live on the XDP fast path without a restart.
+    use super::resync_xdp_cache_inner;
+    use crate::dns::cache_snapshot::{new_mutable_cache, CacheEntry, MutableCacheMap};
+    use crate::dns::local::{name_to_wire_qname, LocalZoneSet, ZoneAction};
+    use bytes::Bytes;
+    use hickory_proto::rr::Name;
+    use std::str::FromStr;
+
+    /// Insert a fake *forwarded* (recursive) A-record entry for `name`, as if it had
+    /// been resolved upstream and cached. Returns its cache key.
+    fn insert_forward(cache: &MutableCacheMap, name: &str) -> u64 {
+        let n = Name::from_str(name).unwrap();
+        let wq = name_to_wire_qname(&n);
+        let key = crate::dns::hasher::hash_wire_qname(&wq) ^ (1u64 << 48); // qtype A=1
+        cache.insert(
+            key,
+            CacheEntry {
+                wire_payload: Bytes::from_static(b"\x00\x00stale-forwarded-answer"),
+                // short TTL -> a normal forwarded entry, NOT a local-data sentinel
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+                wire_qname: Bytes::copy_from_slice(&wq),
+            },
+        );
+        key
+    }
+
+    #[test]
+    fn blacklist_evicts_cached_forward_security() {
+        // evil.com was resolved+cached, THEN blacklisted. The cached answer must go,
+        // otherwise the block silently does nothing until TTL/restart.
+        let cache = new_mutable_cache();
+        let k_evil = insert_forward(&cache, "evil.com.");
+        let k_good = insert_forward(&cache, "good.com.");
+
+        let old = LocalZoneSet::from_config(&[], &[]);
+        let mut new = LocalZoneSet::from_config(&[], &[]);
+        new.override_zone("evil.com", ZoneAction::NxDomain);
+
+        resync_xdp_cache_inner(&cache, &old, &new);
+
+        assert!(!cache.contains_key(&k_evil), "blacklisted name still cached → block not live");
+        assert!(cache.contains_key(&k_good), "unrelated recursive cache entry wrongly evicted");
+    }
+
+    #[test]
+    fn local_data_add_evicts_cached_forward() {
+        // The apex bug: runasm.com forwarded to the parking IP and cached, THEN a
+        // local A record is added. The stale forward must be evicted.
+        let cache = new_mutable_cache();
+        let k = insert_forward(&cache, "runasm.com.");
+
+        let old = LocalZoneSet::from_config(&[], &[]);
+        let mut new = LocalZoneSet::from_config(&[], &[]);
+        new.override_zone("runasm.com", ZoneAction::Static);
+
+        resync_xdp_cache_inner(&cache, &old, &new);
+
+        assert!(!cache.contains_key(&k), "local-data add did not evict the stale forward (apex bug)");
+    }
+
+    #[test]
+    fn delete_evicts_cached_entry() {
+        // A name present before the write but absent after (deletion) must be evicted
+        // via the OLD-keys half of the union.
+        let cache = new_mutable_cache();
+        let k = insert_forward(&cache, "del.lan.");
+
+        let mut old = LocalZoneSet::from_config(&[], &[]);
+        old.override_zone("del.lan", ZoneAction::Static);
+        let new = LocalZoneSet::from_config(&[], &[]);
+
+        resync_xdp_cache_inner(&cache, &old, &new);
+
+        assert!(!cache.contains_key(&k), "deleted name still served from cache");
+    }
+
+    #[test]
+    fn unrelated_recursive_cache_is_preserved() {
+        // Writing one rule must NOT flush the whole recursive cache.
+        let cache = new_mutable_cache();
+        let k_a = insert_forward(&cache, "a.example.");
+        let k_b = insert_forward(&cache, "b.example.");
+
+        let old = LocalZoneSet::from_config(&[], &[]);
+        let mut new = LocalZoneSet::from_config(&[], &[]);
+        new.override_zone("c.example", ZoneAction::NxDomain);
+
+        resync_xdp_cache_inner(&cache, &old, &new);
+
+        assert!(cache.contains_key(&k_a), "unrelated cache entry a.example wrongly evicted");
+        assert!(cache.contains_key(&k_b), "unrelated cache entry b.example wrongly evicted");
     }
 }

@@ -147,6 +147,9 @@ async fn async_main(
             Arc::clone(&mutable),
         ));
         xdp_cache_snapshot = Some(snapshot);
+        // #186: publish the shared cache so API write handlers can evict stale
+        // forwarded entries on local-zone writes (keeps edits live on the fast path).
+        let _ = dns::cache_snapshot::XDP_CACHE_FOR_API.set(Arc::clone(&mutable));
         xdp_cache_mutable = Some(mutable);
     }
 
