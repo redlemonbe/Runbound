@@ -184,8 +184,40 @@ pub struct RunboundHandler {
     /// SEC-20: pre-decoded TSIG keys (name_lower, algorithm, key_bytes) — decoded once at startup.
     tsig_keys: Vec<(String, TsigAlgorithm, Vec<u8>)>,
     axfr_allow: Vec<String>,
-    /// #10: compiled split-horizon entries — (CidrBlock list, per-subnet LocalZoneSet).
-    split_horizon: Vec<(Vec<super::acl::CidrBlock>, std::sync::Arc<LocalZoneSet>)>,
+    /// #10/#186: compiled split-horizon table — live-swappable so API edits
+    /// apply without a restart. Read once per slow-path query via ArcSwap.
+    split_horizon: std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>,
+}
+
+/// #10/#186: compiled split-horizon table — (CidrBlock list, per-subnet LocalZoneSet).
+pub type SplitHorizonTable = Vec<(Vec<super::acl::CidrBlock>, std::sync::Arc<LocalZoneSet>)>;
+
+/// #10/#186: process-wide handle to the live split-horizon table, published once
+/// at startup so API write handlers can hot-swap it without a service restart.
+pub static SPLIT_HORIZON_LIVE: std::sync::OnceLock<std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>> =
+    std::sync::OnceLock::new();
+
+/// Compile editable split-horizon entries into the resolver's per-subnet table.
+/// Used both at boot and on every live API edit.
+pub fn compile_split_horizon(
+    entries: &[crate::config::parser::SplitHorizonEntry],
+) -> SplitHorizonTable {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let subnets: Vec<super::acl::CidrBlock> = entry
+                .subnets
+                .iter()
+                .filter_map(|s| super::acl::CidrBlock::parse(s.trim()))
+                .collect();
+            if subnets.is_empty() {
+                warn!(name = %entry.name, "split-horizon: no valid subnets — entry skipped");
+                return None;
+            }
+            let zones = LocalZoneSet::from_config(&[], &entry.local_data);
+            Some((subnets, std::sync::Arc::new(zones)))
+        })
+        .collect()
 }
 
 impl RunboundHandler {
@@ -224,7 +256,7 @@ impl RunboundHandler {
         tsig_keys_raw: Vec<(String, String, String)>,
         alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
         axfr_allow: Vec<String>,
-        split_horizon: Vec<(Vec<super::acl::CidrBlock>, std::sync::Arc<LocalZoneSet>)>,
+        split_horizon: std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>,
     ) -> Self {
         Self {
             zones,
@@ -1205,10 +1237,18 @@ impl RequestHandler for RunboundHandler {
         // Find first split-horizon entry whose subnets contain client_ip.
         // If the query name resolves in that zone, answer immediately.
         // If no match (None zone action), fall through to global zones.
-        let response_handle = if let Some((_, sh_zones)) = self.split_horizon.iter().find(|(subnets, _)| {
-            subnets.iter().any(|cb| cb.contains(client_ip))
-        }) {
-            match self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, sh_zones).await {
+        // #186: load the live (hot-swappable) split-horizon table. Clone only the
+        // matching per-subnet zone Arc so the ArcSwap guard is dropped before the
+        // await (never held across .await); zero clone when there is no match.
+        let sh_match: Option<std::sync::Arc<LocalZoneSet>> = {
+            let table = self.split_horizon.load();
+            table
+                .iter()
+                .find(|(subnets, _)| subnets.iter().any(|cb| cb.contains(client_ip)))
+                .map(|(_, z)| std::sync::Arc::clone(z))
+        };
+        let response_handle = if let Some(sh_zones) = sh_match {
+            match self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, &sh_zones).await {
                 Ok(info) => return info,
                 Err(rh) => rh,
             }
@@ -2354,19 +2394,13 @@ pub async fn run_dns_server(
         Some(Arc::clone(&alert_tracker)),
         cfg.axfr_allow.clone(),
         {
-            // #10: compile split-horizon entries — parse subnets + build LocalZoneSets
-            cfg.split_horizon.iter().filter_map(|entry| {
-                let subnets: Vec<super::acl::CidrBlock> = entry.subnets.iter()
-                    .filter_map(|s| super::acl::CidrBlock::parse(s.trim()))
-                    .collect();
-                if subnets.is_empty() {
-                    warn!(name=%entry.name, "split-horizon: no valid subnets — entry skipped");
-                    return None;
-                }
-                let zones = LocalZoneSet::from_config(&[], &entry.local_data);
-                info!(name=%entry.name, subnets=%entry.subnets.len(), records=%entry.local_data.len(), "split-horizon zone loaded");
-                Some((subnets, std::sync::Arc::new(zones)))
-            }).collect()
+            // #10/#186: compile split-horizon and publish a live-swappable handle
+            // so API edits apply without a restart.
+            let table = compile_split_horizon(&cfg.split_horizon);
+            info!(entries = table.len(), "split-horizon zones loaded");
+            let live = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(table));
+            let _ = SPLIT_HORIZON_LIVE.set(std::sync::Arc::clone(&live));
+            live
         },
     );
     // Step 3b: wrap handler in Arc for sharing between Server and fallback reader.
@@ -2940,4 +2974,38 @@ mod tests {
         assert_eq!(result.max_payload(), 512, "payload must be floored at 512");
     }
 
+}
+
+#[cfg(test)]
+mod split_horizon_compile_tests {
+    //! #10/#186: split-horizon compiles to a per-subnet table that matches clients
+    //! by source IP. The live hot-swap itself is covered by the runtime test.
+    use super::compile_split_horizon;
+    use crate::config::parser::{LocalData, SplitHorizonEntry};
+    use std::net::IpAddr;
+
+    #[test]
+    fn compile_and_match_by_subnet() {
+        let e = SplitHorizonEntry {
+            name: "internal".into(),
+            subnets: vec!["10.0.0.0/8".into()],
+            local_data: vec![LocalData { rr: "intranet.corp. A 10.0.0.5".into() }],
+        };
+        let table = compile_split_horizon(&[e]);
+        assert_eq!(table.len(), 1, "one compiled entry expected");
+        let inside: IpAddr = "10.1.2.3".parse().unwrap();
+        let outside: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(table[0].0.iter().any(|cb| cb.contains(inside)), "in-range client must match");
+        assert!(!table[0].0.iter().any(|cb| cb.contains(outside)), "out-of-range client must not match");
+    }
+
+    #[test]
+    fn invalid_subnet_entry_is_skipped() {
+        let e = SplitHorizonEntry {
+            name: "bad".into(),
+            subnets: vec!["not-a-subnet".into()],
+            local_data: vec![],
+        };
+        assert_eq!(compile_split_horizon(&[e]).len(), 0, "entry with no valid subnet is skipped");
+    }
 }
