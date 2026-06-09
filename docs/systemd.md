@@ -28,8 +28,8 @@ RestartSec=5s
 
 # Capabilities — CAP_NET_ADMIN + CAP_BPF required for XDP attach
 # CAP_NET_RAW required for AF_XDP socket
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 
 # AF_XDP socket family
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
