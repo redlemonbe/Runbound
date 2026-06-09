@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.16.8] - 2026-06-09
+
+### Fixed
+- **XDP fast path failed to load on native-XDP NICs** (e.g. vmxnet3). The hardened service unit ran without `CAP_PERFMON`, so loading the XDP/CPUMAP program returned `EACCES` even though the verifier passed. Added `CAP_PERFMON` to `AmbientCapabilities`/`CapabilityBoundingSet` (install.sh, runbound.service, docs) — the AF_XDP fast path now attaches in **DRV mode** on native-XDP NICs. The `BPF_PROG_LOAD` errno is now surfaced in the log. (#184)
+- **Dashboard hid the latency `max` for values >= 2000 ms** — the webui formatter returned an em-dash for any value >= 2000 ms; it now formats >= 1000 ms as seconds, so a real 2.5 s max shows instead of nothing. (#185)
+- Dashboard "Security Audit" link now points to the canonical GitHub document instead of a build-frozen embedded copy.
+
+
 ---
 
 ## [0.16.7] - 2026-06-08
