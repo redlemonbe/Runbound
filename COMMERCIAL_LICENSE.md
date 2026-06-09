@@ -19,7 +19,7 @@ Contact us for a quote based on your deployment size.
 
 ## Contact
 
-redlemonbe@codix.be  
+contact@runasm.com  
 🔗 https://github.com/redlemonbe/Runbound
 
 ---
