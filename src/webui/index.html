@@ -1114,7 +1114,7 @@ function updateOverview() {
 function renderStats(s) {
   const fmt  = n => n==null?'—':n.toLocaleString();
   const fmtf = n => n==null?'—':Number(n).toFixed(1);
-  const ms   = n => { if(n==null||n>=2000) return '—'; if(n < 1) return Math.round(n*1000)+' µs'; return Number(n).toFixed(2)+' ms'; };
+  const ms   = n => { if(n==null) return '—'; if(n < 1) return Math.round(n*1000)+' µs'; if(n >= 1000) return (n/1000).toFixed(2)+' s'; return Number(n).toFixed(2)+' ms'; };
   const pct  = n => n==null?'—':fmtf(n)+' %';
   const sec  = n => { if(n==null)return'—'; const d=Math.floor(n/86400),hh=Math.floor((n%86400)/3600),m=Math.floor((n%3600)/60); return d?`${d}d ${hh}h`:hh?`${hh}h ${m}m`:`${m}m`; };
   set('ov-qps',fmtf(s.qps_1m)); set('ov-total',fmt(s.total)); set('ov-cache',pct(s.cache_hit_rate));
