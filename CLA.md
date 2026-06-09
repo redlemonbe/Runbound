@@ -31,10 +31,10 @@ By submitting, you confirm that:
 - If you wrote this code at work, your employer has approved the contribution or waived
   their rights to it.
 
-If you are contributing on behalf of a company, send one email to redlemonbe@codix.be
+If you are contributing on behalf of a company, send one email to contact@runasm.com
 with the subject `CLA — [Company Name]` to confirm your company's authorisation.
 You only need to do this once.
 
 ---
 
-*Questions? Contact redlemonbe@codix.be*
+*Questions? Contact contact@runasm.com*
