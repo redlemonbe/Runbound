@@ -625,7 +625,7 @@ change or a custom hickory fork and is deferred.
 
 ## Reporting a vulnerability
 
-Send a report to **redlemonbe@codix.be** with subject line `[SECURITY] Runbound`.
+Send a report to **security@runasm.com** with subject line `[SECURITY] Runbound`.
 Please include a description of the vulnerability, reproduction steps, and
 your assessment of its impact. We aim to respond within 48 hours.
 
