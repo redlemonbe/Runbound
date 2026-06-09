@@ -161,7 +161,7 @@ impl XdpHandle {
 
         program
             .load()
-            .map_err(|e| format!("XDP prog load failed: {e}"))?;
+            .map_err(|e| format!("XDP prog load failed: {e} (dbg: {e:?})"))?;
 
         // Try DRV mode (zero-copy capable drivers). Fall back to SKB mode
         // (works on every NIC, slightly higher latency due to SKB allocation).
