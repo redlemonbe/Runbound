@@ -21,7 +21,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [F](#cycle-f--v0120-defense-in-depth-hardening) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
 | [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 0 open; 6 fixed, 3 accepted, 2 disputed |
-| [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 2 open (enhancement); 15 fixed, 3 accepted, 5 disputed |
+| [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 4 open (enhancement); 15 fixed, 3 accepted, 5 disputed |
 
 ---
 
@@ -74,6 +74,8 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 |----|-----|--------|---------|
 | OPEN-I17 | MEDIUM | Gemini | `/api/clients[/:ip]` scans the whole log buffer per request (CPU; localhost+auth only). Recommend background pre-aggregation. |
 | OPEN-I18 | LOW | Claude | Serialization escaping (SEC-I4) was applied to local-data/local-zone; a full pass over every API-settable string field at the render boundary is recommended. Primary mitigation remains input-layer control-char rejection. |
+| OPEN-I26 | LOW | Gemini→recal. | **Third pass (xdp/worker.rs).** `start_xdp_on_iface` passes the config `xdp-interface` name to `read_nic_rx_missed` (a `/sys/class/net/<iface>/…` read) without validation — same path-safety class as SEC-I24 but on the XDP setup path (the ioctls already call `sanitize_iface_name`). Gemini's HIGH "command injection" is refuted (the XDP path never shells out). Read-only, admin-config; recommend sanitizing the iface once at `start_xdp_on_iface` entry. |
+| OPEN-I27 | LOW | Gemini | **Third pass.** `answer_from_cache` cache key = `hash(qname) ^ (qtype<<48)` ignores QCLASS, so a non-IN class query (e.g. CH) could match an IN entry — a correctness edge, not poisoning (the cache is filled from the server's own validated resolution). Fix requires a bilateral key change (lookup + population) + tests; deferred. |
 
 ### Disputed (false positives — recorded with refuting evidence)
 
@@ -92,7 +94,7 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 - **kernel slow-path `sendmmsg` unsafe** (kernel_loop.rs): pointer lifetimes sound — pre-allocated scratch (never reallocated), ephemeral `&mut` immediately cast to raw, bounded slice/count ≤ BATCH.
 - **`ratelimit::normalize_ip`**: IPv6 masking guarded (DISP-I22); IPv4 mask hardened (BUG-I9).
 
-**Cycle I status:** 15 fixed, 3 accepted, 2 open (enhancement), 5 disputed. A second pass over `server.rs` (DNS engine + TCP/DoT/DoH listeners) found a real ACL-bypass on the loopback-relayed TCP path (SEC-I23, fixed). Not a clean sweep — SEC-I14 (relay body MAC) is a real accepted gap, and OPEN-I17/I18 remain. Slow-path auto-tune (v0.17.0) introduced exactly one finding (SEC-I11), fixed.
+**Cycle I status:** 15 fixed, 3 accepted, 4 open (enhancement), 5 disputed. Three passes (security-critical files, then `server.rs`, then the untrusted-packet `xdp/worker.rs`). The one real high-impact issue (SEC-I23, ACL bypass on loopback-relayed TCP) is fixed; the third pass added two LOW correctness/defense-in-depth items (OPEN-I26/I27). Not a clean sweep — SEC-I14 (relay body MAC) is a real accepted gap, and OPEN-I17/I18 remain. Slow-path auto-tune (v0.17.0) introduced exactly one finding (SEC-I11), fixed.
 
 ---
 
