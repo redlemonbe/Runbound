@@ -70,3 +70,48 @@ fabric.
 ---
 
 _Captured 2026-06-10 with `lscpu` · `dmidecode` · `smartctl` · `ethtool` · `lspci` on both hosts._
+
+---
+
+## Benchmark tuning
+
+Re-apply after every reboot — none of these persist. Part of the reproducible setup.
+
+### CPU (both machines)
+```bash
+# Governor -> performance (scaling driver: acpi-cpufreq). The #1 benchmark confounder.
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+Verified: all 128 logical CPUs report `performance`.
+
+### Memory (both machines)
+```bash
+# 8 GiB of 2 MiB hugepages for the AF_XDP UMEM.
+echo 4096 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+```
+Verified: `HugePages_Total: 4096`.
+
+### NIC `eno1` (Broadcom BCM57508, `bnxt_en`)
+- **Flow control: off by default** (`ethtool -a eno1` → RX/TX off) — confirmed, no pause frames.
+- **irqbalance: inactive** on both — IRQs are pinned manually for the run, not reshuffled.
+- **Rings** (`ethtool -g eno1`):
+  - `recepteur`: RX max **8191** (already at max), TX **2047** (at max)
+  - `emetteur`: RX **511 / 2047**, TX **511 / 2047** → raise to max for generation
+- **Queues** (`ethtool -l eno1`): current **Combined 32**; max Combined 37 (`recepteur`) / 74 (`emetteur`).
+  The combined-queue count caps the number of AF_XDP RX sockets / XDP workers.
+
+### Pending — link-resetting or access-sensitive (applied inside the run window)
+```bash
+# Generator: max the rings (this bounces the eno1 link)
+sudo ethtool -G eno1 rx 2047 tx 2047
+# Pin NIC IRQs off the Runbound worker cores (single NUMA node here, so straightforward)
+# Attach Runbound XDP on eno1 — eno1 also carries SSH, and bnxt_en AF_XDP ZC is less
+# battle-tested, so this is done behind a dead-man's-switch: an `at` job detaches XDP +
+# stops runbound after N minutes unless cancelled, so a mis-behaving fast path cannot
+# lock anyone out of the box.
+```
+
+### Network / Runbound bench config
+- Traffic over the public `eno1` path: `109.94.96.43` (generator) → `109.94.96.53` (receiver).
+- Receiver config: `xdp-interface: eno1`, bind the public IP, `access-control: 109.94.96.43/32 allow`,
+  `rate-limit: 0`, `xdp: yes`.
