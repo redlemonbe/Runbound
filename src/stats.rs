@@ -40,6 +40,9 @@ pub const HIST_BUCKETS: usize = 13;
 // 300 slots × 1 second each = 5-minute sliding window.
 pub const QPS_RING_SIZE: usize = 300;
 
+// Per-minute latency ring: 1440 slots x 1 min = 24 h, for windowed min/avg/max.
+pub const LAT_RING_MINUTES: usize = 1440;
+
 // ── Hickory resolver cache size ────────────────────────────────────────────
 // Configured in build_resolver(); used to cap the cache_entries approximation.
 const HICKORY_CACHE_SIZE: u64 = 8_192;
@@ -91,6 +94,12 @@ pub struct Stats {
     pub lat_max_us: AtomicU64,
     pub lat_sum_us: AtomicU64,
     pub lat_count: AtomicU64,
+    // Per-minute latency ring (24h) -- windowed min/avg/max for the web UI selector.
+    pub lat_ring_min: Vec<AtomicU64>,
+    pub lat_ring_max: Vec<AtomicU64>,
+    pub lat_ring_sum: Vec<AtomicU64>,
+    pub lat_ring_cnt: Vec<AtomicU64>,
+    pub lat_ring_head: CachePadded<AtomicU64>,
 
     // QPS ring buffer — 300 one-second slots
     pub qps_ring: Vec<AtomicU64>,
@@ -145,6 +154,11 @@ impl Stats {
             lat_max_us: AtomicU64::new(0),
             lat_sum_us: AtomicU64::new(0),
             lat_count: AtomicU64::new(0),
+            lat_ring_min: (0..LAT_RING_MINUTES).map(|_| AtomicU64::new(u64::MAX)).collect(),
+            lat_ring_max: (0..LAT_RING_MINUTES).map(|_| AtomicU64::new(0)).collect(),
+            lat_ring_sum: (0..LAT_RING_MINUTES).map(|_| AtomicU64::new(0)).collect(),
+            lat_ring_cnt: (0..LAT_RING_MINUTES).map(|_| AtomicU64::new(0)).collect(),
+            lat_ring_head: CachePadded(AtomicU64::new(0)),
             qps_ring: (0..QPS_RING_SIZE).map(|_| AtomicU64::new(0)).collect(),
             qps_head: CachePadded(AtomicU64::new(0)),
             qps_peak: CachePadded(AtomicU64::new(0)),
@@ -242,6 +256,31 @@ impl Stats {
         self.lat_max_us.fetch_max(us, Ordering::Relaxed);
         self.lat_sum_us.fetch_add(us, Ordering::Relaxed);
         self.lat_count.fetch_add(1, Ordering::Relaxed);
+        // #webui: also feed the current minute slot of the 24h latency ring.
+        let h = (self.lat_ring_head.load(Ordering::Relaxed) as usize) % LAT_RING_MINUTES;
+        self.lat_ring_min[h].fetch_min(us, Ordering::Relaxed);
+        self.lat_ring_max[h].fetch_max(us, Ordering::Relaxed);
+        self.lat_ring_sum[h].fetch_add(us, Ordering::Relaxed);
+        self.lat_ring_cnt[h].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Windowed (min, avg, max) latency in ms over the last `minutes` minute-slots,
+    /// plus the sample count. `None` when the window has no samples.
+    pub fn latency_window(&self, minutes: usize) -> Option<(f64, f64, f64, u64)> {
+        let head = self.lat_ring_head.load(Ordering::Relaxed) as usize;
+        let n = minutes.min(LAT_RING_MINUTES);
+        let (mut min_us, mut max_us, mut sum_us, mut cnt) = (u64::MAX, 0u64, 0u64, 0u64);
+        for i in 0..n {
+            let slot = (head + LAT_RING_MINUTES - i) % LAT_RING_MINUTES;
+            let c = self.lat_ring_cnt[slot].load(Ordering::Relaxed);
+            if c == 0 { continue; }
+            cnt += c;
+            sum_us += self.lat_ring_sum[slot].load(Ordering::Relaxed);
+            min_us = min_us.min(self.lat_ring_min[slot].load(Ordering::Relaxed));
+            max_us = max_us.max(self.lat_ring_max[slot].load(Ordering::Relaxed));
+        }
+        if cnt == 0 { return None; }
+        Some((min_us as f64 / 1000.0, sum_us as f64 / cnt as f64 / 1000.0, max_us as f64 / 1000.0, cnt))
     }
 
     /// Record a completed forwarded lookup and update cache metrics.
@@ -372,6 +411,9 @@ impl Stats {
             dnssec_secure: self.dnssec_secure.load(Ordering::Relaxed),
             dnssec_bogus: self.dnssec_bogus.load(Ordering::Relaxed),
             dnssec_insecure: self.dnssec_insecure.load(Ordering::Relaxed),
+            latency_windows: [("1m", 1usize), ("5m", 5), ("1h", 60), ("12h", 720), ("24h", 1440)].iter()
+                .map(|&(l, m)| { let (mn, av, mx, c) = self.latency_window(m).unwrap_or((0.0, 0.0, 0.0, 0)); (l.to_string(), mn, av, mx, c) })
+                .collect(),
             qtype_stats,
         }
     }
@@ -424,6 +466,8 @@ pub struct StatsSnapshot {
     pub dnssec_insecure: u64,
     /// Per-record-type query distribution, sorted descending by count.
     pub qtype_stats: Vec<(String, u64)>,
+    /// Per-UI-window latency: (label, min_ms, avg_ms, max_ms, count) for 1m..24h.
+    pub latency_windows: Vec<(String, f64, f64, f64, u64)>,
 }
 
 pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
@@ -459,6 +503,7 @@ pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
             "bogus":    snap.dnssec_bogus,
             "insecure": snap.dnssec_insecure,
         },
+        "latency_windows": snap.latency_windows.iter().fold(serde_json::Map::new(), |mut m, (l, mn, av, mx, c)| { m.insert(l.clone(), serde_json::json!({"min_ms": mn, "avg_ms": av, "max_ms": mx, "count": c})); m }),
         "qtype_stats": snap.qtype_stats.iter()
             .map(|(k, v)| serde_json::json!({"type": k, "count": v}))
             .collect::<Vec<_>>(),
@@ -475,9 +520,22 @@ pub async fn qps_update_loop(stats: Arc<Stats>, snapshot_cache: SharedSnapshot) 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prev_total: u64 = 0;
+    let mut sec_in_min: u64 = 0;
 
     loop {
         interval.tick().await;
+        // #webui: rotate the per-minute latency ring once a minute (reset the slot
+        // we advance into, then publish the new head).
+        sec_in_min += 1;
+        if sec_in_min >= 60 {
+            sec_in_min = 0;
+            let next = ((stats.lat_ring_head.load(Ordering::Relaxed) as usize) + 1) % LAT_RING_MINUTES;
+            stats.lat_ring_min[next].store(u64::MAX, Ordering::Relaxed);
+            stats.lat_ring_max[next].store(0, Ordering::Relaxed);
+            stats.lat_ring_sum[next].store(0, Ordering::Relaxed);
+            stats.lat_ring_cnt[next].store(0, Ordering::Relaxed);
+            stats.lat_ring_head.store(next as u64, Ordering::Relaxed);
+        }
         // #perf: XDP-served packets are counted per-worker (XDP_WORKER_PKTS,
         // contention-free) instead of on the line-rate cache hot path. Sum them with
         // the slow-path total so QPS stays accurate without any contended atomic.

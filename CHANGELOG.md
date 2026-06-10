@@ -7,6 +7,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.16.10] - 2026-06-10
+
+### Added
+- **802.1Q VLAN support on the XDP fast path (#188).** When `rx-vlan-offload` is off, a tagged fabric (e.g. a provider private VLAN) keeps the 802.1Q tag inside the frame; the eBPF gate and the AF_XDP worker now skip a single tag to reach the inner IP/UDP, and the in-place TX reply preserves it. The untagged hot path is byte-for-byte unchanged (one extra ethertype compare per frame; no per-packet cost for untagged traffic). On NICs that strip the RX tag in hardware and refuse to disable it (e.g. bnxt), `RUNBOUND_XDP_VLAN=<vid>` re-inserts one tag on the reply.
+- **Dashboard latency window selector (1m / 5m / 1h / 12h / 24h).** The Latency card shows min/avg/max over a selectable window, backed by a 24 h per-minute ring exposed at `/api/stats` -> `latency_windows`. The ring is fed only on the slow path, so the XDP fast path adds no atomic contention.
+
+### Docs
+- Benchmark report: Runbound on Threadripper PRO 5995WX + Intel X710 (i40e), XDP - peak **10.14 M qps served** (receiver NIC counters), p50 < 1 ms up to 10.56 M qps offered, no measurable NIC RX loss; lifts the X520 (PCIe 2.0) ceiling.
+- Benchmark report: Latitude EPYC 9554P + Broadcom 100 G - `bnxt_en` has no AF_XDP zero-copy (errno 95); documents the limitation and rig tuning.
+- `install.sh` auto-disables `systemd-resolved` so a fresh Debian/Ubuntu install takes `:53` cleanly.
+- `TRADEMARK.md` added; contact emails migrated to runasm.com.
+
+## [0.16.9] - 2026-06-09
+
+### Fixed
+- **Live cache coherency on zone writes + split-horizon hot-swap (#186).** Local-zone / blacklist / feed writes now evict the XDP cache across all seven write paths, and split-horizon views hot-swap live via `ArcSwap` with no restart.
+
 ## [0.16.8] - 2026-06-09
 
 ### Fixed

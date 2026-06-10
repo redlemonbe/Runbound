@@ -293,13 +293,21 @@
       <div class="card"><div class="text-xs text-gray-600 mb-1">Banned IPs</div><div id="ov-banned" class="text-2xl text-red-400 tabular-nums">—</div><div class="text-xs text-gray-700 mt-0.5">XDP + slow-path</div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">Forwarded</div><div id="ov-forwarded" class="text-2xl tabular-nums">—</div></div>
       <div class="card"><div class="text-xs text-gray-600 mb-1">SERVFAIL</div><div id="ov-servfail" class="text-2xl text-yellow-500 tabular-nums">—</div></div>
-      <div class="card"><div class="text-xs text-gray-600 mb-1">Latency avg</div><div id="ov-latency" class="text-2xl tabular-nums">—</div></div>
       <div id="ov-nodes-tile" class="card hidden"><div class="text-xs text-gray-600 mb-1">Nodes</div><div id="ov-nodes-count" class="text-2xl text-cyan-400 tabular-nums">—</div><div id="ov-nodes-detail" class="text-xs text-gray-700 mt-0.5"></div></div>
       <div id="ov-uptime-tile" class="card"><div class="text-xs text-gray-600 mb-1">Uptime</div><div id="ov-uptime" class="text-2xl">—</div></div>
     </div>
     <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
       <div class="card">
-        <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Latency</div>
+        <div class="flex items-center justify-between mb-3">
+          <div class="text-xs text-gray-600 uppercase tracking-wide">Latency</div>
+          <select id="lat-win-sel" class="input" style="padding:3px 8px;font-size:11px" onchange="setLatWindow(this.value)">
+            <option value="1m">1m</option>
+            <option value="5m" selected>5m</option>
+            <option value="1h">1h</option>
+            <option value="12h">12h</option>
+            <option value="24h">24h</option>
+          </select>
+        </div>
         <div class="space-y-2 text-sm">
           <div class="flex justify-between"><span class="text-gray-500">min</span><span id="ov-lmin" class="text-green-400 tabular-nums">—</span></div>
           <div class="flex justify-between"><span class="text-gray-500">average</span><span id="ov-lavg" class="text-cyan-400 tabular-nums">—</span></div>
@@ -828,6 +836,8 @@ let nodes = {}; // id -> {url, key, name, stats, sys, cache, status, lastErr, sy
 const prevIcmpStats = {}; // nodeId -> {dropped, rate_limited} — previous poll values for delta detection
 let masterKey = '';
 let selectedNode = 'all'; // 'all' | node id
+let latWindow = '5m';                       // #webui Latency card window (1m..24h)
+const LAT_WINDOWS = ['1m','5m','1h','12h','24h'];
 let statsTimer = null, sysTimer = null, syncTimer = null, logsTimer = null, protectionTimer = null;
 
 function nodeApi(nodeId, method, path, body) {
@@ -1004,6 +1014,22 @@ function renderNodePills() {
   el.innerHTML = '';
 }
 
+// #webui: aggregate per-minute windowed latency across nodes (min=min, max=max,
+// avg weighted by sample count) for the Latency card window selector.
+function aggLatWindows(ns){
+  const out={};
+  for(const w of LAT_WINDOWS){
+    let mn=Infinity,mx=0,sum=0,cnt=0;
+    for(const n of ns){ const lw=n.stats?.latency_windows?.[w]; if(!lw||!lw.count) continue; cnt+=lw.count; sum+=lw.avg_ms*lw.count; mn=Math.min(mn,lw.min_ms); mx=Math.max(mx,lw.max_ms); }
+    out[w]= cnt? {min_ms:mn,avg_ms:sum/cnt,max_ms:mx,count:cnt} : null;
+  }
+  return out;
+}
+function renderLatSelector(){
+  const el=document.getElementById('lat-win-sel'); if(el && el.value!==latWindow) el.value=latWindow;
+}
+function setLatWindow(w){ latWindow=w; renderLatSelector(); const s=selectedNode==='all'?aggregateStats():nodes[selectedNode]?.stats; if(s) renderStats(s); }
+
 function aggregateStats() {
   const ns = Object.values(nodes).filter(n => n.stats);
   if (!ns.length) return null;
@@ -1021,6 +1047,7 @@ function aggregateStats() {
     local_hits: sum('local_hits'), nxdomain: sum('nxdomain'), refused: sum('refused'),
     qps_1m: sum('qps_1m'), qps_5m: sum('qps_5m'), qps_peak: sum('qps_peak'),
     latency_min_ms: actMin.length?Math.min(...actMin):null, latency_avg_ms: wavg('latency_avg_ms'), latency_max_ms: actMax.length?Math.max(...actMax):null,
+    latency_windows: aggLatWindows(ns),
     cache_hit_rate: wavg('cache_hit_rate'),
     blocked_percent: wavg('blocked_percent'),
     uptime_secs: Math.max(...ns.map(n=>n.stats.uptime_secs??0)),
@@ -1120,8 +1147,10 @@ function renderStats(s) {
   set('ov-qps',fmtf(s.qps_1m)); set('ov-total',fmt(s.total)); set('ov-cache',pct(s.cache_hit_rate));
   set('ov-blocked',fmt(s.blocked)); set('ov-blocked-pct',s.blocked_percent!=null?fmtf(s.blocked_percent)+'% of total':'');
   api('GET','/protection/banned').then(d=>set('ov-banned',fmt(d.count))).catch(()=>{});
-  set('ov-forwarded',fmt(s.forwarded)); set('ov-servfail',fmt(s.servfail)); set('ov-latency',ms(s.latency_avg_ms)); set('ov-uptime',sec(s.uptime_secs));
-  set('ov-lmin',ms(s.latency_min_ms)); set('ov-lavg',ms(s.latency_avg_ms)); set('ov-lmax',ms(s.latency_max_ms));
+  set('ov-forwarded',fmt(s.forwarded)); set('ov-servfail',fmt(s.servfail)); set('ov-uptime',sec(s.uptime_secs));
+  renderLatSelector();
+  const lw = (s.latency_windows && s.latency_windows[latWindow]) || null;
+  set('ov-lmin', lw ? ms(lw.min_ms) : '—'); set('ov-lavg', lw ? ms(lw.avg_ms) : '—'); set('ov-lmax', lw ? ms(lw.max_ms) : '—');
   set('ov-qps1m',fmtf(s.qps_1m)+' /s'); set('ov-qps5m',fmtf(s.qps_5m)+' /s'); set('ov-qpspeak',fmt(s.qps_peak)+' /s');
   set('ov-nxdomain',fmt(s.nxdomain)); set('ov-refused',fmt(s.refused)); set('ov-local',fmt(s.local_hits));
   set('ov-cache-entries',fmt(s.cache_entries)); set('ov-cache-rate',pct(s.cache_hit_rate));
