@@ -935,6 +935,9 @@ fn xdp_worker(
         // #60: load the frozen cache snapshot once per batch — zero-lock read.
         let cache_arc: Option<std::sync::Arc<crate::dns::cache_snapshot::CacheSnapshot>> =
             cache_snapshot.as_ref().map(|s| s.load_full());
+        // #187: per-view (split-horizon) snapshots — loaded once per batch, zero-lock.
+        let view_arc: Option<std::sync::Arc<crate::dns::cache_snapshot::ViewSnapshots>> =
+            crate::dns::cache_snapshot::SPLIT_HORIZON_SNAPSHOTS.get().map(|h| h.load_full());
         tx_descs.clear();
         rx_addrs.clear();
 
@@ -1023,6 +1026,7 @@ fn xdp_worker(
                     src_ip,
                     &mut dns_scratch,
                     cache_arc.as_deref(),
+                    view_arc.as_deref(),
                     &stats,
                     &domain_stats,
                 ) {
@@ -1178,6 +1182,7 @@ fn process_packet(
     src_ip: Option<IpAddr>,
     dns_scratch: &mut Vec<u8>,
     cache_snap: Option<&crate::dns::cache_snapshot::CacheSnapshot>,
+    view_snaps: Option<&crate::dns::cache_snapshot::ViewSnapshots>,
     stats: &Arc<crate::stats::Stats>,
     domain_stats: &Arc<crate::domain_stats::DomainStats>,
 ) -> Option<usize> {
@@ -1252,7 +1257,25 @@ fn process_packet(
     //    ACL Deny → silent drop (answer_from_cache checks ACL first).
     // 2. answer_dns (hickory) — wildcard, CNAME, EDNS-DO, BlockPage, NXDOMAIN, parent-walk.
     // 3. XDP_FALLBACK_TX — upstream recursion, fills the cache for next hit.
-    let dns_len = if let Some(snap) = cache_snap {
+    // #187: split-horizon fast path — if the client IP matches a configured view,
+    // serve that view's snapshot BEFORE the global cache so per-source overrides win
+    // on the fast path (no cross-view leak). A view miss falls through to the global
+    // cache / recursion below. ACL is enforced inside answer_from_cache.
+    let view_len: Option<usize> = match (view_snaps, src_ip) {
+        (Some(views), Some(ip)) => views
+            .iter()
+            .find(|(cidrs, _)| cidrs.iter().any(|cb| cb.contains(ip)))
+            .and_then(|(_, vsnap)| {
+                answer_from_cache(
+                    dns_in, vsnap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats),
+                )
+            }),
+        _ => None,
+    };
+
+    let dns_len = if let Some(len) = view_len {
+        len
+    } else if let Some(snap) = cache_snap {
         match answer_from_cache(dns_in, snap, acl, src_ip, &mut tx[dns_off..], Some(stats), Some(domain_stats)) {
             Some(len) => len,
             None => {

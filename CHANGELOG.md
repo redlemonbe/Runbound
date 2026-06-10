@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.16.11] - 2026-06-10
+
+### Added
+- **Split-horizon served on the XDP fast path (#187).** Each split-horizon view is compiled into a per-view wire snapshot; the XDP worker matches the client IP to its view and serves the view's answer BEFORE the global cache, so per-source overrides win on the fast path with no cross-view leak. Views hot-swap live on API edits (no restart), reusing the exact wire serialisation of the global preload. Zero per-packet cost when no split-horizon is configured.
+
+### Fixed
+- **Split-horizon was not served at all in `xdp: yes` mode.** Queries for a view name arrived via the AF_XDP worker, which only knew the global zones — a view name under a static global zone returned NXDOMAIN (verified A/B on X710), and otherwise was forwarded upstream. The per-view fast-path snapshots (#187) fix this; verified on i40e with two views (alternating sources, no leak), global local-data, recursion, and live API edits.
+
+### Notes
+- Per-view fast-path snapshots cover A/AAAA records — the same coverage as the global local-data preload. Other record types in a view still fall through to the slow path.
+
 ## [0.16.10] - 2026-06-10
 
 ### Added
