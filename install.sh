@@ -90,16 +90,30 @@ echo "Installing Runbound ${VERSION} (${ARCH_TAG})…"
 
 # ── Conflicting services on :53 — hard stop with guidance ─────────────────────
 _conflict=""
-for svc in unbound bind9 named systemd-resolved dnsmasq; do
+for svc in unbound bind9 named dnsmasq; do
     systemctl is-active --quiet "$svc" 2>/dev/null && _conflict="$_conflict $svc"
 done
 if [ -n "$_conflict" ]; then
     echo "" >&2
     fail "Port 53 is already held by another DNS service:${_conflict}
-       Runbound needs port 53. Disable the current resolver, then re-run this installer:
-$(for s in $_conflict; do echo "         sudo systemctl disable --now $s"; done)
-       If you disable systemd-resolved, point /etc/resolv.conf at a real nameserver:
-         echo 'nameserver 1.1.1.1' | sudo tee /etc/resolv.conf"
+       Disable it, then re-run this installer:
+$(for s in $_conflict; do echo "         sudo systemctl disable --now $s"; done)"
+fi
+# systemd-resolved is only the distro stub resolver; installing a DNS server means
+# taking :53. Disable it automatically (opt out with RUNBOUND_KEEP_RESOLVED=1) and
+# repoint /etc/resolv.conf so name resolution keeps working until Runbound is up.
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    if [ "${RUNBOUND_KEEP_RESOLVED:-0}" = "1" ]; then
+        fail "systemd-resolved holds :53 and RUNBOUND_KEEP_RESOLVED=1 is set.
+       Free :53 yourself, then re-run:  sudo systemctl disable --now systemd-resolved"
+    fi
+    warn "systemd-resolved holds :53 (distro stub) - disabling it so Runbound can bind :53."
+    systemctl disable --now systemd-resolved 2>/dev/null || true
+    if [ -L /etc/resolv.conf ] || ! grep -q '^nameserver' /etc/resolv.conf 2>/dev/null; then
+        rm -f /etc/resolv.conf
+        printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > /etc/resolv.conf
+        warn "Repointed /etc/resolv.conf -> 1.1.1.1, 9.9.9.9 (Runbound becomes the resolver once running)."
+    fi
 fi
 
 # ── Download (with API fallback if direct URL fails) ─────────────────────────
