@@ -45,12 +45,16 @@ X520, second receiver port administratively down (single-link case):
 |-----|-----------------------:|-------------:|------------------:|------------:|--------|
 | Runbound v0.16.9 `xdp: yes` | ~10.1 M QPS | ~13.0 M (10G line rate) | 10.56 M offered | ~0 | [report](RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md) |
 | Runbound v0.16.11 `xdp: yes` | **10.09 M QPS** (timestamped) | 13.04 M | 10.56 M offered | 0 | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md) |
+| Runbound v0.16.11 `xdp: yes` **dual link** | **13.15 M QPS** (sum of 2 ports, 99.8% of offered) | 13.18 M (generator cap) | ~13.0 M total | ~0.002 %/run | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md) |
 
-The v0.16.11 run includes a same-method A/B against the previous binary: served
--0.06 %, knee +0.02 % — the 802.1Q VLAN path (#188) and the per-view split-horizon
-snapshots (#187) cost nothing measurable on the untagged, no-view hot path. The
-offered peak is the 10 GbE line rate for this query mix; whether the served ceiling
-is the link or the server requires a faster link (25/40 GbE) to determine.
+The v0.16.11 single-link run includes a same-method A/B against the previous binary:
+served -0.06 %, knee +0.02 % — the 802.1Q VLAN path (#188) and the per-view
+split-horizon snapshots (#187) cost nothing measurable on the untagged, no-view hot
+path. The **dual-link** run answers the single-link open question: with two links the
+served total rises to 13.15 M (+30 %) at ~11 % receiver CPU and 99.8 % of offered —
+the single-link 10.09 M served cap was the link's response direction, not the server.
+In dual-link the ceiling moves to the **generator** (dual Xeon v2 pushes ~13.2 M pps
+total across any number of NICs); Runbound's own ceiling on this rig was not reached.
 
 ## Files
 
@@ -61,6 +65,7 @@ is the link or the server requires a faster link (25/40 GbE) to determine.
   for the Runbound runs (`xdp:no`, real forward-zone, no local-data, `rate-limit: 0`).
 - **Runbound runs**
   - [X710 v0.16.11 `xdp: yes` single-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)
+  - [X710 v0.16.11 `xdp: yes` dual-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md)
   - [X710 v0.16.9 `xdp: yes`](RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md)
   - [`xdp: yes` (AF_XDP fast path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md)
   - [`xdp: no` (kernel slow path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md)
