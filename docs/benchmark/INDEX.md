@@ -36,6 +36,22 @@ numbers toward the link rate; the reference resolvers would not move as much, be
 CPU-limited first. Any such figure is **a function of this rig**, recorded in the reports,
 not asserted as a universal claim.
 
+## X710 (PCIe 3.0) — the X520 bus cap lifted
+
+Same hosts and methodology, single Intel **X710** (i40e, PCIe 3.0) DAC replacing the
+X520, second receiver port administratively down (single-link case):
+
+| Run | Max served (NIC truth) | Offered peak | Knee (p50 < 1 ms) | NIC RX loss | Report |
+|-----|-----------------------:|-------------:|------------------:|------------:|--------|
+| Runbound v0.16.9 `xdp: yes` | ~10.1 M QPS | ~13.0 M (10G line rate) | 10.56 M offered | ~0 | [report](RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md) |
+| Runbound v0.16.11 `xdp: yes` | **10.09 M QPS** (timestamped) | 13.04 M | 10.56 M offered | 0 | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md) |
+
+The v0.16.11 run includes a same-method A/B against the previous binary: served
+-0.06 %, knee +0.02 % — the 802.1Q VLAN path (#188) and the per-view split-horizon
+snapshots (#187) cost nothing measurable on the untagged, no-view hot path. The
+offered peak is the 10 GbE line rate for this query mix; whether the served ceiling
+is the link or the server requires a faster link (25/40 GbE) to determine.
+
 ## Files
 
 - [README.md](README.md) — the standard methodology (warmup + ramp, NIC-counter truth, host
@@ -44,6 +60,8 @@ not asserted as a universal claim.
 - [runbound-receiver-bench.conf](runbound-receiver-bench.conf) — the receiver config used
   for the Runbound runs (`xdp:no`, real forward-zone, no local-data, `rate-limit: 0`).
 - **Runbound runs**
+  - [X710 v0.16.11 `xdp: yes` single-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)
+  - [X710 v0.16.9 `xdp: yes`](RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md)
   - [`xdp: yes` (AF_XDP fast path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md)
   - [`xdp: no` (kernel slow path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md)
 - **Reference-server baselines** (same rig + methodology)
