@@ -2544,6 +2544,114 @@ pub async fn run_dns_server(
             phys_sorted.into_iter().take(cap).collect::<Vec<usize>>()
         };
         let n_fast = fast_cores.len().max(1);
+
+        // #slowpath-autotune: the kernel-UDP slow path is softirq-bound. Without RPS the
+        // RX softirq stays on the handful of NIC-IRQ cores (~3M ceiling); spreading it to
+        // all cores lifts it toward the NAPI wall (~7M+ on this NIC class). Pin the NIC
+        // IRQs to its NUMA-local CPUs so NAPI stays local. XDP mode never reaches this
+        // block (outer `if !cfg.xdp`), so the AF_XDP fast path is byte-for-byte unaffected.
+        {
+            // The bind address (`interface:`) is not a NIC name, so detect the NIC(s) to
+            // tune: the explicitly configured `xdp-interface` if present, otherwise
+            // auto-detect physical UP NICs (out-of-the-box, no manual host tuning). RPS is
+            // applied to every target (harmless on idle NICs); IRQ pinning only to an
+            // explicitly named NIC, so the management NIC's IRQs are never re-pinned.
+            let named: Vec<String> = cfg
+                .xdp_interface
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let rps_targets: Vec<String> = if named.is_empty() {
+                crate::cpu::physical_up_nics()
+            } else {
+                named.clone()
+            };
+            // Moderate NIC queue count for the kernel-UDP slow path (vs the XDP max):
+            // ~16 queues feed the RX ring fast enough at line rate while leaving the bulk
+            // of cores free for the RPS-distributed serving threads. RPS to all physical
+            // serving cores is the dominant lever (measured 0.5M -> 6.4M qps). Queue +
+            // IRQ retune only on an explicitly named NIC (a combined-count change resets
+            // the link — never do that to the management NIC); RPS is harmless on idle
+            // NICs, so it is applied to every detected target.
+            // Raise the kernel socket-buffer ceiling so the kloop's SO_RCVBUF request
+            // (RCVBUF_SIZE, 32 MiB) is not clamped — otherwise NAPI overruns the socket
+            // under burst (UdpRcvbufErrors) even with spare CPU. Best-effort sysctl write
+            // (root); harmless if it already is higher. Slow-path only.
+            const SOCKBUF_MAX: usize = 32 * 1024 * 1024;
+            for knob in ["net.core.rmem_max", "net.core.wmem_max"] {
+                let path = format!("/proc/sys/{}", knob.replace('.', "/"));
+                if let Ok(cur) = std::fs::read_to_string(&path) {
+                    if cur.trim().parse::<usize>().map(|v| v < SOCKBUF_MAX).unwrap_or(true) {
+                        let _ = std::fs::write(&path, SOCKBUF_MAX.to_string());
+                    }
+                }
+            }
+            // Safety cap so a pathologically large NUMA node (NPS1: a node = the
+            // whole socket) does not create an excessive number of NAPI/IRQ cores.
+            const SLOWPATH_QUEUE_CAP: u32 = 32;
+            for nic in &rps_targets {
+                let mut queues = 0u32;
+                let mut irq_n = 0usize;
+                if named.contains(nic) {
+                    // Adapt to the NIC's OWN NUMA node + the CPU topology: the kernel-UDP
+                    // slow path is bounded by NAPI saturating the NIC-NUMA-local cores, so
+                    // size the queues to ONE RX queue (and IRQ) per node-local logical CPU —
+                    // enough to drain the ring at line rate, all node-local — and pin those
+                    // IRQs to that node, leaving the rest of the machine for the RPS-spread
+                    // serving threads. This is the dominant lever after RPS: measured
+                    // X710/5995WX (NIC on node 4 = 16 logical CPUs) — node-local IRQs +
+                    // rx-usecs 25 = 8.2M vs cross-node IRQs 6.7M. Reads the live topology, so
+                    // it adapts to the card (which node) and the CPU (node size); falls back
+                    // to all serving cores if the cpulist is unreadable.
+                    let nic_node = crate::cpu::nic_numa_node(nic);
+                    let node_cpus = std::fs::read_to_string(format!(
+                        "/sys/devices/system/node/node{nic_node}/cpulist"
+                    ))
+                    .ok()
+                    .map(|s| crate::cpu::parse_cpulist(&s))
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| fast_cores.clone());
+                    let target_q = (node_cpus.len() as u32)
+                        .min(fast_cores.len() as u32)
+                        .min(SLOWPATH_QUEUE_CAP)
+                        .max(1);
+                    queues = crate::dns::xdp::socket::set_combined_queues(nic, target_q);
+                    // Let the NIC recreate its IRQs after the channel change before pinning.
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    // One IRQ per node-local CPU (incl. SMT), wrapping if queues > node CPUs.
+                    let pairs: Vec<(u32, usize)> = (0..queues)
+                        .map(|q| (q, node_cpus[q as usize % node_cpus.len()]))
+                        .collect();
+                    crate::cpu::set_irq_affinity(nic, &pairs);
+                    irq_n = pairs.len();
+                    // rx-usecs 25 (moderate coalescing — fewer NAPI re-arms, higher pps at a
+                    // ~25 µs latency cost) and hash UDP/IPv4 on (src ip, dst ip, src port,
+                    // dst port) so traffic from a few client IPs (large NATs / forwarders /
+                    // a benchmark generator) still fans across all queues. Best-effort shell;
+                    // skipped if ethtool is absent.
+                    let _ = std::process::Command::new("ethtool")
+                        .args(["-C", nic, "adaptive-rx", "off", "rx-usecs", "25"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    let _ = std::process::Command::new("ethtool")
+                        .args(["-N", nic, "rx-flow-hash", "udp4", "sdfn"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                let rps_n = crate::cpu::set_rps_cores(nic, &fast_cores);
+                info!(
+                    iface = %nic, nic_queues = queues, irqs_pinned = irq_n, rps_queues = rps_n,
+                    "slow-path auto-tune: moderate NIC queues + 1:1 IRQ pin + RPS to all cores (kernel-UDP softirq scaling)"
+                );
+            }
+        }
         // Reserve at least 2 physical cores for hickory fallback/TCP/API.
         let _n_hickory = (crate::cpu::physical_cores().len().saturating_sub(n_fast)).max(2);
 

@@ -61,7 +61,7 @@ pub struct KernelLoopHandle {
     _threads: Vec<thread::JoinHandle<()>>,
 }
 
-const RCVBUF_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+const RCVBUF_SIZE: usize = 32 * 1024 * 1024; // 32 MiB (#slowpath: absorb RX bursts; needs net.core.rmem_max raised — auto-set in server.rs)
 const DNS_BUF_SIZE: usize = 4096;
 
 /// Bind a blocking SO_REUSEPORT UDP socket with explicit buffer sizes.
@@ -226,9 +226,20 @@ fn worker_loop(
     // (e.g. dig) is answered immediately — no single-query stall, no lost behaviour.
     // Slow path only; the AF_XDP fast path is untouched.
     // Escape hatch: RUNBOUND_NO_RECVMMSG=1 falls back to one recv_from per datagram.
-    const BATCH: usize = 32;
+    const BATCH: usize = 64; // #slowpath: larger recvmmsg batch drains the socket faster, fewer UdpRcvbufErrors
     let mut rx_bufs: Vec<[u8; DNS_BUF_SIZE]> = vec![[0u8; DNS_BUF_SIZE]; BATCH];
-    let mut tx_buf = [0u8; DNS_BUF_SIZE];
+    // TX batch: collect answered responses and flush them with ONE sendmmsg per recv
+    // batch (instead of one send_to per datagram). Fewer syscalls on the serving cores
+    // = faster socket drain = fewer UdpRcvbufErrors under burst. All scratch pre-allocated
+    // once (no per-batch alloc on the hot path).
+    let mut tx_bufs: Vec<[u8; DNS_BUF_SIZE]> = vec![[0u8; DNS_BUF_SIZE]; BATCH];
+    let mut tx_lens = [0usize; BATCH];
+    let mut tx_peers: [Option<std::net::SocketAddr>; BATCH] = [None; BATCH];
+    let mut tx_addrs = vec![unsafe { std::mem::zeroed::<libc::sockaddr_in>() }; BATCH];
+    let mut tx_iovs =
+        vec![libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; BATCH];
+    let mut tx_msgs: Vec<libc::mmsghdr> =
+        (0..BATCH).map(|_| unsafe { std::mem::zeroed::<libc::mmsghdr>() }).collect();
     let mut lens = [0usize; BATCH];
     let mut peers: [Option<std::net::SocketAddr>; BATCH] = [None; BATCH];
 
@@ -299,7 +310,8 @@ fn worker_loop(
             }
         };
 
-        // ── Process each datagram in the batch (continue = next datagram) ────
+        // ── Process each datagram in the batch → collect into the TX batch ───
+        let mut tx_n = 0usize;
         for i in 0..count {
             let len = lens[i];
             let peer = match peers[i] {
@@ -328,9 +340,11 @@ fn worker_loop(
             {
                 let zones_snap = zones.load();
                 use crate::dns::xdp::worker::{answer_dns_wire_pub, WireResultPub};
-                match answer_dns_wire_pub(query, &mut tx_buf, &zones_snap, &acl, src_ip) {
+                match answer_dns_wire_pub(query, &mut tx_bufs[tx_n], &zones_snap, &acl, src_ip) {
                     WireResultPub::Answered(resp_len) => {
-                        let _ = sock.send_to(&tx_buf[..resp_len], peer);
+                        tx_lens[tx_n] = resp_len;
+                        tx_peers[tx_n] = Some(peer);
+                        tx_n += 1;
                         continue;
                     }
                     WireResultPub::Drop => continue, // ACL Deny — silent drop
@@ -347,11 +361,13 @@ fn worker_loop(
                     &snap,
                     &acl,
                     src_ip,
-                    &mut tx_buf,
+                    &mut tx_bufs[tx_n],
                     stats.as_ref(),
                     domain_stats.as_ref(),
                 ) {
-                    let _ = sock.send_to(&tx_buf[..resp_len], peer);
+                    tx_lens[tx_n] = resp_len;
+                    tx_peers[tx_n] = Some(peer);
+                    tx_n += 1;
                     continue;
                 }
             }
@@ -367,6 +383,51 @@ fn worker_loop(
             if fallback_tx.try_send(msg).is_err() {
                 // Channel full — drop rather than block the fast loop.
                 debug!("kloop fallback channel full — dropping query from {peer}");
+            }
+        }
+
+        // ── Flush the TX batch: one sendmmsg for all answered IPv4 datagrams ──
+        if tx_n > 0 {
+            let mut m = 0usize;
+            for i in 0..tx_n {
+                match tx_peers[i] {
+                    Some(std::net::SocketAddr::V4(v4)) => {
+                        tx_addrs[m].sin_family = libc::AF_INET as libc::sa_family_t;
+                        tx_addrs[m].sin_port = v4.port().to_be();
+                        tx_addrs[m].sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+                        tx_iovs[m].iov_base = tx_bufs[i].as_ptr() as *mut libc::c_void;
+                        tx_iovs[m].iov_len = tx_lens[i];
+                        tx_msgs[m].msg_hdr.msg_name =
+                            &mut tx_addrs[m] as *mut _ as *mut libc::c_void;
+                        tx_msgs[m].msg_hdr.msg_namelen =
+                            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                        tx_msgs[m].msg_hdr.msg_iov = &mut tx_iovs[m];
+                        tx_msgs[m].msg_hdr.msg_iovlen = 1;
+                        m += 1;
+                    }
+                    // IPv6 (rare on this path): send individually.
+                    Some(peer) => {
+                        let _ = sock.send_to(&tx_bufs[i][..tx_lens[i]], peer);
+                    }
+                    None => {}
+                }
+            }
+            let mut sent = 0usize;
+            while sent < m {
+                // SAFETY: tx_msgs[sent..m] are fully initialised; their msg_name/msg_iov
+                // point into tx_addrs/tx_iovs, which outlive this call and never realloc.
+                let r = unsafe {
+                    libc::sendmmsg(
+                        fd,
+                        tx_msgs[sent..].as_mut_ptr(),
+                        (m - sent) as libc::c_uint,
+                        0,
+                    )
+                };
+                if r <= 0 {
+                    break;
+                }
+                sent += r as usize;
             }
         }
     }
