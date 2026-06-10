@@ -299,6 +299,51 @@ int dns_xdp(struct xdp_md *ctx)
 
     struct udphdr *udp;
 
+    /* ── 802.1Q VLAN tagged frames (#188) ───────────────────────────────────
+     * DC fabrics (e.g. Latitude private networks) deliver the link as a tagged
+     * VLAN. With rx-vlan-offload OFF the tag stays in the frame, so the XDP gate
+     * must skip the 4-byte tag to reach the inner IP/UDP and redirect DNS to the
+     * AF_XDP socket. Self-contained branch: the untagged fast path below is left
+     * byte-for-byte unchanged (no per-packet cost added to untagged traffic).
+     * In-kernel ICMP-echo / blacklist replies are intentionally NOT mirrored for
+     * tagged traffic — tagged DNS goes straight to the AF_XDP worker, which
+     * carries the tag through to its in-place TX response.                       */
+    if (eth_proto == ETH_P_8021Q) {
+        struct vlan_hdr { __be16 tci; __be16 inner; };
+        struct vlan_hdr *vh = (void *)(eth + 1);
+        if ((void *)(vh + 1) > data_end)
+            return XDP_PASS;
+        __u16 inner = bpf_ntohs(vh->inner);
+        if (inner == ETH_P_IP) {
+            struct iphdr *ip = (void *)(vh + 1);
+            if ((void *)(ip + 1) > data_end)
+                return XDP_PASS;
+            if (ip->protocol != IPPROTO_UDP)
+                return XDP_PASS;
+            if ((ip->ihl & 0xF) != 5)
+                return XDP_PASS;
+            struct udphdr *u = (struct udphdr *)((void *)ip + 20);
+            if ((void *)(u + 1) > data_end)
+                return XDP_PASS;
+            if (u->dest != bpf_htons(53))
+                return XDP_PASS;
+            return bpf_redirect_map(&XSKS, ctx->rx_queue_index, XDP_PASS);
+        } else if (inner == ETH_P_IPV6) {
+            struct ipv6hdr *ip6 = (void *)(vh + 1);
+            if ((void *)(ip6 + 1) > data_end)
+                return XDP_PASS;
+            if (ip6->nexthdr != IPPROTO_UDP)
+                return XDP_PASS;
+            struct udphdr *u = (struct udphdr *)(ip6 + 1);
+            if ((void *)(u + 1) > data_end)
+                return XDP_PASS;
+            if (u->dest != bpf_htons(53))
+                return XDP_PASS;
+            return bpf_redirect_map(&XSKS, ctx->rx_queue_index, XDP_PASS);
+        }
+        return XDP_PASS;
+    }
+
     if (eth_proto == ETH_P_IP) {
         struct iphdr *ip = (void *)(eth + 1);
         if ((void *)(ip + 1) > data_end)
