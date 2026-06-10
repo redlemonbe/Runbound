@@ -113,6 +113,114 @@ pub fn set_irq_affinity(iface: &str, queue_to_core: &[(u32, usize)]) {
     let _ = (iface, queue_to_core);
 }
 
+/// #slowpath-autotune: write the all-online-CPUs mask to every RX queue's `rps_cpus`,
+/// so the kernel spreads RX softirq *processing* across all cores instead of leaving it
+/// on the few NIC-IRQ/NAPI cores. This is the dominant kernel-UDP slow-path lever
+/// (measured X520/5995WX: RPS off ~3M vs on ~7.3M qps). Best-effort; returns the number
+/// of RX queues configured. Slow-path only — never called in `xdp: yes` (XDP runs in
+/// NAPI, before the RPS layer), so the AF_XDP fast path is unaffected.
+/// #slowpath-autotune: physical, UP, non-loopback NICs (have a `device` symlink in
+/// sysfs, operstate "up"). Used to auto-tune RPS out-of-the-box when no `xdp-interface`
+/// is named. Excludes virtual interfaces (bridges, veth, bond, lo).
+pub fn physical_up_nics() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name == "lo" {
+                    continue;
+                }
+                if !std::path::Path::new(&format!("/sys/class/net/{name}/device")).exists() {
+                    continue; // virtual (bridge/veth/bond/...) — no backing device
+                }
+                let up = std::fs::read_to_string(format!("/sys/class/net/{name}/operstate"))
+                    .map(|v| v.trim() == "up")
+                    .unwrap_or(false);
+                if up {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    { Vec::new() }
+}
+
+/// Build a Linux CPU bitmask hex string (comma-separated 32-bit groups, high word
+/// first) with exactly the `cores` bits set — the format `rps_cpus` / `smp_affinity`
+/// expect.
+fn cpu_mask_hex(cores: &[usize]) -> String {
+    let maxc = cores.iter().copied().max().unwrap_or(0);
+    let words = maxc / 32 + 1;
+    let mut w = vec![0u32; words];
+    for &c in cores {
+        w[c / 32] |= 1u32 << (c % 32);
+    }
+    w.iter().rev().map(|x| format!("{x:08x}")).collect::<Vec<_>>().join(",")
+}
+
+/// #slowpath-autotune: spread RX softirq across exactly `cores` by writing their bitmask
+/// to every RX queue's `rps_cpus`. `cores` MUST be PHYSICAL cores only — never HT
+/// siblings: the ASM/SIMD wire path saturates a physical core's execution units, so
+/// landing softirq on the sibling steals throughput instead of adding it. These are the
+/// same physical cores the kernel-UDP worker threads run on, so the by-CPU REUSEPORT
+/// steering (#183) keeps each packet's softirq and its serving thread on one core.
+/// Dominant kernel-UDP slow-path lever (X520/5995WX: ~3M off vs ~7.3M on). Slow-path
+/// only — never called in `xdp: yes`. Returns the number of RX queues configured.
+pub fn set_rps_cores(iface: &str, cores: &[usize]) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        if cores.is_empty() {
+            return 0;
+        }
+        let mask = cpu_mask_hex(cores);
+        let qdir = format!("/sys/class/net/{iface}/queues");
+        let mut n = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&qdir) {
+            for e in entries.flatten() {
+                let fname = e.file_name();
+                let fname = fname.to_string_lossy();
+                if fname.starts_with("rx-")
+                    && std::fs::write(format!("{qdir}/{fname}/rps_cpus"), &mask).is_ok()
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (iface, cores);
+        0
+    }
+}
+
+/// Parse a Linux cpulist (e.g. "32-39,96-103") into individual CPU ids. Used to pin one
+/// NIC IRQ per CPU of the NIC's own NUMA node (NAPI stays node-local).
+pub fn parse_cpulist(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in s.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
+                for c in lo..=hi {
+                    out.push(c);
+                }
+            }
+        } else if let Ok(c) = part.parse::<usize>() {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(target_os = "linux")]
 fn find_irq_for_queue(proc_interrupts: &str, iface: &str, queue_id: u32) -> Option<u32> {
     let patterns = [

@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-10
+
+### Added
+- **Out-of-the-box kernel slow-path (`xdp: no`) NIC auto-tune.** On startup, when a slow-path interface is named, Runbound reads the live topology and tunes the NIC for kernel-UDP throughput: RX queue count = the NIC's NUMA-node logical-CPU count (capped), one IRQ pinned per node-local CPU (NAPI stays node-local), RPS spread across all physical serving cores, `rx-usecs 25`, and `rx-flow-hash udp4 sdfn`. It adapts to the card (which NUMA node the NIC sits on) and the CPU (node size) with no manual host tuning. Measured X710 / Threadripper 5995WX: kernel slow-path served rate ~3.4M -> ~7.3M+ QPS (peak 8.16M), at the i40e NAPI ceiling. RPS to all cores is the dominant lever; node-local IRQ placement is the second. Slow-path only -- gated on `xdp: no`, so the AF_XDP fast path is byte-for-byte unchanged (re-verified 11.18M QPS on the same rig).
+- **Batched `sendmmsg` TX on the kernel slow path.** Answered datagrams from a `recvmmsg` batch are flushed with a single `sendmmsg` (one syscall per batch instead of one `send_to` per datagram), cutting per-packet syscall cost on the serving cores.
+
+### Changed
+- Kernel slow-path socket receive/send buffers raised to 32 MiB, and `net.core.rmem_max`/`wmem_max` auto-raised to match (best-effort, root) so NAPI bursts are absorbed instead of dropped as `UdpRcvbufErrors`. `recvmmsg` batch size 32 -> 64.
+
+### Notes
+- The slow-path auto-tune retunes queues/IRQs only on an explicitly named interface (a channel change resets the link -- never done to an unnamed/management NIC); RPS, which is harmless on an idle NIC, is applied to detected physical NICs. NIC families with hardware flow steering (e.g. mlx5 aRFS) may prefer a different strategy; a driver-aware path is future work.
+
 ## [0.16.11] - 2026-06-10
 
 ### Added
