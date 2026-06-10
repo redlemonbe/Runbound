@@ -2213,6 +2213,7 @@ async fn run_tcp_with_limit(
     relay_addr: SocketAddr,
     tracker: Arc<TcpConnTracker>,
     conn_timeout: Duration,
+    acl: Arc<Acl>,
 ) {
     loop {
         let (mut client, peer) = match public_tcp.accept().await {
@@ -2229,6 +2230,14 @@ async fn run_tcp_with_limit(
         } else {
             normalize_tcp_ip(peer.ip())
         };
+        // SEC (Cycle I, SEC-I23): enforce the source-IP ACL on the REAL client. The relay
+        // to the loopback hickory listener makes the DNS handler see 127.0.0.1, so without
+        // this check TCP/DoT/DoH would bypass allow/deny/refuse rules. Deny and Refuse both
+        // drop the connection here (no DNS message parsed yet); loopback follows the same
+        // ACL as the UDP path.
+        if !matches!(acl.check(src_ip), AclAction::Allow) {
+            continue;
+        }
         if !tracker.try_acquire(src_ip) {
             // Over limit: drop immediately (TcpStream closed on drop → TCP FIN/RST)
             continue;
@@ -2381,7 +2390,7 @@ pub async fn run_dns_server(
         Arc::clone(&zones),
         Arc::clone(&resolver),
         rate_limiter,
-        acl,
+        Arc::clone(&acl),
         private_addrs,
         cache_max_ttl,
         cache_min_ttl,
@@ -2562,7 +2571,15 @@ pub async fn run_dns_server(
                 .map(|s| {
                     s.split(',')
                         .map(|x| x.trim().to_string())
-                        .filter(|x| !x.is_empty())
+                        // SEC (Cycle I, SEC-I24): the interface name flows into sysfs paths
+                        // (/sys/class/net/<iface>/...). Reject path-bearing names so a
+                        // config value cannot traverse out (e.g. "../../tmp/x").
+                        .filter(|x| {
+                            !x.is_empty()
+                                && x.len() <= 15
+                                && !x.contains('/')
+                                && !x.contains("..")
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -2835,6 +2852,7 @@ pub async fn run_dns_server(
             relay_addr,
             tracker2,
             TCP_SESSION_TIMEOUT,
+            Arc::clone(&acl),
         ));
     }
 
@@ -2893,6 +2911,7 @@ pub async fn run_dns_server(
                         relay_dot_addr,
                         tracker_dot,
                         TCP_SESSION_TIMEOUT,
+                        Arc::clone(&acl),
                     ));
                 }
                 Err(e) => warn!(addr=%dot_addr, err=%e, "DoT bind failed — skipping"),
@@ -2925,6 +2944,7 @@ pub async fn run_dns_server(
                         relay_doh_addr,
                         tracker_doh,
                         TCP_SESSION_TIMEOUT,
+                        Arc::clone(&acl),
                     ));
                 }
                 Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
