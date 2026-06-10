@@ -81,6 +81,31 @@ impl Clone for CacheEntry {
 // wire_qname in CacheEntry guards against the (astronomically rare) CRC32c collision.
 pub type CacheSnapshot = HashMap<u64, CacheEntry, IdentityHasherBuilder>;
 pub type SharedCacheSnapshot = Arc<ArcSwap<CacheSnapshot>>;
+
+/// Per-view (split-horizon) snapshots (#187). Each entry maps a set of source
+/// CIDR blocks to a `CacheSnapshot` built from that view's local-data. The XDP
+/// worker matches the client IP to the first view whose CIDRs contain it and
+/// serves from that view's snapshot BEFORE the global one, so split-horizon is
+/// correct on the fast path with no cross-view leak. Empty = no split-horizon
+/// configured = zero per-packet cost.
+pub type ViewSnapshots = Vec<(Vec<crate::dns::acl::CidrBlock>, CacheSnapshot)>;
+pub type SharedViewSnapshots = Arc<ArcSwap<ViewSnapshots>>;
+
+/// Process-wide live handle to the per-view snapshots, (re)published by the
+/// server whenever the split-horizon table is compiled. `None` until first set.
+pub static SPLIT_HORIZON_SNAPSHOTS: std::sync::OnceLock<SharedViewSnapshots> =
+    std::sync::OnceLock::new();
+
+/// Build a `CacheSnapshot` from one split-horizon view's local zone set (#187).
+/// Reuses the exact wire-serialisation of the global preload via
+/// `local_zone_entries`, so a view answers byte-identically to a global zone.
+pub fn build_view_snapshot(zones: &crate::dns::local::LocalZoneSet) -> CacheSnapshot {
+    let mut snap = CacheSnapshot::default();
+    for (key, entry) in crate::dns::local::local_zone_entries(zones) {
+        snap.insert(key, entry);
+    }
+    snap
+}
 pub type MutableCacheMap = Arc<DashMap<u64, CacheEntry, IdentityHasherBuilder>>;
 
 /// Global counter of DNS responses served from the XDP cache snapshot.

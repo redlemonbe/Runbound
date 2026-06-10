@@ -299,21 +299,21 @@ impl LocalZoneSet {
 /// Only exact A/AAAA records are preloaded.  Wildcards, CNAME, MX, TXT,
 /// BlockPage and other special zones are NOT preloaded — they remain handled
 /// by `answer_dns()` (hickory slow path).
-pub(crate) fn preload_into_cache(
+/// Build (cache_key, CacheEntry) pairs for every A/AAAA name in a zone set.
+/// Shared by `preload_into_cache` (global XDP snapshot seed) and the per-view
+/// split-horizon snapshots (#187) so both paths serialise records identically.
+pub(crate) fn local_zone_entries(
     zones: &LocalZoneSet,
-    cache: &crate::dns::cache_snapshot::MutableCacheMap,
-) {
-    use crate::dns::cache_snapshot::{cache_insert_local, sentinel_expires, CacheEntry};
+) -> Vec<(u64, crate::dns::cache_snapshot::CacheEntry)> {
+    use crate::dns::cache_snapshot::{sentinel_expires, CacheEntry};
     use crate::dns::wire_builder::{build_answer_a_aaaa_wire, WireQuery};
     use bytes::Bytes;
 
     let sentinel = sentinel_expires();
-    let mut preloaded = 0usize;
+    let mut out: Vec<(u64, CacheEntry)> = Vec::new();
 
     for (key_raw, entry) in &zones.wire_records.map {
-        // Build A response (qtype=1) if A records exist
         for qtype in [1u16, 28u16] {
-            // Collect recs into a uniform Vec<WireRdata> to avoid SmallVec size mismatch
             let recs: Vec<crate::dns::local::WireRdata> = if qtype == 1 {
                 entry.a_records.iter().cloned().collect()
             } else {
@@ -322,49 +322,43 @@ pub(crate) fn preload_into_cache(
             if recs.is_empty() {
                 continue;
             }
-
-            // Construct a fake WireQuery to drive build_answer_a_aaaa_wire.
-            // QID=0 (will be patched per-request), QCLASS=IN=1.
             let fake_qname = &entry.wire_qname;
-            // Build the full query section bytes: [qname][qtype(2)][qclass(2)]
-            let mut query_section: smallvec::SmallVec<[u8; 72]> = smallvec::SmallVec::new();
-            query_section.extend_from_slice(fake_qname);
-            query_section.extend_from_slice(&qtype.to_be_bytes());
-            query_section.extend_from_slice(&1u16.to_be_bytes()); // IN
-
-            // Use the first record's TTL as the response TTL.
-            let ttl = recs[0].ttl;
-
             let wq = WireQuery {
-                id: 0, // QID patched per-request in answer_from_cache
+                id: 0,
                 qname_wire: fake_qname.as_slice(),
                 qtype,
                 qclass: 1,
-                edns: None, // preload without EDNS — EDNS clients get valid non-OPT response
+                edns: None,
             };
-
             let mut buf = [0u8; 512];
             let len = match build_answer_a_aaaa_wire(&wq, &mut buf, recs.as_slice(), None) {
                 Some(n) => n,
                 None => continue,
             };
-
-            // Key: same formula as answer_from_cache and answer_dns_wire
             let cache_key: u64 = *key_raw ^ ((qtype as u64) << 48);
-
-            let wire_qname_bytes = Bytes::copy_from_slice(fake_qname.as_slice());
-            let wire_payload = Bytes::copy_from_slice(&buf[..len]);
-
-            cache_insert_local(cache, cache_key, CacheEntry {
-                wire_payload,
-                expires_at: sentinel,
-                wire_qname: wire_qname_bytes,
-            });
-            preloaded += 1;
-            let _ = ttl; // TTL embedded in the wire response already
+            out.push((
+                cache_key,
+                CacheEntry {
+                    wire_payload: Bytes::copy_from_slice(&buf[..len]),
+                    expires_at: sentinel,
+                    wire_qname: Bytes::copy_from_slice(fake_qname.as_slice()),
+                },
+            ));
         }
     }
+    out
+}
 
+pub(crate) fn preload_into_cache(
+    zones: &LocalZoneSet,
+    cache: &crate::dns::cache_snapshot::MutableCacheMap,
+) {
+    use crate::dns::cache_snapshot::cache_insert_local;
+    let entries = local_zone_entries(zones);
+    let preloaded = entries.len();
+    for (key, entry) in entries {
+        cache_insert_local(cache, key, entry);
+    }
     tracing::info!(preloaded, "XDP cache: preloaded local-data A/AAAA entries");
 }
 
