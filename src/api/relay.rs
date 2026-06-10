@@ -210,6 +210,19 @@ pub async fn relay_forward_handler(
     // Build relay path: /relay/{relay_path}
     let path = format!("/relay/{}", relay_path.trim_start_matches('/'));
 
+    // SEC: reject path traversal — a relayed path with `..` could be normalised by the
+    // slave to reach an endpoint outside the intended /relay/ surface.
+    if relay_path.contains("..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "RELAY_PATH",
+                "details": "path traversal is not allowed"
+            })),
+        )
+            .into_response();
+    }
+
     // Anti-recursion: never relay to /relay/* itself.
     if path.starts_with("/relay/relay") {
         return (
@@ -258,7 +271,7 @@ pub async fn relay_forward_handler(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
-                    "error": "RELAY_ERROR", "details": e.to_string()
+                    "error": "RELAY_ERROR", "details": "relay to slave failed"
                 })),
             )
                 .into_response()
