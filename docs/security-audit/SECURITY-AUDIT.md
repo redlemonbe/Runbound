@@ -21,7 +21,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [F](#cycle-f--v0120-defense-in-depth-hardening) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
 | [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 0 open; 6 fixed, 3 accepted, 2 disputed |
-| [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 2 open (enhancement); 13 fixed, 3 accepted, 4 disputed |
+| [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 2 open (enhancement); 15 fixed, 3 accepted, 5 disputed |
 
 ---
 
@@ -57,6 +57,8 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 | SEC-I11 | LOW | Gemini + Claude | v0.17.0 `sendmmsg` set `iov_len = resp_len` directly; the replaced `send_to(&buf[..n])` slice had bounds-checked it. A (hypothetical) oversized `resp_len` would make the kernel read past the frame (info leak). Confirmed as a real regression of the new code. | clamp `iov_len` to `DNS_BUF_SIZE`. |
 | BUG-I12 | LOW | Gemini | `CPU_SET(core_id, …)` had no `CPU_SETSIZE` bound (stack write past `cpu_set_t` on a >1024-CPU host or an enumeration bug). | guard `core_id < CPU_SETSIZE`. |
 | INFO-I13 | INFO | Gemini | `/api/clients` pagination `page * limit` could overflow `usize` (latent — immediately bounded by `.min(total)`, not reachable). | `saturating_mul` (hardening). |
+| SEC-I23 | HIGH | Gemini + Claude | **Second pass.** Source-IP ACL (allow/deny/refuse) was not enforced on TCP/DoT/DoH: the per-IP-capped connection is relayed to the loopback hickory listener, so the request handler sees `127.0.0.1` — a client bypassed the ACL whenever loopback is allowed (the common default). Confirmed: `run_tcp_with_limit` applied only the connection cap, not `acl.check`. | Enforce `acl.check(src_ip)` on the real client before relaying; Deny/Refuse drop the connection (loopback follows the same ACL as UDP). |
+| SEC-I24 | LOW | Gemini | **Second pass.** The slow-path auto-tune `xdp-interface` name flows into sysfs paths (`/sys/class/net/<iface>/…`) without validation; a config value like `../../tmp/x` could traverse out. Admin-config-controlled, not API — Gemini's HIGH recalibrated to LOW. | Reject path-bearing names (`/`, `..`, len>15) at the single parse choke point. |
 
 ### Accepted (risk understood, not changed this cycle)
 
@@ -81,6 +83,7 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 | DISP-I20 | Gemini (MEDIUM) | `ApiRateLimiter` doesn't update `last` every check → burst bypass. | Correct token-bucket behaviour: not advancing `last` when zero tokens accrue preserves fractional elapsed time. Updating it unconditionally (the proposed "fix") would *under*-refill and over-limit. Burst is by design. |
 | DISP-I21 | Claude (suspected) | `cfg.alerts.last_mut().unwrap()` panics on a stray alert field. | Every call is preceded by the `ensure_rule` closure (parser.rs:609) that pushes a rule first; the vector is never empty. |
 | DISP-I22 | Claude (suspected) | `normalize_ip` IPv6 `octets[keep_bytes+1..]` OOB for `/128`. | Guarded by `if keep_bytes < 16`. |
+| DISP-I25 | Gemini (MEDIUM) | `domain_stats.inc` unbounded → OOM via random subdomains. | `DomainStats` is capped at `MAX_TRACKED = 10_000` (domain_stats.rs:16/65; test `idempotent_on_cap`). Bounded — no finding. |
 
 ### Verified-correct defenses (reviewed, no finding)
 
@@ -89,7 +92,7 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 - **kernel slow-path `sendmmsg` unsafe** (kernel_loop.rs): pointer lifetimes sound — pre-allocated scratch (never reallocated), ephemeral `&mut` immediately cast to raw, bounded slice/count ≤ BATCH.
 - **`ratelimit::normalize_ip`**: IPv6 masking guarded (DISP-I22); IPv4 mask hardened (BUG-I9).
 
-**Cycle I status:** 13 fixed, 3 accepted, 2 open (enhancement), 4 disputed. Not a clean sweep — SEC-I14 (relay body MAC) is a real accepted gap, and OPEN-I17/I18 remain. Slow-path auto-tune (v0.17.0) introduced exactly one finding (SEC-I11), fixed.
+**Cycle I status:** 15 fixed, 3 accepted, 2 open (enhancement), 5 disputed. A second pass over `server.rs` (DNS engine + TCP/DoT/DoH listeners) found a real ACL-bypass on the loopback-relayed TCP path (SEC-I23, fixed). Not a clean sweep — SEC-I14 (relay body MAC) is a real accepted gap, and OPEN-I17/I18 remain. Slow-path auto-tune (v0.17.0) introduced exactly one finding (SEC-I11), fixed.
 
 ---
 
