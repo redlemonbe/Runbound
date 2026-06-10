@@ -63,7 +63,48 @@ const UDP_HDR: usize = 8;
 
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
+const ETH_P_8021Q: u16 = 0x8100;
 const PROTO_UDP: u8 = 17;
+
+/// Locate the L3 header, transparently skipping a single 802.1Q VLAN tag (#188).
+/// Returns `(ip_off, inner_ethertype)`.
+///
+/// With `rx-vlan-offload off` a DC fabric (e.g. Latitude private VLAN) delivers
+/// the tag inside the frame; this skips it so RX parsing and the in-place TX
+/// response both use the same `ip_off` and the tag is preserved on transmit.
+/// Untagged frames return `(ETH_HDR, ethertype)` exactly as before — the
+/// untagged hot path is unchanged (one extra compare per frame).
+#[inline(always)]
+fn parse_l2(rx: &[u8]) -> Option<(usize, u16)> {
+    if rx.len() < ETH_HDR {
+        return None;
+    }
+    let et = u16::from_be_bytes([rx[12], rx[13]]);
+    if et == ETH_P_8021Q {
+        if rx.len() < ETH_HDR + 4 {
+            return None;
+        }
+        Some((ETH_HDR + 4, u16::from_be_bytes([rx[16], rx[17]])))
+    } else {
+        Some((ETH_HDR, et))
+    }
+}
+
+/// Configured XDP VLAN id for TX tag re-insertion (env `RUNBOUND_XDP_VLAN`), read
+/// once. Needed on NICs that strip the RX 802.1Q tag in hardware and refuse to
+/// disable it (bnxt: `rx-vlan-offload` is fixed on) — XDP then sees an untagged
+/// frame, so the in-place reply must re-insert the tag to traverse a tagged VLAN
+/// (#188). `None` (unset/0) = no insertion, zero per-packet cost.
+#[inline(always)]
+fn xdp_vlan_tag() -> Option<u16> {
+    static V: std::sync::OnceLock<Option<u16>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUNBOUND_XDP_VLAN")
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .filter(|&v| v != 0)
+    })
+}
 
 /// Load the XDP program onto `iface`, open one AF_XDP socket per RX queue,
 /// and spawn a dedicated OS thread for each.  Returns `Ok(Some(handle))` when
@@ -1084,20 +1125,20 @@ fn extract_src_ip(rx: &[u8]) -> Option<IpAddr> {
     if rx.len() < ETH_HDR {
         return None;
     }
-    let ethertype = u16::from_be_bytes([rx[12], rx[13]]);
+    let (ip_off, ethertype) = parse_l2(rx)?;
     match ethertype {
         ETH_P_IP => {
-            if rx.len() < ETH_HDR + 20 {
+            if rx.len() < ip_off + 20 {
                 return None;
             }
-            let src: [u8; 4] = rx[ETH_HDR + 12..ETH_HDR + 16].try_into().ok()?;
+            let src: [u8; 4] = rx[ip_off + 12..ip_off + 16].try_into().ok()?;
             Some(IpAddr::V4(std::net::Ipv4Addr::from(src)))
         }
         ETH_P_IPV6 => {
-            if rx.len() < ETH_HDR + 40 {
+            if rx.len() < ip_off + 40 {
                 return None;
             }
-            let src: [u8; 16] = rx[ETH_HDR + 8..ETH_HDR + 24].try_into().ok()?;
+            let src: [u8; 16] = rx[ip_off + 8..ip_off + 24].try_into().ok()?;
             Some(IpAddr::V6(std::net::Ipv6Addr::from(src)))
         }
         _ => None,
@@ -1141,14 +1182,13 @@ fn process_packet(
     domain_stats: &Arc<crate::domain_stats::DomainStats>,
 ) -> Option<usize> {
     // ── Ethernet ─────────────────────────────────────────────────────────────
-    if rx.len() < ETH_HDR {
-        return None;
-    }
-    let ethertype = u16::from_be_bytes([rx[12], rx[13]]);
-
-    let (ip_off, is_v6) = match ethertype {
-        ETH_P_IP => (ETH_HDR, false),
-        ETH_P_IPV6 => (ETH_HDR, true),
+    // Skip an optional single 802.1Q VLAN tag (#188). `ip_off` then drives every
+    // downstream offset (IP/UDP/DNS) and the in-place TX build, so the tag — when
+    // present (rx-vlan-offload off) — is carried through to the reply unchanged.
+    let (ip_off, ethertype) = parse_l2(rx)?;
+    let is_v6 = match ethertype {
+        ETH_P_IP => false,
+        ETH_P_IPV6 => true,
         _ => return None,
     };
 
@@ -1274,10 +1314,11 @@ fn process_packet(
         return None;
     }
 
-    // Ethernet: swap src ↔ dst MAC
+    // Ethernet: swap src ↔ dst MAC. Copy [12..ip_off] so the EtherType — and the
+    // 802.1Q tag when present (ip_off == 18) — is preserved verbatim on the reply.
     tx[0..6].copy_from_slice(&rx[6..12]);
     tx[6..12].copy_from_slice(&rx[0..6]);
-    tx[12..14].copy_from_slice(&rx[12..14]);
+    tx[12..ip_off].copy_from_slice(&rx[12..ip_off]);
 
     if !is_v6 {
         // IPv4: copy then fix length, swap src/dst, recompute checksum
@@ -1328,6 +1369,22 @@ fn process_packet(
         udp_checksum_v6(&si, &di, &tx[udp_off..udp_off + UDP_HDR + dns_len])
     };
     tx[udp_off + 6..udp_off + 8].copy_from_slice(&cksum.to_be_bytes());
+
+    // #188: re-insert one 802.1Q tag when the frame arrived UNtagged (ip_off ==
+    // ETH_HDR) yet a tagged VLAN is required (RUNBOUND_XDP_VLAN). This covers NICs
+    // that strip the RX tag in HW (bnxt). Shift L2-payload right by 4 and stamp
+    // TPID/VID; IP/UDP checksums are unaffected (they don't cover the L2 tag). When
+    // the tag was already present (ip_off == 18) this is skipped — no double tag.
+    if ip_off == ETH_HDR {
+        if let Some(vid) = xdp_vlan_tag() {
+            if reply_len + 4 <= tx.len() {
+                tx.copy_within(12..reply_len, 16);
+                tx[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
+                tx[14..16].copy_from_slice(&(vid & 0x0FFF).to_be_bytes());
+                return Some(reply_len + 4);
+            }
+        }
+    }
 
     // DNS payload is already in tx — no final copy needed.
     Some(reply_len)
