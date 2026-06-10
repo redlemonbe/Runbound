@@ -23,10 +23,12 @@ fn normalize_ip(ip: IpAddr, prefix_v4: u8, prefix_v6: u8) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => {
             let bits = u32::from(v4);
-            let mask = if prefix_v4 >= 32 {
+            let mask = if prefix_v4 == 0 {
+                0 // /0 buckets every source together; avoids the shift-by-32 UB
+            } else if prefix_v4 >= 32 {
                 u32::MAX
             } else {
-                !((1u32 << (32 - prefix_v4)) - 1)
+                u32::MAX << (32 - prefix_v4)
             };
             IpAddr::V4((bits & mask).into())
         }
@@ -134,9 +136,11 @@ impl RateLimiter {
             bucket.tokens = self.burst;
             bucket.last_refill = now;
         } else {
-            let new_tokens = (self.rps * elapsed_ms) / RATE_LIMIT_WINDOW_MS;
+            // u128 math + saturating add: a huge configured rps must never overflow.
+            let new_tokens =
+                ((self.rps as u128 * elapsed_ms as u128) / RATE_LIMIT_WINDOW_MS as u128) as u64;
             if new_tokens > 0 {
-                bucket.tokens = (bucket.tokens + new_tokens).min(self.burst);
+                bucket.tokens = bucket.tokens.saturating_add(new_tokens).min(self.burst);
                 bucket.last_refill = now;
             }
         }

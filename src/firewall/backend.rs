@@ -195,18 +195,14 @@ impl FirewallManager {
                     );
                     return Ok(None);
                 }
+                // nft needs proto / dport / port as separate tokens, not one string.
+                let port_str = port.to_string();
                 let out = run(
                     "nft",
                     &[
-                        "add",
-                        "rule",
-                        "inet",
-                        "filter",
-                        "input",
-                        &proto_clause,
-                        "accept",
-                        "comment",
-                        tag,
+                        "add", "rule", "inet", "filter", "input",
+                        proto, "dport", &port_str,
+                        "accept", "comment", tag,
                     ],
                 )?;
                 // Parse handle from "# handle N" in output

@@ -177,9 +177,13 @@ pub fn start_kernel_fast_loop(
                 #[cfg(target_os = "linux")]
                 {
                     use libc::{cpu_set_t, sched_setaffinity, CPU_SET};
-                    let mut set: cpu_set_t = unsafe { std::mem::zeroed() };
-                    unsafe { CPU_SET(core_id, &mut set) };
-                    unsafe { sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &set) };
+                    // Guard CPU_SET against an out-of-range core_id (would write past the
+                    // stack cpu_set_t on >CPU_SETSIZE-core hosts / an enumeration bug).
+                    if core_id < libc::CPU_SETSIZE as usize {
+                        let mut set: cpu_set_t = unsafe { std::mem::zeroed() };
+                        unsafe { CPU_SET(core_id, &mut set) };
+                        unsafe { sched_setaffinity(0, std::mem::size_of::<cpu_set_t>(), &set) };
+                    }
                 }
 
                 worker_loop(
@@ -396,7 +400,9 @@ fn worker_loop(
                         tx_addrs[m].sin_port = v4.port().to_be();
                         tx_addrs[m].sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
                         tx_iovs[m].iov_base = tx_bufs[i].as_ptr() as *mut libc::c_void;
-                        tx_iovs[m].iov_len = tx_lens[i];
+                        // Clamp to the buffer size: sendmmsg reads iov_len bytes raw, so a
+                        // (hypothetical) oversized resp_len must never read past the frame.
+                        tx_iovs[m].iov_len = tx_lens[i].min(DNS_BUF_SIZE);
                         tx_msgs[m].msg_hdr.msg_name =
                             &mut tx_addrs[m] as *mut _ as *mut libc::c_void;
                         tx_msgs[m].msg_hdr.msg_namelen =

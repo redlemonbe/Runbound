@@ -1,7 +1,7 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.16.6  
-**Last updated:** 2026-06-08  
+**Current version:** v0.17.0  
+**Last updated:** 2026-06-11  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
 This document consolidates all security and performance audit cycles conducted on Runbound. Individual per-cycle files in this directory are historical records; this file is the authoritative status reference.
@@ -21,6 +21,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [F](#cycle-f--v0120-defense-in-depth-hardening) | v0.11.1→v0.12.0 | 2026-06-06 | [AI-ADVERSARIAL] Nexus (Gemini 2.5 Pro × Qwen3-Coder) | 5 open (enhancements); 3 disputed-false, 2 fixed, 2 accepted |
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
 | [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 0 open; 6 fixed, 3 accepted, 2 disputed |
+| [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 2 open (enhancement); 13 fixed, 3 accepted, 4 disputed |
 
 ---
 
@@ -29,6 +30,66 @@ This document consolidates all security and performance audit cycles conducted o
 Through Cycle E (v0.9.50) all tracked findings were fixed, accepted, or classified as false positives. **Cycle F (v0.12.0)** opened enhancement-class findings OPEN-F1..F5. As of v0.15.0: OPEN-F2 (reproducible build + signatures), OPEN-F4 (SIEM JSON logs) and OPEN-F5 (CycloneDX SBOM) are **Fixed**; OPEN-F1 (third-party human audit, #170) remains **Open**; OPEN-F3 (strict RRL) is **not planned**. None were active vulnerabilities.
 
 All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
+
+---
+
+## Cycle I — v0.17.0 — two-AI competitive audit (kernel slow-path auto-tune + full surface re-review)
+
+**Date:** 2026-06-11
+**Sources:** `[AI-INTERNAL]` Claude Opus 4.8 × `[AI-ADVERSARIAL]` Gemini 2.5 Pro (independent per-file red-team; every Gemini finding re-verified against the source by Claude before acceptance).
+**Scope:** v0.17.0 new code (kernel-UDP slow-path `sendmmsg`/auto-tune, `set_combined_queues` ioctl) plus a full re-review of the security-critical surface: `api/mod.rs`, `api/relay.rs`, `api/clients.rs`, `dns/ratelimit.rs`, `dns/kernel_loop.rs`, `config/parser.rs`, `config/writer.rs`, `webui/mod.rs`, `firewall/backend.rs`, `dns/xdp/socket.rs`.
+**Method:** breadth from the adversarial model, severity calibrated against the actual defenses in the codebase (cert pinning, input control-char rejection, constant-time auth). Hallucinated or mis-rated findings are recorded as **Disputed** with the refuting evidence — not silently dropped.
+
+### Fixed
+
+| ID | Sev | Source | Finding | Fix |
+|----|-----|--------|---------|-----|
+| SEC-I1 | MEDIUM | Gemini | `verify_csrf` compared the CSRF token with `==` (timing oracle → token recovery → CSRF bypass). | `subtle::ConstantTimeEq` (webui/mod.rs). |
+| SEC-I2 | LOW | Gemini | `handle_login` compared the username with `!=` (timing → admin username enumeration). | constant-time compare. |
+| SEC-I3 | MEDIUM | Gemini | WebUI `/api` proxy forwarded the raw path; `reqwest` normalises `..`, escaping the `/api/` scope to other localhost endpoints. | reject paths containing `..`. |
+| SEC-I4 | MEDIUM | Gemini | `render_config` embedded string values in double quotes without escaping (config-line injection at the serialization boundary). Gemini rated CRITICAL assuming RCE; **recalibrated**: the primary API vector (local-data) is already blocked by `validate_no_control_chars` (CRLF rejection), and injecting a directive needs a newline. | `escape_str` at the boundary for local-data / local-zone (belt-and-suspenders). |
+| SEC-I5 | MEDIUM | Gemini | `relay_forward_handler` built the relayed path from a user segment without rejecting `..`; a slave could normalise it outside `/relay/`. Requires master-API auth (Gemini's HIGH → MEDIUM). | reject `..` in the relay path. |
+| SEC-I6 | LOW | Gemini | Relay-forward error body returned `e.to_string()`, leaking the internal slave host:port. | generic body; full error stays in the WARN log. |
+| SEC-I7 | MEDIUM | Gemini | `/api/clients/:ip` aggregated an unbounded per-IP domain map; remote random-subdomain flooding + an admin viewing the IP → memory exhaustion. | cap at 50 000 unique domains/IP. |
+| BUG-I8 | LOW | Gemini | Rate-limiter token refill `self.rps * elapsed_ms` could overflow `u64` for an absurd configured `rps`. | `u128` math + `saturating_add`. |
+| BUG-I9 | LOW | Gemini | Rate-limiter IPv4 `/0` prefix → `1u32 << 32` (debug panic; release produced the wrong mask). | explicit `/0` case + `u32::MAX << n`. |
+| BUG-I10 | MEDIUM | Gemini | nftables backend passed `"proto dport port"` as a single `nft` argument → the rule never installs → port stays closed under a default-deny policy (silent availability loss). | pass `proto` / `dport` / `port` as separate tokens. |
+| SEC-I11 | LOW | Gemini + Claude | v0.17.0 `sendmmsg` set `iov_len = resp_len` directly; the replaced `send_to(&buf[..n])` slice had bounds-checked it. A (hypothetical) oversized `resp_len` would make the kernel read past the frame (info leak). Confirmed as a real regression of the new code. | clamp `iov_len` to `DNS_BUF_SIZE`. |
+| BUG-I12 | LOW | Gemini | `CPU_SET(core_id, …)` had no `CPU_SETSIZE` bound (stack write past `cpu_set_t` on a >1024-CPU host or an enumeration bug). | guard `core_id < CPU_SETSIZE`. |
+| INFO-I13 | INFO | Gemini | `/api/clients` pagination `page * limit` could overflow `usize` (latent — immediately bounded by `.min(total)`, not reachable). | `saturating_mul` (hardening). |
+
+### Accepted (risk understood, not changed this cycle)
+
+| ID | Sev | Source | Finding | Rationale |
+|----|-----|--------|---------|-----------|
+| SEC-I14 | MEDIUM | Gemini | Relay HMAC signs `(method, path, ts)` but not the request body. | Mitigated by TOFU cert-pinned TLS master→slave (SEC-B1). Adding the body to the MAC is a wire-format change that breaks rolling master/slave upgrades; deferred to a versioned relay protocol. Gemini's CRITICAL (assumed cert verification disabled) is wrong — pinning is active once registered. |
+| SEC-I15 | LOW | Gemini | `ufw` close-rule deletes by `port/proto`, not by comment tag. | `ufw` cannot delete by comment; nft/iptables use rule handles. Could remove a same-port admin rule on teardown — documented limitation. |
+| SEC-I16 | LOW | Gemini | `write_config_atomic` uses a predictable `.tmp` filename (TOCTOU symlink). | Precondition is an attacker writable config dir = already-compromised host; dir is root-owned. |
+
+### Open (enhancement)
+
+| ID | Sev | Source | Finding |
+|----|-----|--------|---------|
+| OPEN-I17 | MEDIUM | Gemini | `/api/clients[/:ip]` scans the whole log buffer per request (CPU; localhost+auth only). Recommend background pre-aggregation. |
+| OPEN-I18 | LOW | Claude | Serialization escaping (SEC-I4) was applied to local-data/local-zone; a full pass over every API-settable string field at the render boundary is recommended. Primary mitigation remains input-layer control-char rejection. |
+
+### Disputed (false positives — recorded with refuting evidence)
+
+| ID | Source | Claim | Refutation |
+|----|--------|-------|-----------|
+| DISP-I19 | Gemini (HIGH) | Arbitrary file R/W via `cfg_path` in backup/persist. | `cfg_path` is an operator-supplied startup argument, never attacker-controllable through the API — no privilege boundary is crossed. |
+| DISP-I20 | Gemini (MEDIUM) | `ApiRateLimiter` doesn't update `last` every check → burst bypass. | Correct token-bucket behaviour: not advancing `last` when zero tokens accrue preserves fractional elapsed time. Updating it unconditionally (the proposed "fix") would *under*-refill and over-limit. Burst is by design. |
+| DISP-I21 | Claude (suspected) | `cfg.alerts.last_mut().unwrap()` panics on a stray alert field. | Every call is preceded by the `ensure_rule` closure (parser.rs:609) that pushes a rule first; the vector is never empty. |
+| DISP-I22 | Claude (suspected) | `normalize_ip` IPv6 `octets[keep_bytes+1..]` OOB for `/128`. | Guarded by `if keep_bytes < 16`. |
+
+### Verified-correct defenses (reviewed, no finding)
+
+- **API bearer auth** (api/mod.rs:487): `constant_time_eq`, pre-comparison brute-force brake (sleep applied *before* the compare so it is not a timing signal), 429 lockout after 20 invalid attempts, audit events, RBAC write-gating.
+- **AF_XDP `set_combined_queues` ioctl** (xdp/socket.rs): Gemini `NO_EXPLOITABLE_FINDINGS`; Claude concurs — sanitised interface name, mirrors the proven `auto_tune_nic_queues` SCHANNELS path.
+- **kernel slow-path `sendmmsg` unsafe** (kernel_loop.rs): pointer lifetimes sound — pre-allocated scratch (never reallocated), ephemeral `&mut` immediately cast to raw, bounded slice/count ≤ BATCH.
+- **`ratelimit::normalize_ip`**: IPv6 masking guarded (DISP-I22); IPv4 mask hardened (BUG-I9).
+
+**Cycle I status:** 13 fixed, 3 accepted, 2 open (enhancement), 4 disputed. Not a clean sweep — SEC-I14 (relay body MAC) is a real accepted gap, and OPEN-I17/I18 remain. Slow-path auto-tune (v0.17.0) introduced exactly one finding (SEC-I11), fixed.
 
 ---
 
