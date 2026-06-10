@@ -2392,6 +2392,8 @@ async fn delete_split_horizon(
 /// fast path falls through to the slow path where the per-subnet view applies.
 fn apply_split_horizon_live(entries: &[crate::config::parser::SplitHorizonEntry]) {
     let table = crate::dns::server::compile_split_horizon(entries);
+    // #187: rebuild the per-view fast-path snapshots so the XDP path serves the new views.
+    crate::dns::server::publish_view_snapshots(&table);
     // Fast-path coherency: evict split-horizon names from the shared cache so a
     // stale forwarded answer cannot shadow the per-subnet view.
     if let Some(cache) = crate::dns::cache_snapshot::XDP_CACHE_FOR_API.get() {

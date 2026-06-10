@@ -30,6 +30,7 @@ pub enum AclAction {
     Refuse,
 }
 
+#[derive(Clone)]
 pub(crate) struct CidrBlock {
     prefix: IpAddr,
     prefix_len: u8,

@@ -197,6 +197,21 @@ pub type SplitHorizonTable = Vec<(Vec<super::acl::CidrBlock>, std::sync::Arc<Loc
 pub static SPLIT_HORIZON_LIVE: std::sync::OnceLock<std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>> =
     std::sync::OnceLock::new();
 
+/// #187: (re)build the per-view fast-path snapshots from the split-horizon table
+/// and publish them live. Called on startup and on every API hot-swap, so the XDP
+/// fast path can serve each source subnet its own view (no cross-view leak).
+pub fn publish_view_snapshots(table: &SplitHorizonTable) {
+    let views: crate::dns::cache_snapshot::ViewSnapshots = table
+        .iter()
+        .map(|(cidrs, zoneset)| {
+            (cidrs.to_vec(), crate::dns::cache_snapshot::build_view_snapshot(zoneset))
+        })
+        .collect();
+    crate::dns::cache_snapshot::SPLIT_HORIZON_SNAPSHOTS
+        .get_or_init(|| std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())))
+        .store(std::sync::Arc::new(views));
+}
+
 /// Compile editable split-horizon entries into the resolver's per-subnet table.
 /// Used both at boot and on every live API edit.
 pub fn compile_split_horizon(
@@ -2398,6 +2413,7 @@ pub async fn run_dns_server(
             // so API edits apply without a restart.
             let table = compile_split_horizon(&cfg.split_horizon);
             info!(entries = table.len(), "split-horizon zones loaded");
+            publish_view_snapshots(&table);
             let live = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(table));
             let _ = SPLIT_HORIZON_LIVE.set(std::sync::Arc::clone(&live));
             live
