@@ -623,6 +623,60 @@ pub fn auto_tune_nic_queues(iface: &str, budget: u32) -> u32 {
     get_rx_queue_count(iface)
 }
 
+/// #slowpath-autotune: SET the NIC `combined` queue count to an explicit `target`
+/// (capped at the hardware maximum). Unlike `auto_tune_nic_queues` (which raises queues
+/// to the max for AF_XDP, one worker per queue), the kernel-UDP slow path peaks with a
+/// MODERATE queue count: enough NAPI/IRQ cores to drain the RX ring at line rate, but
+/// few enough that those cores don't contend with the RPS-distributed serving threads
+/// that run on EVERY core. Measured X710/5995WX: 16 queues + RPS-all = 6.5M qps, vs
+/// 32q 5.4M, vs 63q (one IRQ per core, no moderation) 3.4M. Returns the resulting
+/// combined count. Slow-path only — never called in `xdp: yes` (the AF_XDP path uses
+/// `auto_tune_nic_queues` instead), so the fast path is unaffected.
+pub fn set_combined_queues(iface: &str, target: u32) -> u32 {
+    let iface_safe = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None => return get_rx_queue_count(iface),
+    };
+    // SAFETY: AF_INET/DGRAM socket used only as an ioctl handle.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return get_rx_queue_count(iface);
+    }
+    // SAFETY: zeroed() valid for this plain repr(C) struct of u32 fields.
+    let mut ch: EthtoolChannels = unsafe { std::mem::zeroed() };
+    ch.cmd = ETHTOOL_GCHANNELS;
+    let mut ifr = build_ifreq(iface_safe, (&mut ch as *mut EthtoolChannels).cast());
+    // SAFETY: fd valid; ifr fully initialised with a valid ifr_data pointer.
+    let get_rc = unsafe {
+        libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>())
+    };
+    if get_rc < 0 {
+        unsafe { libc::close(fd) };
+        return get_rx_queue_count(iface);
+    }
+    let hw_max = ch.max_combined.max(ch.max_rx);
+    let tgt = target.min(hw_max).max(1);
+    if tgt != ch.combined_count {
+        // Combined mode: rx_count/tx_count stay 0 (i40e/ixgbe/ice), only combined_count set.
+        let mut sch: EthtoolChannels = unsafe { std::mem::zeroed() };
+        sch.cmd = ETHTOOL_SCHANNELS;
+        sch.combined_count = tgt;
+        let mut sifr = build_ifreq(iface_safe, (&mut sch as *mut EthtoolChannels).cast());
+        // SAFETY: same as the GET call above.
+        let set_rc = unsafe {
+            libc::ioctl(fd, SIOCETHTOOL as _, (&mut sifr as *mut IfReqEthtool).cast::<libc::c_void>())
+        };
+        if set_rc >= 0 {
+            tracing::info!(iface = %iface, from = ch.combined_count, to = tgt, hw_max,
+                "slow-path: NIC combined queues set to moderate count (kernel-UDP softirq balance)");
+        } else {
+            tracing::warn!(iface = %iface, target = tgt, "slow-path: SCHANNELS failed — keeping current queue count");
+        }
+    }
+    unsafe { libc::close(fd) };
+    get_rx_queue_count(iface)
+}
+
 /// Maximize the NIC RX/TX ring buffers via `SIOCETHTOOL` before XDP attachment.
 ///
 /// `target`:
