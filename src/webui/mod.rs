@@ -210,7 +210,12 @@ fn verify_csrf(state: &WebUiState, headers: &HeaderMap) -> bool {
     };
     headers.get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |actual| expected == actual)
+        // SEC: constant-time compare — a timing oracle on the CSRF token would let an
+        // attacker recover it byte-by-byte and bypass CSRF protection.
+        .map_or(false, |actual| {
+            use subtle::ConstantTimeEq;
+            bool::from(expected.as_bytes().ct_eq(actual.as_bytes()))
+        })
 }
 
 fn session_token(headers: &HeaderMap) -> Option<String> {
@@ -514,7 +519,11 @@ async fn handle_login(
     }
     let ok = {
         let creds = state.creds.lock().unwrap_or_else(|e| e.into_inner());
-        if creds.username != form.rb_user { false }
+        let user_ok = {
+            use subtle::ConstantTimeEq;
+            bool::from(creds.username.as_bytes().ct_eq(form.rb_user.as_bytes()))
+        };
+        if !user_ok { false }
         else {
             match PasswordHash::new(&creds.hash) {
                 Ok(h) => Argon2::default().verify_password(form.rb_pass.as_bytes(), &h).is_ok(),
@@ -674,6 +683,11 @@ async fn proxy_api(State(state): State<Arc<WebUiState>>, req: Request<Body>) -> 
         Err(_) => return (StatusCode::BAD_REQUEST, "request too large").into_response(),
     };
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    // SEC: reqwest normalises `..`; block it so a WebUI user cannot escape the /api/
+    // scope and reach non-API localhost endpoints.
+    if path_and_query.contains("..") {
+        return (StatusCode::BAD_REQUEST, "bad path").into_response();
+    }
     let target = format!("http://127.0.0.1:{}{}", state.api_port, path_and_query);
     let rmethod = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(m) => m,

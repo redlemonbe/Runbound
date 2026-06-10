@@ -105,7 +105,11 @@ impl IpAgg {
         if ts > self.last_seen.as_str() {
             self.last_seen = ts.to_owned();
         }
-        *self.domain_freq.entry(name.to_owned()).or_insert(0) += 1;
+        // Cap unique domains tracked per IP: a flood of random subdomains (remote,
+        // pre-auth) followed by an admin viewing this IP must not grow an unbounded map.
+        if self.domain_freq.len() < 50_000 || self.domain_freq.contains_key(name) {
+            *self.domain_freq.entry(name.to_owned()).or_insert(0) += 1;
+        }
         match action {
             "forwarded" => self.actions.forwarded += 1,
             "cached"    => self.actions.cached    += 1,
@@ -183,7 +187,7 @@ pub async fn clients_handler(
     summaries.sort_unstable_by(|x, y| y.total.cmp(&x.total).then(x.ip.cmp(&y.ip)));
 
     let total = summaries.len();
-    let start = (p.page * p.limit).min(total);
+    let start = p.page.saturating_mul(p.limit).min(total); // no overflow on huge page
     let end   = (start + p.limit).min(total);
     let page  = summaries.drain(start..end).collect::<Vec<_>>();
 

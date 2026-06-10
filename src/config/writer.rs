@@ -89,6 +89,15 @@ fn b(v: bool) -> &'static str {
 
 /// Render a complete runbound.conf from `cfg`. Round-trip stable:
 /// `parse(render(parse(f)))` equals `parse(f)`.
+/// SEC: escape a value before embedding it inside a double-quoted config token so it
+/// cannot break out of its quotes or inject a new directive line. Defense-in-depth — the
+/// primary mitigation is input-layer control-char rejection (validate_no_control_chars).
+fn escape_str(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r'], " ")
+}
+
 pub fn render_config(cfg: &UnboundConfig) -> String {
     let d = parse_str("server:\n").unwrap_or_default();
     let mut o = String::with_capacity(4096);
@@ -109,8 +118,8 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.do_udp != d.do_udp { o.push_str(&format!("    do-udp: {}\n", b(cfg.do_udp))); }
     if cfg.do_tcp != d.do_tcp { o.push_str(&format!("    do-tcp: {}\n", b(cfg.do_tcp))); }
     // local-zone / local-data
-    for z in &cfg.local_zones { o.push_str(&format!("    local-zone: \"{}\" {}\n", z.name, z.zone_type)); }
-    for r in &cfg.local_data { o.push_str(&format!("    local-data: \"{}\"\n", r.rr)); }
+    for z in &cfg.local_zones { o.push_str(&format!("    local-zone: \"{}\" {}\n", escape_str(&z.name), z.zone_type)); }
+    for r in &cfg.local_data { o.push_str(&format!("    local-data: \"{}\"\n", escape_str(&r.rr))); }
     // TLS
     if let Some(v) = &cfg.tls.cert_path { o.push_str(&format!("    tls-service-pem: \"{v}\"\n")); }
     if let Some(v) = &cfg.tls.key_path { o.push_str(&format!("    tls-service-key: \"{v}\"\n")); }
