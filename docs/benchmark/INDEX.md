@@ -2,9 +2,9 @@
 
 This directory holds every Runbound performance benchmark, each produced under the same
 [methodology](README.md) and [report template](TEMPLATE.md). Truth is always the **receiver
-NIC hardware counters** (`ethtool -S`: `tx_pkts_nic` served, `rx_pkts_nic` received, plus
-`rx_no_dma_resources`/`rx_missed_errors` drops), not the generator's self-reported
-round-trip.
+NIC hardware counters** (`ethtool -S` — names are driver-specific: `tx_pkts_nic`/`rx_pkts_nic`
+on i40e, `tx_ucast_frames`/`rx_ucast_frames` on bnxt, plus the per-driver drop counters; see
+each report's appendix), never the generator's self-reported round-trip.
 
 ## Summary — same rig, same generator, same methodology
 
@@ -43,45 +43,41 @@ X520, second receiver port administratively down (single-link case):
 
 | Run | Max served (NIC truth) | Offered peak | Knee (p50 < 1 ms) | NIC RX loss | Report |
 |-----|-----------------------:|-------------:|------------------:|------------:|--------|
-| Runbound v0.16.9 `xdp: yes` | ~10.1 M QPS | ~13.0 M (10G line rate) | 10.56 M offered | ~0 | [report](RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md) |
-| Runbound v0.16.11 `xdp: yes` | **10.09 M QPS** (timestamped) | 13.04 M | 10.56 M offered | 0 | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md) |
+| Runbound v0.16.11 `xdp: yes` | **10.09 M QPS** (timestamped) | 13.04 M (10G line rate) | 10.56 M offered | 0 | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md) |
 | Runbound v0.16.11 `xdp: yes` **dual link** | **13.15 M QPS** (sum of 2 ports, 99.8% of offered) | 13.18 M (generator cap) | ~13.0 M total | ~0.002 %/run | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md) |
 
-The v0.16.11 single-link run includes a same-method A/B against the previous binary:
-served -0.06 %, knee +0.02 % — the 802.1Q VLAN path (#188) and the per-view
-split-horizon snapshots (#187) cost nothing measurable on the untagged, no-view hot
-path. The **dual-link** run answers the single-link open question: with two links the
-served total rises to 13.15 M (+30 %) at ~11 % receiver CPU and 99.8 % of offered —
-the single-link 10.09 M served cap was the link's response direction, not the server.
-In dual-link the ceiling moves to the **generator** (dual Xeon v2 pushes ~13.2 M pps
-total across any number of NICs); Runbound's own ceiling on this rig was not reached.
+The v0.16.11 single-link run includes a same-method A/B against the previous binary
+(v0.16.9, measured at ~10.1 M on the same rig): served -0.06 %, knee +0.02 % — the
+802.1Q VLAN path (#188) and the per-view split-horizon snapshots (#187) cost nothing
+measurable on the untagged, no-view hot path. The **dual-link** run answers the
+single-link open question: with two links the served total rises to 13.15 M (+30 %) at
+~11 % receiver CPU and 99.8 % of offered — the single-link 10.09 M served cap was the
+link's response direction, not the server. In dual-link the ceiling moves to the
+**generator** (dual Xeon v2 pushes ~13.2 M pps total across any number of NICs);
+Runbound's own ceiling on this rig was not reached.
 
 ## EPYC 9554P + Broadcom BCM57508 100 G (Latitude fra2) — the bnxt copy-mode reference
 
 Two identical Latitude.sh `rs4.metal.xlarge` ([rig](rigs/latitude-rs4-metal-xlarge-fra2.md)),
-Runbound **v0.17.2**, generator dnsmark v2.2.1 over **kernel-UDP** (`bnxt_en` has **no AF_XDP
-zero-copy** — `XDP_ZEROCOPY` bind = errno 95 on both hosts, re-verified on kernel 6.8 after 6.12 —
-so `--xdp` generation is unusable and the receiver's AF_XDP fast path runs in **copy mode**),
-802.1Q VLAN 100 G test link, warm cache, same methodology:
+Runbound **v0.17.2**, generator dnsmark v2.2.1 over **kernel-UDP** — `bnxt_en` has **no
+AF_XDP zero-copy** in any kernel (`XDP_ZEROCOPY` bind = errno 95; verified on 6.8, 6.12
+and 6.17), so `--xdp` generation is unusable and the receiver's AF_XDP fast path runs in
+**copy mode**. Four runs, one [consolidated report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md):
 
-| Run | Max served (NIC truth) | CPU at max | Wire p50 (30 k qps) | Report |
-|-----|-----------------------:|-----------:|--------------------:|--------|
-| `xdp: no` (kernel slow path) | 4.09 M sustained (5.45 M burst); collapses to ~2.5–2.9 M under an 11 M flood | 32 % | 0.047 ms | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-noxdp-2026-06-11.md) |
-| `xdp: yes` single link (copy mode) | **7.85 M sustained** under a 10.8 M flood, no collapse, 0 discards | 8 % | 0.024 ms | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-xdp-2026-06-11.md) |
-| `xdp: yes` dual link (copy mode) | **9.07 M sustained / 11.13 M peak** (+15.5 % vs single) | 27 % | — | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-dual-xdp-2026-06-11.md) |
+| Run | Max served (NIC truth) | CPU at max | Wire p50 (30 k qps) |
+|-----|-----------------------:|-----------:|--------------------:|
+| `xdp: no` (kernel slow path, 6.8) | 4.09 M sustained (5.45 M burst); collapses under an 11 M flood | 32 % | 0.047 ms |
+| `xdp: yes` single link (copy mode, 6.8) | **7.85 M sustained** under a 10.8 M flood, no collapse, 0 discards | 8 % | 0.024 ms |
+| `xdp: yes` dual link (copy mode, 6.8) | **9.07 M sustained / 11.13 M peak** (+15.5 % vs single) | 27 % | — |
+| kernel 6.17 follow-up (single port) | 7.3–8.0 M (copy, peak 9.09 M); `xdp: no` 5.03 M | ≤10 % / 32 % | — |
 
-| **kernel 6.17 follow-up** (public path, single port) | 7.3–8.0 M sustained, peak 9.09 M (copy); `xdp: no` 5.03 M | ≤10 % / 32 % | — | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-kernel617-2026-06-11.md) |
-
-Every figure on this rig is bounded by the missing `bnxt_en` zero-copy (generator capped at
-~10.6 M qps kernel-UDP on 6.8, 14.0 M on 6.17; receiver XSK drain in copy mode, **~8 M
-qps/port** across kernels) — Runbound was never the limiting component (0 NIC ring discards,
-≤27 % CPU). The real fast-path ceiling of this CPU class on 100 G needs a zero-copy NIC
-(Intel `ice`/`i40e`, Mellanox `mlx5`); the earlier
-[v0.16.9 attempt](RUNBOUND-v0.16.9-latitude-epyc9554p-bnxt-2026-06-10.md) on this rig is
-superseded by these runs. The kernel-6.17 follow-up also resolves the "~10 M `xdp: no`,
-no loss" expectation: the v0.16.9 off-rig reference line was **absorption (NIC receive),
-not serving** — no configuration serves it. The VLAN was removed after the dual run
-(2026-06-11 evening); the dual case is not reproducible on the current rig.
+Every figure on this rig is bounded by the missing `bnxt_en` zero-copy (generator capped
+at ~10.6 M qps kernel-UDP on 6.8, 14.0 M on 6.17; receiver XSK drain in copy mode, **~8 M
+qps/port** across kernels) — Runbound was never the limiting component (0 NIC ring
+discards, ≤27 % CPU). These copy-mode figures must **not** be compared with the X710
+zero-copy figures above (methodology rule 6). The real fast-path ceiling of this CPU
+class on 100 G needs a zero-copy NIC (Intel `ice`/`i40e`, Mellanox `mlx5`) — verify the
+exact NIC model before renting; "100 G" alone says nothing.
 
 ## Files
 
@@ -91,18 +87,16 @@ not serving** — no configuration serves it. The VLAN was removed after the dua
 - [runbound-receiver-bench.conf](runbound-receiver-bench.conf) — the receiver config used
   for the Runbound runs (`xdp:no`, real forward-zone, no local-data, `rate-limit: 0`).
 - **Runbound runs**
-  - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: no`](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-noxdp-2026-06-11.md)
-  - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: yes` single](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-xdp-2026-06-11.md)
-  - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: yes` dual](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-dual-xdp-2026-06-11.md)
-  - [Latitude EPYC 9554P / bnxt v0.17.2 kernel 6.17 follow-up](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-kernel617-2026-06-11.md)
   - [X710 v0.16.11 `xdp: yes` single-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)
   - [X710 v0.16.11 `xdp: yes` dual-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md)
-  - [X710 v0.16.9 `xdp: yes`](RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md)
-  - [`xdp: yes` (AF_XDP fast path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md)
-  - [`xdp: no` (kernel slow path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md)
+  - [X520 v0.16.1 `xdp: yes` (AF_XDP fast path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md)
+  - [X520 v0.16.1 `xdp: no` (kernel slow path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md)
+  - [Latitude EPYC 9554P / bnxt v0.17.2 — consolidated (xdp:no, XDP single, XDP dual, kernel 6.17)](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md)
 - **Reference-server baselines** (same rig + methodology)
   - [unbound 1.22.0](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md)
   - [BIND 9.20.23](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md)
+- **Rigs**
+  - [Latitude.sh rs4.metal.xlarge (fra2)](rigs/latitude-rs4-metal-xlarge-fra2.md)
 
 ## Related (outside this directory)
 
