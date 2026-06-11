@@ -4,13 +4,18 @@ Two **identical** bare-metal servers rented from **[Latitude.sh](https://www.lat
 region **fra2 (Frankfurt)**, SKU **`rs4.metal.xlarge`**, used as a two-box DNS benchmark
 fabric.
 
-| Role | Hostname | Public IP (`eno1`) | Software |
-|------|----------|--------------------|----------|
-| **Generator** (émetteur) | `emetteur` | `109.94.96.43` | dnsmark v2.1.4 |
-| **Receiver** (récepteur) | `recepteur` | `109.94.96.53` | Runbound v0.16.9 |
+| Role | Hostname | Public IP (`eno1`) | Software (2026-06-11 runs) |
+|------|----------|--------------------|----------------------------|
+| **Generator** (émetteur) | `emetteur` | `109.94.96.43` | dnsmark v2.2.1 (release musl, SHA256 verified) |
+| **Receiver** (récepteur) | `recepteur` | `109.94.96.53` | Runbound v0.17.2 (release gnu, SHA256 verified) |
 
 > **Reproducibility anchor:** rent the same `rs4.metal.xlarge` on Latitude.sh **fra2** to
 > replicate this rig. The two units are spec-identical apart from one NVMe model (see below).
+
+> **2026-06-11 — both machines reinstalled** (was Debian 13 / kernel 6.12.90 on
+> 2026-06-10): now **Ubuntu 24.04.4 LTS**, kernel **6.8.0-124-generic**, user `ubuntu`.
+> Hardware unchanged (re-verified: dmidecode, ethtool, lscpu). Sections below updated
+> accordingly; the 2026-06-10 storage/PCIe details still apply.
 
 ---
 
@@ -33,85 +38,98 @@ fabric.
 ### Network
 - **Broadcom BCM57508 NetXtreme-E** — driver **`bnxt_en`**, firmware **227.0.131.0 / pkg 227.1.111.0**
   - **2 × 100 GbE**: `eno1`, `eno2` — both link up @ 100000 Mb/s — PCIe `81:00.0` / `81:00.1`
-- Intel **I350** 1 GbE — driver `igb` — `eth1`/`eth3`, down (onboard/mgmt) — PCIe `01:00.0` / `01:00.1`
+- Intel **I350** 1 GbE — driver `igb` — down (onboard/mgmt)
 
 ### Storage (NVMe)
-- 2 × Micron **7400** 894 GB — `MTFDKBG960TDZ`, fw `E1MU23BC`
-- Micron **7450** 7.68 TB — `MTFDKCC7T6TFR`, fw `E2MU110` — **×4 on receiver**, ×3 on generator
+- 2 × Micron **7400** 894 GB — `MTFDKBG960TDZ`, fw `E1MU23BC` (root, md0 RAID)
+- Micron **7450** 7.68 TB — `MTFDKCC7T6TFR`, fw `E2MU110` — ×4 on receiver, ×3 on generator
 - generator also has 1 × Micron **7500** 7.68 TB — `MTFDKCC7T6TGP`, fw `E3MQ000`
 
-### OS / kernel
-- **Debian GNU/Linux 13 (trixie)**
-- Kernel **6.12.90+deb13.1-amd64**
-- CPU governor: **`schedutil`** ⚠️ — set to **`performance`** before any measurement (governor is the #1 benchmark confounder)
+### OS / kernel (since 2026-06-11)
+- **Ubuntu 24.04.4 LTS**, kernel **6.8.0-124-generic**, user `ubuntu`
+- CPU governor default: ⚠️ not `performance` — pin it before any measurement
+- `systemd-resolved` active (stub on 127.0.0.53/54 only — does not conflict with a
+  bench bind on a test IP; check `ss -ulpn | grep :53` anyway, methodology rule 5)
 
 ---
 
 ## Per-machine notes
 
 - **`emetteur` (109.94.96.43)** — generator (dnsmark). One NVMe is a Micron **7500** instead of a 7450.
-- **`recepteur` (109.94.96.53)** — receiver (Runbound). Installed via the repo `install.sh`
-  (systemd unit with `CAP_PERFMON`/`CAP_BPF`); `systemd-resolved` disabled to free `:53`.
+- **`recepteur` (109.94.96.53)** — receiver (Runbound), run as root from `/home/ubuntu`
+  for the 2026-06-11 bench (no systemd unit).
 
 ## Network topology (important for the bench)
 
-- **No direct private link** between the two boxes. The "2×100G" are the **two ports of the
-  single BCM57508** on each machine — not a cable between the servers.
-- Benchmark traffic therefore runs over the **public `eno1` IPs** (`109.94.96.43` → `109.94.96.53`).
-  Measured path: **1 hop (ttl 63), ~0.25 ms RTT** — both units sit on the same Latitude fra2
-  fabric, so the inter-box path is expected to be full line-rate (to be confirmed at the NIC counters).
+- The "2×100G" are the **two ports of the single BCM57508** on each machine.
+- **Latitude private network, 802.1Q VID 2126**, delivered **tagged on `eno2` only**
+  (tested 2026-06-11: `eno1.2126` = 100 % ARP/ping loss). Sub-interfaces
+  `eno2.2126`: 10.21.26.1 (generator) ↔ 10.21.26.2 (receiver), ping RTT 0.37 ms,
+  0 % loss. **Lossless at ≥10.5 M pps** in the 2026-06-11 runs.
+- The public `eno1` /31s are **routed** (1 hop, TTL 63, ~0.24 ms). Usable as a second
+  load path, but the fabric dropped **~8 %** of a ~10.5 M pps generator flood before
+  the receiver NIC (measured 2026-06-11) — prefer the VLAN for measurement.
+- An **untagged** private delivery un-bridges the hosts (ARP `INCOMPLETE`) — the
+  tagged VLAN is the only clean L2-adjacent path (2026-06-10 finding, still true).
 
-## XDP / AF_XDP caveat
+## XDP / AF_XDP on this NIC — measured verdicts
 
-- `bnxt_en` supports **native XDP**; **AF_XDP zero-copy on `bnxt_en` must be validated** on this
-  kernel before trusting any fast-path number — Broadcom's ZC path is less battle-tested than
-  mlx5 / ice / ixgbe. Confirm the ZC bind succeeds (loader logs + `dmesg`) on the first run.
-
----
-
-_Captured 2026-06-10 with `lscpu` · `dmidecode` · `smartctl` · `ethtool` · `lspci` on both hosts._
+- `bnxt_en` supports **native XDP (DRV mode)** — Runbound attaches and serves.
+- **AF_XDP zero-copy: NOT supported** — `XDP_ZEROCOPY` bind → `EOPNOTSUPP` (errno 95)
+  on every queue. Verified on Debian 13 / kernel 6.12.90 (2026-06-10, incl. mainline
+  `bnxt_xdp.c` source check) **and re-verified on Ubuntu 24.04 / kernel 6.8.0-124**
+  (2026-06-11). Driver-feature gap; only a different NIC lifts it (Intel
+  `ice`/`i40e`/`ixgbe`, Mellanox `mlx5`).
+- AF_XDP **copy mode works and is usable on the receiver side**: Runbound v0.17.2
+  served 7.85 M qps single-port / 9.07 M dual-port (see the 2026-06-11 reports).
+  Copy mode is **not usable for generation** (dnsmark `--xdp` → ~10 k qps).
+- **802.1Q on this kernel:** `ethtool -K eno2 rxvlan off` is **accepted** on
+  6.8.0-124 (it was refused on 6.12.90) — with it, the #188 per-packet tag-preserve
+  path works and `RUNBOUND_XDP_VLAN` is not needed, including mixed
+  tagged+untagged dual-port attach.
+- **Counter names differ across kernels** (truth source for every report):
+  - kernel 6.12 (2026-06-10): `rx_ucast_packets` / `tx_ucast_packets`
+  - kernel 6.8 (2026-06-11): **`rx_ucast_frames` / `tx_ucast_frames`** (port-level HW),
+    drops in `rx_total_ring_discards` / `rx_stat_discard`
+- dnsmark's wire-truth PHY guard does not resolve bnxt counter names (reports
+  "0 qps confirmed" while traffic flows) — generator egress must be cross-checked
+  against the receiver NIC counters.
 
 ---
 
 ## Benchmark tuning
 
-Re-apply after every reboot — none of these persist. Part of the reproducible setup.
+Re-apply after every reboot — none of these persist. Part of the reproducible setup
+(`tune-common.sh` in the 2026-06-11 session).
 
-### CPU (both machines)
+### CPU + memory (both machines)
 ```bash
-# Governor -> performance (scaling driver: acpi-cpufreq). The #1 benchmark confounder.
 echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+echo 4096 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages   # 8 GiB for AF_XDP UMEM
+sudo sysctl -w net.core.rmem_max=67108864 net.core.wmem_max=67108864 net.core.netdev_max_backlog=250000
+sudo systemctl stop irqbalance     # already inactive by default on this image
 ```
-Verified: all 128 logical CPUs report `performance`.
 
-### Memory (both machines)
+### NIC (per test port)
 ```bash
-# 8 GiB of 2 MiB hugepages for the AF_XDP UMEM.
-echo 4096 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-```
-Verified: `HugePages_Total: 4096`.
-
-### NIC `eno1` (Broadcom BCM57508, `bnxt_en`)
-- **Flow control: off by default** (`ethtool -a eno1` → RX/TX off) — confirmed, no pause frames.
-- **irqbalance: inactive** on both — IRQs are pinned manually for the run, not reshuffled.
-- **Rings** (`ethtool -g eno1`):
-  - `recepteur`: RX max **8191** (already at max), TX **2047** (at max)
-  - `emetteur`: RX **511 / 2047**, TX **511 / 2047** → raise to max for generation
-- **Queues** (`ethtool -l eno1`): current **Combined 32**; max Combined 37 (`recepteur`) / 74 (`emetteur`).
-  The combined-queue count caps the number of AF_XDP RX sockets / XDP workers.
-
-### Pending — link-resetting or access-sensitive (applied inside the run window)
-```bash
-# Generator: max the rings (this bounces the eno1 link)
-sudo ethtool -G eno1 rx 2047 tx 2047
-# Pin NIC IRQs off the Runbound worker cores (single NUMA node here, so straightforward)
-# Attach Runbound XDP on eno1 — eno1 also carries SSH, and bnxt_en AF_XDP ZC is less
-# battle-tested, so this is done behind a dead-man's-switch: an `at` job detaches XDP +
-# stops runbound after N minutes unless cancelled, so a mis-behaving fast path cannot
-# lock anyone out of the box.
+sudo ethtool -A <nic> rx off tx off          # flow control (off by default here — verify)
+sudo ethtool -N <nic> rx-flow-hash udp4 sdfn
+sudo ethtool -G <nic> rx 2047 tx 2047        # max on this fw; bounces the link
+# rings on 6.8: RX max 2047 (+ jumbo 8188), TX max 2047 — both machines
+# channels: combined 32 active / 74 max
 ```
 
-### Network / Runbound bench config
-- Traffic over the public `eno1` path: `109.94.96.43` (generator) → `109.94.96.53` (receiver).
-- Receiver config: `xdp-interface: eno1`, bind the public IP, `access-control: 109.94.96.43/32 allow`,
-  `rate-limit: 0`, `xdp: yes`.
+### Operational warnings
+- **Latitude's edge protection rate-limits SSH**: repeated short-lived TCP
+  connections to :22 (e.g. aborted host-key mismatches) get the source IP
+  **temporarily banned at the fabric level** (local firewall is empty). Use SSH
+  `ControlMaster`/`ControlPersist` multiplexing; reach the second box via
+  `ProxyJump` through the first. Bans observed to last ~15–45 min.
+- Attaching XDP to `eno1` (the SSH port) is safe in practice (non-DNS traffic is
+  XDP_PASSed) but do it behind a **dead-man's switch**:
+  `systemd-run --on-active=480 --unit=deadman bash -c 'pkill -x runbound; ip link set eno1 xdp off'`.
+
+---
+
+_Hardware captured 2026-06-10 (`lscpu` · `dmidecode` · `smartctl` · `ethtool` · `lspci`);
+OS/topology/XDP sections re-verified 2026-06-11 on the Ubuntu reinstall._
