@@ -1,6 +1,6 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.17.0  
+**Current version:** v0.17.2 (Cycle I remediations cover through v0.17.1; v0.17.2 adds no security-relevant change — see CHANGELOG)  
 **Last updated:** 2026-06-11  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
