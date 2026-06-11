@@ -4,7 +4,11 @@
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 
 - **Transport crypto.** `rustls` 0.23 (TLS 1.2 + 1.3) for DoT/DoH/DoQ and the relay.
-- **Relay authentication.** HMAC-SHA256, timestamped, anti-replay ±30 s; TOFU cert pinning.
+- **Relay authentication.** HMAC-SHA256 over method + path + timestamp **+ body**
+  (SEC-I14, v0.17.1), anti-replay ±30 s, constant-time dual-accept for rolling upgrades
+  (`src/sync.rs:118`); TOFU cert pinning. Registration rejects loopback/link-local/ULA
+  and (by default) RFC 1918 relay hosts — `sync-allow-private-relay` opts LAN
+  deployments in (§6.3).
 - **API.** Localhost-only bind; bearer token (env var preferred over config); optional
   PKCS#11 HSM storage for the API key and relay HMAC key; optional Unix socket (0600).
 - **Rate limit + bans on *both* datapaths (one mechanism).** Per-source-IP token-bucket
@@ -41,10 +45,25 @@
 - **Least privilege.** The service runs as a dedicated non-root user (`User=runbound`)
   with only `CAP_NET_BIND_SERVICE`/`NET_RAW`/`NET_ADMIN`/`BPF`, `NoNewPrivileges=yes`,
   `ProtectSystem=strict`, `PrivateTmp=yes`.
+- **Cycle I remediations (v0.17.1).** The Cycle I two-AI adversarial audit
+  (Claude Opus 4.8 × Gemini 2.5 Pro; full report `docs/security-audit/SECURITY-AUDIT.md`)
+  closed every Open and Accepted finding. The user-visible hardening, per the CHANGELOG:
+  relay HMAC covers the body (SEC-I14, above); **ACL enforced on the real client IP for
+  TCP/DoT/DoH** before the loopback relay (SEC-I23 — closed an ACL bypass that made TCP
+  clients look like 127.0.0.1); WebUI CSRF token and login username compared in constant
+  time; `/api` proxy rejects `..` traversal; config serialization escapes every string
+  field and config writes use `O_EXCL` + an unpredictable temp name; the nftables
+  firewall rule arguments were fixed (the rule previously never installed) and `ufw`
+  deletes only the exact tagged rule; rate-limiter integer-overflow hardening (u128
+  refill, `/0` mask); `/api/clients` aggregation memoized (2 s); per-IP domain map
+  capped; both fast paths serve class IN only; kernel slow-path `sendmmsg` length clamp;
+  `CPU_SET` and interface-name bounds checks. 5 adversarial findings were re-verified
+  and recorded as **Disputed** (false positives) with refuting evidence, not silently
+  dropped.
 - **Audit discipline.** All findings live in one `SECURITY-AUDIT.md` with strict severities
   and mixed statuses (Fixed/Accepted/Open/Disputed); re-audits use a different model/session
-  (the latest cycle was cross-checked by an independent local model, Qwen3-Coder-30B).
-  Marketing language is banned.
+  (the latest completed cycle, Cycle I, was a two-AI adversarial review — Claude Opus 4.8 ×
+  Gemini 2.5 Pro). Marketing language is banned.
 
 ## To expand
-- Full threat model table; the audit cycles (A–F) summary; HSM setup.
+- Full threat model table; the audit cycles (A–I) summary; HSM setup.

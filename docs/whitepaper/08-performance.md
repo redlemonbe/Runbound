@@ -1,7 +1,10 @@
 # 08 — Performance
 
-> **Status: current (v0.16.6)** — governed by `docs/benchmark/README.md` (the methodology) and
-> the per-run reports under `docs/benchmark/`.
+> **Status: current as of v0.17.2 (2026-06-11)** — governed by `docs/benchmark/README.md`
+> (the methodology) and the per-run reports under `docs/benchmark/`. The latest measured
+> runs in-repo are v0.16.11 (X710 fast path) and v0.17.0 (slow-path auto-tune, CHANGELOG);
+> there is no v0.17.2-specific report — v0.17.1/0.17.2 contain no datapath changes
+> (security remediations and an API path fix).
 
 This chapter holds **only measured numbers produced under the documented methodology**.
 Until a run is completed under that methodology at the current version, this chapter states
@@ -25,7 +28,30 @@ any figure not yet re-measured.
 - The naïve hickory slow path measured **1.78× Unbound's instructions/query** — the reason
   the fast paths exist (§1.2).
 
-## Slow path vs fast path — measured (v0.16.6, 5995WX, single X520, warm cache)
+## X710 10 GbE — the current reference numbers (v0.16.9 / v0.16.11)
+
+Measured on the documented rig (receiver: 5995WX + Intel X710-DA2; generator: dual Xeon
+E5-2690 v2 + X710, direct DACs; dnsmark 2.2.1, XDP zero-copy both sides, NIC-counter
+truth):
+
+- **Single link** ([report](../benchmark/RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md),
+  [v0.16.11](../benchmark/RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)):
+  offered reaches the 10 G line rate (~13.0 M qps of 78-byte queries); **served capped at
+  10.09 M** by the *response-direction* line rate (answers are larger than queries) — a
+  link property, not a server one.
+- **Dual link** ([report](../benchmark/RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md)):
+  one XDP program + 32 zero-copy XSK workers per port, no bonding. **Served peak
+  13.15 M qps** (port balance 49.9/50.1 %) under 13.18 M offered — **99.8 % answered at
+  peak, at ~11 % receiver CPU**. The ceiling is the generator (~13.2 M pps total whether
+  flooding one NIC or two); **Runbound's own ceiling on this rig was not reached.**
+  p50 stayed in the 0.04–0.30 ms band from 0.4 M to ~12.8 M qps total.
+- **Kernel slow path after the v0.17.0 auto-tune** (§4.5; CHANGELOG-sourced): served rate
+  ~3.4 M → ~7.3 M+ qps (peak 8.16 M) at the i40e NAPI ceiling, on the same rig — RPS to
+  all cores is the dominant lever, node-local IRQ placement the second. The AF_XDP fast
+  path is unchanged by the auto-tune (re-verified 11.18 M qps on the same rig, single
+  link, per the CHANGELOG).
+
+## Slow path vs fast path — measured (historical: v0.16.6, 5995WX, single X520, warm cache)
 
 The kernel slow path (`xdp: no`) runs the **same** SIMD/ASM cache wire responder as the
 AF_XDP fast path — only the I/O source differs (kernel UDP socket vs AF_XDP ring). Measured
@@ -68,4 +94,6 @@ an open-loop AF_XDP generator is needed to reach the receiver's actual saturatio
 Full report in the dnsmark repository (`docs/cross-validation-dnsperf.md`).
 
 ## To expand
-- The official v0.15.0 benchmark report once run under supervision.
+- A v0.17.x run under the documented methodology (the v0.16.11 dual-link report's open
+  item — a stronger generator or a third link — still stands to find the receiver's true
+  ceiling). The full run index is in [docs/benchmark/INDEX.md](../benchmark/INDEX.md).
