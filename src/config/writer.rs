@@ -111,8 +111,8 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.port != d.port { o.push_str(&format!("    port: {}\n", cfg.port)); }
     if cfg.verbosity != d.verbosity { o.push_str(&format!("    verbosity: {}\n", cfg.verbosity)); }
     if cfg.log_format != d.log_format { o.push_str(&format!("    log-format: {}\n", cfg.log_format)); }
-    if let Some(v) = &cfg.logfile { o.push_str(&format!("    logfile: \"{v}\"\n")); }
-    if let Some(v) = &cfg.pidfile { o.push_str(&format!("    pidfile: \"{v}\"\n")); }
+    if let Some(v) = &cfg.logfile { o.push_str(&format!("    logfile: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = &cfg.pidfile { o.push_str(&format!("    pidfile: \"{}\"\n", escape_str(v))); }
     if cfg.do_ipv4 != d.do_ipv4 { o.push_str(&format!("    do-ip4: {}\n", b(cfg.do_ipv4))); }
     if cfg.do_ipv6 != d.do_ipv6 { o.push_str(&format!("    do-ip6: {}\n", b(cfg.do_ipv6))); }
     if cfg.do_udp != d.do_udp { o.push_str(&format!("    do-udp: {}\n", b(cfg.do_udp))); }
@@ -121,20 +121,20 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     for z in &cfg.local_zones { o.push_str(&format!("    local-zone: \"{}\" {}\n", escape_str(&z.name), z.zone_type)); }
     for r in &cfg.local_data { o.push_str(&format!("    local-data: \"{}\"\n", escape_str(&r.rr))); }
     // TLS
-    if let Some(v) = &cfg.tls.cert_path { o.push_str(&format!("    tls-service-pem: \"{v}\"\n")); }
-    if let Some(v) = &cfg.tls.key_path { o.push_str(&format!("    tls-service-key: \"{v}\"\n")); }
+    if let Some(v) = &cfg.tls.cert_path { o.push_str(&format!("    tls-service-pem: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = &cfg.tls.key_path { o.push_str(&format!("    tls-service-key: \"{}\"\n", escape_str(v))); }
     if let Some(v) = cfg.tls.dot_port { o.push_str(&format!("    tls-port: {v}\n")); }
     if let Some(v) = cfg.tls.doh_port { o.push_str(&format!("    https-port: {v}\n")); }
     if let Some(v) = cfg.tls.doq_port { o.push_str(&format!("    quic-port: {v}\n")); }
-    if let Some(v) = &cfg.tls.hostname { o.push_str(&format!("    tls-cert-hostname: \"{v}\"\n")); }
-    if let Some(v) = &cfg.tls.dot_client_auth_ca { o.push_str(&format!("    dot-client-auth-ca: \"{v}\"\n")); }
+    if let Some(v) = &cfg.tls.hostname { o.push_str(&format!("    tls-cert-hostname: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = &cfg.tls.dot_client_auth_ca { o.push_str(&format!("    dot-client-auth-ca: \"{}\"\n", escape_str(v))); }
     // rate limit
     if let Some(v) = cfg.rate_limit { o.push_str(&format!("    rate-limit: {v}\n")); }
     if cfg.rate_limit_prefix_v4 != d.rate_limit_prefix_v4 { o.push_str(&format!("    rate-limit-prefix-v4: {}\n", cfg.rate_limit_prefix_v4)); }
     if cfg.rate_limit_prefix_v6 != d.rate_limit_prefix_v6 { o.push_str(&format!("    rate-limit-prefix-v6: {}\n", cfg.rate_limit_prefix_v6)); }
-    if let Some(v) = &cfg.api_key { o.push_str(&format!("    api-key: \"{v}\"\n")); }
+    if let Some(v) = &cfg.api_key { o.push_str(&format!("    api-key: \"{}\"\n", escape_str(v))); }
     if let Some(v) = cfg.api_port { o.push_str(&format!("    api-port: {v}\n")); }
-    if let Some(v) = &cfg.api_socket { o.push_str(&format!("    api-socket: \"{v}\"\n")); }
+    if let Some(v) = &cfg.api_socket { o.push_str(&format!("    api-socket: \"{}\"\n", escape_str(v))); }
     if let Some(v) = cfg.cache_max_ttl { o.push_str(&format!("    cache-max-ttl: {v}\n")); }
     if let Some(v) = cfg.cache_min_ttl { o.push_str(&format!("    cache-min-ttl: {v}\n")); }
     if cfg.cache_min_entries != d.cache_min_entries { o.push_str(&format!("    cache-min-entries: {}\n", cfg.cache_min_entries)); }
@@ -144,28 +144,28 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.log_retention != d.log_retention { o.push_str(&format!("    log-retention: {}\n", cfg.log_retention)); }
     if cfg.log_client_ip != d.log_client_ip { o.push_str(&format!("    log-client-ip: {}\n", b(cfg.log_client_ip))); }
     if cfg.audit_log != d.audit_log { o.push_str(&format!("    audit-log: {}\n", b(cfg.audit_log))); }
-    if let Some(v) = &cfg.audit_log_path { o.push_str(&format!("    audit-log-path: \"{v}\"\n")); }
-    if let Some(v) = &cfg.audit_log_hmac_key { o.push_str(&format!("    audit-log-hmac-key: \"{v}\"\n")); }
+    if let Some(v) = &cfg.audit_log_path { o.push_str(&format!("    audit-log-path: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = &cfg.audit_log_hmac_key { o.push_str(&format!("    audit-log-hmac-key: \"{}\"\n", escape_str(v))); }
     if cfg.audit_checkpoint_every != d.audit_checkpoint_every { o.push_str(&format!("    audit-checkpoint-every: {}\n", cfg.audit_checkpoint_every)); }
     if cfg.mode != d.mode { o.push_str(&format!("    mode: \"{}\"\n", cfg.mode)); }
     if let Some(v) = cfg.sync_port { o.push_str(&format!("    sync-port: {v}\n")); }
-    if let Some(v) = &cfg.sync_master { o.push_str(&format!("    sync-master: \"{v}\"\n")); }
-    if let Some(v) = &cfg.sync_key { o.push_str(&format!("    sync-key: \"{v}\"\n")); }
+    if let Some(v) = &cfg.sync_master { o.push_str(&format!("    sync-master: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = &cfg.sync_key { o.push_str(&format!("    sync-key: \"{}\"\n", escape_str(v))); }
     if cfg.sync_interval != d.sync_interval { o.push_str(&format!("    sync-interval: {}\n", cfg.sync_interval)); }
     if cfg.sync_allow_private_relay != d.sync_allow_private_relay { o.push_str(&format!("    sync-allow-private-relay: {}\n", b(cfg.sync_allow_private_relay))); }
-    if let Some(v) = &cfg.acme_email { o.push_str(&format!("    acme-email: \"{v}\"\n")); }
-    for x in &cfg.acme_domains { o.push_str(&format!("    acme-domain: \"{x}\"\n")); }
-    if let Some(v) = &cfg.acme_cache_dir { o.push_str(&format!("    acme-cache-dir: \"{v}\"\n")); }
+    if let Some(v) = &cfg.acme_email { o.push_str(&format!("    acme-email: \"{}\"\n", escape_str(v))); }
+    for x in &cfg.acme_domains { o.push_str(&format!("    acme-domain: \"{}\"\n", escape_str(x))); }
+    if let Some(v) = &cfg.acme_cache_dir { o.push_str(&format!("    acme-cache-dir: \"{}\"\n", escape_str(v))); }
     if cfg.acme_staging != d.acme_staging { o.push_str(&format!("    acme-staging: {}\n", b(cfg.acme_staging))); }
     if let Some(v) = cfg.acme_challenge_port { o.push_str(&format!("    acme-challenge-port: {v}\n")); }
-    if let Some(v) = &cfg.hsm_pkcs11_lib { o.push_str(&format!("    hsm-pkcs11-lib: \"{v}\"\n")); }
+    if let Some(v) = &cfg.hsm_pkcs11_lib { o.push_str(&format!("    hsm-pkcs11-lib: \"{}\"\n", escape_str(v))); }
     if cfg.hsm_slot != d.hsm_slot { o.push_str(&format!("    hsm-slot: {}\n", cfg.hsm_slot)); }
-    if let Some(v) = &cfg.hsm_pin { o.push_str(&format!("    hsm-pin: \"{v}\"\n")); }
-    if let Some(v) = &cfg.hsm_api_key_label { o.push_str(&format!("    hsm-api-key-label: \"{v}\"\n")); }
-    if let Some(v) = &cfg.hsm_store_key_label { o.push_str(&format!("    hsm-store-key-label: \"{v}\"\n")); }
+    if let Some(v) = &cfg.hsm_pin { o.push_str(&format!("    hsm-pin: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = &cfg.hsm_api_key_label { o.push_str(&format!("    hsm-api-key-label: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = &cfg.hsm_store_key_label { o.push_str(&format!("    hsm-store-key-label: \"{}\"\n", escape_str(v))); }
     if cfg.udp_busy_poll != d.udp_busy_poll { o.push_str(&format!("    udp-busy-poll: {}\n", b(cfg.udp_busy_poll))); }
     if cfg.xdp != d.xdp { o.push_str(&format!("    xdp: {}\n", b(cfg.xdp))); }
-    if let Some(v) = &cfg.xdp_interface { o.push_str(&format!("    xdp-interface: \"{v}\"\n")); }
+    if let Some(v) = &cfg.xdp_interface { o.push_str(&format!("    xdp-interface: \"{}\"\n", escape_str(v))); }
     if cfg.xdp_cpu_governor != d.xdp_cpu_governor { o.push_str(&format!("    xdp-cpu-governor: {}\n", if cfg.xdp_cpu_governor { "performance" } else { "no" })); }
     if cfg.xdp_irq_affinity != d.xdp_irq_affinity { o.push_str(&format!("    xdp-irq-affinity: {}\n", b(cfg.xdp_irq_affinity))); }
     if cfg.xdp_hugepages != d.xdp_hugepages { o.push_str(&format!("    xdp-hugepages: {}\n", b(cfg.xdp_hugepages))); }
@@ -190,14 +190,14 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.block_https_record != d.block_https_record { o.push_str(&format!("    block-https-record: {}\n", b(cfg.block_https_record))); }
     if cfg.block_page != d.block_page { o.push_str(&format!("    block-page: {}\n", b(cfg.block_page))); }
     if cfg.block_page_port != d.block_page_port { o.push_str(&format!("    block-page-port: {}\n", cfg.block_page_port)); }
-    if cfg.block_page_title != d.block_page_title { o.push_str(&format!("    block-page-title: \"{}\"\n", cfg.block_page_title)); }
-    if cfg.block_page_org != d.block_page_org { o.push_str(&format!("    block-page-org: \"{}\"\n", cfg.block_page_org)); }
-    if let Some(v) = &cfg.block_page_redirect_ip { o.push_str(&format!("    block-page-redirect-ip: \"{v}\"\n")); }
+    if cfg.block_page_title != d.block_page_title { o.push_str(&format!("    block-page-title: \"{}\"\n", escape_str(&cfg.block_page_title))); }
+    if cfg.block_page_org != d.block_page_org { o.push_str(&format!("    block-page-org: \"{}\"\n", escape_str(&cfg.block_page_org))); }
+    if let Some(v) = &cfg.block_page_redirect_ip { o.push_str(&format!("    block-page-redirect-ip: \"{}\"\n", escape_str(v))); }
     if cfg.block_page_allow_bypass != d.block_page_allow_bypass { o.push_str(&format!("    block-page-allow-bypass: {}\n", b(cfg.block_page_allow_bypass))); }
     if cfg.block_page_bypass_pin != d.block_page_bypass_pin { o.push_str(&format!("    block-page-bypass-pin: \"{}\"\n", cfg.block_page_bypass_pin)); }
-    for (name, alg, sec) in &cfg.tsig_keys { o.push_str(&format!("    tsig-key: \"{name}\" {alg} \"{sec}\"\n")); }
+    for (name, alg, sec) in &cfg.tsig_keys { o.push_str(&format!("    tsig-key: \"{}\" {alg} \"{}\"\n", escape_str(name), escape_str(sec))); }
     if cfg.firewall_manage != d.firewall_manage { o.push_str(&format!("    firewall-manage: {}\n", b(cfg.firewall_manage))); }
-    if let Some(v) = &cfg.firewall_backend { o.push_str(&format!("    firewall-backend: \"{v}\"\n")); }
+    if let Some(v) = &cfg.firewall_backend { o.push_str(&format!("    firewall-backend: \"{}\"\n", escape_str(v))); }
     if cfg.firewall_tag != d.firewall_tag { o.push_str(&format!("    firewall-tag: \"{}\"\n", cfg.firewall_tag)); }
     if cfg.ui_enabled != d.ui_enabled { o.push_str(&format!("    ui-enabled: {}\n", b(cfg.ui_enabled))); }
     if cfg.ui_port != d.ui_port { o.push_str(&format!("    ui-port: {}\n", cfg.ui_port)); }
@@ -214,18 +214,18 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.ui_acme_dns != d.ui_acme_dns { o.push_str(&format!("    ui-acme-dns: \"{}\"\n", cfg.ui_acme_dns)); }
     if cfg.ui_acme_cf_token != d.ui_acme_cf_token { o.push_str(&format!("    ui-acme-cf-token: \"{}\"\n", cfg.ui_acme_cf_token)); }
     if cfg.ui_acme_hook != d.ui_acme_hook { o.push_str(&format!("    ui-acme-hook: \"{}\"\n", cfg.ui_acme_hook)); }
-    if cfg.ui_brand_name != d.ui_brand_name { o.push_str(&format!("    ui-brand-name: \"{}\"\n", cfg.ui_brand_name)); }
-    if cfg.ui_brand_logo_url != d.ui_brand_logo_url { o.push_str(&format!("    ui-brand-logo-url: \"{}\"\n", cfg.ui_brand_logo_url)); }
-    if cfg.ui_accent_color != d.ui_accent_color { o.push_str(&format!("    ui-accent-color: \"{}\"\n", cfg.ui_accent_color)); }
-    if cfg.ui_favicon_url != d.ui_favicon_url { o.push_str(&format!("    ui-favicon-url: \"{}\"\n", cfg.ui_favicon_url)); }
-    for x in &cfg.ui_tls_san { o.push_str(&format!("    ui-tls-san: \"{x}\"\n")); }
+    if cfg.ui_brand_name != d.ui_brand_name { o.push_str(&format!("    ui-brand-name: \"{}\"\n", escape_str(&cfg.ui_brand_name))); }
+    if cfg.ui_brand_logo_url != d.ui_brand_logo_url { o.push_str(&format!("    ui-brand-logo-url: \"{}\"\n", escape_str(&cfg.ui_brand_logo_url))); }
+    if cfg.ui_accent_color != d.ui_accent_color { o.push_str(&format!("    ui-accent-color: \"{}\"\n", escape_str(&cfg.ui_accent_color))); }
+    if cfg.ui_favicon_url != d.ui_favicon_url { o.push_str(&format!("    ui-favicon-url: \"{}\"\n", escape_str(&cfg.ui_favicon_url))); }
+    for x in &cfg.ui_tls_san { o.push_str(&format!("    ui-tls-san: \"{}\"\n", escape_str(x))); }
     if cfg.bot_ban_duration_secs != d.bot_ban_duration_secs { o.push_str(&format!("    bot-ban-duration-secs: {}\n", cfg.bot_ban_duration_secs)); }
     if cfg.bot_honeypot_enabled != d.bot_honeypot_enabled { o.push_str(&format!("    bot-honeypot-enabled: {}\n", b(cfg.bot_honeypot_enabled))); }
     // webhooks (one block per target)
     for w in &cfg.webhooks {
-        o.push_str(&format!("    webhook: \"{}\"\n", w.url));
+        o.push_str(&format!("    webhook: \"{}\"\n", escape_str(&w.url)));
         o.push_str(&format!("    webhook-format: \"{}\"\n", fmt_str(&w.format)));
-        if let Some(t) = &w.token { o.push_str(&format!("    webhook-token: \"{t}\"\n")); }
+        if let Some(t) = &w.token { o.push_str(&format!("    webhook-token: \"{}\"\n", escape_str(t))); }
         if !w.events.is_empty() {
             let evs: Vec<&str> = w.events.iter().map(evt_str).collect();
             o.push_str(&format!("    webhook-events: \"{}\"\n", evs.join(" ")));
@@ -235,7 +235,7 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     // ── forward-zone blocks ──────────────────────────────────────────────
     for fz in &cfg.forward_zones {
         o.push_str("\nforward-zone:\n");
-        o.push_str(&format!("    name: \"{}\"\n", fz.name));
+        o.push_str(&format!("    name: \"{}\"\n", escape_str(&fz.name)));
         for a in &fz.addrs { o.push_str(&format!("    forward-addr: {a}\n")); }
         if fz.tls { o.push_str("    forward-tls-upstream: yes\n"); }
         if let Some(h) = &fz.tls_hostname { o.push_str(&format!("    forward-tls-hostname: \"{h}\"\n")); }
@@ -356,9 +356,21 @@ pub fn write_config_atomic(cfg: &UnboundConfig, path: &Path) -> std::io::Result<
             format!("refusing to write config: rendered output does not re-parse: {e}"),
         ));
     }
-    let tmp = path.with_extension("conf.tmp");
+    // SEC-I16: unpredictable temp name + O_EXCL (create_new) so a symlink pre-placed in
+    // the config dir cannot redirect the write (open fails on an existing path).
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(rendered.as_bytes())?;
         f.sync_all()?;
     }
