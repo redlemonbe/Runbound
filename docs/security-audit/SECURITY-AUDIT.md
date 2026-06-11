@@ -96,6 +96,24 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 
 **Cycle I status:** 15 fixed, 3 accepted, 4 open (enhancement), 5 disputed. Three passes (security-critical files, then `server.rs`, then the untrusted-packet `xdp/worker.rs`). The one real high-impact issue (SEC-I23, ACL bypass on loopback-relayed TCP) is fixed; the third pass added two LOW correctness/defense-in-depth items (OPEN-I26/I27). Not a clean sweep — SEC-I14 (relay body MAC) is a real accepted gap, and OPEN-I17/I18 remain. Slow-path auto-tune (v0.17.0) introduced exactly one finding (SEC-I11), fixed.
 
+### v0.17.1 — Open / Accepted remediation
+
+The Cycle I Open and Accepted findings were revisited and fixed — all except SEC-I14 (see below):
+
+| ID | Was | Now | Fix |
+|----|-----|-----|-----|
+| SEC-I16 | Accepted (LOW) | **Fixed** | `write_config_atomic` uses an unpredictable temp name + `O_EXCL` (`create_new`) — a pre-placed symlink cannot redirect the write. |
+| SEC-I15 | Accepted (LOW) | **Fixed** | `ufw` close-rule deletes the exact rule (port/proto + our comment tag), falling back to the broad match on ufw versions that ignore the comment — no longer removes a same-port admin rule. |
+| OPEN-I18 | Open (LOW) | **Fixed** | `escape_str` applied to every inline string field of `render_config` plus the user-facing settings (branding, block-page, webhook, tsig, acme, forward-zone, ui-tls-san), on top of local-data/local-zone. |
+| OPEN-I26 | Open (LOW) | **Fixed** | `start_xdp_on_iface` validates the interface name once at entry (`sanitize_iface_name`) — the config value cannot traverse out of `/sys/class/net/`. |
+| OPEN-I17 | Open (MEDIUM) | **Fixed** | `/api/clients` memoizes the sorted aggregation for 2 s — repeated authenticated requests cannot spin the CPU re-scanning the log buffer. |
+| OPEN-I27 | Open (LOW) | **Fixed** | Both fast paths (`answer_from_cache`, `answer_dns_wire`) serve only class IN; a non-IN query (e.g. CH) falls through instead of getting an IN answer. |
+
+**SEC-I14 (relay HMAC body) — remains Accepted.** Covering the body requires buffering the request body *before* the HMAC check at both receiver sites (today the handlers verify on headers, then read the body), and the change cannot be validated end-to-end while the slave is unreachable. Shipping an untested master↔slave wire-protocol change risks a silently-broken relay. The MitM vector is already closed by TOFU cert-pinned TLS (SEC-B1). To be implemented and tested when the slave is reachable, deploying the slave first (it will accept both formats).
+
+**Cycle I status (post-v0.17.1):** 21 fixed, 1 accepted (SEC-I14), 0 open, 5 disputed.
+
+
 ---
 
 ## Audit status — v0.9.44

@@ -254,7 +254,14 @@ impl FirewallManager {
                     );
                     return Ok(());
                 }
-                run("ufw", &["delete", "allow", &r]).map(|_| ())
+                // SEC-I15: delete the exact rule we created (port/proto + our comment),
+                // so a same-port admin rule is never removed; fall back to the broad match
+                // on ufw versions that ignore the comment in `delete`.
+                if run("ufw", &["delete", "allow", &r, "comment", tag]).is_ok() {
+                    Ok(())
+                } else {
+                    run("ufw", &["delete", "allow", &r]).map(|_| ())
+                }
             }
             Backend::Nftables => match rule.nft_handle {
                 Some(h) => {

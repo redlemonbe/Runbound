@@ -432,6 +432,10 @@ fn start_xdp_on_iface(
     stats: Arc<crate::stats::Stats>,
     domain_stats: Arc<crate::domain_stats::DomainStats>,
 ) -> Result<Option<XdpHandle>, String> {
+    // SEC (OPEN-I26): the interface name flows into sysfs reads (e.g. read_nic_rx_missed);
+    // validate it once here so a config value cannot traverse out of /sys/class/net/.
+    let iface = super::socket::sanitize_iface_name(iface)
+        .ok_or_else(|| format!("unsafe interface name: {iface}"))?;
     let ifidx = iface_index(iface).ok_or_else(|| format!("interface {iface} not found"))?;
 
     // #80: maximize NIC ring buffers before attaching XDP to prevent hardware
@@ -1572,7 +1576,12 @@ fn answer_from_cache(
         return None;
     }
     let qtype = u16::from_be_bytes([query_bytes[pos], query_bytes[pos + 1]]);
-    let _qclass = u16::from_be_bytes([query_bytes[pos + 2], query_bytes[pos + 3]]);
+    let qclass = u16::from_be_bytes([query_bytes[pos + 2], query_bytes[pos + 3]]);
+    // OPEN-I27: the cache holds only class-IN records (populated with QCLASS=IN); never
+    // serve them for another class (e.g. CH) — fall through to the slow path instead.
+    if qclass != 1 {
+        return None;
+    }
 
     // ANY queries are not cached (hickory returns NOTIMP per RFC 8482).
     const QTYPE_ANY: u16 = 255;
@@ -1861,7 +1870,8 @@ fn answer_dns_wire(
     const QTYPE_A:    u16 = 1;
     const QTYPE_AAAA: u16 = 28;
 
-    if wq.qtype == QTYPE_A || wq.qtype == QTYPE_AAAA {
+    // OPEN-I27: only class IN is served from the wire index (local-data is class IN).
+    if wq.qclass == 1 && (wq.qtype == QTYPE_A || wq.qtype == QTYPE_AAAA) {
         // Normalise wire QNAME to lowercase (shared helper = same bytes as load-time index).
         let qname_lc = crate::dns::wire_builder::normalize_query_qname(wq.qname_wire);
 
