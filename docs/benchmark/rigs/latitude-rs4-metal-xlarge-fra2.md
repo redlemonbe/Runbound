@@ -13,9 +13,15 @@ fabric.
 > replicate this rig. The two units are spec-identical apart from one NVMe model (see below).
 
 > **2026-06-11 — both machines reinstalled** (was Debian 13 / kernel 6.12.90 on
-> 2026-06-10): now **Ubuntu 24.04.4 LTS**, kernel **6.8.0-124-generic**, user `ubuntu`.
-> Hardware unchanged (re-verified: dmidecode, ethtool, lscpu). Sections below updated
-> accordingly; the 2026-06-10 storage/PCIe details still apply.
+> 2026-06-10): now **Ubuntu 24.04.4 LTS**, user `ubuntu`. Initial kernel
+> **6.8.0-124-generic** (the three v0.17.2 runs), upgraded the same evening to
+> **6.17.0-35-generic** (HWE) for the follow-up runs. Hardware unchanged
+> (re-verified: dmidecode, ethtool, lscpu); the 2026-06-10 storage/PCIe details
+> still apply.
+>
+> **2026-06-11 evening — the VLAN 2126 private network was removed** by the
+> maintainer. The only inter-box path is now the routed public `eno1` /31s; the
+> dual-link case is no longer reproducible as-is.
 
 ---
 
@@ -46,7 +52,9 @@ fabric.
 - generator also has 1 × Micron **7500** 7.68 TB — `MTFDKCC7T6TGP`, fw `E3MQ000`
 
 ### OS / kernel (since 2026-06-11)
-- **Ubuntu 24.04.4 LTS**, kernel **6.8.0-124-generic**, user `ubuntu`
+- **Ubuntu 24.04.4 LTS**, kernel **6.17.0-35-generic** (HWE; 6.8.0-124 until the
+  2026-06-11 evening upgrade — 6.8 and 6.17 measured numbers differ, see the
+  [kernel 6.17 follow-up report](../RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-kernel617-2026-06-11.md)), user `ubuntu`
 - CPU governor default: ⚠️ not `performance` — pin it before any measurement
 - `systemd-resolved` active (stub on 127.0.0.53/54 only — does not conflict with a
   bench bind on a test IP; check `ss -ulpn | grep :53` anyway, methodology rule 5)
@@ -62,27 +70,38 @@ fabric.
 ## Network topology (important for the bench)
 
 - The "2×100G" are the **two ports of the single BCM57508** on each machine.
-- **Latitude private network, 802.1Q VID 2126**, delivered **tagged on `eno2` only**
-  (tested 2026-06-11: `eno1.2126` = 100 % ARP/ping loss). Sub-interfaces
-  `eno2.2126`: 10.21.26.1 (generator) ↔ 10.21.26.2 (receiver), ping RTT 0.37 ms,
-  0 % loss. **Lossless at ≥10.5 M pps** in the 2026-06-11 runs.
-- The public `eno1` /31s are **routed** (1 hop, TTL 63, ~0.24 ms). Usable as a second
-  load path, but the fabric dropped **~8 %** of a ~10.5 M pps generator flood before
-  the receiver NIC (measured 2026-06-11) — prefer the VLAN for measurement.
-- An **untagged** private delivery un-bridges the hosts (ARP `INCOMPLETE`) — the
-  tagged VLAN is the only clean L2-adjacent path (2026-06-10 finding, still true).
+- **Latitude private network, 802.1Q VID 2126** (used by the three v0.17.2 runs;
+  **removed 2026-06-11 evening**): was delivered **tagged on `eno2` only** (tested:
+  `eno1.2126` = 100 % ARP/ping loss). Sub-interfaces `eno2.2126`: 10.21.26.1
+  (generator) ↔ 10.21.26.2 (receiver), ping RTT 0.37 ms, 0 % loss. **Lossless at
+  ≥10.5 M pps.** Prefer this kind of link for measurement if re-created.
+- The public `eno1` /31s are **routed** (1 hop, TTL 63, ~0.24 ms) — the only
+  inter-box path since the VLAN removal. The fabric dropped **~8 %** of a
+  ~10.5 M pps generator flood before the receiver NIC (measured 2026-06-11).
+- An **untagged** private delivery un-bridges the hosts (ARP `INCOMPLETE`/`FAILED`) —
+  re-verified 2026-06-11 after the VLAN removal; a tagged VLAN is the only clean
+  L2-adjacent path on this fabric.
 
 ## XDP / AF_XDP on this NIC — measured verdicts
 
 - `bnxt_en` supports **native XDP (DRV mode)** — Runbound attaches and serves.
 - **AF_XDP zero-copy: NOT supported** — `XDP_ZEROCOPY` bind → `EOPNOTSUPP` (errno 95)
-  on every queue. Verified on Debian 13 / kernel 6.12.90 (2026-06-10, incl. mainline
-  `bnxt_xdp.c` source check) **and re-verified on Ubuntu 24.04 / kernel 6.8.0-124**
-  (2026-06-11). Driver-feature gap; only a different NIC lifts it (Intel
-  `ice`/`i40e`/`ixgbe`, Mellanox `mlx5`).
+  on every queue. Verified on kernel 6.12.90 (2026-06-10, incl. mainline
+  `bnxt_xdp.c` source check), 6.8.0-124 **and 6.17.0-35** (2026-06-11).
+  Driver-feature gap; only a different NIC lifts it (Intel `ice`/`i40e`/`ixgbe`,
+  Mellanox `mlx5`).
 - AF_XDP **copy mode works and is usable on the receiver side**: Runbound v0.17.2
-  served 7.85 M qps single-port / 9.07 M dual-port (see the 2026-06-11 reports).
-  Copy mode is **not usable for generation** (dnsmark `--xdp` → ~10 k qps).
+  served 7.85 M qps single-port / 9.07 M dual-port on 6.8, 7.3–8.0 M single-port on
+  6.17 — **~8 M qps/port is the copy-mode drain ceiling** (stable across kernels and
+  paths; 64 queues measured worse than 32).
+- Copy-mode **generation**: dnsmark XSK TX is **wedged (0 qps) on kernel 6.8** and
+  works on **6.17 (~6.9 M qps)** — still below its kernel-UDP path (11.9 M egress on
+  6.8, **14.0 M on 6.17**), which remains the load source. On a routed path, true
+  XDP TX needs `ip neigh replace <dst> lladdr <gw_mac> dev eno1 nud permanent`
+  (otherwise silent `sendmmsg` fallback).
+- The Runbound v0.17.0 **slow-path auto-tune no-ops on bnxt** for queues and IRQs
+  (`nic_queues=0 irqs_pinned=0`; only RPS is applied) — pin IRQs manually for
+  `xdp: no` runs (filed upstream).
 - **802.1Q on this kernel:** `ethtool -K eno2 rxvlan off` is **accepted** on
   6.8.0-124 (it was refused on 6.12.90) — with it, the #188 per-packet tag-preserve
   path works and `RUNBOUND_XDP_VLAN` is not needed, including mixed
@@ -91,6 +110,8 @@ fabric.
   - kernel 6.12 (2026-06-10): `rx_ucast_packets` / `tx_ucast_packets`
   - kernel 6.8 (2026-06-11): **`rx_ucast_frames` / `tx_ucast_frames`** (port-level HW),
     drops in `rx_total_ring_discards` / `rx_stat_discard`
+  - kernel 6.17 (2026-06-11): **both** name sets exist — use the `*_ucast_frames`
+    port-HW pair (the `*_packets` aggregates are software counters; methodology rule 1)
 - dnsmark's wire-truth PHY guard does not resolve bnxt counter names (reports
   "0 qps confirmed" while traffic flows) — generator egress must be cross-checked
   against the receiver NIC counters.

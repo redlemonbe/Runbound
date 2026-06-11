@@ -70,12 +70,18 @@ so `--xdp` generation is unusable and the receiver's AF_XDP fast path runs in **
 | `xdp: yes` single link (copy mode) | **7.85 M sustained** under a 10.8 M flood, no collapse, 0 discards | 8 % | 0.024 ms | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-xdp-2026-06-11.md) |
 | `xdp: yes` dual link (copy mode) | **9.07 M sustained / 11.13 M peak** (+15.5 % vs single) | 27 % | — | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-dual-xdp-2026-06-11.md) |
 
+| **kernel 6.17 follow-up** (public path, single port) | 7.3–8.0 M sustained, peak 9.09 M (copy); `xdp: no` 5.03 M | ≤10 % / 32 % | — | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-kernel617-2026-06-11.md) |
+
 Every figure on this rig is bounded by the missing `bnxt_en` zero-copy (generator capped at
-~10.6 M qps kernel-UDP; receiver XSK drain in copy mode) — Runbound was never the limiting
-component (0 NIC ring discards, ≤27 % CPU). The real fast-path ceiling of this CPU class on
-100 G needs a zero-copy NIC (Intel `ice`/`i40e`, Mellanox `mlx5`); the earlier
+~10.6 M qps kernel-UDP on 6.8, 14.0 M on 6.17; receiver XSK drain in copy mode, **~8 M
+qps/port** across kernels) — Runbound was never the limiting component (0 NIC ring discards,
+≤27 % CPU). The real fast-path ceiling of this CPU class on 100 G needs a zero-copy NIC
+(Intel `ice`/`i40e`, Mellanox `mlx5`); the earlier
 [v0.16.9 attempt](RUNBOUND-v0.16.9-latitude-epyc9554p-bnxt-2026-06-10.md) on this rig is
-superseded by these three runs.
+superseded by these runs. The kernel-6.17 follow-up also resolves the "~10 M `xdp: no`,
+no loss" expectation: the v0.16.9 off-rig reference line was **absorption (NIC receive),
+not serving** — no configuration serves it. The VLAN was removed after the dual run
+(2026-06-11 evening); the dual case is not reproducible on the current rig.
 
 ## Files
 
@@ -88,6 +94,7 @@ superseded by these three runs.
   - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: no`](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-noxdp-2026-06-11.md)
   - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: yes` single](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-xdp-2026-06-11.md)
   - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: yes` dual](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-dual-xdp-2026-06-11.md)
+  - [Latitude EPYC 9554P / bnxt v0.17.2 kernel 6.17 follow-up](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-kernel617-2026-06-11.md)
   - [X710 v0.16.11 `xdp: yes` single-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)
   - [X710 v0.16.11 `xdp: yes` dual-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md)
   - [X710 v0.16.9 `xdp: yes`](RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md)
