@@ -7,6 +7,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-06-11
+
 ### Fixed
 - `/api/audit/tail` now resolves the configured `audit-log-path` (it previously always read `<base_dir>/audit.log`, so the endpoint returned 404 when a custom audit-log path was configured). Found during the Cycle I QA.
 
