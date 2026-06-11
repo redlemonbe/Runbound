@@ -88,7 +88,22 @@ pub fn hmac_unix_now() -> u64 {
         .as_secs()
 }
 
-pub fn hmac_sign(key: &str, method: &str, path: &str, ts: u64) -> String {
+pub fn hmac_sign(key: &str, method: &str, path: &str, ts: u64, body: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    // SEC-I14: the request body is part of the signed message (after the header line).
+    let msg = format!("{method}\n{path}\n{ts}\n");
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key size");
+    mac.update(msg.as_bytes());
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Pre-v0.17.1 header-only signature (body NOT covered). Kept only so a v0.17.1 verifier
+/// accepts a not-yet-upgraded peer during a rolling upgrade. Remove once all nodes are
+/// >= v0.17.1.
+fn hmac_sign_legacy(key: &str, method: &str, path: &str, ts: u64) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
@@ -100,23 +115,36 @@ pub fn hmac_sign(key: &str, method: &str, path: &str, ts: u64) -> String {
 
 /// Constant-time HMAC verification. Returns true iff the signature is valid
 /// AND the timestamp is within ±30 s of the current server clock.
-pub fn hmac_verify_with_ts(key: &str, method: &str, path: &str, ts: u64, sig: &str) -> bool {
-    use subtle::ConstantTimeEq as _;
+pub fn hmac_verify_with_ts(
+    key: &str,
+    method: &str,
+    path: &str,
+    ts: u64,
+    body: &[u8],
+    sig: &str,
+) -> bool {
     let now = hmac_unix_now();
     let diff = if now >= ts { now - ts } else { ts - now };
     if diff > 30 {
         return false;
     }
-    let expected = hmac_sign(key, method, path, ts);
-    // Length mismatch also returns false.
-    // Fold both length check and byte comparison into a single constant-time accumulator.
+    // SEC-I14: accept the body-covering signature (v0.17.1+); fall back to the legacy
+    // header-only signature so a not-yet-upgraded peer still verifies during a rolling
+    // upgrade. Both branches always run (no secret-dependent short-circuit).
+    let new_ok = ct_eq_hex(&hmac_sign(key, method, path, ts, body), sig) as u8;
+    let legacy_ok = ct_eq_hex(&hmac_sign_legacy(key, method, path, ts), sig) as u8;
+    (new_ok | legacy_ok) == 1
+}
+
+/// Constant-time comparison of two equal-purpose hex strings (length mismatch also fails).
+fn ct_eq_hex(expected: &str, sig: &str) -> bool {
+    use subtle::ConstantTimeEq as _;
     let len_ok: u8 = if expected.len() == sig.len() { 1 } else { 0 };
     let byte_diff: u8 = sig
         .bytes()
         .zip(expected.bytes())
         .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-    // Both checks must pass: len_ok == 1 AND byte_diff == 0.
-    let combined = byte_diff | (1u8.wrapping_sub(len_ok)); // non-zero if either fails
+    let combined = byte_diff | (1u8.wrapping_sub(len_ok));
     combined.ct_eq(&0u8).into()
 }
 
@@ -897,19 +925,16 @@ async fn handle_sync_request(
             .headers()
             .get("x-runbound-ts")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         let sig = req
             .headers()
             .get("x-runbound-sig")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
         let ts: u64 = ts_str.parse().unwrap_or(0);
-        if !hmac_verify_with_ts(&sync_key, "POST", "/nodes/register", ts, sig) {
-            return Ok(json_resp(
-                401,
-                serde_json::json!({ "error": "UNAUTHORIZED" }),
-            ));
-        }
+        // SEC-I14: read the body BEFORE verifying so the HMAC can cover it.
         let body_bytes = match req.collect().await {
             Ok(b) => b.to_bytes(),
             Err(e) => {
@@ -919,6 +944,12 @@ async fn handle_sync_request(
                 ))
             }
         };
+        if !hmac_verify_with_ts(&sync_key, "POST", "/nodes/register", ts, &body_bytes, &sig) {
+            return Ok(json_resp(
+                401,
+                serde_json::json!({ "error": "UNAUTHORIZED" }),
+            ));
+        }
         if body_bytes.len() > 4096 {
             return Ok(json_resp(
                 413,
@@ -1582,24 +1613,20 @@ async fn handle_relay_request(
         .headers()
         .get("x-runbound-ts")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let sig = req
         .headers()
         .get("x-runbound-sig")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let ts: u64 = ts_str.parse().unwrap_or(0);
-    if !hmac_verify_with_ts(&sync_key, &method, &path, ts, sig) {
-        return Ok(json_resp(
-            401,
-            serde_json::json!({ "error": "UNAUTHORIZED" }),
-        ));
-    }
 
     // Strip /relay/ prefix to get the operation path.
     let op = path.strip_prefix("/relay/").unwrap_or("").trim_matches('/');
 
-    // Read body (max 64 KiB).
+    // SEC-I14: read the body BEFORE verifying so the HMAC can cover it (max 64 KiB).
     let body_bytes = match req.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
@@ -1609,6 +1636,12 @@ async fn handle_relay_request(
             ))
         }
     };
+    if !hmac_verify_with_ts(&sync_key, &method, &path, ts, &body_bytes, &sig) {
+        return Ok(json_resp(
+            401,
+            serde_json::json!({ "error": "UNAUTHORIZED" }),
+        ));
+    }
     if body_bytes.len() > 65_536 {
         return Ok(json_resp(
             413,
@@ -2010,5 +2043,28 @@ async fn slave_status_watcher(
 
         // Remove stale keys (nodes that left the snapshot).
         prev.retain(|k, _| current_keys.contains(k));
+    }
+}
+
+
+#[cfg(test)]
+mod sec_i14_hmac_body {
+    use super::{hmac_sign, hmac_sign_legacy, hmac_unix_now, hmac_verify_with_ts};
+
+    #[test]
+    fn body_is_covered_with_legacy_fallback() {
+        let key = "k";
+        let body = br#"{"node_id":"x"}"#;
+        let ts = hmac_unix_now();
+        let sig = hmac_sign(key, "POST", "/relay/dns", ts, body);
+        // valid body-covering signature verifies
+        assert!(hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &sig));
+        // a tampered body is rejected
+        assert!(!hmac_verify_with_ts(key, "POST", "/relay/dns", ts, b"tampered", &sig));
+        // a legacy (header-only) signature still verifies (rolling-upgrade compat)
+        let legacy = hmac_sign_legacy(key, "POST", "/relay/dns", ts);
+        assert!(hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &legacy));
+        // wrong key is rejected
+        assert!(!hmac_verify_with_ts("other", "POST", "/relay/dns", ts, body, &sig));
     }
 }

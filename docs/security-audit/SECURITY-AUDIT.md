@@ -109,9 +109,9 @@ The Cycle I Open and Accepted findings were revisited and fixed — all except S
 | OPEN-I17 | Open (MEDIUM) | **Fixed** | `/api/clients` memoizes the sorted aggregation for 2 s — repeated authenticated requests cannot spin the CPU re-scanning the log buffer. |
 | OPEN-I27 | Open (LOW) | **Fixed** | Both fast paths (`answer_from_cache`, `answer_dns_wire`) serve only class IN; a non-IN query (e.g. CH) falls through instead of getting an IN answer. |
 
-**SEC-I14 (relay HMAC body) — remains Accepted.** Covering the body requires buffering the request body *before* the HMAC check at both receiver sites (today the handlers verify on headers, then read the body), and the change cannot be validated end-to-end while the slave is unreachable. Shipping an untested master↔slave wire-protocol change risks a silently-broken relay. The MitM vector is already closed by TOFU cert-pinned TLS (SEC-B1). To be implemented and tested when the slave is reachable, deploying the slave first (it will accept both formats).
+**SEC-I14 (relay HMAC body) — Fixed (v0.17.1).** The relay HMAC now covers the request body (both receiver handlers buffer the body before verifying). Backward-compatible: a v0.17.1 verifier also accepts the legacy header-only signature, so a not-yet-upgraded peer still authenticates during a rolling upgrade (unit-tested: body coverage + tamper rejection + legacy fallback + wrong-key rejection). End-to-end relay not re-tested live (slave unreachable). **Deploy note: the relay is fully functional only once BOTH master and slave are >= v0.17.1.**
 
-**Cycle I status (post-v0.17.1):** 21 fixed, 1 accepted (SEC-I14), 0 open, 5 disputed.
+**Cycle I status (post-v0.17.1):** 22 fixed, 0 accepted, 0 open, 5 disputed.
 
 
 ---

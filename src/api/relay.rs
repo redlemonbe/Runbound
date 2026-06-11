@@ -95,7 +95,7 @@ async fn relay_request(
     use hyper_util::rt::TokioIo;
 
     let ts = hmac_unix_now();
-    let sig = hmac_sign(sync_key, method, path, ts);
+    let sig = hmac_sign(sync_key, method, path, ts, &body);
 
     let tcp = tokio::time::timeout(
         Duration::from_secs(5),
@@ -380,7 +380,7 @@ pub async fn register_with_master(
     };
 
     let ts = hmac_unix_now();
-    let sig = hmac_sign(&sync_key, "POST", "/nodes/register", ts);
+    let sig = hmac_sign(&sync_key, "POST", "/nodes/register", ts, &body);
 
     let tls_config = relay_tls_config();
     let sni_host = master_sync_addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&master_sync_addr);
