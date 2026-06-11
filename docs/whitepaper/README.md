@@ -10,10 +10,11 @@ Runbound does but *how* and *why* — down to the hand-written assembly on the h
 and the eBPF verifier constraints that shaped the in-kernel code.
 
 > **Status & honesty.** This document describes the code as it exists in the repository
-> at the stated version. Where a claim is not backed by a measurement or by the code,
-> it is marked **"I cannot confirm this."** No marketing language is used: the words
-> *production-ready, blazing, world-first, military-grade, rock-solid, unbreakable,
-> guaranteed* are banned, in line with the project's security-audit conventions.
+> at **v0.17.2** (last full sync pass: 2026-06-11). Where a claim is not backed by a
+> measurement or by the code, it is marked **"I cannot confirm this."** No marketing
+> language is used: the words *production-ready, blazing, world-first, military-grade,
+> rock-solid, unbreakable, guaranteed* are banned, in line with the project's
+> security-audit conventions.
 
 ---
 
@@ -25,9 +26,9 @@ Each chapter is a standalone Markdown file. Line references point at real source
 | # | Chapter | What it covers |
 |---|---------|----------------|
 | 01 | [Architecture](01-architecture.md) | The dual-path model (XDP fast path / kernel slow path), process model, packet life-cycle, the shared wire answer routine |
-| 02 | [The XDP fast path](02-fast-path-xdp.md) | eBPF program, AF_XDP zero-copy, XSKMAP/CPUMAP routing, the zero-alloc wire response builder |
+| 02 | [The XDP fast path](02-fast-path-xdp.md) | eBPF program, AF_XDP zero-copy, XSKMAP/CPUMAP routing, 802.1Q tagged fabrics, per-view split-horizon snapshots, the zero-alloc wire response builder (positive + negative answers) |
 | 03 | [SIMD & hand-written assembly](03-simd-and-asm.md) | CRC32c domain hashing, AVX2/SSE2 label lowercasing & comparison, the eBPF FNV-vs-CRC verifier story |
-| 04 | [The slow path](04-slow-path.md) | the `xdp:no` kernel fast loop (SO_REUSEPORT per core, by-CPU cBPF + RPS, batched recvmmsg, shared rate-limit/ban gate, shared wire responder); hickory fallback (recursion, DoT/DoH, DNSSEC AD, serve-stale) |
+| 04 | [The slow path](04-slow-path.md) | the `xdp:no` kernel fast loop (SO_REUSEPORT per core, by-CPU cBPF + RPS, batched recvmmsg/sendmmsg, shared rate-limit/ban gate, shared wire responder); startup NIC auto-tune (NUMA-local queues/IRQs, RPS, coalescing); hickory fallback (recursion, DoT/DoH, DNSSEC AD, serve-stale) |
 | 05 | [Caching](05-cache.md) | Cache sizing under cgroup v2, stale serving, negative cache |
 | 06 | [Control plane](06-control-plane.md) | REST API (axum), config-writer (atomic full-regen), web UI, HMAC relay, SSE, split-horizon, Unix socket |
 | 07 | [Security](07-security.md) | rate-limit + bans on both datapaths (one shared gate), DNSSEC AD, constant-time auth, least-privilege systemd, HMAC relay, reproducible build + signatures, SBOM, audit discipline |

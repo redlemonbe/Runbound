@@ -33,8 +33,14 @@ restart (split-horizon, whose resolver table is built at boot).
 `src/api/relay.rs` + `src/sync.rs` implement encrypted command forwarding (issues #85/#87/
 #88):
 
-- **Authentication = HMAC-SHA256** over the request, with `X-Relay-Timestamp` +
-  `X-Relay-HMAC`, anti-replay window ±30 s.
+- **Authentication = HMAC-SHA256 over method + path + timestamp + request body**
+  (SEC-I14, v0.17.1 — before that the body was not covered), carried in the
+  `x-runbound-ts` + `x-runbound-sig` headers (`src/api/relay.rs:136`), anti-replay
+  window ±30 s. Verification is constant-time and **dual-accept**: both the
+  body-covering and the legacy header-only signature are computed and compared (no
+  secret-dependent short-circuit — `hmac_verify_with_ts`, `src/sync.rs:118`) so a
+  not-yet-upgraded peer still verifies during a rolling upgrade. Deploy note: the relay
+  is fully functional only once **both** master and slave run ≥ v0.17.1.
 - **Confidentiality = rustls TLS**, but with a **custom verifier that does not validate the
   certificate chain** (`NoCertVerifier`, `src/api/relay.rs:35`). The comment is explicit:
   *"HMAC-SHA256 provides authentication; the TLS layer still encrypts — only cert
@@ -46,7 +52,15 @@ restart (split-horizon, whose resolver table is built at boot).
   > confirmed in code during a security review.
 - **Sync** is a delta journal (`SyncJournal`, capacity 1000) over TOFU TLS, with SHA-256
   content hashing (`src/sync.rs`).
-- **Auto-registration**: the slave registers itself to the master on startup.
+- **Auto-registration**: the slave registers itself to the master on startup
+  (`POST /nodes/register`, HMAC-signed, `src/sync.rs:923`). The master validates the
+  advertised `relay_host` against SSRF: loopback, unspecified, link-local, IPv6 ULA and
+  — unless `sync-allow-private-relay: yes` is set on the master — **RFC 1918 private
+  ranges are rejected with 400** (`src/sync.rs:1047`). LAN deployments (a slave at a
+  private address, the common self-hosted case) therefore **require**
+  `sync-allow-private-relay: yes` in the master config; without it registration fails
+  with `INVALID_RELAY_HOST` and the slave logs only `Registration returned non-200
+  status=400`.
 
 ## 6.4 SSE, backup/restore, split-horizon, web UI
 

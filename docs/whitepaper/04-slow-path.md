@@ -22,11 +22,21 @@ hickory **fallback** pipeline:
   the process; capped at 16 on a Xeon-v2 + X520 host). The kernel's default 4-tuple hash is
   uneven for a few flows, so an `SO_ATTACH_REUSEPORT_CBPF` *by-CPU* program (returning
   `SKF_AD_CPU`) plus RPS spreads datagrams evenly across the group — flat per-socket load.
-- **Batched receive with `recvmmsg`** (`MSG_WAITFORONE`): one syscall drains up to 32
-  datagrams instead of one syscall per datagram. Per-packet `recv_from` cannot keep the
+- **Batched receive with `recvmmsg`** (`MSG_WAITFORONE`): one syscall drains up to 64
+  datagrams (`BATCH = 64`, `src/dns/kernel_loop.rs:233`; raised from 32 in v0.17.0)
+  instead of one syscall per datagram. Per-packet `recv_from` cannot keep the
   socket buffer empty under burst — the overflow shows up as `UdpRcvbufErrors`, not a NIC
   drop. `MSG_WAITFORONE` returns as soon as ≥1 datagram is ready, so a lone query (e.g.
   `dig`) is still answered immediately — no batching latency for single queries.
+- **Batched transmit with `sendmmsg`** (v0.17.0): answered responses from one `recvmmsg`
+  batch are collected and flushed with a **single** `sendmmsg`
+  (`src/dns/kernel_loop.rs:235`) — one syscall per batch on the TX side too, with the
+  iovec/header arrays allocated once, not per batch.
+- **32 MiB socket buffers**: each kloop socket requests `SO_RCVBUF = 32 MiB`
+  (`RCVBUF_SIZE`, `src/dns/kernel_loop.rs:64`) so NAPI bursts are absorbed instead of
+  dropped as `UdpRcvbufErrors`; startup auto-raises `net.core.rmem_max`/`wmem_max` to
+  match (best-effort, root — `src/dns/server.rs:2603`) and warns if the kernel clamps
+  the buffer.
 - **The shared per-source gate.** Every datagram passes the *same* gate the XDP path uses,
   driven by the *same* objects: `rl_should_drop()` (the memoized per-source rate-limit) and
   `icmp_stats.is_banned()` (the ban set). One mechanism governs both routes, exactly like
@@ -80,8 +90,38 @@ the racing resolvers carried no cache, so `xdp: no` forwarded *every* query (cac
 hickory **fallback** still infers a hit from latency (a lookup under
 `CACHE_HIT_THRESHOLD_US`, `crate::stats`).
 
+## 4.5 NIC auto-tune at startup (v0.17.0, `xdp: no` only)
+
+When a slow-path interface is **explicitly named** in the config, startup reads the live
+topology and tunes the NIC for kernel-UDP throughput (`src/dns/server.rs:2590-2675`):
+
+- **RX queue count = the NIC's NUMA-node logical-CPU count**, capped at 32
+  (`SLOWPATH_QUEUE_CAP`) and at the serving-core count. The kernel-UDP path is bounded by
+  NAPI saturating the NIC-node-local cores, so one RX queue (and IRQ) per node-local
+  logical CPU drains the ring at line rate while leaving the rest of the machine to the
+  serving threads.
+- **One IRQ pinned per node-local CPU** (`crate::cpu::set_irq_affinity`), wrapping if
+  queues exceed node CPUs, after a 300 ms settle so the driver recreates its IRQs
+  post-channel-change.
+- **RPS spread across all physical serving cores** (`crate::cpu::set_rps_cores`) — the
+  dominant lever: the in-code measurement note records 0.5 M → 6.4 M qps from RPS alone
+  on the X710/5995WX rig.
+- **`rx-usecs 25`, adaptive-rx off** (moderate coalescing — fewer NAPI re-arms at a
+  ~25 µs latency cost) and **`rx-flow-hash udp4 sdfn`** so a few client IPs (NATs,
+  forwarders, a benchmark generator) still fan across all queues. Best-effort `ethtool`
+  shell-outs; skipped if `ethtool` is absent.
+
+Safety: queue/IRQ retuning happens **only on an explicitly named NIC** — a
+combined-channel change resets the link and must never hit a management interface. RPS,
+which is harmless on an idle NIC, is applied to every detected physical NIC. Per the
+CHANGELOG (v0.17.0), this took the measured kernel slow path from ~3.4 M to ~7.3 M+
+served qps (peak 8.16 M, at the i40e NAPI ceiling) on the X710/5995WX rig, with the
+AF_XDP fast path byte-for-byte unchanged. The auto-tune adapts to the card (which NUMA
+node it sits on) and the CPU (node size); NIC families with hardware flow steering (e.g.
+mlx5 aRFS) may prefer a different strategy — a driver-aware path is future work.
+
 ## To expand (verify against code)
-- Negative caching state machine (RFC 2308, #166): NXDOMAIN cached vs SERVFAIL treated as
-  transient (must not be cached long — false-negative trap).
 - serve-stale (#108) exact TTL policy.
 - resolv.conf emergency fallback (#94).
+- (Negative caching #166 is documented in [02-fast-path-xdp.md](02-fast-path-xdp.md) §2.5
+  — the kloop serves the same snapshot, see §4.4.)

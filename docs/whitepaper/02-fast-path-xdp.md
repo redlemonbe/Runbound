@@ -14,7 +14,11 @@ Files: `ebpf/dns_xdp.c`, `src/dns/xdp/{loader,socket,umem,worker,wire_builder}.r
 `dns_xdp` (`ebpf/dns_xdp.c:289`) runs on every frame the NIC delivers to the XDP hook,
 before the kernel network stack. Its logic, in order:
 
-1. **Parse Ethernet.** If not IPv4/IPv6, `XDP_PASS` (hand to kernel).
+1. **Parse Ethernet.** If the frame carries one 802.1Q VLAN tag (`ETH_P_8021Q`), skip
+   exactly one tag to reach the inner ethertype (#188, `ebpf/dns_xdp.c:302` — on a tagged
+   fabric with `rx-vlan-offload` off the tag stays inside the frame). If the result is
+   not IPv4/IPv6, `XDP_PASS` (hand to kernel). Untagged traffic pays one extra ethertype
+   compare per frame and is otherwise byte-for-byte unchanged.
 2. **ICMP echo (IPv4).** If enabled in config, rate-limit per source IP and answer the
    echo in place with `XDP_TX` (see §3.7). Otherwise `XDP_PASS`.
 3. **Must be UDP, dest port 53.** Anything else (TCP for DoT/DoH/AXFR, other ports)
@@ -134,6 +138,25 @@ ambiguous `Option<usize>` (`src/dns/xdp/worker.rs:WireResult`):
 
 The explicit enum exists because an earlier `Some(0)` sentinel was a footgun (#155 review).
 
+### Split-horizon on the fast path (#187)
+
+Each configured split-horizon view is compiled into a **per-view wire snapshot**
+(`crate::dns::cache_snapshot::ViewSnapshots`). The worker loads the view set once per RX
+batch with a lock-free `ArcSwap` read (`src/dns/xdp/worker.rs:942`) and, per query,
+matches the client source IP to its view **before** consulting the global cache
+(`src/dns/xdp/worker.rs:1264`) — so a per-source override always wins on the fast path and
+answers cannot leak across views. View edits through the API hot-swap the snapshots live
+(no restart), reusing the same wire serialisation as the global local-data preload.
+Coverage is A/AAAA — the same as the global preload; other record types in a view fall
+through to the slow path. When no split-horizon is configured the per-packet cost is zero
+(the `Option` is `None`).
+
+### VLAN tag on TX
+
+The in-place reply preserves the 802.1Q tag that arrived in the frame. For NICs that
+strip the RX tag in hardware and refuse to disable it (e.g. bnxt), `RUNBOUND_XDP_VLAN=<vid>`
+re-inserts one tag on the reply (`src/dns/xdp/worker.rs:93`).
+
 ---
 
 ## 2.5 The zero-allocation response builder
@@ -154,9 +177,17 @@ File: `src/dns/xdp/wire_builder.rs`. This replaces hickory's
   repeated, saving bytes and a copy. Flags are set to `QR=1 AA=1 RD RA RCODE=0`
   (authoritative NOERROR, `src/dns/xdp/wire_builder.rs:34`).
 
-Only A (1) and AAAA (28) are handled in wire form today; NXDOMAIN/NODATA/REFUSED and EDNS
-echo for other shapes are explicitly listed as "next deliveries" in the source header — so
-I will not claim they are wire-accelerated.
+Positive answers are wire-built for A (1) and AAAA (28). Negative and error responses are
+also wire-built: `build_nxdomain` / `build_nodata` / `build_refused`
+(`src/dns/xdp/wire_builder.rs:388-520`) write RFC-minimal responses (no SOA in authority)
+directly into the TX frame. Since #166 (v0.10.5), `NXDOMAIN` and `NODATA` results are
+**cached as wire answers** on the fast path (RFC 2308), keyed by name + type, with a TTL
+derived from the SOA `MINIMUM` field clamped to [60, 900] s; `SERVFAIL` is deliberately
+never cached (transient condition). On a Tranco top-10 000 corpus this change removed a
+17 % steady-state miss rate dominated by repeated `NODATA`/`AAAA` lookups (CHANGELOG
+v0.10.5). Note: the summary comment at the top of `wire_builder.rs` still says
+"NXDOMAIN, NODATA, REFUSED: next deliveries" — that comment is stale; the builders below
+it are the code that runs.
 
 ---
 
