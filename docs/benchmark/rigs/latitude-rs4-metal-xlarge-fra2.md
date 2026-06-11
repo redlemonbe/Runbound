@@ -54,7 +54,7 @@ fabric.
 ### OS / kernel (since 2026-06-11)
 - **Ubuntu 24.04.4 LTS**, kernel **6.17.0-35-generic** (HWE; 6.8.0-124 until the
   2026-06-11 evening upgrade — 6.8 and 6.17 measured numbers differ, see the
-  [kernel 6.17 follow-up report](../RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-kernel617-2026-06-11.md)), user `ubuntu`
+  [consolidated report](../RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md)), user `ubuntu`
 - CPU governor default: ⚠️ not `performance` — pin it before any measurement
 - `systemd-resolved` active (stub on 127.0.0.53/54 only — does not conflict with a
   bench bind on a test IP; check `ss -ulpn | grep :53` anyway, methodology rule 5)

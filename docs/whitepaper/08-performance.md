@@ -28,14 +28,13 @@ any figure not yet re-measured.
 - The naïve hickory slow path measured **1.78× Unbound's instructions/query** — the reason
   the fast paths exist (§1.2).
 
-## X710 10 GbE — the current reference numbers (v0.16.9 / v0.16.11)
+## X710 10 GbE — the current reference numbers (v0.16.11)
 
 Measured on the documented rig (receiver: 5995WX + Intel X710-DA2; generator: dual Xeon
 E5-2690 v2 + X710, direct DACs; dnsmark 2.2.1, XDP zero-copy both sides, NIC-counter
 truth):
 
-- **Single link** ([report](../benchmark/RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md),
-  [v0.16.11](../benchmark/RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)):
+- **Single link** ([report](../benchmark/RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)):
   offered reaches the 10 G line rate (~13.0 M qps of 78-byte queries); **served capped at
   10.09 M** by the *response-direction* line rate (answers are larger than queries) — a
   link property, not a server one.
