@@ -1,23 +1,43 @@
 # Runbound — Benchmark index
 
-This directory holds every Runbound performance benchmark, each produced under the same
-[methodology](README.md) and [report template](TEMPLATE.md). Truth is always the **receiver
-NIC hardware counters** (`ethtool -S` — names are driver-specific: `tx_pkts_nic`/`rx_pkts_nic`
-on i40e, `tx_ucast_frames`/`rx_ucast_frames` on bnxt, plus the per-driver drop counters; see
-each report's appendix), never the generator's self-reported round-trip.
+## Measured speeds at a glance
 
-## Summary — same rig, same generator, same methodology
+Maximum **served** throughput per run — receiver NIC hardware counters, never the
+generator's self-reported rate. Full context behind every number in its report.
 
-All runs below: **AMD Threadripper PRO 5995WX**, single **Intel X520 / 82599** (10 GbE,
-PCIe 2.0 x8), generator **dnsmark** (AF_XDP open-loop) on dual Xeon E5-2690 v2, warm cache,
-no local-data, governor `performance`, flow-control off, RSS `udp4 sdfn`.
+| Max served | Latency (p50) | Receiver CPU | Configuration | Rig / NIC | Report |
+|-----------:|--------------:|-------------:|---------------|-----------|--------|
+| **13.15 M qps** | 0.21–0.30 ms band to ~12.8 M | **~11 %** | Runbound v0.16.11 — `xdp: yes`, **dual link**, AF_XDP **zero-copy** | 5995WX + 2× X710 10G | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md) |
+| **10.09 M qps** | p50 < 1 ms up to 10.56 M offered | ~11 % | Runbound v0.16.11 — `xdp: yes`, single link, zero-copy (served cap = link response direction) | 5995WX + X710 10G | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md) |
+| **~10.1 M qps** | 0.062 ms | ~11 % (≈31 cores) | Runbound v0.16.1 — `xdp: yes`, zero-copy (NIC PCIe-2.0 bus-bound) | 5995WX + X520 10G | [report](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md) |
+| **9.07 M qps** (peak 11.13 M) | — | ~27 % | Runbound v0.17.2 — `xdp: yes`, dual link, **copy mode** (bnxt: no zero-copy) | EPYC 9554P + 2× BCM57508 100G | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
+| **7.85 M qps** | wire p50 **0.024 ms** | **~8 %** | Runbound v0.17.2 — `xdp: yes`, single link, copy mode, no collapse under 10.8 M flood | EPYC 9554P + BCM57508 100G | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
+| **~7.3 M qps** | ~0.09 ms | ~55 % (≈70 cores) | Runbound v0.16.1 — **`xdp: no`** (kernel slow path) | 5995WX + X520 10G | [report](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md) |
+| **4.09–5.03 M qps** | wire p50 0.047 ms | ~32 % | Runbound v0.17.2 — `xdp: no` (kernels 6.8 / 6.17; auto-tune no-ops on bnxt, #190) | EPYC 9554P + BCM57508 100G | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
+| 3.59 M qps | 0.195 ms | ~65 % (64 thr) | **unbound 1.22.0** (baseline) | 5995WX + X520 10G | [baseline](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md) |
+| 2.98 M qps | 0.068 ms | 100 % (128 thr) | **BIND 9.20.23** (baseline) | 5995WX + X520 10G | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md) |
 
-| Server | Max served (NIC truth) | Cores at max | Cache-hit latency (p50) | Report |
-|--------|-----------------------:|--------------|------------------------:|--------|
-| **Runbound `xdp: yes`** (AF_XDP fast path) | **~10.1 M QPS** | ~31 | 0.062 ms | [report](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md) |
-| **Runbound `xdp: no`** (kernel slow path) | **~7.3 M QPS** | ~70 | ~0.09 ms | [report](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md) |
-| unbound 1.22.0 | ~3.59 M QPS | 64 (~65% CPU) | 0.195 ms | [baseline](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md) |
-| BIND 9.20.23 | ~2.98 M QPS | 128 (all, 100%) | 0.068 ms | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md) |
+Reading rules for this table:
+
+- **Compare within one rig only** (methodology rule 6). Same-rig comparisons that hold:
+  Runbound fast path vs slow path vs unbound vs BIND on the X520 rig; single vs dual on
+  X710; `xdp: no` vs copy-mode XDP on the EPYC/bnxt rig. Cross-rig numbers are functions
+  of their NIC/driver/kernel.
+- **No run above saturates Runbound itself.** X710 dual: ceiling = generator (~13.2 M pps).
+  X520: NIC PCIe-2.0 bus. EPYC/bnxt: missing `bnxt_en` zero-copy (copy-mode drain ~8 M
+  qps/port) and generator. At every fast-path maximum Runbound sits at ≤27 % CPU with
+  ~0 NIC drops — the measured numbers are floors, not the server's ceiling.
+- Truth source: receiver NIC hardware counters (`ethtool -S` — driver-specific names:
+  `tx_pkts_nic`/`rx_pkts_nic` on i40e, `tx_ucast_frames`/`rx_ucast_frames` on bnxt),
+  timestamped 1 Hz deltas. Latency: dnsmark round-trip, wire-anchored by tcpdump where
+  stated. Every run follows [README.md](README.md) (warmup + ramp) and
+  [TEMPLATE.md](TEMPLATE.md).
+
+## X520 rig — Runbound vs reference resolvers (same rig, same generator)
+
+**AMD Threadripper PRO 5995WX**, single **Intel X520 / 82599** (10 GbE, PCIe 2.0 x8),
+generator **dnsmark** (AF_XDP open-loop) on dual Xeon E5-2690 v2, warm cache, no
+local-data, governor `performance`, flow-control off, RSS `udp4 sdfn`.
 
 On this rig Runbound's kernel slow path serves roughly **2–2.5×** the two reference
 resolvers, and its AF_XDP fast path roughly **2.8–3.4×**, at lower latency and far fewer
@@ -25,26 +45,17 @@ engaged cores. Both baselines were measured with an explicit offered-load ramp (
 built-in `--ramp` yields no RTT samples against a flooded kernel-UDP server); see each
 report for the full curve and the saturation knee.
 
-## The ceiling on this rig is the NIC bus, not Runbound
-
-At 10.1 M served the AF_XDP fast path used **~11 % CPU** — it is **bus-bound** by the X520's
+At 10.1 M served the AF_XDP fast path used ~11 % CPU — it is **bus-bound** by the X520's
 PCIe 2.0 x8 RX path (the NIC receives ~10.7 M pps and drops the rest), not CPU-bound. The
 two reference resolvers, by contrast, plateau on their own per-query kernel-UDP cost
 (BIND saturates all 128 cores; unbound peaks at 64 threads). Because Runbound keeps large
-CPU headroom, a NIC without the PCIe 2.0 RX cap (e.g. a PCIe-3.0 card) would raise its
-numbers toward the link rate; the reference resolvers would not move as much, being
-CPU-limited first. Any such figure is **a function of this rig**, recorded in the reports,
-not asserted as a universal claim.
+CPU headroom, a NIC without the PCIe 2.0 RX cap raises its numbers toward the link rate;
+the reference resolvers would not move as much, being CPU-limited first.
 
-## X710 (PCIe 3.0) — the X520 bus cap lifted
+## X710 rig (PCIe 3.0) — the X520 bus cap lifted
 
 Same hosts and methodology, single Intel **X710** (i40e, PCIe 3.0) DAC replacing the
-X520, second receiver port administratively down (single-link case):
-
-| Run | Max served (NIC truth) | Offered peak | Knee (p50 < 1 ms) | NIC RX loss | Report |
-|-----|-----------------------:|-------------:|------------------:|------------:|--------|
-| Runbound v0.16.11 `xdp: yes` | **10.09 M QPS** (timestamped) | 13.04 M (10G line rate) | 10.56 M offered | 0 | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md) |
-| Runbound v0.16.11 `xdp: yes` **dual link** | **13.15 M QPS** (sum of 2 ports, 99.8% of offered) | 13.18 M (generator cap) | ~13.0 M total | ~0.002 %/run | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md) |
+X520, second receiver port administratively down in the single-link case.
 
 The v0.16.11 single-link run includes a same-method A/B against the previous binary
 (v0.16.9, measured at ~10.1 M on the same rig): served -0.06 %, knee +0.02 % — the
@@ -62,22 +73,16 @@ Two identical Latitude.sh `rs4.metal.xlarge` ([rig](rigs/latitude-rs4-metal-xlar
 Runbound **v0.17.2**, generator dnsmark v2.2.1 over **kernel-UDP** — `bnxt_en` has **no
 AF_XDP zero-copy** in any kernel (`XDP_ZEROCOPY` bind = errno 95; verified on 6.8, 6.12
 and 6.17), so `--xdp` generation is unusable and the receiver's AF_XDP fast path runs in
-**copy mode**. Four runs, one [consolidated report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md):
-
-| Run | Max served (NIC truth) | CPU at max | Wire p50 (30 k qps) |
-|-----|-----------------------:|-----------:|--------------------:|
-| `xdp: no` (kernel slow path, 6.8) | 4.09 M sustained (5.45 M burst); collapses under an 11 M flood | 32 % | 0.047 ms |
-| `xdp: yes` single link (copy mode, 6.8) | **7.85 M sustained** under a 10.8 M flood, no collapse, 0 discards | 8 % | 0.024 ms |
-| `xdp: yes` dual link (copy mode, 6.8) | **9.07 M sustained / 11.13 M peak** (+15.5 % vs single) | 27 % | — |
-| kernel 6.17 follow-up (single port) | 7.3–8.0 M (copy, peak 9.09 M); `xdp: no` 5.03 M | ≤10 % / 32 % | — |
+**copy mode**. Four runs (xdp:no, XDP single, XDP dual, kernel-6.17 follow-up) in one
+[consolidated report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md).
 
 Every figure on this rig is bounded by the missing `bnxt_en` zero-copy (generator capped
 at ~10.6 M qps kernel-UDP on 6.8, 14.0 M on 6.17; receiver XSK drain in copy mode, **~8 M
 qps/port** across kernels) — Runbound was never the limiting component (0 NIC ring
 discards, ≤27 % CPU). These copy-mode figures must **not** be compared with the X710
-zero-copy figures above (methodology rule 6). The real fast-path ceiling of this CPU
-class on 100 G needs a zero-copy NIC (Intel `ice`/`i40e`, Mellanox `mlx5`) — verify the
-exact NIC model before renting; "100 G" alone says nothing.
+zero-copy figures above. The real fast-path ceiling of this CPU class on 100 G needs a
+zero-copy NIC (Intel `ice`/`i40e`, Mellanox `mlx5`) — verify the exact NIC model before
+renting; "100 G" alone says nothing.
 
 ## Files
 
