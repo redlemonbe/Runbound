@@ -56,6 +56,27 @@ the single-link 10.09 M served cap was the link's response direction, not the se
 In dual-link the ceiling moves to the **generator** (dual Xeon v2 pushes ~13.2 M pps
 total across any number of NICs); Runbound's own ceiling on this rig was not reached.
 
+## EPYC 9554P + Broadcom BCM57508 100 G (Latitude fra2) — the bnxt copy-mode reference
+
+Two identical Latitude.sh `rs4.metal.xlarge` ([rig](rigs/latitude-rs4-metal-xlarge-fra2.md)),
+Runbound **v0.17.2**, generator dnsmark v2.2.1 over **kernel-UDP** (`bnxt_en` has **no AF_XDP
+zero-copy** — `XDP_ZEROCOPY` bind = errno 95 on both hosts, re-verified on kernel 6.8 after 6.12 —
+so `--xdp` generation is unusable and the receiver's AF_XDP fast path runs in **copy mode**),
+802.1Q VLAN 100 G test link, warm cache, same methodology:
+
+| Run | Max served (NIC truth) | CPU at max | Wire p50 (30 k qps) | Report |
+|-----|-----------------------:|-----------:|--------------------:|--------|
+| `xdp: no` (kernel slow path) | 4.09 M sustained (5.45 M burst); collapses to ~2.5–2.9 M under an 11 M flood | 32 % | 0.047 ms | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-noxdp-2026-06-11.md) |
+| `xdp: yes` single link (copy mode) | **7.85 M sustained** under a 10.8 M flood, no collapse, 0 discards | 8 % | 0.024 ms | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-xdp-2026-06-11.md) |
+| `xdp: yes` dual link (copy mode) | **9.07 M sustained / 11.13 M peak** (+15.5 % vs single) | 27 % | — | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-dual-xdp-2026-06-11.md) |
+
+Every figure on this rig is bounded by the missing `bnxt_en` zero-copy (generator capped at
+~10.6 M qps kernel-UDP; receiver XSK drain in copy mode) — Runbound was never the limiting
+component (0 NIC ring discards, ≤27 % CPU). The real fast-path ceiling of this CPU class on
+100 G needs a zero-copy NIC (Intel `ice`/`i40e`, Mellanox `mlx5`); the earlier
+[v0.16.9 attempt](RUNBOUND-v0.16.9-latitude-epyc9554p-bnxt-2026-06-10.md) on this rig is
+superseded by these three runs.
+
 ## Files
 
 - [README.md](README.md) — the standard methodology (warmup + ramp, NIC-counter truth, host
@@ -64,6 +85,9 @@ total across any number of NICs); Runbound's own ceiling on this rig was not rea
 - [runbound-receiver-bench.conf](runbound-receiver-bench.conf) — the receiver config used
   for the Runbound runs (`xdp:no`, real forward-zone, no local-data, `rate-limit: 0`).
 - **Runbound runs**
+  - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: no`](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-noxdp-2026-06-11.md)
+  - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: yes` single](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-xdp-2026-06-11.md)
+  - [Latitude EPYC 9554P / bnxt v0.17.2 `xdp: yes` dual](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-dual-xdp-2026-06-11.md)
   - [X710 v0.16.11 `xdp: yes` single-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)
   - [X710 v0.16.11 `xdp: yes` dual-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md)
   - [X710 v0.16.9 `xdp: yes`](RUNBOUND-v0.16.9-threadripper-5995wx-x710-xdp-2026-06-10.md)
