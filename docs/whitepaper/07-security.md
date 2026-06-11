@@ -1,6 +1,7 @@
 # 07 — Security
 
-> **Status: draft outline** — cross-references `SECURITY.md`, `THREAT_MODEL.md`,
+> **Status: current (v0.17.2)** — condensed, with code anchors; open items are listed
+> at the end. Cross-references `SECURITY.md`, `THREAT_MODEL.md`,
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 
 - **Transport crypto.** `rustls` 0.23 (TLS 1.2 + 1.3) for DoT/DoH/DoQ and the relay.

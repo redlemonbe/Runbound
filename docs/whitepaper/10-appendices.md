@@ -1,7 +1,7 @@
 # 10 — Appendices
 
-> **Status: draft outline** — generated references to be cross-linked with
-> `docs/configuration.md` and `docs/api.md` rather than duplicated.
+> **Status: current (v0.17.2)** — intentionally pointer-style: references
+> `docs/configuration.md` and `docs/api.md` rather than duplicating them.
 
 ## A. Configuration reference
 See `docs/configuration.md`. Notable directives: `xdp`, `api-port`, `api-key`,

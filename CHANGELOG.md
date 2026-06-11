@@ -421,11 +421,11 @@ Cycle I two-AI audit (Claude Opus 4.8 x Gemini 2.5 Pro) remediation — every Op
 
 - **Webhook notifications** (#11): multi-target webhook system for system event alerts.
   - 4 formats: Slack (blocks API), Discord (embeds + color), ntfy (Priority/Tags headers), GenericJson
-  - Per-target event filtering: , , , , , , , 
+  - Per-target event filtering: `domain_blocked`, `slave_disconnect`, `qps_spike`, `feed_error`, `key_rotated`, `config_reloaded`, `alert_threshold`, `all`
   - Retry: 3 attempts with exponential backoff (1s, 2s); rejects private/loopback URLs
-  - Config directives: , , , 
-  -  — fire a test notification to all configured targets
-  -  event auto-fires on successful 
+  - Config directives: `webhook-url`, `webhook-format`, `webhook-token`, `webhook-events`
+  - `POST /api/webhooks/test` — fire a test notification to all configured targets
+  - `config_reloaded` event auto-fires on successful config reload
 
 ---
 
@@ -440,7 +440,7 @@ Cycle I two-AI audit (Claude Opus 4.8 x Gemini 2.5 Pro) remediation — every Op
 
 ---
 
-## [0.9.52] -- 2026-05-26
+## [0.9.52] — 2026-05-26
 
 ### Changed
 
@@ -452,7 +452,7 @@ Cycle I two-AI audit (Claude Opus 4.8 x Gemini 2.5 Pro) remediation — every Op
 
 ---
 
-## [0.9.51] -- 2026-05-26
+## [0.9.51] — 2026-05-26
 
 ### Added
 
@@ -466,7 +466,7 @@ Cycle I two-AI audit (Claude Opus 4.8 x Gemini 2.5 Pro) remediation — every Op
 
 ---
 
-## [0.9.50] -- 2026-05-26
+## [0.9.50] — 2026-05-26
 
 ### Security
 
