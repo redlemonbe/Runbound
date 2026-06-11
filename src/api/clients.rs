@@ -20,7 +20,7 @@ const CLIENT_LIST_MAX: usize = 500;
 
 // ── Serialisable output types ──────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ClientSummary {
     ip:          String,
     total:       u64,
@@ -157,6 +157,9 @@ fn build_agg(s: &AppState) -> HashMap<String, IpAgg> {
 
 // ── GET /api/clients ───────────────────────────────────────────────────────
 
+static CLIENTS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Vec<ClientSummary>)>>> =
+    std::sync::OnceLock::new();
+
 pub async fn clients_handler(
     State(s): State<AppState>,
     params_result: Result<Query<ClientsParams>, axum::extract::rejection::QueryRejection>,
@@ -175,16 +178,30 @@ pub async fn clients_handler(
         ).into_response();
     }
 
-    let agg = build_agg(&s);
-    let mut summaries: Vec<ClientSummary> = agg.into_iter().map(|(ip, a)| ClientSummary {
-        ip,
-        total:       a.total,
-        blocked:     a.blocked,
-        blocked_pct: a.blocked_pct(),
-        last_seen:   a.last_seen.clone(),
-        top_domain:  a.top_domain(),
-    }).collect();
-    summaries.sort_unstable_by(|x, y| y.total.cmp(&x.total).then(x.ip.cmp(&y.ip)));
+    // OPEN-I17: the full log-buffer scan + aggregation is bounded but expensive; memoize
+    // the sorted result for a short window so repeated authenticated requests cannot spin
+    // the CPU re-scanning on every call.
+    let mut summaries: Vec<ClientSummary> = {
+        let cache = CLIENTS_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some((t, v)) if t.elapsed() < std::time::Duration::from_secs(2) => v.clone(),
+            _ => {
+                let agg = build_agg(&s);
+                let mut v: Vec<ClientSummary> = agg.into_iter().map(|(ip, a)| ClientSummary {
+                    ip,
+                    total:       a.total,
+                    blocked:     a.blocked,
+                    blocked_pct: a.blocked_pct(),
+                    last_seen:   a.last_seen.clone(),
+                    top_domain:  a.top_domain(),
+                }).collect();
+                v.sort_unstable_by(|x, y| y.total.cmp(&x.total).then(x.ip.cmp(&y.ip)));
+                *guard = Some((std::time::Instant::now(), v.clone()));
+                v
+            }
+        }
+    };
 
     let total = summaries.len();
     let start = p.page.saturating_mul(p.limit).min(total); // no overflow on huge page
