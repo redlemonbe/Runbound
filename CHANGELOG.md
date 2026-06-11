@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-06-11
+
+### Security
+Cycle I two-AI audit (Claude Opus 4.8 x Gemini 2.5 Pro) remediation — every Open and Accepted finding fixed (full report: docs/security-audit/SECURITY-AUDIT.md):
+- **Relay HMAC now covers the request body** (SEC-I14), not just method/path/timestamp. Backward-compatible: a v0.17.1 node also accepts the legacy header-only signature during a rolling upgrade. **Deploy note: the relay is fully functional only once BOTH master and slave are >= v0.17.1.**
+- **ACL enforced on the real client IP for TCP/DoT/DoH** before the loopback relay (SEC-I23) — closes an ACL bypass that let TCP clients be seen as 127.0.0.1.
+- WebUI CSRF token + login username compared in constant time; `/api` proxy rejects `..` path traversal.
+- Config serialization escapes every string field; config writes use `O_EXCL` + an unpredictable temp name.
+- Firewall: nftables rule arguments fixed (the rule previously never installed); `ufw` deletes only the exact tagged rule.
+- Rate-limiter integer-overflow hardening (u128 refill, `/0` mask); `/api/clients` aggregation memoized (2 s) to bound CPU; per-IP domain map capped; both fast paths serve class IN only; kernel slow-path `sendmmsg` length clamp; `CPU_SET` and interface-name bounds checks.
+
+### Notes
+- 5 adversarial findings were re-verified and recorded as false positives (Disputed) with refuting evidence, not silently dropped.
+
 ## [0.17.0] - 2026-06-10
 
 ### Added
