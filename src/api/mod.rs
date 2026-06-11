@@ -3297,7 +3297,10 @@ async fn audit_tail_handler(
     Query(q): Query<AuditTailQuery>,
 ) -> impl IntoResponse {
     let n = q.n.unwrap_or(100).min(1000);
-    let log_path = s.base_dir.join("audit.log");
+    // Use the configured audit-log-path if set, else base_dir/audit.log — must match
+    // audit::init resolution, otherwise /audit/tail cannot find the log (QA Cycle I).
+    let log_path = s.cfg.audit_log_path.as_ref().map(std::path::PathBuf::from)
+        .unwrap_or_else(|| s.base_dir.join("audit.log"));
     match crate::audit::tail_audit_log(&log_path, n) {
         Ok(lines) => (
             StatusCode::OK,
