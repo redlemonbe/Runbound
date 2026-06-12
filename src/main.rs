@@ -96,8 +96,65 @@ fn main() -> Result<()> {
     // Kernel slow path: OS scheduler floats on all cores (+39% vs naive pin, Xeon v2+X520).
     // XDP fast path: workers auto-pinned to NUMA-local physical cores in start_xdp_on_iface().
     info!(cores = core_count, "CPU placement: automatic (OS scheduler + XDP NUMA-local pin)");
+    // #physical-only: pin every tokio thread (control plane + hickory fallback + API) to a
+    // PHYSICAL core, never an SMT sibling. The cache-hit hot path is the kloop / AF_XDP worker
+    // (already physical-only); a tokio async thread floating onto the HT sibling of a busy SIMD
+    // core steals that core's execution units (HT only helps code that leaves units idle —
+    // saturated ASM/SIMD has none to spare). Default num_cpus (= all logical incl. HT) is what
+    // put async work on the SMT siblings. Worker count = physical cores so fallback bursts still
+    // scale; the threads park when idle, so sharing physical cores with the kloop is free.
+    let phys_cores = crate::cpu::physical_cores();
+    let n_phys = phys_cores.len().max(1);
+    // #physical-only (non-negotiable): confine the WHOLE process to PHYSICAL cores up-front, so
+    // EVERY thread Runbound ever spawns — tokio workers, the API/UI runtimes, std::threads, the
+    // kloop and the XDP workers — inherits a physical-cores-only affinity mask and can NEVER be
+    // scheduled onto an SMT sibling. A thread on the HT sibling of a saturated SIMD core steals
+    // its execution units (HT only helps code that leaves units idle — Runbound's ASM/SIMD hot
+    // path has none to spare). Threads that need one specific core (kloop / XDP) narrow this
+    // mask further to a single physical core; that is always a subset, so it stays HT-free.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: zeroed cpu_set_t, CPU_SET each physical core id (< CPU_SETSIZE), then
+        // sched_setaffinity on self (pid 0). All standard, no aliasing.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &c in &phys_cores {
+                if c < libc::CPU_SETSIZE as usize {
+                    libc::CPU_SET(c, &mut set);
+                }
+            }
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+    let pin_cursor = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(n_phys)
+        .max_blocking_threads(n_phys)
+        .on_thread_start({
+            let phys = phys_cores.clone();
+            let cursor = pin_cursor.clone();
+            move || {
+                #[cfg(target_os = "linux")]
+                {
+                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let core = phys[i % phys.len()];
+                    if core < libc::CPU_SETSIZE as usize {
+                        // SAFETY: zeroed cpu_set_t + CPU_SET(core) with core < CPU_SETSIZE;
+                        // sched_setaffinity on self (pid 0) is a standard pin.
+                        unsafe {
+                            let mut set: libc::cpu_set_t = std::mem::zeroed();
+                            libc::CPU_SET(core, &mut set);
+                            libc::sched_setaffinity(
+                                0,
+                                std::mem::size_of::<libc::cpu_set_t>(),
+                                &set,
+                            );
+                        }
+                    }
+                }
+            }
+        })
         .build()?;
 
     runtime.block_on(async_main(cfg, base_dir, cfg_path))
@@ -1642,7 +1699,7 @@ async fn build_and_launch(
                                         .and_then(|l| l.splitn(2, ':').nth(1))
                                         .map(|h| h.trim().to_owned());
                                     let location = match host_hdr {
-                                        // Host already includes port (e.g. "192.168.8.12:8091")
+                                        // Host already includes port (e.g. "192.168.8.12:8090")
                                         Some(h) if h.contains(':') => {
                                             format!("https://{h}{path}")
                                         }

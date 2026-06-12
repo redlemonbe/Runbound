@@ -7,6 +7,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-13
+
+### Added
+- **Fast path: automatic UMEM fallback to regular pages.** When the hugepage-backed
+  `XDP_UMEM_REG` fails (observed on i40e/X710 + kernel 6.12: `ENOMEM` even with 2 MiB
+  hugepages free), the worker retries the UMEM on regular pages for all queues instead of
+  disabling the fast path. The fast path now comes up at full speed out-of-the-box with the
+  default `xdp-hugepages: yes` (measured 11.2 Mqps on the X710, generator-bound).
+- **Slow path: flow-independent serving spread.** The `SO_REUSEPORT` cBPF now returns
+  `SKF_AD_RANDOM` instead of `SKF_AD_CPU`, so datagrams fan out across all serving sockets
+  regardless of how many source flows the traffic has — no RPS required (RPS collapses on
+  i40e). The kernel-UDP slow path serves cache hits across the NIC node's physical cores.
+- **Process-wide physical-core affinity (never HyperThread).** Every Runbound thread —
+  kloop, AF_XDP workers, the tokio control-plane/fallback runtime, the API/UI runtimes — is
+  confined to physical cores. The hand-written SIMD/ASM wire path saturates a physical core's
+  execution units, so a thread on the SMT sibling steals throughput instead of adding it.
+- **Cache auto-sizing scales with RAM.** The resolver cache is sized to ~1/4 of available
+  memory (cgroup-aware), capped at ~32 GiB, instead of a fixed 65 536-entry (~32 MiB) cap.
+  It is a ceiling, not an upfront allocation; the existing memory-pressure watermarks shrink
+  it dynamically, so growth stays OOM-safe.
+
+### Changed
+- **Slow-path NIC auto-tune** disables the i40e/ixgbe flow-director ATR (`ntuple off` +
+  `flow-director-atr off`): ATR re-steers flows to the queue the app last transmitted from and
+  fights any softirq spread (measured 16.8M → 152k softnet drops/s when disabled). IRQs are
+  pinned to the NIC node's physical cores; the RPS step was removed (it collapses on i40e).
+
+### Fixed
+- Slow-path queue-cap: `SCHANNELS` now reuses the `GET`-ed channel struct (preserving
+  `other_count`), so the i40e accepts the combined-queue reduction instead of staying at its
+  default.
+- Slow-path: the cache snapshot is loaded once per `recvmmsg` batch instead of once per
+  datagram, removing per-packet ArcSwap refcount contention on the serving cores.
+- WebUI: the "Auth events" notice no longer hard-codes port 8091 — it shows the actual
+  listener port. (Default UI port stays 8090; the UI's API calls were already relative.)
+
 ## [0.17.2] - 2026-06-11
 
 ### Fixed

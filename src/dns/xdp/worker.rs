@@ -482,6 +482,11 @@ fn start_xdp_on_iface(
 
     // Create all sockets before spawning threads so we can run the self-test.
     let mut sockets: Vec<(u32, XskSocket)> = Vec::with_capacity(queue_count as usize);
+    // #auto-fallback: if the hugepage-backed UMEM fails XDP_UMEM_REG (measured on i40e +
+    // kernel 6.12: ENOMEM even with 2 MiB hugepages free — a chunk-size / ZC incompatibility),
+    // drop to a regular-page UMEM for ALL queues instead of disabling the fast path entirely.
+    // Detected once on the first failing queue, then sticky for the rest.
+    let mut eff_hugepages = hugepages;
     for q in 0..queue_count {
         // S1: XSKMAP is created with max_entries=64; a queue_id ≥ 64 would write
         // outside the map bounds inside the kernel.
@@ -494,9 +499,19 @@ fn start_xdp_on_iface(
         // SAFETY: `ifidx` is a valid ifindex returned by `iface_index`. `q` is
         //         in [0, min(queue_count, 64)), which is the valid range of NIC RX
         //         queues. On zero-copy failure we fall back to copy mode.
-        let sock = unsafe { create_xsk_socket(ifidx, q, true, hugepages, &xdp_ring_sizes) }
-            .or_else(|_| unsafe { create_xsk_socket(ifidx, q, false, hugepages, &xdp_ring_sizes) })
-            .map_err(|e| format!("AF_XDP socket creation failed: {e}"))?;
+        let mk = |zc: bool, huge: bool| unsafe { create_xsk_socket(ifidx, q, zc, huge, &xdp_ring_sizes) };
+        let sock = match mk(true, eff_hugepages).or_else(|_| mk(false, eff_hugepages)) {
+            Ok(s) => s,
+            Err(e) if eff_hugepages => {
+                tracing::warn!(queue_id = q, err = %e,
+                    "XDP: hugepage UMEM registration failed — falling back to regular-page UMEM for all queues (set xdp-hugepages: no to silence)");
+                eff_hugepages = false;
+                mk(true, false)
+                    .or_else(|_| mk(false, false))
+                    .map_err(|e| format!("AF_XDP socket creation failed (regular pages): {e}"))?
+            }
+            Err(e) => return Err(format!("AF_XDP socket creation failed: {e}")),
+        };
         tracing::info!(
             queue_id = q,
             mode = if sock.zerocopy { "zerocopy" } else { "copy" },

@@ -20,8 +20,11 @@ hickory **fallback** pipeline:
 
 - **One `SO_REUSEPORT` UDP socket per physical core** (minus one reserved for the rest of
   the process; capped at 16 on a Xeon-v2 + X520 host). The kernel's default 4-tuple hash is
-  uneven for a few flows, so an `SO_ATTACH_REUSEPORT_CBPF` *by-CPU* program (returning
-  `SKF_AD_CPU`) plus RPS spreads datagrams evenly across the group — flat per-socket load.
+  uneven for a few flows, so (since v0.18.0) an `SO_ATTACH_REUSEPORT_CBPF` program returning
+  `SKF_AD_RANDOM` spreads datagrams evenly across the group **independent of source-flow
+  count** — flat per-socket load with **no RPS** (RPS collapses the i40e/X710 NAPI: measured
+  16.8M softnet drops/s). On a few-flow benchmark generator this is what lets every serving
+  core stay busy; on real traffic (thousands of source ports) the default hash already would.
 - **Batched receive with `recvmmsg`** (`MSG_WAITFORONE`): one syscall drains up to 64
   datagrams (`BATCH = 64`, `src/dns/kernel_loop.rs:233`; raised from 32 in v0.17.0)
   instead of one syscall per datagram. Per-packet `recv_from` cannot keep the
@@ -125,3 +128,14 @@ mlx5 aRFS) may prefer a different strategy — a driver-aware path is future wor
 - resolv.conf emergency fallback (#94).
 - (Negative caching #166 is documented in [02-fast-path-xdp.md](02-fast-path-xdp.md) §2.5
   — the kloop serves the same snapshot, see §4.4.)
+
+
+## 4.7 Physical cores only (never HyperThread)
+
+Every Runbound thread — the kloop, the AF_XDP workers, and the tokio control-plane /
+fallback runtime — is confined to **physical cores** (a process-wide affinity mask set at
+startup; per-worker pins narrow it to one physical core). The hand-written SIMD/ASM wire
+path saturates a physical core's execution units, so a thread scheduled on the SMT sibling
+steals throughput instead of adding it. HT only helps code that leaves execution units
+idle; the wire builder leaves none. Residual SMT-core activity under load is kernel
+housekeeping (ksoftirqd), not Runbound.

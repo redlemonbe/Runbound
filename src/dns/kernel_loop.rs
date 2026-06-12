@@ -87,13 +87,15 @@ fn bind_kernel_udp(addr: &str) -> anyhow::Result<UdpSocket> {
     let addr: std::net::SocketAddr = addr.parse()?;
     sock.bind(&addr.into())?;
 
-    // #183: spread incoming datagrams EVENLY across the SO_REUSEPORT group by the CPU
-    // that processes them, instead of the kernel's default 4-tuple hash (which is uneven
-    // for a benchmark's few flows → some sockets overflow while others idle, dropping
-    // packets even with spare CPU). The 2-insn cBPF returns SKF_AD_CPU; the kernel maps
-    // socket = cpu % nsockets. Combined with RPS (softirq spread across all cores) this
-    // gives a flat per-socket load. Best-effort: ignore errors on kernels without it.
-    // RUNBOUND_DISABLE_CBPF=1 keeps the kernel's default 4-tuple hash (A/B testing).
+    // #slowpath-spread: spread incoming datagrams EVENLY across the SO_REUSEPORT group,
+    // INDEPENDENT of flow count. The kernel's default 4-tuple hash confines a few-flow load
+    // (e.g. a benchmark's 5 source ports, or a single big NAT/forwarder) to a handful of
+    // sockets while the rest idle. A by-CPU cBPF (SKF_AD_CPU) only spreads with RPS, which
+    // collapses on i40e/X710 (35M softnet drops). Instead the 2-insn cBPF returns
+    // SKF_AD_RANDOM (prandom_u32): socket = random % nsockets, so every datagram lands on a
+    // random worker — flat per-socket load on all cores with NO RPS and NO flow dependence,
+    // exactly what RPS gave the X520 but without its i40e collapse. DNS is stateless, so the
+    // lack of per-flow socket affinity is irrelevant. RUNBOUND_DISABLE_CBPF=1 → default hash.
     if std::env::var_os("RUNBOUND_DISABLE_CBPF").is_none() {
         use std::os::fd::AsRawFd;
         #[repr(C)]
@@ -101,12 +103,12 @@ fn bind_kernel_udp(addr: &str) -> anyhow::Result<UdpSocket> {
         #[repr(C)]
         struct SockFprog { len: u16, filter: *const SockFilter }
         const SKF_AD_OFF: u32 = 0xffff_f000; // -0x1000
-        const SKF_AD_CPU: u32 = 36;
+        const SKF_AD_RANDOM: u32 = 56; // BPF_ANC | prandom_u32()
         const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
         const BPF_RET_A: u16 = 0x16;    // BPF_RET | BPF_A
         const SO_ATTACH_REUSEPORT_CBPF: libc::c_int = 51;
         let prog = [
-            SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: SKF_AD_OFF + SKF_AD_CPU },
+            SockFilter { code: BPF_LD_W_ABS, jt: 0, jf: 0, k: SKF_AD_OFF + SKF_AD_RANDOM },
             SockFilter { code: BPF_RET_A,    jt: 0, jf: 0, k: 0 },
         ];
         let fprog = SockFprog { len: prog.len() as u16, filter: prog.as_ptr() };
@@ -315,6 +317,12 @@ fn worker_loop(
         };
 
         // ── Process each datagram in the batch → collect into the TX batch ───
+        // #perf: snapshot the cache ONCE per recvmmsg batch (a single
+        // ArcSwap::load_full / Arc refcount bump) instead of once per datagram.
+        // Per-datagram load_full bounced the snapshot's atomic refcount across
+        // every serving core, capping the per-core-queue spread; one bump per
+        // batch removes that contention on the cache hot path.
+        let cache_batch = cache_snapshot.as_ref().map(|c| c.load_full());
         let mut tx_n = 0usize;
         for i in 0..count {
             let len = lens[i];
@@ -357,12 +365,11 @@ fn worker_loop(
             }
 
             // ── Fast path B: cache snapshot (SIMD lookup, zero hickory) ──────
-            if let Some(ref cache_arc) = cache_snapshot {
-                let snap = cache_arc.load_full();
+            if let Some(ref snap) = cache_batch {
                 use crate::dns::xdp::worker::answer_from_cache_pub;
                 if let Some(resp_len) = answer_from_cache_pub(
                     query,
-                    &snap,
+                    snap,
                     &acl,
                     src_ip,
                     &mut tx_bufs[tx_n],

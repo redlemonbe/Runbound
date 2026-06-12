@@ -1949,7 +1949,7 @@ async function loadAuthEvents() {
         }).join('');
     els.forEach(el => el.innerHTML = html);
   } catch(e) {
-    els.forEach(el => el.innerHTML = '<span class="text-gray-700">Auth events: embedded WebUI only (port 8091).</span>');
+    els.forEach(el => el.innerHTML = '<span class="text-gray-700">Auth events: embedded WebUI only (port ' + window.location.port + ').</span>');
   }
 }
 

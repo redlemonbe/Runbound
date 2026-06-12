@@ -284,7 +284,7 @@ pub struct UnboundConfig {
     // ── Embedded web UI (#4/#91) ──────────────────────────────────────────────
     /// Serve the built-in web UI. Default: false.
     pub ui_enabled: bool,
-    /// Port for the web UI listener. Default: 8090.
+    /// Port for the web UI listener. Default: 8091.
     pub ui_port: u16,
     /// Bind address for the web UI listener. Default: 0.0.0.0.
     pub ui_bind: String,
@@ -417,7 +417,7 @@ impl UnboundConfig {
             stale_answer_ttl: 30,
             stale_max_age: 86400,
             ui_enabled: false,
-            ui_port: 8090,
+            ui_port: 8091,
             ui_bind: "0.0.0.0".to_owned(),
             ui_tls: true,
             ui_cert: String::new(),
@@ -896,7 +896,7 @@ fn parse_server_directive(
         "firewall-backend" => cfg.firewall_backend = Some(val.trim_matches('"').to_owned()),
         "firewall-tag" => cfg.firewall_tag = val.trim_matches('"').to_owned(),
         "ui-enabled" => cfg.ui_enabled = val.trim_matches('"') == "yes",
-        "ui-port" => cfg.ui_port = val.parse().unwrap_or(8090),
+        "ui-port" => cfg.ui_port = val.parse().unwrap_or(8091),
         "ui-bind" => cfg.ui_bind = val.trim_matches('"').to_owned(),
         "ui-tls"  => match val.trim().trim_matches('"') {
             "acme" => { cfg.ui_tls = true;  cfg.ui_tls_acme = true; }
