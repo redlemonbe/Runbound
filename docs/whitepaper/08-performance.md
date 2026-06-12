@@ -1,10 +1,15 @@
 # 08 — Performance
 
-> **Status: current as of v0.17.2 (2026-06-11)** — governed by `docs/benchmark/README.md`
+> **Status: current as of v0.18.0 (2026-06-13)** — governed by `docs/benchmark/README.md`
 > (the methodology) and the per-run reports under `docs/benchmark/`. The latest measured
 > runs in-repo are v0.16.11 (X710 fast path) and v0.17.0 (slow-path auto-tune, CHANGELOG);
-> there is no v0.17.2-specific report — v0.17.1/0.17.2 contain no datapath changes
-> (security remediations and an API path fix).
+> v0.18.0 changes both datapaths (slow-path random reuseport spread + physical-core
+> affinity; fast-path hugepage->regular-page UMEM auto-fallback). Validation-rig numbers
+> (Threadripper PRO 5995WX, Intel X710/i40e, kernel 6.12, dnsmark with the v2.2.2 flow
+> spread, sustained hold, counted at the NIC `tx_packets`): fast path **~11.2 Mqps**
+> (generator-bound — not the server ceiling, the NIC delivers more), slow path
+> **~6.55 Mqps** (kernel-UDP, NIC-node physical cores). A formal per-run report under
+> the documented methodology is pending; treat these as validation measurements.
 
 This chapter holds **only measured numbers produced under the documented methodology**.
 Until a run is completed under that methodology at the current version, this chapter states

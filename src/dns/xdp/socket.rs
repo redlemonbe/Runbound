@@ -656,18 +656,21 @@ pub fn set_combined_queues(iface: &str, target: u32) -> u32 {
     }
     let hw_max = ch.max_combined.max(ch.max_rx);
     let tgt = target.min(hw_max).max(1);
-    if tgt != ch.combined_count {
-        // Combined mode: rx_count/tx_count stay 0 (i40e/ixgbe/ice), only combined_count set.
-        let mut sch: EthtoolChannels = unsafe { std::mem::zeroed() };
-        sch.cmd = ETHTOOL_SCHANNELS;
-        sch.combined_count = tgt;
-        let mut sifr = build_ifreq(iface_safe, (&mut sch as *mut EthtoolChannels).cast());
+    let from = ch.combined_count;
+    if tgt != from {
+        // #190 fix: reuse the GET'd channels struct (preserving other_count/rx_count/tx_count
+        // the i40e driver requires) instead of a zeroed one. A zeroed other_count made the
+        // i40e reject SCHANNELS, leaving the X710 stuck at its 119-queue default. Mirrors
+        // `ethtool -L combined N`, which changes only combined_count and keeps the rest.
+        ch.cmd = ETHTOOL_SCHANNELS;
+        ch.combined_count = tgt;
+        let mut sifr = build_ifreq(iface_safe, (&mut ch as *mut EthtoolChannels).cast());
         // SAFETY: same as the GET call above.
         let set_rc = unsafe {
             libc::ioctl(fd, SIOCETHTOOL as _, (&mut sifr as *mut IfReqEthtool).cast::<libc::c_void>())
         };
         if set_rc >= 0 {
-            tracing::info!(iface = %iface, from = ch.combined_count, to = tgt, hw_max,
+            tracing::info!(iface = %iface, from, to = tgt, hw_max,
                 "slow-path: NIC combined queues set to moderate count (kernel-UDP softirq balance)");
         } else {
             tracing::warn!(iface = %iface, target = tgt, "slow-path: SCHANNELS failed — keeping current queue count");

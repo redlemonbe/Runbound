@@ -1811,7 +1811,14 @@ fn cache_size_from_meminfo() -> usize {
     if avail_kb == 0 {
         return 8192;
     }
-    ((avail_kb * 1024 / 10 / 512) as usize).clamp(512, 65536)
+    // #cache: size the resolver cache to a generous slice of AVAILABLE memory (cgroup-aware),
+    // so it scales with the host's RAM instead of a fixed tiny cap. This is a CEILING, not an
+    // upfront allocation — entries fill it as queries arrive; the memory-pressure watermarks
+    // (MEM_*_WATERMARK) shrink it dynamically if usage climbs, so growing it stays OOM-safe.
+    // Was clamped at 65536 entries (~32 MiB) — absurdly small on a multi-GiB host.
+    const CACHE_ENTRY_BYTES: u64 = 512; // rough avg cache entry (name + RRset + metadata)
+    let entries = avail_kb * 1024 / 4 / CACHE_ENTRY_BYTES; // ~1/4 of available memory
+    (entries as usize).clamp(8192, 64 * 1024 * 1024) // 8K floor … 64M entries (~32 GiB) ceiling
 }
 
 /// Read system memory and return (available_kb, total_kb).
@@ -2633,6 +2640,15 @@ pub async fn run_dns_server(
                     .map(|s| crate::cpu::parse_cpulist(&s))
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| fast_cores.clone());
+                    // #physical-only: pin the NAPI IRQs to the NIC node's PHYSICAL cores, NEVER
+                    // their SMT siblings — the SIMD serving saturates a physical core's execution
+                    // units, so a softirq on an HT sibling steals throughput (and shows up as
+                    // "active cores > physical core count" in mpstat). Keep a generous RX-queue
+                    // count for RSS fan-out (node logical-CPU count), but wrap those IRQs onto
+                    // the physical node cores only (fast_cores is the physical serving set).
+                    let irq_cores: Vec<usize> =
+                        fast_cores.iter().copied().filter(|c| node_cpus.contains(c)).collect();
+                    let irq_cores = if irq_cores.is_empty() { node_cpus.clone() } else { irq_cores };
                     let target_q = (node_cpus.len() as u32)
                         .min(fast_cores.len() as u32)
                         .min(SLOWPATH_QUEUE_CAP)
@@ -2640,9 +2656,9 @@ pub async fn run_dns_server(
                     queues = crate::dns::xdp::socket::set_combined_queues(nic, target_q);
                     // Let the NIC recreate its IRQs after the channel change before pinning.
                     std::thread::sleep(std::time::Duration::from_millis(300));
-                    // One IRQ per node-local CPU (incl. SMT), wrapping if queues > node CPUs.
+                    // One IRQ per node-local PHYSICAL core, wrapping if queues > physical cores.
                     let pairs: Vec<(u32, usize)> = (0..queues)
-                        .map(|q| (q, node_cpus[q as usize % node_cpus.len()]))
+                        .map(|q| (q, irq_cores[q as usize % irq_cores.len()]))
                         .collect();
                     crate::cpu::set_irq_affinity(nic, &pairs);
                     irq_n = pairs.len();
@@ -2661,11 +2677,29 @@ pub async fn run_dns_server(
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .status();
+                    // #slowpath: disable the i40e/ixgbe flow-director ATR (automatic
+                    // application-targeted RX re-steering). ATR re-pins each flow to the queue
+                    // the app last transmitted from; with the kloop sending from many sockets it
+                    // thrashes the RX placement and, under any softirq spread, drops packets
+                    // (measured on i40e: 16.8M softnet drops/s with ATR on -> 152k/s with it off).
+                    // Best-effort: ntuple covers the generic path, the priv-flag the i40e ATR.
+                    for args in [
+                        vec!["-K", nic, "ntuple", "off"],
+                        vec!["--set-priv-flags", nic, "flow-director-atr", "off"],
+                    ] {
+                        let _ = std::process::Command::new("ethtool")
+                            .args(&args)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
                 }
-                let rps_n = crate::cpu::set_rps_cores(nic, &fast_cores);
+                // #slowpath-spread: NO RPS — it collapses on i40e (measured 16.8M softnet
+                // drops/s, 1.39M qps). The serving is spread across all cores by the random
+                // reuseport cBPF (kernel_loop.rs) instead, flow-independent and i40e-safe.
                 info!(
-                    iface = %nic, nic_queues = queues, irqs_pinned = irq_n, rps_queues = rps_n,
-                    "slow-path auto-tune: moderate NIC queues + 1:1 IRQ pin + RPS to all cores (kernel-UDP softirq scaling)"
+                    iface = %nic, nic_queues = queues, irqs_pinned = irq_n,
+                    "slow-path auto-tune: node-local queues + 1:1 IRQ pin, random reuseport spread (no RPS)"
                 );
             }
         }
