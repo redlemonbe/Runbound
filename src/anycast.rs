@@ -14,6 +14,7 @@
 
 use crate::config::parser::AnycastConfig;
 use anyhow::{bail, Context, Result};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use tracing::{info, warn};
 
@@ -81,9 +82,20 @@ impl AnycastAnnouncer {
             return Ok(());
         }
         let bin = self.exabgp_bin();
-        let child = Command::new(&bin)
-            .arg(CONF_PATH)
-            .stdin(Stdio::null())
+        let mut command = Command::new(&bin);
+        command.arg(CONF_PATH).stdin(Stdio::null());
+        // Best-effort net for the case where Runbound dies without running Drop (SIGKILL/OOM).
+        // NOTE: this is NOT the primary reaper — exabgp can daemonize/re-parent and survive it
+        // (verified). The reliable mechanism in production is the supervising cgroup: run Runbound
+        // under systemd (default KillMode=control-group reaps the exabgp child on any unit death).
+        // Graceful shutdown is covered by `Drop`/`withdraw()`. See docs/anycast.md.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+                Ok(())
+            });
+        }
+        let child = command
             .spawn()
             .with_context(|| format!("anycast: spawning '{bin}' (is exabgp installed and on PATH?)"))?;
         info!(address = %self.cfg.address, pid = child.id(),

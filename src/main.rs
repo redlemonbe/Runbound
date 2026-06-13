@@ -615,6 +615,26 @@ async fn async_main(
     ));
     fw_manager.open(&fw_ports);
     let fw_cleanup = Arc::clone(&fw_manager);
+
+    // ── anycast: announce the VIP over BGP while the server runs ───────────────────
+    // Held for the lifetime of the server; dropped on shutdown → exabgp stops → route
+    // withdrawn (graceful drain). The VIP must already be on a dummy/lo iface (docs/anycast.md).
+    let _anycast_announcer = cfg.anycast.as_ref().and_then(|ac| {
+        match anycast::AnycastAnnouncer::prepare(ac) {
+            Ok(mut a) => match a.announce() {
+                Ok(()) => Some(a),
+                Err(e) => {
+                    tracing::error!("anycast: announce failed — running without it: {e:#}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::error!("anycast: invalid config — running without it: {e:#}");
+                None
+            }
+        }
+    });
+
     let result = dns::run_dns_server(
         &cfg,
         zones,
