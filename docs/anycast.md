@@ -127,3 +127,58 @@ All four were measured, not assumed.
   use the API or a TCP probe for health if you want a guaranteed low-rate response.
 - Per-node throughput is unchanged by anycast — see [docs/benchmark/INDEX.md](benchmark/INDEX.md);
   anycast multiplies it across nodes.
+
+## 8. Built-in announcer — the `anycast:` config block
+
+Instead of running exabgp yourself (§4), Runbound can **manage it for you**. Add an `anycast:`
+block and Runbound writes `/run/runbound-anycast.conf`, spawns exabgp as a supervised child,
+announces the route on startup, and **withdraws it on shutdown**:
+
+```
+anycast:
+  address: 198.51.100.53/32     # the VIP route to announce
+  local-as: 65001               # this node's BGP AS
+  peer: 192.168.1.1             # the BGP router / route-reflector
+  peer-as: 65000
+  local-address: 192.168.1.10   # this node's IP for the BGP session
+  # router-id:   (optional, defaults to local-address)
+  # exabgp-path: (optional, defaults to "exabgp" on $PATH)
+```
+
+You still configure: the **VIP on `dummy0`/`lo`** (always present — Runbound binds it), the
+**rp_filter** sysctl, `interface: 198.51.100.53` in the `server:` block, and **exabgp installed**
+on the node. Runbound does the rest.
+
+**Run it under systemd — this is required, not optional.** Announcement is gated on Runbound's
+life: graceful stop withdraws via Runbound's shutdown hook; on a *hard* death (SIGKILL/OOM) the
+exabgp child is reaped by the **supervising cgroup** (`KillMode=control-group`, the systemd
+default), which drops the BGP session and withdraws the route. `PR_SET_PDEATHSIG` is set as a
+best-effort net but is **not** sufficient on its own (exabgp can re-parent past it) — the cgroup
+is the reliable reaper. A minimal unit:
+
+```ini
+[Unit]
+Description=Runbound (anycast node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/sbin/ip addr add 198.51.100.53/32 dev dummy0
+ExecStart=/usr/local/sbin/runbound -c /etc/runbound/runbound.conf
+# KillMode=control-group is the default — on any exit, the exabgp child is killed too,
+# so the BGP route is always withdrawn when this node goes down.
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Bench-validated (real BGP, FRR ECMP router + two nodes):** Runbound spawned exabgp from the
+block and announced the VIP/32; the router installed an ECMP route across both nodes (split
+16/24, 0 failures). Graceful `systemctl stop` → exabgp stopped → route withdrawn → drained to
+the survivor, **0 failures**; a hard `systemctl kill -s KILL` → cgroup reaped exabgp → withdrawn,
+**0 failures**; restart → re-announced → ECMP rebalanced, **0 failures**.
+
+> The block is parsed and round-trips through the config writer (the API never drops it). If
+> exabgp is missing or the block is invalid, Runbound logs the error and **keeps serving DNS
+> normally** without announcing — anycast is strictly additive.
