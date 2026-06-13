@@ -2359,6 +2359,13 @@ async fn add_split_horizon(
     if req.name.trim().is_empty() || req.subnets.is_empty() {
         return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID","details":"name and at least one subnet are required"})));
     }
+    // SEC-J1: these fields are written back into runbound.conf; reject control
+    // characters / quotes / backslashes so a value cannot inject a config directive
+    // (the config writer also escapes them now — defence in depth).
+    let has_bad = |s: &str| s.chars().any(|c| c.is_control() || c == '"' || c == '\\');
+    if has_bad(&req.name) || req.subnets.iter().any(|s| has_bad(s)) {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID","details":"name/subnet contains forbidden characters"})));
+    }
     let name = req.name.clone();
     {
         let mut g = s.split_horizon.lock().unwrap_or_else(|e| e.into_inner());

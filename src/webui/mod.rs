@@ -185,12 +185,20 @@ fn load_or_default_creds(path: &PathBuf) -> WebUiCred {
             }
         }
     }
-    // Default: admin/admin
+    // SEC-J2: no static admin/admin fallback. Generate a RANDOM one-time password, log it
+    // once so the operator can sign in, persist its hash so it is stable across restarts,
+    // and rely on the UI's password-status nudge to force a change.
+    let pw = uuid::Uuid::new_v4().simple().to_string();
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
-        .hash_password(b"admin", &salt)
+        .hash_password(pw.as_bytes(), &salt)
         .expect("argon2 hash")
         .to_string();
+    tracing::warn!(username = "admin", password = %pw,
+        "WebUI: no webui-auth.conf — generated a RANDOM one-time admin password (logged once). Sign in and change it.");
+    if let Ok(j) = serde_json::to_string(&serde_json::json!({"username": "admin", "hash": hash})) {
+        let _ = std::fs::write(path, j);
+    }
     WebUiCred { username: "admin".to_string(), hash }
 }
 
