@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-06-13
+
+### Security
+- **Cycle J two-AI security audit + pentest remediation** (Claude Opus 4.8 × Gemini 2.5 Pro; full report in `docs/security-audit/SECURITY-AUDIT.md`). All fixes are outside the slow/fast DNS datapath; verified with 282 tests, clippy `-D warnings` clean, and an A/B bench (fastpath 11.16M qps, slowpath unchanged — datapath byte-identical).
+  - **SEC-J1 (HIGH)** — config-directive injection via the split-horizon API. The config writer now escapes `name`/`subnet`/`local-data`, and the API rejects control/newline characters. Closes an authenticated-API → root escalation (an injected `ui-acme-hook` would run as root on the next ACME challenge). (#191)
+  - **SEC-J2** — the WebUI no longer falls back to `admin`/`admin`; a random one-time password is generated, logged once, and persisted. (#192)
+  - **SEC-J3** — upstream health probes use a random DNS transaction ID, verified in the reply (off-path spoofing). (#193)
+  - **SEC-J5** — the legacy header-only HMAC relay signature (request body not covered) is no longer accepted; only the body-covering signature verifies.
+  - **SEC-J7** — TLS private keys are written atomically (mode 0600 from creation), closing a brief world-readable window.
+  - **SEC-J13** — the optional API Unix socket is unlinked only if the path is actually a socket (TOCTOU).
+  - **SEC-J14** — `add_upstream` dedups on (addr, port, protocol) and is capped.
+
 ## [0.18.0] - 2026-06-13
 
 ### Added
