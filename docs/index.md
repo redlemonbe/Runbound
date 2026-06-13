@@ -33,6 +33,7 @@ Complete reference for Runbound. Each page targets the current stable release an
 | [xdp.md](xdp.md) | XDP fast path — how it works, NIC requirements, ring auto-sizing, expected QPS |
 | [internals.md](internals.md) | **Expert** — packet lifecycle, timing budget, implemented optimisations, roadmap |
 | [ha.md](ha.md) | High-availability topologies — active/passive, anycast-ready |
+| [anycast.md](anycast.md) | Anycast deployment — one VIP across nodes, ECMP/BGP, health-driven route withdrawal (bench-validated) |
 | [sync.md](sync.md) | Master/slave replication — protocol, zone sync, slave health |
 | [proxmox.md](proxmox.md) | Proxmox / bare-metal deployment with bridge and vmbr NICs |
 | [homelab.md](homelab.md) | Homelab setup — single server, LAN-only, ad-blocking |
