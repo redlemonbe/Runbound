@@ -7,15 +7,15 @@ generator's self-reported rate. Full context behind every number in its report.
 
 | Max served | Latency (p50) | Receiver CPU | Configuration | Rig / NIC | Report |
 |-----------:|--------------:|-------------:|---------------|-----------|--------|
-| **13.15 M qps** | 0.21–0.30 ms band to ~12.8 M | **~11 %** | Runbound v0.16.11 — `xdp: yes`, **dual link**, AF_XDP **zero-copy** | 5995WX + 2× X710 10G | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md) |
-| **10.09 M qps** | p50 < 1 ms up to 10.56 M offered | ~11 % | Runbound v0.16.11 — `xdp: yes`, single link, zero-copy (served cap = link response direction) | 5995WX + X710 10G | [report](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md) |
-| **~10.1 M qps** | 0.062 ms | ~11 % (≈31 cores) | Runbound v0.16.1 — `xdp: yes`, zero-copy (NIC PCIe-2.0 bus-bound) | 5995WX + X520 10G | [report](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md) |
-| **9.07 M qps** (peak 11.13 M) | — | ~27 % | Runbound v0.17.2 — `xdp: yes`, dual link, **copy mode** (bnxt: no zero-copy) | EPYC 9554P + 2× BCM57508 100G | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
-| **7.85 M qps** | wire p50 **0.024 ms** | **~8 %** | Runbound v0.17.2 — `xdp: yes`, single link, copy mode, no collapse under 10.8 M flood | EPYC 9554P + BCM57508 100G | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
-| **~7.3 M qps** | ~0.09 ms | ~55 % (≈70 cores) | Runbound v0.16.1 — **`xdp: no`** (kernel slow path) | 5995WX + X520 10G | [report](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md) |
-| **4.09–5.03 M qps** | wire p50 0.047 ms | ~32 % | Runbound v0.17.2 — `xdp: no` (kernels 6.8 / 6.17; auto-tune no-ops on bnxt, #190) | EPYC 9554P + BCM57508 100G | [report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
-| 3.59 M qps | 0.195 ms | ~65 % (64 thr) | **unbound 1.22.0** (baseline) | 5995WX + X520 10G | [baseline](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md) |
-| 2.98 M qps | 0.068 ms | 100 % (128 thr) | **BIND 9.20.23** (baseline) | 5995WX + X520 10G | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md) |
+| **13.15 M qps** | 0.21–0.30 ms band to ~12.8 M | **~11 %** | Runbound v0.16.11 — `xdp: yes`, **dual link**, AF_XDP **zero-copy** | 5995WX + 2× X710 10G | [report](archive/RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md) |
+| **10.09 M qps** | p50 < 1 ms up to 10.56 M offered | ~11 % | Runbound v0.16.11 — `xdp: yes`, single link, zero-copy (served cap = link response direction) | 5995WX + X710 10G | [report](archive/RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md) |
+| **~10.1 M qps** | 0.062 ms | ~11 % (≈31 cores) | Runbound v0.16.1 — `xdp: yes`, zero-copy (NIC PCIe-2.0 bus-bound) | 5995WX + X520 10G | [report](archive/RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md) |
+| **9.07 M qps** (peak 11.13 M) | — | ~27 % | Runbound v0.17.2 — `xdp: yes`, dual link, **copy mode** (bnxt: no zero-copy) | EPYC 9554P + 2× BCM57508 100G | [report](archive/RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
+| **7.85 M qps** | wire p50 **0.024 ms** | **~8 %** | Runbound v0.17.2 — `xdp: yes`, single link, copy mode, no collapse under 10.8 M flood | EPYC 9554P + BCM57508 100G | [report](archive/RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
+| **~7.3 M qps** | ~0.09 ms | ~55 % (≈70 cores) | Runbound v0.16.1 — **`xdp: no`** (kernel slow path) | 5995WX + X520 10G | [report](archive/RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md) |
+| **4.09–5.03 M qps** | wire p50 0.047 ms | ~32 % | Runbound v0.17.2 — `xdp: no` (kernels 6.8 / 6.17; auto-tune no-ops on bnxt, #190) | EPYC 9554P + BCM57508 100G | [report](archive/RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md) |
+| 3.59 M qps | 0.195 ms | ~65 % (64 thr) | **unbound 1.22.0** (baseline) | 5995WX + X520 10G | [baseline](archive/BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md) |
+| 2.98 M qps | 0.068 ms | 100 % (128 thr) | **BIND 9.20.23** (baseline) | 5995WX + X520 10G | [baseline](archive/BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md) |
 
 Reading rules for this table:
 
@@ -74,7 +74,7 @@ Runbound **v0.17.2**, generator dnsmark v2.2.1 over **kernel-UDP** — `bnxt_en`
 AF_XDP zero-copy** in any kernel (`XDP_ZEROCOPY` bind = errno 95; verified on 6.8, 6.12
 and 6.17), so `--xdp` generation is unusable and the receiver's AF_XDP fast path runs in
 **copy mode**. Four runs (xdp:no, XDP single, XDP dual, kernel-6.17 follow-up) in one
-[consolidated report](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md).
+[consolidated report](archive/RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md).
 
 Every figure on this rig is bounded by the missing `bnxt_en` zero-copy (generator capped
 at ~10.6 M qps kernel-UDP on 6.8, 14.0 M on 6.17; receiver XSK drain in copy mode, **~8 M
@@ -92,14 +92,14 @@ renting; "100 G" alone says nothing.
 - [runbound-receiver-bench.conf](runbound-receiver-bench.conf) — the receiver config used
   for the Runbound runs (`xdp:no`, real forward-zone, no local-data, `rate-limit: 0`).
 - **Runbound runs**
-  - [X710 v0.16.11 `xdp: yes` single-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)
-  - [X710 v0.16.11 `xdp: yes` dual-link](RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md)
-  - [X520 v0.16.1 `xdp: yes` (AF_XDP fast path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md)
-  - [X520 v0.16.1 `xdp: no` (kernel slow path)](RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md)
-  - [Latitude EPYC 9554P / bnxt v0.17.2 — consolidated (xdp:no, XDP single, XDP dual, kernel 6.17)](RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md)
+  - [X710 v0.16.11 `xdp: yes` single-link](archive/RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)
+  - [X710 v0.16.11 `xdp: yes` dual-link](archive/RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md)
+  - [X520 v0.16.1 `xdp: yes` (AF_XDP fast path)](archive/RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md)
+  - [X520 v0.16.1 `xdp: no` (kernel slow path)](archive/RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md)
+  - [Latitude EPYC 9554P / bnxt v0.17.2 — consolidated (xdp:no, XDP single, XDP dual, kernel 6.17)](archive/RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md)
 - **Reference-server baselines** (same rig + methodology)
-  - [unbound 1.22.0](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md)
-  - [BIND 9.20.23](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md)
+  - [unbound 1.22.0](archive/BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md)
+  - [BIND 9.20.23](archive/BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md)
 - **Rigs**
   - [Latitude.sh rs4.metal.xlarge (fra2)](rigs/latitude-rs4-metal-xlarge-fra2.md)
 
