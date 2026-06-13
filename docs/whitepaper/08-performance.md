@@ -46,11 +46,11 @@ Measured on the documented rig (receiver: 5995WX + Intel X710-DA2; generator: du
 E5-2690 v2 + X710, direct DACs; dnsmark 2.2.1, XDP zero-copy both sides, NIC-counter
 truth):
 
-- **Single link** ([report](../benchmark/RUNBOUND-v0.16.11-threadripper-5995wx-x710-xdp-2026-06-10.md)):
+- **Single link** *(v0.16.11 — detailed report archived, in git history pre-`6ff6ae4`)*:
   offered reaches the 10 G line rate (~13.0 M qps of 78-byte queries); **served capped at
   10.09 M** by the *response-direction* line rate (answers are larger than queries) — a
   link property, not a server one.
-- **Dual link** ([report](../benchmark/RUNBOUND-v0.16.11-threadripper-5995wx-x710-dual-xdp-2026-06-10.md)):
+- **Dual link** *(v0.16.11 — detailed report archived, in git history pre-`6ff6ae4`)*:
   one XDP program + 32 zero-copy XSK workers per port, no bonding. **Served peak
   13.15 M qps** (port balance 49.9/50.1 %) under 13.18 M offered — **99.8 % answered at
   peak, at ~11 % receiver CPU**. The ceiling is the generator (~13.2 M pps total whether
@@ -88,9 +88,8 @@ syscall cost; batched `recvmmsg` receive (§4.0) keeps it efficient (~54 % CPU a
 offered, ~70 cores engaged), ~5 M packets dropped at the NIC under the same
 firehose, and an earlier latency knee — its rate under a sub-millisecond median SLO is
 ~4.6 M served (p50 0.746 ms). A NIC without the PCIe 2.0 RX cap would scale both higher;
-the magnitude of that headroom is not measured here. Reports:
-[fast path](../benchmark/RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md),
-[slow path](../benchmark/RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md).
+the magnitude of that headroom is not measured here. (v0.16.1 X520 fast-path and slow-path
+reports archived — in git history pre-`6ff6ae4`; the current round is in [benchmark/INDEX.md](../benchmark/INDEX.md).)
 
 > The slow path serves from cache only since the #183 fix: the racing resolvers were built
 > cache-less and the cache snapshot was built for `xdp: yes` only, leaving `xdp: no`

@@ -12,8 +12,8 @@ Only the **latest released version** receives security fixes — there is no LTS
 
 | Version | Supported |
 |---------|-----------|
-| 0.17.x  | ✅ |
-| < 0.17  | ❌ |
+| 0.18.x  | ✅ |
+| < 0.18  | ❌ |
 
 ## Reporting a vulnerability
 
