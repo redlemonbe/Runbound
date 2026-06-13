@@ -1418,7 +1418,16 @@ async fn build_and_launch(
     // axum 0.7 serve() is TCP-only, so the socket is served via a small hyper-util loop.
     if let Some(sock_path) = cfg.api_socket.clone() {
         let app_unix = app.clone();
-        let _ = std::fs::remove_file(&sock_path);
+        // SEC-J13: only unlink a pre-existing *socket* — never follow a symlink or delete a
+        // regular file an attacker may have planted at this path (TOCTOU hardening).
+        {
+            use std::os::unix::fs::FileTypeExt;
+            match std::fs::symlink_metadata(&sock_path) {
+                Ok(md) if md.file_type().is_socket() => { let _ = std::fs::remove_file(&sock_path); }
+                Ok(_) => { error!(socket = %sock_path, "api-socket path exists and is not a socket — refusing to unlink"); }
+                Err(_) => {}
+            }
+        }
         match tokio::net::UnixListener::bind(&sock_path) {
             Ok(listener) => {
                 use std::os::unix::fs::PermissionsExt;

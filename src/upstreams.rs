@@ -406,10 +406,25 @@ pub fn add_upstream(
         consecutive_strip_count: 0,
         next_check_at: Instant::now(),
     };
-    upstreams
-        .write()
-        .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in add_upstream: {e}"))
-        .push(entry.clone());
+    {
+        let mut list = upstreams
+            .write()
+            .unwrap_or_else(|e| panic!("upstreams: RwLock poisoned in add_upstream: {e}"));
+        // SEC-J14: dedup on (addr, port, protocol) and cap the total, to bound config /
+        // memory growth from repeated or replayed authenticated API calls.
+        if let Some(existing) = list
+            .iter()
+            .find(|u| u.addr == entry.addr && u.port == entry.port && u.protocol == entry.protocol)
+        {
+            return existing.clone();
+        }
+        const MAX_UPSTREAMS: usize = 128;
+        if list.len() >= MAX_UPSTREAMS {
+            tracing::warn!(count = list.len(), "add_upstream: upstream cap reached — refusing new entry");
+            return entry;
+        }
+        list.push(entry.clone());
+    }
     entry
 }
 
@@ -725,6 +740,16 @@ pub fn probe_upstream(addr: &str, port: u16, protocol: &str) -> ProbeResult {
 }
 
 // ── UDP probe — sends EDNS0+DO query, checks AD bit (#48) ─────────────────
+/// SEC-J3: a probe packet with a random DNS transaction ID, so an off-path attacker
+/// cannot pass the health check by forging a reply carrying the (previously static) ID.
+fn random_probe_packet() -> [u8; 28] {
+    let mut pkt = DNS_PROBE_PACKET;
+    let r = uuid::Uuid::new_v4().into_bytes();
+    pkt[0] = r[0];
+    pkt[1] = r[1];
+    pkt
+}
+
 fn probe_udp(addr: &str, port: u16) -> ProbeResult {
     let ip: IpAddr = match addr.parse() {
         Ok(ip) => ip,
@@ -743,14 +768,15 @@ fn probe_udp(addr: &str, port: u16) -> ProbeResult {
     let _ = sock.set_read_timeout(Some(Duration::from_millis(PROBE_TIMEOUT_MS)));
 
     let t0 = Instant::now();
-    if sock.send_to(&DNS_PROBE_PACKET, target).is_err() {
+    let pkt = random_probe_packet();
+    if sock.send_to(&pkt, target).is_err() {
         return (false, None, None, Some("send failed".into()));
     }
 
     let mut buf = [0u8; 512];
     match sock.recv_from(&mut buf) {
         Ok((n, _)) if n >= 12 => {
-            if buf[0] == DNS_PROBE_PACKET[0] && buf[1] == DNS_PROBE_PACKET[1] {
+            if buf[0] == pkt[0] && buf[1] == pkt[1] {
                 let latency = Some(t0.elapsed().as_millis() as u64);
                 // #48: AD bit = bit 5 of flags byte 3
                 let dnssec = Some(parse_ad_bit(&buf[..n]));
@@ -808,8 +834,9 @@ fn probe_dot(addr: &str, port: u16) -> ProbeResult {
     let mut tls = rustls::StreamOwned::new(conn, tcp);
 
     // Step 3: send DNS query with 2-byte TCP length prefix (RFC 7858 §3.3)
-    let len_prefix = (DNS_PROBE_PACKET.len() as u16).to_be_bytes();
-    if tls.write_all(&len_prefix).is_err() || tls.write_all(&DNS_PROBE_PACKET).is_err() {
+    let pkt = random_probe_packet();
+    let len_prefix = (pkt.len() as u16).to_be_bytes();
+    if tls.write_all(&len_prefix).is_err() || tls.write_all(&pkt).is_err() {
         return (false, None, None, Some("DNS send failed".into()));
     }
 
@@ -830,7 +857,7 @@ fn probe_dot(addr: &str, port: u16) -> ProbeResult {
     }
 
     // Step 6: verify ID match and extract AD bit
-    if buf[0] == DNS_PROBE_PACKET[0] && buf[1] == DNS_PROBE_PACKET[1] {
+    if buf[0] == pkt[0] && buf[1] == pkt[1] {
         let latency = Some(t0.elapsed().as_millis() as u64);
         let dnssec = Some(parse_ad_bit(&buf));
         (true, latency, dnssec, None)
