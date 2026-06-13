@@ -26,6 +26,8 @@ are bounded by the **10 G link's response direction (~10.1 M pps)**, again not R
 
 | Max served | Latency (p50) | Receiver CPU | Configuration | Link / NIC | Report |
 |-----------:|--------------:|-------------:|---------------|-----------|--------|
+| **~20.28 M qps** | ~0.05 ms (wire) | **~24 %** | **Runbound v0.18.1** `xdp: yes` **dual-link**, AF_XDP gen on **2 cards** — **2×10 G line-bound** (server not saturated) | X510 + X710 | [report](RUNBOUND-v0.18.1-threadripper-5995wx-x510x710-dual-xdp-2026-06-13.md) |
+| **~12.90 M qps** | ~0.05 ms (wire) | **~12 %** | **Runbound v0.18.1** `xdp: yes` **dual-link**, AF_XDP gen on **1 card** — **generator-bound** | 2× X710 (i40e) | [report](RUNBOUND-v0.18.1-threadripper-5995wx-x710-dual-xdp-2026-06-13.md) |
 | **~10.12 M qps** | **0.045 ms** (wire) | **~11 %** | **Runbound v0.18.1** `xdp: yes` (AF_XDP fast path), AF_XDP generator — **link-bound** | X710 (i40e) | [report](RUNBOUND-v0.18.1-threadripper-5995wx-x710-xdp-2026-06-13.md) |
 | **~10.12 M qps** | 0.054 ms (wire) | **~24 %** | **Runbound v0.18.1** `xdp: yes` (AF_XDP fast path), AF_XDP generator — **link-bound** (ixgbe heavier) | X510 (ixgbe) | [report](RUNBOUND-v0.18.1-threadripper-5995wx-x510-xdp-2026-06-13.md) |
 | **~3.71 M qps** | 0.066 ms @921 k egress | **19.1 %** | **Runbound v0.18.1** `xdp: no` (kernel slow path), non-XDP generator | X710 (i40e) | [report](RUNBOUND-v0.18.1-threadripper-5995wx-x710-noxdp-2026-06-13.md) |
@@ -35,12 +37,15 @@ are bounded by the **10 G link's response direction (~10.1 M pps)**, again not R
 | **~1.65 M qps** | 1.026 ms @513 k egress | **23.2 %** | **unbound 1.22.0** baseline, non-XDP generator (ixgbe RX-bound) | X510 (ixgbe) | [baseline](BASELINE-unbound-1.22.0-threadripper-5995wx-x510-2026-06-13.md) |
 | **~1.46 M qps** | 1.051 ms @500 k egress | **21.8 %** | **BIND 9.20.23** baseline, non-XDP generator (ixgbe RX-bound) | X510 (ixgbe) | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x510-2026-06-13.md) |
 
-**Runbound's AF_XDP fast path tops the table at ~10.12 M served (≤24 % CPU), link-bound** — on
-the X710 that is ~5.5× unbound, ~6.9× BIND and ~2.7× Runbound's own kernel slow path, at lower
-CPU and lower latency (p50 0.045 ms). The single 10 G link is the wall; the archived dual-link
-run reaches 13.15 M. The rows below it compare the **kernel paths** (Runbound `xdp: no` vs the
-two kernel-UDP resolvers), same host, generator, links and methodology. Findings, all consistent
-with the X520 archive:
+**Runbound's AF_XDP fast path tops the table — and never reaches its own ceiling.** Single 10 G
+link: ~10.12 M served at ≤24 % CPU (link-bound). **Dual-link X510+X710: ~20.28 M at 24 % CPU**,
+both 10 G links at line rate at once — the 2×10 G aggregate is the wall, not the server (still
+~76 % CPU idle). The dual-X710 row (12.90 M) is *generator*-bound: both its links are fed from the
+two ports of the generator's single X710 card (one PCIe bus, ~13 M); using two *separate* generator
+cards (the mixed row) lifts it to 20.28 M. On a single link the fast path is ~5.5× unbound, ~6.9×
+BIND, ~2.7× Runbound's own slow path, at lower CPU and lower latency (p50 0.045 ms). The rows below
+compare the **kernel paths** (Runbound `xdp: no` vs the two kernel-UDP resolvers), same host,
+generator, links and methodology. Findings, all consistent with the X520 archive:
 
 - **Runbound's slow path serves ~2× the references** (X710 3.71 M vs unbound 2.09 M / BIND
   1.84 M; X510 2.51 M vs 1.65 M / 1.46 M) at the same ~19–23 % CPU — the "2–2.5×" ordering of
@@ -73,6 +78,8 @@ round-trip. Every run follows [README.md](README.md) (warmup + ramp) and [TEMPLA
 - [runbound-receiver-bench.conf](runbound-receiver-bench.conf) — the receiver config for the
   Runbound runs (`xdp:no`, real forward-zone, no local-data, `rate-limit: 0`).
 - **New bench rig (2026-06-13) — X710 + X510 direct links**
+  - [Runbound v0.18.1 `xdp: yes` **dual-link X510+X710** (20.28 M, link-bound)](RUNBOUND-v0.18.1-threadripper-5995wx-x510x710-dual-xdp-2026-06-13.md)
+  - [Runbound v0.18.1 `xdp: yes` **dual-link X710** (12.90 M, generator-bound)](RUNBOUND-v0.18.1-threadripper-5995wx-x710-dual-xdp-2026-06-13.md)
   - [Runbound v0.18.1 `xdp: yes` (AF_XDP fast path) — X710 (i40e)](RUNBOUND-v0.18.1-threadripper-5995wx-x710-xdp-2026-06-13.md)
   - [Runbound v0.18.1 `xdp: yes` (AF_XDP fast path) — X510 (ixgbe)](RUNBOUND-v0.18.1-threadripper-5995wx-x510-xdp-2026-06-13.md)
   - [Runbound v0.18.1 `xdp: no` (kernel slow path) — X710 (i40e)](RUNBOUND-v0.18.1-threadripper-5995wx-x710-noxdp-2026-06-13.md)
@@ -81,7 +88,6 @@ round-trip. Every run follows [README.md](README.md) (warmup + ramp) and [TEMPLA
   - [unbound 1.22.0 — X510 (ixgbe)](BASELINE-unbound-1.22.0-threadripper-5995wx-x510-2026-06-13.md)
   - [BIND 9.20.23 — X710 (i40e)](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-06-13.md)
   - [BIND 9.20.23 — X510 (ixgbe)](BASELINE-bind9-9.20.23-threadripper-5995wx-x510-2026-06-13.md)
-  - _Runbound `xdp: yes` dual-link (both NICs at once) to follow._
 - **Rigs**
   - [Latitude.sh rs4.metal.xlarge (fra2)](rigs/latitude-rs4-metal-xlarge-fra2.md)
 - **Archive** — all pre-v0.18.1 results (X520, X710 v0.16.x, EPYC/bnxt): [archive/README.md](archive/README.md)
