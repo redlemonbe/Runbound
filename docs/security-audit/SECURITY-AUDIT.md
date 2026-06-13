@@ -22,7 +22,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
 | [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 0 open; 6 fixed, 3 accepted, 2 disputed |
 | [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 4 open (enhancement); 15 fixed, 3 accepted, 5 disputed |
-| [J](#cycle-j--v0180--two-ai-competitive-audit-full-surface-re-review) | v0.17.2→v0.18.0 | 2026-06-13 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 1 HIGH + 4 MEDIUM + 6 LOW open (remediation pending approval); 2 accepted, 2 disputed; 0 fixed |
+| [J](#cycle-j--v0180--two-ai-competitive-audit-full-surface-re-review) | v0.17.2→v0.18.0 | 2026-06-13 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro + live pentest | 1 HIGH + 3 MEDIUM + 7 LOW open (remediation pending approval); 2 accepted, 2 disputed; 0 fixed. Pentest: SEC-J1/J2 confirmed exploitable, SEC-J4 downgraded→LOW |
 
 ---
 
@@ -39,7 +39,7 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 **Date:** 2026-06-13  
 **Sources:** `[AI-INTERNAL]` Claude Opus 4.8 (per-domain manual review of the relay/auth, eBPF packet parser, and config-write paths) × `[AI-ADVERSARIAL]` Gemini 2.5 Pro (independent per-file red-team on the 11 highest-risk files: `sync.rs`, `api/mod.rs`, `config/parser.rs`, `ebpf/dns_xdp.c`, `dns/xdp/worker.rs`, `upstreams.rs`, `feeds/mod.rs`, `webui/mod.rs`, `main.rs`, `dns/kernel_loop.rs`, `dns/xdp/umem.rs`). Every Gemini finding was re-verified against the source by Claude before classification; two were rejected as model hallucinations (see Disputed). Per the standing process, remediation is **not yet applied** — findings are filed Open pending a maintainer-approved plan. Live exploitation of the bypass/auth findings is validated separately (Cycle J-pentest, below when run).
 
-**Status:** 0 fixed (remediation pending approval), 1 HIGH + 4 MEDIUM + 6 LOW open, 2 accepted, 2 disputed. Not a clean sweep: the one HIGH (SEC-J1) is a real API→host privilege-escalation primitive.
+**Status:** 0 fixed (remediation pending approval), 1 HIGH + 3 MEDIUM + 7 LOW open, 2 accepted, 2 disputed (SEC-J4 downgraded MEDIUM→LOW after live pentest — see Cycle J-pentest). Not a clean sweep: the one HIGH (SEC-J1) is a real API→host privilege-escalation primitive, confirmed exploitable in the live pentest.
 
 ### Open
 
@@ -114,6 +114,18 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 
 - **DISP-J1 — "Compressed-name parsing panic / DoS in `answer_from_cache`" (Gemini: HIGH).** Rejected. Gemini assumed `normalize_query_qname` interprets `0xC0` as a 192-byte label length and over-reads. In fact `normalize_query_qname` (`xdp/wire_builder.rs:235`) calls `simd::copy_lowercase_label`, which is a length-bounded byte copy+lowercase over the supplied slice (`src.len()`), with a scalar fallback `for &b in src {…}` — it never reads a label-length field, so `0xC0` is copied verbatim and there is no out-of-bounds access or panic. The crafted query merely cache-misses to the slow path. Model hallucination from the misleading "label" name.
 - **DISP-J2 — "OS command injection via ACME hook" (Gemini: CRITICAL, main.rs/parser.rs).** Re-scoped, not a standalone finding. `hook_run` runs `Command::new(script)` directly (no shell), so there is no shell-metacharacter injection; and `ui-acme-hook` is set from the operator-controlled config file, not directly from the API. The only attacker path to control it is the SEC-J1 split-horizon config injection — tracked there as arbitrary-binary execution, not as independent command injection.
+
+### Cycle J — live pentest validation (2026-06-13)
+
+`[AI-INTERNAL]` Claude, against a **throwaway `xdp: no` instance** (isolated config + data dir, ports 1053/18080/18090 on a build host) — never against production. Attack vectors were taken from the `[AI-ADVERSARIAL]` Gemini code findings above; the pentest validated or refuted each empirically.
+
+- **API authentication — solid.** `/api/stats`: no key → 401, wrong key → 401, valid key → 200.
+- **SEC-J1 — CONFIRMED (HIGH stands).** `POST /api/split-horizon` with `name = "evilview\n    ui-acme-hook: \"/tmp/PWNED.sh\"\n#x"` was accepted (200) and the regenerated config contained a standalone line `    ui-acme-hook: "/tmp/PWNED.sh"` — arbitrary config-directive injection via the authenticated API, proven.
+- **SEC-J2 — CONFIRMED (MEDIUM stands).** With no `webui-auth.conf`, `POST /login rb_user=admin&rb_pass=admin` returned `303 → /` with a valid `rb_session` cookie; a wrong password returned `/login?err=Invalid credentials`. Default `admin`/`admin` grants full WebUI access. Mitigations confirmed present: `HttpOnly; Secure; SameSite=Lax` cookie, CSRF token, 5/min login rate-limit.
+- **SEC-J4 — DOWNGRADED MEDIUM → LOW (with evidence).** A blacklisted real domain returned `REFUSED` for **both** `example.com` and `EXAMPLE.COM` on the kernel slow path → the slow path enforces the blacklist **case-insensitively**, so the eBPF fast-path case/VLAN/compression gaps are caught downstream (a perf / defence-in-depth loss, not a blocking bypass). Side note found: a name that is also `local-data` is answered before the blacklist is consulted (local-data precedence) — minor, admin-self-contradictory config.
+- WebUI session/CSRF/login-rate-limit defences: verified correct.
+
+**Net:** the audit's one HIGH (SEC-J1) and the WebUI default-credentials MEDIUM (SEC-J2) are confirmed exploitable; SEC-J4 is downgraded with evidence; API key authentication is solid. Remediation still pending maintainer approval.
 
 ---
 
