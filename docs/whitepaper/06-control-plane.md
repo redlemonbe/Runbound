@@ -36,11 +36,11 @@ restart (split-horizon, whose resolver table is built at boot).
 - **Authentication = HMAC-SHA256 over method + path + timestamp + request body**
   (SEC-I14, v0.17.1 — before that the body was not covered), carried in the
   `x-runbound-ts` + `x-runbound-sig` headers (`src/api/relay.rs:136`), anti-replay
-  window ±30 s. Verification is constant-time and **dual-accept**: both the
-  body-covering and the legacy header-only signature are computed and compared (no
-  secret-dependent short-circuit — `hmac_verify_with_ts`, `src/sync.rs:118`) so a
-  not-yet-upgraded peer still verifies during a rolling upgrade. Deploy note: the relay
-  is fully functional only once **both** master and slave run ≥ v0.17.1.
+  window ±30 s. Verification is constant-time (no secret-dependent short-circuit —
+  `hmac_verify_with_ts`, `src/sync.rs:118`). As of **v0.18.1 (SEC-J5) only the
+  body-covering signature is accepted** — the pre-v0.17.1 legacy header-only fallback
+  (which left the body unauthenticated) was removed once the fleet was ≥ v0.17.1. Deploy
+  note: the relay requires **both** master and slave at ≥ v0.17.1.
 - **Confidentiality = rustls TLS**, but with a **custom verifier that does not validate the
   certificate chain** (`NoCertVerifier`, `src/api/relay.rs:35`). The comment is explicit:
   *"HMAC-SHA256 provides authentication; the TLS layer still encrypts — only cert
