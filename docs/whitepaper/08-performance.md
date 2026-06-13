@@ -1,15 +1,22 @@
 # 08 — Performance
 
-> **Status: current as of v0.18.0 (2026-06-13)** — governed by `docs/benchmark/README.md`
-> (the methodology) and the per-run reports under `docs/benchmark/`. The latest measured
-> runs in-repo are v0.16.11 (X710 fast path) and v0.17.0 (slow-path auto-tune, CHANGELOG);
-> v0.18.0 changes both datapaths (slow-path random reuseport spread + physical-core
-> affinity; fast-path hugepage->regular-page UMEM auto-fallback). Validation-rig numbers
-> (Threadripper PRO 5995WX, Intel X710/i40e, kernel 6.12, dnsmark with the v2.2.2 flow
-> spread, sustained hold, counted at the NIC `tx_packets`): fast path **~11.2 Mqps**
-> (generator-bound — not the server ceiling, the NIC delivers more), slow path
-> **~6.55 Mqps** (kernel-UDP, NIC-node physical cores). A formal per-run report under
-> the documented methodology is pending; treat these as validation measurements.
+> **Status: current as of v0.18.1 (2026-06-13)** — governed by `docs/benchmark/README.md`
+> (the methodology) and the per-run reports under `docs/benchmark/`. A full re-benchmark was
+> run on **v0.18.1** on a new rig (Threadripper PRO 5995WX receiver; dual Xeon E5-2690 v2
+> generator; direct 10 GbE DACs Intel X710/i40e + X510/ixgbe; dnsmark v2.3.0; warm cache;
+> NIC `tx_packets` truth). Headline measured results (per-run reports in `docs/benchmark/`,
+> indexed in `docs/benchmark/INDEX.md`):
+>
+> | v0.18.1 | served (NIC) | receiver CPU | limited by |
+> |---|---|---|---|
+> | `xdp: yes` **dual-link** X510+X710 | **~20.28 Mqps** | ~24 % | the two 10 G links (server not saturated) |
+> | `xdp: yes` single link X710 | ~10.1 Mqps | ~11 % | 10 G link response direction |
+> | `xdp: yes` dual-link X710 (1 gen card) | ~12.9 Mqps | ~12 % | generator's single X710 card |
+> | `xdp: no` kernel slow path X710 | ~3.71 Mqps | ~19 % | kernel-UDP RX + generator |
+>
+> In no run did Runbound reach its own CPU ceiling (≤24 %). Same-rig kernel-UDP references:
+> unbound 1.22.0 ~2.09 M, BIND 9.20.23 ~1.84 M. The older v0.16.11 (X710) and v0.17.0
+> sections below are superseded by the v0.18.1 reports but kept for the datapath history.
 
 This chapter holds **only measured numbers produced under the documented methodology**.
 Until a run is completed under that methodology at the current version, this chapter states

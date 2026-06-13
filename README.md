@@ -170,9 +170,24 @@ curl -s -X POST http://localhost:8080/api/feeds \
 
 ## Performance
 
-Official benchmarks are being **re-run under a documented, reproducible methodology**
-— see [docs/benchmark/](docs/benchmark/). Previous ad-hoc numbers were removed to
-avoid stale or non-comparable claims.
+Benchmarked under a documented, reproducible methodology — **the truth is the receiver
+NIC hardware counters** (`tx_packets`), warm cache, governor pinned, flow-control off,
+never the generator's self-report. Full per-run reports: [docs/benchmark/](docs/benchmark/).
+Rig (2026-06-13): AMD Threadripper PRO 5995WX receiver, dual Xeon E5-2690 v2 generator
+(dnsmark), direct 10 GbE DACs (Intel X710/i40e + X510/ixgbe).
+
+| Runbound v0.18.1 | Served (receiver NIC) | Receiver CPU | Limited by |
+|---|---|---|---|
+| `xdp: yes` — **dual-link** (X510 + X710) | **~20.28 M qps** | ~24 % | the two 10 G links — **server not saturated** |
+| `xdp: yes` — single link (X710) | ~10.1 M qps | ~11 % | 10 G link (response direction) |
+| `xdp: no` — kernel slow path (X710) | ~3.71 M qps | ~19 % | kernel-UDP RX + generator |
+
+In no run did Runbound reach its own CPU ceiling (≤24 %); the limit is always the link, the
+NIC RX path, or the generator. Same-rig kernel-UDP reference resolvers: **unbound 1.22.0
+~2.09 M**, **BIND 9.20.23 ~1.84 M** — Runbound's slow path ~2×, its fast path ~5–6×, at
+lower CPU and lower latency. ~20.28 M qps ≈ **1.75 trillion queries/day** on a single node,
+the order of a large public resolver's average load. Latency, the generator-bound
+dual-X710 run, and full context: [docs/benchmark/INDEX.md](docs/benchmark/INDEX.md).
 
 The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC
 hardware, huge pages are self-provisioned, and NIC queues scale to the CPU
