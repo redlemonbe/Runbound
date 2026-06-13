@@ -273,9 +273,9 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     // ── split-horizon blocks ─────────────────────────────────────────────
     for se in &cfg.split_horizon {
         o.push_str("\nsplit-horizon:\n");
-        o.push_str(&format!("    name: \"{}\"\n", se.name));
-        for s in &se.subnets { o.push_str(&format!("    subnet: \"{s}\"\n")); }
-        for ld in &se.local_data { o.push_str(&format!("    local-data: \"{}\"\n", ld.rr)); }
+        o.push_str(&format!("    name: \"{}\"\n", escape_str(&se.name)));
+        for s in &se.subnets { o.push_str(&format!("    subnet: \"{}\"\n", escape_str(s))); }
+        for ld in &se.local_data { o.push_str(&format!("    local-data: \"{}\"\n", escape_str(&ld.rr))); }
     }
 
     // ── alert blocks ─────────────────────────────────────────────────────

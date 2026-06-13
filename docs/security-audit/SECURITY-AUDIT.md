@@ -39,7 +39,7 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 **Date:** 2026-06-13  
 **Sources:** `[AI-INTERNAL]` Claude Opus 4.8 (per-domain manual review of the relay/auth, eBPF packet parser, and config-write paths) × `[AI-ADVERSARIAL]` Gemini 2.5 Pro (independent per-file red-team on the 11 highest-risk files: `sync.rs`, `api/mod.rs`, `config/parser.rs`, `ebpf/dns_xdp.c`, `dns/xdp/worker.rs`, `upstreams.rs`, `feeds/mod.rs`, `webui/mod.rs`, `main.rs`, `dns/kernel_loop.rs`, `dns/xdp/umem.rs`). Every Gemini finding was re-verified against the source by Claude before classification; two were rejected as model hallucinations (see Disputed). Per the standing process, remediation is **not yet applied** — findings are filed Open pending a maintainer-approved plan. Live exploitation of the bypass/auth findings is validated separately (Cycle J-pentest, below when run).
 
-**Status:** 0 fixed (remediation pending approval), 1 HIGH + 3 MEDIUM + 7 LOW open, 2 accepted, 2 disputed (SEC-J4 downgraded MEDIUM→LOW after live pentest — see Cycle J-pentest). Not a clean sweep: the one HIGH (SEC-J1) is a real API→host privilege-escalation primitive, confirmed exploitable in the live pentest.
+**Status (post-remediation, PR #198):** 7 fixed (SEC-J1 HIGH + J2/J3/J5/J7/J13/J14), SEC-J9 closed (already mitigated, #195), SEC-J12 closed (false positive, #196), SEC-J8 deferred (eBPF/XDP datapath — cosmetic), SEC-J4 downgraded→LOW (pentest), SEC-J6/J10 accepted (defence-in-depth), 2 disputed (Gemini false positives). Not a clean sweep — SEC-J8 is deferred and J6/J10 remain accepted. The one HIGH (SEC-J1) is fixed and was confirmed exploitable pre-fix in the live pentest.
 
 ### Open
 
@@ -125,7 +125,23 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 - **SEC-J4 — DOWNGRADED MEDIUM → LOW (with evidence).** A blacklisted real domain returned `REFUSED` for **both** `example.com` and `EXAMPLE.COM` on the kernel slow path → the slow path enforces the blacklist **case-insensitively**, so the eBPF fast-path case/VLAN/compression gaps are caught downstream (a perf / defence-in-depth loss, not a blocking bypass). Side note found: a name that is also `local-data` is answered before the blacklist is consulted (local-data precedence) — minor, admin-self-contradictory config.
 - WebUI session/CSRF/login-rate-limit defences: verified correct.
 
-**Net:** the audit's one HIGH (SEC-J1) and the WebUI default-credentials MEDIUM (SEC-J2) are confirmed exploitable; SEC-J4 is downgraded with evidence; API key authentication is solid. Remediation still pending maintainer approval.
+**Net:** the audit's one HIGH (SEC-J1) and the WebUI default-credentials MEDIUM (SEC-J2) are confirmed exploitable; SEC-J4 is downgraded with evidence; API key authentication is solid.
+
+### Cycle J — remediation (PR #198, 2026-06-13)
+
+Maintainer-approved; applied on `audit/v0.18-hardening` (**all changes outside the slow/fast DNS datapath**; 282 tests pass, clippy `-D warnings` clean):
+
+- **SEC-J1 (HIGH) — Fixed.** Config writer escapes `name`/`subnet`/`local-data`; `add_split_horizon` rejects control/newline input (defence in depth).
+- **SEC-J2 — Fixed.** Random one-time WebUI password (logged once, persisted) instead of `admin`/`admin`.
+- **SEC-J3 — Fixed.** Random DNS transaction ID per probe, verified in the reply.
+- **SEC-J5 — Fixed.** Legacy header-only HMAC fallback removed (body-covering only).
+- **SEC-J7 — Fixed.** TLS private keys written atomically with mode 0600 from creation.
+- **SEC-J13 — Fixed.** API Unix socket unlinked only if it is actually a socket.
+- **SEC-J14 — Fixed.** `add_upstream` dedups on (addr, port, protocol) and is capped.
+- **SEC-J9 — Closed, already mitigated** (#195): streaming read + 100 MiB cap.
+- **SEC-J12 — Closed, false positive** (#196): `proxy_api` enforces auth + CSRF and blocks `..`.
+- **SEC-J8 — Deferred:** touches the eBPF/XDP datapath (cosmetic off-by-one).
+- **SEC-J6 / SEC-J10 — Accepted** (defence-in-depth, kept).
 
 ---
 
