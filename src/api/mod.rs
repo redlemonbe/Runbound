@@ -187,8 +187,16 @@ pub fn init_api_key(config_key: Option<String>) -> String {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         })
-        .or_else(|| std::env::var("RUNBOUND_API_KEY").ok())
-        .or(config_key)
+        // #190: a set-but-blank RUNBOUND_API_KEY (or a blank config `api-key`) must NOT
+        // win over the random fallback — an empty key panicked at `&api_key[..8]`
+        // (main.rs). Trim and treat blank as absent, matching the FILE path above.
+        .or_else(|| {
+            std::env::var("RUNBOUND_API_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| config_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
         .unwrap_or_else(|| {
             // 256 bits from OS CSPRNG — two UUID v4s = 64 hex chars.
             // Previous implementation used PID+timestamp (deterministic → weak).
