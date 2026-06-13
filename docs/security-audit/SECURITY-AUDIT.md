@@ -1,7 +1,7 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.17.2 (Cycle I remediations cover through v0.17.1; v0.17.2 adds no security-relevant change — see CHANGELOG)  
-**Last updated:** 2026-06-11  
+**Current version:** v0.18.0 (Cycle J two-AI audit completed 2026-06-13; remediation pending maintainer approval — see Cycle J)  
+**Last updated:** 2026-06-13  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
 This document consolidates all security and performance audit cycles conducted on Runbound. Individual per-cycle files in this directory are historical records; this file is the authoritative status reference.
@@ -22,6 +22,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [G](#cycle-g--v0150-two-ai-competitive-audit) | v0.13.0→v0.15.0 | 2026-06-06 | [AI-INTERNAL] Claude × [AI-ADVERSARIAL] Qwen3-Coder-30B (local) + Gemini 2.5 Pro | 2 open (2 fixed, 4 disputed) — no accepted |
 | [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 0 open; 6 fixed, 3 accepted, 2 disputed |
 | [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 4 open (enhancement); 15 fixed, 3 accepted, 5 disputed |
+| [J](#cycle-j--v0180--two-ai-competitive-audit-full-surface-re-review) | v0.17.2→v0.18.0 | 2026-06-13 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 1 HIGH + 4 MEDIUM + 6 LOW open (remediation pending approval); 2 accepted, 2 disputed; 0 fixed |
 
 ---
 
@@ -30,6 +31,89 @@ This document consolidates all security and performance audit cycles conducted o
 Through Cycle E (v0.9.50) all tracked findings were fixed, accepted, or classified as false positives. **Cycle F (v0.12.0)** opened enhancement-class findings OPEN-F1..F5. As of v0.15.0: OPEN-F2 (reproducible build + signatures), OPEN-F4 (SIEM JSON logs) and OPEN-F5 (CycloneDX SBOM) are **Fixed**; OPEN-F1 (third-party human audit, #170) remains **Open**; OPEN-F3 (strict RRL) is **not planned**. None were active vulnerabilities.
 
 All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
+
+---
+
+## Cycle J — v0.18.0 — two-AI competitive audit (full-surface re-review)
+
+**Date:** 2026-06-13  
+**Sources:** `[AI-INTERNAL]` Claude Opus 4.8 (per-domain manual review of the relay/auth, eBPF packet parser, and config-write paths) × `[AI-ADVERSARIAL]` Gemini 2.5 Pro (independent per-file red-team on the 11 highest-risk files: `sync.rs`, `api/mod.rs`, `config/parser.rs`, `ebpf/dns_xdp.c`, `dns/xdp/worker.rs`, `upstreams.rs`, `feeds/mod.rs`, `webui/mod.rs`, `main.rs`, `dns/kernel_loop.rs`, `dns/xdp/umem.rs`). Every Gemini finding was re-verified against the source by Claude before classification; two were rejected as model hallucinations (see Disputed). Per the standing process, remediation is **not yet applied** — findings are filed Open pending a maintainer-approved plan. Live exploitation of the bypass/auth findings is validated separately (Cycle J-pentest, below when run).
+
+**Status:** 0 fixed (remediation pending approval), 1 HIGH + 4 MEDIUM + 6 LOW open, 2 accepted, 2 disputed. Not a clean sweep: the one HIGH (SEC-J1) is a real API→host privilege-escalation primitive.
+
+### Open
+
+#### SEC-J1 — Config-directive injection via the split-horizon API (`name`/`subnet` not escaped) — HIGH
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro, confirmed against code by [AI-INTERNAL] Claude  
+**Severity:** HIGH **Status:** Open  
+**Description:** `add_split_horizon` (`api/mod.rs`) accepts the API-supplied `name`/`subnet`, validating only non-emptiness (no character validation), then `persist_config → render_config` writes them with `format!("    name: \"{}\"\n", se.name)` at `config/writer.rs:276-277` **without `escape_str`** — unlike `local-zone` (l.121) and forward-zone `name` (l.238), which do escape. `escape_str` neutralises `"`, `\`, `\n`, `\r`; its omission here lets a `name` containing a newline inject an arbitrary directive into the regenerated `runbound.conf`. An authenticated API client can thus inject any server directive — e.g. `ui-acme-hook: "/path"`, which `hook_run` (`acme.rs:415`, `tokio::process::Command::new(script)`) later executes **as root** on the next ACME DNS-01 challenge; or `ui-cert`/`ui-key` to coerce arbitrary file reads; or directives that weaken bind/TLS. This crosses the API→OS trust boundary (an API key is not meant to grant shell-root). The hook is run directly (no shell), so it is arbitrary-binary execution, not shell-metacharacter injection — Gemini's separate "OS command injection via ACME hook" (main.rs) and "command injection via ui-acme-hook" (parser.rs) framings are the same chain, re-scoped here.  
+**Fix (proposed):** wrap `se.name` and each `subnet` in `escape_str` in `render_config`; additionally reject control/newline characters in `add_split_horizon` at the API boundary.
+
+#### SEC-J2 — WebUI falls back to default credentials `admin`/`admin` — MEDIUM
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro, confirmed by [AI-INTERNAL] Claude  
+**Severity:** MEDIUM **Status:** Open  
+**Description:** `load_or_default_creds` (`webui/mod.rs:178-194`) returns `admin`/`admin` (argon2-hashed) when `webui-auth.conf` is absent, unreadable or invalid. The default is partly mitigated — `/api/webui/password-status` (l.601) exposes `default:true` for the UI to warn, the file is written on first password change (l.642), and the design intends "delete the file to reset". But a webui that is enabled and exposed without a password change is open to `admin/admin`. Conditional on `ui-enabled` + network exposure.  
+**Fix (proposed):** on first boot with no creds file, generate a random one-time password, log it once, and require a change before granting access — instead of a static fallback.
+
+#### SEC-J3 — Upstream health-probe uses a static DNS transaction ID (off-path spoofable) — MEDIUM
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro, confirmed by [AI-INTERNAL] Claude  
+**Severity:** MEDIUM **Status:** Open  
+**Description:** `DNS_PROBE_PACKET` (`upstreams.rs:41`) hard-codes the DNS ID `0x0001`; the UDP/DoT probe acceptance check (`upstreams.rs:753`, `:833`) validates only `buf[0..2] == DNS_PROBE_PACKET[0..2]` — a value that is public (open-source). An off-path attacker spoofing the upstream's source IP can forge a "healthy" reply, masking a dead upstream (degrades the racing resolver / suppresses failover). Connected-UDP source filtering does not stop a spoofed source IP.  
+**Fix (proposed):** randomise the probe ID per send, verify it (and the echoed question) in the response.
+
+#### SEC-J4 — Blacklist XDP fast-path bypass (case / VLAN / compression) — MEDIUM (to confirm at pentest)
+**Source:** [AI-INTERNAL] Claude + [AI-ADVERSARIAL] Gemini 2.5 Pro  
+**Severity:** MEDIUM (provisional) **Status:** Open — confirm at pentest  
+**Description:** The eBPF fast-block (`dns_xdp.c`) compares the raw wire QNAME against `dns_blacklist`. Three gaps make the fast-path match avoidable: (a) `extract_qname_key` (l.234) copies bytes **without lowercasing**, while `dns_qname_hash` (l.223) lowercases — so a mixed-case / DNS-0x20 query for a blacklisted name misses the map; (b) VLAN-tagged frames (l.311-345) redirect straight to XSKS, skipping the fast-block entirely; (c) a QNAME with a compression pointer changes the extracted key. **Severity hinges on whether the AF_XDP slow-path worker re-applies the blacklist** — if it does, these are fast-path-only (a perf/defence-in-depth loss); if it does not, they are real blocking bypasses. No explicit blacklist re-check was found in `worker.rs`. To be resolved empirically by the pentest (query a blacklisted name in upper-case / via VLAN and observe whether it is blocked).  
+**Fix (proposed):** lowercase in `extract_qname_key`; apply the fast-block on the VLAN path; ensure the slow-path worker authoritatively enforces the blacklist.
+
+#### SEC-J9 — Feed download is fully buffered in memory before parsing — MEDIUM
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro  
+**Severity:** MEDIUM **Status:** Open  
+**Description:** `update_feed` (`feeds/mod.rs`) buffers the entire feed body in memory before parsing; a large (or attacker-influenced, if the feed URL is attacker-chosen) response can exhaust memory. Bounded only by the HTTP client defaults.  
+**Fix (proposed):** stream-parse line by line with a hard size cap.
+
+#### SEC-J12 — WebUI API-proxy path handling may reach internal endpoints — MEDIUM (to confirm)
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro  
+**Severity:** MEDIUM (provisional) **Status:** Open — needs code+pentest confirmation  
+**Description:** Gemini reports the embedded WebUI proxy forwards client-controlled paths to the local API without normalisation, potentially reaching endpoints the UI should not expose. Not yet arbitrated line-by-line by Claude; flagged for confirmation and pentest.  
+**Fix (proposed):** allow-list the proxied path prefixes; normalise/reject `..`.
+
+#### SEC-J7 — TLS private keys written then `chmod` (non-atomic; brief world-readable window) — LOW
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro  
+**Severity:** LOW **Status:** Open  
+**Description:** `ensure_relay_cert` (`sync.rs:173-176`) and `ensure_sync_cert` (`:586-589`) do `fs::write(key)` then `set_permissions(0o600)`; between the two the key sits at the umask default. Local-attacker TOCTOU.  
+**Fix (proposed):** create with `OpenOptions::mode(0o600)` atomically.
+
+#### SEC-J8 — ICMP rate-limiter off-by-one — LOW
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro  
+**Severity:** LOW **Status:** Open  
+**Description:** `dns_xdp.c` ICMP handler uses `r->count >= cfg->rate_pps` to drop, allowing one extra packet per window vs the configured rate. Cosmetic.  
+**Fix (proposed):** adjust the comparison / counter init.
+
+#### SEC-J13 — API Unix-socket setup TOCTOU (local) — LOW
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro  
+**Severity:** LOW **Status:** Open  
+**Description:** `main.rs` unlinks/creates the API Unix socket path with a TOCTOU window; a local attacker controlling the directory could influence file deletion. Socket path is admin-config.  
+**Fix (proposed):** create in a root-owned dir with restrictive perms; avoid unlink-then-bind on an attacker-writable path.
+
+#### SEC-J14 — Unbounded upstream addition via API (resource growth) — LOW
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro  
+**Severity:** LOW **Status:** Open  
+**Description:** `add_upstream` (`upstreams.rs:380`) appends without a cap or dedup; a replayed/looped API call grows the upstream set and config. Authenticated only.  
+**Fix (proposed):** cap the count, dedup on (addr, transport).
+
+### Accepted (risk understood, kept this cycle)
+
+- **SEC-J5 — Legacy header-only HMAC still accepted (`hmac_verify_with_ts`, `sync.rs:134-136`).** LOW. The body-covering MAC (SEC-I14) is verified, but the pre-v0.17.1 header-only MAC is also accepted for rolling upgrade — so body tampering is theoretically possible *if TLS is also defeated* (relay is TLS-pinned via `PinnedCertVerifier`). Defence-in-depth only. **Now removable** once the fleet is ≥ v0.17.1 — slated for SEC-J1's remediation batch. Gemini rated this HIGH assuming a cleartext MITM, which the pinned TLS layer prevents.
+- **SEC-J6 — Anti-replay is a ±30 s timestamp window, no nonce cache (`sync.rs:126-130`).** LOW. Replay within 30 s is possible only behind a defeated pinned-TLS channel. Accepted as defence-in-depth; a nonce cache is a future hardening.
+- **SEC-J10 — kernel slow-path TX length not re-clamped to the written length (`kernel_loop.rs`).** LOW. Gemini posited a stale-memory leak *if* a downstream builder returned a wrong length; no such bug exists, and the send already clamps `tx_lens[i].min(DNS_BUF_SIZE)`, bounding any read to the per-slot buffer. Accepted; an explicit clamp-to-written-length is cheap hardening.
+- **SEC-J11 — Ring/UMEM size integer-overflow (`umem.rs`).** LOW. Sizes are admin-config and documented as validated to powers-of-two in `[64, 65536]` (l.32); within that range no overflow occurs, and the values are not network-controlled. Accepted pending a check that the bound is enforced before every size computation.
+
+### Disputed (false positives — recorded with refuting evidence)
+
+- **DISP-J1 — "Compressed-name parsing panic / DoS in `answer_from_cache`" (Gemini: HIGH).** Rejected. Gemini assumed `normalize_query_qname` interprets `0xC0` as a 192-byte label length and over-reads. In fact `normalize_query_qname` (`xdp/wire_builder.rs:235`) calls `simd::copy_lowercase_label`, which is a length-bounded byte copy+lowercase over the supplied slice (`src.len()`), with a scalar fallback `for &b in src {…}` — it never reads a label-length field, so `0xC0` is copied verbatim and there is no out-of-bounds access or panic. The crafted query merely cache-misses to the slow path. Model hallucination from the misleading "label" name.
+- **DISP-J2 — "OS command injection via ACME hook" (Gemini: CRITICAL, main.rs/parser.rs).** Re-scoped, not a standalone finding. `hook_run` runs `Command::new(script)` directly (no shell), so there is no shell-metacharacter injection; and `ui-acme-hook` is set from the operator-controlled config file, not directly from the API. The only attacker path to control it is the SEC-J1 split-horizon config injection — tracked there as arbitrary-binary execution, not as independent command injection.
 
 ---
 
