@@ -81,6 +81,13 @@ datacenter you can equally use ECMP: the upstream router holds an equal-cost rou
 via every node and hashes flows across them (enable L4 hashing:
 `net.ipv4.fib_multipath_hash_policy=1`).
 
+> **Withdraw the BGP *route*, not the VIP.** Keep `198.51.100.53` on `dummy0` **at all times**;
+> the announcer pulls the *route* on health failure, never the interface address. If the health
+> mechanism removes the VIP itself, the node cannot re-bind `interface: 198.51.100.53` when
+> Runbound restarts — a chicken-and-egg deadlock (observed and avoided in the §6-D lab). exabgp
+> does this correctly by design; if you script it (e.g. FRR `network` toggle), keep the address
+> up and toggle only the advertisement.
+
 ## 5. Health-driven withdrawal is mandatory
 
 A dead node that is **still announced** is worse than no anycast: roughly *1/N* of all queries
@@ -91,7 +98,7 @@ and on a fleet the master aggregates it.
 
 ## 6. Bench validation (2026-06-13)
 
-All three were measured, not assumed.
+All four were measured, not assumed.
 
 - **A — source-IP correctness.** One node, VIP on `dummy0`, queried from a remote client.
   tcpdump confirmed **every reply sourced from the VIP** on all paths — UDP cache-hit, UDP
@@ -100,10 +107,16 @@ All three were measured, not assumed.
   (NXDOMAIN / SERVFAIL). **Zero** replies leaked from the node's unicast address.
 - **B — ECMP distribution.** Two nodes serving the same VIP, an ECMP client with L4 hashing.
   50 queries split **29 / 21** across the two nodes — same VIP, both answer, client accepts.
-- **C — withdrawal.** With one node killed but **still in the ECMP route**, ~**half the
-  queries failed** (21/40 timed out). After withdrawing the dead next-hop (what the
-  health-checked announcer does automatically), **0 failures** — all traffic drained to the
-  healthy node.
+- **C — withdrawal (manual).** With one node killed but **still in the ECMP route**, ~**half
+  the queries failed** (21/40 timed out). After withdrawing the dead next-hop, **0 failures** —
+  all traffic drained to the healthy node. (Demonstrates why the announcer's health check is
+  mandatory.)
+- **D — real BGP, full automatic lifecycle.** Three-node lab — two Runbound nodes + an **FRR**
+  ECMP router, real eBGP `/32` announcements, a health watcher per node (VIP permanent, BGP
+  route toggled on Runbound liveness). Healthy: ECMP split (22/18). **Node killed → route
+  withdrawn automatically → all traffic drained to the survivor, 0 client failures**; node
+  restored → re-announced automatically → ECMP rebalanced, **0 failures**. Lossless in both
+  directions, no manual intervention — the production behaviour.
 
 ## 7. Notes
 
