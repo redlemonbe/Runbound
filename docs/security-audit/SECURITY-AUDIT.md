@@ -1,6 +1,6 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.18.0 (Cycle J two-AI audit completed 2026-06-13; remediation pending maintainer approval — see Cycle J)  
+**Current version:** v0.18.1 (Cycle J two-AI audit + remediation completed 2026-06-13 — merged in #198, released as v0.18.1; v0.18.1 also publishes the re-benchmark results)  
 **Last updated:** 2026-06-13  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
