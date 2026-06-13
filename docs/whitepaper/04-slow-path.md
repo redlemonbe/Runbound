@@ -106,22 +106,30 @@ topology and tunes the NIC for kernel-UDP throughput (`src/dns/server.rs:2590-26
 - **One IRQ pinned per node-local CPU** (`crate::cpu::set_irq_affinity`), wrapping if
   queues exceed node CPUs, after a 300 ms settle so the driver recreates its IRQs
   post-channel-change.
-- **RPS spread across all physical serving cores** (`crate::cpu::set_rps_cores`) — the
-  dominant lever: the in-code measurement note records 0.5 M → 6.4 M qps from RPS alone
-  on the X710/5995WX rig.
+- **RX softirq spread via the random reuseport cBPF** (`kernel_loop.rs`), **not RPS**.
+  RPS was tried as the spread lever but collapses on i40e (measured ~16.8 M softnet
+  drops/s, ~1.39 M qps), so it was removed: the kloop relies on `SO_REUSEPORT` + a
+  random-steering cBPF to distribute serving across cores, flow-independent and i40e-safe.
 - **`rx-usecs 25`, adaptive-rx off** (moderate coalescing — fewer NAPI re-arms at a
   ~25 µs latency cost) and **`rx-flow-hash udp4 sdfn`** so a few client IPs (NATs,
   forwarders, a benchmark generator) still fan across all queues. Best-effort `ethtool`
   shell-outs; skipped if `ethtool` is absent.
 
-Safety: queue/IRQ retuning happens **only on an explicitly named NIC** — a
-combined-channel change resets the link and must never hit a management interface. RPS,
-which is harmless on an idle NIC, is applied to every detected physical NIC. Per the
-CHANGELOG (v0.17.0), this took the measured kernel slow path from ~3.4 M to ~7.3 M+
-served qps (peak 8.16 M, at the i40e NAPI ceiling) on the X710/5995WX rig, with the
-AF_XDP fast path byte-for-byte unchanged. The auto-tune adapts to the card (which NUMA
-node it sits on) and the CPU (node size); NIC families with hardware flow steering (e.g.
-mlx5 aRFS) may prefer a different strategy — a driver-aware path is future work.
+Safety, and an important limitation: queue/IRQ retuning happens **only on an explicitly
+named NIC** (`xdp-interface:`) — a combined-channel change resets the link and must never
+hit a management interface. The consequence is that **out of the box, with no named NIC,
+the queue/IRQ stage does nothing** (`nic_queues=0 irqs_pinned=0`) and the slow path runs
+untuned ([#190](https://github.com/redlemonbe/Runbound/issues/190)). To enable slow-path
+tuning under `xdp: no`, name the data NIC with `xdp-interface:`.
+
+On i40e/X710 the kernel slow path is NAPI-bound and plateaus at **~1.5 M qps served**
+(best ~1.59 M with kloop-core isolation, the [#165](https://github.com/redlemonbe/Runbound/issues/165)
+lever). The earlier ~7.3 M figure was measured on **ixgbe/X520** (a different datapath)
+and is **not reproducible on i40e**; real slow-path scaling on i40e is tracked in #165.
+The AF_XDP fast path is byte-for-byte unchanged throughout. The auto-tune adapts to the
+card (which NUMA node it sits on) and the CPU (node size); NIC families with hardware flow
+steering (e.g. mlx5 aRFS) may prefer a different strategy — a driver-aware path is future
+work.
 
 ## To expand (verify against code)
 - serve-stale (#108) exact TTL policy.

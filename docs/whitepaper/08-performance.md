@@ -49,11 +49,16 @@ truth):
   peak, at ~11 % receiver CPU**. The ceiling is the generator (~13.2 M pps total whether
   flooding one NIC or two); **Runbound's own ceiling on this rig was not reached.**
   p50 stayed in the 0.04–0.30 ms band from 0.4 M to ~12.8 M qps total.
-- **Kernel slow path after the v0.17.0 auto-tune** (§4.5; CHANGELOG-sourced): served rate
-  ~3.4 M → ~7.3 M+ qps (peak 8.16 M) at the i40e NAPI ceiling, on the same rig — RPS to
-  all cores is the dominant lever, node-local IRQ placement the second. The AF_XDP fast
-  path is unchanged by the auto-tune (re-verified 11.18 M qps on the same rig, single
-  link, per the CHANGELOG).
+- **Kernel slow path (`xdp: no`), v0.17.0 auto-tune** (§4.5): the queue/IRQ retune is
+  applied only when a NIC is explicitly named (`xdp-interface:` — a channel change must
+  never hit a management NIC), so out of the box, with no named NIC, the kernel slow path
+  is **not** retuned ([#190](https://github.com/redlemonbe/Runbound/issues/190)). On
+  i40e/X710 the kernel slow path is NAPI-bound and plateaus at **~1.5 M qps served**
+  (best ~1.59 M with kloop-core isolation, the [#165](https://github.com/redlemonbe/Runbound/issues/165)
+  lever); the ~7.3 M figure reported earlier was measured on **ixgbe/X520** (a different
+  datapath, see the historical table below) and is **not reproducible on i40e**. Real
+  slow-path scaling on i40e is tracked in #165. The AF_XDP fast path is unaffected by any
+  of this (re-verified **11.18 M qps** single link on the same rig).
 
 ## Slow path vs fast path — measured (historical: v0.16.6, 5995WX, single X520, warm cache)
 
