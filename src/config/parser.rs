@@ -25,6 +25,28 @@ pub struct ForwardZone {
     pub tls_hostname: Option<String>,
 }
 
+/// Anycast deployment: announce one service IP (VIP) from this node over BGP via a
+/// managed exabgp child, withdrawing the route when Runbound is unhealthy. The VIP itself
+/// must live on a dummy/lo interface at all times (so the slow path can bind it); only the
+/// BGP advertisement is toggled. See docs/anycast.md.
+#[derive(Debug, Clone, Default)]
+pub struct AnycastConfig {
+    /// The anycast VIP route announced by every node, e.g. "198.51.100.53/32".
+    pub address: String,
+    /// Local BGP AS number of this node.
+    pub local_as: u32,
+    /// BGP peer (router / route-reflector) address.
+    pub peer: String,
+    /// Peer BGP AS number.
+    pub peer_as: u32,
+    /// This node's address for the BGP session (local-address). Defaults to the peer-facing IP.
+    pub local_address: Option<String>,
+    /// BGP router-id. Defaults to `local_address`.
+    pub router_id: Option<String>,
+    /// Path to the exabgp binary (default "exabgp" on $PATH).
+    pub exabgp_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
     pub cert_path: Option<String>,
@@ -364,6 +386,8 @@ pub struct UnboundConfig {
     /// accepted-but-unused + unknown directives), as (section, line). Re-emitted
     /// on full config regeneration so nothing is silently dropped.
     pub raw_passthrough: Vec<(String, String)>,
+    /// Anycast deployment block (None = not configured). See [`AnycastConfig`].
+    pub anycast: Option<AnycastConfig>,
 }
 
 
@@ -470,6 +494,7 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
     let mut current_forward: Option<ForwardZone> = None;
     let mut current_extra_key: Option<ExtraApiKey> = None;
     let mut current_split: Option<SplitHorizonEntry> = None;
+    let mut current_anycast: Option<AnycastConfig> = None;
     let mut current_section = String::new();
 
     for (lineno, raw) in content.lines().enumerate() {
@@ -492,6 +517,9 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                 if !se.subnets.is_empty() {
                     cfg.split_horizon.push(se);
                 }
+            }
+            if let Some(ac) = current_anycast.take() {
+                cfg.anycast = Some(ac);
             }
             current_section = line.trim_end_matches(':').to_string();
             continue;
@@ -529,6 +557,23 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
                     "forward-tls-hostname" => fwd.tls_hostname = Some(val.trim_matches('"').to_string()),
                     other => warn!(
                         "Line {}: unknown forward-zone directive '{}' — ignored",
+                        lineno + 1,
+                        other
+                    ),
+                }
+            }
+            "anycast" => {
+                let ac = current_anycast.get_or_insert_with(AnycastConfig::default);
+                match key {
+                    "address" => ac.address = val.trim_matches('"').to_string(),
+                    "local-as" => ac.local_as = val.trim().parse().unwrap_or(0),
+                    "peer" => ac.peer = val.trim_matches('"').to_string(),
+                    "peer-as" => ac.peer_as = val.trim().parse().unwrap_or(0),
+                    "local-address" => ac.local_address = Some(val.trim_matches('"').to_string()),
+                    "router-id" => ac.router_id = Some(val.trim_matches('"').to_string()),
+                    "exabgp-path" => ac.exabgp_path = Some(val.trim_matches('"').to_string()),
+                    other => warn!(
+                        "Line {}: unknown anycast directive '{}' — ignored",
                         lineno + 1,
                         other
                     ),
@@ -680,6 +725,9 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
         if !se.subnets.is_empty() {
             cfg.split_horizon.push(se);
         }
+    }
+    if let Some(ac) = current_anycast {
+        cfg.anycast = Some(ac);
     }
 
     Ok(cfg)
