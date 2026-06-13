@@ -5,11 +5,10 @@
 Maximum **served** throughput per run — receiver NIC hardware counters, never the
 generator's self-reported rate. Full context behind every number in its report.
 
-> **Re-benchmark in progress (2026-06-13).** The whole suite is being re-run on a new rig
-> (X710 + X510 direct links) with **Runbound v0.18.1 + dnsmark v2.3.0**. This index lists
-> only the current round. All pre-v0.18.1 results (X520, X710 v0.16.x, EPYC/bnxt) are kept,
-> unchanged, in [`archive/`](archive/README.md) — they used a different binary and, for the
-> baselines, an AF-XDP generator, so they are **not** comparable to the rows below.
+> **Full re-benchmark (2026-06-13).** The whole suite was re-run from scratch on a new rig
+> (X710 + X510 direct links) with **Runbound v0.18.1 + dnsmark v2.3.0**. This index lists only
+> this current round; pre-v0.18.1 results (X520, X710 v0.16.x, EPYC/bnxt) were measured on a
+> different binary and are superseded — recoverable from git history if ever needed.
 
 ## New bench rig (2026-06-13) — X710 + X510 direct links, **non-XDP generator**
 
@@ -90,7 +89,6 @@ round-trip. Every run follows [README.md](README.md) (warmup + ramp) and [TEMPLA
   - [BIND 9.20.23 — X510 (ixgbe)](BASELINE-bind9-9.20.23-threadripper-5995wx-x510-2026-06-13.md)
 - **Rigs**
   - [Latitude.sh rs4.metal.xlarge (fra2)](rigs/latitude-rs4-metal-xlarge-fra2.md)
-- **Archive** — all pre-v0.18.1 results (X520, X710 v0.16.x, EPYC/bnxt): [archive/README.md](archive/README.md)
 
 ## Related (outside this directory)
 
