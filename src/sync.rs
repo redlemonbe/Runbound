@@ -100,19 +100,6 @@ pub fn hmac_sign(key: &str, method: &str, path: &str, ts: u64, body: &[u8]) -> S
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Pre-v0.17.1 header-only signature (body NOT covered). Kept only so a v0.17.1 verifier
-/// accepts a not-yet-upgraded peer during a rolling upgrade. Remove once all nodes are
-/// >= v0.17.1.
-fn hmac_sign_legacy(key: &str, method: &str, path: &str, ts: u64) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-    let msg = format!("{method}\n{path}\n{ts}");
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).expect("HMAC accepts any key size");
-    mac.update(msg.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
-}
-
 /// Constant-time HMAC verification. Returns true iff the signature is valid
 /// AND the timestamp is within ±30 s of the current server clock.
 pub fn hmac_verify_with_ts(
@@ -128,12 +115,10 @@ pub fn hmac_verify_with_ts(
     if diff > 30 {
         return false;
     }
-    // SEC-I14: accept the body-covering signature (v0.17.1+); fall back to the legacy
-    // header-only signature so a not-yet-upgraded peer still verifies during a rolling
-    // upgrade. Both branches always run (no secret-dependent short-circuit).
-    let new_ok = ct_eq_hex(&hmac_sign(key, method, path, ts, body), sig) as u8;
-    let legacy_ok = ct_eq_hex(&hmac_sign_legacy(key, method, path, ts), sig) as u8;
-    (new_ok | legacy_ok) == 1
+    // SEC-J5 (v0.18.x): only the body-covering signature is accepted. The pre-v0.17.1
+    // header-only fallback (which left the request body unauthenticated) was removed now
+    // that the fleet is >= v0.17.1. The relay channel is TLS-pinned; this is defence in depth.
+    ct_eq_hex(&hmac_sign(key, method, path, ts, body), sig)
 }
 
 /// Constant-time comparison of two equal-purpose hex strings (length mismatch also fails).
@@ -148,11 +133,28 @@ fn ct_eq_hex(expected: &str, sig: &str) -> bool {
     combined.ct_eq(&0u8).into()
 }
 
+/// SEC-J7: write a private-key file atomically with mode 0600 from creation, so the key
+/// is never briefly world-readable in the window between `write` and a later `chmod`.
+fn write_key_0600(path: &std::path::Path, pem: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true).mode(0o600)
+            .open(path)
+            .map_err(|e| anyhow::anyhow!("create key {path:?}: {e}"))?;
+        f.write_all(pem.as_bytes())
+            .map_err(|e| anyhow::anyhow!("write key {path:?}: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, pem).map_err(|e| anyhow::anyhow!("write key {path:?}: {e}"))?;
+    Ok(())
+}
+
 /// Generate or load the relay TLS cert (separate from sync cert — each node has its own).
 pub fn ensure_relay_cert() -> anyhow::Result<(String, String)> {
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     let cert_path = relay_cert_path();
     let key_path = relay_key_path();
@@ -171,10 +173,7 @@ pub fn ensure_relay_cert() -> anyhow::Result<(String, String)> {
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
     fs::write(&cert_path, &cert_pem).map_err(|e| anyhow::anyhow!("write relay-cert.pem: {e}"))?;
-    fs::write(&key_path, &key_pem).map_err(|e| anyhow::anyhow!("write relay-key.pem: {e}"))?;
-    #[cfg(unix)]
-    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| anyhow::anyhow!("chmod relay-key.pem: {e}"))?;
+    write_key_0600(&key_path, &key_pem)?;
     Ok((cert_pem, key_pem))
 }
 
@@ -561,8 +560,6 @@ impl SyncJournal {
 /// Load existing sync cert or generate a new self-signed one. Returns (cert_pem, key_pem).
 pub fn ensure_sync_cert() -> anyhow::Result<(String, String)> {
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     let cert_path = sync_cert_path();
     let key_path = sync_key_path();
@@ -584,10 +581,7 @@ pub fn ensure_sync_cert() -> anyhow::Result<(String, String)> {
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
     fs::write(&cert_path, &cert_pem).map_err(|e| anyhow::anyhow!("write sync-cert.pem: {e}"))?;
-    fs::write(&key_path, &key_pem).map_err(|e| anyhow::anyhow!("write sync-key.pem: {e}"))?;
-    #[cfg(unix)]
-    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| anyhow::anyhow!("chmod sync-key.pem: {e}"))?;
+    write_key_0600(&key_path, &key_pem)?;
 
     Ok((cert_pem, key_pem))
 }
@@ -2049,10 +2043,10 @@ async fn slave_status_watcher(
 
 #[cfg(test)]
 mod sec_i14_hmac_body {
-    use super::{hmac_sign, hmac_sign_legacy, hmac_unix_now, hmac_verify_with_ts};
+    use super::{hmac_sign, hmac_unix_now, hmac_verify_with_ts};
 
     #[test]
-    fn body_is_covered_with_legacy_fallback() {
+    fn body_is_covered_legacy_rejected() {
         let key = "k";
         let body = br#"{"node_id":"x"}"#;
         let ts = hmac_unix_now();
@@ -2061,9 +2055,10 @@ mod sec_i14_hmac_body {
         assert!(hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &sig));
         // a tampered body is rejected
         assert!(!hmac_verify_with_ts(key, "POST", "/relay/dns", ts, b"tampered", &sig));
-        // a legacy (header-only) signature still verifies (rolling-upgrade compat)
-        let legacy = hmac_sign_legacy(key, "POST", "/relay/dns", ts);
-        assert!(hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &legacy));
+        // SEC-J5: a signature that does not cover this body (e.g. computed over an empty
+        // body, as the removed legacy header-only path did) no longer verifies
+        let header_only = hmac_sign(key, "POST", "/relay/dns", ts, b"");
+        assert!(!hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &header_only));
         // wrong key is rejected
         assert!(!hmac_verify_with_ts("other", "POST", "/relay/dns", ts, body, &sig));
     }
