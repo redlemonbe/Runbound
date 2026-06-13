@@ -31,6 +31,7 @@
 #![allow(clippy::empty_line_after_doc_comments)]
 
 mod acme;
+mod anycast;
 mod blockpage;
 mod api;
 mod audit;
