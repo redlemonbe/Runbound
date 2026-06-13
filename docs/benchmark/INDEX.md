@@ -49,13 +49,25 @@ runs (identical host + generator), **not** as comparable to the AF-XDP X520 numb
 
 | Max served | Latency (p50, closed-loop) | Receiver CPU | Configuration | Link / NIC | Report |
 |-----------:|---------------------------:|-------------:|---------------|-----------|--------|
+| **~2.09 M qps** | 0.227 ms @927 k egress | **20.5 %** | **unbound 1.22.0** baseline, non-XDP generator (generator/RX-bound) | X710 (i40e) | [baseline](BASELINE-unbound-1.22.0-threadripper-5995wx-x710-2026-06-13.md) |
 | **~1.84 M qps** | 0.320 ms @872 k egress | **17.3 %** | **BIND 9.20.23** baseline, non-XDP generator (generator/RX-bound) | X710 (i40e) | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-06-13.md) |
+| **~1.65 M qps** | 1.026 ms @513 k egress | **23.2 %** | **unbound 1.22.0** baseline, non-XDP generator (ixgbe RX-bound) | X510 (ixgbe) | [baseline](BASELINE-unbound-1.22.0-threadripper-5995wx-x510-2026-06-13.md) |
 | **~1.46 M qps** | 1.051 ms @500 k egress | **21.8 %** | **BIND 9.20.23** baseline, non-XDP generator (ixgbe RX-bound) | X510 (ixgbe) | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x510-2026-06-13.md) |
 
-Same host, same BIND, same generator — only the link changed: the **i40e ingests ~4.52 M/s
-(drops 1.22 M/s)** where the **ixgbe ingests ~2.46 M/s (drops 3.60 M/s)** under the identical
-~6 M offered, so BIND serves more behind the i40e (~1.84 M vs ~1.46 M) at the same CPU. The
-limit on both links is the kernel-UDP RX path and the non-XDP generator, not BIND.
+Two axes, both consistent with the X520 archive:
+
+- **Resolver:** on each link unbound serves ~13–14 % more than BIND (X710 2.09 M vs 1.84 M;
+  X510 1.65 M vs 1.46 M) at comparable CPU, with a cleaner success rate and a much tighter
+  closed-loop tail (unbound X510 p999 **1.161 ms** vs BIND **13.663 ms**). Same ordering as
+  the archived X520 run (unbound 3.59 M > BIND 2.98 M).
+- **Link/NIC:** same resolver, same generator, only the link changes — the **i40e ingests
+  ~4.3–4.5 M/s (drops ~1.1–1.2 M/s)** where the **ixgbe ingests ~2.5 M/s (drops ~3.5 M/s)**
+  under the identical ~6 M offered, so both resolvers serve more behind the i40e at the same CPU.
+
+The limit on both links, both resolvers, is the **kernel-UDP RX path and the non-XDP generator
+(~6 M offered)**, not the resolver — each sits at ~17–23 % CPU at its peak here. (dnsperf reads
+much lower in closed-loop, especially unbound on ixgbe where RX drops inflate its "lost" count;
+the open-loop dnsmark NIC counters are the throughput truth — see each report's §5.)
 
 ## X520 rig — Runbound vs reference resolvers (same rig, same generator)
 
@@ -122,6 +134,8 @@ renting; "100 G" alone says nothing.
   - [X520 v0.16.1 `xdp: no` (kernel slow path)](archive/RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md)
   - [Latitude EPYC 9554P / bnxt v0.17.2 — consolidated (xdp:no, XDP single, XDP dual, kernel 6.17)](archive/RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md)
 - **New bench rig (2026-06-13) — non-XDP generator, X710 + X510**
+  - [unbound 1.22.0 — X710 (i40e)](BASELINE-unbound-1.22.0-threadripper-5995wx-x710-2026-06-13.md)
+  - [unbound 1.22.0 — X510 (ixgbe)](BASELINE-unbound-1.22.0-threadripper-5995wx-x510-2026-06-13.md)
   - [BIND 9.20.23 — X710 (i40e)](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-06-13.md)
   - [BIND 9.20.23 — X510 (ixgbe)](BASELINE-bind9-9.20.23-threadripper-5995wx-x510-2026-06-13.md)
 - **Reference-server baselines — X520 archive** (AF-XDP generator, same rig + methodology)
