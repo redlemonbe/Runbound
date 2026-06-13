@@ -33,6 +33,30 @@ Reading rules for this table:
   stated. Every run follows [README.md](README.md) (warmup + ramp) and
   [TEMPLATE.md](TEMPLATE.md).
 
+## New bench rig (2026-06-13) — X710 + X510 direct links, **non-XDP generator**
+
+A fresh rig was built to re-run the whole suite on **Runbound v0.18.1 + dnsmark v2.3.0**:
+the same hosts (5995WX receiver / dual Xeon E5-2690 v2 generator) now joined by **two
+direct DAC links isolated from the prod LAN** — Intel **X710 (i40e)** and **X510 (ixgbe)**.
+The reference-resolver baselines are re-measured first; the Runbound runs follow.
+
+**Important methodology change vs the X520 archive:** this round drives the generator
+**non-XDP (kernel UDP)**, capped at ~6 M q/s offered on the Xeon v2. The archived X520
+baselines used an AF-XDP generator pushing 12 M offered. So the new served peaks are
+**generator/RX-bound, not the resolver's saturation ceiling** — BIND sits at ~17–22 % CPU
+at its peak here. Read these as the non-XDP reference for the matching non-XDP Runbound
+runs (identical host + generator), **not** as comparable to the AF-XDP X520 numbers below.
+
+| Max served | Latency (p50, closed-loop) | Receiver CPU | Configuration | Link / NIC | Report |
+|-----------:|---------------------------:|-------------:|---------------|-----------|--------|
+| **~1.84 M qps** | 0.320 ms @872 k egress | **17.3 %** | **BIND 9.20.23** baseline, non-XDP generator (generator/RX-bound) | X710 (i40e) | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-06-13.md) |
+| **~1.46 M qps** | 1.051 ms @500 k egress | **21.8 %** | **BIND 9.20.23** baseline, non-XDP generator (ixgbe RX-bound) | X510 (ixgbe) | [baseline](BASELINE-bind9-9.20.23-threadripper-5995wx-x510-2026-06-13.md) |
+
+Same host, same BIND, same generator — only the link changed: the **i40e ingests ~4.52 M/s
+(drops 1.22 M/s)** where the **ixgbe ingests ~2.46 M/s (drops 3.60 M/s)** under the identical
+~6 M offered, so BIND serves more behind the i40e (~1.84 M vs ~1.46 M) at the same CPU. The
+limit on both links is the kernel-UDP RX path and the non-XDP generator, not BIND.
+
 ## X520 rig — Runbound vs reference resolvers (same rig, same generator)
 
 **AMD Threadripper PRO 5995WX**, single **Intel X520 / 82599** (10 GbE, PCIe 2.0 x8),
@@ -97,7 +121,10 @@ renting; "100 G" alone says nothing.
   - [X520 v0.16.1 `xdp: yes` (AF_XDP fast path)](archive/RUNBOUND-v0.16.1-threadripper-5995wx-x520-xdp-2026-06-07.md)
   - [X520 v0.16.1 `xdp: no` (kernel slow path)](archive/RUNBOUND-v0.16.1-threadripper-5995wx-x520-noxdp-2026-06-07.md)
   - [Latitude EPYC 9554P / bnxt v0.17.2 — consolidated (xdp:no, XDP single, XDP dual, kernel 6.17)](archive/RUNBOUND-v0.17.2-latitude-epyc9554p-bnxt-2026-06-11.md)
-- **Reference-server baselines** (same rig + methodology)
+- **New bench rig (2026-06-13) — non-XDP generator, X710 + X510**
+  - [BIND 9.20.23 — X710 (i40e)](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-06-13.md)
+  - [BIND 9.20.23 — X510 (ixgbe)](BASELINE-bind9-9.20.23-threadripper-5995wx-x510-2026-06-13.md)
+- **Reference-server baselines — X520 archive** (AF-XDP generator, same rig + methodology)
   - [unbound 1.22.0](archive/BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-06-08.md)
   - [BIND 9.20.23](archive/BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-06-08.md)
 - **Rigs**
