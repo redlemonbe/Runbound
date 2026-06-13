@@ -65,7 +65,8 @@ truth):
   lever); the ~7.3 M figure reported earlier was measured on **ixgbe/X520** (a different
   datapath, see the historical table below) and is **not reproducible on i40e**. Real
   slow-path scaling on i40e is tracked in #165. The AF_XDP fast path is unaffected by any
-  of this (re-verified **11.18 M qps** single link on the same rig).
+  of this (re-verified at the 10 G link ceiling — **~10.1–11.2 M qps** single link,
+  run-to-run; the v0.18.1 per-run report records **~10.12 M** sustained served).
 
 ## Slow path vs fast path — measured (historical: v0.16.6, 5995WX, single X520, warm cache)
 
