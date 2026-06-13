@@ -1063,6 +1063,18 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         })
         .collect();
 
+    // Anycast state (built-in announcer) for the cluster / node view.
+    let anycast_json = match crate::anycast::state() {
+        Some(st) => serde_json::json!({
+            "configured": st.configured,
+            "address":    st.address,
+            "peer":       st.peer,
+            "local_as":   st.local_as,
+            "announced":  st.announced.load(Ordering::Relaxed),
+        }),
+        None => serde_json::json!({ "configured": false }),
+    };
+
     JsonExtract(serde_json::json!({
         "version":              env!("CARGO_PKG_VERSION"),
         "uptime_secs":          snap.uptime_secs,
@@ -1094,6 +1106,7 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         "upstream_racing":      s.cfg.upstream_racing,
         "upstream_racing_wins": upstream_racing_wins,
             "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
+        "anycast":              anycast_json,
     }))
 }
 

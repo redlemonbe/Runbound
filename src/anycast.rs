@@ -16,9 +16,41 @@ use crate::config::parser::AnycastConfig;
 use anyhow::{bail, Context, Result};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
 const CONF_PATH: &str = "/run/runbound-anycast.conf";
+
+/// Live anycast state published for the REST API (`/api/system`) and the WebUI cluster view.
+/// `announced` tracks whether the exabgp child is up (route advertised) right now.
+#[derive(Default)]
+pub struct AnycastState {
+    pub configured: bool,
+    pub address: String,
+    pub peer: String,
+    pub local_as: u32,
+    pub announced: AtomicBool,
+}
+
+static STATE: OnceLock<Arc<AnycastState>> = OnceLock::new();
+
+/// The published anycast state, or `None` if this node has no `anycast:` block.
+pub fn state() -> Option<Arc<AnycastState>> {
+    STATE.get().cloned()
+}
+
+fn publish(cfg: &AnycastConfig) -> Arc<AnycastState> {
+    let st = Arc::new(AnycastState {
+        configured: true,
+        address: cfg.address.clone(),
+        peer: cfg.peer.clone(),
+        local_as: cfg.local_as,
+        announced: AtomicBool::new(false),
+    });
+    let _ = STATE.set(Arc::clone(&st)); // first writer wins (one announcer per process)
+    STATE.get().cloned().unwrap_or(st)
+}
 
 /// Render the exabgp configuration for this node from the `anycast:` block.
 /// The route is announced statically while the session is up; Runbound controls
@@ -60,6 +92,7 @@ pub fn generate_exabgp_conf(cfg: &AnycastConfig) -> Result<String> {
 pub struct AnycastAnnouncer {
     cfg: AnycastConfig,
     child: Option<Child>,
+    state: Arc<AnycastState>,
 }
 
 impl AnycastAnnouncer {
@@ -69,7 +102,8 @@ impl AnycastAnnouncer {
         std::fs::write(CONF_PATH, &conf).with_context(|| format!("anycast: writing {CONF_PATH}"))?;
         info!(address = %cfg.address, peer = %cfg.peer, local_as = cfg.local_as,
               "anycast: exabgp config written to {CONF_PATH}");
-        Ok(Self { cfg: cfg.clone(), child: None })
+        let state = publish(cfg);
+        Ok(Self { cfg: cfg.clone(), child: None, state })
     }
 
     fn exabgp_bin(&self) -> String {
@@ -101,6 +135,7 @@ impl AnycastAnnouncer {
         info!(address = %self.cfg.address, pid = child.id(),
               "anycast: exabgp started — route ANNOUNCED");
         self.child = Some(child);
+        self.state.announced.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -111,6 +146,7 @@ impl AnycastAnnouncer {
             let _ = child.wait();
             warn!(address = %self.cfg.address, "anycast: exabgp stopped — route WITHDRAWN");
         }
+        self.state.announced.store(false, Ordering::Relaxed);
     }
 
     /// True while the exabgp child is alive (route announced).
