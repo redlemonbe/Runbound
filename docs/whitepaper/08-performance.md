@@ -108,6 +108,38 @@ correctness, latency and NIC-truth; dnsperf is generator-bound, as expected — 
 an open-loop AF_XDP generator is needed to reach the receiver's actual saturation point.
 Full report in the dnsmark repository (`docs/cross-validation-dnsperf.md`).
 
+## Bottleneck analysis & scaling headroom
+
+At the 2026-06-13 ceiling — **~20.28 M qps served, dual-link (X510 + X710)** — the limit is
+**the aggregate link line rate, not Runbound and not the CPU.** Each 10 GbE link carries
+~10.1 M small-DNS responses/s (its *response-direction* line rate); both links run at line
+rate at once, with **~0 NIC drops** and the receiver (a single AMD Threadripper PRO 5995WX,
+a PCIe-3.0 / 2013-class Xeon-v2 generator on the other end) at **~24 % CPU**. Single link:
+~10.12 M served at **~11 % CPU**. In no run did Runbound reach its own CPU ceiling — ~76 % of
+the machine was idle at the maximum.
+
+So the wall is **bandwidth**, hit in this order as each is removed: link line rate → NIC
+RX / PCIe path → CPU / memory. On this rig the **links saturated first** — PCIe 3.0 (X710)
+still had headroom, so the run is *not* PCIe-bound. The only demonstrably *bus*-bound result
+is the archived dual-Xeon-v2 / **X520** set: PCIe 2.0 x8 capped the RX path at ~10 M while
+Runbound stayed < 25 % CPU — a property of that 2013-era NIC/bus, not of the software.
+
+**Scaling projections — architectural, `[UNVERIFIED — awaiting hardware]`.** Because Runbound
+is link/bandwidth-bound and far from CPU-bound, served throughput should track the NIC line
+rate as long as CPU, PCIe and memory keep pace:
+
+| platform (projected) | link | projected served | basis |
+|---|---|---:|---|
+| PCIe 4.0 + 2×25 G (mlx5 zero-copy) | 50 G | **~50 M qps** | line-rate-bound; ≈ 60 % CPU by linear extrapolation from 20 M @ 24 % |
+| PCIe 5.0 + 100 G (mlx5 / ice zero-copy) | 100 G | **~100–200 M qps** | needs a many-core Zen5 / EPYC Turin (AVX-512); multi-variable |
+
+> **These are projections, not measurements.** They assume: (a) an **AF_XDP zero-copy** NIC —
+> Mellanox `mlx5` or Intel `ice` / `i40e`, **not** Broadcom `bnxt` (no zero-copy in any kernel
+> → copy-mode only); (b) PCIe and memory bandwidth that keep pace with the link; (c) NIC RSS
+> queues pinned to physical cores (the [#165](https://github.com/redlemonbe/Runbound/issues/165)
+> lever). They have **not** been run on the target hardware. The measured, reproducible fact is
+> the one above: **20.28 M served at ~24 % CPU, link-bound** — the server was never the wall.
+
 ## To expand
 - A v0.17.x run under the documented methodology (the v0.16.11 dual-link report's open
   item — a stronger generator or a third link — still stands to find the receiver's true
