@@ -87,8 +87,6 @@ round-trip. Every run follows [README.md](README.md) (warmup + ramp) and [TEMPLA
   - [unbound 1.22.0 — X510 (ixgbe)](BASELINE-unbound-1.22.0-threadripper-5995wx-x510-2026-06-13.md)
   - [BIND 9.20.23 — X710 (i40e)](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-06-13.md)
   - [BIND 9.20.23 — X510 (ixgbe)](BASELINE-bind9-9.20.23-threadripper-5995wx-x510-2026-06-13.md)
-- **Rigs**
-  - [Latitude.sh rs4.metal.xlarge (fra2)](rigs/latitude-rs4-metal-xlarge-fra2.md)
 
 ## Related (outside this directory)
 
