@@ -16,8 +16,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   actually running the XDP fast path therefore showed a wrong XDP badge in the master
   WebUI cluster view. The XDP attach mode is now published to a single global source of
   truth (`XDP_MODE`) at the same instant the API state is updated, and both the API and
-  the relay handler read it — so master and slave can never disagree. Data path
-  unchanged.
+  the relay handler read it — so master and slave can never disagree. The change under
+  `src/dns/` is additive and read-only (the `XDP_MODE` global + two status accessors); the
+  packet hot path (socket/ring/recv/tx) is byte-identical.
 
 ### Security
 - **Cycle K two-AI audit (Claude Opus 4.8 × Gemini 2.5 Pro) of the anycast feature** —
