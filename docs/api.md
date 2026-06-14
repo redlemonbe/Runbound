@@ -740,7 +740,8 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
   "upstreams_total": 3,
   "nic_rx_ring": 4096,
   "nic_rx_ring_max": 4096,
-  "nic_rx_dropped": 0
+  "nic_rx_dropped": 0,
+  "anycast": { "configured": true, "address": "198.51.100.53/32", "announced": true, "peer": "192.168.1.1", "local_as": 65001 }
 }
 ```
 
@@ -754,6 +755,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 | `nic_rx_ring` | u32 | Current RX ring depth applied to the NIC (descriptors). `0` when XDP is disabled or the driver does not support ethtool ring queries. |
 | `nic_rx_ring_max` | u32 | Maximum RX ring depth supported by the driver. Equal to `nic_rx_ring` when auto-sizing succeeded. |
 | `nic_rx_dropped` | u64 | Hardware-level RX drops read from `/sys/class/net/<iface>/statistics/rx_dropped`. A non-zero value under load indicates the NIC FIFO is overflowing before XDP sees the packets. |
+| `anycast` | object | Anycast announcer state (see [anycast.md](../docs/anycast.md)). `{ configured, address, peer, local_as, announced }` when an `anycast:` block is set; `{ "configured": false }` otherwise. `announced` is `true` while the exabgp child is up (route advertised). The WebUI **System** tab renders this per node (master + each slave via the relay). |
 
 ---
 

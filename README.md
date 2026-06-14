@@ -25,6 +25,7 @@ Most existing `unbound.conf` files work as-is. Non-standard or exotic directives
 | Real-time stats + Prometheus | ✅ statistics channel (XML/JSON) | ❌ | ✅ |
 | Master/slave replication | ✅ | ❌ | ✅ built-in*¹ |
 | Automatic TLS (Let's Encrypt) | ❌ | ❌ | ✅ ACME |
+| Anycast deployment (built-in BGP announcer) | ❌ | ❌ | ✅ v0.19.0 |
 | AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ |
 | XDP ICMP echo responder (rate-limited) | ❌ | ❌ | ✅ |
 | Embedded browser dashboard | ❌ | ❌ | ✅ no nginx needed |

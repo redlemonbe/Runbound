@@ -885,6 +885,44 @@ forward-zone:
 
 ---
 
+## `anycast:` directives
+
+Announce one service IP (VIP) from this node over BGP via a **managed `exabgp` child**, so many
+nodes serve the same address (the model every large public resolver uses). Runbound writes the
+exabgp config, supervises the child, announces the route while serving, and withdraws it on
+shutdown. **No datapath change** — the XDP fast path reflects the query's destination IP and the
+slow path sources replies from the bound VIP; anycast is additive (a missing/invalid block keeps
+DNS serving). The VIP itself must live on a `dummy`/`lo` interface, and the node must run under
+**systemd** (the supervising cgroup reaps exabgp on a hard death). Full guide — routing, sysctls,
+systemd unit, bench validation — in [docs/anycast.md](anycast.md).
+
+```
+anycast:
+  address: 198.51.100.53/32     # the VIP route to announce (IPv4/IPv6 CIDR)
+  local-as: 65001               # this node's BGP AS
+  peer: 192.168.1.1             # the BGP router / route-reflector
+  peer-as: 65000
+  local-address: 192.168.1.10   # this node's IP for the BGP session
+  router-id: 192.168.1.10       # optional — defaults to local-address
+  exabgp-path: exabgp           # optional — defaults to "exabgp" on $PATH
+```
+
+| Directive | Type | Description |
+|---|---|---|
+| `address` | string | VIP route announced (IPv4/IPv6 CIDR, e.g. `198.51.100.53/32`). **Required.** |
+| `local-as` | u32 | This node's BGP AS number. **Required.** |
+| `peer` | string | BGP peer (router/route-reflector) IP. **Required.** |
+| `peer-as` | u32 | Peer BGP AS number. **Required.** |
+| `local-address` | string | This node's IP for the BGP session. **Required.** |
+| `router-id` | string | BGP router-id. Defaults to `local-address`. |
+| `exabgp-path` | string | Path to the `exabgp` binary. Defaults to `exabgp` on `$PATH`. |
+
+> The string fields accept only IPv4/IPv6/CIDR characters (no whitespace, braces or semicolons)
+> to prevent exabgp config injection. `exabgp` must be installed on the node. The node's anycast
+> state is exposed at `GET /api/system` (`anycast` object) and in the WebUI **System** tab.
+
+---
+
 ## Complete example
 
 ```
