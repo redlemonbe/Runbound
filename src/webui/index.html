@@ -580,6 +580,12 @@
       <div id="sys-slaves-list" class="text-sm text-gray-600 italic">—</div>
     </div>
     <div class="card max-w-4xl mx-auto mb-3">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Anycast</div>
+      <div id="sys-anycast-body" class="space-y-2 text-sm">
+        <div class="text-gray-600 italic">Not configured on this node.</div>
+      </div>
+    </div>
+    <div class="card max-w-4xl mx-auto mb-3">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Full backup / restore</div>
       <p class="text-xs text-gray-700 mb-3">Export the complete state (config + DNS entries + blacklist + feeds + upstreams + users + keys/certs) as one file. Restoring requires a service restart to apply. <span class="text-yellow-500">The backup contains secrets — store it securely.</span></p>
       <div class="flex gap-2 flex-wrap items-center">
@@ -1427,6 +1433,18 @@ async function loadSystem(){
     set('sys-mem-total',s.mem_total_mb!=null?s.mem_total_mb.toLocaleString()+' MB':'—');
     set('sys-mem-avail',s.mem_avail_mb!=null?s.mem_avail_mb.toLocaleString()+' MB':'—');
     if(s.cache_entries!=null)set('sys-cache-entries',s.cache_entries.toLocaleString());
+    const ac=s.anycast||{}, acb=document.getElementById('sys-anycast-body');
+    if(acb){
+      if(!ac.configured){ acb.innerHTML='<div class="text-gray-600 italic">Not configured on this node.</div>'; }
+      else{
+        const badge=ac.announced?'<span class="badge badge-xdp-on">announced</span>':'<span class="badge badge-xdp-off">withdrawn</span>';
+        acb.innerHTML=
+          '<div class="flex justify-between"><span class="text-gray-500">Route</span><span class="text-cyan-300 font-mono">'+(ac.address||'—')+'</span></div>'+
+          '<div class="flex justify-between"><span class="text-gray-500">State</span><span>'+badge+'</span></div>'+
+          '<div class="flex justify-between"><span class="text-gray-500">BGP peer</span><span class="font-mono text-gray-400">'+(ac.peer||'—')+'</span></div>'+
+          '<div class="flex justify-between"><span class="text-gray-500">Local AS</span><span class="tabular-nums">'+(ac.local_as||'—')+'</span></div>';
+      }
+    }
   }catch(_){}
   try{
     const c = n.cache ?? await nodeApi(nId,'GET','/cache/stats');
@@ -1472,6 +1490,9 @@ async function loadSlaves(){
       const xdpBadge=sys
         ?(sys.xdp_active?`<span class="badge badge-xdp-on">${esc(sys.xdp_mode??'active')}</span>`:'<span class="badge badge-xdp-off">off</span>')
         :'<span class="text-gray-700">—</span>';
+      const acBadge=sys?.anycast?.configured
+        ?(sys.anycast.announced?'<span class="badge badge-xdp-on">announced</span>':'<span class="badge badge-xdp-off">withdrawn</span>')
+        :'<span class="text-gray-700">—</span>';
       return`<div class="slave-card">
   <div class="slave-card-hdr">
     <span class="text-cyan-300 font-mono text-xs">${esc(ip)}</span>
@@ -1482,6 +1503,7 @@ async function loadSlaves(){
     <div class="row-m"><span class="text-gray-500">CPU usage</span><span class="text-yellow-500 tabular-nums">${cpuPct}</span></div>
     <div class="row-m"><span class="text-gray-500">Memory used</span><span class="text-green-400 tabular-nums">${memUsed}</span></div>
     <div class="row-m"><span class="text-gray-500">XDP</span>${xdpBadge}</div>
+    <div class="row-m"><span class="text-gray-500">Anycast</span>${acBadge}</div>
     <div class="row-m"><span class="text-gray-500">Zones synced</span><span class="text-gray-300 tabular-nums">${s.zones_synced??'—'}</span></div>
     <div class="row-m"><span class="text-gray-500">Last sync</span><span class="text-gray-400 font-mono">${syncTime(s)}</span></div>
   </div>

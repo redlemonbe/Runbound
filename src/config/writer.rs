@@ -79,6 +79,10 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
             key,
             "name" | "metric" | "window-s" | "threshold" | "action" | "notify-url" | "block-duration-s"
         ),
+        "anycast" => matches!(
+            key,
+            "address" | "local-as" | "peer" | "peer-as" | "local-address" | "router-id" | "exabgp-path"
+        ),
         _ => false,
     }
 }
@@ -241,6 +245,18 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
         if let Some(h) = &fz.tls_hostname { o.push_str(&format!("    forward-tls-hostname: \"{h}\"\n")); }
     }
 
+    // ── anycast ──────────────────────────────────────────────────────────
+    if let Some(ac) = &cfg.anycast {
+        o.push_str("\nanycast:\n");
+        o.push_str(&format!("    address: {}\n", ac.address));
+        o.push_str(&format!("    local-as: {}\n", ac.local_as));
+        o.push_str(&format!("    peer: {}\n", ac.peer));
+        o.push_str(&format!("    peer-as: {}\n", ac.peer_as));
+        if let Some(la) = &ac.local_address { o.push_str(&format!("    local-address: {la}\n")); }
+        if let Some(ri) = &ac.router_id { o.push_str(&format!("    router-id: {ri}\n")); }
+        if let Some(ep) = &ac.exabgp_path { o.push_str(&format!("    exabgp-path: {ep}\n")); }
+    }
+
     // ── icmp ─────────────────────────────────────────────────────────────
     if cfg.icmp_enabled != d.icmp_enabled || cfg.icmp_rate_pps != d.icmp_rate_pps || cfg.icmp_burst != d.icmp_burst {
         o.push_str("\nicmp:\n");
@@ -384,6 +400,25 @@ pub fn write_config_atomic(cfg: &UnboundConfig, path: &Path) -> std::io::Result<
 mod roundtrip_tests {
     use crate::config::parser::parse_str;
     use crate::config::writer::render_config;
+
+    /// The anycast block parses and survives a write→re-parse round-trip.
+    #[test]
+    fn anycast_block_roundtrip() {
+        let src = "server:\n  do-udp: yes\nanycast:\n  address: 198.51.100.53/32\n  local-as: 65001\n  peer: 192.168.1.1\n  peer-as: 65000\n  local-address: 192.168.1.10\n";
+        let cfg = parse_str(src).unwrap();
+        let ac = cfg.anycast.as_ref().expect("anycast block parsed");
+        assert_eq!(ac.address, "198.51.100.53/32");
+        assert_eq!(ac.local_as, 65001);
+        assert_eq!(ac.peer, "192.168.1.1");
+        assert_eq!(ac.peer_as, 65000);
+        assert_eq!(ac.local_address.as_deref(), Some("192.168.1.10"));
+        // write → re-parse must preserve it (not silently dropped)
+        let cfg2 = parse_str(&render_config(&cfg)).unwrap();
+        let ac2 = cfg2.anycast.as_ref().expect("anycast survives round-trip");
+        assert_eq!(ac2.local_as, 65001);
+        assert_eq!(ac2.peer_as, 65000);
+        assert_eq!(ac2.address, "198.51.100.53/32");
+    }
 
     /// parse(render(parse(f))) must equal parse(f) for every shipped example config.
     /// Guards against the writer silently dropping or altering any directive.
