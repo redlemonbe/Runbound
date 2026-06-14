@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-14
+
+### Added
+- **Anycast deployment — one VIP served from many nodes over BGP.** A new `anycast:` config block turns Runbound into a turnkey anycast node: it renders the exabgp config, supervises exabgp as a child, announces the VIP `/32` while serving, and withdraws it on shutdown (the supervising cgroup reaps exabgp on a hard death — run under systemd). **No datapath change** — the XDP fast path already reflects the query's destination IP, and the slow path sources replies from the bound VIP (so anycast is additive; a missing/invalid block keeps DNS serving). `/api/system` now exposes the node's anycast state, and the WebUI **System** tab shows it per node (master + each slave via the relay). Full guide and bench validation in `docs/anycast.md`.
+  - Bench-validated end-to-end with **real BGP** (FRR ECMP router + two Runbound nodes): announce, ECMP split across nodes, graceful **and** hard-kill withdrawal — **0 client failures** in every case.
+  - Anycast string fields (`address`/`peer`/`local-address`/`router-id`) are restricted to IPv4/IPv6/CIDR characters to prevent exabgp config injection (an injected `process { run … }` block would be root RCE).
+
+### Notes
+- The DNS datapath is **byte-identical to 0.18.1** (no files changed under `src/dns/`). Re-verified on the X710 rig: fast path **~10.1 M qps** (0 NIC drops, ~13 % CPU), slow path **~3.6 M qps** — within DVFS run-to-run noise of the 0.18.1 figures. **286 tests pass, clippy `-D warnings` clean.**
+
 ## [0.18.1] - 2026-06-13
 
 ### Security
