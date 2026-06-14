@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-06-14
+
+### Fixed
+- **Anycast under a privilege-dropped deployment.** The generated exabgp config was written to `/run/runbound-anycast.conf`, which a `User=runbound` (non-root) systemd service cannot write — so the `anycast:` block failed with `Permission denied` on the standard production setup (it worked only when Runbound ran as root, as in the v0.19.0 lab validation). The config now lives in Runbound's runtime base directory (`base_dir()`, writable by the runbound user) and exabgp spawns correctly. Found and fixed on a live production node.
+  - On Debian, `exabgp` installs to `/usr/sbin` — off the `runbound` user's `PATH`. Set `exabgp-path: /usr/sbin/exabgp` in the `anycast:` block (the directive already existed; documented in `docs/anycast.md` / `docs/configuration.md`).
+
 ## [0.19.0] - 2026-06-14
 
 ### Added

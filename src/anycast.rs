@@ -15,12 +15,17 @@
 use crate::config::parser::AnycastConfig;
 use anyhow::{bail, Context, Result};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
-const CONF_PATH: &str = "/run/runbound-anycast.conf";
+/// The generated exabgp config lives in Runbound's runtime base dir (writable by the runbound
+/// user) — NOT `/run`, which a privilege-dropped `User=runbound` process cannot write.
+fn conf_path() -> PathBuf {
+    crate::runtime::base_dir().join("anycast-exabgp.conf")
+}
 
 /// Live anycast state published for the REST API (`/api/system`) and the WebUI cluster view.
 /// `announced` tracks whether the exabgp child is up (route advertised) right now.
@@ -109,17 +114,20 @@ pub struct AnycastAnnouncer {
     cfg: AnycastConfig,
     child: Option<Child>,
     state: Arc<AnycastState>,
+    conf_path: PathBuf,
 }
 
 impl AnycastAnnouncer {
-    /// Validate the config and write `/run/runbound-anycast.conf`. Does not announce yet.
+    /// Validate the config and write the exabgp config (in Runbound's runtime dir). Does not announce yet.
     pub fn prepare(cfg: &AnycastConfig) -> Result<Self> {
         let conf = generate_exabgp_conf(cfg)?;
-        std::fs::write(CONF_PATH, &conf).with_context(|| format!("anycast: writing {CONF_PATH}"))?;
+        let conf_path = conf_path();
+        std::fs::write(&conf_path, &conf)
+            .with_context(|| format!("anycast: writing {}", conf_path.display()))?;
         info!(address = %cfg.address, peer = %cfg.peer, local_as = cfg.local_as,
-              "anycast: exabgp config written to {CONF_PATH}");
+              path = %conf_path.display(), "anycast: exabgp config written");
         let state = publish(cfg);
-        Ok(Self { cfg: cfg.clone(), child: None, state })
+        Ok(Self { cfg: cfg.clone(), child: None, state, conf_path })
     }
 
     fn exabgp_bin(&self) -> String {
@@ -133,7 +141,7 @@ impl AnycastAnnouncer {
         }
         let bin = self.exabgp_bin();
         let mut command = Command::new(&bin);
-        command.arg(CONF_PATH).stdin(Stdio::null());
+        command.arg(&self.conf_path).stdin(Stdio::null());
         // Best-effort net for the case where Runbound dies without running Drop (SIGKILL/OOM).
         // NOTE: this is NOT the primary reaper — exabgp can daemonize/re-parent and survive it
         // (verified). The reliable mechanism in production is the supervising cgroup: run Runbound
