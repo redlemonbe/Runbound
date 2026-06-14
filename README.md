@@ -1,6 +1,6 @@
 # Runbound
 
-## ASM-accelerated, Unbound-compatible DNS server — live REST API + XDP fast path
+## Unbound-compatible DNS server — XDP kernel-bypass fast path, live REST API, no restart
 
 **Unbound-compatible DNS server — REST API, XDP kernel-bypass, no restart ever.**
 
@@ -12,6 +12,8 @@
 
 Most existing `unbound.conf` files work as-is. Non-standard or exotic directives are ignored gracefully — see [Unbound compatibility](docs/unbound-migration.md). Runbound adds a live REST API, AF_XDP kernel-bypass, and a browser dashboard on top.
 
+> **Prior art.** DNS-over-XDP is not new — [Knot DNS](https://www.knot-dns.cz/) has had an authoritative XDP mode since 3.0 (2020), and the Knot project ships `kxdpgun`, an XDP DNS load generator. Runbound's contribution is the *combination*: a **drop-in Unbound-compatible resolver** with the XDP fast path on the cache/serve hot path, a **live REST API** (change config with no restart), and a **single static musl binary** — not XDP on its own.
+
 ---
 
 ## What you get
@@ -20,16 +22,15 @@ Most existing `unbound.conf` files work as-is. Non-standard or exotic directives
 |---|:---:|:---:|:---:|
 | Drop-in Unbound config | ❌ | ✅ | ✅ |
 | UDP / TCP / DoT / DoH | ✅ | ✅ | ✅ |
-| Add / block domains live | ⚠️ | ❌ restart | ✅ API |
+| Add / block domains live | ⚠️ | ⚠️ unbound-control | ✅ REST API |
 | Block-list feed subscriptions | ⚠️ | ❌ manual | ✅ API |
-| Real-time stats + Prometheus | ✅ statistics channel (XML/JSON) | ❌ | ✅ |
+| Real-time stats + Prometheus | ✅ statistics channel (XML/JSON) | ⚠️ unbound-control / exporter | ✅ |
 | Master/slave replication | ✅ | ❌ | ✅ built-in*¹ |
 | Automatic TLS (Let's Encrypt) | ❌ | ❌ | ✅ ACME |
 | Anycast deployment (built-in BGP announcer) | ❌ | ❌ | ✅ v0.19.0 |
 | AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ |
 | XDP ICMP echo responder (rate-limited) | ❌ | ❌ | ✅ |
 | Embedded browser dashboard | ❌ | ❌ | ✅ no nginx needed |
-| Linear scaling (no lock contention) | ❌ | ❌ | ✅ |
 | Static binary, no dependencies | ❌ | ❌ | ✅ musl |
 | Split-horizon DNS (per-subnet answers) | ❌ | ⚠️ views | ✅ v0.9.63 |
 | RBAC (read/dns/operator/admin roles) | ❌ | ❌ | ✅ v0.9.62 |
@@ -183,18 +184,22 @@ Rig (2026-06-13): AMD Threadripper PRO 5995WX receiver, dual Xeon E5-2690 v2 gen
 | `xdp: yes` — single link (X710) | ~10.1 M qps | ~11 % | 10 G link (response direction) |
 | `xdp: no` — kernel slow path (X710) | ~3.71 M qps | ~19 % | kernel-UDP RX + generator |
 
-In no run did Runbound reach its own CPU ceiling (≤24 %); the limit is always the link, the
-NIC RX path, or the generator. Same-rig kernel-UDP reference resolvers: **unbound 1.22.0
-~2.09 M**, **BIND 9.20.23 ~1.84 M** — Runbound's slow path ~2×, its fast path ~5–6×, at
-lower CPU and lower latency. ~20.28 M qps ≈ **1.75 trillion queries/day** on a single node,
-the order of a large public resolver's average load. Latency, the generator-bound
-dual-X710 run, and full context: [docs/benchmark/INDEX.md](docs/benchmark/INDEX.md).
+These figures are **cache-hit / hot-path throughput** (answers served from cache or local
+zones over the XDP fast path), not recursion under cache miss — a different workload. In no run
+did Runbound reach its own CPU ceiling (≤24 %); the limit is always the link, the NIC RX path,
+or the generator. Same-rig kernel-UDP reference resolvers, same cache-hit workload: **unbound
+1.22.0 ~2.09 M**, **BIND 9.20.23 ~1.84 M** — both excellent and both bounded by the kernel
+socket path here, not their own code (see the [diplomacy of the comparison](docs/benchmark/INDEX.md)).
+Runbound's slow path is ~2× and its fast path ~5–6× on the same rig, at lower CPU and lower
+latency. Latency, the generator-bound dual-X710 run, and full context:
+[docs/benchmark/INDEX.md](docs/benchmark/INDEX.md).
 
 The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC
 hardware, huge pages are self-provisioned, and NIC queues scale to the CPU
-automatically (kept at the driver default on bus-bound Xeon v2 + X520). The
-architecture targets linear scaling — `SO_REUSEPORT`, `ArcSwap` lock-free config,
-per-core affinity, and a single-lookup ASM hot path (CRC32c + SIMD).
+automatically (kept at the driver default on bus-bound Xeon v2 + X520). It is **designed for
+linear scaling** — `SO_REUSEPORT`, lock-free config hot-swap (`ArcSwap`), per-core affinity, and
+SSE4.2 `CRC32c` + SIMD on the lookup path — though core scaling beyond the 2×10G link ceiling is
+not yet demonstrated (every run so far is link-bound at ≤24 % CPU).
 
 ## AF/XDP Fast Path
 
