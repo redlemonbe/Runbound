@@ -19,6 +19,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Doc version drift guard (SECURITY.md vs Cargo.toml)
+        run: |
+          CARGO_MM=$(grep -m1 '^version = ' Cargo.toml | grep -oE '[0-9]+\.[0-9]+')
+          SEC_MM=$(grep -oE '[0-9]+\.[0-9]+\.x' SECURITY.md | head -1 | sed 's/\.x//')
+          echo "Cargo.toml minor: $CARGO_MM | SECURITY.md supported: ${SEC_MM}.x"
+          if [ "$CARGO_MM" != "$SEC_MM" ]; then
+            echo "::error file=SECURITY.md::Supported version ${SEC_MM}.x does not match Cargo.toml ($CARGO_MM.x). Update the SECURITY.md supported-versions table."
+            exit 1
+          fi
+
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq

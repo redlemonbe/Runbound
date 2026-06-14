@@ -1,6 +1,6 @@
 # 08 — Performance
 
-> **Status: current as of v0.18.1 (2026-06-13)** — governed by `docs/benchmark/README.md`
+> **Status: current as of v0.19.3 (2026-06-13)** — governed by `docs/benchmark/README.md`
 > (the methodology) and the per-run reports under `docs/benchmark/`. A full re-benchmark was
 > run on **v0.18.1** on a new rig (Threadripper PRO 5995WX receiver; dual Xeon E5-2690 v2
 > generator; direct 10 GbE DACs Intel X710/i40e + X510/ixgbe; dnsmark v2.3.0; warm cache;

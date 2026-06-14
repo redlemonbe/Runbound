@@ -127,6 +127,13 @@ All four were measured, not assumed.
   use the API or a TCP probe for health if you want a guaranteed low-rate response.
 - Per-node throughput is unchanged by anycast — see [docs/benchmark/INDEX.md](benchmark/INDEX.md);
   anycast multiplies it across nodes.
+- **UDP is stateless; DoT/DoH (TCP) is not.** On a route change (a node failing, or ECMP
+  rehashing) an in-flight DoT/DoH TCP connection can be steered to another node and reset —
+  normal anycast behaviour; clients reconnect transparently. Plain UDP/53 is unaffected (each
+  query is independent). For a zero-disruption *planned* drain of a DoT/DoH-heavy node, withdraw
+  with BGP graceful shutdown (GSHUT, RFC 8326) before the stop — that requires driving the
+  announcer manually (§4); the built-in announcer (§8) drops the session on stop, which is
+  graceful for UDP but can reset a live TCP connection.
 
 ## 8. Built-in announcer — the `anycast:` config block
 
