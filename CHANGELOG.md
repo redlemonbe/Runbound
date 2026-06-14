@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-06-14
+
+### Fixed
+- **WebUI cluster view — slave anycast state.** The master fetches each slave's status over the relay, whose sync-port `/system` handler returned a fixed field subset that omitted `anycast`, so the WebUI **System** tab showed a slave's anycast as `—` even while it was announcing. The relay `/system` response now includes the `anycast` object (matching `/api/system`); the master's cluster view shows each slave's announced/withdrawn state. (Found while validating the v0.19.1 anycast deployment on the live master/slave pair.)
+
 ## [0.19.1] - 2026-06-14
 
 ### Fixed

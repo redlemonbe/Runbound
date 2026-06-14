@@ -1864,6 +1864,16 @@ async fn handle_relay_request(
                 "workers":           cpu_cores,
                 "prefetch_enabled":  relay.cfg.prefetch,
                 "dnssec_validation": relay.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                "anycast":           match crate::anycast::state() {
+                    Some(st) => serde_json::json!({
+                        "configured": st.configured,
+                        "address":    st.address,
+                        "peer":       st.peer,
+                        "local_as":   st.local_as,
+                        "announced":  st.announced.load(std::sync::atomic::Ordering::Relaxed),
+                    }),
+                    None => serde_json::json!({ "configured": false }),
+                },
             })))
         }
         ("GET", op) if op.starts_with("cache") => {
