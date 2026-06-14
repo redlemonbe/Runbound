@@ -19,6 +19,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   the relay handler read it — so master and slave can never disagree. Data path
   unchanged.
 
+### Security
+- **Cycle K two-AI audit (Claude Opus 4.8 × Gemini 2.5 Pro) of the anycast feature** —
+  see `docs/security-audit/SECURITY-AUDIT.md`. **SEC-K1 (LOW, fixed):** the operator
+  `exabgp-path` is now validated (no whitespace / shell metacharacters, must resolve to an
+  existing regular file) before it is spawned — defence-in-depth (the value is config-file
+  only, with no API setter, so it never crossed a privilege boundary; Gemini's HIGH "RCE"
+  rating was disputed down to LOW because `Command::new` does no shell or argument splitting).
+  A live pentest confirms the exabgp-config injection guard and the new path check both fail
+  closed (anycast is disabled and the DNS server keeps serving). SEC-K2 (writer escaping) is
+  accepted as currently unreachable; OPEN-K1 (readiness-based BGP withdrawal) is filed as a
+  future enhancement.
+
 
 ## [0.19.2] - 2026-06-14
 
