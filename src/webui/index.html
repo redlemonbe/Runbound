@@ -1490,6 +1490,9 @@ async function loadSlaves(){
       const xdpBadge=sys
         ?(sys.xdp_active?`<span class="badge badge-xdp-on">${esc(sys.xdp_mode??'active')}</span>`:'<span class="badge badge-xdp-off">off</span>')
         :'<span class="text-gray-700">—</span>';
+      const acBadge=sys?.anycast?.configured
+        ?(sys.anycast.announced?'<span class="badge badge-xdp-on">announced</span>':'<span class="badge badge-xdp-off">withdrawn</span>')
+        :'<span class="text-gray-700">—</span>';
       return`<div class="slave-card">
   <div class="slave-card-hdr">
     <span class="text-cyan-300 font-mono text-xs">${esc(ip)}</span>
@@ -1500,6 +1503,7 @@ async function loadSlaves(){
     <div class="row-m"><span class="text-gray-500">CPU usage</span><span class="text-yellow-500 tabular-nums">${cpuPct}</span></div>
     <div class="row-m"><span class="text-gray-500">Memory used</span><span class="text-green-400 tabular-nums">${memUsed}</span></div>
     <div class="row-m"><span class="text-gray-500">XDP</span>${xdpBadge}</div>
+    <div class="row-m"><span class="text-gray-500">Anycast</span>${acBadge}</div>
     <div class="row-m"><span class="text-gray-500">Zones synced</span><span class="text-gray-300 tabular-nums">${s.zones_synced??'—'}</span></div>
     <div class="row-m"><span class="text-gray-500">Last sync</span><span class="text-gray-400 font-mono">${syncTime(s)}</span></div>
   </div>
