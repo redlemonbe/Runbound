@@ -86,6 +86,32 @@ The `safe` validator in `generate_exabgp_conf` (whitelist: `is_ascii_hexdigit` +
 #### Gemini RCE-01 severity (HIGH) — downgraded to LOW
 Gemini rated the unvalidated `exabgp-path` as **HIGH RCE**. Refuted on two grounds: (1) the value is config-file-only (no API setter — Gemini itself confirmed this in its trust-model section), so it does not cross a privilege boundary; (2) the cited exploit relies on shell/argument parsing that `Command::new` does not perform. Re-scoped to **LOW** and fixed as defence-in-depth (SEC-K1). The finding itself is valid and was actioned; only the severity is disputed.
 
+### Cycle K-pentest — live validation (2026-06-14)
+
+**Target:** the running prod nodes (master `192.168.8.12`, slave `192.168.8.11`, both v0.19.3 with the SEC-K1 fix deployed) plus the release binary run in an isolated network namespace for the destructive cases. Method: exercise the actual binary/endpoints, not just read the source.
+
+**Battery A — external, against the live services (non-mutating):**
+
+| Test | Expected | Observed | Verdict |
+|------|----------|----------|---------|
+| `GET /api/system` no key | 401 | 401 | pass |
+| `GET /api/system` wrong key | 401 | 401 | pass |
+| `GET /api/system` valid key | 200 | 200 | pass |
+| anycast state leaked without auth | no | not present in unauth response | pass |
+| slave sync-port `GET /relay/system` without HMAC | reject | 401 | pass |
+| API write to set anycast (`POST /api/config`, `/api/anycast`, `/api/system/anycast`) | no such setter | 405 / 404 / 404 | pass — **config-file-only trust boundary confirmed live** |
+| unauth request flood (130 req) | rate-limited | 111/130 → 429 | pass |
+
+**Battery B — the real binary vs. a malicious `anycast:` config (isolated netns, so no impact on prod `:53`):**
+
+| Config | Expected | Observed | Verdict |
+|--------|----------|----------|---------|
+| `address: 1.2.3.4/32 next-hop self` (injection attempt via whitespace) | rejected, anycast disabled, DNS keeps running | `ERROR anycast: invalid config — running without it: 'address' = '…' is not a plain IPv4/IPv6 address or CIDR (rejected to prevent exabgp config injection)` | pass |
+| `exabgp-path: exabgp; id > /tmp/PWNED` (SEC-K1) | rejected before spawn | `ERROR anycast: … 'exabgp-path' = '…' must be a bare executable path (no whitespace or shell metacharacters)`; **no `/tmp/PWNED` created** | pass |
+| valid config, `exabgp-path: /bin/true` (control) | config written, route announced | `INFO anycast: exabgp config written` → `route ANNOUNCED` | pass |
+
+**Result:** no exploitable finding. The injection guard (SEC-K4) and the SEC-K1 path validation both fire on the live binary and fail closed (anycast disabled, the DNS server keeps serving). The config-file-only trust boundary is confirmed against the running API (no endpoint mutates anycast). SEC-J auth/HMAC/rate-limit controls show no regression. SEC-K2 (writer escaping) remains unreachable for the same reason A's API-write tests return 404/405.
+
 ---
 
 ## Cycle J — v0.18.0 — two-AI competitive audit (full-surface re-review)
