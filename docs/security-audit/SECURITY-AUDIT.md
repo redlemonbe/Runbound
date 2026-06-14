@@ -1,7 +1,7 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.18.1 (Cycle J two-AI audit + remediation completed 2026-06-13 — merged in #198, released as v0.18.1; v0.18.1 also publishes the re-benchmark results)  
-**Last updated:** 2026-06-13  
+**Current version:** v0.19.3 (Cycle K two-AI audit of the new anycast feature, 2026-06-14 — SEC-K1 fixed, SEC-K2/K3 accepted/enhancement; Gemini's RCE rating disputed-down to LOW. Prior: Cycle J completed 2026-06-13, merged in #198, released as v0.18.1)  
+**Last updated:** 2026-06-14  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
 This document consolidates all security and performance audit cycles conducted on Runbound. Individual per-cycle files in this directory are historical records; this file is the authoritative status reference.
@@ -23,6 +23,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [H](#cycle-h--v0160v0164-two-ai-adversarial--rate-limitban-both-paths-dnssec-ad-persistence) | v0.16.0→v0.16.4 | 2026-06-08 | [AI-ADVERSARIAL] Claude Opus 4.8 (Red×Blue) | 0 open; 6 fixed, 3 accepted, 2 disputed |
 | [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 4 open (enhancement); 15 fixed, 3 accepted, 5 disputed |
 | [J](#cycle-j--v0180--two-ai-competitive-audit-full-surface-re-review) | v0.17.2→v0.18.0 | 2026-06-13 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro + live pentest | 1 HIGH + 3 MEDIUM + 7 LOW open (remediation pending approval); 2 accepted, 2 disputed; 0 fixed. Pentest: SEC-J1/J2 confirmed exploitable, SEC-J4 downgraded→LOW |
+| [K](#cycle-k--v0193--two-ai-competitive-audit-anycast-feature) | v0.18.1→v0.19.3 | 2026-06-14 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro + live pentest | 1 LOW fixed (SEC-K1); 1 accepted (SEC-K2); 1 enhancement open (OPEN-K1); 2 info-positive; 1 disputed (Gemini RCE HIGH→LOW). New surface = anycast only; data path byte-identical |
 
 ---
 
@@ -31,6 +32,59 @@ This document consolidates all security and performance audit cycles conducted o
 Through Cycle E (v0.9.50) all tracked findings were fixed, accepted, or classified as false positives. **Cycle F (v0.12.0)** opened enhancement-class findings OPEN-F1..F5. As of v0.15.0: OPEN-F2 (reproducible build + signatures), OPEN-F4 (SIEM JSON logs) and OPEN-F5 (CycloneDX SBOM) are **Fixed**; OPEN-F1 (third-party human audit, #170) remains **Open**; OPEN-F3 (strict RRL) is **not planned**. None were active vulnerabilities.
 
 All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
+
+**Cycle J (v0.18.1)** remediated SEC-J1 (HIGH) and 6 others (#198). **Cycle K (v0.19.3)** audited the new anycast feature only: SEC-K1 (LOW) is **Fixed**, SEC-K2 is **Accepted** (defence-in-depth, currently unreachable), and **OPEN-K1** (readiness-based BGP withdrawal) is **Open** as an enhancement. No active vulnerability was found in the feature, and the DNS data path (`src/dns/`) is byte-identical to v0.18.1, so no datapath finding can have been introduced.
+
+---
+
+## Cycle K — v0.19.3 — two-AI competitive audit (anycast feature)
+
+**Date:** 2026-06-14  
+**Scope:** the new attack surface introduced since Cycle J — the **anycast** feature only (`src/anycast.rs`, the `anycast:` arms of `config/parser.rs` and `config/writer.rs`, the `/api/system` + relay `/system` exposure in `api/mod.rs`/`sync.rs`, and the `XDP_MODE` status global). The DNS data path was **not** re-reviewed because `git diff v0.18.1..HEAD -- src/dns/` is empty (byte-identical); Cycles H/I/J cover it.  
+**Sources:** `[AI-INTERNAL]` Claude Opus 4.8 (manual review of the exabgp-config generation, the spawn/reap lifecycle, the config write/round-trip path, and the API/relay trust boundary) × `[AI-ADVERSARIAL]` Gemini 2.5 Pro (independent red-team of `src/anycast.rs` + the parser/writer/wiring excerpts, asked specifically to confirm or refute API-settability and to rate injection/RCE/traversal/DoS/leak). Every Gemini finding was re-verified against the source by Claude before classification. Live exploitation is validated separately (**Cycle K-pentest**, below).
+
+**Trust boundary (confirmed by both auditors):** the `anycast:` block is parsed from the on-disk config file **only** — there is no REST endpoint that sets or mutates `cfg.anycast` (the API is read-only: `/api/system` exposes state, nothing writes it). An operator who can edit the config file already has root-equivalent access on the node. This caps the severity of every config-value finding at the operator-trust level — none of them cross the API→OS boundary that made SEC-J1 a HIGH.
+
+**Status:** 1 fixed (SEC-K1), 1 accepted (SEC-K2), 1 enhancement open (OPEN-K1), 2 info-positive (SEC-K4/K5), 1 disputed (Gemini rated the exabgp-path issue HIGH; downgraded to LOW — see Disputed). Not a clean sweep: SEC-K2 is accepted-not-fixed and OPEN-K1 is deferred.
+
+### Fixed
+
+#### SEC-K1 — `exabgp-path` is spawned without validation — LOW (Gemini: HIGH, disputed)
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro (RCE-01), re-scoped by [AI-INTERNAL] Claude  
+**Severity:** LOW **Status:** Fixed (v0.19.3)  
+**Description:** `AnycastAnnouncer::announce` runs `Command::new(exabgp_bin())` where `exabgp_bin()` returns the operator-supplied `exabgp-path` verbatim (`src/anycast.rs`). The value was not validated, so an operator could point it at any binary, executed as the (privilege-dropped) `runbound` user. Because the value is **config-file-only** (no API setter) and the config writer already requires root-equivalent access, this does **not** cross a privilege boundary — it is an operator footgun / defence-in-depth gap, not a remote vulnerability. Gemini's exploit string `exabgp-path: "/usr/bin/ncat -e /bin/bash …"` is **incorrect**: `std::process::Command::new` performs **no argument splitting and invokes no shell**, so that whole string is treated as a single file name (`exabgp -e …` does not exist) and the spawn fails — there is no shell-metacharacter or argument-injection path here.  
+**Fix (applied):** added `validate_exabgp_path` — rejects any value containing whitespace or shell metacharacters (so a value that only makes sense as a *command line* fails fast instead of being exec'd), and `prepare()` additionally requires the path to resolve to an existing regular file. Unit test `exabgp_path_rejects_command_line_values`.
+
+### Accepted
+
+#### SEC-K2 — `render_config` re-emits anycast values without `escape_str` — LOW (defence-in-depth)
+**Source:** [AI-INTERNAL] Claude (missed by Gemini, which reviewed only the announcer)  
+**Severity:** LOW **Status:** Accepted  
+**Description:** When the config is regenerated (`config/writer.rs`, after any API config change), the `anycast:` block is written with `format!("    address: {}\n", ac.address)` etc. — **verbatim, no `escape_str`** — the same omission class as SEC-J1. It is **not currently reachable**: `cfg.anycast` is only ever populated by the line-oriented parser (a value cannot contain a newline), and there is no API setter, so no attacker-controlled newline can reach the writer. It is filed Accepted as a standing note: **if** an API setter for anycast is ever added, `render_config` must escape these fields (or validate them as IP/CIDR) at that time, exactly as forward-zone `name` does. Cross-reference: [[SEC-J1]].  
+**Rationale:** no exploit path exists today; `generate_exabgp_conf` independently re-validates every value (strict IP/CIDR whitelist) before the value is ever used, so even a malformed stored value cannot reach exabgp.
+
+### Open
+
+#### OPEN-K1 — BGP withdrawal is liveness-only, not readiness-based — INFO (enhancement)
+**Source:** [AI-INTERNAL] Claude  
+**Severity:** INFO **Status:** Open (enhancement)  
+**Description:** The announcer withdraws the route only when the exabgp child stops — i.e. when the Runbound **process** dies (graceful `Drop`, or the systemd cgroup reaping the child on hard death). A node that is **alive but degraded** (e.g. all upstreams unreachable, returning SERVFAIL) keeps its BGP announcement and continues to attract anycast traffic. This is a deliberate *liveness* model (validated at the bench: process-kill → fast drain, 0 client failures) and is the common BGP-anycast default, but a *readiness* model — withdraw when the node cannot actually resolve — would shed traffic from a sick-but-running node faster.  
+**Proposed (future):** optional health-gated withdraw/announce driven by a resolver self-probe, behind a config toggle; keep liveness as the default.
+
+### Info (positive)
+
+#### SEC-K4 — exabgp config-injection guard is effective — INFO
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro (SEC-01), confirmed by [AI-INTERNAL] Claude  
+The `safe` validator in `generate_exabgp_conf` (whitelist: `is_ascii_hexdigit` + `.` `:` `/`) blocks the newline / `;` / `{ }` characters needed to inject an exabgp `process { run … }` directive into the generated config. `local-as`/`peer-as` are typed `u32`. Verified by `exabgp_config_injection_rejected`. No change needed.
+
+#### SEC-K5 — child reaping correctly depends on the systemd cgroup — INFO
+**Source:** [AI-ADVERSARIAL] Gemini 2.5 Pro (OPN-01), confirmed by [AI-INTERNAL] Claude  
+`Drop`/`withdraw` cover graceful shutdown; `PR_SET_PDEATHSIG` is a best-effort net for hard death; the reliable reaper on `SIGKILL`/OOM is the systemd `KillMode=control-group` default. This is documented (`docs/anycast.md` §8, the systemd unit). The only residual is running Runbound **outside** a cgroup supervisor (e.g. bare `nohup`), where a hard-killed parent could orphan exabgp and black-hole the VIP — documented as a hard requirement. No code change.
+
+### Disputed
+
+#### Gemini RCE-01 severity (HIGH) — downgraded to LOW
+Gemini rated the unvalidated `exabgp-path` as **HIGH RCE**. Refuted on two grounds: (1) the value is config-file-only (no API setter — Gemini itself confirmed this in its trust-model section), so it does not cross a privilege boundary; (2) the cited exploit relies on shell/argument parsing that `Command::new` does not perform. Re-scoped to **LOW** and fixed as defence-in-depth (SEC-K1). The finding itself is valid and was actioned; only the severity is disputed.
 
 ---
 
