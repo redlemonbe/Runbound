@@ -1855,8 +1855,8 @@ async fn handle_relay_request(
             Ok(json_ok(serde_json::json!({
                 "version":           env!("CARGO_PKG_VERSION"),
                 "uptime_secs":       snap.uptime_secs,
-                "xdp_active":        false,
-                "xdp_mode":          "disabled",
+                "xdp_active":        crate::dns::xdp::socket::xdp_is_active(),
+                "xdp_mode":          crate::dns::xdp::socket::xdp_mode_str(),
                 "cpu_cores":         cpu_cores,
                 "cpu_percent":       cpu_percent,
                 "mem_total_mb":      mem_total_mb,

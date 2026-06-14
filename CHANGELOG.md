@@ -7,6 +7,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-06-14
+
+### Fixed
+- **Cluster view: slave XDP status now reported truthfully.** The slave relay `/system`
+  endpoint (served on the sync port, a deliberately reduced payload distinct from the
+  main `/api/system`) hardcoded `xdp_active: false` / `xdp_mode: "disabled"`. A slave
+  actually running the XDP fast path therefore showed a wrong XDP badge in the master
+  WebUI cluster view. The XDP attach mode is now published to a single global source of
+  truth (`XDP_MODE`) at the same instant the API state is updated, and both the API and
+  the relay handler read it — so master and slave can never disagree. Data path
+  unchanged.
+
+
 ## [0.19.2] - 2026-06-14
 
 ### Fixed

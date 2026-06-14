@@ -16,7 +16,7 @@
 
 
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::dns::xdp::umem::{
@@ -137,6 +137,26 @@ pub static XDP_NIC_RX_RING_MAX: AtomicU32 = AtomicU32::new(0);
 pub static XDP_ACTIVE_IFACE: OnceLock<String> = OnceLock::new();
 /// Per-queue modes for the first XDP interface (compat).
 pub static XDP_QUEUE_MODES: OnceLock<Vec<(u32, bool)>> = OnceLock::new();
+
+/// Canonical XDP attach mode, published once the data path is up: 0=disabled, 1=drv, 2=skb.
+/// Single source of truth for every read-only consumer that is not wired to `AppState`
+/// (notably the slave relay `/system` handler in `sync.rs`, which has no `AppState`).
+/// Written by `main.rs` at the same point it updates the `AppState` Arc, so they never diverge.
+pub static XDP_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// `true` while the XDP fast path is attached (drv or skb).
+pub fn xdp_is_active() -> bool {
+    XDP_MODE.load(Ordering::Relaxed) > 0
+}
+
+/// Human-readable XDP mode for the API/WebUI: `"drv"`, `"skb"`, or `"disabled"`.
+pub fn xdp_mode_str() -> &'static str {
+    match XDP_MODE.load(Ordering::Relaxed) {
+        1 => "drv",
+        2 => "skb",
+        _ => "disabled",
+    }
+}
 
 pub const AF_XDP: libc::c_int = 44;
 
@@ -1064,6 +1084,22 @@ pub fn list_eligible_interfaces() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── XDP mode global (single source of truth for non-AppState consumers) ──
+    #[test]
+    fn xdp_mode_global_maps_to_strings() {
+        // No other test mutates XDP_MODE, so this is race-free; restore to 0 after.
+        XDP_MODE.store(0, Ordering::Relaxed);
+        assert!(!xdp_is_active());
+        assert_eq!(xdp_mode_str(), "disabled");
+        XDP_MODE.store(1, Ordering::Relaxed);
+        assert!(xdp_is_active());
+        assert_eq!(xdp_mode_str(), "drv");
+        XDP_MODE.store(2, Ordering::Relaxed);
+        assert!(xdp_is_active());
+        assert_eq!(xdp_mode_str(), "skb");
+        XDP_MODE.store(0, Ordering::Relaxed);
+    }
 
     // ── is_bonded_interface ───────────────────────────────────────────────
     // These tests run without real hardware; they verify the sysfs-path logic

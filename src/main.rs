@@ -345,13 +345,14 @@ async fn async_main(
             );
             // Update xdp_mode from the first handle (representative)
             if let Some(h) = handles.first() {
-                xdp_mode.store(
-                    match h.mode {
-                        dns::xdp::XdpMode::Drv => 1,
-                        dns::xdp::XdpMode::Skb => 2,
-                    },
-                    Ordering::Relaxed,
-                );
+                let m: u8 = match h.mode {
+                    dns::xdp::XdpMode::Drv => 1,
+                    dns::xdp::XdpMode::Skb => 2,
+                };
+                xdp_mode.store(m, Ordering::Relaxed);
+                // Mirror into the global single-source-of-truth so consumers without
+                // AppState (the slave relay /system handler) report the real mode too.
+                dns::xdp::socket::XDP_MODE.store(m, Ordering::Relaxed);
             }
             handles
         }
