@@ -53,15 +53,16 @@ Runbound was designed with security as a first-class feature:
 
 A common assumption: security features degrade performance.
 
-Runbound's benchmark at verbosity:1 (production mode, log buffer active for notable
-events only) shows p99 latency within 9% of BIND9 and Unbound — servers with no
-equivalent security surface. At verbosity:0 (benchmark mode), performance is
-essentially equivalent.
-
-The overhead of Runbound's security features at 105,000 QPS sustained is
-approximately **16 microseconds per query average** compared to bare-metal BIND9.
-For a query that takes 232 microseconds end-to-end, this is a 7% overhead for
-features that BIND9 and Unbound do not offer at all.
+The security surface (ACLs, rate limiting, the relay HMAC, the hardened parser) is
+**active in every benchmark** — none of it is disabled to produce the headline numbers.
+With it on, the kernel slow path still serves ~3.71 M qps at ~19 % CPU on the X710 — about
+2× BIND (1.84 M) and unbound (2.09 M) on the same rig — at a **p99 of 0.371 ms vs ~7–9 ms**
+for those two; the AF_XDP fast path serves ~10 M+/link at sub-millisecond p99 (0.245 ms).
+The only verbosity cost we can isolate is logging: production `verbosity: 1` adds ~0.01 ms
+p50 over benchmark `verbosity: 0` (`configuration.md`). In other words the security features
+do not show up as a measurable penalty on the hot path — they live inside an envelope that
+is already several times faster than the reference resolvers. (Full numbers and method:
+`docs/benchmark/`.)
 
 ---
 
