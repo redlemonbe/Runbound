@@ -1,18 +1,25 @@
 # 08 — Performance
 
-> **Status: current as of v0.19.3 (2026-06-13)** — governed by `docs/benchmark/README.md`
-> (the methodology) and the per-run reports under `docs/benchmark/`. A full re-benchmark was
-> run on **v0.18.1** on a new rig (Threadripper PRO 5995WX receiver; dual Xeon E5-2690 v2
-> generator; direct 10 GbE DACs Intel X710/i40e + X510/ixgbe; dnsmark v2.3.0; warm cache;
-> NIC `tx_packets` truth). Headline measured results (per-run reports in `docs/benchmark/`,
-> indexed in `docs/benchmark/INDEX.md`):
+> **Status: current as of v0.19.3 (2026-06-15)** — governed by `docs/benchmark/README.md`
+> (the methodology) and the per-run reports under `docs/benchmark/`. The suite was re-run on
+> a new rig (Threadripper PRO 5995WX receiver; dual Xeon E5-2690 v2 generator; direct 10 GbE
+> DACs Intel X710/i40e + X510/ixgbe; dnsmark v2.3.0; warm cache; NIC `tx_packets` truth); the
+> dual-link runs and the latency were refreshed at **v0.19.3** (DNS datapath byte-identical to
+> v0.18.1). Headline measured results (per-run reports in `docs/benchmark/`, indexed in
+> `docs/benchmark/INDEX.md`):
 >
-> | v0.18.1 | served (NIC) | receiver CPU | limited by |
+> | v0.19.3 | served (NIC) | receiver CPU | limited by |
 > |---|---|---|---|
-> | `xdp: yes` **dual-link** X510+X710 | **~20.28 Mqps** | ~24 % | the two 10 G links (server not saturated) |
-> | `xdp: yes` single link X710 | ~10.1 Mqps | ~11 % | 10 G link response direction |
-> | `xdp: yes` dual-link X710 (1 gen card) | ~12.9 Mqps | ~12 % | generator's single X710 card |
+> | `xdp: yes` **dual-link** X510+X710 | **~20.3 Mqps** | ~24 % (steady) | the two 10 G links (server not saturated) |
+> | `xdp: yes` single link X710 | ~10.14 Mqps | ~10.5 % (steady) | 10 G link response direction |
+> | `xdp: yes` dual-link X710 (1 gen card) | ~13.5 Mqps | ~12 % | generator's single X710 card |
 > | `xdp: no` kernel slow path X710 | ~3.71 Mqps | ~19 % | kernel-UDP RX + generator |
+>
+> **Latency** (fast-path wire RTT, capped sub-saturation; AF_XDP can't be tcpdump-anchored):
+> i40e **p50 0.073 / p95 0.203 / p99 0.245 ms**, ixgbe p50 0.188 / p99 0.256 ms. Slow path
+> (closed-loop, kernel-UDP): p50 0.066 / p95 0.207 / p99 0.371 ms. The closed-loop `--xdp`
+> *completion %* under-counts (generator-side accounting, HW-proven: server emits ~all
+> responses; the matched-sample RTT is the valid figure) — see the per-run reports.
 >
 > In no run did Runbound reach its own CPU ceiling (≤24 %). Same-rig kernel-UDP references:
 > unbound 1.22.0 ~2.09 M, BIND 9.20.23 ~1.84 M. The older v0.16.11 (X710) and v0.17.0
@@ -40,7 +47,7 @@ any figure not yet re-measured.
 - The naïve hickory slow path measured **1.78× Unbound's instructions/query** — the reason
   the fast paths exist (§1.2).
 
-## X710 10 GbE — the current reference numbers (v0.16.11)
+## X710 10 GbE — earlier detail (v0.16.11, superseded by the v0.19.3 table above)
 
 Measured on the documented rig (receiver: 5995WX + Intel X710-DA2; generator: dual Xeon
 E5-2690 v2 + X710, direct DACs; dnsmark 2.2.1, XDP zero-copy both sides, NIC-counter
