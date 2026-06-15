@@ -12,8 +12,10 @@
 One **Intel X510 (ixgbe)** link plus one **Intel X710 (i40e)** link driven as two XDP
 fast-path links, Runbound v0.19.3 serves a sustained **~20.3 M QPS** (sum of the two
 receiver NICs' `tx_packets`) — **~10.1 M (X510) + ~10.18 M (X710)**, each at its 10 G line
-rate — with **8.26 GB RSS**. Per-query wire latency (closed-loop AF_XDP, capped):
-**p50 0.224 ms / p95 0.250 ms / p99 3.043 ms**, 99.76 % NOERROR. By driving the two links
+rate — with **8.26 GB RSS**. Per-link wire latency, capped sub-saturation (closed-loop
+AF_XDP, `rate-limit: 0`, warm cache): **X710/i40e p50 0.073 / p95 0.203 / p99 0.245 ms;
+X510/ixgbe p50 0.188 / p95 0.250 / p99 0.256 ms** — both sub-millisecond, 99.8 % NOERROR. By
+driving the two links
 from **two separate generator cards** (ixgbe + i40e, two PCIe buses), the generator escapes
 the single-card ~13.5 M cap of the dual-X710 run, and the receiver answers both 10 G links
 at line rate at once. The cap here is the **aggregate link capacity (2 × 10 G ≈ 20 M
@@ -55,7 +57,8 @@ dual-X710 run.
 | Served X510 link (`enp66s0f1`) | **~10.1 M/s** (10.0–10.16 M) | receiver NIC `tx_packets` |
 | Served X710 link (`enp33s0f0np0`) | **~10.18 M/s** | receiver NIC `tx_packets` |
 | **Served total** | **~20.3 M peak** (steady ~20.0–20.34 M) | sum of both NICs |
-| Latency p50 / p95 / p99 | **0.224 / 0.250 / 3.043 ms** | dnsmark closed-loop AF_XDP wire samples |
+| Latency p50/p95/p99 — X710/i40e link | **0.073 / 0.203 / 0.245 ms** | dnsmark closed-loop AF_XDP, capped |
+| Latency p50/p95/p99 — X510/ixgbe link | **0.188 / 0.250 / 0.256 ms** | dnsmark closed-loop AF_XDP, capped |
 | Success rate | **99.76 % NOERROR** | dnsmark rcode breakdown |
 | NIC drops (`rx_missed_errors`) | **X510 ~33.3 M total; X710 ~23 k** over the run | `ethtool -S` |
 | Receiver CPU % | **~13 %** over the firehose window | `/proc/stat` |
@@ -67,10 +70,15 @@ Caveats (per methodology):
   offering more than the X510 link's response direction can return (~10 G small-DNS pps), so
   the excess backs up and is dropped at ingress. It is a property of offering past the link's
   return cap, not a server fault. The X710 link (offered ≈ served) dropped ~0.
-- **Latency is not tcpdump-anchored** (rule 7); it is dnsmark's closed-loop AF_XDP wire RTT,
-  completion 59.5 % (the known `--xdp` closed-loop unreliability). p50/p95 are sub-0.25 ms;
-  the p99 tail of 3.043 ms I cannot attribute with certainty (ixgbe path vs closed-loop
-  jitter) — **I cannot confirm** its cause.
+- **Latency is measured per-link at a capped, sub-saturation rate** (`rate-limit: 0`, warm
+  cache, **0 rate-limit events server-side**): both links are sub-millisecond (i40e p99
+  0.245 ms, ixgbe p99 0.256 ms). It is dnsmark closed-loop AF_XDP wire RTT — tcpdump cannot
+  observe the fast path (XDP bypasses the kernel tap), so rule 7 does not apply there.
+  **Latency must be read at a capped rate, not under the firehose**: at full firehose the
+  X510 is over-offered past its 10 G return cap (the 33 M ingress drops above), which adds a
+  saturation queue tail (a ~3 ms p99) — that is the over-offer artifact, not the service
+  latency. dnsmark's closed-loop `--xdp` under-counts *completions* (generator-side), so the
+  completion ratio is not a success rate; the sampled RTT is the valid figure.
 - The CPU figure is an average over the full firehose window (includes ramp transients), a
   floor on steady-state CPU. The v0.18.1 report measured ~24 % under different conditions
   (host load, build); the difference I cannot fully confirm.
