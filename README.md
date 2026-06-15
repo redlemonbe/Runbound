@@ -178,10 +178,10 @@ never the generator's self-report. Full per-run reports: [docs/benchmark/](docs/
 Rig (2026-06-13): AMD Threadripper PRO 5995WX receiver, dual Xeon E5-2690 v2 generator
 (dnsmark), direct 10 GbE DACs (Intel X710/i40e + X510/ixgbe).
 
-| Runbound v0.18.1 | Served (receiver NIC) | Receiver CPU | Limited by |
+| Runbound v0.19.3 | Served (receiver NIC) | Receiver CPU | Limited by |
 |---|---|---|---|
-| `xdp: yes` — **dual-link** (X510 + X710) | **~20.28 M qps** | ~24 % | the two 10 G links — **server not saturated** |
-| `xdp: yes` — single link (X710) | ~10.1 M qps | ~11 % | 10 G link (response direction) |
+| `xdp: yes` — **dual-link** (X510 + X710) | **~20.3 M qps** | ~24 % (steady) | the two 10 G links — **server not saturated** |
+| `xdp: yes` — single link (X710) | ~10.14 M qps | ~10.5 % (steady) | 10 G link (response direction) |
 | `xdp: no` — kernel slow path (X710) | ~3.71 M qps | ~19 % | kernel-UDP RX + generator |
 
 These figures are **cache-hit / hot-path throughput** (answers served from cache or local
@@ -191,7 +191,10 @@ or the generator. Same-rig kernel-UDP reference resolvers, same cache-hit worklo
 1.22.0 ~2.09 M**, **BIND 9.20.23 ~1.84 M** — both excellent and both bounded by the kernel
 socket path here, not their own code (see the [diplomacy of the comparison](docs/benchmark/INDEX.md)).
 Runbound's slow path is ~2× and its fast path ~5–6× on the same rig, at lower CPU and lower
-latency. Latency, the generator-bound dual-X710 run, and full context:
+latency: fast-path wire **p50 0.073 / p95 0.203 / p99 0.245 ms** (measured at a capped,
+sub-saturation rate — the AF_XDP fast path cannot be tcpdump-anchored, so this is the
+generator's wire RTT) vs unbound p50 ~0.227 ms / BIND ~0.320 ms. The generator-bound dual-X710
+run (~13.5 M, generator-bound) and full context, with every counter and caveat:
 [docs/benchmark/INDEX.md](docs/benchmark/INDEX.md).
 
 The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC
