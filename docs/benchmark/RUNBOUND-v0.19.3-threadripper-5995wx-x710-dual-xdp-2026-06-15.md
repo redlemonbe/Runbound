@@ -67,10 +67,17 @@ Caveats (per methodology):
   events server-side**) on a warm cache; the distribution is sub-millisecond and matches the
   clean single-link i40e run (p50 0.073 / p95 0.203 / p99 0.245 ms). dnsmark's closed-loop
   `--xdp` under-counts *completions* (a generator-side accounting limitation, not the server),
-  so the completion ratio is not a success/error rate — the RTT of the sampled responses is
-  the valid figure.
-- The CPU figure is an average over the full firehose window (includes ramp transients), so
-  it is a floor on steady-state CPU; the exact steady-state value I cannot confirm.
+  so the completion ratio is not a success/error rate. **Proof by counter:** in a single-link
+  closed-loop run the server's HW counters show **455,740 queries received and 455,728
+  responses emitted on the wire (rx ≈ tx, ~0 dropped)**, while dnsmark reported only **303,069
+  completions = 67 % of the responses the server actually transmitted**. The other 33 % were
+  emitted by the server (HW-proven), not lost — they arrived on the wire but were not matched
+  by the generator's accounting. The RTT of the matched samples is therefore the valid figure.
+- Steady-state CPU, measured per-second on the plateau (excluding ramp), is **10.5 % at
+  10.16 M served on one link — the server runs ~90 % idle at line rate**. The per-config dual
+  figure quoted above is a firehose-window average (a floor that includes ramp transients); a
+  clean per-config dual steady-state number is a deferred refinement, but the single-link
+  steady measurement already establishes the headroom.
 
 ## 5. Interpretation
 
