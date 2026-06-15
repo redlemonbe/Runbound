@@ -66,12 +66,19 @@ truth):
 - **Kernel slow path (`xdp: no`), v0.17.0 auto-tune** (§4.5): the queue/IRQ retune is
   applied only when a NIC is explicitly named (`xdp-interface:` — a channel change must
   never hit a management NIC), so out of the box, with no named NIC, the kernel slow path
-  is **not** retuned ([#190](https://github.com/redlemonbe/Runbound/issues/190)). On
-  i40e/X710 the kernel slow path is NAPI-bound and plateaus at **~1.5 M qps served**
-  (best ~1.59 M with kloop-core isolation, the [#165](https://github.com/redlemonbe/Runbound/issues/165)
-  lever); the ~7.3 M figure reported earlier was measured on **ixgbe/X520** (a different
-  datapath, see the historical table below) and is **not reproducible on i40e**. Real
-  slow-path scaling on i40e is tracked in #165. The AF_XDP fast path is unaffected by any
+  is **not** retuned ([#190](https://github.com/redlemonbe/Runbound/issues/190)). The
+  i40e/X710 kernel slow path is **highly tuning-sensitive** — three measured figures, three
+  conditions:
+  - **~3.71 M qps served at ~19 % CPU** — the canonical benchmark
+    (`RUNBOUND-v0.18.1-…-x710-noxdp`): NIC tuned (RSS `udp4 sdfn`, node-local queues/IRQs,
+    RX ring 4096), 63 `SO_REUSEPORT` workers, a kernel-UDP generator (~4.6 M offered), p99
+    0.371 ms — ~2× BIND/unbound on the same rig. **This is the slow-path number.**
+  - **~1.5 M qps** (best ~1.59 M) — **out of the box, NOT retuned** (no named NIC), i40e
+    NAPI-bound ([#190](https://github.com/redlemonbe/Runbound/issues/190)/[#165](https://github.com/redlemonbe/Runbound/issues/165)).
+  - **~7.3 M** — historical **ixgbe/X520** (a different datapath, see the table below), **not
+    reproducible on i40e**.
+  A mis-tuned setup (e.g. NIC RX queues spread cross-NUMA away from the card's node) collapses
+  below even the out-of-box figure — the lever is node-local queues/IRQs (#165). The AF_XDP fast path is unaffected by any
   of this (re-verified at the 10 G link ceiling — **~10.1–11.2 M qps** single link,
   run-to-run; the v0.18.1 per-run report records **~10.12 M** sustained served).
 
