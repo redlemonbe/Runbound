@@ -78,10 +78,17 @@ Caveats (per methodology):
   X510 is over-offered past its 10 G return cap (the 33 M ingress drops above), which adds a
   saturation queue tail (a ~3 ms p99) — that is the over-offer artifact, not the service
   latency. dnsmark's closed-loop `--xdp` under-counts *completions* (generator-side), so the
-  completion ratio is not a success rate; the sampled RTT is the valid figure.
-- The CPU figure is an average over the full firehose window (includes ramp transients), a
-  floor on steady-state CPU. The v0.18.1 report measured ~24 % under different conditions
-  (host load, build); the difference I cannot fully confirm.
+  completion ratio is not a success rate. **Proof by counter:** in a single-link closed-loop
+  run the server's HW counters show **455,740 queries received and 455,728 responses emitted
+  (rx ≈ tx, ~0 dropped)** while dnsmark reported **303,069 completions = 67 % of responses the
+  server actually transmitted** — the other 33 % were emitted (HW-proven), not lost; the
+  sampled RTT is the valid figure.
+- Steady-state CPU, measured per-second on the plateau (excluding ramp), is **10.5 % at
+  10.16 M served on one link (~90 % idle at line rate)**. The dual figure quoted above is a
+  firehose-window average (a floor incl. ramp); the v0.18.1 report's ~24 % was a steady-window
+  measurement at the dual ~20 M rate, consistent with the steady cost scaling with served
+  throughput — so the apparent "13 % vs 24 %" is window-average vs steady, not a contradiction.
+  A clean per-config dual steady number is a deferred refinement.
 
 ## 5. Interpretation
 
