@@ -60,9 +60,15 @@ and confirm where the limit sits.
 | Receiver RAM | **8.27 GB RSS** | `ps -o rss` |
 
 Caveats (per methodology):
-- **Latency is not tcpdump-anchored** (rule 7); it is dnsmark's closed-loop AF_XDP wire RTT.
-  The closed-loop completion accounting under `--xdp` is unreliable on this build (52.77 %
-  completed), but the completed samples' RTT is consistent with the single-link report.
+- **Latency = dnsmark closed-loop AF_XDP wire RTT (generator TX/RX timestamps).** tcpdump
+  cannot observe the AF_XDP fast path — XDP redirects to the XSK before the kernel AF_PACKET
+  tap — so the wire RTT is taken at the generator, not via tcpdump (methodology rule 7 is not
+  applicable to the fast path for that reason). Measured with `rate-limit: 0` (**0 rate-limit
+  events server-side**) on a warm cache; the distribution is sub-millisecond and matches the
+  clean single-link i40e run (p50 0.073 / p95 0.203 / p99 0.245 ms). dnsmark's closed-loop
+  `--xdp` under-counts *completions* (a generator-side accounting limitation, not the server),
+  so the completion ratio is not a success/error rate — the RTT of the sampled responses is
+  the valid figure.
 - The CPU figure is an average over the full firehose window (includes ramp transients), so
   it is a floor on steady-state CPU; the exact steady-state value I cannot confirm.
 
