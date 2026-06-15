@@ -434,7 +434,7 @@ leaves the queue count untouched and continues.
 | Hardware | Mode | Estimated peak |
 |---|---|---|
 | VM virtio (Proxmox/KVM) | copy mode | ~500k–1M QPS (theoretical) |
-| Bare metal Intel 10GbE | native zero-copy | **~10.12 M QPS** (X710 single-link, link-bound) · **~20.28 M** dual-link (X510+X710), ~24 % CPU — see [benchmark/INDEX.md](benchmark/INDEX.md) |
+| Bare metal Intel 10GbE | native zero-copy | **~10.14 M QPS** (X710 single-link, link-bound, ~10.5 % CPU) · **~20.3 M** dual-link (X510+X710), ~24 % CPU — see [benchmark/INDEX.md](benchmark/INDEX.md) |
 
 Wire speed on 10GbE = ~14.88M 64-byte packets/second (physical limit, not yet validated end-to-end).
 
