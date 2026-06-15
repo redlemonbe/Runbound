@@ -122,10 +122,14 @@ the queue/IRQ stage does nothing** (`nic_queues=0 irqs_pinned=0`) and the slow p
 untuned ([#190](https://github.com/redlemonbe/Runbound/issues/190)). To enable slow-path
 tuning under `xdp: no`, name the data NIC with `xdp-interface:`.
 
-On i40e/X710 the kernel slow path is NAPI-bound and plateaus at **~1.5 M qps served**
-(best ~1.59 M with kloop-core isolation, the [#165](https://github.com/redlemonbe/Runbound/issues/165)
-lever). The earlier ~7.3 M figure was measured on **ixgbe/X520** (a different datapath)
-and is **not reproducible on i40e**; real slow-path scaling on i40e is tracked in #165.
+On i40e/X710 the kernel slow path is **tuning-sensitive**, three measured figures:
+**~3.71 M qps served at ~19 % CPU** under the benchmark methodology (NIC tuned, 63
+`SO_REUSEPORT` workers, kernel-UDP generator — the canonical `…-x710-noxdp` report, ~2×
+BIND/unbound); **~1.5 M** (best ~1.59 M) **out of the box, not retuned** — i40e NAPI-bound
+([#190](https://github.com/redlemonbe/Runbound/issues/190)/[#165](https://github.com/redlemonbe/Runbound/issues/165));
+and the historical **~7.3 M** which was **ixgbe/X520** (a different datapath, **not
+reproducible on i40e**). The lever between the first two is node-local queues/IRQs; real
+slow-path scaling on i40e is tracked in #165.
 The AF_XDP fast path is byte-for-byte unchanged throughout. The auto-tune adapts to the
 card (which NUMA node it sits on) and the CPU (node size); NIC families with hardware flow
 steering (e.g. mlx5 aRFS) may prefer a different strategy — a driver-aware path is future
