@@ -38,7 +38,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "api-key" | "api-port" | "api-socket"
                 | "cache-max-ttl" | "cache-min-ttl" | "cache-min-entries"
                 | "private-address"
-                | "dnssec-validation" | "dnssec-log-bogus"
+                | "dnssec-validation" | "dnssec-log-bogus" | "resolution"
                 | "log-retention" | "log-client-ip"
                 | "audit-log" | "audit-log-path" | "audit-log-hmac-key" | "audit-checkpoint-every"
                 | "mode" | "sync-port" | "sync-master" | "sync-key" | "sync-interval"
@@ -145,6 +145,7 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     for x in &cfg.private_addresses { o.push_str(&format!("    private-address: {x}\n")); }
     if cfg.dnssec_validation != d.dnssec_validation { o.push_str(&format!("    dnssec-validation: {}\n", b(cfg.dnssec_validation))); }
     if cfg.dnssec_log_bogus != d.dnssec_log_bogus { o.push_str(&format!("    dnssec-log-bogus: {}\n", b(cfg.dnssec_log_bogus))); }
+    if cfg.resolution_mode != d.resolution_mode { o.push_str(&format!("    resolution: {}\n", cfg.resolution_mode.as_str())); }
     if cfg.log_retention != d.log_retention { o.push_str(&format!("    log-retention: {}\n", cfg.log_retention)); }
     if cfg.log_client_ip != d.log_client_ip { o.push_str(&format!("    log-client-ip: {}\n", b(cfg.log_client_ip))); }
     if cfg.audit_log != d.audit_log { o.push_str(&format!("    audit-log: {}\n", b(cfg.audit_log))); }
