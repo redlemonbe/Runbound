@@ -82,7 +82,6 @@ impl ZoneKey {
     }
 
     /// The DS RR (SHA-256) to publish at the parent for `zone`.
-    #[allow(dead_code)] // surfaced via the API in #201 increment 5 (DS publication)
     pub fn ds(&self, zone: &Name) -> Result<DS, String> {
         let dnskey = self.dnskey()?;
         let key_tag = dnskey
@@ -272,7 +271,6 @@ impl ZoneSigner {
     }
 
     /// DS records (SHA-256) for every signed zone — surfaced to the operator to publish at the parent.
-    #[allow(dead_code)] // exposed via GET /api/dnssec/ds in #201 increment 5
     pub fn ds_records(&self) -> Vec<(String, DS)> {
         let mut out = Vec::new();
         for z in self.zones.values() {

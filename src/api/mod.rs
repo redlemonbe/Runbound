@@ -643,6 +643,7 @@ pub fn router(state: AppState) -> Router {
         .route("/stats/stream", get(stats_stream_handler))
         .route("/stats/top-domains", get(top_domains_handler))
         .route("/config", get(config_handler).patch(patch_config_handler))
+        .route("/dnssec/ds", get(dnssec_ds_handler))
         .route("/reload", post(reload_handler))
         // DNS CRUD
         .route("/dns/lookup", post(dns_lookup_handler))
@@ -1192,6 +1193,35 @@ fn process_cpu_percent() -> f64 {
 }
 
 // ── GET /config ────────────────────────────────────────────────────────────
+
+/// GET /api/dnssec/ds — the DS records to publish at the parent registrar for each signed local
+/// zone (#201). Keys are loaded from the config dir on demand; the value is the standard DS
+/// presentation `<key_tag> <alg> <digest_type> <digest-hex>`.
+async fn dnssec_ds_handler(State(s): State<AppState>) -> impl IntoResponse {
+    if !s.cfg.local_zone_dnssec {
+        return JsonExtract(serde_json::json!({ "enabled": false, "ds": [] }));
+    }
+    let apexes: Vec<String> = s.cfg.local_zones.iter().map(|z| z.name.clone()).collect();
+    match crate::dns::zone_signer::ZoneSigner::new(
+        s.base_dir.as_ref(),
+        &apexes,
+        std::time::Duration::from_secs(14 * 24 * 3600),
+    ) {
+        Ok(signer) => {
+            let ds: Vec<_> = signer
+                .ds_records()
+                .into_iter()
+                .map(|(zone, ds)| serde_json::json!({ "zone": zone, "ds": format!("{ds}") }))
+                .collect();
+            JsonExtract(serde_json::json!({ "enabled": true, "ds": ds }))
+        }
+        Err(_) => JsonExtract(serde_json::json!({
+            "enabled": true,
+            "error": "failed to load zone keys",
+            "ds": []
+        })),
+    }
+}
 
 async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
     let cfg = s.cfg.as_ref();
