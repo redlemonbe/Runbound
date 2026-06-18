@@ -91,6 +91,36 @@ local-zone: "1.168.192.in-addr.arpa." static
 local-data: "10.1.168.192.in-addr.arpa. 300 IN PTR nas.home."
 ```
 
+### Local-zone DNSSEC signing (#201)
+
+Sign the authoritative `local-zone` / `local-data` with DNSSEC — online and zero-touch.
+
+```
+server:
+    local-zone-dnssec: yes   # default: no
+```
+
+When enabled, each configured `local-zone` apex gets an auto-generated **KSK + ZSK**
+(ECDSAP256SHA256), persisted under `<base_dir>/dnssec/<zone>/{ksk,zsk}.key` (mode `0600`).
+Answers carry RRSIGs, negative answers (NXDOMAIN / NODATA) are proven with **NSEC3**
+(RFC 5155 / 9276 — SHA-1, 0 iterations, empty salt, closest-encloser proof), the apex
+DNSKEY / SOA are synthesised, and CNAME chains are signed end-to-end. Signing runs on the
+slow path; the XDP fast-path snapshot is bypassed for signed zones so the client DO bit is
+honoured per query.
+
+Publish the **DS** at the parent — fetch it from [`GET /api/dnssec/ds`](api.md):
+
+```bash
+curl -s localhost:8081/api/dnssec/ds -H "Authorization: Bearer $KEY"
+# { "enabled": true, "ds": [ { "zone": "home.", "ds": "12345 13 2 <sha256-digest>" } ] }
+```
+
+**HA / slave propagation (model B):** the master is the sole signer. With
+`local-zone-dnssec: yes` on both nodes, the master replicates each zone key to its slaves
+over the encrypted relay (HMAC-SHA256 + TLS-pinned channel) and the slave hot-swaps its
+signer — so both HA nodes serve answers validatable against the same published DS. A slave
+never generates its own keys.
+
 ### TLS (DNS-over-TLS / DoH / DoQ)
 
 ```
@@ -818,6 +848,31 @@ rules.
 > SIGKILL the rules remain open until manually removed or next clean start.
 
 ---
+
+### Resolution mode — forward vs. full-recursion (#202)
+
+How cache-miss queries are resolved.
+
+```
+server:
+    resolution: forward          # default — forward to the forward-zone upstreams
+    resolution: full-recursion   # sovereign iterative resolution from the root
+```
+
+`forward` (default) sends cache misses to the `forward-zone:` upstreams (e.g. 1.1.1.1).
+`full-recursion` makes Runbound a **sovereign recursive resolver**: it resolves iteratively
+from the root servers itself, so no third-party resolver ever sees your queries.
+
+When full-recursion is active:
+- **DNSSEC is validated and enforced** when `dnssec-validation: yes` — a Bogus answer is
+  refused with SERVFAIL, the AD bit is set only for fully-Secure answers, and DNSSEC records
+  are stripped for non-DO clients (RFC 4035 §3.2.1).
+- **Anti-SSRF:** the recursor refuses to query loopback / RFC 1918 / CGNAT / link-local
+  (incl. `169.254` cloud-metadata) / ULA addresses — on glue, CNAME chains and NS addresses.
+- QNAME minimisation, 0x20 case-randomisation and serve-stale (RFC 8767) are on.
+
+Toggle live without a restart via [`PUT /api/resolution`](api.md); the master propagates the
+mode to slaves over the relay. Opt-in (experimental); `forward` stays the default.
 
 ## `forward-zone:` directives
 

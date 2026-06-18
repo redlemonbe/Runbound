@@ -171,6 +171,20 @@ list of `acme-*` directives.
 
 ---
 
+## Option E — WebUI / API (generate or import, no shell)
+
+Since v0.20.0 you can enable DoT/DoH/DoQ entirely from the **WebUI** (*Settings -> Encrypted
+DNS*) or the REST API — no OpenSSL, no file editing:
+
+- **Generate a self-signed certificate:** `POST /api/tls/self-signed {"hostname":"dns.example.com"}`
+  — writes `cert.pem` + `key.pem` (`0600`) in `base_dir` and sets the config.
+- **Import an existing cert + key** (e.g. Lets Encrypt): `POST /api/tls/import {"cert_pem":"...","key_pem":"..."}`
+  — the pair is validated (the key must match the leaf certificate) before being written.
+- **Status / disable:** `GET /api/tls/cert` (CN, expiry, SHA-256 fingerprint, SANs) and `DELETE /api/tls`.
+
+These mutations are **admin-only** and persist the `tls-service-*` directives; **restart**
+Runbound to bind the listeners (`restart_required: true` is returned). See [api.md](api.md).
+
 ## WebUI TLS — auto-generated certificate SANs
 
 ### Default SANs (as of v0.9.44)

@@ -38,6 +38,9 @@ Most existing `unbound.conf` files work as-is. Non-standard or exotic directives
 | Multi-user API with zone isolation | ❌ | ❌ | ✅ v0.9.51 |
 | White-label UI branding | ❌ | ❌ | ✅ v0.9.61 |
 | Hot backup / restore | ❌ | ❌ | ✅ API |
+| Authoritative DNSSEC signing (local zones, NSEC3) | ✅ | ❌ validator only | ✅ **v0.20.0** online, zero-touch |
+| Sovereign full recursion (iterative from root) | ✅ | ✅ | ✅ **v0.20.0** opt-in |
+| Encrypted DNS server (DoT / DoH / DoQ) + WebUI cert mgmt | ⚠️ | ⚠️ | ✅ **v0.20.0** self-signed or import |
 
 *¹ Runbound ships both REST API-driven replication and standard AXFR/IXFR zone transfers (RFC 5936, v0.9.13+). AXFR requires explicit ACL configuration — see [docs/configuration.md](docs/configuration.md).
 
@@ -178,7 +181,7 @@ never the generator's self-report. Full per-run reports: [docs/benchmark/](docs/
 Rig (2026-06-13): AMD Threadripper PRO 5995WX receiver, dual Xeon E5-2690 v2 generator
 (dnsmark), direct 10 GbE DACs (Intel X710/i40e + X510/ixgbe).
 
-| Runbound v0.19.3 | Served (receiver NIC) | Receiver CPU | Limited by |
+| Runbound v0.20.0 | Served (receiver NIC) | Receiver CPU | Limited by |
 |---|---|---|---|
 | `xdp: yes` — **dual-link** (X510 + X710) | **~20.3 M qps** | ~24 % (steady) | the two 10 G links — **server not saturated** |
 | `xdp: yes` — single link (X710) | ~10.14 M qps | ~10.5 % (steady) | 10 G link (response direction) |

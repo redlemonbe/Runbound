@@ -551,7 +551,8 @@ for the full live lists.
 
 ### `PATCH /api/config`
 
-Toggle runtime settings without restarting. Currently supports DNSSEC validation.
+Toggle runtime settings without restarting. Currently supports DNSSEC validation
+(when full-recursion is active the sovereign recursor is rebuilt so the new policy takes effect).
 The change is applied immediately and propagated to all registered slaves.
 
 ```bash
@@ -570,6 +571,36 @@ curl -X PATCH http://localhost:8080/api/config \
 | `dnssec_validation` | bool | Enable or disable DNSSEC validation at runtime |
 
 **Note:** This change is not persisted to `runbound.conf`. To make it permanent, edit `dnssec-validation: yes/no` in the config file and restart.
+
+---
+
+### `GET /api/resolution`
+
+Current resolution mode (#202) and whether the sovereign recursor is live.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/resolution
+```
+
+```json
+{"mode": "full-recursion", "recursor_active": true}
+```
+
+---
+
+### `PUT /api/resolution`
+
+Switch between `forward` and `full-recursion` at runtime (#202) — no restart. **Admin only.** Propagated to slaves over the relay. See [configuration.md](configuration.md).
+
+```bash
+curl -X PUT http://localhost:8080/api/resolution \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" -H "Content-Type: application/json" \
+  -d '{"mode":"full-recursion"}'
+```
+
+```json
+{"ok": true, "mode": "full-recursion", "recursor_active": true}
+```
 
 ---
 
@@ -711,6 +742,74 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/tls
   "doq": {"enabled": true, "port": 853, "rfc": "RFC 9250"},
   "cert": "/etc/runbound/cert.pem"
 }
+```
+
+---
+
+### `GET /api/tls/cert`
+
+Encrypted-DNS certificate status: `active` (what the running server booted with) vs `configured` (persisted), the ports, hostname, and the parsed certificate (subject/issuer CN, validity, SHA-256 fingerprint, SANs). `restart_required` is true when the persisted config differs from the running listeners.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/tls/cert
+```
+
+```json
+{
+  "active": true, "configured": true, "restart_required": false,
+  "dot_port": 853, "doh_port": 443, "doq_port": 853, "hostname": "dns.example.com",
+  "cert": { "subject_cn": "dns.example.com", "self_signed": true, "not_after": 1788000000,
+            "days_remaining": 365, "expired": false, "fingerprint_sha256": "AB:CD:...", "sans": ["dns.example.com"] }
+}
+```
+
+---
+
+### `POST /api/tls/self-signed`
+
+Generate a self-signed certificate + key for `hostname` and enable DoT/DoH/DoQ. The key is written `0600` (atomic) in `base_dir`; the config is updated. **Admin only.** Requires a restart to bind the listeners (`restart_required: true`).
+
+```bash
+curl -X POST http://localhost:8080/api/tls/self-signed \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" -H "Content-Type: application/json" \
+  -d '{"hostname":"dns.example.com","dot_port":853,"doh_port":443,"doq_port":853}'
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `hostname` | string | required — TLS SNI / DoH host (1..253 chars, no control chars) |
+| `dot_port` / `doh_port` / `doq_port` | u16 | optional port overrides |
+
+---
+
+### `POST /api/tls/import`
+
+Import an existing certificate + key (e.g. Lets Encrypt). The pair is validated against rustls (the key must match the leaf certificate) before being written; a mismatch returns `400`. Key written `0600`. **Admin only.** `restart_required: true`.
+
+```bash
+curl -X POST http://localhost:8080/api/tls/import \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" -H "Content-Type: application/json" \
+  -d '{"cert_pem":"-----BEGIN CERTIFICATE-----\n...","key_pem":"-----BEGIN PRIVATE KEY-----\n...","hostname":"dns.example.com"}'
+```
+
+---
+
+### `DELETE /api/tls`
+
+Disable encrypted DNS (clears `tls-service-pem` / `tls-service-key`). **Admin only.** `restart_required: true`.
+
+---
+
+### `GET /api/dnssec/ds`
+
+DS record(s) for the DNSSEC-signed local zones (`local-zone-dnssec: yes` — see [configuration.md](configuration.md)). Publish these at the parent zone. Reads the live in-memory signer (no key generation on this read path).
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/dnssec/ds
+```
+
+```json
+{"enabled": true, "ds": [{"zone": "home.", "ds": "12345 13 2 <sha256-digest>"}]}
 ```
 
 ---

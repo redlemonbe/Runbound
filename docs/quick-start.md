@@ -73,6 +73,22 @@ sudo cp /etc/unbound/unbound.conf /etc/runbound/runbound.conf
 
 ---
 
+## New in v0.20.0
+
+Three opt-in capabilities (default-off, toggleable live via the API/WebUI):
+
+**Sign your local zones with DNSSEC (#201)** — `local-zone-dnssec: yes`. Each zone gets an
+auto-generated KSK+ZSK; publish the DS shown by `GET /api/dnssec/ds` at the parent. In HA the
+master replicates the keys to its slaves. See [configuration.md](configuration.md).
+
+**Become a sovereign recursive resolver (#202)** — `resolution: full-recursion` resolves
+iteratively from the root instead of forwarding, so no upstream ever sees your queries (DNSSEC
+enforced, anti-SSRF, QNAME-minimisation). Toggle live: `PUT /api/resolution {"mode":"full-recursion"}`.
+
+**Serve encrypted DNS (DoT / DoH / DoQ)** — enable from the WebUI *Settings -> Encrypted DNS*
+panel (generate a self-signed cert or import your own), or `POST /api/tls/self-signed`; restart
+to bind the listeners.
+
 ## 3. Run
 
 ```bash
