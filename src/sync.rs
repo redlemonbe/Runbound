@@ -1532,6 +1532,8 @@ pub struct NodeRelay {
     pub domain_stats: Arc<crate::domain_stats::DomainStats>,
     pub dnssec_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub resolver: crate::dns::server::SharedResolver,
+    pub resolution_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    pub recursor: crate::dns::recursor::SharedRecursor,
     pub icmp_stats: std::sync::Arc<crate::icmp::IcmpStats>,
     pub icmp_cfg: std::sync::Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
     pub base_dir: std::sync::Arc<std::path::PathBuf>,
@@ -2011,6 +2013,42 @@ async fn handle_relay_request(
                 }
             }
             Ok(json_ok(serde_json::json!({ "ok": true, "zones": p.zones.len() })))
+        }
+        // #202: resolution-mode toggle propagated from the master.
+        ("PUT", "resolution") => {
+            #[derive(serde::Deserialize)]
+            struct ResPatch {
+                mode: Option<String>,
+            }
+            let p: ResPatch = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") })))
+                }
+            };
+            if let Some(m) = p
+                .mode
+                .as_deref()
+                .and_then(crate::config::parser::ResolutionMode::parse_value)
+            {
+                let dnssec = relay.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
+                match crate::dns::recursor::rebuild_shared(&relay.recursor, m, dnssec) {
+                    Ok(()) => {
+                        relay.resolution_mode.store(
+                            u8::from(m == crate::config::parser::ResolutionMode::FullRecursion),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        tracing::info!(mode = m.as_str(), "resolution mode applied on slave via relay");
+                    }
+                    Err(e) => {
+                        relay
+                            .resolution_mode
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(%e, "relay: recursor build failed on slave — staying forward");
+                    }
+                }
+            }
+            Ok(json_ok(serde_json::json!({ "ok": true })))
         }
         _ => Ok(json_resp(404, serde_json::json!({ "error": "NOT_FOUND" }))),
     }

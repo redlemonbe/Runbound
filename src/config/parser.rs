@@ -3,6 +3,34 @@
 use anyhow::{Context, Result};
 use tracing::warn;
 
+/// Resolution backend for queries not answered locally / from cache.
+/// `Forward` (default) = send to the configured upstreams (`forward-zone`) — current behaviour.
+/// `FullRecursion` = iterative resolution from the root servers (sovereign, no third-party
+/// forwarder), backed by the in-tree stable recursor (hickory-resolver `recursor` feature); opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResolutionMode {
+    #[default]
+    Forward,
+    FullRecursion,
+}
+
+impl ResolutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResolutionMode::Forward => "forward",
+            ResolutionMode::FullRecursion => "full-recursion",
+        }
+    }
+    /// Parse a `resolution:` directive value; `None` for an unknown value.
+    pub fn parse_value(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "forward" => Some(ResolutionMode::Forward),
+            "full-recursion" | "full" | "recursion" => Some(ResolutionMode::FullRecursion),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalZone {
     pub name: String,
@@ -135,9 +163,10 @@ pub struct UnboundConfig {
     /// Log WARN for every DNSSEC-bogus query when dnssec-validation is enabled.
     pub dnssec_log_bogus: bool,
     /// #201: sign local zones (`local-zone` / `local-data`) with DNSSEC. Default: false.
-    /// When enabled, each local zone gets an auto-generated KSK+ZSK (ECDSAP256SHA256) and its
-    /// answers are signed online (lazy, cached); the DS is surfaced for the operator to publish.
     pub local_zone_dnssec: bool,
+    /// Resolution backend for cache-miss queries: `forward` (default) or `full-recursion`
+    /// (sovereign iterative-from-root, opt-in). See [`ResolutionMode`].
+    pub resolution_mode: ResolutionMode,
 
     // ── GDPR / privacy controls ────────────────────────────────────────────
     /// Max entries in the in-RAM query log ring buffer. Default: 1000. 0 = disabled.
@@ -425,6 +454,7 @@ impl UnboundConfig {
             sync_interval: 30,
             log_retention: 1000,
             log_client_ip: false,
+            resolution_mode: ResolutionMode::Forward,
             xdp: true,
             xdp_hugepages: true,
             xdp_busy_poll: true,
@@ -857,6 +887,14 @@ fn parse_server_directive(
             }
         }
         "dnssec-validation" => cfg.dnssec_validation = val.trim_matches('"') == "yes",
+        "resolution" => match ResolutionMode::parse_value(val.trim_matches('"')) {
+            Some(m) => cfg.resolution_mode = m,
+            None => warn!(
+                "unknown resolution mode '{}' — keeping '{}'",
+                val.trim(),
+                cfg.resolution_mode.as_str()
+            ),
+        },
         "log-format" => cfg.log_format = val.trim_matches('"').trim().to_lowercase(),
         "dnssec-log-bogus" => cfg.dnssec_log_bogus = val.trim_matches('"') == "yes",
         "local-zone-dnssec" => cfg.local_zone_dnssec = val.trim_matches('"') == "yes",
@@ -1059,6 +1097,40 @@ fn parse_server_directive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #202: resolution mode (forward vs full-recursion) ─────────────────
+    #[test]
+    fn resolution_mode_defaults_to_forward() {
+        assert_eq!(UnboundConfig::defaults().resolution_mode, ResolutionMode::Forward);
+        assert_eq!(parse_str("server:\n").unwrap().resolution_mode, ResolutionMode::Forward);
+    }
+
+    #[test]
+    fn resolution_mode_parses_values() {
+        assert_eq!(
+            parse_str("server:\n  resolution: full-recursion\n").unwrap().resolution_mode,
+            ResolutionMode::FullRecursion
+        );
+        assert_eq!(
+            parse_str("server:\n  resolution: forward\n").unwrap().resolution_mode,
+            ResolutionMode::Forward
+        );
+    }
+
+    #[test]
+    fn resolution_mode_unknown_keeps_default() {
+        let cfg = parse_str("server:\n  resolution: bogus\n").unwrap();
+        assert_eq!(cfg.resolution_mode, ResolutionMode::Forward);
+    }
+
+    #[test]
+    fn resolution_mode_render_roundtrip() {
+        let cfg = parse_str("server:\n  resolution: full-recursion\n").unwrap();
+        let rendered = crate::config::writer::render_config(&cfg);
+        assert!(rendered.contains("resolution: full-recursion"), "rendered:\n{rendered}");
+        let reparsed = parse_str(&rendered).unwrap();
+        assert_eq!(reparsed.resolution_mode, ResolutionMode::FullRecursion);
+    }
 
     // ── FEAT #16: prefetch config parsing ─────────────────────────────────
 

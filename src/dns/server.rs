@@ -80,6 +80,12 @@ const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 // realistic upstream.
 const RESOLVER_LOOKUP_TIMEOUT: Duration = Duration::from_millis(2500);
 
+// SEC-L6: outer fuse for the sovereign full-recursion path (#202). The forward path is bounded
+// by timed_lookup/RESOLVER_LOOKUP_TIMEOUT; recursion has only hickory per-NS timeouts + the
+// recursion-depth limits, so a flood toward deep/slow delegations could occupy a worker far
+// longer. 5s caps total worker occupancy while tolerating a legitimately cold deep lookup.
+const RECURSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Wrap a resolver lookup with a hard external timeout.
 /// Returns `Err(NetError::Timeout)` if hickory does not respond within
 /// `RESOLVER_LOOKUP_TIMEOUT`, cancelling the hickory future and freeing the
@@ -150,9 +156,13 @@ pub struct RunboundHandler {
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     dnssec_log_bogus: bool,
-    /// #201: online DNSSEC signer for local zones — hot-swappable so the slave can adopt the
+    /// #201: online DNSSEC signer for local zones — hot-swappable so the slave adopts the
     /// master's replicated keys at runtime. Inner `None` when local-zone-dnssec is off.
     zone_signer: crate::dns::zone_signer::SharedZoneSigner,
+    /// #202: resolution mode — 0 = forward (default), 1 = full-recursion. Hot-swappable.
+    resolution_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// #202: sovereign full-recursion backend; `Some(..)` only when resolution=full-recursion.
+    recursor: crate::dns::recursor::SharedRecursor,
     /// Optional prefetch tracker — None when prefetch: no (default).
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
     /// #60: mutable cache map shared with XDP workers (via publish_loop).
@@ -276,6 +286,8 @@ impl RunboundHandler {
         alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
         axfr_allow: Vec<String>,
         split_horizon: std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>,
+        resolution_mode: Arc<std::sync::atomic::AtomicU8>,
+        recursor: crate::dns::recursor::SharedRecursor,
     ) -> Self {
         Self {
             zones,
@@ -293,6 +305,8 @@ impl RunboundHandler {
             dnssec_enabled,
             dnssec_log_bogus,
             zone_signer,
+            resolution_mode,
+            recursor,
             prefetch_tracker,
             xdp_cache,
             cache_max_entries,
@@ -830,6 +844,239 @@ impl RunboundHandler {
         self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, &zones_guard).await
     }
 
+    /// #202: sovereign full-recursion — resolve from the root via the recursor, then build
+    /// and send the response with correct DNSSEC semantics.
+    ///
+    /// The hickory recursor attaches a `Proof` (Secure / Insecure / Bogus / Indeterminate) to
+    /// every record but does **not** itself enforce it; enforcement is the resolver's job here:
+    ///   - Bogus data is refused with SERVFAIL (RFC 4035), unless the client set the CD bit.
+    ///   - The AD bit is set only when every answer + authority record is cryptographically Secure.
+    ///   - NXDOMAIN / NODATA come back as errors; turned into proper negative responses (rcode +
+    ///     SOA, plus the NSEC3 proof + AD bit when the recursor exposes a validated NODATA denial —
+    ///     a bogus denial is refused), not SERVFAIL.
+    ///   - On a transient recursion failure, a recent answer is served stale (RFC 8767).
+    async fn resolve_recursive<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        qname: &LowerName,
+        qtype: RecordType,
+        recursor: &crate::dns::recursor::SovereignRecursor,
+    ) -> ResponseInfo {
+        let dnssec_ok = request.edns.as_ref().map(|e| e.flags().dnssec_ok).unwrap_or(false);
+        let cd = request.metadata.checking_disabled;
+        let validating = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
+        let query = hickory_proto::op::Query::query(Name::from(qname), qtype);
+        let resolved = match tokio::time::timeout(
+            RECURSION_TIMEOUT,
+            crate::dns::recursor::recursor_resolve(recursor, query, dnssec_ok),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(%qname, "full-recursion: outer timeout — SERVFAIL");
+                return send_error(request, response_handle, ResponseCode::ServFail).await;
+            }
+        };
+        match resolved {
+            Ok(msg) => {
+                // DNSSEC enforcement: never serve Bogus data unless the client disabled checking.
+                let bogus = msg
+                    .answers
+                    .iter()
+                    .chain(msg.authorities.iter())
+                    .any(|r| r.proof.is_bogus());
+                if bogus && !cd {
+                    warn!(%qname, "full-recursion: DNSSEC validation failed (bogus) — SERVFAIL");
+                    return send_error(request, response_handle, ResponseCode::ServFail).await;
+                }
+                // AD bit: authenticated only when every answer + authority record is Secure.
+                let has_records = !msg.answers.is_empty() || !msg.authorities.is_empty();
+                let all_secure = has_records
+                    && msg
+                        .answers
+                        .iter()
+                        .chain(msg.authorities.iter())
+                        .all(|r| r.proof.is_secure());
+                let rcode = msg.metadata.response_code;
+                let mut answers = msg.answers;
+                let mut authority = msg.authorities;
+                let mut additionals = msg.additionals;
+                // RFC 8767: remember the fresh answer so a later recursion failure can serve it stale.
+                self.store_stale(qname, qtype, &answers);
+                // RFC 4035 §3.2.1: strip DNSSEC records when the client did not set DO. We do this
+                // by hand against the known qtype — the recursor's own strip is a no-op here
+                // because its response carries no question section to infer the type from.
+                if !dnssec_ok {
+                    let keep =
+                        |r: &Record| r.record_type() == qtype || !r.record_type().is_dnssec();
+                    answers.retain(keep);
+                    authority.retain(keep);
+                    additionals.retain(keep);
+                }
+                let mut metadata = Metadata::response_from_request(&request.metadata);
+                metadata.recursion_available = true;
+                metadata.response_code = rcode;
+                metadata.authentic_data = validating && !cd && all_secure;
+                let opt_edns = make_opt_edns(request);
+                let mut builder = MessageResponseBuilder::from_message_request(request);
+                if let Some(ref opt) = opt_edns {
+                    builder.edns(opt);
+                }
+                let response = builder.build(
+                    metadata,
+                    answers.iter(),
+                    authority.iter(),
+                    std::iter::empty(),
+                    additionals.iter(),
+                );
+                response_handle.send_response(response).await.unwrap_or_else(|e| {
+                    error!("recursive send: {e}");
+                    servfail_info(request)
+                })
+            }
+            // NXDOMAIN / NODATA: build a proper negative response.
+            Err(e) if e.is_nx_domain() || e.is_no_records_found() => {
+                let rcode = if e.is_nx_domain() {
+                    ResponseCode::NXDomain
+                } else {
+                    ResponseCode::NoError
+                };
+                let mut authority: Vec<Record> = Vec::new();
+                let mut ad = false;
+                // When the recursor surfaces the authenticated-denial records (NODATA →
+                // RecursorError::Negative), include the NSEC3/SOA proof and set AD when it is Secure
+                // (RFC 6840); refuse a bogus denial. NXDOMAIN comes back as Net(NetError), which does
+                // not expose the proof records, so we fall back to the SOA alone (AD stays unset).
+                match e {
+                    hickory_resolver::recursor::RecursorError::Negative(ad_data) => {
+                        if let Some(a) = ad_data.authorities {
+                            authority.extend(a.iter().cloned());
+                        } else if let Some(s) = ad_data.soa {
+                            authority.push((*s).into_record_of_rdata());
+                        }
+                        if !cd && authority.iter().any(|r| r.proof.is_bogus()) {
+                            warn!(%qname, "full-recursion: bogus authenticated denial — SERVFAIL");
+                            return send_error(request, response_handle, ResponseCode::ServFail).await;
+                        }
+                        ad = validating
+                            && !cd
+                            && !authority.is_empty()
+                            && authority.iter().all(|r| r.proof.is_secure());
+                    }
+                    other => {
+                        if let Some(s) = other.into_soa() {
+                            authority.push((*s).into_record_of_rdata());
+                        }
+                    }
+                }
+                // RFC 4035 §3.2.1: strip DNSSEC (NSEC3/RRSIG) records when the client did not set DO.
+                if !dnssec_ok {
+                    let keep =
+                        |r: &Record| r.record_type() == qtype || !r.record_type().is_dnssec();
+                    authority.retain(keep);
+                }
+                let mut metadata = Metadata::response_from_request(&request.metadata);
+                metadata.recursion_available = true;
+                metadata.response_code = rcode;
+                metadata.authentic_data = ad;
+                let opt_edns = make_opt_edns(request);
+                let mut builder = MessageResponseBuilder::from_message_request(request);
+                if let Some(ref opt) = opt_edns {
+                    builder.edns(opt);
+                }
+                let response = builder.build(
+                    metadata,
+                    std::iter::empty::<&Record>(),
+                    authority.iter(),
+                    std::iter::empty(),
+                    std::iter::empty(),
+                );
+                response_handle.send_response(response).await.unwrap_or_else(|e| {
+                    error!("recursive neg send: {e}");
+                    servfail_info(request)
+                })
+            }
+            // Transient failure: RFC 8767 serve-stale if we have a recent answer, else SERVFAIL.
+            Err(e) => {
+                warn!(%qname, "full-recursion failed: {e}");
+                if let Some(info) = self
+                    .try_serve_stale(request, &mut response_handle, qname, qtype)
+                    .await
+                {
+                    return info;
+                }
+                send_error(request, response_handle, ResponseCode::ServFail).await
+            }
+        }
+    }
+
+    /// #108/#202: remember a fresh positive answer in the serve-stale cache (LRU-evicted).
+    fn store_stale(&self, qname: &LowerName, qtype: RecordType, records: &[Record]) {
+        if let Some(ref sc) = self.stale_cache {
+            if !records.is_empty() {
+                if sc.len() >= self.cache_max_entries {
+                    if let Some(old_key) = sc.iter().next().map(|e| e.key().clone()) {
+                        sc.remove(&old_key);
+                    }
+                }
+                sc.insert(
+                    (qname.clone(), qtype),
+                    (records.to_vec(), std::time::Instant::now()),
+                );
+            }
+        }
+    }
+
+    /// #202: RFC 8767 serve-stale on the recursion path — if a recent answer is cached, serve it
+    /// (TTL capped at `stale_answer_ttl`) instead of SERVFAIL. Returns `None` if nothing to serve.
+    async fn try_serve_stale<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: &mut R,
+        qname: &LowerName,
+        qtype: RecordType,
+    ) -> Option<ResponseInfo> {
+        let sc = self.stale_cache.as_ref()?;
+        let capped: Vec<Record> = {
+            let entry = sc.get(&(qname.clone(), qtype))?;
+            let (ref stale_records, stored_at) = *entry;
+            if stored_at.elapsed().as_secs() > self.stale_max_age || stale_records.is_empty() {
+                return None;
+            }
+            let stale_ttl = self.stale_answer_ttl;
+            stale_records
+                .iter()
+                .map(|r| {
+                    let mut rc = r.clone();
+                    rc.ttl = stale_ttl;
+                    rc
+                })
+                .collect()
+        };
+        self.stats.inc_stale_served();
+        info!(name = %sanitize_dns_name(qname), ttl = self.stale_answer_ttl, "serve-stale (recursion)");
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.recursion_available = true;
+        let opt_edns = make_opt_edns(request);
+        let mut builder = MessageResponseBuilder::from_message_request(request);
+        if let Some(ref opt) = opt_edns {
+            builder.edns(opt);
+        }
+        let response = builder.build(
+            metadata,
+            capped.iter(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        Some(response_handle.send_response(response).await.unwrap_or_else(|e| {
+            error!("stale send: {e}");
+            servfail_info(request)
+        }))
+    }
+
     /// Recursive upstream resolution with DNSSEC validation and rebinding protection.
     async fn resolve_upstream<R: ResponseHandler>(
         &self,
@@ -840,6 +1087,16 @@ impl RunboundHandler {
         client_ip: IpAddr,
         start: Instant,
     ) -> ResponseInfo {
+        // #202: sovereign full-recursion path — resolve iteratively from the root.
+        if self.resolution_mode.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            let snap = self.recursor.load_full();
+            if let Some(rec) = snap.as_ref() {
+                return self
+                    .resolve_recursive(request, response_handle, qname, qtype, &**rec)
+                    .await;
+            }
+            // recursor not available (build failed) — fall through to forwarding.
+        }
         // #33: racing mode — send to all upstreams simultaneously, first wins.
         // All lookup calls go through timed_lookup (#83) to cap worker occupancy.
         let result = if self.upstream_racing {
@@ -2538,6 +2795,8 @@ pub async fn run_dns_server(
     alert_tracker: Arc<crate::alerts::AlertTracker>,
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     icmp_stats: Arc<crate::icmp::IcmpStats>,
+    resolution_mode: Arc<std::sync::atomic::AtomicU8>,
+    recursor: crate::dns::recursor::SharedRecursor,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -2676,6 +2935,8 @@ pub async fn run_dns_server(
     let zone_signer: crate::dns::zone_signer::SharedZoneSigner =
         Arc::new(arc_swap::ArcSwap::from_pointee(signer_inner));
     let _ = crate::dns::zone_signer::SHARED_SIGNER.set(Arc::clone(&zone_signer));
+    // #202: resolution_mode + recursor are created in build_and_launch (so the API can
+    // hot-swap them) and threaded in as parameters — same pattern as dnssec_enabled.
 
     let handler = RunboundHandler::new(
         Arc::clone(&zones),
@@ -2719,6 +2980,8 @@ pub async fn run_dns_server(
             let _ = SPLIT_HORIZON_LIVE.set(std::sync::Arc::clone(&live));
             live
         },
+        Arc::clone(&resolution_mode),
+        Arc::clone(&recursor),
     );
     // Step 3b: wrap handler in Arc for sharing between Server and fallback reader.
     let handler_arc = std::sync::Arc::new(handler);
