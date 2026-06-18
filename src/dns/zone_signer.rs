@@ -207,7 +207,6 @@ struct ZoneKeys {
 /// Online DNSSEC signer for the configured local zones (#201). Holds each zone's KSK+ZSK and
 /// signs answers / the apex DNSKEY on the slow path. `None` in the handler when the feature is off.
 pub struct ZoneSigner {
-    sig_validity: Duration,
     zones: HashMap<LowerName, ZoneKeys>,
 }
 
@@ -281,10 +280,7 @@ impl ZoneSigner {
                 ZoneKeys { apex, ksk, zsk, zsk_signer, ksk_signer },
             );
         }
-        Ok(Self {
-            sig_validity,
-            zones,
-        })
+        Ok(Self { zones })
     }
 
     #[allow(dead_code)] // used by startup diagnostics / API in later #201 increments

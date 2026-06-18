@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-18
+
+### Added
+- **Authoritative DNSSEC signing of local zones (#201).** `local-zone-dnssec: yes` makes Runbound an online signer for its `local-zone`/`local-data`: per-zone KSK+ZSK (ECDSAP256SHA256) auto-generated and persisted (0600), answers carry RRSIGs, NXDOMAIN/NODATA proven with NSEC3 (RFC 5155/9276 — SHA-1, 0 iterations, empty salt, closest-encloser), apex DNSKEY/SOA synthesised, and the DS surfaced via `GET /api/dnssec/ds` to publish at the parent. CNAME chains are signed end-to-end. HA: the master replicates zone keys to slaves over the encrypted relay (model B) so both nodes serve answers validatable against the same DS.
+- **Sovereign full-recursion (#202).** `resolution: full-recursion` switches cache-miss resolution from forwarding to an in-tree iterative-from-root recursor (opt-in; `forward` stays default). DNSSEC validated and enforced (Bogus → SERVFAIL, AD bit, RFC 4035 §3.2.1 strip), anti-SSRF server filters (loopback / RFC 1918 / 169.254 metadata / ULA, on glue + CNAME + NS), QNAME minimisation, 0x20, serve-stale (RFC 8767). Toggle live via `PUT /api/resolution`.
+- **Encrypted DNS (DoT / DoH / DoQ) from the WebUI.** A Settings panel + `/api/tls/*` endpoints enable DNS-over-TLS (853), DNS-over-HTTPS (443) and DNS-over-QUIC (853/udp) by generating a self-signed certificate or importing your own (validated against rustls). Private keys written 0600 atomically. Activation requires a restart.
+
+### Security
+- **Cycle L two-model audit (Claude Opus 4.8 — 3 adversarial agents — × Gemini 2.5 Pro) + live pentest** — see `docs/security-audit/SECURITY-AUDIT.md`. 0 CRITICAL. **SEC-L0 (HIGH, fixed):** a `TcpConnTracker` DashMap self-deadlock let the first inbound DNS-over-TCP / DoT / DoH connection from any tracked client freeze all subsequent TCP/DoT/DoH accepts — a remote, unauthenticated DoS reachable with one connection; fixed by scoping the shard guard before `remove_if`. **MEDIUM (fixed):** per-query signer reconstruction → cached per-zone signer (SEC-L1); unsigned-denial downgrade now fails closed to SERVFAIL (SEC-L2); DoT private-key TOCTOU/world-readable → atomic 0600 write (SEC-L3); DNSSEC-toggle recursor desync → rebuilt on toggle (SEC-L4). **LOW/INFO (fixed):** RRSIG inception skew (L5), recursion time-fuse (L6), CNAME-chain signing (L7), `/api/dnssec/ds` no longer generates keys on a read (L9), `/api/tls/*` admin guard (L10), `import_key` filename guard (L11). SEC-L12 (coarse rate-limiter) accepted; OPEN-L1 (per-answer RRSIG/NSEC3 cache) open. Two Gemini findings (path traversal, NSEC3 empty-salt) disputed-down at the code. Live pentest: no exploitable finding.
+
+### Notes
+- The XDP/eBPF/kernel-UDP datapath is byte-identical to v0.19.3; the X710 bench reproduces the published fast path (~13.6 M qps, 0 NIC drops) and slow path (~3.7 M qps, 19% CPU). All new code is off the packet hot path.
+
+
 ## [0.19.3] - 2026-06-14
 
 ### Fixed
