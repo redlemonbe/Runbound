@@ -1,7 +1,7 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.19.3 (Cycle K two-AI audit of the new anycast feature, 2026-06-14 — SEC-K1 fixed, SEC-K2/K3 accepted/enhancement; Gemini's RCE rating disputed-down to LOW. Prior: Cycle J completed 2026-06-13, merged in #198, released as v0.18.1)  
-**Last updated:** 2026-06-14  
+**Current version:** v0.19.3 (Cycle L two-model adversarial audit of the release delta — #201 DNSSEC signing, DoT/DoH/DoQ WebUI, #202 sovereign recursion. SEC-L0 (HIGH) TCP-tracker deadlock DoS fixed; 6 more fixed, 2 accepted, OPEN-L1 open; 0 new CRITICAL/HIGH. Gemini 2.5 Pro cross-model pass completed (both findings disputed-down). Prior: Cycle K v0.19.3 anycast)  
+**Last updated:** 2026-06-18  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
 This document consolidates all security and performance audit cycles conducted on Runbound. Individual per-cycle files in this directory are historical records; this file is the authoritative status reference.
@@ -24,6 +24,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 4 open (enhancement); 15 fixed, 3 accepted, 5 disputed |
 | [J](#cycle-j--v0180--two-ai-competitive-audit-full-surface-re-review) | v0.17.2→v0.18.0 | 2026-06-13 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro + live pentest | 1 HIGH + 3 MEDIUM + 7 LOW open (remediation pending approval); 2 accepted, 2 disputed; 0 fixed. Pentest: SEC-J1/J2 confirmed exploitable, SEC-J4 downgraded→LOW |
 | [K](#cycle-k--v0193--two-ai-competitive-audit-anycast-feature) | v0.18.1→v0.19.3 | 2026-06-14 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro + live pentest | 1 LOW fixed (SEC-K1); 1 accepted (SEC-K2); 1 enhancement open (OPEN-K1); 2 info-positive; 1 disputed (Gemini RCE HIGH→LOW). New surface = anycast; packet hot path unchanged |
+| [L](#cycle-l--v0193--release--two-model-adversarial-audit-201-dnssec-signing--dotdohdoq--202-recursion) | v0.19.3 → release | 2026-06-18 | [AI-INTERNAL] Claude Opus 4.8 (3 agents) × [AI-ADVERSARIAL] Gemini 2.5 Pro | 1 HIGH fixed pre-audit (SEC-L0); 7 fixed, 2 accepted, OPEN-L1 open; 2 Gemini findings disputed; 0 new CRITICAL/HIGH |
 
 ---
 
@@ -34,6 +35,52 @@ Through Cycle E (v0.9.50) all tracked findings were fixed, accepted, or classifi
 All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2, SEC-C3, SEC-C4), accepted (SEC-B6, SEC-B8, SEC-B11, SEC-B15, SEC-C5, SEC-C7, PERF-C2), or classified as false positives (SEC-C6, SEC-C8).
 
 **Cycle J (v0.18.1)** remediated SEC-J1 (HIGH) and 6 others (#198). **Cycle K (v0.19.3)** audited the new anycast feature only: SEC-K1 (LOW) is **Fixed**, SEC-K2 is **Accepted** (defence-in-depth, currently unreachable), and **OPEN-K1** (readiness-based BGP withdrawal) is **Open** as an enhancement. No active vulnerability was found in the feature. The DNS packet hot path is unchanged: the only delta under `src/dns/` since v0.18.1 is an additive read-only status global (`XDP_MODE` + two accessors in `xdp/socket.rs`) that is never called on the packet path — the `XskSocket`/ring/recv/tx code is byte-identical — so no datapath finding can have been introduced.
+
+**Cycle L (release delta)** audited #201 DNSSEC signing, the DoT/DoH/DoQ WebUI/API and #202 recursion. **SEC-L0 (HIGH)** — a `TcpConnTracker` DashMap self-deadlock that let one inbound TCP/DoT/DoH connection DoS all later TCP — was found in functional testing and **Fixed** before the audit. The audit added 0 CRITICAL/HIGH: SEC-L1/L2/L3/L4 (MEDIUM) and SEC-L5/L6 (LOW) and SEC-L9 (INFO) are **Fixed**; SEC-L7 and SEC-L10 are **Accepted**; **OPEN-L1** (per-answer RRSIG/NSEC3 cache) is **Open** as an enhancement. The XDP/eBPF/kernel-UDP datapath is byte-identical to `main`.
+
+---
+
+## Cycle L — v0.19.3 → release — two-model adversarial audit (#201 DNSSEC signing + DoT/DoH/DoQ + #202 recursion)
+
+**Sources:** [AI-INTERNAL] Claude Opus 4.8 — three independent adversarial agents (1: DNSSEC/crypto `zone_signer.rs`; 2: DoT/DoH/DoQ API + the `TcpConnTracker` concurrency fix; 3: REST API / config persistence / #202 recursion). Each agent was required to arbitrate every candidate finding against the source and to refute the non-exploitable ones. [AI-ADVERSARIAL] Gemini 2.5 Pro completed a cross-model pass on the #201 crypto module (`zone_signer.rs`) after retrying through repeated 503s. Consistent with prior cycles it over-rated both of its findings; both are refuted at the code (below). One (path traversal) is nonetheless fenced off as defence-in-depth (SEC-L11).
+
+**Scope:** the attack surface added since Cycle K. #201 online DNSSEC signing of local zones (`src/dns/zone_signer.rs`, signing/serving in `src/dns/server.rs`, the `LOCAL_ZONE_DNSSEC` fast-path gate in `src/dns/local.rs`, the `dnssec-keys` key-replication relay arm in `src/sync.rs` + master push in `src/main.rs`, `/api/dnssec/ds`); the DoT/DoH/DoQ "Encrypted DNS" WebUI/API (`/api/tls/*`, the listener wiring + `TcpConnTracker` in `src/dns/server.rs`, TLS directives in `config/{parser,writer}.rs`); and #202 sovereign full-recursion (`src/dns/recursor.rs`, `resolve_recursive`, `/api/resolution`). The XDP/eBPF/kernel-UDP datapath is **byte-identical** to `main` (`git diff origin/main...HEAD -- src/dns/xdp/ src/dns/kernel_loop.rs ebpf/ src/dns/hasher.rs` is empty), so no datapath finding can have been introduced; the bench reproduced the v0.19.3 fast path (~13.6 M qps, 0 NIC drops) and the v0.18.1 slow path (~3.7 M qps, 19% CPU).
+
+**Result:** one HIGH DoS found in functional testing and fixed before the audit (SEC-L0); the formal audit added 4 MEDIUM + 4 LOW + 2 INFO, **0 CRITICAL, 0 HIGH**. Seven fixed, two accepted, one open (enhancement); a set of inflated candidates were refuted at the code.
+
+### Findings
+
+| ID | Severity | Status | Summary |
+|----|----------|--------|---------|
+| SEC-L0 | HIGH | **Fixed** | `TcpConnTracker::release` self-deadlocked DashMap (a `get()` shard read-guard held across `remove_if` on the same shard). The first inbound DNS-over-TCP / DoT / DoH connection from any tracked (non-loopback) client froze all subsequent TCP/DoT/DoH accepts — a remote, unauthenticated DoS reachable with one connection. Loopback masked it (never inserted). Found in functional testing; fixed by scoping the guard before `remove_if` (commit `eba55e55`); the audit confirmed the fix correct (no double-decrement, no underflow, cap not bypassable). |
+| SEC-L1 | MEDIUM | **Fixed** | Asymmetric crypto DoS: a DO=1 flood of random names in a signed local zone re-signed RRSIG/NSEC3 per query AND reconstructed the ECDSA key from PKCS#8 (with its self-test) for every RRset. Source-spoofable UDP bypasses the per-IP rate-limiter. Fix: build the per-zone `DnssecSigner` once at load and reuse it. The per-answer RRSIG/NSEC3 cache is tracked as OPEN-L1. |
+| SEC-L2 | MEDIUM | **Fixed** | Silent downgrade of authenticated denial: when the NSEC3/SOA proof for a signed zone could not be built, the server fell through to an UNSIGNED NXDOMAIN/NODATA for a DO=1 client. Fix: fail **closed** with SERVFAIL — never serve an unsigned denial for a signed zone. |
+| SEC-L3 | MEDIUM | **Fixed** | DoT/DoH private key written with the umask (typically 0644) then chmod 0600 afterwards — a TOCTOU window where a local user can read the key; a failed chmod was also swallowed. Fix: write the key via a 0600 temp file + atomic rename (also closes SEC-L8). |
+| SEC-L4 | MEDIUM | **Fixed** | The DNSSEC-validation toggle (`PATCH /api/config {dnssec_validation}`) did not rebuild the sovereign recursor, so Bogus→SERVFAIL enforcement silently kept the policy captured when the recursor was last built. Fix: rebuild the recursor on the toggle when full-recursion is the active mode. |
+| SEC-L5 | LOW | **Fixed** | RRSIG inception was set to "now" — a validator whose clock runs slightly ahead rejects fresh signatures (now < inception). Fix: backdate inception 1 h (validity window length unchanged). |
+| SEC-L6 | LOW | **Fixed** | `resolve_recursive` had no Runbound outer time fuse (the forward path has `timed_lookup`); a flood toward deep/slow delegations could occupy a worker far longer than the forward cap. Fix: wrap in a 5 s `RECURSION_TIMEOUT` → SERVFAIL on timeout. |
+| SEC-L7 | LOW | **Accepted** | `sign_answer` does not follow and sign CNAME chains or wildcards in a signed local zone — a DNSSEC-correctness gap for those record shapes, not a forgery (it also removes any type/algorithm-confusion surface in the RRSIG, since the signed RRset is type-homogeneous). Tracked; local-zone CNAME/wildcard is uncommon. |
+| SEC-L8 | LOW | **Fixed** | (folded into SEC-L3) On a failed config write after a successful key write, an orphan private key was left at the fixed path — eliminated by the atomic-rename key write. |
+| SEC-L9 | INFO | **Fixed** | `/api/dnssec/ds` rebuilt the signer with `ZoneSigner::new` (load_or_generate) on every GET — writing fresh keys on a read, and on a slave minting divergent local keys instead of the replicated ones. Fix: read the live in-memory signer; no generation on a read path. |
+| SEC-L10 | INFO | **Accepted** | The `/api/tls/*` mutating handlers have no internal `admin` check (defence-in-depth). The middleware allow-list is deny-by-default and returns 403 to every non-admin role, and the slave-guard blocks non-GET on a slave, so this is a style inconsistency, not a reachable bypass. |
+| SEC-L11 | INFO | **Fixed** | Defence-in-depth (from the Gemini pass): `import_key` now rejects any `file` other than `ksk.key`/`zsk.key`. The relayed `file` is hard-coded by the slave (not attacker-controlled) and the relay is HMAC-authenticated, so the flagged path traversal is not reachable; the guard fences it at the function. |
+| OPEN-L1 | LOW | **Open** | Enhancement: cache the signed RRSIG and the NSEC3 chain per (zone, owner-set) with a TTL so a DO=1 flood of random names in a signed zone cannot force repeated signing. SEC-L1 removed the per-RR key reconstruction; the per-answer cache is the remaining work. |
+
+### Refuted at the code (candidate findings dismissed)
+
+- **Path traversal in `import_key`** (replicated-key filename from a DNS name): `Name::from_str` rejects `/` (and escapes `..`), and the file component is the hard-coded `ksk.key`/`zsk.key`. Not exploitable.
+- **Unauthenticated forged-key injection** via the `dnssec-keys` relay arm: the relay dispatch runs behind `hmac_verify_with_ts` (HMAC-SHA256 over method+path+ts+body, ±30 s anti-replay, constant-time compare) on the TOFU-pinned TLS channel; the header-only fallback was removed in SEC-J5. An off-path or unauthenticated party cannot push keys.
+- **Config-directive injection (SEC-J1 class)** via the API TLS hostname: `escape_str` maps `\n`/`\r` to space and escapes `"`/`\`, and the parser is strictly single-line — no new directive can be created; the hostname is also control-char + length validated.
+- **Recursor anti-SSRF**: `RecursorOptions` inherits `RECOMMENDED_SERVER_FILTERS` (loopback, RFC 1918, CGNAT 100.64/10, **link-local 169.254/16 incl. cloud metadata**, ULA / v6 link-local), applied to NS selection, glue, and resolved NS addresses across every delegation level and CNAME chain — not just the first hop.
+- **RBAC / slave-guard** on `/api/tls/*` and `/api/resolution`: admin-only via the deny-by-default allow-list; non-GET on a slave is blocked globally and per-handler.
+- **DoT loopback relay**: the real client source IP is ACL-checked before relaying; TLS terminates at the loopback hickory listener (no downgrade); per-IP cap (20) + 30 s session timeout bound FD exhaustion; the relay listener binds an ephemeral loopback port, not externally reachable.
+- **NSEC3 zone enumeration via empty salt** (Gemini, MEDIUM → **disputed**): empty salt + 0 iterations is the RFC 9276 *recommended* configuration; a non-empty salt / non-zero iterations is explicitly deprecated and gives no meaningful anti-enumeration benefit (NSEC3 is walkable online regardless; the salt only marginally raises offline pre-computation). Not a vulnerability. True anti-enumeration needs NSEC3 white-lies or non-publication, not a salt.
+- **Path traversal in `import_key`** (Gemini, HIGH → **disputed**, also flagged-and-refuted by the Claude crypto agent): the `file` argument is not attacker-controlled (hard-coded `ksk.key`/`zsk.key` by the slave) and the relay is HMAC-authenticated; fenced off anyway by SEC-L11.
+- **Key material at rest / in logs**: #201 keys are 0600 from creation (`write_key_0600`); no private-key bytes are logged or returned by any endpoint.
+
+### Re-audit note
+
+Per the audit conventions, the SEC-L fixes must be re-reviewed in a later cycle by a different session/model, and the deferred Gemini 2.5 Pro cross-model pass appended, before the next release tag. Findings span two branches: SEC-L0/L1/L2/L3/L5/L9 on `feat/201-dnssec-signing`; SEC-L4/L6 on `feat/202-sovereign-recursion` (PR #207).
 
 ---
 

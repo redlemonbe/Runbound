@@ -248,6 +248,13 @@ pub fn export_keys(config_dir: &Path, apex: &Name) -> Option<(String, String, St
 /// it differs from what is already there. Returns `true` if the file changed. Used on the slave to
 /// adopt the master's replicated keys.
 pub fn import_key(config_dir: &Path, zone: &str, file: &str, b64: &str) -> Result<bool, String> {
+    // SEC-L11 (defence-in-depth): only ever write the two known key filenames. The slave passes
+    // these as hard-coded literals today, but validate here so no future caller can turn the
+    // relayed `file` into a path-traversal write. (Cross-model Gemini finding, disputed-down:
+    // not currently reachable since `file` is not attacker-controlled, but cheap to fence off.)
+    if file != "ksk.key" && file != "zsk.key" {
+        return Err(format!("invalid key filename: {file}"));
+    }
     let bytes = data_encoding::BASE64
         .decode(b64.as_bytes())
         .map_err(|e| format!("base64 decode: {e}"))?;
