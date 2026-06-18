@@ -11,7 +11,7 @@
 //   - `recursion_limit` / `ns_recursion_limit` bound the delegation walk (anti-DoS budget).
 //   - case randomisation (0x20) is enabled here (off by default) for off-path poisoning resistance.
 //
-// EXPERIMENTAL / opt-in: only used when `resolution: full-recursion`. Default stays `forward`.
+// Opt-in: only used when `resolution: full-recursion`. Default stays `forward`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::AtomicU8;

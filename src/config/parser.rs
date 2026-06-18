@@ -6,7 +6,7 @@ use tracing::warn;
 /// Resolution backend for queries not answered locally / from cache.
 /// `Forward` (default) = send to the configured upstreams (`forward-zone`) — current behaviour.
 /// `FullRecursion` = iterative resolution from the root servers (sovereign, no third-party
-/// forwarder). EXPERIMENTAL: backed by `hickory-recursor` (alpha); strictly opt-in.
+/// forwarder), backed by the in-tree stable recursor (hickory-resolver `recursor` feature); opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResolutionMode {
     #[default]
@@ -163,7 +163,7 @@ pub struct UnboundConfig {
     /// Log WARN for every DNSSEC-bogus query when dnssec-validation is enabled.
     pub dnssec_log_bogus: bool,
     /// Resolution backend for cache-miss queries: `forward` (default) or `full-recursion`
-    /// (sovereign iterative-from-root — EXPERIMENTAL, opt-in). See [`ResolutionMode`].
+    /// (sovereign iterative-from-root, opt-in). See [`ResolutionMode`].
     pub resolution_mode: ResolutionMode,
 
     // ── GDPR / privacy controls ────────────────────────────────────────────

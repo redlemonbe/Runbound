@@ -1397,7 +1397,6 @@ async fn resolution_get_handler(State(s): State<AppState>) -> impl IntoResponse 
     JsonExtract(serde_json::json!({
         "mode": if full { "full-recursion" } else { "forward" },
         "recursor_active": s.recursor.load_full().is_some(),
-        "experimental": true,
     }))
 }
 
