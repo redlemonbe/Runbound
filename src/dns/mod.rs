@@ -12,6 +12,7 @@ pub mod axfr;
 pub mod prefetch;
 pub mod ratelimit;
 pub mod server;
+pub mod zone_signer;
 pub mod xdp;
 
 pub use acl::Acl;
