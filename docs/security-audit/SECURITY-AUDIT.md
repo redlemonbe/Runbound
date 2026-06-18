@@ -1,6 +1,6 @@
 # Runbound — Security Audit Master Document
 
-**Current version:** v0.19.3 (Cycle L two-model adversarial audit of the release delta — #201 DNSSEC signing, DoT/DoH/DoQ WebUI, #202 sovereign recursion. SEC-L0 (HIGH) TCP-tracker deadlock DoS fixed; 8 more fixed, 1 accepted (SEC-L12), OPEN-L1 open; 0 new CRITICAL/HIGH. Gemini 2.5 Pro cross-model pass completed (both findings disputed-down). Prior: Cycle K v0.19.3 anycast)  
+**Current version:** v0.19.3 (Cycle L two-model adversarial audit of the release delta — #201 DNSSEC signing, DoT/DoH/DoQ WebUI, #202 sovereign recursion. SEC-L0 (HIGH) TCP-tracker deadlock DoS fixed; 8 more fixed, 1 accepted (SEC-L12), OPEN-L1 open; 0 new CRITICAL/HIGH. Gemini 2.5 Pro cross-model pass completed (both disputed-down). Live pentest: no exploitable finding. Prior: Cycle K v0.19.3 anycast)  
 **Last updated:** 2026-06-18  
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
@@ -24,7 +24,7 @@ This document consolidates all security and performance audit cycles conducted o
 | [I](#cycle-i--v0170--two-ai-competitive-audit-kernel-slow-path-auto-tune--full-surface-re-review) | v0.16.11→v0.17.0 | 2026-06-11 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro | 4 open (enhancement); 15 fixed, 3 accepted, 5 disputed |
 | [J](#cycle-j--v0180--two-ai-competitive-audit-full-surface-re-review) | v0.17.2→v0.18.0 | 2026-06-13 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro + live pentest | 1 HIGH + 3 MEDIUM + 7 LOW open (remediation pending approval); 2 accepted, 2 disputed; 0 fixed. Pentest: SEC-J1/J2 confirmed exploitable, SEC-J4 downgraded→LOW |
 | [K](#cycle-k--v0193--two-ai-competitive-audit-anycast-feature) | v0.18.1→v0.19.3 | 2026-06-14 | [AI-INTERNAL] Claude Opus 4.8 × [AI-ADVERSARIAL] Gemini 2.5 Pro + live pentest | 1 LOW fixed (SEC-K1); 1 accepted (SEC-K2); 1 enhancement open (OPEN-K1); 2 info-positive; 1 disputed (Gemini RCE HIGH→LOW). New surface = anycast; packet hot path unchanged |
-| [L](#cycle-l--v0193--release--two-model-adversarial-audit-201-dnssec-signing--dotdohdoq--202-recursion) | v0.19.3 → release | 2026-06-18 | [AI-INTERNAL] Claude Opus 4.8 (3 agents) × [AI-ADVERSARIAL] Gemini 2.5 Pro | 1 HIGH fixed pre-audit (SEC-L0); 9 fixed, 1 accepted, OPEN-L1 open; 2 Gemini disputed; 0 new CRITICAL/HIGH |
+| [L](#cycle-l--v0193--release--two-model-adversarial-audit-201-dnssec-signing--dotdohdoq--202-recursion) | v0.19.3 → release | 2026-06-18 | [AI-INTERNAL] Claude Opus 4.8 (3 agents) × [AI-ADVERSARIAL] Gemini 2.5 Pro | 1 HIGH fixed pre-audit (SEC-L0); 9 fixed, 1 accepted, OPEN-L1 open; 2 Gemini disputed; live pentest clean; 0 new CRITICAL/HIGH |
 
 ---
 
@@ -78,6 +78,26 @@ All findings have been fixed (SEC-B7, SEC-B10, SEC-B13, SEC-B16, SEC-C1, SEC-C2,
 - **NSEC3 zone enumeration via empty salt** (Gemini, MEDIUM → **disputed**): empty salt + 0 iterations is the RFC 9276 *recommended* configuration; a non-empty salt / non-zero iterations is explicitly deprecated and gives no meaningful anti-enumeration benefit (NSEC3 is walkable online regardless; the salt only marginally raises offline pre-computation). Not a vulnerability. True anti-enumeration needs NSEC3 white-lies or non-publication, not a salt.
 - **Path traversal in `import_key`** (Gemini, HIGH → **disputed**, also flagged-and-refuted by the Claude crypto agent): the `file` argument is not attacker-controlled (hard-coded `ksk.key`/`zsk.key` by the slave) and the relay is HMAC-authenticated; fenced off anyway by SEC-L11.
 - **Key material at rest / in logs**: #201 keys are 0600 from creation (`write_key_0600`); no private-key bytes are logged or returned by any endpoint.
+
+### Cycle L — live pentest (2026-06-18)
+
+Live adversarial pentest against feature-enabled instances (signed local zone with a CNAME, a `read`-role multi-user key, the relay sync-port; plus a full-recursion + DNSSEC-validating instance for #202). Every probe was a real request/flood, not a code read.
+
+| Probe | Result |
+|-------|--------|
+| Auth bypass — no key / wrong key / empty Bearer / key-as-`?query` / 60-char key prefix | all **401**; valid key 200. No bypass; prefix match defeated (constant-time compare). |
+| RBAC — `read` role → POST /dns, DELETE /dns/:id, POST /tls/import, POST /rotate-key | all **403**; reads 200. No privilege escalation. |
+| Key exposure — `/api/dnssec/ds`, `/api/tls/cert`, `/api/config` | no private-key bytes, no API/sync key in clear. |
+| Relay HMAC — no HMAC / bogus sig / valid HMAC + 120 s-old timestamp | all **401**; the gate and the ±30 s anti-replay hold. |
+| Config-directive injection — TLS hostname with `\n ui-acme-hook: touch /tmp/PWNED` | **400** INVALID_HOSTNAME (control-char reject) before the writer; no directive injected, no file created. SEC-J1 class not reachable. |
+| Cert-import abuse — malformed PEM / empty key / 3 MB body | **400** / **413**; no panic; process alive. |
+| Path traversal — `GET /api/dns/../config`, blacklist domain `../../etc/passwd` | **404** / **400**. |
+| TCP-tracker deadlock (SEC-L0) — 60 concurrent DNS-over-TCP queries | **60/60 answered**, no freeze: the fix holds under concurrency (pre-fix, one connection froze all subsequent TCP). |
+| DNS-name injection — oversize label, CRLF in an API record name | rejected (illegal-name / **400** control-char). |
+| Recursion DNSSEC enforcement (#202) — `dnssec-failed.org` (bogus) | **SERVFAIL** (refused); `cloudflare.com` → **AD** set; signed/unsigned names resolve. Confirms SEC-L4 enforcement is live. |
+| Recursor anti-SSRF (#202) | `RECOMMENDED_SERVER_FILTERS` active (loopback / RFC 1918 / 169.254 metadata, on glue + CNAME + NS); no internal-connection attempt observed. A forced-SSRF live test needs a controlled malicious authoritative server (not exercised; covered by code review). |
+
+**Pentest result:** no exploitable finding. SEC-L0 (the only HIGH) confirmed fixed under concurrency; the Cycle L remediations hold against live attack. Method note: one false alarm during the run — a `grep -q PWNED` matched the `ls: cannot access '/tmp/PWNED'` *error string*, not a created file — was caught and disproved with `test -f` (file absent; injection returned 400). Datapath byte-identical; no datapath probe applicable.
 
 ### Re-audit note
 
