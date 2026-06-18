@@ -1183,6 +1183,8 @@ async fn build_and_launch(
                                     domain_stats: Arc::clone(&domain_stats),
                                     dnssec_enabled: Arc::clone(&dnssec_enabled),
                                     resolver: Arc::clone(&resolver),
+                                    resolution_mode: Arc::clone(&resolution_mode),
+                                    recursor: Arc::clone(&recursor),
                                     icmp_stats: Arc::clone(&icmp_stats),
                                     icmp_cfg: Arc::clone(&icmp_cfg),
                                     base_dir: Arc::new(base_dir.clone()),
