@@ -21,7 +21,9 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use hickory_proto::op::{Message, Query};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorOptions};
+use hickory_resolver::recursor::{
+    DnssecConfig, DnssecPolicy, Recursor, RecursorError, RecursorOptions,
+};
 
 use crate::config::parser::ResolutionMode;
 
@@ -79,16 +81,14 @@ pub fn build_recursor(dnssec: bool) -> Result<SovereignRecursor, String> {
     .map_err(|e| format!("failed to build sovereign recursor: {e}"))
 }
 
-/// Resolve a single query iteratively from the root.
+/// Resolve a single query iteratively from the root. The `RecursorError` is propagated as-is so
+/// the caller can distinguish NXDOMAIN / NODATA (which carry the zone SOA) from real failures.
 pub async fn recursor_resolve(
     recursor: &SovereignRecursor,
     query: Query,
     dnssec_ok: bool,
-) -> Result<Message, String> {
-    recursor
-        .resolve(query, Instant::now(), dnssec_ok)
-        .await
-        .map_err(|e| format!("recursor resolve error: {e}"))
+) -> Result<Message, RecursorError> {
+    recursor.resolve(query, Instant::now(), dnssec_ok).await
 }
 
 /// Hot-swappable handle to the sovereign recursor. `None` = forward mode (or build failed →
