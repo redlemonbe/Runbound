@@ -187,6 +187,11 @@ async fn async_main(
         blacklist_reload_rx,
     ) = build_and_launch(&cfg, base_dir, cfg_path).await?;
 
+    // #201: latch the local-zone signing flag before any fast-path preload runs, so signed
+    // local zones are kept out of the snapshot and served on the slow path.
+    dns::local::LOCAL_ZONE_DNSSEC
+        .store(cfg.local_zone_dnssec, std::sync::atomic::Ordering::Relaxed);
+
     // #60: XDP cache snapshot — create only when XDP is enabled and configured.
     let mut xdp_cache_snapshot: Option<dns::cache_snapshot::SharedCacheSnapshot> = None;
     let mut xdp_cache_mutable: Option<dns::cache_snapshot::MutableCacheMap> = None;

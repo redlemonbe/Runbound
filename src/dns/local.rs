@@ -10,6 +10,12 @@ use crate::dns::simd;
 use smallvec::SmallVec;
 use std::str::FromStr;
 
+/// #201: set once at startup from `local-zone-dnssec`. When true, local zones are **not**
+/// preloaded into the fast-path snapshot — they are served (and DNSSEC-signed) on the slow path,
+/// which is the only place we can vary the answer by the client's DO bit (RFC 4035 §3.2.1).
+pub static LOCAL_ZONE_DNSSEC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 use hickory_proto::rr::{
     rdata::{self, CNAME},
     LowerName, Name, RData, Record, RecordType,
@@ -353,6 +359,14 @@ pub(crate) fn preload_into_cache(
     zones: &LocalZoneSet,
     cache: &crate::dns::cache_snapshot::MutableCacheMap,
 ) {
+    // #201: when local zones are DNSSEC-signed, they must be served on the slow path (so the
+    // RRSIG can be added and the DO bit honoured), not from the unsigned fast-path snapshot.
+    if LOCAL_ZONE_DNSSEC.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            "local-zone-dnssec: local zones served signed on the slow path (skipping fast-path preload)"
+        );
+        return;
+    }
     use crate::dns::cache_snapshot::cache_insert_local;
     let entries = local_zone_entries(zones);
     let preloaded = entries.len();

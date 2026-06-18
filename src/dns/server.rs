@@ -150,6 +150,8 @@ pub struct RunboundHandler {
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     dnssec_log_bogus: bool,
+    /// #201: online DNSSEC signer for local zones. `None` when local-zone-dnssec is off.
+    zone_signer: Option<Arc<crate::dns::zone_signer::ZoneSigner>>,
     /// Optional prefetch tracker — None when prefetch: no (default).
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
     /// #60: mutable cache map shared with XDP workers (via publish_loop).
@@ -249,6 +251,7 @@ impl RunboundHandler {
         log_buffer: SharedLogBuffer,
         dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
         dnssec_log_bogus: bool,
+        zone_signer: Option<Arc<crate::dns::zone_signer::ZoneSigner>>,
         prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
         xdp_cache: Option<super::cache_snapshot::MutableCacheMap>,
         cache_max_entries: usize,
@@ -288,6 +291,7 @@ impl RunboundHandler {
             log_buffer,
             dnssec_enabled,
             dnssec_log_bogus,
+            zone_signer,
             prefetch_tracker,
             xdp_cache,
             cache_max_entries,
@@ -408,6 +412,58 @@ impl RunboundHandler {
         start: Instant,
         zones_snap: &LocalZoneSet,
     ) -> Result<ResponseInfo, R> {
+        // #201: a DNSKEY query at a signed zone's apex is answered with the synthesized
+        // DNSKEY RRset (KSK + ZSK) + its RRSIG.
+        if qtype == RecordType::DNSKEY {
+            if let Some(ref signer) = self.zone_signer {
+                if signer.is_apex(qname) {
+                    if let Some(records) = signer.apex_dnskey(qname) {
+                        let dnssec_ok = request
+                            .edns
+                            .as_ref()
+                            .map(|e| e.flags().dnssec_ok)
+                            .unwrap_or(false);
+                        let answer: Vec<Record> = if dnssec_ok {
+                            records
+                        } else {
+                            records
+                                .into_iter()
+                                .filter(|r| r.record_type() != RecordType::RRSIG)
+                                .collect()
+                        };
+                        let mut metadata = Metadata::response_from_request(&request.metadata);
+                        metadata.authoritative = true;
+                        let opt_edns = make_opt_edns(request);
+                        let mut builder = MessageResponseBuilder::from_message_request(request);
+                        if let Some(ref opt) = opt_edns {
+                            builder.edns(opt);
+                        }
+                        let response = builder.build(
+                            metadata,
+                            answer.iter(),
+                            std::iter::empty(),
+                            std::iter::empty(),
+                            std::iter::empty(),
+                        );
+                        self.record_query(
+                            client_ip,
+                            qname,
+                            qtype,
+                            ResponseCode::NoError,
+                            LogAction::Local,
+                            start,
+                        );
+                        return Ok(response_handle.send_response(response).await.unwrap_or_else(
+                            |e| {
+                                error!("dnskey send: {e}");
+                                servfail_info(request)
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
         let zone_action = zones_snap.find(qname);
 
         match zone_action {
@@ -464,12 +520,27 @@ impl RunboundHandler {
                     debug!(name=%sanitize_dns_name(qname), count = records.len(), "local-data answer");
                     let mut metadata = Metadata::response_from_request(&request.metadata);
                     metadata.authoritative = true;
+                    // #201: when local-zone-dnssec is on and the client set DO, append the RRSIG
+                    // for this RRset (online signing on the slow path).
+                    let mut answer: Vec<Record> = records.iter().map(|r| (*r).clone()).collect();
+                    let dnssec_ok = request
+                        .edns
+                        .as_ref()
+                        .map(|e| e.flags().dnssec_ok)
+                        .unwrap_or(false);
+                    if dnssec_ok {
+                        if let Some(ref signer) = self.zone_signer {
+                            if let Some(rrsig) = signer.sign_answer(qtype, &records) {
+                                answer.push(rrsig);
+                            }
+                        }
+                    }
                     let opt_edns = make_opt_edns(request);
                     let mut builder = MessageResponseBuilder::from_message_request(request);
                     if let Some(ref opt) = opt_edns { builder.edns(opt); }
                     let response = builder.build(
                         metadata,
-                        records,
+                        answer.iter(),
                         std::iter::empty(),
                         std::iter::empty(),
                         std::iter::empty(),
@@ -2393,6 +2464,28 @@ pub async fn run_dns_server(
     let domain_stats_for_kloop = Arc::clone(&domain_stats);
     let xdp_cache_for_kloop    = xdp_cache.as_ref().map(Arc::clone);
 
+    // #201: build the online DNSSEC signer when local-zone-dnssec is enabled. Keys live under
+    // the config dir; on failure we log and disable signing rather than refuse to start.
+    let zone_signer: Option<Arc<crate::dns::zone_signer::ZoneSigner>> = if cfg.local_zone_dnssec {
+        let apexes: Vec<String> = cfg.local_zones.iter().map(|z| z.name.clone()).collect();
+        match crate::dns::zone_signer::ZoneSigner::new(
+            crate::runtime::base_dir(),
+            &apexes,
+            Duration::from_secs(14 * 24 * 3600),
+        ) {
+            Ok(s) => {
+                info!(zones = apexes.len(), "local-zone-dnssec: online signer ready");
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                error!("local-zone-dnssec: signer init failed: {e} — serving unsigned");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let handler = RunboundHandler::new(
         Arc::clone(&zones),
         Arc::clone(&resolver),
@@ -2405,6 +2498,7 @@ pub async fn run_dns_server(
         log_buffer,
         Arc::clone(&dnssec_enabled),
         cfg.dnssec_log_bogus,
+        zone_signer,
         prefetch_tracker,
         xdp_cache,
         cache_max_entries,
