@@ -18,29 +18,51 @@ Most existing `unbound.conf` files work as-is. Non-standard or exotic directives
 
 ## What you get
 
-| | BIND9 | Unbound | Runbound |
-|---|:---:|:---:|:---:|
-| Drop-in Unbound config | ❌ | ✅ | ✅ |
-| UDP / TCP / DoT / DoH | ✅ | ✅ | ✅ |
-| Add / block domains live | ⚠️ | ⚠️ unbound-control | ✅ REST API |
-| Block-list feed subscriptions | ⚠️ | ❌ manual | ✅ API |
-| Real-time stats + Prometheus | ✅ statistics channel (XML/JSON) | ⚠️ unbound-control / exporter | ✅ |
-| Master/slave replication | ✅ | ❌ | ✅ built-in*¹ |
-| Automatic TLS (Let's Encrypt) | ❌ | ❌ | ✅ ACME |
-| Anycast deployment (built-in BGP announcer) | ❌ | ❌ | ✅ v0.19.0 |
-| AF/XDP kernel-bypass fast path | ❌ | ❌ | ✅ |
-| XDP ICMP echo responder (rate-limited) | ❌ | ❌ | ✅ |
-| Embedded browser dashboard | ❌ | ❌ | ✅ no nginx needed |
-| Static binary, no dependencies | ❌ | ❌ | ✅ musl |
-| Split-horizon DNS (per-subnet answers) | ❌ | ⚠️ views | ✅ v0.9.63 |
-| RBAC (read/dns/operator/admin roles) | ❌ | ❌ | ✅ v0.9.62 |
-| Webhook notifications (Slack/Discord/ntfy) | ❌ | ❌ | ✅ v0.9.58 |
-| Multi-user API with zone isolation | ❌ | ❌ | ✅ v0.9.51 |
-| White-label UI branding | ❌ | ❌ | ✅ v0.9.61 |
-| Hot backup / restore | ❌ | ❌ | ✅ API |
-| Authoritative DNSSEC signing (local zones, NSEC3) | ✅ | ❌ validator only | ✅ **v0.20.0** online, zero-touch |
-| Sovereign full recursion (iterative from root) | ✅ | ✅ | ✅ **v0.20.0** opt-in |
-| Encrypted DNS server (DoT / DoH / DoQ) + WebUI cert mgmt | ⚠️ | ⚠️ | ✅ **v0.20.0** self-signed or import |
+A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a live REST API and an embedded dashboard. Everything below is built in — no plugins, single static binary.
+
+### Resolution
+| Feature | Notes |
+|---|---|
+| Drop-in Unbound config | parses `unbound.conf`-style syntax |
+| Forwarding resolver | DoT-capable upstreams, query racing, per-upstream health probes |
+| Sovereign full recursion | iterative from the root, opt-in (#202) — no third-party resolver sees your queries |
+| Split-horizon DNS | per-subnet answers |
+| serve-stale (RFC 8767) | answer from expired cache while refreshing in the background |
+
+### Security & DNSSEC
+| Feature | Notes |
+|---|---|
+| DNSSEC validation | enforced under full-recursion — Bogus → SERVFAIL, AD bit |
+| Authoritative DNSSEC signing | online & zero-touch — per-zone KSK+ZSK (ECDSAP256), NSEC3 denial, DS surfaced via API (#201) |
+| Encrypted DNS server | DoT (853) / DoH (443) / DoQ (853) — cert generated or imported from the WebUI/API |
+| Automatic TLS | built-in ACME / Let’s Encrypt |
+| Rate limiting + ICMP flood ban | enforced on both the XDP fast path and the kernel slow path |
+| RBAC | read / dns / operator / admin API roles |
+| Privacy by default | client-IP redaction, configurable retention (GDPR) |
+| Tamper-evident audit log | HMAC-chained, SIEM-ready JSON |
+
+### Performance — XDP fast path
+| Feature | Notes |
+|---|---|
+| AF_XDP kernel-bypass | zero-syscall hot path; ~13.5 M qps dual-link X710 (NIC-truth, server ~10 % CPU) |
+| SIMD / ASM wire responder | shared by the fast and slow paths |
+| Multi-NIC + IRQ/CPU auto-pinning | governor control, ring auto-sizing |
+| XDP ICMP echo responder | rate-limited, with auto-ban |
+| Static binary | musl, no runtime dependencies |
+
+### Management & operations
+| Feature | Notes |
+|---|---|
+| Live REST API | add/block domains, zones, config — no restart |
+| Embedded browser dashboard | no nginx needed |
+| Block-list feed subscriptions | managed via the API |
+| Real-time stats | Prometheus `/metrics` + SSE stream |
+| Master/slave replication | REST relay (HMAC + TLS-pinned) **and** AXFR/IXFR (RFC 5936) *¹ |
+| Anycast deployment | built-in BGP announcer, health-driven route withdrawal |
+| Multi-user API | per-user zone isolation |
+| Webhook notifications | Slack / Discord / ntfy |
+| Hot backup / restore | via the API |
+| White-label UI branding | logo + colours |
 
 *¹ Runbound ships both REST API-driven replication and standard AXFR/IXFR zone transfers (RFC 5936, v0.9.13+). AXFR requires explicit ACL configuration — see [docs/configuration.md](docs/configuration.md).
 
