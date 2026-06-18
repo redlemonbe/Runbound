@@ -1365,6 +1365,19 @@ async fn patch_config_handler(
         if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, v).await {
             warn!(%e, "resolver rebuild after DNSSEC toggle — continuing");
         }
+        // SEC-L4: when the sovereign recursor is the active resolver, rebuild it so the new
+        // validation policy actually takes effect. Otherwise the recursor keeps the DNSSEC
+        // policy captured when it was last built, and Bogus->SERVFAIL enforcement silently
+        // desyncs from what the API/config reports.
+        if s.resolution_mode.load(Ordering::Relaxed) == 1 {
+            if let Err(e) = crate::dns::recursor::rebuild_shared(
+                &s.recursor,
+                crate::config::parser::ResolutionMode::FullRecursion,
+                v,
+            ) {
+                warn!(%e, "recursor rebuild after DNSSEC toggle — continuing");
+            }
+        }
         s.audit.send(AuditEvent::ConfigReload);
         info!(dnssec = v, "DNSSEC validation toggled via API");
         persist_config(&s);

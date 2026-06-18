@@ -80,6 +80,12 @@ const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 // realistic upstream.
 const RESOLVER_LOOKUP_TIMEOUT: Duration = Duration::from_millis(2500);
 
+// SEC-L6: outer fuse for the sovereign full-recursion path (#202). The forward path is bounded
+// by timed_lookup/RESOLVER_LOOKUP_TIMEOUT; recursion has only hickory per-NS timeouts + the
+// recursion-depth limits, so a flood toward deep/slow delegations could occupy a worker far
+// longer. 5s caps total worker occupancy while tolerating a legitimately cold deep lookup.
+const RECURSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Wrap a resolver lookup with a hard external timeout.
 /// Returns `Err(NetError::Timeout)` if hickory does not respond within
 /// `RESOLVER_LOOKUP_TIMEOUT`, cancelling the hickory future and freeing the
@@ -618,7 +624,19 @@ impl RunboundHandler {
         let cd = request.metadata.checking_disabled;
         let validating = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
         let query = hickory_proto::op::Query::query(Name::from(qname), qtype);
-        match crate::dns::recursor::recursor_resolve(recursor, query, dnssec_ok).await {
+        let resolved = match tokio::time::timeout(
+            RECURSION_TIMEOUT,
+            crate::dns::recursor::recursor_resolve(recursor, query, dnssec_ok),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(%qname, "full-recursion: outer timeout — SERVFAIL");
+                return send_error(request, response_handle, ResponseCode::ServFail).await;
+            }
+        };
+        match resolved {
             Ok(msg) => {
                 // DNSSEC enforcement: never serve Bogus data unless the client disabled checking.
                 let bogus = msg
