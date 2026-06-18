@@ -204,6 +204,55 @@ pub struct ZoneSigner {
     zones: HashMap<LowerName, ZoneKeys>,
 }
 
+/// Hot-swappable handle to the zone signer, so a slave can adopt the master's replicated keys at
+/// runtime. `None` inner = signing off (or not yet keyed).
+pub type SharedZoneSigner =
+    std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<ZoneSigner>>>>;
+
+/// Process-global handle to the live signer, shared by the DNS handler (run_dns_server) and the
+/// relay key-replication path (sync.rs) without threading it through every constructor.
+pub static SHARED_SIGNER: std::sync::OnceLock<SharedZoneSigner> = std::sync::OnceLock::new();
+
+/// Rebuild the signer for `apexes` under `config_dir` and hot-swap it into the shared handle.
+/// Called on the slave after the master replicates fresh keys to disk. Returns the zone count.
+pub fn rebuild_shared(config_dir: &Path, apexes: &[String], sig_validity: Duration) -> Result<usize, String> {
+    let signer = ZoneSigner::new(config_dir, apexes, sig_validity)?;
+    let n = signer.zones.len();
+    if let Some(shared) = SHARED_SIGNER.get() {
+        shared.store(std::sync::Arc::new(Some(std::sync::Arc::new(signer))));
+    }
+    Ok(n)
+}
+
+/// Read a zone's stored KSK + ZSK (PKCS#8 DER) from disk, base64-encoded for relay transport.
+/// `(zone-presentation, ksk_b64, zsk_b64)`; `None` if either key file is missing.
+pub fn export_keys(config_dir: &Path, apex: &Name) -> Option<(String, String, String)> {
+    let dir = zone_key_dir(config_dir, apex);
+    let ksk = std::fs::read(dir.join("ksk.key")).ok()?;
+    let zsk = std::fs::read(dir.join("zsk.key")).ok()?;
+    Some((
+        apex.to_string(),
+        data_encoding::BASE64.encode(&ksk),
+        data_encoding::BASE64.encode(&zsk),
+    ))
+}
+
+/// Write a base64-encoded PKCS#8 key to `<config_dir>/dnssec/<zone>/<file>` (mode 0600), only when
+/// it differs from what is already there. Returns `true` if the file changed. Used on the slave to
+/// adopt the master's replicated keys.
+pub fn import_key(config_dir: &Path, zone: &str, file: &str, b64: &str) -> Result<bool, String> {
+    let bytes = data_encoding::BASE64
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    let zone_name = Name::from_str(zone).map_err(|e| format!("invalid zone '{zone}': {e}"))?;
+    let path = zone_key_dir(config_dir, &zone_name).join(file);
+    if std::fs::read(&path).map(|c| c == bytes).unwrap_or(false) {
+        return Ok(false);
+    }
+    write_key_0600(&path, &bytes)?;
+    Ok(true)
+}
+
 impl ZoneSigner {
     /// Load (or generate on first use) the KSK+ZSK for each configured local-zone apex.
     pub fn new(config_dir: &Path, apexes: &[String], sig_validity: Duration) -> Result<Self, String> {

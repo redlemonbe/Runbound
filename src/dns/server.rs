@@ -150,8 +150,9 @@ pub struct RunboundHandler {
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     dnssec_log_bogus: bool,
-    /// #201: online DNSSEC signer for local zones. `None` when local-zone-dnssec is off.
-    zone_signer: Option<Arc<crate::dns::zone_signer::ZoneSigner>>,
+    /// #201: online DNSSEC signer for local zones — hot-swappable so the slave can adopt the
+    /// master's replicated keys at runtime. Inner `None` when local-zone-dnssec is off.
+    zone_signer: crate::dns::zone_signer::SharedZoneSigner,
     /// Optional prefetch tracker — None when prefetch: no (default).
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
     /// #60: mutable cache map shared with XDP workers (via publish_loop).
@@ -251,7 +252,7 @@ impl RunboundHandler {
         log_buffer: SharedLogBuffer,
         dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
         dnssec_log_bogus: bool,
-        zone_signer: Option<Arc<crate::dns::zone_signer::ZoneSigner>>,
+        zone_signer: crate::dns::zone_signer::SharedZoneSigner,
         prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
         xdp_cache: Option<super::cache_snapshot::MutableCacheMap>,
         cache_max_entries: usize,
@@ -398,6 +399,11 @@ impl RunboundHandler {
 }
 
 impl RunboundHandler {
+    /// Current zone-signer snapshot (hot-swappable — the slave adopts the master's replicated keys).
+    fn signer(&self) -> Option<std::sync::Arc<crate::dns::zone_signer::ZoneSigner>> {
+        (*self.zone_signer.load_full()).clone()
+    }
+
     /// Attempt to answer from local zones (blacklist, static data, CNAME chains).
     /// Returns `Ok(info)` when a response was sent; `Err(rh)` when no local match
     /// #201: build + send a DNSSEC-signed negative response (SOA + RRSIG + NSEC3 proof) for a
@@ -411,7 +417,7 @@ impl RunboundHandler {
         is_nxdomain: bool,
         zones_snap: &LocalZoneSet,
     ) -> Option<ResponseInfo> {
-        let signer = self.zone_signer.as_ref()?;
+        let signer = self.signer()?;
         let dnssec_ok = request
             .edns
             .as_ref()
@@ -477,7 +483,7 @@ impl RunboundHandler {
         // #201: a DNSKEY query at a signed zone's apex is answered with the synthesized
         // DNSKEY RRset (KSK + ZSK) + its RRSIG.
         if qtype == RecordType::DNSKEY {
-            if let Some(ref signer) = self.zone_signer {
+            if let Some(signer) = self.signer() {
                 if signer.is_apex(qname) {
                     if let Some(records) = signer.apex_dnskey(qname) {
                         let dnssec_ok = request
@@ -528,7 +534,7 @@ impl RunboundHandler {
 
         // #201: an SOA query at a signed zone's apex returns the synthesized SOA + RRSIG.
         if qtype == RecordType::SOA {
-            if let Some(ref signer) = self.zone_signer {
+            if let Some(signer) = self.signer() {
                 if signer.is_apex(qname) {
                     if let Some(records) = signer.signed_soa(qname) {
                         let dnssec_ok = request
@@ -642,7 +648,7 @@ impl RunboundHandler {
                         .map(|e| e.flags().dnssec_ok)
                         .unwrap_or(false);
                     if dnssec_ok {
-                        if let Some(ref signer) = self.zone_signer {
+                        if let Some(signer) = self.signer() {
                             if let Some(rrsig) = signer.sign_answer(qtype, &records) {
                                 answer.push(rrsig);
                             }
@@ -2594,7 +2600,11 @@ pub async fn run_dns_server(
 
     // #201: build the online DNSSEC signer when local-zone-dnssec is enabled. Keys live under
     // the config dir; on failure we log and disable signing rather than refuse to start.
-    let zone_signer: Option<Arc<crate::dns::zone_signer::ZoneSigner>> = if cfg.local_zone_dnssec {
+    // The master (or a standalone node) generates + holds the keys; a slave starts with no signer
+    // and adopts the master's replicated keys via the relay (model B) — never signs with its own.
+    let signer_inner: Option<Arc<crate::dns::zone_signer::ZoneSigner>> = if cfg.local_zone_dnssec
+        && !cfg.is_slave()
+    {
         let apexes: Vec<String> = cfg.local_zones.iter().map(|z| z.name.clone()).collect();
         match crate::dns::zone_signer::ZoneSigner::new(
             crate::runtime::base_dir(),
@@ -2613,6 +2623,10 @@ pub async fn run_dns_server(
     } else {
         None
     };
+    // Hot-swappable handle, shared globally so the relay key-replication path can adopt fresh keys.
+    let zone_signer: crate::dns::zone_signer::SharedZoneSigner =
+        Arc::new(arc_swap::ArcSwap::from_pointee(signer_inner));
+    let _ = crate::dns::zone_signer::SHARED_SIGNER.set(Arc::clone(&zone_signer));
 
     let handler = RunboundHandler::new(
         Arc::clone(&zones),

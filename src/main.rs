@@ -1354,6 +1354,46 @@ async fn build_and_launch(
                 );
             }
         });
+
+        // #201: replicate zone DNSSEC keys to slaves every 30 s (model B). Idempotent — the slave
+        // only rewrites + rebuilds when a key actually changes. Covers slaves that register later.
+        if cfg.local_zone_dnssec {
+            let j2 = Arc::clone(j);
+            let k2 = k.clone();
+            let apexes: Vec<String> = cfg.local_zones.iter().map(|z| z.name.clone()).collect();
+            tokio::spawn(async move {
+                let base = crate::runtime::base_dir();
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    let mut zones = Vec::new();
+                    for a in &apexes {
+                        if let Ok(name) = <hickory_proto::rr::Name as std::str::FromStr>::from_str(a)
+                        {
+                            if let Some((zone, ksk, zsk)) =
+                                crate::dns::zone_signer::export_keys(base, &name)
+                            {
+                                zones.push(
+                                    serde_json::json!({ "zone": zone, "ksk": ksk, "zsk": zsk }),
+                                );
+                            }
+                        }
+                    }
+                    if !zones.is_empty() {
+                        let body = bytes::Bytes::from(
+                            serde_json::json!({ "zones": zones }).to_string(),
+                        );
+                        crate::api::relay::push_to_slaves(
+                            &j2,
+                            &k2,
+                            axum::http::Method::PUT,
+                            "dnssec-keys".to_string(),
+                            body,
+                        );
+                    }
+                }
+            });
+        }
     }
 
     // Multi-user registry — load users.json if present, or create ephemeral if extra keys defined.

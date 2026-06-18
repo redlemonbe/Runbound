@@ -1964,6 +1964,54 @@ async fn handle_relay_request(
             }
             Ok(json_ok(serde_json::json!({ "ok": true })))
         }
+        // #201: master replicates zone DNSSEC keys (PKCS#8, base64) over the encrypted relay.
+        // The slave writes them (mode 0600) and hot-swaps its signer so it signs with the master's
+        // keys (model B) — required for HA, else the slave's RRSIGs fail against the published DS.
+        ("PUT", "dnssec-keys") => {
+            #[derive(serde::Deserialize)]
+            struct KeyEntry {
+                zone: String,
+                ksk: String,
+                zsk: String,
+            }
+            #[derive(serde::Deserialize)]
+            struct Payload {
+                zones: Vec<KeyEntry>,
+            }
+            let p: Payload = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") })))
+                }
+            };
+            let base = crate::runtime::base_dir();
+            let mut changed = false;
+            for e in &p.zones {
+                for (file, b64) in [("ksk.key", &e.ksk), ("zsk.key", &e.zsk)] {
+                    match crate::dns::zone_signer::import_key(base, &e.zone, file, b64) {
+                        Ok(c) => changed |= c,
+                        Err(err) => {
+                            tracing::warn!(%err, zone = %e.zone, file, "relay: dnssec key import failed")
+                        }
+                    }
+                }
+            }
+            if changed {
+                let apexes: Vec<String> =
+                    relay.cfg.local_zones.iter().map(|z| z.name.clone()).collect();
+                match crate::dns::zone_signer::rebuild_shared(
+                    base,
+                    &apexes,
+                    std::time::Duration::from_secs(14 * 24 * 3600),
+                ) {
+                    Ok(n) => {
+                        tracing::info!(zones = n, "dnssec keys replicated from master — signer rebuilt")
+                    }
+                    Err(err) => tracing::warn!(%err, "relay: signer rebuild after key import failed"),
+                }
+            }
+            Ok(json_ok(serde_json::json!({ "ok": true, "zones": p.zones.len() })))
+        }
         _ => Ok(json_resp(404, serde_json::json!({ "error": "NOT_FOUND" }))),
     }
 }
