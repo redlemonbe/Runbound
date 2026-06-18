@@ -329,6 +329,29 @@ impl ZoneSigner {
         sign_rrset(&rrset, &z.zsk_signer).ok()
     }
 
+    /// SEC-L7: sign every RRset in a record chain (e.g. a CNAME chain + its terminal RRset).
+    /// Groups by (owner, type) and signs each group with the zone ZSK; returns the RRSIG records
+    /// to append. Records outside any signed zone are skipped (sign_answer returns None).
+    pub fn sign_chain(&self, records: &[Record]) -> Vec<Record> {
+        let mut groups: Vec<(Name, RecordType, Vec<&Record>)> = Vec::new();
+        for r in records {
+            let n = r.name.clone();
+            let ty = r.record_type();
+            if let Some(g) = groups.iter_mut().find(|(gn, gt, _)| *gn == n && *gt == ty) {
+                g.2.push(r);
+            } else {
+                groups.push((n, ty, vec![r]));
+            }
+        }
+        let mut out = Vec::new();
+        for (_, ty, recs) in &groups {
+            if let Some(rrsig) = self.sign_answer(*ty, recs) {
+                out.push(rrsig);
+            }
+        }
+        out
+    }
+
     /// The apex DNSKEY RRset (KSK + ZSK) plus its RRSIG (signed by the KSK), for a DNSKEY query.
     pub fn apex_dnskey(&self, apex: &LowerName) -> Option<Vec<Record>> {
         let z = self.zones.get(apex)?;

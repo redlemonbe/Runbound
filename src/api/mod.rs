@@ -4132,8 +4132,13 @@ async fn tls_cert_handler(State(s): State<AppState>) -> impl IntoResponse {
 /// POST /api/tls/self-signed — generate a self-signed cert+key, enable DoT/DoH/DoQ.
 async fn tls_self_signed_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     ApiJson(b): ApiJson<TlsSelfSignedBody>,
 ) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"encrypted-DNS settings require admin"}))).into_response();
+    }
     if let Some(r) = tls_slave_guard(&s) {
         return r;
     }
@@ -4214,8 +4219,13 @@ async fn tls_self_signed_handler(
 /// POST /api/tls/import — import an existing cert + key (e.g. Let's Encrypt).
 async fn tls_import_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     ApiJson(b): ApiJson<TlsImportBody>,
 ) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"encrypted-DNS settings require admin"}))).into_response();
+    }
     if let Some(r) = tls_slave_guard(&s) {
         return r;
     }
@@ -4289,7 +4299,14 @@ async fn tls_import_handler(
 }
 
 /// DELETE /api/tls — disable encrypted DNS (clear cert/key directives).
-async fn tls_disable_handler(State(s): State<AppState>) -> impl IntoResponse {
+async fn tls_disable_handler(
+    State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"encrypted-DNS settings require admin"}))).into_response();
+    }
     if let Some(r) = tls_slave_guard(&s) {
         return r;
     }

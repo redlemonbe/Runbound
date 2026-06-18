@@ -710,8 +710,19 @@ impl RunboundHandler {
 
                 // CNAME chain following (RFC 1034 §3.6.2)
                 if qtype != RecordType::CNAME {
-                    let chain = follow_local_cname(&zones_snap, qname, qtype);
-                    if !chain.is_empty() {
+                    let mut answers = follow_local_cname(&zones_snap, qname, qtype);
+                    if !answers.is_empty() {
+                        // SEC-L7: sign each RRset of the CNAME chain (RFC 4035) when the zone is
+                        // signed and the client set DO — otherwise a signed-zone CNAME answer goes
+                        // out unsigned.
+                        let dnssec_ok =
+                            request.edns.as_ref().map(|e| e.flags().dnssec_ok).unwrap_or(false);
+                        if dnssec_ok {
+                            if let Some(signer) = self.signer() {
+                                let sigs = signer.sign_chain(&answers);
+                                answers.extend(sigs);
+                            }
+                        }
                         let mut metadata = Metadata::response_from_request(&request.metadata);
                         metadata.authoritative = true;
                         let opt_edns = make_opt_edns(request);
@@ -719,7 +730,7 @@ impl RunboundHandler {
                     if let Some(ref opt) = opt_edns { builder.edns(opt); }
                         let response = builder.build(
                             metadata,
-                            chain.iter(),
+                            answers.iter(),
                             std::iter::empty(),
                             std::iter::empty(),
                             std::iter::empty(),
