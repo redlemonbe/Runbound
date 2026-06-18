@@ -14,11 +14,16 @@
 // EXPERIMENTAL / opt-in: only used when `resolution: full-recursion`. Default stays `forward`.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::AtomicU8;
+use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use hickory_proto::op::{Message, Query};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorOptions};
+
+use crate::config::parser::ResolutionMode;
 
 /// IANA root servers (IPv4) — the public, stable recursion bootstrap ("hints").
 /// <https://www.iana.org/domains/root/servers>
@@ -84,4 +89,56 @@ pub async fn recursor_resolve(
         .resolve(query, Instant::now(), dnssec_ok)
         .await
         .map_err(|e| format!("recursor resolve error: {e}"))
+}
+
+/// Hot-swappable handle to the sovereign recursor. `None` = forward mode (or build failed →
+/// the dispatch falls back to forwarding). Shared by the DNS data path and the API toggle.
+pub type SharedRecursor = Arc<ArcSwap<Option<Arc<SovereignRecursor>>>>;
+
+/// AtomicU8 mirror of `ResolutionMode` (1 = full-recursion, 0 = forward) read on the hot path.
+pub fn mode_atomic(mode: ResolutionMode) -> Arc<AtomicU8> {
+    Arc::new(AtomicU8::new(u8::from(mode == ResolutionMode::FullRecursion)))
+}
+
+/// Build the shared recursor handle for `mode`. The recursor is built only in full-recursion
+/// mode; on build failure we log and return an empty handle so the caller forwards instead.
+pub fn shared_recursor(mode: ResolutionMode, dnssec: bool) -> SharedRecursor {
+    let inner = build_inner(mode, dnssec);
+    Arc::new(ArcSwap::from_pointee(inner))
+}
+
+/// Rebuild an existing shared handle in place (live toggle). Returns the error string if
+/// full-recursion was requested but the recursor failed to build (handle is left as `None`).
+pub fn rebuild_shared(handle: &SharedRecursor, mode: ResolutionMode, dnssec: bool) -> Result<(), String> {
+    if mode == ResolutionMode::FullRecursion {
+        match build_recursor(dnssec) {
+            Ok(r) => {
+                handle.store(Arc::new(Some(Arc::new(r))));
+                Ok(())
+            }
+            Err(e) => {
+                handle.store(Arc::new(None));
+                Err(e)
+            }
+        }
+    } else {
+        handle.store(Arc::new(None));
+        Ok(())
+    }
+}
+
+fn build_inner(mode: ResolutionMode, dnssec: bool) -> Option<Arc<SovereignRecursor>> {
+    if mode != ResolutionMode::FullRecursion {
+        return None;
+    }
+    match build_recursor(dnssec) {
+        Ok(r) => {
+            tracing::info!(dnssec, "resolution=full-recursion: sovereign recursor built");
+            Some(Arc::new(r))
+        }
+        Err(e) => {
+            tracing::error!("resolution=full-recursion requested but recursor build failed: {e} — forwarding");
+            None
+        }
+    }
 }
