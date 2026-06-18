@@ -14,8 +14,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use hickory_proto::dnssec::crypto::{signing_key_from_der, EcdsaSigningKey};
-use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
-use hickory_proto::dnssec::{Algorithm, DigestType, DnssecSigner, SigningKey};
+use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, NSEC3, RRSIG};
+use hickory_proto::dnssec::{Algorithm, DigestType, DnssecSigner, Nsec3HashAlgorithm, SigningKey};
 use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::OffsetDateTime;
@@ -282,6 +282,153 @@ impl ZoneSigner {
     }
 }
 
+// ── #201: NSEC3 authenticated denial of existence (RFC 5155, params per RFC 9276) ───────────
+// Generation is complete + unit-tested here; it is wired into the negative serve path (with the
+// zone owner-set + SOA) in the following increment, hence the module-scoped dead-code allowance.
+mod nsec3_gen {
+    #![allow(dead_code)]
+    use super::*;
+
+// RFC 9276: SHA-1, 0 iterations, empty salt.
+const NSEC3_ITERATIONS: u16 = 0;
+
+/// Raw 20-byte NSEC3 SHA-1 hash of `name`.
+fn nsec3_hash(name: &Name, salt: &[u8]) -> Option<Vec<u8>> {
+    Nsec3HashAlgorithm::SHA1
+        .hash(salt, name, NSEC3_ITERATIONS)
+        .ok()
+        .map(|d| d.as_ref().to_vec())
+}
+
+/// NSEC3 owner name: `<base32hex(hash)>.<apex>`.
+fn nsec3_owner(apex: &Name, hash: &[u8]) -> Option<Name> {
+    apex.prepend_label(data_encoding::BASE32_DNSSEC.encode(hash).as_str())
+        .ok()
+}
+
+/// One node of the sorted NSEC3 hash ring.
+struct Nsec3Node {
+    hash: Vec<u8>,
+    types: Vec<RecordType>,
+}
+
+/// Build the NSEC3 chain over the zone's owner names, sorted ascending by hash (deduped).
+fn build_nsec3_chain(owners: &[(Name, Vec<RecordType>)], salt: &[u8]) -> Option<Vec<Nsec3Node>> {
+    let mut nodes: Vec<Nsec3Node> = Vec::with_capacity(owners.len());
+    for (name, types) in owners {
+        let hash = nsec3_hash(name, salt)?;
+        let mut t = types.clone();
+        t.push(RecordType::RRSIG);
+        nodes.push(Nsec3Node { hash, types: t });
+    }
+    nodes.sort_by(|a, b| a.hash.cmp(&b.hash));
+    nodes.dedup_by(|a, b| a.hash == b.hash);
+    (!nodes.is_empty()).then_some(nodes)
+}
+
+/// The `next hashed owner name` for node `i` (wraps to node 0).
+fn next_hash(nodes: &[Nsec3Node], i: usize) -> Vec<u8> {
+    nodes[(i + 1) % nodes.len()].hash.clone()
+}
+
+/// True if node `i` *covers* `target` (owner < target < next, with ring wraparound).
+fn covers(nodes: &[Nsec3Node], i: usize, target: &[u8]) -> bool {
+    let owner = nodes[i].hash.as_slice();
+    let next = nodes[(i + 1) % nodes.len()].hash.as_slice();
+    if owner < next {
+        owner < target && target < next
+    } else {
+        target > owner || target < next // last node wraps the ring
+    }
+}
+
+impl ZoneSigner {
+    /// Build + sign one NSEC3 RR (node `i`): returns `[NSEC3 record, RRSIG]`.
+    fn signed_nsec3(
+        &self,
+        z: &ZoneKeys,
+        nodes: &[Nsec3Node],
+        i: usize,
+        salt: &[u8],
+    ) -> Option<Vec<Record>> {
+        let owner = nsec3_owner(&z.apex, &nodes[i].hash)?;
+        let nsec3 = NSEC3::new(
+            Nsec3HashAlgorithm::SHA1,
+            false,
+            NSEC3_ITERATIONS,
+            salt.to_vec(),
+            next_hash(nodes, i),
+            nodes[i].types.iter().copied(),
+        );
+        let rec = Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC3(nsec3)));
+        let mut rrset = RecordSet::new(owner, RecordType::NSEC3, 0);
+        rrset.set_ttl(300);
+        rrset.insert(rec.clone(), 0);
+        let signer = z.zsk.dnssec_signer(&z.apex, self.sig_validity).ok()?;
+        let rrsig = sign_rrset(&rrset, &signer).ok()?;
+        Some(vec![rec, rrsig])
+    }
+
+    /// NSEC3 NODATA proof: the signed NSEC3 matching `qname` (which exists, but lacks the qtype).
+    pub fn nsec3_nodata(
+        &self,
+        qname: &Name,
+        owners: &[(Name, Vec<RecordType>)],
+    ) -> Option<Vec<Record>> {
+        let z = self.zone_for(&LowerName::from(qname.clone()))?;
+        let salt: &[u8] = &[];
+        let nodes = build_nsec3_chain(owners, salt)?;
+        let qhash = nsec3_hash(qname, salt)?;
+        let i = nodes.iter().position(|n| n.hash == qhash)?;
+        self.signed_nsec3(z, &nodes, i, salt)
+    }
+
+    /// NSEC3 NXDOMAIN proof (RFC 5155 §7.2.2): match the closest encloser, cover the next-closer
+    /// name, cover the wildcard at the closest encloser. `owners` must include empty non-terminals.
+    pub fn nsec3_nxdomain(
+        &self,
+        qname: &Name,
+        owners: &[(Name, Vec<RecordType>)],
+    ) -> Option<Vec<Record>> {
+        let z = self.zone_for(&LowerName::from(qname.clone()))?;
+        let salt: &[u8] = &[];
+        let nodes = build_nsec3_chain(owners, salt)?;
+        let existing: std::collections::HashSet<Vec<u8>> =
+            owners.iter().filter_map(|(n, _)| nsec3_hash(n, salt)).collect();
+
+        // Closest encloser: the longest existing ancestor of qname. Next closer: one label longer.
+        let mut child = qname.clone();
+        let (ce, next_closer) = loop {
+            if child.is_root() {
+                return None;
+            }
+            let parent = child.base_name();
+            if existing.contains(&nsec3_hash(&parent, salt)?) {
+                break (parent, child);
+            }
+            child = parent;
+        };
+
+        let ce_hash = nsec3_hash(&ce, salt)?;
+        let nc_hash = nsec3_hash(&next_closer, salt)?;
+        let wc_hash = nsec3_hash(&ce.prepend_label("*").ok()?, salt)?;
+
+        let ce_i = nodes.iter().position(|n| n.hash == ce_hash)?;
+        let nc_i = (0..nodes.len()).find(|&i| covers(&nodes, i, &nc_hash));
+        let wc_i = (0..nodes.len()).find(|&i| covers(&nodes, i, &wc_hash));
+
+        let mut out: Vec<Record> = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for i in [Some(ce_i), nc_i, wc_i].into_iter().flatten() {
+            if seen.insert(i) {
+                out.extend(self.signed_nsec3(z, &nodes, i, salt)?);
+            }
+        }
+        Some(out)
+    }
+}
+} // mod nsec3_gen
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +497,43 @@ mod tests {
             pubkey.verify(tbs.as_ref(), rrsig.sig()).is_ok(),
             "RRSIG must validate against the ZSK public key"
         );
+    }
+
+    #[test]
+    fn nsec3_nodata_and_nxdomain_proofs() {
+        let tmp = std::env::temp_dir().join(format!("rb201n3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let signer =
+            ZoneSigner::new(&tmp, &["example.com.".to_string()], Duration::from_secs(86_400))
+                .unwrap();
+        // Owner set: apex (SOA/DNSKEY) + www (A).
+        let owners = vec![
+            (
+                Name::from_str("example.com.").unwrap(),
+                vec![RecordType::SOA, RecordType::DNSKEY, RecordType::NSEC3PARAM],
+            ),
+            (Name::from_str("www.example.com.").unwrap(), vec![RecordType::A]),
+        ];
+        // NODATA: www exists but has no MX -> matching NSEC3 for www.
+        let nodata = signer
+            .nsec3_nodata(&Name::from_str("www.example.com.").unwrap(), &owners)
+            .expect("NODATA proof");
+        assert!(nodata
+            .iter()
+            .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::NSEC3(_)))));
+        assert!(nodata
+            .iter()
+            .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::RRSIG(_)))));
+        // NXDOMAIN: nope.example.com -> closest-encloser proof (CE=apex, cover next-closer + wildcard).
+        let nx = signer
+            .nsec3_nxdomain(&Name::from_str("nope.example.com.").unwrap(), &owners)
+            .expect("NXDOMAIN proof");
+        let n3 = nx
+            .iter()
+            .filter(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::NSEC3(_))))
+            .count();
+        assert!((1..=3).contains(&n3), "expected 1..3 NSEC3 RRs, got {n3}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
