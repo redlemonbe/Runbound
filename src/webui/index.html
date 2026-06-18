@@ -268,7 +268,7 @@
   <button role="tab" aria-selected="false" aria-controls="tab-dns"        class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('dns',this)">DNS</button>
   <button role="tab" aria-selected="false" aria-controls="tab-blacklist"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('blacklist',this)">Blacklist</button>
   <button role="tab" aria-selected="false" aria-controls="tab-feeds"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('feeds',this)">Feeds</button>
-  <button role="tab" aria-selected="false" aria-controls="tab-upstreams"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
+  <button id="tab-btn-upstreams" role="tab" aria-selected="false" aria-controls="tab-upstreams"  class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('upstreams',this)">Upstreams</button>
   <button role="tab" aria-selected="false" aria-controls="tab-splithz" class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('splithz',this)">Split-Horizon</button>
   <button role="tab" aria-selected="false" aria-controls="tab-logs"       class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('logs',this)">Logs</button>
   <button role="tab" aria-selected="false" aria-controls="tab-protection" class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('protection',this)">Protection</button>
@@ -742,11 +742,11 @@
       <p id="dnssec-status-note" class="text-xs text-gray-700"></p>
     </div>
     <div class="card mb-4">
-      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Resolution Mode <span class="text-amber-500 normal-case">· experimental</span></div>
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Resolution Mode</div>
       <div class="flex items-start justify-between gap-4 mb-3">
         <div>
           <p class="text-sm text-gray-300">How names are resolved</p>
-          <p class="text-xs text-gray-600 mt-1"><b>Forward</b> sends queries to your upstream resolvers (DoT). <b>Sovereign</b> recurses from the IANA root servers with no third-party forwarder — DNSSEC-validated, anti-SSRF. Admin only.</p>
+          <p class="text-xs text-gray-600 mt-1"><b>Forward</b> sends queries to your upstream resolvers (DoT). <b>Sovereign</b> recurses from the IANA root servers with no third-party forwarder — DNSSEC-validated, anti-SSRF. In Sovereign mode the upstream resolvers are not used (the Upstreams tab is hidden); each node needs outbound port 53 to the internet. Admin only.</p>
         </div>
         <button id="resolution-toggle-btn" onclick="toggleResolution()" class="btn-secondary text-xs w-28 shrink-0">—</button>
       </div>
@@ -912,6 +912,7 @@ async function loadAll() {
     discoverSlaves();
     toast('Connected');
     initSparkline();
+    initResolutionToggle(); // reflect resolution mode on load (hides Upstreams tab if sovereign)
   } catch(e) { setConn(false, e.message); toast('Connection failed: '+e.message, true); }
 }
 
@@ -1967,8 +1968,11 @@ function applyResolutionUi(mode) {
     btn.className = (full ? 'btn-primary' : 'btn-secondary') + ' text-xs w-28 shrink-0';
   }
   if (note) note.textContent = full
-    ? 'Sovereign — recursing from the root servers (experimental).'
+    ? 'Sovereign — recursing from the IANA root servers. Upstream resolvers are not used; the Upstreams tab is hidden.'
     : 'Forward — querying your upstream resolvers.';
+  // In Sovereign mode the upstreams are bypassed entirely, so hide their tab.
+  const upsTab = document.getElementById('tab-btn-upstreams');
+  if (upsTab) upsTab.style.display = full ? 'none' : '';
 }
 async function initResolutionToggle() {
   try {
