@@ -400,6 +400,68 @@ impl RunboundHandler {
 impl RunboundHandler {
     /// Attempt to answer from local zones (blacklist, static data, CNAME chains).
     /// Returns `Ok(info)` when a response was sent; `Err(rh)` when no local match
+    /// #201: build + send a DNSSEC-signed negative response (SOA + RRSIG + NSEC3 proof) for a
+    /// signed local zone. Returns `None` (caller falls through to the plain response) when the
+    /// zone is not signed or the client did not set DO.
+    async fn try_signed_negative<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: &mut R,
+        qname: &LowerName,
+        is_nxdomain: bool,
+        zones_snap: &LocalZoneSet,
+    ) -> Option<ResponseInfo> {
+        let signer = self.zone_signer.as_ref()?;
+        let dnssec_ok = request
+            .edns
+            .as_ref()
+            .map(|e| e.flags().dnssec_ok)
+            .unwrap_or(false);
+        if !dnssec_ok {
+            return None;
+        }
+        let apex = signer.apex_for(qname)?;
+        let qname_name: Name = qname.into();
+        let owners = crate::dns::zone_signer::zone_owners(
+            zones_snap
+                .records
+                .iter()
+                .filter(|(n, _)| apex.zone_of(n))
+                .map(|(n, recs)| (n.clone(), recs.iter().map(|r| r.record_type()).collect())),
+            &apex,
+        );
+        let authority = signer.signed_negative(is_nxdomain, &qname_name, &owners)?;
+        let rcode = if is_nxdomain {
+            ResponseCode::NXDomain
+        } else {
+            ResponseCode::NoError
+        };
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.authoritative = true;
+        metadata.response_code = rcode;
+        let opt_edns = make_opt_edns(request);
+        let mut builder = MessageResponseBuilder::from_message_request(request);
+        if let Some(ref opt) = opt_edns {
+            builder.edns(opt);
+        }
+        let response = builder.build(
+            metadata,
+            std::iter::empty::<&Record>(),
+            authority.iter(),
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        Some(
+            response_handle
+                .send_response(response)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("signed-negative send: {e}");
+                    servfail_info(request)
+                }),
+        )
+    }
+
     /// was found and the query should fall through to recursive resolution.
     /// Core zone lookup logic. Accepts an explicit zone set (for split-horizon or global use).
     async fn handle_zone_set<R: ResponseHandler>(
@@ -456,6 +518,57 @@ impl RunboundHandler {
                         return Ok(response_handle.send_response(response).await.unwrap_or_else(
                             |e| {
                                 error!("dnskey send: {e}");
+                                servfail_info(request)
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        // #201: an SOA query at a signed zone's apex returns the synthesized SOA + RRSIG.
+        if qtype == RecordType::SOA {
+            if let Some(ref signer) = self.zone_signer {
+                if signer.is_apex(qname) {
+                    if let Some(records) = signer.signed_soa(qname) {
+                        let dnssec_ok = request
+                            .edns
+                            .as_ref()
+                            .map(|e| e.flags().dnssec_ok)
+                            .unwrap_or(false);
+                        let answer: Vec<Record> = if dnssec_ok {
+                            records
+                        } else {
+                            records
+                                .into_iter()
+                                .filter(|r| r.record_type() != RecordType::RRSIG)
+                                .collect()
+                        };
+                        let mut metadata = Metadata::response_from_request(&request.metadata);
+                        metadata.authoritative = true;
+                        let opt_edns = make_opt_edns(request);
+                        let mut builder = MessageResponseBuilder::from_message_request(request);
+                        if let Some(ref opt) = opt_edns {
+                            builder.edns(opt);
+                        }
+                        let response = builder.build(
+                            metadata,
+                            answer.iter(),
+                            std::iter::empty(),
+                            std::iter::empty(),
+                            std::iter::empty(),
+                        );
+                        self.record_query(
+                            client_ip,
+                            qname,
+                            qtype,
+                            ResponseCode::NoError,
+                            LogAction::Local,
+                            start,
+                        );
+                        return Ok(response_handle.send_response(response).await.unwrap_or_else(
+                            |e| {
+                                error!("soa send: {e}");
                                 servfail_info(request)
                             },
                         ));
@@ -599,6 +712,13 @@ impl RunboundHandler {
                 // RFC 1035 §3.7 / RFC 2308: NODATA vs NXDOMAIN
                 if zones_snap.name_has_records(qname) {
                     debug!(name=%sanitize_dns_name(qname), %qtype, "local-zone NODATA");
+                    // #201: signed NODATA proof (matching NSEC3 + SOA) when signed + client DO.
+                    if let Some(info) = self
+                        .try_signed_negative(request, &mut response_handle, qname, false, zones_snap)
+                        .await
+                    {
+                        return Ok(info);
+                    }
                     let mut metadata = Metadata::response_from_request(&request.metadata);
                     metadata.authoritative = true;
                     let opt_edns = make_opt_edns(request);
@@ -636,6 +756,14 @@ impl RunboundHandler {
                     LogAction::Nxdomain,
                     start,
                 );
+                // #201: serve a DNSSEC-signed NXDOMAIN denial (name is absent — the NODATA case
+                // returned above) when the zone is signed and the client set DO.
+                if let Some(info) = self
+                    .try_signed_negative(request, &mut response_handle, qname, true, zones_snap)
+                    .await
+                {
+                    return Ok(info);
+                }
                 return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
             }
             None => {}

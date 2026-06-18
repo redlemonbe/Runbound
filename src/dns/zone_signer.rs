@@ -16,6 +16,7 @@ use std::time::Duration;
 use hickory_proto::dnssec::crypto::{signing_key_from_der, EcdsaSigningKey};
 use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, NSEC3, RRSIG};
 use hickory_proto::dnssec::{Algorithm, DigestType, DnssecSigner, Nsec3HashAlgorithm, SigningKey};
+use hickory_proto::rr::rdata::SOA;
 use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::OffsetDateTime;
@@ -242,6 +243,11 @@ impl ZoneSigner {
         self.zones.contains_key(name)
     }
 
+    /// The apex of the signed zone containing `name`, if any.
+    pub fn apex_for(&self, name: &LowerName) -> Option<Name> {
+        self.zone_for(name).map(|z| z.apex.clone())
+    }
+
     /// Sign a positive answer RRset, returning the RRSIG record to append to the answer section.
     /// `None` if the name is not within a signed zone.
     pub fn sign_answer(&self, qtype: RecordType, records: &[&Record]) -> Option<Record> {
@@ -280,6 +286,85 @@ impl ZoneSigner {
         }
         out
     }
+
+    /// Synthesize the apex SOA for a signed zone (Runbound local zones carry none). Minute-resolution
+    /// serial so it advances monotonically across restarts; conservative timers.
+    fn synth_soa(apex: &Name) -> SOA {
+        let serial = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            / 60) as u32;
+        let rname = apex.prepend_label("hostmaster").unwrap_or_else(|_| apex.clone());
+        SOA::new(apex.clone(), rname, serial, 3600, 900, 604_800, 300)
+    }
+
+    /// The signed apex SOA RRset (for SOA queries and the authority of negative responses).
+    pub fn signed_soa(&self, apex: &LowerName) -> Option<Vec<Record>> {
+        let z = self.zones.get(apex)?;
+        let mut rrset = RecordSet::new(z.apex.clone(), RecordType::SOA, 0);
+        rrset.set_ttl(300);
+        rrset.add_rdata(RData::SOA(Self::synth_soa(&z.apex)));
+        let signer = z.zsk.dnssec_signer(&z.apex, self.sig_validity).ok()?;
+        let rrsig = sign_rrset(&rrset, &signer).ok()?;
+        let mut out: Vec<Record> = rrset.records_without_rrsigs().cloned().collect();
+        out.push(rrsig);
+        Some(out)
+    }
+
+    /// Authority section for a signed negative response: SOA + RRSIG, then the NSEC3 denial
+    /// (closest-encloser for NXDOMAIN, matching for NODATA). `owners` = the zone owner set.
+    pub fn signed_negative(
+        &self,
+        is_nxdomain: bool,
+        qname: &Name,
+        owners: &[(Name, Vec<RecordType>)],
+    ) -> Option<Vec<Record>> {
+        let z = self.zone_for(&LowerName::from(qname.clone()))?;
+        let apex = LowerName::from(z.apex.clone());
+        let mut authority = self.signed_soa(&apex)?;
+        let denial = if is_nxdomain {
+            self.nsec3_nxdomain(qname, owners)?
+        } else {
+            self.nsec3_nodata(qname, owners)?
+        };
+        authority.extend(denial);
+        Some(authority)
+    }
+}
+
+/// Compute the zone's owner set for NSEC3: every name at/under `apex` with its present RR types,
+/// the apex augmented with SOA + DNSKEY + NSEC3PARAM, and the empty non-terminals between names
+/// and the apex. `entries` yields each existing owner name with its present types.
+pub fn zone_owners(
+    entries: impl Iterator<Item = (Name, Vec<RecordType>)>,
+    apex: &Name,
+) -> Vec<(Name, Vec<RecordType>)> {
+    use std::collections::{HashMap, HashSet};
+    let mut map: HashMap<Name, HashSet<RecordType>> = HashMap::new();
+    // Apex always exists with these meta types.
+    let apex_entry = map.entry(apex.clone()).or_default();
+    apex_entry.insert(RecordType::SOA);
+    apex_entry.insert(RecordType::DNSKEY);
+    apex_entry.insert(RecordType::NSEC3PARAM);
+    for (name, types) in entries {
+        if !apex.zone_of(&name) {
+            continue; // outside this zone
+        }
+        // Empty non-terminals: every ancestor between `name` and the apex must exist.
+        let mut cur = name.clone();
+        while cur.num_labels() > apex.num_labels() {
+            map.entry(cur.clone()).or_default();
+            cur = cur.base_name();
+        }
+        let e = map.entry(name).or_default();
+        for t in types {
+            e.insert(t);
+        }
+    }
+    map.into_iter()
+        .map(|(n, ts)| (n, ts.into_iter().collect()))
+        .collect()
 }
 
 // ── #201: NSEC3 authenticated denial of existence (RFC 5155, params per RFC 9276) ───────────
@@ -533,6 +618,45 @@ mod tests {
             .filter(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::NSEC3(_))))
             .count();
         assert!((1..=3).contains(&n3), "expected 1..3 NSEC3 RRs, got {n3}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn signed_negative_has_soa_nsec3_and_owners_have_ents() {
+        let tmp = std::env::temp_dir().join(format!("rb201neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let apex = Name::from_str("example.com.").unwrap();
+        let signer =
+            ZoneSigner::new(&tmp, &["example.com.".to_string()], Duration::from_secs(86_400))
+                .unwrap();
+        // A record under a deep name forces an empty non-terminal (b.example.com).
+        let owners = zone_owners(
+            vec![(
+                Name::from_str("a.b.example.com.").unwrap(),
+                vec![RecordType::A],
+            )]
+            .into_iter(),
+            &apex,
+        );
+        assert!(owners
+            .iter()
+            .any(|(n, ts)| *n == apex && ts.contains(&RecordType::SOA)));
+        assert!(owners
+            .iter()
+            .any(|(n, _)| *n == Name::from_str("b.example.com.").unwrap()));
+        let neg = signer
+            .signed_negative(true, &Name::from_str("nope.example.com.").unwrap(), &owners)
+            .expect("signed negative");
+        assert!(neg.iter().any(|r| matches!(&r.data, RData::SOA(_))));
+        assert!(neg
+            .iter()
+            .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::NSEC3(_)))));
+        assert!(
+            neg.iter()
+                .filter(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::RRSIG(_))))
+                .count()
+                >= 2
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
