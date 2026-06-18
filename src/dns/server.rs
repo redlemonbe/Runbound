@@ -150,6 +150,10 @@ pub struct RunboundHandler {
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     dnssec_log_bogus: bool,
+    /// #202: resolution mode — 0 = forward (default), 1 = full-recursion. Hot-swappable.
+    resolution_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// #202: sovereign full-recursion backend; `Some(..)` only when resolution=full-recursion.
+    recursor: Arc<ArcSwap<Option<Arc<crate::dns::recursor::SovereignRecursor>>>>,
     /// Optional prefetch tracker — None when prefetch: no (default).
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
     /// #60: mutable cache map shared with XDP workers (via publish_loop).
@@ -272,6 +276,8 @@ impl RunboundHandler {
         alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
         axfr_allow: Vec<String>,
         split_horizon: std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>,
+        resolution_mode: Arc<std::sync::atomic::AtomicU8>,
+        recursor: Arc<ArcSwap<Option<Arc<crate::dns::recursor::SovereignRecursor>>>>,
     ) -> Self {
         Self {
             zones,
@@ -288,6 +294,8 @@ impl RunboundHandler {
             log_buffer,
             dnssec_enabled,
             dnssec_log_bogus,
+            resolution_mode,
+            recursor,
             prefetch_tracker,
             xdp_cache,
             cache_max_entries,
@@ -587,6 +595,57 @@ impl RunboundHandler {
         self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, &zones_guard).await
     }
 
+    /// #202: sovereign full-recursion — resolve from the root via the recursor, then build
+    /// and send the response (mirrors the forward path's Metadata/AD/EDNS handling).
+    async fn resolve_recursive<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut response_handle: R,
+        qname: &LowerName,
+        qtype: RecordType,
+        recursor: &crate::dns::recursor::SovereignRecursor,
+    ) -> ResponseInfo {
+        let dnssec_ok = request.edns.as_ref().map(|e| e.flags().dnssec_ok).unwrap_or(false);
+        let query = hickory_proto::op::Query::query(Name::from(qname), qtype);
+        match crate::dns::recursor::recursor_resolve(recursor, query, dnssec_ok).await {
+            Ok(msg) => {
+                // Message exposes its sections as public fields in hickory 0.26.
+                let dnssec_ad = self
+                    .dnssec_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && msg.metadata.authentic_data;
+                let rcode = msg.metadata.response_code;
+                let answers = msg.answers;
+                let authority = msg.authorities;
+                let additionals = msg.additionals;
+                let mut metadata = Metadata::response_from_request(&request.metadata);
+                metadata.recursion_available = true;
+                metadata.response_code = rcode;
+                metadata.authentic_data = dnssec_ad;
+                let opt_edns = make_opt_edns(request);
+                let mut builder = MessageResponseBuilder::from_message_request(request);
+                if let Some(ref opt) = opt_edns {
+                    builder.edns(opt);
+                }
+                let response = builder.build(
+                    metadata,
+                    answers.iter(),
+                    authority.iter(),
+                    std::iter::empty(),
+                    additionals.iter(),
+                );
+                response_handle.send_response(response).await.unwrap_or_else(|e| {
+                    error!("recursive send: {e}");
+                    servfail_info(request)
+                })
+            }
+            Err(e) => {
+                warn!(%qname, "full-recursion failed: {e}");
+                servfail_info(request)
+            }
+        }
+    }
+
     /// Recursive upstream resolution with DNSSEC validation and rebinding protection.
     async fn resolve_upstream<R: ResponseHandler>(
         &self,
@@ -597,6 +656,16 @@ impl RunboundHandler {
         client_ip: IpAddr,
         start: Instant,
     ) -> ResponseInfo {
+        // #202: sovereign full-recursion path — resolve iteratively from the root.
+        if self.resolution_mode.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            let snap = self.recursor.load_full();
+            if let Some(rec) = snap.as_ref() {
+                return self
+                    .resolve_recursive(request, response_handle, qname, qtype, &**rec)
+                    .await;
+            }
+            // recursor not available (build failed) — fall through to forwarding.
+        }
         // #33: racing mode — send to all upstreams simultaneously, first wins.
         // All lookup calls go through timed_lookup (#83) to cap worker occupancy.
         let result = if self.upstream_racing {
@@ -2393,6 +2462,28 @@ pub async fn run_dns_server(
     let domain_stats_for_kloop = Arc::clone(&domain_stats);
     let xdp_cache_for_kloop    = xdp_cache.as_ref().map(Arc::clone);
 
+    // #202: resolution mode + sovereign recursor (built only when full-recursion).
+    let resolution_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+        if cfg.resolution_mode == crate::config::parser::ResolutionMode::FullRecursion { 1 } else { 0 },
+    ));
+    let recursor: Arc<ArcSwap<Option<Arc<crate::dns::recursor::SovereignRecursor>>>> =
+        Arc::new(ArcSwap::from_pointee(
+            if cfg.resolution_mode == crate::config::parser::ResolutionMode::FullRecursion {
+                match crate::dns::recursor::build_recursor(cfg.dnssec_validation) {
+                    Ok(r) => {
+                        info!(dnssec = cfg.dnssec_validation, "resolution=full-recursion: sovereign recursor built");
+                        Some(Arc::new(r))
+                    }
+                    Err(e) => {
+                        error!("resolution=full-recursion requested but recursor build failed: {e} — falling back to forward");
+                        None
+                    }
+                }
+            } else {
+                None
+            },
+        ));
+
     let handler = RunboundHandler::new(
         Arc::clone(&zones),
         Arc::clone(&resolver),
@@ -2434,6 +2525,8 @@ pub async fn run_dns_server(
             let _ = SPLIT_HORIZON_LIVE.set(std::sync::Arc::clone(&live));
             live
         },
+        Arc::clone(&resolution_mode),
+        Arc::clone(&recursor),
     );
     // Step 3b: wrap handler in Arc for sharing between Server and fallback reader.
     let handler_arc = std::sync::Arc::new(handler);
