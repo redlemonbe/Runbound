@@ -153,7 +153,7 @@ pub struct RunboundHandler {
     /// #202: resolution mode — 0 = forward (default), 1 = full-recursion. Hot-swappable.
     resolution_mode: Arc<std::sync::atomic::AtomicU8>,
     /// #202: sovereign full-recursion backend; `Some(..)` only when resolution=full-recursion.
-    recursor: Arc<ArcSwap<Option<Arc<crate::dns::recursor::SovereignRecursor>>>>,
+    recursor: crate::dns::recursor::SharedRecursor,
     /// Optional prefetch tracker — None when prefetch: no (default).
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
     /// #60: mutable cache map shared with XDP workers (via publish_loop).
@@ -277,7 +277,7 @@ impl RunboundHandler {
         axfr_allow: Vec<String>,
         split_horizon: std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>,
         resolution_mode: Arc<std::sync::atomic::AtomicU8>,
-        recursor: Arc<ArcSwap<Option<Arc<crate::dns::recursor::SovereignRecursor>>>>,
+        recursor: crate::dns::recursor::SharedRecursor,
     ) -> Self {
         Self {
             zones,
@@ -2353,6 +2353,8 @@ pub async fn run_dns_server(
     alert_tracker: Arc<crate::alerts::AlertTracker>,
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     icmp_stats: Arc<crate::icmp::IcmpStats>,
+    resolution_mode: Arc<std::sync::atomic::AtomicU8>,
+    recursor: crate::dns::recursor::SharedRecursor,
 ) -> anyhow::Result<()> {
     let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
@@ -2462,27 +2464,8 @@ pub async fn run_dns_server(
     let domain_stats_for_kloop = Arc::clone(&domain_stats);
     let xdp_cache_for_kloop    = xdp_cache.as_ref().map(Arc::clone);
 
-    // #202: resolution mode + sovereign recursor (built only when full-recursion).
-    let resolution_mode = Arc::new(std::sync::atomic::AtomicU8::new(
-        if cfg.resolution_mode == crate::config::parser::ResolutionMode::FullRecursion { 1 } else { 0 },
-    ));
-    let recursor: Arc<ArcSwap<Option<Arc<crate::dns::recursor::SovereignRecursor>>>> =
-        Arc::new(ArcSwap::from_pointee(
-            if cfg.resolution_mode == crate::config::parser::ResolutionMode::FullRecursion {
-                match crate::dns::recursor::build_recursor(cfg.dnssec_validation) {
-                    Ok(r) => {
-                        info!(dnssec = cfg.dnssec_validation, "resolution=full-recursion: sovereign recursor built");
-                        Some(Arc::new(r))
-                    }
-                    Err(e) => {
-                        error!("resolution=full-recursion requested but recursor build failed: {e} — falling back to forward");
-                        None
-                    }
-                }
-            } else {
-                None
-            },
-        ));
+    // #202: resolution_mode + recursor are created in build_and_launch (so the API can
+    // hot-swap them) and threaded in as parameters — same pattern as dnssec_enabled.
 
     let handler = RunboundHandler::new(
         Arc::clone(&zones),

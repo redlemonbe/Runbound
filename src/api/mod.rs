@@ -338,6 +338,11 @@ pub struct AppState {
     /// Runtime DNSSEC validation toggle (#72 perf path). Mirrors cfg.dnssec_validation at startup.
     /// Updated by PATCH /api/config; all rebuild_and_swap calls read from here.
     pub dnssec_enabled: Arc<AtomicBool>,
+    /// #202: resolution mode (0 = forward, 1 = full-recursion). Hot-swapped by PUT /api/resolution
+    /// (admin-only); the DNS data path reads it on the hot path. Shared with the running handler.
+    pub resolution_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// #202: sovereign recursor handle, rebuilt in place when the mode is toggled.
+    pub recursor: crate::dns::recursor::SharedRecursor,
     /// Multi-user registry (None = single-user mode, only master API key works).
     pub user_registry: Option<Arc<crate::multiuser::UserRegistry>>,
     /// #153: Channel to send the current blacklist domain list to the XDP poll task
@@ -643,6 +648,7 @@ pub fn router(state: AppState) -> Router {
         .route("/stats/stream", get(stats_stream_handler))
         .route("/stats/top-domains", get(top_domains_handler))
         .route("/config", get(config_handler).patch(patch_config_handler))
+        .route("/resolution", get(resolution_get_handler).put(resolution_put_handler))
         .route("/reload", post(reload_handler))
         // DNS CRUD
         .route("/dns/lookup", post(dns_lookup_handler))
@@ -1222,6 +1228,7 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
         "rate_limit":        cfg.rate_limit,
         "cache_max_ttl":     cfg.cache_max_ttl,
         "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
+        "resolution_mode":   if s.resolution_mode.load(Ordering::Relaxed) == 1 { "full-recursion" } else { "forward" },
         "log_retention":     cfg.log_retention,
         "log_client_ip":     cfg.log_client_ip,
         "api_port":          cfg.api_port,
@@ -1375,6 +1382,95 @@ async fn patch_config_handler(
         "ok": true,
         "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
     }))
+}
+
+// ── #202: resolution mode (forward ↔ sovereign full-recursion) ──────────────
+
+#[derive(serde::Deserialize)]
+struct ResolutionBody {
+    mode: String,
+}
+
+/// GET /api/resolution — current mode + whether the sovereign recursor is live.
+async fn resolution_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let full = s.resolution_mode.load(Ordering::Relaxed) == 1;
+    JsonExtract(serde_json::json!({
+        "mode": if full { "full-recursion" } else { "forward" },
+        "recursor_active": s.recursor.load_full().is_some(),
+        "experimental": true,
+    }))
+}
+
+/// PUT /api/resolution — admin-only. Atomically switches between forward and sovereign
+/// full-recursion: rebuilds the recursor, flips the hot-path atomic only once the backend is
+/// ready, persists runbound.conf, and propagates to slaves so the cluster answers consistently.
+/// A failed recursor build leaves us in forward mode and returns 500 (never full-recursion with
+/// no backend).
+async fn resolution_put_handler(
+    State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+    ApiJson(body): ApiJson<ResolutionBody>,
+) -> impl IntoResponse {
+    let caller = caller_ext
+        .map(|e| e.0)
+        .unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (
+            StatusCode::FORBIDDEN,
+            JsonExtract(serde_json::json!({
+                "error": "FORBIDDEN",
+                "details": "changing the resolution mode requires admin"
+            })),
+        );
+    }
+    let mode = match crate::config::parser::ResolutionMode::parse_value(&body.mode) {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({
+                    "error": "INVALID_MODE",
+                    "details": "mode must be 'forward' or 'full-recursion'"
+                })),
+            )
+        }
+    };
+    let dnssec = s.dnssec_enabled.load(Ordering::Relaxed);
+    // Build the recursor first; only flip the hot-path atomic once it is actually ready so we
+    // never route queries to full-recursion with no backend.
+    if let Err(e) = crate::dns::recursor::rebuild_shared(&s.recursor, mode, dnssec) {
+        warn!(%e, "resolution: full-recursion requested but recursor build failed — staying in forward");
+        s.resolution_mode.store(0, Ordering::Relaxed);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({
+                "error": "RECURSOR_BUILD_FAILED",
+                "details": "failed to initialise the sovereign recursor",
+                "mode": "forward"
+            })),
+        );
+    }
+    let val = u8::from(mode == crate::config::parser::ResolutionMode::FullRecursion);
+    s.resolution_mode.store(val, Ordering::Relaxed);
+    s.audit.send(AuditEvent::ConfigReload);
+    info!(mode = mode.as_str(), "resolution mode changed via API");
+    persist_config(&s);
+    // Propagate to slaves (best-effort) — the relay replays PUT /api/resolution with admin context.
+    if let Some(ref j) = s.sync_journal {
+        if let Some(ref k) = s.sync_key {
+            let body_bytes =
+                bytes::Bytes::from(serde_json::json!({"mode": mode.as_str()}).to_string());
+            relay::push_to_slaves(j, k, Method::PUT, "resolution".to_string(), body_bytes);
+        }
+    }
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({
+            "ok": true,
+            "mode": mode.as_str(),
+            "recursor_active": s.recursor.load_full().is_some(),
+        })),
+    )
 }
 
 // ── DNS CRUD ───────────────────────────────────────────────────────────────
@@ -2447,6 +2543,11 @@ fn persist_config(s: &AppState) {
     if s.slave_mode { return; }
     let mut c = (*s.cfg).clone();
     c.dnssec_validation = s.dnssec_enabled.load(Ordering::Relaxed);
+    c.resolution_mode = if s.resolution_mode.load(Ordering::Relaxed) == 1 {
+        crate::config::parser::ResolutionMode::FullRecursion
+    } else {
+        crate::config::parser::ResolutionMode::Forward
+    };
     c.forward_zones = upstreams::rebuild_forward_zones(&s.upstreams);
     c.split_horizon = s.split_horizon.lock().unwrap_or_else(|e| e.into_inner()).clone();
     match crate::config::writer::write_config_atomic(&c, std::path::Path::new(&s.cfg_path)) {
@@ -3961,6 +4062,11 @@ mod tests {
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
+            resolution_mode: crate::dns::recursor::mode_atomic(cfg_arc.resolution_mode),
+            recursor: crate::dns::recursor::shared_recursor(
+                crate::config::parser::ResolutionMode::Forward,
+                false,
+            ),
             user_registry: None,
             blacklist_reload_tx: None,
         };
@@ -6132,6 +6238,11 @@ mod tests {
             icmp_stats: crate::icmp::IcmpStats::new(),
             icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
             dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
+            resolution_mode: crate::dns::recursor::mode_atomic(cfg_arc.resolution_mode),
+            recursor: crate::dns::recursor::shared_recursor(
+                crate::config::parser::ResolutionMode::Forward,
+                false,
+            ),
             user_registry: None,
             blacklist_reload_tx: None,
         };

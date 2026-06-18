@@ -184,6 +184,8 @@ async fn async_main(
         icmp_stats,
         icmp_cfg,
         dnssec_enabled,
+        resolution_mode,
+        recursor,
         blacklist_reload_rx,
     ) = build_and_launch(&cfg, base_dir, cfg_path).await?;
 
@@ -654,6 +656,8 @@ async fn async_main(
         Arc::clone(&alert_tracker),
         Arc::clone(&dnssec_enabled),
         icmp_stats,
+        resolution_mode,
+        recursor,
     )
     .await;
     fw_cleanup.close();
@@ -822,6 +826,8 @@ async fn build_and_launch(
     Arc<crate::icmp::IcmpStats>,
     Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
     Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicU8>,
+    dns::recursor::SharedRecursor,
     tokio::sync::mpsc::Receiver<Vec<String>>,
 )> {
     // ── Audit log ─────────────────────────────────────────────────────────
@@ -1021,6 +1027,12 @@ async fn build_and_launch(
 
     let cfg_arc = Arc::new(cfg.clone());
     let dnssec_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cfg.dnssec_validation));
+
+    // ── #202: sovereign full-recursion (resolution mode + recursor) ───────
+    // Created once here so the DNS data path (run_dns_server) and the API (AppState,
+    // hot-swap on toggle) share the same handles — same pattern as dnssec_enabled.
+    let resolution_mode = dns::recursor::mode_atomic(cfg.resolution_mode);
+    let recursor = dns::recursor::shared_recursor(cfg.resolution_mode, cfg.dnssec_validation);
 
     // ── Shared DNS resolver (hot-swappable via ArcSwap) ───────────────────
     let resolver = dns::server::create_shared_resolver(cfg)
@@ -1411,6 +1423,8 @@ async fn build_and_launch(
         icmp_stats: Arc::clone(&icmp_stats),
         icmp_cfg: Arc::clone(&icmp_cfg),
         dnssec_enabled: Arc::clone(&dnssec_enabled),
+        resolution_mode: Arc::clone(&resolution_mode),
+        recursor: Arc::clone(&recursor),
         user_registry,
         blacklist_reload_tx: Some(blacklist_reload_tx),
     };
@@ -1845,6 +1859,8 @@ async fn build_and_launch(
         icmp_stats,
         icmp_cfg,
         dnssec_enabled,
+        resolution_mode,
+        recursor,
         blacklist_reload_rx,
     ))
 }
