@@ -9,12 +9,14 @@
 // (RRSIG / NSEC3) and the serving path land in later increments.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use hickory_proto::dnssec::crypto::{signing_key_from_der, EcdsaSigningKey};
-use hickory_proto::dnssec::rdata::{DNSKEY, DS};
-use hickory_proto::dnssec::{Algorithm, DigestType, SigningKey};
-use hickory_proto::rr::Name;
+use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, RRSIG};
+use hickory_proto::dnssec::{Algorithm, DigestType, DnssecSigner, SigningKey};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordSet};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use time::OffsetDateTime;
 
 /// The single algorithm used for local-zone signing: ECDSA P-256 / SHA-256 (RFC 6605, alg 13).
 const ZONE_ALGORITHM: Algorithm = Algorithm::ECDSAP256SHA256;
@@ -90,6 +92,34 @@ impl ZoneKey {
             digest.as_ref().to_vec(),
         ))
     }
+
+    /// Build a `DnssecSigner` bound to `zone` for producing RRSIGs. The signing key is
+    /// reconstructed from the stored PKCS#8 so the `ZoneKey` itself stays usable afterwards.
+    pub fn dnssec_signer(&self, zone: &Name, sig_validity: Duration) -> Result<DnssecSigner, String> {
+        let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.pkcs8.clone()));
+        let key = signing_key_from_der(&der, ZONE_ALGORITHM)
+            .map_err(|e| format!("dnssec signer key: {e}"))?;
+        let dnskey = self.dnskey()?;
+        Ok(DnssecSigner::new(dnskey, key, zone.clone(), sig_validity))
+    }
+}
+
+/// Sign an RRset with `signer`, returning the RRSIG as a ready-to-serve `Record` (RFC 4034).
+/// Inception is "now"; expiration is `now + signer.sig_duration()`.
+pub fn sign_rrset(rrset: &RecordSet, signer: &DnssecSigner) -> Result<Record, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("clock before epoch: {e}"))?
+        .as_secs() as i64;
+    let inception =
+        OffsetDateTime::from_unix_timestamp(now).map_err(|e| format!("inception time: {e}"))?;
+    let rrsig = RRSIG::from_rrset(rrset, DNSClass::IN, inception, signer)
+        .map_err(|e| format!("sign rrset: {e}"))?;
+    Ok(Record::from_rdata(
+        rrset.name().clone(),
+        rrset.ttl(),
+        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
+    ))
 }
 
 /// Directory holding a zone's keys: `<config_dir>/dnssec/<zone>/`.
@@ -190,5 +220,36 @@ mod tests {
         remove_zone_keys(&tmp, &zone).unwrap();
         assert!(!tmp.join("dnssec").join("test.example").exists());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sign_rrset_produces_valid_rrsig() {
+        use hickory_proto::dnssec::{PublicKey, TBS};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::RecordType;
+        let zsk = ZoneKey::generate(false).unwrap();
+        let zone = Name::from_str("example.com.").unwrap();
+        let mut rrset = RecordSet::new(zone.clone(), RecordType::A, 0);
+        rrset.add_rdata(RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 1))));
+        let signer = zsk
+            .dnssec_signer(&zone, Duration::from_secs(86_400))
+            .unwrap();
+        let rec = sign_rrset(&rrset, &signer).unwrap();
+        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &rec.data else {
+            panic!("expected an RRSIG record");
+        };
+        // The RRSIG must validate against the ZSK public key over the canonical RRset.
+        let tbs = TBS::from_input(
+            rrset.name(),
+            DNSClass::IN,
+            rrsig.input(),
+            rrset.records_without_rrsigs(),
+        )
+        .unwrap();
+        let pubkey = signer.key().to_public_key().unwrap();
+        assert!(
+            pubkey.verify(tbs.as_ref(), rrsig.sig()).is_ok(),
+            "RRSIG must validate against the ZSK public key"
+        );
     }
 }
