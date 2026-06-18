@@ -2397,16 +2397,27 @@ impl TcpConnTracker {
     }
 
     fn release(&self, ip: IpAddr) {
-        if let Some(c) = self.counts.get(&ip) {
-            let prev = c.fetch_sub(1, Ordering::Relaxed);
-            if prev == 1 {
-                // Count just reached 0 — evict the entry so the map does not
-                // grow unbounded when many distinct source IPs connect over time.
-                // Re-insertion is safe: a concurrent increment will use or_insert_with.
-                self.counts
-                    .remove_if(&ip, |_, v| v.load(Ordering::Relaxed) == 0);
-                self.last_warn.remove(&ip);
+        // SCOPE the get() Ref so its DashMap shard read-lock is dropped BEFORE the
+        // remove_if() below takes the SAME shard write-lock. Holding the read guard
+        // across remove_if self-deadlocks DashMap: the worker thread hangs holding the
+        // shard lock, and every later try_acquire()/release() for an IP hashing to that
+        // shard blocks forever — freezing ALL subsequent TCP/DoT/DoH accepts from tracked
+        // (non-loopback) clients after the very first connection. Loopback is never
+        // inserted (try_acquire short-circuits) so it masked the bug in local testing.
+        let reached_zero = {
+            if let Some(c) = self.counts.get(&ip) {
+                c.fetch_sub(1, Ordering::Relaxed) == 1
+            } else {
+                false
             }
+        };
+        if reached_zero {
+            // Count just reached 0 — evict the entry so the map does not grow
+            // unbounded when many distinct source IPs connect over time.
+            // Re-insertion is safe: a concurrent increment will use or_insert_with.
+            self.counts
+                .remove_if(&ip, |_, v| v.load(Ordering::Relaxed) == 0);
+            self.last_warn.remove(&ip);
         }
     }
 }
