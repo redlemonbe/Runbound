@@ -13,8 +13,6 @@
 //
 // EXPERIMENTAL / opt-in: only used when `resolution: full-recursion`. Default stays `forward`.
 
-#![allow(dead_code)] // items are wired into resolve_upstream in the next commit (#202)
-
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
 
