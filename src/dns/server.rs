@@ -602,8 +602,10 @@ impl RunboundHandler {
     /// every record but does **not** itself enforce it; enforcement is the resolver's job here:
     ///   - Bogus data is refused with SERVFAIL (RFC 4035), unless the client set the CD bit.
     ///   - The AD bit is set only when every answer + authority record is cryptographically Secure.
-    ///   - NXDOMAIN and NODATA come back as errors carrying the zone SOA; they are turned into
-    ///     proper negative responses (rcode + SOA in the authority section), not SERVFAIL.
+    ///   - NXDOMAIN / NODATA come back as errors; turned into proper negative responses (rcode +
+    ///     SOA, plus the NSEC3 proof + AD bit when the recursor exposes a validated NODATA denial —
+    ///     a bogus denial is refused), not SERVFAIL.
+    ///   - On a transient recursion failure, a recent answer is served stale (RFC 8767).
     async fn resolve_recursive<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -640,6 +642,8 @@ impl RunboundHandler {
                 let mut answers = msg.answers;
                 let mut authority = msg.authorities;
                 let mut additionals = msg.additionals;
+                // RFC 8767: remember the fresh answer so a later recursion failure can serve it stale.
+                self.store_stale(qname, qtype, &answers);
                 // RFC 4035 §3.2.1: strip DNSSEC records when the client did not set DO. We do this
                 // by hand against the known qtype — the recursor's own strip is a no-op here
                 // because its response carries no question section to infer the type from.
@@ -671,20 +675,51 @@ impl RunboundHandler {
                     servfail_info(request)
                 })
             }
-            // NXDOMAIN / NODATA: build a proper negative response (rcode + SOA), not SERVFAIL.
+            // NXDOMAIN / NODATA: build a proper negative response.
             Err(e) if e.is_nx_domain() || e.is_no_records_found() => {
                 let rcode = if e.is_nx_domain() {
                     ResponseCode::NXDomain
                 } else {
                     ResponseCode::NoError
                 };
-                let soa: Vec<Record> = e
-                    .into_soa()
-                    .map(|s| vec![(*s).into_record_of_rdata()])
-                    .unwrap_or_default();
+                let mut authority: Vec<Record> = Vec::new();
+                let mut ad = false;
+                // When the recursor surfaces the authenticated-denial records (NODATA →
+                // RecursorError::Negative), include the NSEC3/SOA proof and set AD when it is Secure
+                // (RFC 6840); refuse a bogus denial. NXDOMAIN comes back as Net(NetError), which does
+                // not expose the proof records, so we fall back to the SOA alone (AD stays unset).
+                match e {
+                    hickory_resolver::recursor::RecursorError::Negative(ad_data) => {
+                        if let Some(a) = ad_data.authorities {
+                            authority.extend(a.iter().cloned());
+                        } else if let Some(s) = ad_data.soa {
+                            authority.push((*s).into_record_of_rdata());
+                        }
+                        if !cd && authority.iter().any(|r| r.proof.is_bogus()) {
+                            warn!(%qname, "full-recursion: bogus authenticated denial — SERVFAIL");
+                            return send_error(request, response_handle, ResponseCode::ServFail).await;
+                        }
+                        ad = validating
+                            && !cd
+                            && !authority.is_empty()
+                            && authority.iter().all(|r| r.proof.is_secure());
+                    }
+                    other => {
+                        if let Some(s) = other.into_soa() {
+                            authority.push((*s).into_record_of_rdata());
+                        }
+                    }
+                }
+                // RFC 4035 §3.2.1: strip DNSSEC (NSEC3/RRSIG) records when the client did not set DO.
+                if !dnssec_ok {
+                    let keep =
+                        |r: &Record| r.record_type() == qtype || !r.record_type().is_dnssec();
+                    authority.retain(keep);
+                }
                 let mut metadata = Metadata::response_from_request(&request.metadata);
                 metadata.recursion_available = true;
                 metadata.response_code = rcode;
+                metadata.authentic_data = ad;
                 let opt_edns = make_opt_edns(request);
                 let mut builder = MessageResponseBuilder::from_message_request(request);
                 if let Some(ref opt) = opt_edns {
@@ -693,7 +728,7 @@ impl RunboundHandler {
                 let response = builder.build(
                     metadata,
                     std::iter::empty::<&Record>(),
-                    soa.iter(),
+                    authority.iter(),
                     std::iter::empty(),
                     std::iter::empty(),
                 );
@@ -702,11 +737,83 @@ impl RunboundHandler {
                     servfail_info(request)
                 })
             }
+            // Transient failure: RFC 8767 serve-stale if we have a recent answer, else SERVFAIL.
             Err(e) => {
                 warn!(%qname, "full-recursion failed: {e}");
+                if let Some(info) = self
+                    .try_serve_stale(request, &mut response_handle, qname, qtype)
+                    .await
+                {
+                    return info;
+                }
                 send_error(request, response_handle, ResponseCode::ServFail).await
             }
         }
+    }
+
+    /// #108/#202: remember a fresh positive answer in the serve-stale cache (LRU-evicted).
+    fn store_stale(&self, qname: &LowerName, qtype: RecordType, records: &[Record]) {
+        if let Some(ref sc) = self.stale_cache {
+            if !records.is_empty() {
+                if sc.len() >= self.cache_max_entries {
+                    if let Some(old_key) = sc.iter().next().map(|e| e.key().clone()) {
+                        sc.remove(&old_key);
+                    }
+                }
+                sc.insert(
+                    (qname.clone(), qtype),
+                    (records.to_vec(), std::time::Instant::now()),
+                );
+            }
+        }
+    }
+
+    /// #202: RFC 8767 serve-stale on the recursion path — if a recent answer is cached, serve it
+    /// (TTL capped at `stale_answer_ttl`) instead of SERVFAIL. Returns `None` if nothing to serve.
+    async fn try_serve_stale<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: &mut R,
+        qname: &LowerName,
+        qtype: RecordType,
+    ) -> Option<ResponseInfo> {
+        let sc = self.stale_cache.as_ref()?;
+        let capped: Vec<Record> = {
+            let entry = sc.get(&(qname.clone(), qtype))?;
+            let (ref stale_records, stored_at) = *entry;
+            if stored_at.elapsed().as_secs() > self.stale_max_age || stale_records.is_empty() {
+                return None;
+            }
+            let stale_ttl = self.stale_answer_ttl;
+            stale_records
+                .iter()
+                .map(|r| {
+                    let mut rc = r.clone();
+                    rc.ttl = stale_ttl;
+                    rc
+                })
+                .collect()
+        };
+        self.stats.inc_stale_served();
+        info!(name = %sanitize_dns_name(qname), ttl = self.stale_answer_ttl, "serve-stale (recursion)");
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.recursion_available = true;
+        let opt_edns = make_opt_edns(request);
+        let mut builder = MessageResponseBuilder::from_message_request(request);
+        if let Some(ref opt) = opt_edns {
+            builder.edns(opt);
+        }
+        let response = builder.build(
+            metadata,
+            capped.iter(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        Some(response_handle.send_response(response).await.unwrap_or_else(|e| {
+            error!("stale send: {e}");
+            servfail_info(request)
+        }))
     }
 
     /// Recursive upstream resolution with DNSSEC validation and rebinding protection.
