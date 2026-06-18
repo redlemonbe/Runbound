@@ -596,7 +596,14 @@ impl RunboundHandler {
     }
 
     /// #202: sovereign full-recursion — resolve from the root via the recursor, then build
-    /// and send the response (mirrors the forward path's Metadata/AD/EDNS handling).
+    /// and send the response with correct DNSSEC semantics.
+    ///
+    /// The hickory recursor attaches a `Proof` (Secure / Insecure / Bogus / Indeterminate) to
+    /// every record but does **not** itself enforce it; enforcement is the resolver's job here:
+    ///   - Bogus data is refused with SERVFAIL (RFC 4035), unless the client set the CD bit.
+    ///   - The AD bit is set only when every answer + authority record is cryptographically Secure.
+    ///   - NXDOMAIN and NODATA come back as errors carrying the zone SOA; they are turned into
+    ///     proper negative responses (rcode + SOA in the authority section), not SERVFAIL.
     async fn resolve_recursive<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -606,22 +613,47 @@ impl RunboundHandler {
         recursor: &crate::dns::recursor::SovereignRecursor,
     ) -> ResponseInfo {
         let dnssec_ok = request.edns.as_ref().map(|e| e.flags().dnssec_ok).unwrap_or(false);
+        let cd = request.metadata.checking_disabled;
+        let validating = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
         let query = hickory_proto::op::Query::query(Name::from(qname), qtype);
         match crate::dns::recursor::recursor_resolve(recursor, query, dnssec_ok).await {
             Ok(msg) => {
-                // Message exposes its sections as public fields in hickory 0.26.
-                let dnssec_ad = self
-                    .dnssec_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    && msg.metadata.authentic_data;
+                // DNSSEC enforcement: never serve Bogus data unless the client disabled checking.
+                let bogus = msg
+                    .answers
+                    .iter()
+                    .chain(msg.authorities.iter())
+                    .any(|r| r.proof.is_bogus());
+                if bogus && !cd {
+                    warn!(%qname, "full-recursion: DNSSEC validation failed (bogus) — SERVFAIL");
+                    return send_error(request, response_handle, ResponseCode::ServFail).await;
+                }
+                // AD bit: authenticated only when every answer + authority record is Secure.
+                let has_records = !msg.answers.is_empty() || !msg.authorities.is_empty();
+                let all_secure = has_records
+                    && msg
+                        .answers
+                        .iter()
+                        .chain(msg.authorities.iter())
+                        .all(|r| r.proof.is_secure());
                 let rcode = msg.metadata.response_code;
-                let answers = msg.answers;
-                let authority = msg.authorities;
-                let additionals = msg.additionals;
+                let mut answers = msg.answers;
+                let mut authority = msg.authorities;
+                let mut additionals = msg.additionals;
+                // RFC 4035 §3.2.1: strip DNSSEC records when the client did not set DO. We do this
+                // by hand against the known qtype — the recursor's own strip is a no-op here
+                // because its response carries no question section to infer the type from.
+                if !dnssec_ok {
+                    let keep =
+                        |r: &Record| r.record_type() == qtype || !r.record_type().is_dnssec();
+                    answers.retain(keep);
+                    authority.retain(keep);
+                    additionals.retain(keep);
+                }
                 let mut metadata = Metadata::response_from_request(&request.metadata);
                 metadata.recursion_available = true;
                 metadata.response_code = rcode;
-                metadata.authentic_data = dnssec_ad;
+                metadata.authentic_data = validating && !cd && all_secure;
                 let opt_edns = make_opt_edns(request);
                 let mut builder = MessageResponseBuilder::from_message_request(request);
                 if let Some(ref opt) = opt_edns {
@@ -639,9 +671,40 @@ impl RunboundHandler {
                     servfail_info(request)
                 })
             }
+            // NXDOMAIN / NODATA: build a proper negative response (rcode + SOA), not SERVFAIL.
+            Err(e) if e.is_nx_domain() || e.is_no_records_found() => {
+                let rcode = if e.is_nx_domain() {
+                    ResponseCode::NXDomain
+                } else {
+                    ResponseCode::NoError
+                };
+                let soa: Vec<Record> = e
+                    .into_soa()
+                    .map(|s| vec![(*s).into_record_of_rdata()])
+                    .unwrap_or_default();
+                let mut metadata = Metadata::response_from_request(&request.metadata);
+                metadata.recursion_available = true;
+                metadata.response_code = rcode;
+                let opt_edns = make_opt_edns(request);
+                let mut builder = MessageResponseBuilder::from_message_request(request);
+                if let Some(ref opt) = opt_edns {
+                    builder.edns(opt);
+                }
+                let response = builder.build(
+                    metadata,
+                    std::iter::empty::<&Record>(),
+                    soa.iter(),
+                    std::iter::empty(),
+                    std::iter::empty(),
+                );
+                response_handle.send_response(response).await.unwrap_or_else(|e| {
+                    error!("recursive neg send: {e}");
+                    servfail_info(request)
+                })
+            }
             Err(e) => {
                 warn!(%qname, "full-recursion failed: {e}");
-                servfail_info(request)
+                send_error(request, response_handle, ResponseCode::ServFail).await
             }
         }
     }
