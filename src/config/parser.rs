@@ -134,6 +134,10 @@ pub struct UnboundConfig {
     pub dnssec_validation: bool,
     /// Log WARN for every DNSSEC-bogus query when dnssec-validation is enabled.
     pub dnssec_log_bogus: bool,
+    /// #201: sign local zones (`local-zone` / `local-data`) with DNSSEC. Default: false.
+    /// When enabled, each local zone gets an auto-generated KSK+ZSK (ECDSAP256SHA256) and its
+    /// answers are signed online (lazy, cached); the DS is surfaced for the operator to publish.
+    pub local_zone_dnssec: bool,
 
     // ── GDPR / privacy controls ────────────────────────────────────────────
     /// Max entries in the in-RAM query log ring buffer. Default: 1000. 0 = disabled.
@@ -855,6 +859,7 @@ fn parse_server_directive(
         "dnssec-validation" => cfg.dnssec_validation = val.trim_matches('"') == "yes",
         "log-format" => cfg.log_format = val.trim_matches('"').trim().to_lowercase(),
         "dnssec-log-bogus" => cfg.dnssec_log_bogus = val.trim_matches('"') == "yes",
+        "local-zone-dnssec" => cfg.local_zone_dnssec = val.trim_matches('"') == "yes",
         "log-retention" => cfg.log_retention = val.parse().unwrap_or(1000),
         "log-client-ip" => cfg.log_client_ip = val.trim_matches('"') != "no",
         "audit-log" => cfg.audit_log = val.trim_matches('"') == "yes",
@@ -1137,6 +1142,25 @@ mod tests {
     fn xdp_ring_size_boundary_65536_is_valid() {
         let cfg = parse_str("server:\n  xdp-rx-ring-size: 65536\n").unwrap();
         assert_eq!(cfg.xdp_rx_ring_size, 65536);
+    }
+
+    // --- #201 local-zone-dnssec flag ---
+    #[test]
+    fn local_zone_dnssec_flag_parses() {
+        assert!(
+            !parse_str("server:\n").unwrap().local_zone_dnssec,
+            "default must be off"
+        );
+        assert!(
+            parse_str("server:\n  local-zone-dnssec: yes\n")
+                .unwrap()
+                .local_zone_dnssec
+        );
+        assert!(
+            !parse_str("server:\n  local-zone-dnssec: no\n")
+                .unwrap()
+                .local_zone_dnssec
+        );
     }
 
     // --- #158 xdp-cpu-governor parser coverage ---
