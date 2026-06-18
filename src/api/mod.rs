@@ -1204,13 +1204,15 @@ async fn dnssec_ds_handler(State(s): State<AppState>) -> impl IntoResponse {
     if !s.cfg.local_zone_dnssec {
         return JsonExtract(serde_json::json!({ "enabled": false, "ds": [] }));
     }
-    let apexes: Vec<String> = s.cfg.local_zones.iter().map(|z| z.name.clone()).collect();
-    match crate::dns::zone_signer::ZoneSigner::new(
-        s.base_dir.as_ref(),
-        &apexes,
-        std::time::Duration::from_secs(14 * 24 * 3600),
-    ) {
-        Ok(signer) => {
+    // SEC-L9: surface the DS from the LIVE in-memory signer (built once at startup on the master,
+    // adopted via key-replication on the slave). Do NOT call ZoneSigner::new here: that path
+    // load_or_generate()s, i.e. it would WRITE fresh keys on a mere authenticated GET, and on a
+    // slave it would mint divergent local keys instead of the replicated master keys.
+    match crate::dns::zone_signer::SHARED_SIGNER
+        .get()
+        .and_then(|sh| (*sh.load_full()).clone())
+    {
+        Some(signer) => {
             let ds: Vec<_> = signer
                 .ds_records()
                 .into_iter()
@@ -1218,11 +1220,7 @@ async fn dnssec_ds_handler(State(s): State<AppState>) -> impl IntoResponse {
                 .collect();
             JsonExtract(serde_json::json!({ "enabled": true, "ds": ds }))
         }
-        Err(_) => JsonExtract(serde_json::json!({
-            "enabled": true,
-            "error": "failed to load zone keys",
-            "ds": []
-        })),
+        None => JsonExtract(serde_json::json!({ "enabled": true, "ds": [] })),
     }
 }
 
@@ -4057,12 +4055,29 @@ fn tls_write_config(s: &AppState, mutate: impl FnOnce(&mut TlsConfig)) -> Result
         .map_err(|e| format!("write config: {e}"))
 }
 
-fn tls_set_key_perms(path: &std::path::Path) {
+// SEC-L3: write a private key so it is NEVER world-readable, even briefly. fs::write creates
+// with the umask (typically 0644) and only chmods afterwards — a TOCTOU window where a local
+// user can read the key. Write to a 0600 temp file then atomically rename over the target
+// (the rename also fixes SEC-L8: no half-written/orphan key on failure). A failed write/perm
+// is propagated (no silent 0644 key).
+fn tls_write_key_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true).create(true).truncate(true).mode(0o600)
+                .open(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&tmp, path)
     }
+    #[cfg(not(unix))]
+    { std::fs::write(path, bytes) }
 }
 
 fn tls_slave_guard(s: &AppState) -> Option<axum::response::Response> {
@@ -4153,14 +4168,13 @@ async fn tls_self_signed_handler(
         )
             .into_response();
     }
-    if let Err(e) = std::fs::write(&key_path, ck.key_pair.serialize_pem()) {
+    if let Err(e) = tls_write_key_0600(&key_path, ck.key_pair.serialize_pem().as_bytes()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             JsonExtract(serde_json::json!({ "error": "WRITE_KEY", "details": e.to_string() })),
         )
             .into_response();
     }
-    tls_set_key_perms(&key_path);
     let (cp, kp) = (
         cert_path.to_string_lossy().to_string(),
         key_path.to_string_lossy().to_string(),
@@ -4221,14 +4235,13 @@ async fn tls_import_handler(
         )
             .into_response();
     }
-    if let Err(e) = std::fs::write(&key_path, b.key_pem.as_bytes()) {
+    if let Err(e) = tls_write_key_0600(&key_path, b.key_pem.as_bytes()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             JsonExtract(serde_json::json!({ "error": "WRITE_KEY", "details": e.to_string() })),
         )
             .into_response();
     }
-    tls_set_key_perms(&key_path);
     let (cp, kp) = (
         cert_path.to_string_lossy().to_string(),
         key_path.to_string_lossy().to_string(),

@@ -436,7 +436,34 @@ impl RunboundHandler {
                 .map(|(n, recs)| (n.clone(), recs.iter().map(|r| r.record_type()).collect())),
             &apex,
         );
-        let authority = signer.signed_negative(is_nxdomain, &qname_name, &owners)?;
+        // SEC-L2: at this point the zone IS signed and the client set DO (apex_for succeeded).
+        // If the denial proof cannot be built, fail CLOSED with SERVFAIL — never fall through to
+        // serve an UNSIGNED NXDOMAIN/NODATA for a signed zone (a silent downgrade of the
+        // authenticated-denial guarantee).
+        let authority = match signer.signed_negative(is_nxdomain, &qname_name, &owners) {
+            Some(a) => a,
+            None => {
+                warn!(name = %sanitize_dns_name(qname), "signed-zone denial proof failed — SERVFAIL (refusing unsigned downgrade)");
+                let mut md = Metadata::response_from_request(&request.metadata);
+                md.response_code = ResponseCode::ServFail;
+                let opt = make_opt_edns(request);
+                let mut b = MessageResponseBuilder::from_message_request(request);
+                if let Some(ref o) = opt {
+                    b.edns(o);
+                }
+                let resp = b.build(
+                    md,
+                    std::iter::empty::<&Record>(),
+                    std::iter::empty(),
+                    std::iter::empty(),
+                    std::iter::empty(),
+                );
+                return Some(response_handle.send_response(resp).await.unwrap_or_else(|e| {
+                    error!("signed-negative SERVFAIL send: {e}");
+                    servfail_info(request)
+                }));
+            }
+        };
         let rcode = if is_nxdomain {
             ResponseCode::NXDomain
         } else {

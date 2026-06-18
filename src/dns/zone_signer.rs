@@ -117,8 +117,11 @@ pub fn sign_rrset(rrset: &RecordSet, signer: &DnssecSigner) -> Result<Record, St
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| format!("clock before epoch: {e}"))?
         .as_secs() as i64;
-    let inception =
-        OffsetDateTime::from_unix_timestamp(now).map_err(|e| format!("inception time: {e}"))?;
+    // SEC-L5: backdate inception by 1h so a validator whose clock runs slightly ahead does
+    // not reject a freshly-minted signature (now < inception). Expiration shifts with it; the
+    // validity window length is unchanged.
+    let inception = OffsetDateTime::from_unix_timestamp(now - 3600)
+        .map_err(|e| format!("inception time: {e}"))?;
     let rrsig = RRSIG::from_rrset(rrset, DNSClass::IN, inception, signer)
         .map_err(|e| format!("sign rrset: {e}"))?;
     Ok(Record::from_rdata(
@@ -195,6 +198,10 @@ struct ZoneKeys {
     apex: Name,
     ksk: ZoneKey,
     zsk: ZoneKey,
+    // SEC-L1: per-zone signers built ONCE at load (not reconstructed from PKCS#8 per RRset per
+    // query). Reused for every RRSIG; sign_rrset still stamps a fresh inception each call.
+    zsk_signer: DnssecSigner,
+    ksk_signer: DnssecSigner,
 }
 
 /// Online DNSSEC signer for the configured local zones (#201). Holds each zone's KSK+ZSK and
@@ -260,7 +267,12 @@ impl ZoneSigner {
         for a in apexes {
             let apex = Name::from_str(a).map_err(|e| format!("invalid zone '{a}': {e}"))?;
             let (ksk, zsk) = load_or_generate(config_dir, &apex)?;
-            zones.insert(LowerName::from(apex.clone()), ZoneKeys { apex, ksk, zsk });
+            let zsk_signer = zsk.dnssec_signer(&apex, sig_validity)?;
+            let ksk_signer = ksk.dnssec_signer(&apex, sig_validity)?;
+            zones.insert(
+                LowerName::from(apex.clone()),
+                ZoneKeys { apex, ksk, zsk, zsk_signer, ksk_signer },
+            );
         }
         Ok(Self {
             sig_validity,
@@ -307,8 +319,7 @@ impl ZoneSigner {
         for r in records {
             rrset.insert((*r).clone(), 0);
         }
-        let signer = z.zsk.dnssec_signer(&z.apex, self.sig_validity).ok()?;
-        sign_rrset(&rrset, &signer).ok()
+        sign_rrset(&rrset, &z.zsk_signer).ok()
     }
 
     /// The apex DNSKEY RRset (KSK + ZSK) plus its RRSIG (signed by the KSK), for a DNSKEY query.
@@ -318,8 +329,7 @@ impl ZoneSigner {
         rrset.set_ttl(3600);
         rrset.add_rdata(RData::DNSSEC(DNSSECRData::DNSKEY(z.ksk.dnskey().ok()?)));
         rrset.add_rdata(RData::DNSSEC(DNSSECRData::DNSKEY(z.zsk.dnskey().ok()?)));
-        let signer = z.ksk.dnssec_signer(&z.apex, self.sig_validity).ok()?;
-        let rrsig = sign_rrset(&rrset, &signer).ok()?;
+        let rrsig = sign_rrset(&rrset, &z.ksk_signer).ok()?;
         let mut out: Vec<Record> = rrset.records_without_rrsigs().cloned().collect();
         out.push(rrsig);
         Some(out)
@@ -354,8 +364,7 @@ impl ZoneSigner {
         let mut rrset = RecordSet::new(z.apex.clone(), RecordType::SOA, 0);
         rrset.set_ttl(300);
         rrset.add_rdata(RData::SOA(Self::synth_soa(&z.apex)));
-        let signer = z.zsk.dnssec_signer(&z.apex, self.sig_validity).ok()?;
-        let rrsig = sign_rrset(&rrset, &signer).ok()?;
+        let rrsig = sign_rrset(&rrset, &z.zsk_signer).ok()?;
         let mut out: Vec<Record> = rrset.records_without_rrsigs().cloned().collect();
         out.push(rrsig);
         Some(out)
@@ -498,8 +507,7 @@ impl ZoneSigner {
         let mut rrset = RecordSet::new(owner, RecordType::NSEC3, 0);
         rrset.set_ttl(300);
         rrset.insert(rec.clone(), 0);
-        let signer = z.zsk.dnssec_signer(&z.apex, self.sig_validity).ok()?;
-        let rrsig = sign_rrset(&rrset, &signer).ok()?;
+        let rrsig = sign_rrset(&rrset, &z.zsk_signer).ok()?;
         Some(vec![rec, rrsig])
     }
 
