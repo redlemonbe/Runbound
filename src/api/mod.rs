@@ -667,7 +667,10 @@ pub fn router(state: AppState) -> Router {
         .route("/system", get(system_handler))
         .route("/cache/flush", post(cache_flush_handler))
         // TLS / Protocol status
-        .route("/tls", get(tls_status_handler))
+        .route("/tls", get(tls_status_handler).delete(tls_disable_handler))
+        .route("/tls/cert", get(tls_cert_handler))
+        .route("/tls/self-signed", post(tls_self_signed_handler))
+        .route("/tls/import", post(tls_import_handler))
         // Monitoring
         .route(
             "/upstreams",
@@ -3922,6 +3925,376 @@ async fn rotate_user_key_handler(
         None => (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"NOT_FOUND"}))).into_response(),
     }
 }
+
+// ── Encrypted DNS admin: DoT / DoH / DoQ TLS material (WebUI) ───────────────
+// The DoT (853), DoH (443) and DoQ (853/udp) listeners are bound once at startup
+// (see dns/server.rs). These endpoints let the WebUI enable encrypted DNS by
+// either generating a self-signed certificate or importing an existing cert+key,
+// persisting tls-service-pem / tls-service-key / ports / hostname to runbound.conf.
+// Activation requires a restart — every mutating response carries restart_required.
+
+const TLS_CERT_FILE: &str = "cert.pem";
+const TLS_KEY_FILE: &str = "key.pem";
+
+#[derive(Deserialize)]
+struct TlsSelfSignedBody {
+    hostname: String,
+    dot_port: Option<u16>,
+    doh_port: Option<u16>,
+    doq_port: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct TlsImportBody {
+    cert_pem: String,
+    key_pem: String,
+    hostname: Option<String>,
+    dot_port: Option<u16>,
+    doh_port: Option<u16>,
+    doq_port: Option<u16>,
+}
+
+/// Parse a PEM cert file into a JSON summary (subject/issuer CN, validity, SHA-256
+/// fingerprint, SANs). Falls back to fingerprint-only if X.509 parsing fails.
+fn tls_cert_info(cert_path: &str) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let pem = match std::fs::read(cert_path) {
+        Ok(b) => b,
+        Err(_) => return serde_json::Value::Null,
+    };
+    let certs: Vec<_> = rustls_pemfile::certs(&mut pem.as_slice()).flatten().collect();
+    let der = match certs.first() {
+        Some(d) => d,
+        None => return serde_json::Value::Null,
+    };
+    let fingerprint = {
+        let mut h = Sha256::new();
+        h.update(der.as_ref());
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    match x509_parser::parse_x509_certificate(der.as_ref()) {
+        Ok((_, c)) => {
+            let cn = |name: &x509_parser::x509::X509Name| {
+                name.iter_common_name()
+                    .next()
+                    .and_then(|a| a.as_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let subject = cn(c.subject());
+            let issuer = cn(c.issuer());
+            let not_before = c.validity().not_before.timestamp();
+            let not_after = c.validity().not_after.timestamp();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let days_remaining = (not_after - now) / 86_400;
+            let sans: Vec<String> = c
+                .subject_alternative_name()
+                .ok()
+                .flatten()
+                .map(|san| {
+                    san.value
+                        .general_names
+                        .iter()
+                        .filter_map(|gn| match gn {
+                            x509_parser::extensions::GeneralName::DNSName(n) => {
+                                Some((*n).to_string())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "subject_cn": subject,
+                "issuer_cn": issuer,
+                "self_signed": !subject.is_empty() && subject == issuer,
+                "not_before": not_before,
+                "not_after": not_after,
+                "days_remaining": days_remaining,
+                "expired": days_remaining < 0,
+                "fingerprint_sha256": fingerprint,
+                "sans": sans,
+            })
+        }
+        Err(_) => serde_json::json!({
+            "fingerprint_sha256": fingerprint,
+            "parse_error": true,
+        }),
+    }
+}
+
+/// Validate that cert_pem contains at least one certificate, key_pem a private key,
+/// and that rustls accepts them together (the key matches the leaf certificate).
+fn tls_validate_cert_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
+    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..]).flatten().collect();
+    if certs.is_empty() {
+        return Err("no CERTIFICATE block found in cert_pem".to_string());
+    }
+    let key = match rustls_pemfile::private_key(&mut &key_pem[..]) {
+        Ok(Some(k)) => k,
+        Ok(None) => return Err("no PRIVATE KEY block found in key_pem".to_string()),
+        Err(e) => return Err(format!("key parse error: {e}")),
+    };
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map(|_| ())
+        .map_err(|e| format!("certificate and private key do not match: {e}"))
+}
+
+/// Load the persisted config, mutate its TLS section, write it back atomically.
+fn tls_write_config(s: &AppState, mutate: impl FnOnce(&mut TlsConfig)) -> Result<(), String> {
+    let mut c = crate::config::load(&s.cfg_path).map_err(|e| format!("load config: {e}"))?;
+    mutate(&mut c.tls);
+    crate::config::writer::write_config_atomic(&c, std::path::Path::new(&s.cfg_path))
+        .map_err(|e| format!("write config: {e}"))
+}
+
+fn tls_set_key_perms(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+fn tls_slave_guard(s: &AppState) -> Option<axum::response::Response> {
+    if s.slave_mode {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                JsonExtract(serde_json::json!({
+                    "error": "SLAVE_READ_ONLY",
+                    "details": "encrypted-DNS settings are managed on the master"
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+/// GET /api/tls/cert — active (booted) vs configured (persisted) state + cert info.
+async fn tls_cert_handler(State(s): State<AppState>) -> impl IntoResponse {
+    let cfg_tls = crate::config::load(&s.cfg_path)
+        .map(|c| c.tls)
+        .unwrap_or_else(|_| (*s.tls_cfg).clone());
+    let boot = s.tls_cfg.as_ref();
+    let active = boot.cert_path.is_some() && boot.key_path.is_some();
+    let configured = cfg_tls.cert_path.is_some() && cfg_tls.key_path.is_some();
+    let restart_required = cfg_tls.cert_path != boot.cert_path
+        || cfg_tls.key_path != boot.key_path
+        || cfg_tls.dot_port != boot.dot_port
+        || cfg_tls.doh_port != boot.doh_port
+        || cfg_tls.doq_port != boot.doq_port
+        || cfg_tls.hostname != boot.hostname;
+    let cert = cfg_tls
+        .cert_path
+        .as_deref()
+        .map(tls_cert_info)
+        .unwrap_or(serde_json::Value::Null);
+    JsonExtract(serde_json::json!({
+        "active": active,
+        "configured": configured,
+        "restart_required": restart_required,
+        "dot_port": cfg_tls.dot_port.unwrap_or(853),
+        "doh_port": cfg_tls.doh_port.unwrap_or(443),
+        "doq_port": cfg_tls.doq_port.unwrap_or(853),
+        "hostname": cfg_tls.hostname.clone().unwrap_or_else(|| "runbound.local".to_string()),
+        "cert_path": cfg_tls.cert_path,
+        "cert": cert,
+    }))
+    .into_response()
+}
+
+/// POST /api/tls/self-signed — generate a self-signed cert+key, enable DoT/DoH/DoQ.
+async fn tls_self_signed_handler(
+    State(s): State<AppState>,
+    ApiJson(b): ApiJson<TlsSelfSignedBody>,
+) -> impl IntoResponse {
+    if let Some(r) = tls_slave_guard(&s) {
+        return r;
+    }
+    let host = b.hostname.trim().to_string();
+    if host.is_empty() || host.len() > 253 || host.contains(|c: char| c.is_control()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "INVALID_HOSTNAME",
+                "details": "hostname must be 1..253 chars with no control characters"
+            })),
+        )
+            .into_response();
+    }
+    let cert_path = s.base_dir.join(TLS_CERT_FILE);
+    let key_path = s.base_dir.join(TLS_KEY_FILE);
+    let sans = vec![host.clone(), "localhost".to_string(), "127.0.0.1".to_string()];
+    let ck = match rcgen::generate_simple_self_signed(sans) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({ "error": "GEN_FAILED", "details": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    if let Err(e) = std::fs::write(&cert_path, ck.cert.pem()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({ "error": "WRITE_CERT", "details": e.to_string() })),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::write(&key_path, ck.key_pair.serialize_pem()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({ "error": "WRITE_KEY", "details": e.to_string() })),
+        )
+            .into_response();
+    }
+    tls_set_key_perms(&key_path);
+    let (cp, kp) = (
+        cert_path.to_string_lossy().to_string(),
+        key_path.to_string_lossy().to_string(),
+    );
+    let (dot, doh, doq) = (b.dot_port, b.doh_port, b.doq_port);
+    if let Err(e) = tls_write_config(&s, move |t| {
+        t.cert_path = Some(cp);
+        t.key_path = Some(kp);
+        t.hostname = Some(host);
+        if let Some(p) = dot {
+            t.dot_port = Some(p);
+        }
+        if let Some(p) = doh {
+            t.doh_port = Some(p);
+        }
+        if let Some(p) = doq {
+            t.doq_port = Some(p);
+        }
+    }) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({ "error": "CONFIG_WRITE", "details": e })),
+        )
+            .into_response();
+    }
+    s.audit.send(AuditEvent::ConfigReload);
+    info!(cert = %cert_path.display(), "Encrypted DNS: self-signed certificate generated");
+    JsonExtract(serde_json::json!({
+        "ok": true,
+        "mode": "self-signed",
+        "restart_required": true,
+        "cert": tls_cert_info(&cert_path.to_string_lossy()),
+    }))
+    .into_response()
+}
+
+/// POST /api/tls/import — import an existing cert + key (e.g. Let's Encrypt).
+async fn tls_import_handler(
+    State(s): State<AppState>,
+    ApiJson(b): ApiJson<TlsImportBody>,
+) -> impl IntoResponse {
+    if let Some(r) = tls_slave_guard(&s) {
+        return r;
+    }
+    if let Err(e) = tls_validate_cert_key(b.cert_pem.as_bytes(), b.key_pem.as_bytes()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({ "error": "INVALID_CERT", "details": e })),
+        )
+            .into_response();
+    }
+    let cert_path = s.base_dir.join(TLS_CERT_FILE);
+    let key_path = s.base_dir.join(TLS_KEY_FILE);
+    if let Err(e) = std::fs::write(&cert_path, b.cert_pem.as_bytes()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({ "error": "WRITE_CERT", "details": e.to_string() })),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::write(&key_path, b.key_pem.as_bytes()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({ "error": "WRITE_KEY", "details": e.to_string() })),
+        )
+            .into_response();
+    }
+    tls_set_key_perms(&key_path);
+    let (cp, kp) = (
+        cert_path.to_string_lossy().to_string(),
+        key_path.to_string_lossy().to_string(),
+    );
+    let host = b.hostname.and_then(|h| {
+        let h = h.trim().to_string();
+        if h.is_empty() || h.len() > 253 || h.contains(|c: char| c.is_control()) {
+            None
+        } else {
+            Some(h)
+        }
+    });
+    let (dot, doh, doq) = (b.dot_port, b.doh_port, b.doq_port);
+    if let Err(e) = tls_write_config(&s, move |t| {
+        t.cert_path = Some(cp);
+        t.key_path = Some(kp);
+        if let Some(h) = host {
+            t.hostname = Some(h);
+        }
+        if let Some(p) = dot {
+            t.dot_port = Some(p);
+        }
+        if let Some(p) = doh {
+            t.doh_port = Some(p);
+        }
+        if let Some(p) = doq {
+            t.doq_port = Some(p);
+        }
+    }) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({ "error": "CONFIG_WRITE", "details": e })),
+        )
+            .into_response();
+    }
+    s.audit.send(AuditEvent::ConfigReload);
+    info!(cert = %cert_path.display(), "Encrypted DNS: certificate imported");
+    JsonExtract(serde_json::json!({
+        "ok": true,
+        "mode": "import",
+        "restart_required": true,
+        "cert": tls_cert_info(&cert_path.to_string_lossy()),
+    }))
+    .into_response()
+}
+
+/// DELETE /api/tls — disable encrypted DNS (clear cert/key directives).
+async fn tls_disable_handler(State(s): State<AppState>) -> impl IntoResponse {
+    if let Some(r) = tls_slave_guard(&s) {
+        return r;
+    }
+    if let Err(e) = tls_write_config(&s, |t| {
+        t.cert_path = None;
+        t.key_path = None;
+    }) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({ "error": "CONFIG_WRITE", "details": e })),
+        )
+            .into_response();
+    }
+    s.audit.send(AuditEvent::ConfigReload);
+    info!("Encrypted DNS: disabled via API");
+    JsonExtract(serde_json::json!({ "ok": true, "restart_required": true })).into_response()
+}
+
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 

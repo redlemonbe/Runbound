@@ -754,6 +754,43 @@
         <li><span class="os-name">Android</span><span>Settings → Security → Install from storage → CA Certificate</span></li>
       </ul>
     </div>
+    <div id="settings-tls-card" class="card mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="text-xs text-gray-600 uppercase tracking-wide">Encrypted DNS — DoT / DoH / DoQ</div>
+        <span id="tls-state-badge" class="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-400">—</span>
+      </div>
+      <p class="text-xs text-gray-400 mb-3">Serve DNS over TLS (853), HTTPS (443) and QUIC (853/udp) so clients such as Firefox can encrypt their queries to Runbound. Generate a self-signed certificate, or import your own (e.g. Let&#39;s Encrypt).</p>
+      <div id="tls-restart-note" class="hidden text-xs text-amber-400 bg-amber-950/40 border border-amber-900 rounded px-3 py-2 mb-3">⚠ Configuration saved — restart Runbound to activate the new encrypted-DNS settings.</div>
+      <div id="tls-cert-info" class="hidden text-xs text-gray-400 mb-3 space-y-1 font-mono"></div>
+      <div class="space-y-3 max-w-sm" style="padding-left:3px">
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Server hostname (TLS SNI / DoH)</label>
+          <input id="tls-hostname" type="text" class="input w-full" placeholder="dns.example.com" />
+        </div>
+        <div class="grid grid-cols-3 gap-2">
+          <div><label class="text-xs text-gray-500 block mb-1">DoT port</label><input id="tls-dot-port" type="number" class="input w-full" placeholder="853" /></div>
+          <div><label class="text-xs text-gray-500 block mb-1">DoH port</label><input id="tls-doh-port" type="number" class="input w-full" placeholder="443" /></div>
+          <div><label class="text-xs text-gray-500 block mb-1">DoQ port</label><input id="tls-doq-port" type="number" class="input w-full" placeholder="853" /></div>
+        </div>
+      </div>
+      <div class="flex gap-2 mt-3 flex-wrap">
+        <button onclick="tlsGenSelfSigned()" class="btn-primary text-xs">Generate self-signed</button>
+        <button onclick="tlsToggleImport()" class="btn-secondary text-xs">Import certificate…</button>
+        <button id="tls-disable-btn" onclick="tlsDisable()" class="btn-secondary text-xs hidden ml-auto">Disable</button>
+      </div>
+      <div id="tls-import-box" class="hidden mt-3 space-y-2">
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Certificate (PEM — full chain)</label>
+          <textarea id="tls-cert-pem" class="input w-full font-mono text-xs" rows="4" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Private key (PEM)</label>
+          <textarea id="tls-key-pem" class="input w-full font-mono text-xs" rows="4" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
+        </div>
+        <button onclick="tlsImport()" class="btn-primary text-xs">Import &amp; enable</button>
+      </div>
+      <p id="tls-msg" class="text-xs mt-3"></p>
+    </div>
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-4">Change Password</div>
       <div class="space-y-3 max-w-sm" style="padding-left:3px">
@@ -1580,7 +1617,7 @@ function showTab(name,btn){
   if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
   if(name==='protection'){loadProtection();protectionTimer=setInterval(loadProtection,4000);}
-  if(name==='settings'){initDnssecToggle();loadAuthEvents();initCaCard();}
+  if(name==='settings'){initDnssecToggle();loadAuthEvents();initCaCard();loadTlsStatus();}
   if(name==='users'){loadUsers();}
 }
 
@@ -1951,6 +1988,59 @@ function initCaCard() {
     const card = document.getElementById('settings-ca-card');
     if (card) card.classList.toggle('hidden', !r.ok);
   }).catch(() => {});
+}
+
+// ── Encrypted DNS (DoT / DoH / DoQ) settings ──────────────────────────────
+function tlsEsc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function tlsPorts(){
+  const p = id => { const v = parseInt(document.getElementById(id).value,10); return Number.isFinite(v) ? v : undefined; };
+  return { dot_port:p('tls-dot-port'), doh_port:p('tls-doh-port'), doq_port:p('tls-doq-port') };
+}
+function tlsToggleImport(){ document.getElementById('tls-import-box').classList.toggle('hidden'); }
+function tlsMsg(m, ok){ const e=document.getElementById('tls-msg'); if(!e)return; e.textContent=m; e.className='text-xs mt-3 '+(ok?'text-emerald-400':'text-red-400'); }
+async function loadTlsStatus(){
+  let t;
+  try { t = await api('GET','/tls/cert'); } catch(e){ return; }
+  const badge = document.getElementById('tls-state-badge'); if(!badge) return;
+  if(t.active){ badge.textContent='active'; badge.className='text-xs px-2 py-0.5 rounded bg-emerald-900 text-emerald-300'; }
+  else if(t.configured){ badge.textContent='configured'; badge.className='text-xs px-2 py-0.5 rounded bg-amber-900 text-amber-300'; }
+  else { badge.textContent='disabled'; badge.className='text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-400'; }
+  document.getElementById('tls-restart-note').classList.toggle('hidden', !t.restart_required);
+  document.getElementById('tls-disable-btn').classList.toggle('hidden', !t.configured);
+  const hn = document.getElementById('tls-hostname');
+  if(hn && !hn.value && t.hostname && t.hostname!=='runbound.local') hn.value = t.hostname;
+  document.getElementById('tls-dot-port').placeholder = t.dot_port;
+  document.getElementById('tls-doh-port').placeholder = t.doh_port;
+  document.getElementById('tls-doq-port').placeholder = t.doq_port;
+  const info = document.getElementById('tls-cert-info');
+  if(t.cert && t.cert.fingerprint_sha256){
+    const c=t.cert; let h='';
+    if(c.subject_cn) h += '<div>Subject: <span class="text-gray-300">'+tlsEsc(c.subject_cn)+'</span>'+(c.self_signed?' <span class="text-amber-400">(self-signed)</span>':'')+'</div>';
+    if(typeof c.days_remaining==='number'){ const col=c.expired?'text-red-400':(c.days_remaining<30?'text-amber-400':'text-emerald-400'); const d=c.not_after?new Date(c.not_after*1000).toISOString().slice(0,10):''; h += '<div>Expires: <span class="'+col+'">'+(c.expired?'EXPIRED':c.days_remaining+' days')+'</span>'+(d?' ('+d+')':'')+'</div>'; }
+    if(c.sans && c.sans.length) h += '<div>SANs: <span class="text-gray-300">'+tlsEsc(c.sans.join(", "))+'</span></div>';
+    h += '<div class="break-all text-gray-600">SHA-256: '+tlsEsc(c.fingerprint_sha256)+'</div>';
+    info.innerHTML=h; info.classList.remove('hidden');
+  } else { info.classList.add('hidden'); }
+}
+async function tlsGenSelfSigned(){
+  const hostname=document.getElementById('tls-hostname').value.trim();
+  if(!hostname){ tlsMsg('Enter a server hostname first.', false); return; }
+  try { await api('POST','/tls/self-signed', Object.assign({hostname}, tlsPorts())); tlsMsg('Self-signed certificate generated — restart Runbound to activate.', true); loadTlsStatus(); }
+  catch(e){ tlsMsg('Error: '+e.message, false); }
+}
+async function tlsImport(){
+  const cert_pem=document.getElementById('tls-cert-pem').value.trim();
+  const key_pem=document.getElementById('tls-key-pem').value.trim();
+  const hn=document.getElementById('tls-hostname').value.trim();
+  if(!cert_pem || !key_pem){ tlsMsg('Paste both the certificate and the private key.', false); return; }
+  const body=Object.assign({cert_pem, key_pem}, tlsPorts()); if(hn) body.hostname=hn;
+  try { await api('POST','/tls/import', body); tlsMsg('Certificate imported — restart Runbound to activate.', true); document.getElementById('tls-cert-pem').value=''; document.getElementById('tls-key-pem').value=''; document.getElementById('tls-import-box').classList.add('hidden'); loadTlsStatus(); }
+  catch(e){ tlsMsg('Error: '+e.message, false); }
+}
+async function tlsDisable(){
+  if(!confirm('Disable encrypted DNS? Clients fall back to plaintext after the next restart.')) return;
+  try { await api('DELETE','/tls'); tlsMsg('Encrypted DNS disabled — restart Runbound to apply.', true); loadTlsStatus(); }
+  catch(e){ tlsMsg('Error: '+e.message, false); }
 }
 
 async function loadAuthEvents() {

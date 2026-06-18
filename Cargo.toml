@@ -141,6 +141,7 @@ arc-swap = "1"
 
 # Self-signed TLS certificate generation (--gen-cert)
 rcgen = { version = "0.13", features = ["x509-parser"] }
+x509-parser = "0.16"
 
 # Slave/master sync: HTTPS server (TLS termination) + HTTPS client (cert pinning)
 tokio-rustls   = "0.26"
