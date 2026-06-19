@@ -3099,6 +3099,9 @@ async fn spawn_tls_service(
         }
     };
 
+    // DoH is served by our own RFC 8484 handler (see doh_service); clone the
+    // shared handler before `handler` is moved into the hickory server below.
+    let doh_handler = std::sync::Arc::clone(&handler);
     let mut server = Server::new(TlsArcHandler(handler));
     for iface in interfaces {
         // DNS-over-TLS (853 TCP) — public listener relays to a loopback hickory listener.
@@ -3138,24 +3141,24 @@ async fn spawn_tls_service(
                 Ok(relay_doh) => {
                     if let Ok(relay_doh_addr) = relay_doh.local_addr() {
                         info!(addr=%doh_addr, "DoH (DNS-over-HTTPS) listening — RFC 8484");
-                        if let Err(e) = server.register_https_listener_with_tls_config(
+                        // Runbound serves DoH itself (see doh_service): hickory's
+                        // verify_request requires Content-Type on every request, so it
+                        // rejects the bodyless GET that Firefox/Chrome send (#doh-get).
+                        handles.push(tokio::spawn(doh_service(
                             relay_doh,
-                            TLS_SESSION_TIMEOUT,
                             std::sync::Arc::clone(&doh_config),
-                            Some(hostname.clone()),
+                            std::sync::Arc::clone(&doh_handler),
                             "/dns-query".to_string(),
-                        ) {
-                            warn!(err=%e, "DoH register failed");
-                        } else {
-                            handles.push(tokio::spawn(run_tcp_with_limit(
-                                public_doh,
-                                relay_doh_addr,
-                                std::sync::Arc::clone(tcp_tracker),
-                                TLS_SESSION_TIMEOUT,
-                                std::sync::Arc::clone(acl),
-                                proxy_protocol,
-                            )));
-                        }
+                            hostname.clone(),
+                        )));
+                        handles.push(tokio::spawn(run_tcp_with_limit(
+                            public_doh,
+                            relay_doh_addr,
+                            std::sync::Arc::clone(tcp_tracker),
+                            TLS_SESSION_TIMEOUT,
+                            std::sync::Arc::clone(acl),
+                            proxy_protocol,
+                        )));
                     }
                 }
                 Err(e) => warn!(addr=%doh_addr, err=%e, "DoH relay bind failed — skipping"),
@@ -3188,6 +3191,217 @@ async fn spawn_tls_service(
         }
     }));
     handles
+}
+
+// ───────────────────────── DNS-over-HTTPS (RFC 8484) ─────────────────────────
+// Runbound serves DoH itself rather than via hickory's HTTPS listener: hickory's
+// verify_request requires `Content-Type: application/dns-message` on EVERY request,
+// but an RFC 8484 GET carries the query in `?dns=` and has no body (so no
+// Content-Type) — hickory therefore rejects every GET, which is exactly what
+// Firefox and Chrome send. This handler accepts GET (?dns=base64url) and POST
+// (application/dns-message), resolves through the shared RunboundHandler, and
+// returns application/dns-message. TLS + HTTP/2 terminate here, behind the same
+// public relay that enforces the source-IP ACL / per-IP conn cap / PROXY protocol.
+
+/// Captures the wire response produced by the DNS handler into `out`.
+#[derive(Clone)]
+struct DohCapture {
+    peer: SocketAddr,
+    out: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+#[async_trait::async_trait]
+impl ResponseHandler for DohCapture {
+    async fn send_response<'a>(
+        &mut self,
+        response: hickory_server::zone_handler::MessageResponse<
+            '_,
+            'a,
+            impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+            impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+            impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+            impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
+        >,
+    ) -> Result<ResponseInfo, hickory_server::net::NetError> {
+        let (stream_handle, mut receiver) = BufDnsStreamHandle::new(self.peer);
+        let mut rh = ResponseHandle::new(self.peer, stream_handle, DnsProtocol::Https);
+        let info = rh.send_response(response).await?;
+        // Drop the sender before draining (see UdpResponseHandler note) to avoid a
+        // deadlock: the mpsc receiver yields None only once all senders are dropped.
+        drop(rh);
+        use futures_util::StreamExt;
+        if let Some(serial_msg) = receiver.next().await {
+            let (bytes, _dst) = serial_msg.into_parts();
+            *self.out.lock().unwrap_or_else(|e| e.into_inner()) = Some(bytes);
+        }
+        Ok(info)
+    }
+}
+
+/// Resolve a DNS wire query through the full handler, returning the wire response.
+async fn doh_resolve(
+    handler: &std::sync::Arc<RunboundHandler>,
+    wire: Vec<u8>,
+    peer: SocketAddr,
+) -> Option<Vec<u8>> {
+    let request = match Request::from_bytes(wire, peer, DnsProtocol::Https) {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(err=%e, "DoH: malformed query");
+            return None;
+        }
+    };
+    let out = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cap = DohCapture {
+        peer,
+        out: std::sync::Arc::clone(&out),
+    };
+    handler
+        .handle_request::<DohCapture, hickory_server::net::runtime::TokioTime>(&request, cap)
+        .await;
+    let r = out.lock().unwrap_or_else(|e| e.into_inner()).take();
+    r
+}
+
+fn doh_reply(
+    status: hyper::StatusCode,
+    body: Vec<u8>,
+) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+    let mut b = hyper::Response::builder().status(status);
+    if !body.is_empty() {
+        b = b.header(hyper::header::CONTENT_TYPE, "application/dns-message");
+    }
+    b.body(http_body_util::Full::new(bytes::Bytes::from(body)))
+        .unwrap_or_else(|_| hyper::Response::new(http_body_util::Full::new(bytes::Bytes::new())))
+}
+
+/// Handle one DoH HTTP request (GET `?dns=` or POST application/dns-message).
+async fn doh_handle(
+    req: hyper::Request<hyper::body::Incoming>,
+    handler: std::sync::Arc<RunboundHandler>,
+    peer: SocketAddr,
+    path: std::sync::Arc<str>,
+    hostname: std::sync::Arc<str>,
+) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, std::convert::Infallible> {
+    use base64::Engine;
+    if req.uri().path() != &*path {
+        return Ok(doh_reply(hyper::StatusCode::NOT_FOUND, Vec::new()));
+    }
+    // authority / Host must match the configured hostname (parity with hickory).
+    let authority = req
+        .uri()
+        .authority()
+        .map(|a| a.host().to_string())
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        });
+    if let Some(h) = authority {
+        if h != *hostname {
+            return Ok(doh_reply(hyper::StatusCode::NOT_FOUND, Vec::new()));
+        }
+    }
+    let wire: Vec<u8> = match *req.method() {
+        hyper::Method::GET => {
+            let q = req.uri().query().unwrap_or("");
+            let dns = q.split('&').find_map(|kv| {
+                let mut it = kv.splitn(2, '=');
+                match (it.next(), it.next()) {
+                    (Some("dns"), Some(v)) => Some(v),
+                    _ => None,
+                }
+            });
+            let Some(b64) = dns else {
+                return Ok(doh_reply(hyper::StatusCode::BAD_REQUEST, Vec::new()));
+            };
+            match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64.trim_end_matches('=')) {
+                Ok(b) => b,
+                Err(_) => return Ok(doh_reply(hyper::StatusCode::BAD_REQUEST, Vec::new())),
+            }
+        }
+        hyper::Method::POST => {
+            let ct = req
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if ct != "application/dns-message" {
+                return Ok(doh_reply(
+                    hyper::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    Vec::new(),
+                ));
+            }
+            use http_body_util::BodyExt;
+            // DNS messages are tiny; cap the body to guard against abuse.
+            match http_body_util::Limited::new(req.into_body(), 65_535)
+                .collect()
+                .await
+            {
+                Ok(c) => c.to_bytes().to_vec(),
+                Err(_) => return Ok(doh_reply(hyper::StatusCode::BAD_REQUEST, Vec::new())),
+            }
+        }
+        _ => return Ok(doh_reply(hyper::StatusCode::METHOD_NOT_ALLOWED, Vec::new())),
+    };
+    match doh_resolve(&handler, wire, peer).await {
+        Some(resp) => Ok(doh_reply(hyper::StatusCode::OK, resp)),
+        None => Ok(doh_reply(hyper::StatusCode::BAD_REQUEST, Vec::new())),
+    }
+}
+
+/// Serve DoH on `listener` (the loopback target of the public 443 relay). TLS +
+/// HTTP/2 (and HTTP/1.1 fallback) terminate here; each request is resolved through
+/// the shared handler. Aborting this task drops the listener and frees the socket.
+async fn doh_service(
+    listener: TcpListener,
+    tls: std::sync::Arc<rustls::ServerConfig>,
+    handler: std::sync::Arc<RunboundHandler>,
+    path: String,
+    hostname: String,
+) {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let path: std::sync::Arc<str> = std::sync::Arc::from(path);
+    let hostname: std::sync::Arc<str> = std::sync::Arc::from(hostname);
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                debug!(err=%e, "DoH accept error");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let handler = std::sync::Arc::clone(&handler);
+        let path = std::sync::Arc::clone(&path);
+        let hostname = std::sync::Arc::clone(&hostname);
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(err=%e, "DoH TLS handshake failed");
+                    return;
+                }
+            };
+            let io = hyper_util::rt::TokioIo::new(tls_stream);
+            let svc = hyper::service::service_fn(move |req| {
+                doh_handle(
+                    req,
+                    std::sync::Arc::clone(&handler),
+                    peer,
+                    std::sync::Arc::clone(&path),
+                    std::sync::Arc::clone(&hostname),
+                )
+            });
+            let builder = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            );
+            if let Err(e) = builder.serve_connection(io, svc).await {
+                debug!(err=%e, "DoH connection error");
+            }
+        });
+    }
 }
 
 /// Supervise the encrypted-DNS listeners. On each `()` received (sent by the

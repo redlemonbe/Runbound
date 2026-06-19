@@ -146,7 +146,7 @@ x509-parser = "0.16"
 
 # Slave/master sync: HTTPS server (TLS termination) + HTTPS client (cert pinning)
 tokio-rustls   = "0.26"
-hyper          = { version = "1", features = ["http1"] }
+hyper          = { version = "1", features = ["http1", "http2"] }
 hyper-util     = { version = "0.1", features = ["tokio", "server-auto"] }
 http-body-util = "0.1"
 url = "2.5.8"
