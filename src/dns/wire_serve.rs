@@ -19,13 +19,23 @@
 // the slow-path receive loop at integration. Remove the allow once it is.
 #![allow(dead_code)]
 
+use smallvec::SmallVec;
+
 use crate::dns::local::{LocalZoneSet, ZoneAction};
 use crate::dns::wire::consts::{rcode, rtype};
 use crate::dns::wire::{Edns, Message, Rdata, Record};
 
-/// Lowercased wire key for a name already in wire form.
-fn lower_key(wire_name: &[u8]) -> Vec<u8> {
-    wire_name.iter().map(|b| b.to_ascii_lowercase()).collect()
+/// Lowercased wire key for a name already in wire form — on the stack.
+///
+/// Two fast-path properties: (1) the case-fold is the hand-written SIMD/asm
+/// `copy_lowercase_label` (`byte OR (mask AND 0x20)`), the same one the hot path
+/// uses; (2) the result lives inline in a `SmallVec<[u8; 64]>`, so a normal name
+/// never heap-allocates and the `HashMap` lookups borrow it directly. Length
+/// octets are 0–63, all below `A`, so the case bit never touches them.
+fn lower_key(wire_name: &[u8]) -> SmallVec<[u8; 64]> {
+    let mut out: SmallVec<[u8; 64]> = SmallVec::new();
+    crate::dns::simd::copy_lowercase_label(&mut out, wire_name);
+    out
 }
 
 /// Build the authoritative local answer for `query`, or `None` if the queried
@@ -121,7 +131,7 @@ pub fn serve_datagram(query: &[u8], zones: &LocalZoneSet) -> Option<Vec<u8>> {
 /// or empty if the chain does not resolve within the local zones.
 fn follow_cname(zones: &LocalZoneSet, start: &[u8], qtype: u16) -> Vec<Record> {
     let mut chain: Vec<Record> = Vec::with_capacity(8);
-    let mut current = start.to_vec();
+    let mut current: SmallVec<[u8; 64]> = SmallVec::from_slice(start);
 
     for _ in 0..8 {
         let cnames = zones.local_records_wire(&current, rtype::CNAME);

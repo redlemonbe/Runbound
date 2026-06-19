@@ -142,7 +142,12 @@ pub(crate) fn name_to_wire_qname(name: &Name) -> SmallVec<[u8; 64]> {
 /// Matches `name_to_wire_qname` (the hot path) after lowercasing, so a query's
 /// QNAME bytes index straight into the store.
 pub(crate) fn wire_name_key(name: &crate::dns::wire::Name) -> Box<[u8]> {
-    name.wire().iter().map(|b| b.to_ascii_lowercase()).collect()
+    // Same SIMD/asm case-fold (`byte OR (mask AND 0x20)`) as the hot path, not a
+    // scalar loop. Length octets (0–63) sit below 'A', so the case bit leaves
+    // them untouched — folding the whole wire name is safe.
+    let mut out: SmallVec<[u8; 64]> = SmallVec::new();
+    simd::copy_lowercase_label(&mut out, name.wire());
+    out.into_vec().into_boxed_slice()
 }
 
 impl LocalZoneSet {
