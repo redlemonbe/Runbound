@@ -57,11 +57,13 @@ pub fn answer_local(query: &Message, zones: &LocalZoneSet) -> Option<Message> {
             rc = rcode::NXDOMAIN;
         }
         ZoneAction::BlockPage => {
+            // Authoritative either way: serve the pre-inserted block record if
+            // present, otherwise an authoritative NXDOMAIN (matches the XDP path).
+            resp.header.set_aa(true);
             let recs = zones.local_records_wire(&key, qtype);
             if recs.is_empty() {
                 rc = rcode::NXDOMAIN;
             } else {
-                resp.header.set_aa(true);
                 resp.answers = recs.into_iter().cloned().collect();
             }
         }
@@ -91,11 +93,13 @@ pub fn answer_local(query: &Message, zones: &LocalZoneSet) -> Option<Message> {
     }
     resp.header.set_rcode_low(rc);
 
-    // Echo EDNS: if the client sent an OPT, answer with one sized to the
-    // smaller of our default and the client's advertised payload.
+    // Echo EDNS (RFC 6891 §7): if the client sent an OPT, answer with one sized
+    // to the smaller of our default and the client's advertised payload, and
+    // reflect the DO bit (mirrors the XDP slow path's OPT echo).
     if let Ok(Some(client)) = query.edns() {
         let mut server = Edns::default();
         server.udp_payload = client.udp_payload.clamp(512, server.udp_payload);
+        server.set_dnssec_ok(client.dnssec_ok());
         resp.additional.push(server.to_record());
     }
 

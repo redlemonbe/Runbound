@@ -24,11 +24,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use hickory_proto::{
-    op::{Edns, Message, MessageType, OpCode, ResponseCode},
-    rr::LowerName,
-    serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
-};
 
 use super::loader::XdpHandle;
 /// Return type for `answer_dns_wire()` — three-way dispatch replacing `Option<usize>`.
@@ -53,7 +48,7 @@ use super::socket::{
 };
 use super::umem::{XdpDesc, XdpRingSizes, FRAME_SIZE};
 use crate::dns::acl::{Acl, AclAction};
-use crate::dns::local::{LocalZoneSet, ZoneAction};
+use crate::dns::local::LocalZoneSet;
 use crate::dns::RateLimiter;
 
 const ETH_HDR: usize = 14;
@@ -1274,7 +1269,8 @@ fn process_packet(
     // ── SINGLE-LOOKUP HOT PATH ────────────────────────────────────────────────
     // 1. Cache (local-data preloaded + recursive hits) — ONE ASM lookup (CRC32c + identity).
     //    ACL Deny → silent drop (answer_from_cache checks ACL first).
-    // 2. answer_dns (hickory) — wildcard, CNAME, EDNS-DO, BlockPage, NXDOMAIN, parent-walk.
+    // 2. answer_dns (wire serving core) — Refuse/NxDomain/BlockPage/Static, exact
+    //    records, CNAME chains, NODATA/NXDOMAIN, EDNS echo. Non-local forwards on.
     // 3. XDP_FALLBACK_TX — upstream recursion, fills the cache for next hit.
     // #187: split-horizon fast path — if the client IP matches a configured view,
     // serve that view's snapshot BEFORE the global cache so per-source overrides win
@@ -1306,7 +1302,8 @@ fn process_packet(
                         return None; // ACL Deny — silent drop
                     }
                 }
-                // Try hickory for wildcard/CNAME/EDNS/BlockPage/NXDOMAIN authoritative.
+                // Try the wire serving core for local zones (records / CNAME /
+                // BlockPage / NODATA / NXDOMAIN). Non-local returns false → forward.
                 if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
                     let len = dns_scratch.len();
                     if dns_off + len > tx.len() {
@@ -1330,7 +1327,7 @@ fn process_packet(
             }
         }
     } else {
-        // No cache — fall through to hickory (covers xdp-cache-snapshot: no).
+        // No cache — fall through to the wire serving core (xdp-cache-snapshot: no).
         if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
             let len = dns_scratch.len();
             if dns_off + len > tx.len() { return None; }
@@ -1943,101 +1940,57 @@ fn answer_dns(
     src_ip: Option<IpAddr>,
     out: &mut Vec<u8>,
 ) -> bool {
-    let msg = match Message::from_bytes(query_bytes) {
+    let query = match crate::dns::wire::Message::parse(query_bytes) {
         Ok(m) => m,
         Err(_) => return false,
     };
-    // #160 RFC 6891 §7: must echo OPT RR in response if query carries one.
-    let req_edns: Option<Edns> = msg.edns.clone();
-    if msg.message_type != MessageType::Query {
+    // Must be a standard query (QR=0, opcode QUERY).
+    if query.header.qr() || query.header.opcode() != crate::dns::wire::consts::opcode::QUERY {
         return false;
     }
-    if msg.op_code != OpCode::Query {
-        return false;
-    }
-
-    let q = match msg.queries.first() {
-        Some(q) => q,
+    let q = match query.first_question() {
+        Some(q) => q.clone(),
         None => return false,
     };
 
-    // ── ACL check ─────────────────────────────────────────────────────────
-    // Applied before zone lookup so that Deny/Refuse clients cannot probe
-    // local zone membership even in the XDP fast path.
+    // ACL: applied before zone lookup so Deny/Refuse clients cannot probe local
+    // zone membership even in the XDP fast path.
     if let Some(ip) = src_ip {
         match acl.check(ip) {
             AclAction::Allow => {}
             AclAction::Deny => return false, // silent drop — no response
             AclAction::Refuse => {
-                // Craft a minimal REFUSED response and send it.
-                let mut refused = Message::new(msg.id, MessageType::Response, OpCode::Query);
-                refused.metadata.response_code = ResponseCode::Refused;
-                refused.metadata.recursion_desired = msg.recursion_desired;
-                refused.add_query(q.clone());
-                let mut enc = BinEncoder::new(out);
-                return refused.emit(&mut enc).is_ok();
+                let mut refused = crate::dns::wire::Message {
+                    header: query.header,
+                    ..Default::default()
+                };
+                refused.header.set_qr(true);
+                refused.header.set_aa(false);
+                refused.header.set_ra(false);
+                refused.header.set_rcode_low(crate::dns::wire::consts::rcode::REFUSED);
+                refused.questions.push(q);
+                out.clear();
+                out.extend_from_slice(&refused.encode());
+                return true;
             }
         }
     }
 
-    let name = LowerName::from(q.name());
-    let rtype = q.query_type();
-
-    // ANY queries go to the normal server (which returns NOTIMP per RFC 8482)
-    if rtype == hickory_proto::rr::RecordType::ANY {
+    // ANY goes to the normal server (which returns NOTIMP per RFC 8482).
+    if q.qtype == crate::dns::wire::consts::rtype::ANY {
         return false;
     }
 
-    let mut resp = Message::new(msg.id, MessageType::Response, OpCode::Query);
-    resp.metadata.recursion_desired = msg.recursion_desired;
-    resp.metadata.recursion_available = false;
-    resp.add_query(q.clone());
-
-    let zone_action = zones.find(&name); match zone_action {
-        Some(ZoneAction::Refuse) => {
-            resp.metadata.response_code = ResponseCode::Refused;
-            resp.metadata.authoritative = false;
+    // Hickory-free local-zone serving: Refuse / NxDomain / BlockPage / Static,
+    // exact records, CNAME chains, NODATA vs NXDOMAIN, EDNS echo.
+    match crate::dns::wire_serve::answer_local(&query, zones) {
+        Some(resp) => {
+            out.clear();
+            out.extend_from_slice(&resp.encode());
+            true
         }
-        Some(ZoneAction::NxDomain) | Some(ZoneAction::BlockPage) => {
-            // BlockPage: if pre-inserted A record exists, return it; otherwise NxDomain
-            let bp_records = zones.local_records(&name, rtype);
-            if matches!(zone_action, Some(ZoneAction::BlockPage)) && !bp_records.is_empty() {
-                resp.metadata.response_code = ResponseCode::NoError;
-                resp.metadata.authoritative = true;
-                for r in bp_records { resp.add_answer(r.clone()); }
-            } else {
-                resp.metadata.response_code = ResponseCode::NXDomain;
-                resp.metadata.authoritative = true;
-            }
-        }
-        Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
-            resp.metadata.authoritative = true;
-            let records = zones.local_records(&name, rtype);
-            if !records.is_empty() {
-                resp.metadata.response_code = ResponseCode::NoError;
-                for r in records {
-                    resp.add_answer(r.clone());
-                }
-            } else if zones.name_has_records(&name) {
-                // NODATA — name exists, wrong type (RFC 2308)
-                resp.metadata.response_code = ResponseCode::NoError;
-            } else {
-                resp.metadata.response_code = ResponseCode::NXDomain;
-            }
-        }
-        // Name not in any local zone — forward to kernel / hickory-server
-        None => return false,
+        None => false, // not authoritative — forward upstream
     }
-
-    // #160 RFC 6891 §7: echo OPT RR — client payload capped to 1232, DO bit reflected.
-    if let Some(req_opt) = req_edns {
-        let mut resp_edns = Edns::new();
-        resp_edns.set_max_payload(req_opt.max_payload().min(1232).max(512));
-        resp_edns.flags_mut().dnssec_ok = req_opt.flags().dnssec_ok;
-        resp.set_edns(resp_edns);
-    }
-    let mut enc = BinEncoder::new(out);
-    resp.emit(&mut enc).is_ok()
 }
 
 // ── Checksum helpers ──────────────────────────────────────────────────────────
