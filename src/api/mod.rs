@@ -7281,6 +7281,11 @@ async fn put_alert_rules(
         if r.action == "notify" && r.notify_url.as_deref().unwrap_or("").is_empty() {
             return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"MISSING_NOTIFY_URL","details":"action=notify requires notify-url"}))).into_response();
         }
+        if let Some(u) = &r.notify_url {
+            if u.len() > 2048 || u.contains(|c: char| c.is_control()) {
+                return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_NOTIFY_URL","details":"notify-url must be <=2048 chars with no control characters"}))).into_response();
+            }
+        }
         out.push(crate::config::parser::AlertRule {
             name,
             metric: r.metric,

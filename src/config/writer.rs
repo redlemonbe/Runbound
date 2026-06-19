@@ -307,12 +307,12 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     // ── alert blocks ─────────────────────────────────────────────────────
     for al in &cfg.alerts {
         o.push_str("\nalert:\n");
-        o.push_str(&format!("    name: \"{}\"\n", al.name));
-        o.push_str(&format!("    metric: \"{}\"\n", al.metric));
+        o.push_str(&format!("    name: \"{}\"\n", escape_str(&al.name)));
+        o.push_str(&format!("    metric: \"{}\"\n", escape_str(&al.metric)));
         o.push_str(&format!("    window-s: {}\n", al.window_s));
         o.push_str(&format!("    threshold: {}\n", al.threshold));
-        o.push_str(&format!("    action: \"{}\"\n", al.action));
-        if let Some(u) = &al.notify_url { o.push_str(&format!("    notify-url: \"{u}\"\n")); }
+        o.push_str(&format!("    action: \"{}\"\n", escape_str(&al.action)));
+        if let Some(u) = &al.notify_url { o.push_str(&format!("    notify-url: \"{}\"\n", escape_str(u))); }
         o.push_str(&format!("    block-duration-s: {}\n", al.block_duration_s));
     }
 
