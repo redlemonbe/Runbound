@@ -52,6 +52,20 @@ files). Concretely:
 So removing hickory from the data path = **re-keying the data model on
 `wire::Name` / `wire::Record`**, then everything else falls out.
 
+**Refinement found while wiring:** the *hot* path is already hickory-free at
+query time — A/AAAA serve from `wire_records` (a wire-keyed index) + the XDP
+cache, with no hickory access per packet. hickory in `local.rs` is at **load
+time** (`parse_local_data` builds hickory `Record`s) and in the **slow path**
+(`answer_dns` serves hickory `Record`s). So phase 2 splits cleanly:
+load-time parsing (replaceable now — see below) and slow-path serving (phase 3).
+
+### Phase 2 progress
+
+- **Done:** `wire::present::parse_rr_line` — a hickory-free presentation parser
+  for `local-data`, proven byte-identical to `parse_local_data` for
+  A/AAAA/NS/CNAME/PTR/MX/TXT/SRV (differential test). The rarer types
+  (CAA/SSHFP/TLSA/NAPTR) are next, then the zone store builds from our records.
+
 ## Phase ladder (each rung ships, is A/B benched, rolls back trivially)
 
 - **Phase 1 — own codec. DONE.** `src/dns/wire/`: bounds-checked decoder,

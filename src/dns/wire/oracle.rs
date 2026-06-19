@@ -222,6 +222,47 @@ fn wire_name_is_a_valid_lookup_key() {
     }
 }
 
+/// Phase-2 increment: our hickory-free presentation parser
+/// (`wire::present::parse_rr_line`) must produce records byte-identical to the
+/// existing hickory parser (`dns::local::parse_local_data`) for every modelled
+/// type — same type, TTL, owner name, and RDATA wire bytes. This is what lets
+/// the zone store be built from our own types instead of hickory's.
+#[test]
+fn parse_rr_line_matches_hickory_parse_local_data() {
+    use crate::dns::local::{name_to_wire_qname, parse_local_data};
+    use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+
+    let fold = |b: &[u8]| b.iter().map(|c| c.to_ascii_lowercase()).collect::<Vec<_>>();
+    let lines = [
+        "host.example.com. 300 A 192.0.2.1",
+        "host.example.com. AAAA 2001:db8::1",
+        "example.com. 3600 IN NS ns1.example.com.",
+        "www.example.com. CNAME cdn.example.net.",
+        "4.3.2.1.in-addr.arpa. 600 PTR host.example.com.",
+        "example.com. 3600 MX 10 mail.example.com.",
+        "example.com. TXT \"v=spf1 -all\"",
+        "_sip._tcp.example.com. SRV 10 60 5060 sip.example.com.",
+    ];
+    for line in lines {
+        let hick = parse_local_data(line).unwrap_or_else(|| panic!("hickory parses {line}"));
+        let mine = wire::present::parse_rr_line(line).unwrap_or_else(|| panic!("ours parses {line}"));
+
+        assert_eq!(mine.rtype, u16::from(hick.record_type()), "{line}: type");
+        assert_eq!(mine.ttl, hick.ttl, "{line}: ttl");
+        assert_eq!(
+            fold(mine.name.wire()),
+            name_to_wire_qname(&hick.name).to_vec(),
+            "{line}: owner name"
+        );
+
+        let mut my_rd = wire::Encoder::uncompressed();
+        mine.rdata.emit(&mut my_rd);
+        let mut hk_rd = Vec::new();
+        hick.data.emit(&mut BinEncoder::new(&mut hk_rd)).unwrap();
+        assert_eq!(fold(my_rd.as_slice()), fold(&hk_rd), "{line}: rdata wire");
+    }
+}
+
 /// Beyond the fixed cases: hundreds of randomly-shaped messages (mixed types,
 /// names, TTLs, section sizes) built and compressed by hickory, round-tripped
 /// through our codec, and canonically compared. This is where odd compression
