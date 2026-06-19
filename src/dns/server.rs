@@ -62,6 +62,13 @@ use crate::stats::{Stats, CACHE_HIT_THRESHOLD_US};
 // A non-blocking try_acquire returns REFUSED instantly without allocating
 // any additional memory, so the bound is hard even at line rate.
 const MAX_INFLIGHT_REQUESTS: usize = 4_096;
+/// #ddos tarpit: cap on concurrently held (slowed) abuser requests + the hold delay.
+const ABUSE_TARPIT_MAX: usize = 256;
+const ABUSE_TARPIT_DELAY: Duration = Duration::from_secs(2);
+static TARPIT_SEMA: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+fn tarpit_sema() -> &'static Semaphore {
+    TARPIT_SEMA.get_or_init(|| Semaphore::new(ABUSE_TARPIT_MAX))
+}
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 
@@ -1704,9 +1711,16 @@ impl RequestHandler for RunboundHandler {
             // non-UDP transports (connection-verified) or a valid UDP server cookie.
             let verified = info.protocol != DnsProtocol::Udp
                 || cookie_verified(&self.cookie_secret, request, client_ip);
-            if at.record(client_ip, verified) {
-                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
-                return send_error(request, response_handle, ResponseCode::Refused).await;
+            match at.record(client_ip, verified) {
+                crate::alerts::AbuseVerdict::Block => {
+                    self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
+                    return send_error(request, response_handle, ResponseCode::Refused).await;
+                }
+                crate::alerts::AbuseVerdict::Tarpit => {
+                    self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
+                    return tarpit_response(request, response_handle).await;
+                }
+                crate::alerts::AbuseVerdict::Serve => {}
             }
         }
 
@@ -2110,6 +2124,19 @@ async fn send_cookie_badcookie<R: ResponseHandler>(
             error!("send: {err}");
             servfail_info(request)
         })
+}
+
+/// Tarpit a verified abuser (#ddos): hold the request a bounded delay, then answer
+/// REFUSED. On TCP/DoT/DoH this keeps the attacker's connection occupied at near-zero
+/// cost to us; the permit cap prevents self-DoS (over the cap we REFUSE immediately).
+async fn tarpit_response<R: ResponseHandler>(
+    request: &Request,
+    response_handle: R,
+) -> ResponseInfo {
+    if let Ok(_permit) = tarpit_sema().try_acquire() {
+        tokio::time::sleep(ABUSE_TARPIT_DELAY).await;
+    }
+    send_error(request, response_handle, ResponseCode::Refused).await
 }
 
 async fn send_error<R: ResponseHandler>(

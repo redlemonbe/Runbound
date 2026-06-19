@@ -37,10 +37,20 @@ struct BlockEntry {
     rule: String,
 }
 
+/// Verdict for a recorded query (#ddos): Serve = let through; Tarpit = delayed
+/// REFUSED to waste a verified abuser's time on connection transports; Block = drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbuseVerdict {
+    Serve,
+    Tarpit,
+    Block,
+}
+
 pub struct AlertTracker {
     rules: std::sync::RwLock<Vec<AlertRule>>,
     client_counts: DashMap<IpAddr, ClientBucket, ahash::RandomState>,
     blocked: DashMap<IpAddr, BlockEntry, ahash::RandomState>,
+    tarpitted: DashMap<IpAddr, BlockEntry, ahash::RandomState>,
     recent: Mutex<VecDeque<AlertEvent>>,
     notify_tx: tokio::sync::mpsc::UnboundedSender<(String, AlertEvent)>,
     base_dir: Option<Arc<PathBuf>>,
@@ -55,6 +65,7 @@ impl AlertTracker {
             rules: std::sync::RwLock::new(rules),
             client_counts: DashMap::with_hasher(ahash::RandomState::default()),
             blocked: DashMap::with_hasher(ahash::RandomState::default()),
+            tarpitted: DashMap::with_hasher(ahash::RandomState::default()),
             recent: Mutex::new(VecDeque::new()),
             notify_tx: tx,
             base_dir: base_dir_arc,
@@ -143,6 +154,21 @@ impl AlertTracker {
         false
     }
 
+    /// Returns true if this IP is currently tarpitted (delayed responses).
+    pub fn is_tarpitted(&self, ip: IpAddr) -> bool {
+        if let Some(entry) = self.tarpitted.get(&ip) {
+            match entry.expires {
+                None => return true,
+                Some(exp) if Instant::now() < exp => return true,
+                Some(_) => {
+                    drop(entry);
+                    self.tarpitted.remove(&ip);
+                }
+            }
+        }
+        false
+    }
+
     /// Record a query from `ip`. Returns true if the query should be blocked.
     ///
     /// `verified` is true only when the source IP is proven not spoofed: TCP / DoT /
@@ -151,21 +177,21 @@ impl AlertTracker {
     /// sources — blocking on a spoofable UDP source would let an attacker spoof a
     /// victim's IP and get the victim banned (anti-spoof gate, #ddos). Unverified
     /// UDP floods are handled by the rate limiter + DNS cookies, not by banning.
-    pub fn record(&self, ip: IpAddr, verified: bool) -> bool {
+    pub fn record(&self, ip: IpAddr, verified: bool) -> AbuseVerdict {
         if self.rules.read().unwrap().is_empty() {
-            return false;
+            return AbuseVerdict::Serve;
         }
 
         // Honour an existing block for every source — a ban set while a source was
         // verified still drops later (possibly spoofed) packets claiming that IP,
         // which causes no new harm.
         if self.is_blocked(ip) {
-            return true;
+            return AbuseVerdict::Block;
         }
 
         // Anti-spoof: never count or escalate an unverified source.
         if !verified {
-            return false;
+            return AbuseVerdict::Serve;
         }
 
         let now = Instant::now();
@@ -212,7 +238,13 @@ impl AlertTracker {
             }
         }
 
-        self.is_blocked(ip)
+        if self.is_blocked(ip) {
+            AbuseVerdict::Block
+        } else if self.is_tarpitted(ip) {
+            AbuseVerdict::Tarpit
+        } else {
+            AbuseVerdict::Serve
+        }
     }
 
     fn trigger(&self, ip: IpAddr, rule: &AlertRule, count: u64, now: Instant) {
@@ -248,6 +280,18 @@ impl AlertTracker {
                     };
                     self.blocked.insert(ip, BlockEntry { expires, rule: rule.name.clone() });
                     self.persist_blocks();
+                }
+            }
+            "tarpit" => {
+                if !self.tarpitted.contains_key(&ip) && self.tarpitted.len() >= MAX_BLOCKED_ENTRIES {
+                    tracing::warn!(ip = %ip, "tarpit map full -- entry dropped");
+                } else {
+                    let expires = if rule.block_duration_s == 0 {
+                        None
+                    } else {
+                        Some(now + std::time::Duration::from_secs(rule.block_duration_s))
+                    };
+                    self.tarpitted.insert(ip, BlockEntry { expires, rule: rule.name.clone() });
                 }
             }
             "notify" => {
