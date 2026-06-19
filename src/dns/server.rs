@@ -2732,6 +2732,7 @@ async fn run_tcp_with_limit(
     tracker: Arc<TcpConnTracker>,
     conn_timeout: Duration,
     acl: Arc<Acl>,
+    proxy_protocol: bool,
 ) {
     loop {
         let (mut client, peer) = match public_tcp.accept().await {
@@ -2741,12 +2742,23 @@ async fn run_tcp_with_limit(
                 continue;
             }
         };
+        // #21: PROXY protocol v2 — when enabled, the real client IP is carried in a
+        // header prepended by the L4 load balancer; the socket peer is the LB. The
+        // header is mandatory once enabled: drop connections without a valid one.
+        let raw_ip = if proxy_protocol {
+            match tokio::time::timeout(Duration::from_secs(5), read_proxy_v2(&mut client)).await {
+                Ok(Some(ip)) => ip,
+                _ => continue,
+            }
+        } else {
+            peer.ip()
+        };
         // FIX 2 (VUL-NEW-03): check loopback BEFORE normalize so that ::1
         // is not collapsed to :: (an unrelated /48 prefix) by normalize_tcp_ip.
-        let src_ip = if peer.ip().is_loopback() {
-            peer.ip()
+        let src_ip = if raw_ip.is_loopback() {
+            raw_ip
         } else {
-            normalize_tcp_ip(peer.ip())
+            normalize_tcp_ip(raw_ip)
         };
         // SEC (Cycle I, SEC-I23): enforce the source-IP ACL on the REAL client. The relay
         // to the loopback hickory listener makes the DNS handler see 127.0.0.1, so without
@@ -2773,6 +2785,44 @@ async fn run_tcp_with_limit(
             }
             tracker2.release(src_ip);
         });
+    }
+}
+
+/// Parse a PROXY protocol v2 header (HAProxy/Envoy) off the front of a TCP stream
+/// and return the real client IP. Returns `None` for the LOCAL command, an
+/// unsupported address family, or a malformed/absent header — the caller then
+/// drops the connection (PROXY protocol is mandatory once enabled). (#21)
+async fn read_proxy_v2(stream: &mut TcpStream) -> Option<std::net::IpAddr> {
+    use tokio::io::AsyncReadExt;
+    const SIG: [u8; 12] = [
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+    let mut hdr = [0u8; 16];
+    stream.read_exact(&mut hdr).await.ok()?;
+    if hdr[0..12] != SIG {
+        return None;
+    }
+    if (hdr[12] >> 4) != 0x02 {
+        return None; // version must be 2
+    }
+    let cmd = hdr[12] & 0x0F; // 0 = LOCAL, 1 = PROXY
+    let fam = hdr[13] >> 4; // 1 = AF_INET, 2 = AF_INET6
+    let len = u16::from_be_bytes([hdr[14], hdr[15]]) as usize;
+    let mut addrs = vec![0u8; len];
+    stream.read_exact(&mut addrs).await.ok()?;
+    if cmd != 1 {
+        return None; // LOCAL: no proxied client address
+    }
+    match fam {
+        1 if len >= 12 => Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            addrs[0], addrs[1], addrs[2], addrs[3],
+        ))),
+        2 if len >= 36 => {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&addrs[0..16]);
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(o)))
+        }
+        _ => None,
     }
 }
 
@@ -2809,6 +2859,7 @@ async fn spawn_tls_service(
     interfaces: &[String],
     acl: &Arc<Acl>,
     tcp_tracker: &Arc<TcpConnTracker>,
+    proxy_protocol: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let (certs, key) = match load_tls_materials(tls_cfg) {
@@ -2877,6 +2928,7 @@ async fn spawn_tls_service(
                                 std::sync::Arc::clone(tcp_tracker),
                                 TLS_SESSION_TIMEOUT,
                                 std::sync::Arc::clone(acl),
+                                proxy_protocol,
                             )));
                         }
                     }
@@ -2908,6 +2960,7 @@ async fn spawn_tls_service(
                                 std::sync::Arc::clone(tcp_tracker),
                                 TLS_SESSION_TIMEOUT,
                                 std::sync::Arc::clone(acl),
+                                proxy_protocol,
                             )));
                         }
                     }
@@ -2955,6 +3008,7 @@ async fn tls_supervisor(
     interfaces: Vec<String>,
     acl: Arc<Acl>,
     tcp_tracker: Arc<TcpConnTracker>,
+    proxy_protocol: bool,
 ) {
     fn current_tls(cfg_path: &str) -> TlsConfig {
         crate::config::load(cfg_path)
@@ -2967,6 +3021,7 @@ async fn tls_supervisor(
         &interfaces,
         &acl,
         &tcp_tracker,
+        proxy_protocol,
     )
     .await;
     while rx.recv().await.is_some() {
@@ -2983,6 +3038,7 @@ async fn tls_supervisor(
             &interfaces,
             &acl,
             &tcp_tracker,
+            proxy_protocol,
         )
         .await;
         info!(tasks = handles.len(), "encrypted DNS: hot reload complete");
@@ -3647,6 +3703,7 @@ pub async fn run_dns_server(
             tracker2,
             TCP_SESSION_TIMEOUT,
             Arc::clone(&acl),
+            cfg.proxy_protocol,
         ));
     }
 
@@ -3661,7 +3718,7 @@ pub async fn run_dns_server(
         let ifaces = interfaces.clone();
         let acl_tls = std::sync::Arc::clone(&acl);
         let tracker_tls = std::sync::Arc::clone(&tcp_tracker);
-        tokio::spawn(tls_supervisor(rx, h, cfg_path, ifaces, acl_tls, tracker_tls));
+        tokio::spawn(tls_supervisor(rx, h, cfg_path, ifaces, acl_tls, tracker_tls, cfg.proxy_protocol));
     }
 
 

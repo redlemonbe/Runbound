@@ -430,6 +430,22 @@ pub struct UnboundConfig {
     pub raw_passthrough: Vec<(String, String)>,
     /// Anycast deployment block (None = not configured). See [`AnycastConfig`].
     pub anycast: Option<AnycastConfig>,
+    /// Node identity for anycast / multi-PoP deployments (#21): shown in /health,
+    /// the `runbound_node_info` metric, and the startup log.
+    pub node_id: Option<String>,
+    /// Seconds to keep serving after SIGTERM before exiting, so BGP can withdraw
+    /// the route and in-flight queries drain (#21). Default 5.
+    pub drain_timeout_secs: u64,
+    /// /health returns 503 above this cumulative SERVFAIL percentage (#21, BGP RHI).
+    /// 0 = disabled (/health stays a pure liveness probe).
+    pub health_servfail_threshold: f64,
+    /// /health returns 503 above this p95 latency in ms (#21). 0 = disabled.
+    pub health_latency_threshold_ms: u64,
+    /// /health returns 503 when the 1-minute QPS is below this (#21). 0 = disabled.
+    pub health_min_qps: u64,
+    /// Accept PROXY protocol v2 on TCP (DoT/DoH/TCP-53) so the real client IP behind
+    /// an L4 load balancer is used for ACL / rate-limit / logging (#21). Default off.
+    pub proxy_protocol: bool,
 }
 
 
@@ -513,6 +529,7 @@ impl UnboundConfig {
             ui_brand_logo_url: String::new(),
             ui_accent_color: "#22d3ee".to_string(),
             ui_favicon_url: String::new(),
+            drain_timeout_secs: 5,
             webhooks: vec![],
             ..Default::default()
         }
@@ -1017,6 +1034,12 @@ fn parse_server_directive(
         "ui-accent-color"  => cfg.ui_accent_color  = val.trim().trim_matches('"').to_owned(),
         "ui-favicon-url"   => cfg.ui_favicon_url   = val.trim().trim_matches('"').to_owned(),
         "branding"         => cfg.branding = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
+        "node-id"                   => cfg.node_id = Some(val.trim().trim_matches('"').to_owned()),
+        "drain-timeout"             => cfg.drain_timeout_secs = val.trim().parse().unwrap_or(5),
+        "health-servfail-threshold" => cfg.health_servfail_threshold = val.trim().parse().unwrap_or(0.0),
+        "health-latency-threshold"  => cfg.health_latency_threshold_ms = val.trim().parse().unwrap_or(0),
+        "health-min-qps"            => cfg.health_min_qps = val.trim().parse().unwrap_or(0),
+        "proxy-protocol"            => cfg.proxy_protocol = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }

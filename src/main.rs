@@ -552,6 +552,7 @@ async fn async_main(
     {
         use tokio::signal::unix::{signal, SignalKind};
         let gg = std::sync::Arc::clone(&governor_arc);
+        let drain_secs = cfg.drain_timeout_secs;
         tokio::spawn(async move {
             let mut term = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
@@ -570,6 +571,12 @@ async fn async_main(
             tokio::select! {
                 _ = term.recv() => { info!("SIGTERM received — graceful shutdown"); }
                 _ = intr.recv() => { info!("SIGINT received — graceful shutdown"); }
+            }
+            // #21: drain — keep serving briefly so BGP withdraws the anycast route
+            // and in-flight queries finish before the process exits.
+            if drain_secs > 0 {
+                info!(secs = drain_secs, "draining before exit (anycast: lets BGP converge)");
+                tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
             }
             // Drop all GovernorGuards: restores CPU governor on every XDP core (#158).
             // Multi-interface: one guard per interface; each core returns to its original governor.
@@ -1437,6 +1444,12 @@ async fn build_and_launch(
 
     let state = AppState {
         split_horizon: std::sync::Arc::new(std::sync::Mutex::new(cfg.split_horizon.clone())),
+        node_health: crate::api::NodeHealth {
+            node_id: cfg.node_id.clone(),
+            servfail_threshold: cfg.health_servfail_threshold,
+            latency_threshold_ms: cfg.health_latency_threshold_ms,
+            min_qps: cfg.health_min_qps,
+        },
         zones: Arc::clone(&zones),
         tls_cfg: Arc::clone(&tls_cfg),
         rate_limiter: api::ApiRateLimiter::new_public(),

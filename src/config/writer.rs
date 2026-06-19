@@ -63,6 +63,8 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "ui-acme-domain" | "ui-acme-email" | "ui-acme-dns" | "ui-acme-cf-token" | "ui-acme-hook"
                 | "ui-brand-name" | "ui-brand-logo-url" | "ui-accent-color" | "ui-favicon-url"
                 | "branding"
+                | "node-id" | "drain-timeout" | "health-servfail-threshold"
+                | "health-latency-threshold" | "health-min-qps" | "proxy-protocol"
                 | "ui-tls-san"
                 | "bot-ban-duration-secs" | "bot-honeypot-enabled"
                 | "webhook" | "webhook-url" | "webhook-format" | "webhook-token" | "webhook-events"

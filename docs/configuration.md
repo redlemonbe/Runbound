@@ -1622,6 +1622,34 @@ If `branding: yes` but `branding.conf` is missing, Runbound logs a warning and
 keeps the built-in defaults (or any `ui-brand-*` directives present). A full
 example ships in [`examples/branding.conf`](../examples/branding.conf).
 
+### Anycast readiness & health (#21)
+
+Top-level `server:` directives for running Runbound as a node in an anycast /
+multi-PoP deployment. BGP itself stays external (BIRD/ExaBGP/FRR) and polls
+`/health`.
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `node-id` | (unset) | Node name shown in `/health` (`"node"`), the `runbound_node_info{node=...}` metric, and the startup log. |
+| `drain-timeout` | `5` | Seconds to keep serving after SIGTERM before exit, so BGP can withdraw the route and in-flight queries drain. |
+| `health-servfail-threshold` | `0` (off) | `GET /health` returns **503** when the cumulative SERVFAIL rate exceeds this percent — BGP then withdraws the route. |
+| `health-latency-threshold` | `0` (off) | `/health` returns 503 above this p95 latency (ms). |
+| `health-min-qps` | `0` (off) | `/health` returns 503 when the 1-minute QPS falls below this. |
+| `proxy-protocol` | `no` | Accept **PROXY protocol v2** on TCP (TCP-53 / DoT / DoH) so the real client IP behind an L4 load balancer is used for ACL, rate-limit and logging. Mandatory once enabled: TCP connections without a valid v2 header are dropped. |
+
+`/health` stays a pure `200` liveness probe unless at least one `health-*`
+threshold is set (opt-in, backward-compatible). When armed it also returns 503
+if every upstream is down. PROXY protocol applies to the connection-oriented
+transports only (UDP/DoQ are not a spoofed-amplification vector).
+
+```
+server:
+    node-id:                   "ams-01"
+    drain-timeout:             10
+    health-servfail-threshold: 10.0
+    proxy-protocol:            yes
+```
+
 ### Webhook target (in the `server:` block, repeatable)
 
 A webhook is declared by a `webhook` line, optionally followed by its sub-directives:

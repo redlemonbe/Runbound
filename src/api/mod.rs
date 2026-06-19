@@ -276,6 +276,15 @@ impl ApiRateLimiter {
 
 // ── Shared state ───────────────────────────────────────────────────────────
 
+/// Anycast / health knobs surfaced to the API and /health endpoint (#21).
+#[derive(Clone, Default)]
+pub struct NodeHealth {
+    pub node_id: Option<String>,
+    pub servfail_threshold: f64,
+    pub latency_threshold_ms: u64,
+    pub min_qps: u64,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub zones: Arc<ArcSwap<LocalZoneSet>>,
@@ -352,6 +361,7 @@ pub struct AppState {
     /// runbound.conf; applied to the resolver on the next service restart (the live
     /// resolver's split-horizon table is built at boot and not hot-swapped).
     pub split_horizon: Arc<std::sync::Mutex<Vec<crate::config::parser::SplitHorizonEntry>>>,
+    pub node_health: NodeHealth,
 }
 
 // ── Request types ──────────────────────────────────────────────────────────
@@ -823,22 +833,48 @@ async fn health_handler(State(s): State<AppState>) -> impl IntoResponse {
             list.len() as u32,
         )
     };
-    // #74: dynamic status — "ok" nominal, "degraded" all upstreams down, "error" no upstreams
+    // #21: BGP Route Health Injection — return 503 when degraded so the BGP
+    // daemon (BIRD/ExaBGP/FRR) withdraws the anycast route. Opt-in: 503 only fires
+    // when a health threshold is configured; otherwise /health stays a 200 liveness probe.
+    let nh = &s.node_health;
+    let total = snap.total.max(1);
+    let servfail_pct = snap.servfail as f64 / total as f64 * 100.0;
+    let armed = nh.servfail_threshold > 0.0 || nh.latency_threshold_ms > 0 || nh.min_qps > 0;
+    let mut reason: Option<String> = None;
+    if nh.servfail_threshold > 0.0 && servfail_pct > nh.servfail_threshold {
+        reason = Some(format!("servfail {servfail_pct:.1}% > {:.1}%", nh.servfail_threshold));
+    }
+    if reason.is_none() && nh.latency_threshold_ms > 0 && snap.latency_p95_ms > nh.latency_threshold_ms as f64 {
+        reason = Some(format!("p95 latency {:.0}ms > {}ms", snap.latency_p95_ms, nh.latency_threshold_ms));
+    }
+    if reason.is_none() && nh.min_qps > 0 && (snap.qps_1m as u64) < nh.min_qps {
+        reason = Some(format!("qps {:.0} < {}", snap.qps_1m, nh.min_qps));
+    }
+    if reason.is_none() && armed && upstreams_total > 0 && upstreams_healthy == 0 {
+        reason = Some("all upstreams down".to_string());
+    }
     let status = if upstreams_total == 0 {
         "error"
-    } else if upstreams_healthy == 0 {
+    } else if upstreams_healthy == 0 || reason.is_some() {
         "degraded"
     } else {
         "ok"
     };
-    JsonExtract(serde_json::json!({
+    let code = if reason.is_some() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (code, JsonExtract(serde_json::json!({
         "status":            status,
+        "node":              nh.node_id,
         "uptime_secs":       snap.uptime_secs,
         "xdp_active":        xdp_active,
         "upstreams_healthy": upstreams_healthy,
         "upstreams_total":   upstreams_total,
         "cache_entries":     snap.cache_entries,
-    }))
+        "reason":            reason,
+    })))
 }
 
 // ── GET /api/icmp/stats (#89) ─────────────────────────────────────────────
@@ -3518,8 +3554,13 @@ fn render_prometheus_metrics(
     evictions: u64,
     xdp_active: bool,
     upstreams: &[UpstreamMetric],
+    node_id: Option<&str>,
 ) -> String {
     let mut out = String::with_capacity(2048);
+    if let Some(n) = node_id {
+        out.push_str("# HELP runbound_node_info Node identity for multi-PoP/anycast deployments.\n# TYPE runbound_node_info gauge\n");
+        out.push_str(&format!("runbound_node_info{{node=\"{}\"}} 1\n", n));
+    }
     out.push_str(&fmt_counter(
         "runbound_queries_total",
         "Total DNS queries received",
@@ -3728,6 +3769,7 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
             evictions,
             xdp_active,
             &upstreams,
+            s.node_health.node_id.as_deref(),
         ),
     )
 }
@@ -4476,6 +4518,7 @@ mod tests {
         let stats_cache = crate::stats::new_snapshot_cache(&stats);
         let state = AppState {
             split_horizon: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            node_health: NodeHealth::default(),
             zones: Arc::clone(&zones),
             zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
             tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
@@ -6652,6 +6695,7 @@ mod tests {
         let stats_cache = crate::stats::new_snapshot_cache(&stats);
         let state = AppState {
             split_horizon: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            node_health: NodeHealth::default(),
             zones: Arc::clone(&zones),
             zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
             tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
