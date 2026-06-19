@@ -14,6 +14,7 @@ pub mod ratelimit;
 pub mod server;
 pub mod recursor;
 pub mod zone_signer;
+pub mod wire;
 pub mod xdp;
 
 pub use acl::Acl;
