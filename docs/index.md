@@ -46,7 +46,7 @@ Complete reference for Runbound. Each page targets the current stable release an
 
 | Page | What you will find |
 |------|--------------------|
-| [api.md](api.md) | Complete REST API reference — every endpoint, field, and error code |
+| [api.md](api.md) | Complete REST API reference — every endpoint, field, and error code (incl. Prometheus `/metrics`, DDoS alert-rules, tarpit, audit search) |
 
 ---
 
@@ -56,7 +56,7 @@ Complete reference for Runbound. Each page targets the current stable release an
 |------|--------------------|
 | [security.md](security.md) | Security features — ACL, rate limiting, DNS rebinding, DNSSEC, CHAOS class |
 | [hardening.md](hardening.md) | systemd hardening deep-dive — every directive explained, what breaks if missing |
-| [security-audit/SECURITY-AUDIT.md](security-audit/SECURITY-AUDIT.md) | Master audit document — all cycles (A through H), current finding statuses, known limitations |
+| [security-audit/SECURITY-AUDIT.md](security-audit/SECURITY-AUDIT.md) | Master audit document — all cycles (A through M), current finding statuses, known limitations |
 | [audit.md](audit.md) | Supply-chain audit — dependency scanning, cargo-deny, RUSTSEC cadence |
 | [hsm.md](hsm.md) | HSM / PKCS#11 integration — hardware key storage, HMAC audit log |
 | [gdpr.md](gdpr.md) | GDPR compliance guide — data inventory, `log-client-ip`, retention |
