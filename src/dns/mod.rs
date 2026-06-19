@@ -14,6 +14,7 @@ pub mod ratelimit;
 pub mod server;
 pub mod recursor;
 pub mod zone_signer;
+pub mod udp_server;
 pub mod wire;
 pub mod wire_bridge;
 pub mod wire_serve;
