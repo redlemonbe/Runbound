@@ -276,6 +276,7 @@
   <button role="tab" aria-selected="false" aria-controls="tab-system"     class="py-3 px-3 transition-colors hover:text-gray-300 ml-auto" onclick="showTab('system',this)">System</button>
   <button role="tab" aria-selected="false" aria-controls="tab-settings"   class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('settings',this)">Settings</button>
   <button role="tab" aria-selected="false" aria-controls="tab-about"      class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('about',this)">About</button>
+  <button role="tab" aria-selected="false" aria-controls="tab-account"    class="py-3 px-3 transition-colors hover:text-gray-300" onclick="showTab('account',this)">Account</button>
 </nav>
 
 <div class="p-5 max-w-6xl mx-auto">
@@ -652,7 +653,7 @@
   </div>
 
   <!-- ═══ ABOUT ═══ -->
-  <div id="tab-about" class="hidden fade max-w-3xl mx-auto">
+  <div id="tab-about" class="hidden fade max-w-5xl mx-auto">
     <div class="flex items-center gap-3 mb-2">
       <span id="brand-name-login" class="text-cyan-400 font-bold text-2xl tracking-widest" style="text-shadow:0 0 18px #22d3ee44">RUNBOUND</span>
       <span id="about-version" class="badge" style="background:#0e2233;color:#67e8f9;border:1px solid #164e63">—</span>
@@ -734,7 +735,7 @@
 </div>
 
   <!-- ═══ SETTINGS ═══ -->
-  <div id="tab-settings" class="hidden fade max-w-2xl mx-auto">
+  <div id="tab-settings" class="hidden fade max-w-5xl mx-auto">
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DNSSEC Validation</div>
       <div class="flex items-start justify-between gap-4 mb-3">
@@ -807,6 +808,10 @@
       </div>
       <p id="tls-msg" class="text-xs mt-3"></p>
     </div>
+  </div>
+
+  <!-- ACCOUNT -->
+  <div id="tab-account" class="hidden fade max-w-5xl mx-auto">
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-4">Change Password</div>
       <div class="space-y-3 max-w-sm" style="padding-left:3px">
@@ -840,13 +845,13 @@
         <button onclick="loadAuthEvents()" class="btn-secondary text-xs">Refresh</button>
       </div>
       <div id="auth-events-list" class="space-y-1 font-mono text-xs">
-        <span class="text-gray-700">Open Settings to load…</span>
+        <span class="text-gray-700">Open Account to load…</span>
       </div>
     </div>
   </div>
 
   <!-- ═══ USERS ═══ -->
-  <div id="tab-users" class="hidden fade max-w-3xl mx-auto">
+  <div id="tab-users" class="hidden fade max-w-5xl mx-auto">
     <div id="users-disabled-notice" class="hidden card mb-4 text-xs text-yellow-400">
       Multi-user mode is disabled. To enable it, create <code class="font-mono bg-gray-800 px-1 rounded">users.json</code>
       in the Runbound data directory and restart the service.
@@ -1622,7 +1627,7 @@ function toast(msg,err=false){const el=document.getElementById('toast');el.textC
 function showTab(name,btn){
   if(name!=='logs'){clearInterval(logsTimer);logsTimer=null;const cb=document.getElementById('logs-auto');if(cb)cb.checked=false;}
   if(name!=='protection'){clearInterval(protectionTimer);protectionTimer=null;}
-  ['overview','dns','blacklist','feeds','upstreams','splithz','logs','system','protection','about','settings','users'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
+  ['overview','dns','blacklist','feeds','upstreams','splithz','logs','system','protection','about','settings','users','account'].forEach(t=>document.getElementById('tab-'+t).classList.add('hidden'));
   document.querySelectorAll('.tab-active').forEach(b=>{b.classList.remove('tab-active');b.setAttribute('aria-selected','false');});
   const el=document.getElementById('tab-'+name);el.classList.remove('hidden');el.classList.add('fade');
   btn.classList.add('tab-active');btn.setAttribute('aria-selected','true');
@@ -1634,7 +1639,8 @@ function showTab(name,btn){
   if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
   if(name==='protection'){loadProtection();protectionTimer=setInterval(loadProtection,4000);}
-  if(name==='settings'){initDnssecToggle();initResolutionToggle();loadAuthEvents();initCaCard();loadTlsStatus();}
+  if(name==='settings'){initDnssecToggle();initResolutionToggle();initCaCard();loadTlsStatus();}
+  if(name==='account'){loadAuthEvents();}
   if(name==='users'){loadUsers();}
 }
 
@@ -1940,7 +1946,7 @@ async function checkDefaultPassword(){
 }
 function goChangePassword(){
   document.getElementById('default-pw-modal').style.display='none';
-  showTab('settings', document.querySelector('button[aria-controls="tab-settings"]'));
+  showTab('account', document.querySelector('button[aria-controls="tab-account"]'));
   setTimeout(()=>{const u=document.getElementById('set-new-pass'); if(u){u.scrollIntoView({behavior:'smooth',block:'center'}); u.focus();}},150);
 }
 window.onload=()=>{ applyBranding(); loadAll(); resetIdleTimer(); checkDefaultPassword(); };
