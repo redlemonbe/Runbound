@@ -186,6 +186,31 @@ These mutations are **admin-only** and persist the `tls-service-*` directives. T
 listeners are then **(re)bound live** — no process restart, and the plain UDP/TCP :53 path is
 never interrupted (`restart_required: false`). See [api.md](api.md).
 
+### Trusting the generated certificate (browsers / DoH)
+
+A WebUI/API self-signed certificate is **signed by the Runbound Local CA**, not a bare
+self-signed leaf — so a single CA import makes every certificate it issues (DoT, DoH, and the
+WebUI itself) trusted, and the trust survives regeneration/renewal. Browsers refuse a DoH
+resolver whose certificate does not chain to a trusted CA — and Firefox in *Max Protection*
+mode has no fallback, so the network simply appears down. This import is therefore required
+to use DoH from a browser:
+
+1. **Download the CA** — *Settings → Encrypted DNS → Download CA cert…*, or
+   `GET /api/tls/ca` (returns `runbound-ca.pem`, `Content-Type: application/x-pem-file`).
+2. **Import it once** into the client trust store:
+   - **Firefox:** Settings → Privacy & Security → Certificates → View Certificates →
+     *Authorities* → Import → select `runbound-ca.pem` → tick *Trust this CA to identify websites*.
+   - **Linux (system-wide):** `sudo cp runbound-ca.pem /usr/local/share/ca-certificates/runbound-ca.crt && sudo update-ca-certificates`
+   - **macOS:** Keychain Access → *System* → import `runbound-ca.pem` → set *Always Trust*.
+   - **Windows (admin):** `certutil -addstore -f Root runbound-ca.pem`
+3. Point the client at `https://<hostname>/dns-query` (DoH) or `<hostname>:853` (DoT). The
+   `<hostname>` must match a SAN on the certificate — i.e. the hostname you generated it with.
+
+> A publicly-trusted certificate (e.g. Let's Encrypt) needs **no** client import: obtain it
+> out-of-band and load it via *Import certificate…* / `POST /api/tls/import`, or use the
+> built-in ACME flow (Option D) on an internet-reachable host. ACME cannot validate a host
+> that is only reachable on a private LAN (HTTP-01 needs a public port 80).
+
 ## WebUI TLS — auto-generated certificate SANs
 
 ### Default SANs (as of v0.9.44)

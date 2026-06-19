@@ -796,7 +796,9 @@
         <div class="flex gap-2 mt-3 flex-wrap">
           <button onclick="tlsGenSelfSigned()" class="btn-primary text-xs">Generate self-signed</button>
           <button onclick="tlsToggleImport()" class="btn-secondary text-xs">Import certificate…</button>
+          <button onclick="tlsDownloadCA()" class="btn-secondary text-xs">Download CA cert…</button>
         </div>
+        <p class="text-xs text-gray-600 mt-2">A self-signed certificate is signed by the <span class="text-gray-400">Runbound Local CA</span>. Browsers don&#39;t trust it until you <span class="text-gray-400">download the CA and import it once</span> into your browser/OS trust store — then Firefox/Chrome accept DoT/DoH (and the WebUI). Have a real certificate (e.g. Let&#39;s Encrypt)? Use “Import certificate…” instead.</p>
         <div id="tls-import-box" class="hidden mt-3 space-y-2">
           <div>
             <label class="text-xs text-gray-500 block mb-1">Certificate (PEM — full chain)</label>
@@ -2074,6 +2076,19 @@ function tlsPorts(){
   return { dot_port:p('tls-dot-port'), doh_port:p('tls-doh-port'), doq_port:p('tls-doq-port') };
 }
 function tlsToggleImport(){ document.getElementById('tls-import-box').classList.toggle('hidden'); }
+async function tlsDownloadCA(){
+  try {
+    const r = await fetch(BASE+'/tls/ca', {credentials:'same-origin'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'runbound-ca.pem';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    tlsMsg('CA certificate downloaded — import it once into your browser/OS trust store, then DoT/DoH is trusted.', true);
+  } catch(e){ tlsMsg('CA download failed: '+e.message, false); }
+}
 function tlsMsg(m, ok){ const e=document.getElementById('tls-msg'); if(!e)return; e.textContent=m; e.className='text-xs mt-3 '+(ok?'text-emerald-400':'text-red-400'); }
 async function tlsToggle(){
   const btn = document.getElementById('tls-toggle-btn');

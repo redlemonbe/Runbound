@@ -686,6 +686,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tls", get(tls_status_handler).delete(tls_disable_handler))
         .route("/tls/cert", get(tls_cert_handler))
         .route("/tls/self-signed", post(tls_self_signed_handler))
+        .route("/tls/ca", get(tls_ca_handler))
         .route("/tls/import", post(tls_import_handler))
         // Monitoring
         .route(
@@ -4278,6 +4279,73 @@ async fn tls_cert_handler(State(s): State<AppState>) -> impl IntoResponse {
     .into_response()
 }
 
+/// Build a leaf certificate for `host` signed by the Runbound Local CA (shared with
+/// the WebUI), so it chains to a CA the operator imports once. Browsers reject bare
+/// self-signed leaves; a CA-signed leaf becomes trusted once the CA is imported.
+fn tls_sign_leaf_with_ca(
+    host: &str,
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) -> anyhow::Result<(String, String)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let not_before =
+        rcgen::date_time_ymd(1970, 1, 1) + std::time::Duration::from_secs(now.saturating_sub(60));
+    let not_after = not_before + std::time::Duration::from_secs(397 * 24 * 3600);
+
+    let ca_key =
+        rcgen::KeyPair::from_pem(ca_key_pem).map_err(|e| anyhow::anyhow!("load CA key: {e}"))?;
+    let ca_cert = rcgen::CertificateParams::from_ca_cert_pem(ca_cert_pem)
+        .map_err(|e| anyhow::anyhow!("load CA cert: {e}"))?
+        .self_signed(&ca_key)
+        .map_err(|e| anyhow::anyhow!("CA re-sign: {e}"))?;
+
+    let mut params =
+        rcgen::CertificateParams::new(vec![]).map_err(|e| anyhow::anyhow!("leaf params: {e}"))?;
+    params.not_before = not_before;
+    params.not_after = not_after;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, host);
+    // SANs: the hostname (DNS name or IP literal) + loopback, for local testing.
+    for san in [host, "localhost", "127.0.0.1"] {
+        if let Ok(ip) = san.parse::<std::net::IpAddr>() {
+            params.subject_alt_names.push(rcgen::SanType::IpAddress(ip));
+        } else if let Ok(ia5) = rcgen::Ia5String::try_from(san) {
+            params.subject_alt_names.push(rcgen::SanType::DnsName(ia5));
+        }
+    }
+
+    let key_pair = rcgen::KeyPair::generate().map_err(|e| anyhow::anyhow!("leaf key gen: {e}"))?;
+    let cert = params
+        .signed_by(&key_pair, &ca_cert, &ca_key)
+        .map_err(|e| anyhow::anyhow!("leaf sign: {e}"))?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+/// GET /api/tls/ca — download the Runbound Local CA certificate (public). Import it
+/// into the browser/OS trust store so the self-signed DoT/DoH cert is trusted.
+async fn tls_ca_handler(State(s): State<AppState>) -> impl IntoResponse {
+    match crate::webui::ensure_webui_ca("", "", &s.base_dir) {
+        Ok((ca_pem, _)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/x-pem-file")
+            .header(
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"runbound-ca.pem\"",
+            )
+            .body(axum::body::Body::from(ca_pem))
+            .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response()),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({ "error": "CA_FAILED", "details": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /api/tls/self-signed — generate a self-signed cert+key, enable DoT/DoH/DoQ.
 async fn tls_self_signed_handler(
     State(s): State<AppState>,
@@ -4304,9 +4372,21 @@ async fn tls_self_signed_handler(
     }
     let cert_path = s.base_dir.join(TLS_CERT_FILE);
     let key_path = s.base_dir.join(TLS_KEY_FILE);
-    let sans = vec![host.clone(), "localhost".to_string(), "127.0.0.1".to_string()];
-    let ck = match rcgen::generate_simple_self_signed(sans) {
-        Ok(c) => c,
+    // Sign the leaf with the Runbound Local CA (shared with the WebUI) so the cert
+    // chains to a CA the operator imports once — browsers reject bare self-signed
+    // leaves. The CA cert is downloadable at GET /api/tls/ca.
+    let (ca_cert_pem, ca_key_pem) = match crate::webui::ensure_webui_ca("", "", &s.base_dir) {
+        Ok(x) => x,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({ "error": "CA_FAILED", "details": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let (cert_pem, key_pem) = match tls_sign_leaf_with_ca(&host, &ca_cert_pem, &ca_key_pem) {
+        Ok(x) => x,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4315,14 +4395,14 @@ async fn tls_self_signed_handler(
                 .into_response()
         }
     };
-    if let Err(e) = std::fs::write(&cert_path, ck.cert.pem()) {
+    if let Err(e) = std::fs::write(&cert_path, cert_pem.as_bytes()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             JsonExtract(serde_json::json!({ "error": "WRITE_CERT", "details": e.to_string() })),
         )
             .into_response();
     }
-    if let Err(e) = tls_write_key_0600(&key_path, ck.key_pair.serialize_pem().as_bytes()) {
+    if let Err(e) = tls_write_key_0600(&key_path, key_pem.as_bytes()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             JsonExtract(serde_json::json!({ "error": "WRITE_KEY", "details": e.to_string() })),
