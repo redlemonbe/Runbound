@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 
-//! Hickory-free plain-UDP slow-path server (de-hickory phase 3 seed).
+//! Hickory-free plain DNS slow-path server — UDP and TCP (de-hickory phase 3 seed).
 //!
-//! This is the first listener that does not go through `hickory-server`: it owns
-//! the socket, parses the query with our codec, serves local zones with
-//! [`crate::dns::wire_serve::answer_local`], and forwards everything else to an
+//! These are the first listeners that do not go through `hickory-server`: they
+//! own the socket, parse the query with our codec, serve local zones with
+//! [`crate::dns::wire_serve::answer_local`], and forward everything else to an
 //! upstream over plain UDP, relaying the answer back. The fast path (XDP) is
-//! unaffected; this is the slow path for `xdp: no` / non-XDP transports.
+//! unaffected; this is the slow path for `xdp: no` / non-XDP transports. TCP
+//! adds the RFC 1035 §4.2.2 two-byte length framing; the serve/forward logic is
+//! shared with UDP.
 //!
-//! Scope of the seed: plain UDP only. The richer forwarding (DoT connection
+//! Scope of the seed: plain UDP/TCP. The richer forwarding (DoT connection
 //! pooling, racing, health) stays on the hickory resolver until phase 4 lifts it
 //! onto our own client; the listener plumbing proven here is what phase 3 grows.
 
@@ -22,7 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 
 use crate::dns::local::LocalZoneSet;
@@ -81,6 +84,43 @@ pub async fn run(
             let resp = handle_datagram(&query, &zones.load(), upstream).await;
             if let Some(bytes) = resp {
                 let _ = sock.send_to(&bytes, peer).await;
+            }
+        });
+    }
+}
+
+/// Plain-TCP DNS server (RFC 1035 §4.2.2 framing: a 2-byte big-endian length
+/// prefixes each message). Same local-serve / forward logic as UDP, one task per
+/// connection, kept alive for back-to-back queries.
+pub async fn run_tcp(
+    listener: TcpListener,
+    zones: Arc<ArcSwap<LocalZoneSet>>,
+    upstream: SocketAddr,
+) -> std::io::Result<()> {
+    loop {
+        let (mut stream, _peer) = listener.accept().await?;
+        let zones = Arc::clone(&zones);
+        tokio::spawn(async move {
+            loop {
+                let mut len_buf = [0u8; 2];
+                if stream.read_exact(&mut len_buf).await.is_err() {
+                    break; // peer closed
+                }
+                let len = u16::from_be_bytes(len_buf) as usize;
+                if len == 0 {
+                    break;
+                }
+                let mut query = vec![0u8; len];
+                if stream.read_exact(&mut query).await.is_err() {
+                    break;
+                }
+                let Some(resp) = handle_datagram(&query, &zones.load(), upstream).await else {
+                    break;
+                };
+                let rlen = (resp.len() as u16).to_be_bytes();
+                if stream.write_all(&rlen).await.is_err() || stream.write_all(&resp).await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -193,6 +233,39 @@ mod tests {
         assert_eq!(
             fwd.answers[0].rdata,
             crate::dns::wire::Rdata::A("203.0.113.9".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_serves_local_with_length_framing() {
+        use tokio::net::TcpStream;
+        let zones = zoneset();
+        let upstream = mock_upstream().await; // unused for a local name
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(run_tcp(listener, zones, upstream));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let q = query_bytes("host.local.", consts::rtype::A);
+        stream
+            .write_all(&(q.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&q).await.unwrap();
+
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; len];
+        stream.read_exact(&mut resp).await.unwrap();
+
+        let m = Message::parse(&resp).unwrap();
+        assert!(m.header.aa());
+        assert_eq!(m.answers.len(), 1);
+        assert_eq!(
+            m.answers[0].rdata,
+            crate::dns::wire::Rdata::A("10.0.0.1".parse().unwrap())
         );
     }
 }
