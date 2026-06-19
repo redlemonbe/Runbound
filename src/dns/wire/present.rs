@@ -96,24 +96,77 @@ pub fn parse_rr_line(rr: &str) -> Option<Record> {
                 target,
             }
         }
-        _ => return None,
-    };
-
-    let rtype_num = match type_str.as_str() {
-        "A" => rtype::A,
-        "AAAA" => rtype::AAAA,
-        "NS" => rtype::NS,
-        "CNAME" => rtype::CNAME,
-        "PTR" => rtype::PTR,
-        "MX" => rtype::MX,
-        "TXT" => rtype::TXT,
-        "SRV" => rtype::SRV,
+        // CAA: flags tag value. hickory only re-encodes the critical bit of the
+        // flags (new_issue/new_issuewild), so mask to 0x80 to stay byte-equal;
+        // the value is the issuer domain with no trailing root dot.
+        "CAA" => {
+            let flags = rest[0].parse::<u8>().ok()? & 0x80;
+            let tag = rest.get(1)?;
+            if *tag != "issue" && *tag != "issuewild" {
+                return None;
+            }
+            let value = rest[2..].join(" ");
+            let value = value.trim_matches('"').trim_end_matches('.');
+            Rdata::Caa {
+                flags,
+                tag: tag.as_bytes().to_vec(),
+                value: value.as_bytes().to_vec(),
+            }
+        }
+        // SSHFP: algorithm fp_type hex_fingerprint → opaque wire RDATA.
+        "SSHFP" => {
+            let algo: u8 = rest[0].parse().ok()?;
+            let fp_type: u8 = rest.get(1)?.parse().ok()?;
+            let fp = hex::decode(rest.get(2)?).ok()?;
+            let mut data = vec![algo, fp_type];
+            data.extend_from_slice(&fp);
+            Rdata::Unknown {
+                rtype: rtype::SSHFP,
+                data,
+            }
+        }
+        // TLSA: cert_usage selector matching_type hex_cert_data → opaque RDATA.
+        "TLSA" => {
+            let cert_usage: u8 = rest[0].parse().ok()?;
+            let selector: u8 = rest.get(1)?.parse().ok()?;
+            let matching: u8 = rest.get(2)?.parse().ok()?;
+            let cert = hex::decode(rest.get(3)?).ok()?;
+            let mut data = vec![cert_usage, selector, matching];
+            data.extend_from_slice(&cert);
+            Rdata::Unknown {
+                rtype: rtype::TLSA,
+                data,
+            }
+        }
+        // NAPTR: order preference "flags" "services" "regexp" replacement.
+        // Char-strings then an uncompressed replacement name (RFC 3403).
+        "NAPTR" => {
+            let order: u16 = rest[0].parse().ok()?;
+            let preference: u16 = rest.get(1)?.parse().ok()?;
+            let mut data = Vec::new();
+            data.extend_from_slice(&order.to_be_bytes());
+            data.extend_from_slice(&preference.to_be_bytes());
+            for i in 2..=4 {
+                let s = rest.get(i)?.trim_matches('"');
+                if s.len() > 255 {
+                    return None;
+                }
+                data.push(s.len() as u8);
+                data.extend_from_slice(s.as_bytes());
+            }
+            let replacement = Name::from_ascii(rest.get(5)?).ok()?;
+            data.extend_from_slice(replacement.wire());
+            Rdata::Unknown {
+                rtype: rtype::NAPTR,
+                data,
+            }
+        }
         _ => return None,
     };
 
     Some(Record {
         name,
-        rtype: rtype_num,
+        rtype: rdata.rtype(),
         rclass: class::IN,
         ttl,
         rdata,
@@ -143,7 +196,8 @@ mod tests {
 
     #[test]
     fn unmodelled_type_is_none() {
-        assert!(parse_rr_line("x.example. 300 TLSA 3 0 1 abcdef").is_none());
+        // DNSKEY is not a local-data type either parser models.
+        assert!(parse_rr_line("x.example. 300 DNSKEY 256 3 8 AwEAAa==").is_none());
     }
 
     #[test]

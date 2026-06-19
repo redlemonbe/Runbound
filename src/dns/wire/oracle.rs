@@ -242,6 +242,10 @@ fn parse_rr_line_matches_hickory_parse_local_data() {
         "example.com. 3600 MX 10 mail.example.com.",
         "example.com. TXT \"v=spf1 -all\"",
         "_sip._tcp.example.com. SRV 10 60 5060 sip.example.com.",
+        "example.com. 300 CAA 0 issue letsencrypt.org",
+        "host.example.com. SSHFP 1 1 123456789abcdef67890123456789abcdef67890",
+        "_443._tcp.example.com. TLSA 3 0 1 abcdef0123456789",
+        "example.com. NAPTR 100 10 \"s\" \"SIP+D2U\" \"\" _sip._udp.example.com.",
     ];
     for line in lines {
         let hick = parse_local_data(line).unwrap_or_else(|| panic!("hickory parses {line}"));
