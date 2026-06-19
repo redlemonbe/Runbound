@@ -4306,6 +4306,12 @@ fn tls_sign_leaf_with_ca(
         rcgen::CertificateParams::new(vec![]).map_err(|e| anyhow::anyhow!("leaf params: {e}"))?;
     params.not_before = not_before;
     params.not_after = not_after;
+    // Emit the Authority Key Identifier (from the CA's Subject Key Identifier) so the
+    // chain verifies under strict X.509 validators (OpenSSL 3 strict mode).
+    params.use_authority_key_identifier_extension = true;
+    // Leaf usage for a TLS server cert (strict validators / OpenSSL 3).
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, host);

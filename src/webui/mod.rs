@@ -856,6 +856,12 @@ fn gen_webui_ca(
     let mut params = rcgen::CertificateParams::new(vec![])
         .map_err(|e| anyhow::anyhow!("CA params: {e}"))?;
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    // KeyUsage for a CA (keyCertSign + cRLSign) — strict X.509 validators reject a
+    // CA that lacks it (#tls-strict).
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
     params.not_before = not_before;
     params.not_after  = not_after;
     params.distinguished_name.push(rcgen::DnType::CommonName, "Runbound Local CA");
