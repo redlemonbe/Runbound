@@ -200,6 +200,14 @@ pub struct RunboundHandler {
     /// #10/#186: compiled split-horizon table — live-swappable so API edits
     /// apply without a restart. Read once per slow-path query via ArcSwap.
     split_horizon: std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>,
+    /// #203: require DNS Cookies (RFC 7873) on UDP.
+    dns_cookies: bool,
+    /// #203: RRL slip ratio (0 = legacy Refused-to-all).
+    rrl_slip: u64,
+    /// #203: per-boot secret for the server cookie HMAC.
+    cookie_secret: [u8; 16],
+    /// #203: counter driving the RRL slip leak.
+    rrl_counter: std::sync::atomic::AtomicU64,
 }
 
 /// #10/#186: compiled split-horizon table — (CidrBlock list, per-subnet LocalZoneSet).
@@ -288,6 +296,8 @@ impl RunboundHandler {
         split_horizon: std::sync::Arc<arc_swap::ArcSwap<SplitHorizonTable>>,
         resolution_mode: Arc<std::sync::atomic::AtomicU8>,
         recursor: crate::dns::recursor::SharedRecursor,
+        dns_cookies: bool,
+        rrl_slip: u64,
     ) -> Self {
         Self {
             zones,
@@ -328,6 +338,14 @@ impl RunboundHandler {
             block_https_record,
 
             split_horizon,
+            dns_cookies,
+            rrl_slip,
+            cookie_secret: {
+                let mut sk = [0u8; 16];
+                let _ = getrandom::fill(&mut sk);
+                sk
+            },
+            rrl_counter: std::sync::atomic::AtomicU64::new(0),
             // SEC-20: decode TSIG keys once at startup instead of per-request.
             tsig_keys: tsig_keys_raw.into_iter().filter_map(|(name, alg_str, secret_b64)| {
                 let alg = match alg_str.as_str() {
@@ -1638,9 +1656,17 @@ impl RequestHandler for RunboundHandler {
             }
         }
 
+        // ── 0. DNS Cookies (RFC 7873) — anti-spoofing on UDP (#203) ────
+        if self.dns_cookies && info.protocol == DnsProtocol::Udp {
+            if let CookieVerdict::NeedCookie(cookie) = cookie_check(&self.cookie_secret, request, client_ip) {
+                debug!(%client_ip, "DNS cookie missing/invalid — BADCOOKIE (anti-spoof)");
+                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
+                return send_cookie_badcookie(request, response_handle, cookie).await;
+            }
+        }
+
         // ── 1. Rate limiting (per source IP) ───────────────────────────
         if !self.rate_limiter.check(client_ip) {
-            warn!(%client_ip, "rate limited");
             self.record_query(
                 client_ip,
                 qname,
@@ -1649,7 +1675,23 @@ impl RequestHandler for RunboundHandler {
                 LogAction::Refused,
                 start,
             );
-            return send_error(request, response_handle, ResponseCode::Refused).await;
+            // #203: RRL with SLIP. slip=0 → legacy (answer Refused to all). slip>0 →
+            // leak 1-in-slip as a Refused response (a legit client learns it is limited)
+            // and silently drop the rest, so a spoofed flood gets zero amplification.
+            if self.rrl_slip == 0 {
+                warn!(%client_ip, "rate limited");
+                return send_error(request, response_handle, ResponseCode::Refused).await;
+            }
+            let n = self.rrl_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % self.rrl_slip == 0 {
+                return send_error(request, response_handle, ResponseCode::Refused).await;
+            }
+            let mut meta = Metadata::response_from_request(&request.metadata);
+            meta.response_code = ResponseCode::Refused;
+            return ResponseInfo::from(hickory_proto::op::Header {
+                metadata: meta,
+                counts: hickory_proto::op::HeaderCounts::default(),
+            });
         }
 
         // ── 1b. Alert threshold check (#12) ────────────────────────────
@@ -1897,6 +1939,79 @@ fn make_opt_edns(request: &MessageRequest) -> Option<Edns> {
     e.set_max_payload(req_edns.max_payload().clamp(512, 1232));
     e.flags_mut().dnssec_ok = req_edns.flags().dnssec_ok;
     Some(e)
+}
+
+/// #203: DNS Cookie verdict for a UDP query.
+enum CookieVerdict {
+    /// Verified (valid server cookie) or not applicable (no/legacy cookie) — answer normally.
+    Ok,
+    /// Unverified client — return BADCOOKIE plus this 16-byte cookie so it retries.
+    NeedCookie(Vec<u8>),
+}
+
+/// Read the raw COOKIE (EDNS option 10) from the request, if present.
+fn read_client_cookie(request: &Request) -> Option<Vec<u8>> {
+    let edns = request.edns.as_ref()?;
+    match edns.option(hickory_proto::rr::rdata::opt::EdnsCode::Cookie)? {
+        hickory_proto::rr::rdata::opt::EdnsOption::Unknown(_, data) => Some(data.clone()),
+        _ => None,
+    }
+}
+
+/// Compute the 8-byte server cookie = HMAC-SHA256(secret, client_cookie || client_ip)[..8].
+fn server_cookie(secret: &[u8; 16], client_cookie: &[u8], ip: IpAddr) -> [u8; 8] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret).expect("hmac key");
+    mac.update(&client_cookie[..client_cookie.len().min(8)]);
+    match ip {
+        IpAddr::V4(a) => mac.update(&a.octets()),
+        IpAddr::V6(a) => mac.update(&a.octets()),
+    }
+    let out = mac.finalize().into_bytes();
+    let mut c = [0u8; 8];
+    c.copy_from_slice(&out[..8]);
+    c
+}
+
+/// Validate the client's DNS Cookie (RFC 7873). Lenient for no-cookie clients;
+/// BADCOOKIE for clients that present a client cookie without a valid server cookie.
+fn cookie_check(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> CookieVerdict {
+    let client_cookie = match read_client_cookie(request) {
+        Some(c) if c.len() >= 8 => c,
+        _ => return CookieVerdict::Ok, // no / malformed cookie → legacy client, answer
+    };
+    let expected = server_cookie(secret, &client_cookie[..8], client_ip);
+    if client_cookie.len() >= 16 {
+        use subtle::ConstantTimeEq;
+        if bool::from(client_cookie[8..16].ct_eq(&expected)) {
+            return CookieVerdict::Ok; // valid server cookie → verified, not spoofed
+        }
+    }
+    let mut full = client_cookie[..8].to_vec();
+    full.extend_from_slice(&expected);
+    CookieVerdict::NeedCookie(full)
+}
+
+/// Send a BADCOOKIE (RFC 7873) response carrying the server cookie so the client retries.
+async fn send_cookie_badcookie<R: ResponseHandler>(
+    request: &Request,
+    mut response_handle: R,
+    cookie: Vec<u8>,
+) -> ResponseInfo {
+    let mut e = make_opt_edns(request).unwrap_or_default();
+    e.options_mut()
+        .insert(hickory_proto::rr::rdata::opt::EdnsOption::Unknown(10, cookie));
+    let mut builder = MessageResponseBuilder::from_message_request(request);
+    builder.edns(&e);
+    let response = builder.error_msg(&request.metadata, ResponseCode::BADCOOKIE);
+    response_handle
+        .send_response(response)
+        .await
+        .unwrap_or_else(|err| {
+            error!("send: {err}");
+            servfail_info(request)
+        })
 }
 
 async fn send_error<R: ResponseHandler>(
@@ -3250,6 +3365,8 @@ pub async fn run_dns_server(
         },
         Arc::clone(&resolution_mode),
         Arc::clone(&recursor),
+        cfg.dns_cookies,
+        cfg.rrl_slip,
     );
     // Step 3b: wrap handler in Arc for sharing between Server and fallback reader.
     let handler_arc = std::sync::Arc::new(handler);

@@ -8,6 +8,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ## [Unreleased]
 
 ### Added
+- **Anti-amplification for public exposure (#203).** `dns-cookies` requires DNS Cookies (RFC 7873) on the UDP slow path — unverified clients get BADCOOKIE + a server cookie and must retry, defeating spoofed-source amplification (legacy cookie-less clients stay answered). `rrl-slip` adds RRL slip: leak 1-in-N over-rate UDP queries and silently drop the rest. `ANY` is already refused (RFC 8482, #180).
 - **Anycast readiness (#21).** `/health` returns **503** when degraded (configurable `health-servfail-threshold` / `health-latency-threshold` / `health-min-qps`) so an external BGP daemon withdraws the route; `node-id` surfaces in `/health`, the `runbound_node_info` metric and logs; `drain-timeout` keeps serving briefly after SIGTERM; `proxy-protocol` accepts PROXY protocol v2 on TCP/DoT/DoH so the real client IP behind an L4 load balancer drives ACL/rate-limit/logging.
 - **Encrypted DNS applies live — no restart.** Enabling, disabling, re-keying or re-porting DoT/DoH/DoQ from the WebUI/API now (re)binds the listeners on a dedicated supervised ServerFuture; the plain UDP/TCP `:53` path is never interrupted (bench-verified: 0 lost queries across enable/rekey/disable). `restart_required` is now always `false`.
 - **WebUI: dedicated Account tab.** Per-user settings (change password, session info, recent auth events) moved out of Settings into their own tab; centred tabs unified to a consistent width.

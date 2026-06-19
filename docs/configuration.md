@@ -1622,6 +1622,19 @@ If `branding: yes` but `branding.conf` is missing, Runbound logs a warning and
 keeps the built-in defaults (or any `ui-brand-*` directives present). A full
 example ships in [`examples/branding.conf`](../examples/branding.conf).
 
+### Anti-amplification — public resolver hardening (#203)
+
+For exposing plain UDP `:53` to the internet. Layered with the existing per-IP
+rate limit (`rate-limit`).
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `dns-cookies` | `no` | Require DNS Cookies (RFC 7873) on UDP. A client that presents a client cookie but no valid server cookie gets **BADCOOKIE** + a fresh server cookie and must retry — a spoofed source never receives the cookie, so it can never pull a full (amplified) answer. Cookie-less legacy clients are still answered (lenient). Enforced on the recursion/forward **slow path** (where large, amplifiable answers are built); cache-hit fast-path answers are ~query-sized (no amplification). |
+| `rrl-slip` | `0` | Response Rate Limiting slip. `0` = answer `Refused` to all over-rate queries (legacy). `N>0` = leak 1-in-`N` over-rate UDP queries as a response and **silently drop** the rest, so a spoofed flood gets zero amplification while a legitimate client still eventually sees a reply. |
+
+`ANY` queries are already refused (RFC 8482, #180) — the classic amplification
+vector — independent of these directives.
+
 ### Anycast readiness & health (#21)
 
 Top-level `server:` directives for running Runbound as a node in an anycast /

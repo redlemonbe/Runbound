@@ -446,6 +446,12 @@ pub struct UnboundConfig {
     /// Accept PROXY protocol v2 on TCP (DoT/DoH/TCP-53) so the real client IP behind
     /// an L4 load balancer is used for ACL / rate-limit / logging (#21). Default off.
     pub proxy_protocol: bool,
+    /// Require DNS Cookies (RFC 7873) on UDP — unverified clients get BADCOOKIE +
+    /// a server cookie and must retry, defeating spoofed-source amplification (#203).
+    pub dns_cookies: bool,
+    /// RRL slip: when rate-limited, leak 1-in-N over-rate UDP queries as a response
+    /// and silently drop the rest (#203). 0 = legacy (answer Refused to all).
+    pub rrl_slip: u64,
 }
 
 
@@ -1040,6 +1046,8 @@ fn parse_server_directive(
         "health-latency-threshold"  => cfg.health_latency_threshold_ms = val.trim().parse().unwrap_or(0),
         "health-min-qps"            => cfg.health_min_qps = val.trim().parse().unwrap_or(0),
         "proxy-protocol"            => cfg.proxy_protocol = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
+        "dns-cookies"               => cfg.dns_cookies = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
+        "rrl-slip"                  => cfg.rrl_slip = val.trim().parse().unwrap_or(0),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }
