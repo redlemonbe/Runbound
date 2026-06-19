@@ -1585,6 +1585,15 @@ impl RunboundHandler {
     }
 }
 
+impl RunboundHandler {
+    /// #ddos: clone of the alert/abuse tracker, so the TCP/DoT/DoH relay can enforce
+    /// bans on the REAL client IP — the handler itself only sees the loopback relay
+    /// address for connection transports.
+    pub fn alert_tracker(&self) -> Option<Arc<crate::alerts::AlertTracker>> {
+        self.alert_tracker.clone()
+    }
+}
+
 #[async_trait]
 impl RequestHandler for RunboundHandler {
     async fn handle_request<R: ResponseHandler, T: Time>(
@@ -1712,11 +1721,17 @@ impl RequestHandler for RunboundHandler {
         }
 
         // ── 1b. Alert threshold check (#12) ────────────────────────────
+        // Connection transports (TCP/DoT/DoH) reach the handler as 127.0.0.1 via the
+        // loopback relay; their abuse detection + ban enforcement happen in the relay
+        // on the REAL client IP (#ddos). Skip loopback here so connection-transport
+        // queries are never mis-attributed to 127.0.0.1 (which would self-DoS by
+        // banning the loopback relay), and so local loopback clients are never banned.
         if let Some(at) = &self.alert_tracker {
             // Anti-spoof gate (#ddos): only escalate sources proven not spoofed —
             // non-UDP transports (connection-verified) or a valid UDP server cookie.
             let verified = info.protocol != DnsProtocol::Udp
                 || cookie_verified(&self.cookie_secret, request, client_ip);
+            if !client_ip.is_loopback() {
             match at.record(client_ip, verified) {
                 crate::alerts::AbuseVerdict::Block => {
                     self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
@@ -1727,6 +1742,7 @@ impl RequestHandler for RunboundHandler {
                     return tarpit_response(request, response_handle).await;
                 }
                 crate::alerts::AbuseVerdict::Serve => {}
+            }
             }
         }
 
@@ -2979,6 +2995,7 @@ async fn run_tcp_with_limit(
     conn_timeout: Duration,
     acl: Arc<Acl>,
     proxy_protocol: bool,
+    alert: Option<Arc<crate::alerts::AlertTracker>>,
 ) {
     loop {
         let (mut client, peer) = match public_tcp.accept().await {
@@ -3013,6 +3030,27 @@ async fn run_tcp_with_limit(
         // ACL as the UDP path.
         if !matches!(acl.check(src_ip), AclAction::Allow) {
             continue;
+        }
+        // #ddos: the handler sees the loopback relay address for connection transports,
+        // so enforce alert verdicts on the REAL client IP here. The TCP/TLS handshake
+        // proves the IP (verified=true). Per-connection granularity.
+        if let Some(at) = &alert {
+            match at.record(raw_ip, true) {
+                crate::alerts::AbuseVerdict::Block => continue,
+                crate::alerts::AbuseVerdict::Tarpit => {
+                    // Hold the attacker's connection a bounded delay, then drop it —
+                    // wastes their time at near-zero cost (capped by the tarpit sema).
+                    if let Ok(permit) = tarpit_sema().try_acquire() {
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            tokio::time::sleep(tarpit_delay()).await;
+                            drop(client);
+                        });
+                    }
+                    continue;
+                }
+                crate::alerts::AbuseVerdict::Serve => {}
+            }
         }
         if !tracker.try_acquire(src_ip) {
             // Over limit: drop immediately (TcpStream closed on drop → TCP FIN/RST)
@@ -3155,6 +3193,7 @@ async fn spawn_tls_service(
     // DoH is served by our own RFC 8484 handler (see doh_service); clone the
     // shared handler before `handler` is moved into the hickory server below.
     let doh_handler = std::sync::Arc::clone(&handler);
+    let alert = handler.alert_tracker();
     let mut server = Server::new(TlsArcHandler(handler));
     for iface in interfaces {
         // DNS-over-TLS (853 TCP) — public listener relays to a loopback hickory listener.
@@ -3178,6 +3217,7 @@ async fn spawn_tls_service(
                                 TLS_SESSION_TIMEOUT,
                                 std::sync::Arc::clone(acl),
                                 proxy_protocol,
+                                alert.clone(),
                             )));
                         }
                     }
@@ -3211,6 +3251,7 @@ async fn spawn_tls_service(
                             TLS_SESSION_TIMEOUT,
                             std::sync::Arc::clone(acl),
                             proxy_protocol,
+                            alert.clone(),
                         )));
                     }
                 }
@@ -4182,6 +4223,7 @@ pub async fn run_dns_server(
             TCP_SESSION_TIMEOUT,
             Arc::clone(&acl),
             cfg.proxy_protocol,
+            Some(Arc::clone(&alert_tracker)),
         ));
     }
 

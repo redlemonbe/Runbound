@@ -132,6 +132,16 @@ struct {
     __type(value, __u8);  // 1 = banned
 } icmp_banned SEC(".maps");
 
+// #ddos: gate for the DNS-path ban lookup. bans_active[0] = 1 when >= 1 IP is
+// banned; the DNS hot path skips the per-packet icmp_banned lookup when it is 0,
+// so an idle server pays only a single array lookup per DNS packet.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} bans_active SEC(".maps");
+
 // DNS wire-format QNAME → u8 (1 = block). Populated/cleared by userspace.
 // Key is the raw QNAME bytes from the DNS packet, zero-padded to 256 bytes.
 // Only the first 128 bytes are matched (covers all practical domain names).
@@ -327,6 +337,17 @@ int dns_xdp(struct xdp_md *ctx)
                 return XDP_PASS;
             if (u->dest != bpf_htons(53))
                 return XDP_PASS;
+            {
+                // #ddos: drop banned IPs' tagged DNS at the kernel (gated).
+                __u32 ba_key = 0;
+                __u32 *ba = bpf_map_lookup_elem(&bans_active, &ba_key);
+                if (ba && *ba) {
+                    __be32 src_ip = ip->saddr;
+                    __u8 *ban = bpf_map_lookup_elem(&icmp_banned, &src_ip);
+                    if (ban && *ban)
+                        return XDP_DROP;
+                }
+            }
             return bpf_redirect_map(&XSKS, ctx->rx_queue_index, XDP_PASS);
         } else if (inner == ETH_P_IPV6) {
             struct ipv6hdr *ip6 = (void *)(vh + 1);
@@ -478,6 +499,28 @@ int dns_xdp(struct xdp_md *ctx)
 
     if (udp->dest != bpf_htons(53))
         return XDP_PASS;
+
+    // ── #ddos: drop DNS from banned IPs at the kernel ────────────────────────────
+    // Gated on bans_active[0]: when no IP is banned the hot path pays one array
+    // lookup and skips the per-IP icmp_banned lookup. IPv4 only (the ban map is v4);
+    // IPv6 bans stay enforced in userspace via the slow path.
+    if (eth_proto == ETH_P_IP) {
+        __u32 ba_key = 0;
+        __u32 *ba = bpf_map_lookup_elem(&bans_active, &ba_key);
+        if (ba && *ba) {
+            struct iphdr *bn_ip = (void *)(eth + 1);
+            if ((void *)(bn_ip + 1) > data_end)
+                return XDP_PASS;
+            __be32 src_ip = bn_ip->saddr;
+            __u8 *ban = bpf_map_lookup_elem(&icmp_banned, &src_ip);
+            if (ban && *ban) {
+                __u32 bk = 2; // STAT_BANNED_DROP
+                __u64 *bv = bpf_map_lookup_elem(&icmp_stats, &bk);
+                if (bv) (*bv)++;
+                return XDP_DROP;
+            }
+        }
+    }
 
     // ── Blacklist fast-block (#153) ──────────────────────────────────────────────
     // IPv4 only: forge NXDOMAIN in-place and XDP_TX back to client (~1 µs RTT).

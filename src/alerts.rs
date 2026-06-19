@@ -183,15 +183,16 @@ impl AlertTracker {
     /// victim's IP and get the victim banned (anti-spoof gate, #ddos). Unverified
     /// UDP floods are handled by the rate limiter + DNS cookies, not by banning.
     pub fn record(&self, ip: IpAddr, verified: bool) -> AbuseVerdict {
-        if self.rules.read().unwrap().is_empty() {
-            return AbuseVerdict::Serve;
-        }
-
-        // Honour an existing block for every source — a ban set while a source was
-        // verified still drops later (possibly spoofed) packets claiming that IP,
-        // which causes no new harm.
+        // Honour an existing block regardless of rules: manual/API bans and bans
+        // restored from disk must be enforced even when no alert rule is configured.
+        // (A ban set while a source was verified still drops later, possibly spoofed,
+        // packets claiming that IP — no new harm.)
         if self.is_blocked(ip) {
             return AbuseVerdict::Block;
+        }
+
+        if self.rules.read().unwrap().is_empty() {
+            return AbuseVerdict::Serve;
         }
 
         // Anti-spoof: never count or escalate an unverified source.
@@ -411,6 +412,7 @@ impl AlertTracker {
         }
         self.blocked.insert(ip, BlockEntry { expires: None, rule: rule.clone() });
         self.persist_blocks();
+        self.xdp_push(ip, true);
         let event = AlertEvent {
             ts: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

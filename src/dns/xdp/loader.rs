@@ -357,6 +357,18 @@ impl XdpHandle {
         hash.insert(ip_be32, 1u8, 0).map_err(|e| e.to_string())
     }
 
+    /// #ddos: set the bans_active gate (1 = >= 1 IP banned). Gates the per-packet
+    /// DNS-path ban lookup so an idle server pays no per-IP lookup.
+    pub fn set_bans_active(&mut self, active: bool) -> Result<(), String> {
+        let map = self
+            .bpf
+            .map_mut("bans_active")
+            .ok_or_else(|| "bans_active map not found".to_string())?;
+        let mut arr = Array::<_, u32>::try_from(map).map_err(|e| e.to_string())?;
+        arr.set(0, if active { 1u32 } else { 0u32 }, 0)
+            .map_err(|e| e.to_string())
+    }
+
     /// Remove `ip_be32` from the BPF `icmp_banned` map (unban).
     pub fn icmp_unban_ip(&mut self, ip_be32: u32) -> Result<(), String> {
         let map = self

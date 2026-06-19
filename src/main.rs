@@ -437,6 +437,8 @@ async fn async_main(
         let mut xdp_handles_all = _xdp_handles; // entire Vec moved into closure
         // Local set of IPs currently banned in BPF — used to detect delta changes.
         let mut bpf_banned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // #ddos: mirror of the BPF bans_active gate (set only on empty<->non-empty).
+        let mut bans_gate = false;
         let mut blacklist_reload_rx = blacklist_reload_rx;
         tokio::spawn(async move {
             let mut last_rate = 0u32;
@@ -474,6 +476,14 @@ async fn async_main(
                             }
                         }
                     }
+                }
+
+                // #ddos: keep the BPF DNS-path ban gate in sync with the ban set, so
+                // the hot path skips the per-IP lookup whenever no IP is banned.
+                let want_gate = !bpf_banned.is_empty();
+                if want_gate != bans_gate {
+                    let _ = h.set_bans_active(want_gate);
+                    bans_gate = want_gate;
                 }
 
                 // #153: Apply pending blacklist reload commands
