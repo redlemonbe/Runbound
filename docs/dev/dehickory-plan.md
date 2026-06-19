@@ -62,9 +62,33 @@ load-time parsing (replaceable now — see below) and slow-path serving (phase 3
 ### Phase 2 progress
 
 - **Done:** `wire::present::parse_rr_line` — a hickory-free presentation parser
-  for `local-data`, proven byte-identical to `parse_local_data` for
-  A/AAAA/NS/CNAME/PTR/MX/TXT/SRV (differential test). The rarer types
-  (CAA/SSHFP/TLSA/NAPTR) are next, then the zone store builds from our records.
+  for `local-data`, proven byte-identical to `parse_local_data` for **all twelve
+  types** (A/AAAA/NS/CNAME/PTR/MX/TXT/SRV/CAA/SSHFP/TLSA/NAPTR) via a differential
+  test. This replaces the load-time parse.
+- **Done:** proof that `wire::Name` preserves hickory's exact wire lookup-key
+  bytes, so re-keying is byte-safe.
+
+### The flip is one coupled refactor (why it stops here, unsupervised)
+
+Storing `wire::Record` instead of hickory `Record` is not local to `local.rs`:
+the hickory `Record` is the **lingua franca of the entire zone subsystem**, read
+and mutated in ~8 prod-critical files:
+
+| Consumer | File |
+|---|---|
+| slow-path serving (`find`/`local_records`/`answer_dns`) | `server.rs`, `xdp/worker.rs` |
+| AXFR zone transfer (iterates `.records`, emits) | `axfr.rs` |
+| dynamic updates (mutates `.records`) | `ddns.rs` |
+| REST zone CRUD (adds/removes `.records`) | `api/mod.rs` |
+| DNSSEC signing | `zone_signer.rs` |
+| master→slave replication | `sync.rs` |
+
+So the storage flip + slow-path serving (phases 2-flip and 3) are a single
+coupled refactor across DDNS / AXFR / signing / API / serving — prod-critical
+paths where a subtle wire-format error is a silent wrong-answer. That is work to
+do **attentively, with the maintainer in the loop and integration tests green**,
+not to rush unsupervised. The foundation it rests on (codec + parser + key
+proof) is landed and proven; the flip itself is the next deliberate step.
 
 ## Phase ladder (each rung ships, is A/B benched, rolls back trivially)
 
