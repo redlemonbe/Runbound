@@ -1989,10 +1989,11 @@ struct DdrInfo {
 
 impl DdrInfo {
     /// Build the SVCB RRset advertised at `_dns.resolver.arpa` (DoT / DoH / DoQ).
-    #[allow(clippy::vec_init_then_push)] // one push per transport, kept readable
     fn svcb_records(&self) -> Vec<hickory_proto::rr::Record> {
         use hickory_proto::rr::rdata::svcb::{Alpn, SvcParamKey, SvcParamValue, Unknown, SVCB};
         use hickory_proto::rr::{Name, RData, Record};
+        /// DDR SVCB TTL (RFC 9462): 2 h — long enough for clients to cache the upgrade.
+        const TTL: u32 = 7200;
         let owner = match Name::from_ascii("_dns.resolver.arpa.") {
             Ok(n) => n,
             Err(_) => return Vec::new(),
@@ -2001,51 +2002,20 @@ impl DdrInfo {
             Ok(n) => n,
             Err(_) => return Vec::new(),
         };
-        let mut recs = Vec::new();
-        // DoT (RFC 7858) — priority 1
-        recs.push(Record::from_rdata(
-            owner.clone(),
-            7200,
-            RData::SVCB(SVCB::new(
-                1,
-                target.clone(),
-                vec![
-                    (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec!["dot".to_string()]))),
-                    (SvcParamKey::Port, SvcParamValue::Port(self.dot_port)),
-                ],
-            )),
-        ));
-        // DoH (RFC 8484) — priority 2, with dohpath (SvcParamKey 7, RFC 9461)
-        recs.push(Record::from_rdata(
-            owner.clone(),
-            7200,
-            RData::SVCB(SVCB::new(
-                2,
-                target.clone(),
-                vec![
-                    (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec!["h2".to_string()]))),
-                    (SvcParamKey::Port, SvcParamValue::Port(self.doh_port)),
-                    (
-                        SvcParamKey::Unknown(7),
-                        SvcParamValue::Unknown(Unknown(b"/dns-query{?dns}".to_vec())),
-                    ),
-                ],
-            )),
-        ));
-        // DoQ (RFC 9250) — priority 3
-        recs.push(Record::from_rdata(
-            owner,
-            7200,
-            RData::SVCB(SVCB::new(
-                3,
-                target,
-                vec![
-                    (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec!["doq".to_string()]))),
-                    (SvcParamKey::Port, SvcParamValue::Port(self.doq_port)),
-                ],
-            )),
-        ));
-        recs
+        let alpn = |a: &str| (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec![a.to_string()])));
+        let port = |p: u16| (SvcParamKey::Port, SvcParamValue::Port(p));
+        let dohpath = (
+            SvcParamKey::Unknown(7),
+            SvcParamValue::Unknown(Unknown(b"/dns-query{?dns}".to_vec())),
+        );
+        vec![
+            // DoT (RFC 7858) — priority 1
+            Record::from_rdata(owner.clone(), TTL, RData::SVCB(SVCB::new(1, target.clone(), vec![alpn("dot"), port(self.dot_port)]))),
+            // DoH (RFC 8484) — priority 2, with dohpath (SvcParamKey 7, RFC 9461)
+            Record::from_rdata(owner.clone(), TTL, RData::SVCB(SVCB::new(2, target.clone(), vec![alpn("h2"), port(self.doh_port), dohpath]))),
+            // DoQ (RFC 9250) — priority 3
+            Record::from_rdata(owner, TTL, RData::SVCB(SVCB::new(3, target, vec![alpn("doq"), port(self.doq_port)]))),
+        ]
     }
 }
 
