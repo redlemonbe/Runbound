@@ -311,6 +311,60 @@ fn records_wire_matches_hickory_store() {
     }
 }
 
+/// The wire-typed zone lookups must agree with the hickory ones they replace.
+#[test]
+fn find_wire_matches_hickory_find() {
+    use crate::config::parser::{LocalData, LocalZone};
+    use crate::dns::local::{name_to_wire_qname, LocalZoneSet};
+    use hickory_proto::rr::{LowerName, Name as HName, RecordType};
+
+    let zones = vec![
+        LocalZone {
+            name: "blocked.example.".into(),
+            zone_type: "always_nxdomain".into(),
+        },
+        LocalZone {
+            name: "refuse.test.".into(),
+            zone_type: "refuse".into(),
+        },
+    ];
+    let data = vec![
+        LocalData {
+            rr: "host.local. A 10.0.0.1".into(),
+        },
+        LocalData {
+            rr: "host.local. AAAA 2001:db8::5".into(),
+        },
+    ];
+    let zs = LocalZoneSet::from_config(&zones, &data);
+
+    for n in [
+        "blocked.example.",
+        "sub.deep.blocked.example.",
+        "refuse.test.",
+        "host.local.",
+        "absent.example.org.",
+        ".",
+    ] {
+        let hn = HName::from_ascii(n).unwrap();
+        let lower = LowerName::from(hn.clone());
+        let wq = name_to_wire_qname(&hn);
+        assert_eq!(zs.find_wire(&wq), zs.find(&lower), "find disagrees for {n}");
+        assert_eq!(
+            zs.name_has_records_wire(&wq),
+            zs.name_has_records(&lower),
+            "name_has_records disagrees for {n}"
+        );
+        for qt in [RecordType::A, RecordType::AAAA, RecordType::MX] {
+            assert_eq!(
+                zs.local_records_wire(&wq, u16::from(qt)).len(),
+                zs.local_records(&lower, qt).len(),
+                "local_records count disagrees for {n}/{qt}"
+            );
+        }
+    }
+}
+
 /// Beyond the fixed cases: hundreds of randomly-shaped messages (mixed types,
 /// names, TTLs, section sizes) built and compressed by hickory, round-tripped
 /// through our codec, and canonically compared. This is where odd compression

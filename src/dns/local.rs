@@ -67,6 +67,9 @@ pub struct LocalZoneSet {
     /// same source so it can be proven equivalent, and consumed by the
     /// hickory-free serving core as consumers migrate off `records`.
     pub records_wire: HashMap<Box<[u8]>, Vec<crate::dns::wire::Record>>,
+    /// De-hickory migration: zone actions keyed by lowercased wire QNAME, the
+    /// wire-typed twin of `zones`. Walked by `find_wire`.
+    pub zones_wire: HashMap<Box<[u8]>, ZoneAction>,
 }
 
 
@@ -177,6 +180,22 @@ impl LocalZoneSet {
                 records_wire.entry(key).or_default().push(wr);
             }
         }
+        // zones_wire mirrors `zones`: explicit zone actions plus an implicit
+        // Static for every local-data name (Unbound behaviour), keyed by wire.
+        let mut zones_wire: HashMap<Box<[u8]>, ZoneAction> = HashMap::new();
+        for z in zones {
+            let n = if z.name.ends_with('.') {
+                z.name.clone()
+            } else {
+                format!("{}.", z.name)
+            };
+            if let Ok(wn) = crate::dns::wire::Name::from_ascii(&n) {
+                zones_wire.insert(wire_name_key(&wn), ZoneAction::from(z.zone_type.as_str()));
+            }
+        }
+        for key in records_wire.keys() {
+            zones_wire.entry(key.clone()).or_insert(ZoneAction::Static);
+        }
 
         // ── Build wire-record index (#156 item 3) ──────────────────────────────
         // Pre-serialise A/AAAA rdata into WireRdata (stack SmallVec) keyed by
@@ -237,7 +256,41 @@ impl LocalZoneSet {
             static_names,
             wire_records: wire_idx,
             records_wire,
+            zones_wire,
         }
+    }
+
+    /// Walk the zone hierarchy by wire QNAME (lowercased), returning the most
+    /// specific zone action — the hickory-free twin of [`LocalZoneSet::find`].
+    /// `q` is a wire-format name `<len><label>…0`; we strip leftmost labels by
+    /// advancing past each length-prefixed label, which yields the parent name.
+    pub fn find_wire(&self, mut q: &[u8]) -> Option<ZoneAction> {
+        loop {
+            if let Some(a) = self.zones_wire.get(q) {
+                return Some(a.clone());
+            }
+            if q.len() <= 1 {
+                return None; // root or empty — nothing more specific above
+            }
+            let skip = 1 + q[0] as usize;
+            if skip >= q.len() {
+                return None;
+            }
+            q = &q[skip..];
+        }
+    }
+
+    /// Exact local records of `qtype` for a wire QNAME (lowercased).
+    pub fn local_records_wire(&self, q: &[u8], qtype: u16) -> Vec<&crate::dns::wire::Record> {
+        self.records_wire
+            .get(q)
+            .map(|recs| recs.iter().filter(|r| r.rtype == qtype).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether a wire QNAME (lowercased) has any record (NODATA vs NXDOMAIN).
+    pub fn name_has_records_wire(&self, q: &[u8]) -> bool {
+        self.records_wire.contains_key(q)
     }
 
     /// Override any existing zone action for `name`.
