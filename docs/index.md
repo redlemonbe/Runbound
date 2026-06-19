@@ -21,6 +21,7 @@ Complete reference for Runbound. Each page targets the current stable release an
 |------|--------------------|
 | [systemd.md](systemd.md) | Production systemd unit — capabilities, hardening, signal handling, log rotation |
 | [web-ui.md](web-ui.md) | Browser dashboard setup (nginx reverse proxy, API key, troubleshooting) |
+| [branding.md](branding.md) | White-label the Web UI — product name, logo, accent colour, favicon and About-tab info via a dedicated `branding.conf` (#25) |
 | [tls.md](tls.md) | DoT / DoH / DoQ certificate configuration, Let's Encrypt ACME |
 | [troubleshooting.md](troubleshooting.md) | Symptoms, causes, and fixes for common deployment issues |
 

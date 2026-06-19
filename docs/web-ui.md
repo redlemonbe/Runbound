@@ -79,11 +79,24 @@ Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
 | **Protection** | ICMP XDP flood protection (enable/disable per node; rate / burst / ban-threshold; per-node stats cards); **Banned source IPs** table (IP, source, age) with per-row **Blacklist** (make permanent) and **Unban** buttons; DDoS alerts log. Bans are enforced on both the XDP fast path and the kernel slow path. |
 | **System** | Runtime info (version, XDP mode, memory, CPU); slave list with sync status and version; full backup download / restore; cache flush button |
 | **Settings** | DNSSEC validation toggle; **Resolution mode** (forward to full-recursion, #202); **Encrypted DNS** panel: enable DoT/DoH/DoQ with a self-signed **or** imported certificate (cert CN/expiry/fingerprint shown); CA certificate download; password change; session info; recent auth event log |
-| **About** | Version badge, uptime, feature list, GitHub links, credits |
+| **About** | Version badge, uptime, feature list, GitHub links, credits; plus a custom organisation / blurb / support-link card when white-label branding is enabled |
 
 The header bar shows: connection dot (blink green = connected, red = error), live
 QPS / query count / uptime, node pills for multi-node selection, **↺ Reload** button
 (`POST /api/reload` — applies config changes without restart), and **⏏ Logout**.
+
+---
+
+## Branding (white-label)
+
+Set `branding: yes` in the main config and place a `branding.conf` next to it to
+re-brand the console: product name, logo, accent colour, favicon, and an About
+card (organisation, blurb, support link). Hex colours work (quote them), and
+branding is **Web UI-only** — it never touches the REST API. The older
+`ui-brand-*` main-config directives remain as a fallback.
+
+Full reference and key table: **[branding.md](branding.md)**. Ready-to-edit
+example: [`examples/branding.conf`](../examples/branding.conf).
 
 ---
 
