@@ -3037,7 +3037,9 @@ async fn run_tcp_with_limit(
         // #ddos: the handler sees the loopback relay address for connection transports,
         // so enforce alert verdicts on the REAL client IP here. The TCP/TLS handshake
         // proves the IP (verified=true). Per-connection granularity.
-        if let Some(at) = &alert {
+        // Loopback never escalates (consistency with the handler; a local process must
+        // not be able to self-ban 127.0.0.1 via the TCP relay) (#ddos).
+        if let (Some(at), false) = (&alert, raw_ip.is_loopback()) {
             match at.record(raw_ip, true) {
                 crate::alerts::AbuseVerdict::Block => continue,
                 crate::alerts::AbuseVerdict::Tarpit => {
