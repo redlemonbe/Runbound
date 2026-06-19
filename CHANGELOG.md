@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+- **White-label branding via a dedicated `branding.conf` file (#25).** Set `branding: yes` in the main config and Runbound loads `branding.conf` from the same directory: `brand-name`, `accent-color`, `logo-url`, `favicon-url`, plus About-tab fields `about-org`, `about-text`, `about-support-url`. Branding is WebUI-only and has **no REST API impact**. Example in `examples/branding.conf`.
+
+### Fixed
+- **Config parser:** a `#` inside a double-quoted value is no longer treated as a comment, so hex colours such as `accent-color: "#22d3ee"` survive parsing (#25).
+
 ## [0.20.0] - 2026-06-18
 
 ### Added

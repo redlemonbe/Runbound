@@ -71,6 +71,9 @@ pub struct WebUiState {
     pub brand_logo_url: String,
     pub accent_color: String,
     pub favicon_url: String,
+    pub about_org: String,
+    pub about_text: String,
+    pub about_support_url: String,
 }
 
 struct WebUiCred {
@@ -93,6 +96,9 @@ pub fn router(
     brand_logo_url: String,
     accent_color: String,
     favicon_url: String,
+    about_org: String,
+    about_text: String,
+    about_support_url: String,
 ) -> Router {
     let auth_path = base_dir.join(CRED_FILE);
     let creds = load_or_default_creds(&auth_path);
@@ -120,6 +126,9 @@ pub fn router(
         brand_logo_url,
         accent_color,
         favicon_url,
+        about_org,
+        about_text,
+        about_support_url,
     });
     // SEC-B10: periodic cleanup of expired sessions (every 5 minutes).
     {
@@ -1021,6 +1030,9 @@ mod tests {
             String::new(),
             "#22d3ee".to_string(),
             String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
         )
     }
 
@@ -1078,11 +1090,14 @@ async fn serve_branding(
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
     let body = format!(
-        r#"{{"brand_name":{},"brand_logo_url":{},"accent_color":{},"favicon_url":{}}}"#,
+        r#"{{"brand_name":{},"brand_logo_url":{},"accent_color":{},"favicon_url":{},"about_org":{},"about_text":{},"about_support_url":{}}}"#,
         serde_json::to_string(&state.brand_name).unwrap_or_default(),
         serde_json::to_string(&state.brand_logo_url).unwrap_or_default(),
         serde_json::to_string(&state.accent_color).unwrap_or_default(),
         serde_json::to_string(&state.favicon_url).unwrap_or_default(),
+        serde_json::to_string(&state.about_org).unwrap_or_default(),
+        serde_json::to_string(&state.about_text).unwrap_or_default(),
+        serde_json::to_string(&state.about_support_url).unwrap_or_default(),
     );
     Response::builder()
         .status(StatusCode::OK)

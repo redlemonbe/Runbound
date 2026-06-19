@@ -1589,6 +1589,39 @@ unless a section header is shown.
 | `ui-accent-color` | `#22d3ee` | Accent colour (hex) for the WebUI theme. |
 | `ui-favicon-url` | (unset) | Favicon URL for white-label branding. |
 
+> The `ui-brand-*` directives above remain valid as a fallback. For a cleaner
+> setup, leave them out of the main config and use a **dedicated branding
+> file** (below) instead — it also enables About-tab customisation.
+
+### White-label branding file (`branding.conf`, #25)
+
+Set `branding: yes` in the `server:` block and Runbound loads a file named
+`branding.conf` from the **same directory as the main config**. It uses the
+same `key: value` syntax; values may be quoted, and **hex colours work** (a `#`
+inside quotes is not treated as a comment). Branding is **WebUI-only** — it is
+never exposed by, nor depends on, the REST API.
+
+```
+server:
+    branding: yes
+```
+
+`branding.conf` (same directory as the main config):
+
+| Key | Example | Description |
+|-----|---------|-------------|
+| `brand-name` | `"ACME DNS"` | Name in the header, login screen and page title. |
+| `accent-color` | `"#7c3aed"` | Any CSS colour; a hex value must be quoted. |
+| `logo-url` | `"https://…/logo.svg"` | Header logo (empty = built-in globe). |
+| `favicon-url` | `"https://…/fav.ico"` | Browser favicon (empty = built-in). |
+| `about-org` | `"ACME Corporation"` | About tab: organisation name (rendered escaped). |
+| `about-text` | `"Internal resolver…"` | About tab: free-text blurb (rendered escaped). |
+| `about-support-url` | `"https://…/support"` | About tab: support link (must be `http(s)://`). |
+
+If `branding: yes` but `branding.conf` is missing, Runbound logs a warning and
+keeps the built-in defaults (or any `ui-brand-*` directives present). A full
+example ships in [`examples/branding.conf`](../examples/branding.conf).
+
 ### Webhook target (in the `server:` block, repeatable)
 
 A webhook is declared by a `webhook` line, optionally followed by its sub-directives:

@@ -62,7 +62,7 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 | Multi-user API | per-user zone isolation |
 | Webhook notifications | Slack / Discord / ntfy |
 | Hot backup / restore | via the API |
-| White-label UI branding | brand name, logo, accent colour, favicon — config directives (#25) |
+| White-label UI branding | name, logo, accent colour, favicon + About-tab info via a dedicated `branding.conf` (#25) |
 
 *¹ Runbound ships both REST API-driven replication and standard AXFR/IXFR zone transfers (RFC 5936, v0.9.13+). AXFR requires explicit ACL configuration — see [docs/configuration.md](docs/configuration.md).
 

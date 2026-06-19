@@ -411,6 +411,15 @@ pub struct UnboundConfig {
     pub ui_accent_color: String,
     /// Custom favicon URL (default: empty = built-in).
     pub ui_favicon_url: String,
+    /// Enable loading a dedicated `branding.conf` next to the main config (#25).
+    /// When `no` (default) branding falls back to the `ui-brand-*` directives.
+    pub branding: bool,
+    /// About-tab organisation name (from branding.conf; escaped on render).
+    pub about_org: String,
+    /// About-tab free-text blurb (from branding.conf; escaped on render).
+    pub about_text: String,
+    /// About-tab support URL (from branding.conf; escaped on render).
+    pub about_support_url: String,
 
     // ── Webhooks (#11) ────────────────────────────────────────────────────────
     /// List of webhook targets for system event notifications.
@@ -532,7 +541,7 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
     let mut current_section = String::new();
 
     for (lineno, raw) in content.lines().enumerate() {
-        let line = raw.split('#').next().unwrap_or("").trim();
+        let line = strip_inline_comment(raw).trim();
         if line.is_empty() {
             continue;
         }
@@ -1007,6 +1016,7 @@ fn parse_server_directive(
         "ui-brand-logo-url" => cfg.ui_brand_logo_url = val.trim().trim_matches('"').to_owned(),
         "ui-accent-color"  => cfg.ui_accent_color  = val.trim().trim_matches('"').to_owned(),
         "ui-favicon-url"   => cfg.ui_favicon_url   = val.trim().trim_matches('"').to_owned(),
+        "branding"         => cfg.branding = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }
@@ -1094,9 +1104,48 @@ fn parse_server_directive(
     Ok(())
 }
 
+/// Strip an inline `#` comment from a config line, but ignore a `#` that
+/// appears inside a double-quoted string. This lets values that legitimately
+/// contain `#` survive -- notably hex colours such as
+/// `ui-accent-color: "#22d3ee"` (#25 white-label branding). A `#` outside
+/// quotes still starts a comment, exactly as before.
+pub(crate) fn strip_inline_comment(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_quotes = !in_quotes,
+            b'#' if !in_quotes => return &raw[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    raw
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- #25: hex colours survive the inline-comment stripper --------------
+    #[test]
+    fn quoted_hash_is_not_a_comment() {
+        let cfg = parse_str("server:\n  ui-accent-color: \"#ff00ff\"\n").unwrap();
+        assert_eq!(cfg.ui_accent_color, "#ff00ff");
+    }
+
+    #[test]
+    fn unquoted_hash_still_starts_a_comment() {
+        let cfg = parse_str("server:\n  ui-brand-name: Acme # my company\n").unwrap();
+        assert_eq!(cfg.ui_brand_name, "Acme");
+    }
+
+    #[test]
+    fn full_line_hash_comment_is_ignored() {
+        let cfg = parse_str("server:\n  # just a comment\n  ui-brand-name: \"X\"\n").unwrap();
+        assert_eq!(cfg.ui_brand_name, "X");
+    }
 
     // ── #202: resolution mode (forward vs full-recursion) ─────────────────
     #[test]

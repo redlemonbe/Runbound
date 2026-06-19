@@ -659,6 +659,11 @@
       <span class="badge" style="background:#1a1a1a;color:#6b7280;border:1px solid #374151">AGPL-3.0</span>
     </div>
     <div class="text-sm mb-5" style="color:#67e8f9;letter-spacing:.06em;text-shadow:0 0 8px #22d3ee22">ASM-Accelerated XDP DNS Server</div>
+    <div id="about-branding" class="card mb-5 hidden">
+      <div id="about-org" class="text-lg font-semibold text-gray-200"></div>
+      <p id="about-text" class="text-sm text-gray-400 mt-1"></p>
+      <a id="about-support" href="#" target="_blank" rel="noopener" class="hidden text-cyan-400 hover:text-cyan-300 text-xs mt-2 inline-block">Support ↗</a>
+    </div>
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
       <div class="card">
         <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Runtime</div>
@@ -1963,6 +1968,15 @@ async function applyBranding() {
       ].join('');
       document.head.appendChild(style);
     }
+    const ab = document.getElementById('about-branding');
+    let abShown = false;
+    if (b.about_org) { const e = document.getElementById('about-org'); if (e) { e.textContent = b.about_org; abShown = true; } }
+    if (b.about_text) { const e = document.getElementById('about-text'); if (e) { e.textContent = b.about_text; abShown = true; } }
+    if (b.about_support_url && /^https?:\/\//i.test(b.about_support_url)) {
+      const e = document.getElementById('about-support');
+      if (e) { e.href = b.about_support_url; e.classList.remove('hidden'); abShown = true; }
+    }
+    if (ab && abShown) ab.classList.remove('hidden');
   } catch(_) {}
 }
 // Settings — DNSSEC toggle + Auth events
