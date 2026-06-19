@@ -412,6 +412,12 @@ async fn async_main(
         let icmp_stats_poll = Arc::clone(&icmp_stats);
         let icmp_cfg_poll = Arc::clone(&icmp_cfg);
         let alert_tracker_poll = Arc::clone(&alert_tracker);
+        // #ddos: route AlertTracker rule blocks to the XDP ban map (line-rate drop),
+        // but ONLY when XDP is actually attached — otherwise nothing drains
+        // ban_cmd_rx and the sends would accumulate unbounded.
+        if !_xdp_handles.is_empty() {
+            alert_tracker.set_ban_tx(icmp_stats.ban_cmd_tx.clone());
+        }
         // Take the receiver from IcmpStats (created in new(), consumed once here).
         let mut ban_cmd_rx = icmp_stats
             .ban_cmd_rx

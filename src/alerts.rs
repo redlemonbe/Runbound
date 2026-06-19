@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use serde::Serialize;
 
 use crate::config::parser::AlertRule;
+use crate::icmp::IcmpBanCmd;
 
 const MAX_CLIENT_BUCKETS: usize = 100_000;
 const RECENT_ALERTS_CAP: usize = 200;
@@ -54,6 +55,8 @@ pub struct AlertTracker {
     recent: Mutex<VecDeque<AlertEvent>>,
     notify_tx: tokio::sync::mpsc::UnboundedSender<(String, AlertEvent)>,
     base_dir: Option<Arc<PathBuf>>,
+    /// #ddos: XDP ban channel — wired only when XDP is attached (set_ban_tx).
+    ban_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>>,
 }
 
 impl AlertTracker {
@@ -69,6 +72,7 @@ impl AlertTracker {
             recent: Mutex::new(VecDeque::new()),
             notify_tx: tx,
             base_dir: base_dir_arc,
+            ban_tx: std::sync::OnceLock::new(),
         });
         tracker.load_blocks();
         tracker
@@ -148,6 +152,7 @@ impl AlertTracker {
                 Some(_) => {
                     drop(entry);
                     self.blocked.remove(&ip);
+                    self.xdp_push(ip, false);
                 }
             }
         }
@@ -280,6 +285,7 @@ impl AlertTracker {
                     };
                     self.blocked.insert(ip, BlockEntry { expires, rule: rule.name.clone() });
                     self.persist_blocks();
+                    self.xdp_push(ip, true);
                 }
             }
             "tarpit" => {
@@ -354,8 +360,36 @@ impl AlertTracker {
     /// Unblock an IP (API: DELETE /api/alerts/blocked/{ip}).
     pub fn unblock(&self, ip: IpAddr) -> bool {
         let removed = self.blocked.remove(&ip).is_some();
-        if removed { self.persist_blocks(); }
+        if removed {
+            self.persist_blocks();
+            self.xdp_push(ip, false);
+        }
         removed
+    }
+
+    /// #ddos: push a block/unblock to the XDP ban map (line-rate XDP_DROP) when an
+    /// XDP ban channel is wired. IPv4 only (the BPF map is v4); IPv6 blocks stay
+    /// enforced in userspace via is_blocked().
+    fn xdp_push(&self, ip: IpAddr, ban: bool) {
+        if let Some(tx) = self.ban_tx.get() {
+            if let IpAddr::V4(v4) = ip {
+                let _ = tx.send(if ban { IcmpBanCmd::Ban(v4) } else { IcmpBanCmd::Unban(v4) });
+            }
+        }
+    }
+
+    /// Wire the XDP ban channel — call ONCE, only when XDP is attached (otherwise
+    /// nothing drains the channel and sends accumulate). Re-syncs already-loaded
+    /// blocks (e.g. restored from disk) into the BPF map.
+    pub fn set_ban_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>) {
+        if self.ban_tx.set(tx).is_err() {
+            return;
+        }
+        for e in self.blocked.iter() {
+            if let IpAddr::V4(v4) = *e.key() {
+                self.xdp_push(IpAddr::V4(v4), true);
+            }
+        }
     }
 
     /// Hot-reload: replace the active alert rules without restarting (#149).
@@ -506,5 +540,51 @@ async fn webhook_sender(
         if let Err(e) = client.post(&url).json(&body).send().await {
             tracing::warn!(url = %url, err = %e, "Alert webhook delivery failed");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod ddos_tests {
+    use super::*;
+    use crate::config::parser::AlertRule;
+
+    fn block_rule(threshold: u64) -> AlertRule {
+        AlertRule {
+            name: "t".to_string(),
+            metric: "client-qps".to_string(),
+            window_s: 60,
+            threshold,
+            action: "block".to_string(),
+            notify_url: None,
+            block_duration_s: 60,
+        }
+    }
+
+    // A verified source crossing the threshold is blocked AND pushed to the XDP ban
+    // channel; an unverified (spoofable) source is never counted or banned (#ddos).
+    #[tokio::test]
+    async fn verified_block_pushes_xdp_ban_unverified_does_not() {
+        let t = AlertTracker::new(vec![block_rule(3)], None);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        t.set_ban_tx(tx);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+
+        // Unverified: never escalates, never bans.
+        for _ in 0..10 {
+            assert_eq!(t.record(ip, false), AbuseVerdict::Serve);
+        }
+        assert!(rx.try_recv().is_err(), "unverified source must never be banned");
+
+        // Verified: crosses threshold (3) -> Block + XDP Ban pushed.
+        let mut v = AbuseVerdict::Serve;
+        for _ in 0..5 {
+            v = t.record(ip, true);
+        }
+        assert_eq!(v, AbuseVerdict::Block);
+        assert!(
+            matches!(rx.try_recv(), Ok(IcmpBanCmd::Ban(_))),
+            "verified block must push an XDP Ban"
+        );
     }
 }
