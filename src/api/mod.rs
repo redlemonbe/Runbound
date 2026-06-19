@@ -3782,15 +3782,30 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_prometheus_metrics(
-            &snap,
-            cache_hits,
-            cache_misses,
-            evictions,
-            xdp_active,
-            &upstreams,
-            s.node_health.node_id.as_deref(),
-        ),
+        {
+            let mut body = render_prometheus_metrics(
+                &snap,
+                cache_hits,
+                cache_misses,
+                evictions,
+                xdp_active,
+                &upstreams,
+                s.node_health.node_id.as_deref(),
+            );
+            // #208: ICMP / ban / abuse / connection observability.
+            use std::sync::atomic::Ordering as O;
+            let ic = &s.icmp_stats;
+            body.push_str(&fmt_counter("runbound_icmp_handled_total", "ICMP echo requests handled by XDP", ic.handled.load(O::Relaxed)));
+            body.push_str(&fmt_counter("runbound_icmp_replied_total", "ICMP echo replies sent by XDP", ic.replied.load(O::Relaxed)));
+            body.push_str(&fmt_counter("runbound_icmp_dropped_total", "Packets dropped from banned source IPs at XDP", ic.dropped.load(O::Relaxed)));
+            body.push_str(&fmt_counter("runbound_icmp_rate_limited_total", "Packets rate-limited at the XDP ICMP gate", ic.rate_limited.load(O::Relaxed)));
+            body.push_str(&fmt_gauge("runbound_banned_ips", "Source IPs currently banned in the XDP map", ic.banned.len() as u64));
+            let (alert_blocked, alert_tarpitted) = s.alert_tracker.metrics();
+            body.push_str(&fmt_gauge("runbound_alert_blocked_ips", "Source IPs currently blocked by an alert rule / manual ban", alert_blocked as u64));
+            body.push_str(&fmt_gauge("runbound_alert_tarpitted_ips", "Source IPs currently tarpitted", alert_tarpitted as u64));
+            body.push_str(&fmt_gauge("runbound_tcp_connections_active", "Active TCP/DoT/DoH relay connections (listener saturation)", crate::dns::server::ACTIVE_TCP_CONNS.load(O::Relaxed)));
+            body
+        },
     )
 }
 

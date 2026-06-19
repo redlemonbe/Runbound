@@ -2988,6 +2988,9 @@ impl TcpConnTracker {
 /// for TCP clients. Acceptable because TCP DNS traffic is inherently low-volume
 /// (large responses, DNSSEC chains). The TCP connection cap enforced here
 /// prevents the primary DoS vector (FD exhaustion via many idle connections).
+/// #208: live count of accepted TCP/DoT/DoH relay connections (listener saturation).
+pub static ACTIVE_TCP_CONNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn run_tcp_with_limit(
     public_tcp: TcpListener,
     relay_addr: SocketAddr,
@@ -3057,6 +3060,7 @@ async fn run_tcp_with_limit(
             continue;
         }
         let tracker2 = Arc::clone(&tracker);
+        ACTIVE_TCP_CONNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             let r = tokio::time::timeout(conn_timeout, async {
                 let mut relay = TcpStream::connect(relay_addr).await?;
@@ -3068,6 +3072,7 @@ async fn run_tcp_with_limit(
                 debug!(err=%e, %src_ip, "TCP relay error");
             }
             tracker2.release(src_ip);
+            ACTIVE_TCP_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
 }

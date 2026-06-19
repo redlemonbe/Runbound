@@ -663,8 +663,25 @@ runbound_nic_rx_ring_max 4096
 # HELP runbound_nic_rx_dropped_total Hardware RX drops at NIC level (pre-XDP)
 # TYPE runbound_nic_rx_dropped_total counter
 runbound_nic_rx_dropped_total 0
+# HELP runbound_icmp_dropped_total Packets dropped from banned source IPs at XDP
+# TYPE runbound_icmp_dropped_total counter
+runbound_icmp_dropped_total 0
+# HELP runbound_banned_ips Source IPs currently banned in the XDP map
+# TYPE runbound_banned_ips gauge
+runbound_banned_ips 0
+# HELP runbound_alert_blocked_ips Source IPs currently blocked by an alert rule / manual ban
+# TYPE runbound_alert_blocked_ips gauge
+runbound_alert_blocked_ips 3
+# HELP runbound_alert_tarpitted_ips Source IPs currently tarpitted
+# TYPE runbound_alert_tarpitted_ips gauge
+runbound_alert_tarpitted_ips 1
+# HELP runbound_tcp_connections_active Active TCP/DoT/DoH relay connections (listener saturation)
+# TYPE runbound_tcp_connections_active gauge
+runbound_tcp_connections_active 12
 ...
 ```
+
+**Metric families (#208):** query totals + per-type (`queries_by_type_total`) + rcode (nxdomain/servfail/blocked/forwarded/local_hits) + QPS + latency percentiles; cache (hit-rate, hits/misses/evictions, entries) incl. XDP wire cache; NIC (rx-ring, rx-dropped); XDP fast-path; **DDoS/abuse** (`icmp_*`, `banned_ips`, `alert_blocked_ips`, `alert_tarpitted_ips`); **listener saturation** (`tcp_connections_active`); per-upstream health + latency; node identity for anycast.
 
 **Prometheus scrape config:**
 

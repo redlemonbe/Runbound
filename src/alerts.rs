@@ -159,6 +159,15 @@ impl AlertTracker {
         false
     }
 
+    /// #208: live (non-expired) counts of blocked + tarpitted IPs (for metrics).
+    pub fn metrics(&self) -> (usize, usize) {
+        let now = Instant::now();
+        let live = |m: &DashMap<IpAddr, BlockEntry, ahash::RandomState>| {
+            m.iter().filter(|e| e.value().expires.is_none_or(|x| now < x)).count()
+        };
+        (live(&self.blocked), live(&self.tarpitted))
+    }
+
     /// Returns true if this IP is currently tarpitted (delayed responses).
     pub fn is_tarpitted(&self, ip: IpAddr) -> bool {
         if let Some(entry) = self.tarpitted.get(&ip) {
