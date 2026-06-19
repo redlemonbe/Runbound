@@ -182,6 +182,111 @@ fn oracle_edns_opt() {
     assert_oracle(m);
 }
 
+/// Phase-2 readiness: the zone store and cache are keyed today on hickory's
+/// `LowerName`. Migrating them to `wire::Name` is only safe if our name, parsed
+/// from a wire QNAME, denotes exactly what hickory's `LowerName` does for the
+/// same bytes — case-insensitively. Prove it across a spread of names so the
+/// re-keying in phase 2 rests on evidence, not hope.
+#[test]
+fn wire_name_is_a_valid_lookup_key() {
+    use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+    // The zone-store/cache key is the case-folded wire form of the name — *not*
+    // its presentation (hickory decodes IDN punycode like `xn--p1ai` to `рф`
+    // for display; on the wire and as a key it is the ASCII label). So prove
+    // the keys match at the byte level: parsing hickory's exact wire name must
+    // yield byte-identical wire bytes, for every name including an IDN and root.
+    for s in [
+        "www.example.com.",
+        "EXAMPLE.COM.",
+        "a.b.c.d.e.f.",
+        "xn--p1ai.",
+        "1.0.0.127.in-addr.arpa.",
+        "_sip._tcp.example.com.",
+        ".",
+    ] {
+        let hick = hname(s);
+        let mut qname = Vec::new();
+        hick.emit(&mut BinEncoder::new(&mut qname)).unwrap();
+
+        let mine = wire::Name::parse(&mut wire::Decoder::new(&qname)).unwrap();
+        assert_eq!(
+            mine.wire(),
+            &qname[..],
+            "our parse must preserve hickory's exact wire key for {s}"
+        );
+
+        // And case-folding (the actual lookup normalization) is order-free:
+        // folding then comparing matches regardless of the original case.
+        let fold = |b: &[u8]| b.iter().map(|c| c.to_ascii_lowercase()).collect::<Vec<_>>();
+        assert_eq!(fold(mine.wire()), fold(&qname));
+    }
+}
+
+/// Beyond the fixed cases: hundreds of randomly-shaped messages (mixed types,
+/// names, TTLs, section sizes) built and compressed by hickory, round-tripped
+/// through our codec, and canonically compared. This is where odd compression
+/// layouts and section combinations get exercised.
+#[test]
+fn oracle_randomized_messages() {
+    let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+    let mut rng = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let names = [
+        "a.com.",
+        "www.a.com.",
+        "b.example.org.",
+        "deep.x.y.z.example.",
+        "ns1.a.com.",
+        "mail.b.example.org.",
+        "_sip._tcp.a.com.",
+    ];
+    let pick = |v: u64| names[(v as usize) % names.len()];
+
+    for _ in 0..400 {
+        let mut m = HMessage::response(rng() as u16, OpCode::Query);
+        m.add_query(Query::query(hname(pick(rng())), RecordType::A));
+        let n_ans = rng() % 6;
+        for _ in 0..n_ans {
+            let name = pick(rng());
+            let ttl = (rng() % 7200) as u32;
+            let rd = match rng() % 7 {
+                0 => RData::A(A(Ipv4Addr::new(
+                    rng() as u8,
+                    rng() as u8,
+                    rng() as u8,
+                    rng() as u8,
+                ))),
+                1 => RData::AAAA(AAAA(Ipv6Addr::new(
+                    rng() as u16,
+                    rng() as u16,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    rng() as u16,
+                ))),
+                2 => RData::CNAME(CNAME(hname(pick(rng())))),
+                3 => RData::NS(NS(hname(pick(rng())))),
+                4 => RData::MX(MX::new(rng() as u16, hname(pick(rng())))),
+                5 => RData::TXT(TXT::new(vec![format!("txt-{}", rng() % 100000)])),
+                _ => RData::SRV(SRV::new(
+                    rng() as u16,
+                    rng() as u16,
+                    rng() as u16,
+                    hname(pick(rng())),
+                )),
+            };
+            m.add_answer(answer(name, ttl, rd));
+        }
+        assert_oracle(m);
+    }
+}
+
 /// The parser must survive arbitrary bytes — no panic, no hang — and any
 /// message it accepts must re-encode to something it accepts again.
 #[test]
