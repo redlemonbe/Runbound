@@ -267,6 +267,50 @@ fn parse_rr_line_matches_hickory_parse_local_data() {
     }
 }
 
+/// The shadow `records_wire` store built in `from_config` must hold exactly the
+/// same records as the hickory `records` map it is built alongside — same names,
+/// same per-name record sets, byte-for-byte (compared through the bridge). This
+/// is the proof the serving core can read `records_wire` instead of `records`.
+#[test]
+fn records_wire_matches_hickory_store() {
+    use crate::config::parser::LocalData;
+    use crate::dns::local::{name_to_wire_qname, LocalZoneSet};
+    use crate::dns::wire_bridge::from_hickory;
+
+    let lines = [
+        "host.example.com. 300 A 192.0.2.1",
+        "host.example.com. 300 A 192.0.2.2",
+        "host.example.com. AAAA 2001:db8::1",
+        "www.example.com. CNAME cdn.example.net.",
+        "example.com. 3600 MX 10 mail.example.com.",
+        "example.com. 3600 NS ns1.example.com.",
+        "example.com. TXT \"hello world\"",
+    ];
+    let data: Vec<LocalData> = lines.iter().map(|l| LocalData { rr: l.to_string() }).collect();
+    let zs = LocalZoneSet::from_config(&[], &data);
+
+    assert_eq!(
+        zs.records.len(),
+        zs.records_wire.len(),
+        "name count differs between the two stores"
+    );
+    for (name, hick_recs) in &zs.records {
+        let key: Box<[u8]> = name_to_wire_qname(name).as_slice().into();
+        let wire_recs = zs
+            .records_wire
+            .get(&key)
+            .unwrap_or_else(|| panic!("wire store missing {name}"));
+        assert_eq!(wire_recs.len(), hick_recs.len(), "{name}: record count");
+        for hr in hick_recs {
+            let expect = from_hickory(hr).expect("bridge hickory->wire");
+            assert!(
+                wire_recs.iter().any(|w| *w == expect),
+                "{name}: a hickory record has no byte-equal match in the wire store"
+            );
+        }
+    }
+}
+
 /// Beyond the fixed cases: hundreds of randomly-shaped messages (mixed types,
 /// names, TTLs, section sizes) built and compressed by hickory, round-tripped
 /// through our codec, and canonically compared. This is where odd compression

@@ -62,6 +62,11 @@ pub struct LocalZoneSet {
     /// Exact-match only; parent-walk / wildcard / other types fall through
     /// to the hickory slow path via answer_dns().
     pub wire_records: WireRecordIndex,
+    /// De-hickory migration: the full record set as our own `wire::Record`,
+    /// keyed by the lowercased wire QNAME. Built alongside `records` from the
+    /// same source so it can be proven equivalent, and consumed by the
+    /// hickory-free serving core as consumers migrate off `records`.
+    pub records_wire: HashMap<Box<[u8]>, Vec<crate::dns::wire::Record>>,
 }
 
 
@@ -130,6 +135,13 @@ pub(crate) fn name_to_wire_qname(name: &Name) -> SmallVec<[u8; 64]> {
     buf
 }
 
+/// Lowercased wire-form bytes of a `wire::Name` — the key type of `records_wire`.
+/// Matches `name_to_wire_qname` (the hot path) after lowercasing, so a query's
+/// QNAME bytes index straight into the store.
+pub(crate) fn wire_name_key(name: &crate::dns::wire::Name) -> Box<[u8]> {
+    name.wire().iter().map(|b| b.to_ascii_lowercase()).collect()
+}
+
 impl LocalZoneSet {
     pub fn from_config(zones: &[LocalZone], data: &[LocalData]) -> Self {
         let mut map = HashMap::with_capacity_and_hasher(zones.len(), DnsHasherBuilder::new());
@@ -151,6 +163,18 @@ impl LocalZoneSet {
                 let name = rec.name.clone();
                 map.entry(name.clone()).or_insert(ZoneAction::Static);
                 record_map.entry(name).or_default().push(rec);
+            }
+        }
+
+        // ── De-hickory: build the wire::Record store from the same lines ───────
+        // parse_rr_line is the hickory-free parser, proven byte-identical to
+        // parse_local_data; we key by the lowercased wire QNAME so the serving
+        // core can look records up straight from a query's QNAME bytes.
+        let mut records_wire: HashMap<Box<[u8]>, Vec<crate::dns::wire::Record>> = HashMap::new();
+        for d in data {
+            if let Some(wr) = crate::dns::wire::present::parse_rr_line(&d.rr) {
+                let key: Box<[u8]> = wire_name_key(&wr.name);
+                records_wire.entry(key).or_default().push(wr);
             }
         }
 
@@ -212,6 +236,7 @@ impl LocalZoneSet {
             records: record_map,
             static_names,
             wire_records: wire_idx,
+            records_wire,
         }
     }
 
