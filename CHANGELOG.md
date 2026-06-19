@@ -7,7 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-19
+
 ### Added
+- **DDoS abuse engine — verified-source tarpit & kernel bans.** Per-client query-rate rules now support `tarpit` (hold a verified abuser then REFUSED, near-zero cost to the server) and `block` in addition to `log`/`notify`. **Escalation (tarpit/block) applies only to verified sources** — TCP/DoT/DoH/DoQ or UDP carrying a valid DNS cookie — so a spoofed UDP source can never get a victim banned. Bans are dropped at the **kernel**: a `bans_active`-gated eBPF check `XDP_DROP`s a banned IP's DNS on the fast path (one array lookup when idle, bench-verified no fast-path regression), and the public→loopback relay enforces verdicts on the real client IP for TCP/DoT/DoH. New `abuse-tarpit-delay-ms` / `abuse-tarpit-max-conns` knobs; recommended base rules ship in the example configs and a one-click **Load recommended** button in the WebUI Protection tab.
+- **Edit alert rules from the WebUI/API.** `PUT /api/alerts/rules` (admin) replaces the rule set, validated, persisted to config and hot-applied with no restart; an editor in the WebUI Protection tab (add/remove, action incl. tarpit, thresholds).
+- **Actor-attributed audit — who did what.** Every authenticated mutating API/WebUI request is recorded as an `admin_action` event (actor, method, path, status) in the HMAC-chained audit log. The WebUI **Logs** tab surfaces this "Admin & config audit" stream and adds a **functional search** across the query log, the audit log and the auth activity.
+- **Download the local CA + trust encrypted DNS.** A WebUI/API self-signed certificate is now signed by the **Runbound Local CA**; `GET /api/tls/ca` (and a WebUI button) exports it to import once into a browser/OS trust store so Firefox/Chrome accept DoT/DoH. The generated chain passes strict X.509 validation (Authority Key Identifier, KeyUsage, ExtendedKeyUsage).
+- **Prometheus `/metrics` completed (#208).** Added ICMP-gate counters, banned/tarpitted-IP gauges, `tcp_connections_active` (listener saturation), and per-record-type/upstream families — 35 metric families for operator observability.
+- **Firewall manages the encrypted-DNS ports.** When `firewall-manage` is on, DoT/DoH/DoQ ports open at startup and re-sync live as encrypted DNS is enabled/disabled/re-ported.
 - **Public encrypted resolver — DDR auto-discovery (#204).** `ddr: yes` publishes DDR (RFC 9462) SVCB records at `_dns.resolver.arpa` advertising the node's DoT/DoH/DoQ endpoints (alpn + port + dohpath), so plain-DNS clients auto-upgrade to encrypted. New deployment guide `docs/public-resolver.md` (Let's Encrypt cert, ports/firewall, mTLS-vs-open access profiles, anycast).
 - **Anti-amplification for public exposure (#203).** `dns-cookies` requires DNS Cookies (RFC 7873) on the UDP slow path — unverified clients get BADCOOKIE + a server cookie and must retry, defeating spoofed-source amplification (legacy cookie-less clients stay answered). `rrl-slip` adds RRL slip: leak 1-in-N over-rate UDP queries and silently drop the rest. `ANY` is already refused (RFC 8482, #180).
 - **Anycast readiness (#21).** `/health` returns **503** when degraded (configurable `health-servfail-threshold` / `health-latency-threshold` / `health-min-qps`) so an external BGP daemon withdraws the route; `node-id` surfaces in `/health`, the `runbound_node_info` metric and logs; `drain-timeout` keeps serving briefly after SIGTERM; `proxy-protocol` accepts PROXY protocol v2 on TCP/DoT/DoH so the real client IP behind an L4 load balancer drives ACL/rate-limit/logging.
@@ -16,7 +24,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - **White-label branding via a dedicated `branding.conf` file (#25).** Set `branding: yes` in the main config and Runbound loads `branding.conf` from the same directory: `brand-name`, `accent-color`, `logo-url`, `favicon-url`, plus About-tab fields `about-org`, `about-text`, `about-support-url`. Branding is WebUI-only and has **no REST API impact**. Example in `examples/branding.conf`.
 
 ### Fixed
+- **DNS-over-HTTPS GET now works.** The embedded hickory HTTPS listener rejected every RFC 8484 **GET** request (it required a `Content-Type` that a bodyless GET cannot have), so DoH was unusable from Firefox/Chrome. Runbound now serves DoH from its own RFC 8484 h2 handler (GET `?dns=` + POST `application/dns-message`) behind the same ACL/conn-cap/PROXY relay.
 - **Config parser:** a `#` inside a double-quoted value is no longer treated as a comment, so hex colours such as `accent-color: "#22d3ee"` survive parsing (#25).
+
+### Security
+- **SEC-M1 (HIGH) — config-directive injection via alert rules, fixed.** The alert-rule writer emitted string fields (notably `notify-url`) unescaped; a malicious admin-reachable value with an embedded newline could inject a separate config directive (the SEC-J1 class → command-running hook → RCE). Fixed by escaping all alert string fields and validating `notify-url`. Found and verified closed by the Cycle M two-AI audit + live pentest (Claude Opus 4.8 × Gemini 2.5 Pro) — no other exploitable finding. See `docs/security-audit/SECURITY-AUDIT.md`.
 
 ## [0.20.0] - 2026-06-18
 

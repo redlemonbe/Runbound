@@ -34,12 +34,12 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 |---|---|
 | DNSSEC validation | enforced under full-recursion — Bogus → SERVFAIL, AD bit |
 | Authoritative DNSSEC signing | online & zero-touch — per-zone KSK+ZSK (ECDSAP256), NSEC3 denial, DS surfaced via API (#201) |
-| Encrypted DNS server | DoT (853) / DoH (443) / DoQ (853) — cert generated or imported from the WebUI/API |
+| Encrypted DNS server | DoT (853) / DoH (443/RFC 8484 GET+POST) / DoQ (853) — self-signed leaf signed by a downloadable local CA (import once), or import your own; live, no restart |
 | Automatic TLS | built-in ACME / Let’s Encrypt |
-| Rate limiting + ICMP flood ban | enforced on both the XDP fast path and the kernel slow path |
+| DDoS abuse engine | per-client rate-limit + **tarpit** + bans, escalation gated to **verified sources** (anti-spoof); bans dropped at the XDP/kernel layer; enforced on both datapaths |
 | RBAC | read / dns / operator / admin API roles |
 | Privacy by default | client-IP redaction, configurable retention (GDPR) |
-| Tamper-evident audit log | HMAC-chained, SIEM-ready JSON |
+| Tamper-evident audit log | HMAC-chained, SIEM-ready JSON; **actor-attributed** (every admin/user action), searchable in the WebUI |
 
 ### Performance — XDP fast path
 | Feature | Notes |
@@ -56,7 +56,7 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 | Live REST API | add/block domains, zones, config — no restart |
 | Embedded browser dashboard | no nginx needed |
 | Block-list feed subscriptions | managed via the API |
-| Real-time stats | Prometheus `/metrics` + SSE stream |
+| Real-time stats | Prometheus `/metrics` (queries, cache, XDP, DDoS/abuse, listener saturation, upstreams) + SSE stream |
 | Master/slave replication | REST relay (HMAC + TLS-pinned) **and** AXFR/IXFR (RFC 5936) *¹ |
 | Anycast deployment | built-in BGP announcer, health-driven route withdrawal |
 | Multi-user API | per-user zone isolation |
