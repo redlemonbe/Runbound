@@ -735,7 +735,7 @@
 </div>
 
   <!-- ═══ SETTINGS ═══ -->
-  <div id="tab-settings" class="hidden fade">
+  <div id="tab-settings" class="hidden fade max-w-3xl mx-auto">
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">DNSSEC Validation</div>
       <div class="flex items-start justify-between gap-4 mb-3">
@@ -772,46 +772,49 @@
       </ul>
     </div>
     <div id="settings-tls-card" class="card mb-4">
-      <div class="flex items-center justify-between mb-3">
-        <div class="text-xs text-gray-600 uppercase tracking-wide">Encrypted DNS — DoT / DoH / DoQ</div>
-        <span id="tls-state-badge" class="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-400">—</span>
-      </div>
-      <p class="text-xs text-gray-400 mb-3">Serve DNS over TLS (853), HTTPS (443) and QUIC (853/udp) so clients such as Firefox can encrypt their queries to Runbound. Generate a self-signed certificate, or import your own (e.g. Let&#39;s Encrypt). Changes are applied live — no restart.</p>
-      <div id="tls-restart-note" class="hidden text-xs text-amber-400 bg-amber-950/40 border border-amber-900 rounded px-3 py-2 mb-3">⚠ Configuration saved — restart Runbound to activate the new encrypted-DNS settings.</div>
-      <div id="tls-cert-info" class="hidden text-xs text-gray-400 mb-3 space-y-1 font-mono"></div>
-      <div class="space-y-3 max-w-sm" style="padding-left:3px">
+      <div class="flex items-start justify-between gap-4 mb-3">
         <div>
-          <label class="text-xs text-gray-500 block mb-1">Server hostname (TLS SNI / DoH)</label>
-          <input id="tls-hostname" type="text" class="input w-full" placeholder="dns.example.com" />
+          <p class="text-sm text-gray-300">Encrypted DNS — DoT / DoH / DoQ</p>
+          <p class="text-xs text-gray-600 mt-1">Serve DNS over TLS (853), HTTPS (443) and QUIC (853/udp) so clients can encrypt their queries to Runbound. Toggle ON to set up a certificate (self-signed or imported); changes apply live — no restart.</p>
         </div>
-        <div class="grid grid-cols-3 gap-2">
-          <div><label class="text-xs text-gray-500 block mb-1">DoT port</label><input id="tls-dot-port" type="number" class="input w-full" placeholder="853" /></div>
-          <div><label class="text-xs text-gray-500 block mb-1">DoH port</label><input id="tls-doh-port" type="number" class="input w-full" placeholder="443" /></div>
-          <div><label class="text-xs text-gray-500 block mb-1">DoQ port</label><input id="tls-doq-port" type="number" class="input w-full" placeholder="853" /></div>
-        </div>
+        <button id="tls-toggle-btn" onclick="tlsToggle()" class="btn-secondary text-xs w-16 shrink-0">—</button>
       </div>
-      <div class="flex gap-2 mt-3 flex-wrap">
-        <button onclick="tlsGenSelfSigned()" class="btn-primary text-xs">Generate self-signed</button>
-        <button onclick="tlsToggleImport()" class="btn-secondary text-xs">Import certificate…</button>
-        <button id="tls-disable-btn" onclick="tlsDisable()" class="btn-secondary text-xs hidden ml-auto">Disable</button>
-      </div>
-      <div id="tls-import-box" class="hidden mt-3 space-y-2">
-        <div>
-          <label class="text-xs text-gray-500 block mb-1">Certificate (PEM — full chain)</label>
-          <textarea id="tls-cert-pem" class="input w-full font-mono text-xs" rows="4" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+      <p id="tls-status-note" class="text-xs text-gray-700 mb-3"></p>
+      <div id="tls-setup" class="hidden">
+        <div id="tls-cert-info" class="hidden text-xs text-gray-400 mb-3 space-y-1 font-mono"></div>
+        <div class="space-y-3 max-w-sm" style="padding-left:3px">
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Server hostname (TLS SNI / DoH)</label>
+            <input id="tls-hostname" type="text" class="input w-full" placeholder="dns.example.com" />
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <div><label class="text-xs text-gray-500 block mb-1">DoT port</label><input id="tls-dot-port" type="number" class="input w-full" placeholder="853" /></div>
+            <div><label class="text-xs text-gray-500 block mb-1">DoH port</label><input id="tls-doh-port" type="number" class="input w-full" placeholder="443" /></div>
+            <div><label class="text-xs text-gray-500 block mb-1">DoQ port</label><input id="tls-doq-port" type="number" class="input w-full" placeholder="853" /></div>
+          </div>
         </div>
-        <div>
-          <label class="text-xs text-gray-500 block mb-1">Private key (PEM)</label>
-          <textarea id="tls-key-pem" class="input w-full font-mono text-xs" rows="4" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
+        <div class="flex gap-2 mt-3 flex-wrap">
+          <button onclick="tlsGenSelfSigned()" class="btn-primary text-xs">Generate self-signed</button>
+          <button onclick="tlsToggleImport()" class="btn-secondary text-xs">Import certificate…</button>
         </div>
-        <button onclick="tlsImport()" class="btn-primary text-xs">Import &amp; enable</button>
+        <div id="tls-import-box" class="hidden mt-3 space-y-2">
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Certificate (PEM — full chain)</label>
+            <textarea id="tls-cert-pem" class="input w-full font-mono text-xs" rows="4" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+          </div>
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Private key (PEM)</label>
+            <textarea id="tls-key-pem" class="input w-full font-mono text-xs" rows="4" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
+          </div>
+          <button onclick="tlsImport()" class="btn-primary text-xs">Import &amp; enable</button>
+        </div>
       </div>
       <p id="tls-msg" class="text-xs mt-3"></p>
     </div>
   </div>
 
   <!-- ACCOUNT -->
-  <div id="tab-account" class="hidden fade">
+  <div id="tab-account" class="hidden fade max-w-3xl mx-auto">
     <div class="card mb-4">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-4">Change Password</div>
       <div class="space-y-3 max-w-sm" style="padding-left:3px">
@@ -851,7 +854,7 @@
   </div>
 
   <!-- ═══ USERS ═══ -->
-  <div id="tab-users" class="hidden fade">
+  <div id="tab-users" class="hidden fade max-w-3xl mx-auto">
     <div id="users-disabled-notice" class="hidden card mb-4 text-xs text-yellow-400">
       Multi-user mode is disabled. To enable it, create <code class="font-mono bg-gray-800 px-1 rounded">users.json</code>
       in the Runbound data directory and restart the service.
@@ -2064,15 +2067,29 @@ function tlsPorts(){
 }
 function tlsToggleImport(){ document.getElementById('tls-import-box').classList.toggle('hidden'); }
 function tlsMsg(m, ok){ const e=document.getElementById('tls-msg'); if(!e)return; e.textContent=m; e.className='text-xs mt-3 '+(ok?'text-emerald-400':'text-red-400'); }
+async function tlsToggle(){
+  const btn = document.getElementById('tls-toggle-btn');
+  if(btn && btn.dataset.value === 'true'){
+    if(!confirm('Disable encrypted DNS? Clients fall back to plaintext immediately.')) return;
+    await tlsDisable();
+  } else {
+    // OFF -> reveal the setup so the user can generate/import a certificate to enable it
+    document.getElementById('tls-setup').classList.remove('hidden');
+    const hn = document.getElementById('tls-hostname'); if(hn) hn.focus();
+  }
+}
 async function loadTlsStatus(){
   let t;
   try { t = await api('GET','/tls/cert'); } catch(e){ return; }
-  const badge = document.getElementById('tls-state-badge'); if(!badge) return;
-  if(t.active){ badge.textContent='active'; badge.className='text-xs px-2 py-0.5 rounded bg-emerald-900 text-emerald-300'; }
-  else if(t.configured){ badge.textContent='configured'; badge.className='text-xs px-2 py-0.5 rounded bg-amber-900 text-amber-300'; }
-  else { badge.textContent='disabled'; badge.className='text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-400'; }
-  document.getElementById('tls-restart-note').classList.toggle('hidden', !t.restart_required);
-  document.getElementById('tls-disable-btn').classList.toggle('hidden', !t.configured);
+  const tbtn = document.getElementById('tls-toggle-btn'); if(!tbtn) return;
+  const on = !!(t.active || t.configured);
+  tbtn.dataset.value = on;
+  tbtn.textContent = on ? 'ON' : 'OFF';
+  tbtn.className = (on ? 'btn-primary' : 'btn-secondary') + ' text-xs w-16 shrink-0';
+  document.getElementById('tls-setup').classList.toggle('hidden', !on);
+  document.getElementById('tls-status-note').textContent = on
+    ? 'Encrypted DNS is ON — DoT / DoH / DoQ served. Toggle OFF to disable (clients fall back to plaintext).'
+    : 'Encrypted DNS is OFF. Toggle ON to set up a certificate and start serving DoT / DoH / DoQ.';
   const hn = document.getElementById('tls-hostname');
   if(hn && !hn.value && t.hostname && t.hostname!=='runbound.local') hn.value = t.hostname;
   document.getElementById('tls-dot-port').placeholder = t.dot_port;
