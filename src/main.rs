@@ -671,6 +671,7 @@ async fn async_main(
         resolution_mode,
         recursor,
         cfg_path,
+        std::sync::Arc::clone(&fw_manager),
     )
     .await;
     fw_cleanup.close();

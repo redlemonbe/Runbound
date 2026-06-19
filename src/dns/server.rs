@@ -3202,6 +3202,7 @@ async fn tls_supervisor(
     acl: Arc<Acl>,
     tcp_tracker: Arc<TcpConnTracker>,
     proxy_protocol: bool,
+    fw: std::sync::Arc<crate::firewall::FirewallManager>,
 ) {
     fn current_tls(cfg_path: &str) -> TlsConfig {
         crate::config::load(cfg_path)
@@ -3234,6 +3235,9 @@ async fn tls_supervisor(
             proxy_protocol,
         )
         .await;
+        // Track the encrypted-DNS ports in the firewall too (open/close live).
+        let fw_cfg = crate::config::load(&cfg_path).unwrap_or_default();
+        fw.resync(&crate::firewall::PortSet::from_config(&fw_cfg));
         info!(tasks = handles.len(), "encrypted DNS: hot reload complete");
     }
 }
@@ -3259,6 +3263,7 @@ pub async fn run_dns_server(
     resolution_mode: Arc<std::sync::atomic::AtomicU8>,
     recursor: crate::dns::recursor::SharedRecursor,
     cfg_path: String,
+    fw: std::sync::Arc<crate::firewall::FirewallManager>,
 ) -> anyhow::Result<()> {
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
     if rps == 0 {
@@ -3923,7 +3928,8 @@ pub async fn run_dns_server(
         let ifaces = interfaces.clone();
         let acl_tls = std::sync::Arc::clone(&acl);
         let tracker_tls = std::sync::Arc::clone(&tcp_tracker);
-        tokio::spawn(tls_supervisor(rx, h, cfg_path, ifaces, acl_tls, tracker_tls, cfg.proxy_protocol));
+        let fw_sup = std::sync::Arc::clone(&fw);
+        tokio::spawn(tls_supervisor(rx, h, cfg_path, ifaces, acl_tls, tracker_tls, cfg.proxy_protocol, fw_sup));
     }
 
 

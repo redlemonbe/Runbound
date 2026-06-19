@@ -122,15 +122,7 @@ impl FirewallManager {
             return;
         }
 
-        let mut rules = vec![(ports.dns_port, "udp"), (ports.dns_port, "tcp")];
-        if let Some(p) = ports.api_port {
-            rules.push((p, "tcp"));
-        }
-        if let Some(p) = ports.sync_port {
-            rules.push((p, "tcp"));
-        }
-
-        for (port, proto) in rules {
+        for (port, proto) in ports.rules() {
             match self.open_rule(port, proto) {
                 Ok(handle) => {
                     let mut g = self.opened.lock().unwrap_or_else(|e| e.into_inner());
@@ -159,6 +151,34 @@ impl FirewallManager {
                 warn!(port=rule.port, proto=rule.proto, err=%e, "firewall: failed to close port");
             }
         }
+    }
+
+    /// Re-sync open rules to `new`: open ports newly desired, close ports no longer
+    /// desired, leave unchanged ones in place. Used on live encrypted-DNS changes so
+    /// the firewall tracks DoT/DoH/DoQ being enabled / disabled / re-ported (#tls-fw).
+    pub fn resync(&self, new: &PortSet) {
+        if self.backend == Backend::None {
+            return;
+        }
+        let desired = new.rules();
+        let mut opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
+        let mut keep: Vec<Rule> = Vec::with_capacity(opened.len());
+        for rule in std::mem::take(&mut *opened) {
+            if desired.iter().any(|(p, pr)| *p == rule.port && *pr == rule.proto) {
+                keep.push(rule);
+            } else if let Err(e) = self.close_rule(&rule) {
+                warn!(port = rule.port, proto = rule.proto, err = %e, "firewall: resync close failed");
+            }
+        }
+        for (port, proto) in desired {
+            if !keep.iter().any(|r| r.port == port && r.proto == proto) {
+                match self.open_rule(port, proto) {
+                    Ok(handle) => keep.push(Rule { port, proto, nft_handle: handle }),
+                    Err(e) => warn!(port, proto, err = %e, "firewall: resync open failed"),
+                }
+            }
+        }
+        *opened = keep;
     }
 
     #[allow(dead_code)]
