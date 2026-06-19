@@ -431,6 +431,8 @@ mod roundtrip_tests {
         for entry in std::fs::read_dir("examples").expect("examples dir") {
             let path = entry.unwrap().path();
             if path.extension().and_then(|e| e.to_str()) != Some("conf") { continue; }
+            // branding.conf is a dedicated WebUI branding file (#25), not a main config.
+            if path.file_name().and_then(|n| n.to_str()) == Some("branding.conf") { continue; }
             let content = std::fs::read_to_string(&path).unwrap();
             let cfg1 = parse_str(&content).expect("parse original");
             let rendered = render_config(&cfg1);
