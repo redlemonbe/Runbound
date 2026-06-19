@@ -1298,23 +1298,21 @@ and reconnaissance sweeps without external monitoring tools.
 Multiple `alert:` blocks can be defined — each creates an independent rule.
 
 ```
-alert {
+alert:
     name:             ddos-ramp
     metric:           client-qps
     window-s:         10
     threshold:        500
     action:           block
     block-duration-s: 300
-}
 
-alert {
+alert:
     name:      recon-sweep
     metric:    client-qps
     window-s:  60
     threshold: 2000
     action:    notify
     notify-url: https://hooks.example.com/runbound-alert
-}
 ```
 
 | Directive | Type | Default | Description |
@@ -1323,7 +1321,7 @@ alert {
 | `metric` | string | `client-qps` | Metric to monitor. Currently supported: `client-qps` (queries/window/source IP). |
 | `window-s` | integer | `10` | Sliding window length in seconds. Queries older than `window-s` are expired. |
 | `threshold` | integer | `1000` | Query count that triggers the action (inclusive). |
-| `action` | string | `log` | What to do when the threshold is reached: `log`, `block`, or `notify`. |
+| `action` | string | `log` | What to do when the threshold is reached: `log`, `block`, `tarpit`, or `notify`. |
 | `notify-url` | URL | — | Webhook URL for `action: notify`. POST with JSON payload (see below). |
 | `block-duration-s` | integer | `300` | Seconds to block the source IP for `action: block`. `0` = permanent until restart. |
 
@@ -1334,8 +1332,23 @@ alert {
 | Action | Behaviour |
 |---|---|
 | `log` | Emit a `WARN` log line. No traffic impact. |
-| `block` | Drop all queries from the source IP for `block-duration-s` seconds. Counter is visible in `GET /api/stats`. |
+| `block` | Drop all queries from the source IP for `block-duration-s` seconds, enforced at the **XDP layer** (line-rate `XDP_DROP`) when XDP is attached, else in userspace. Counter visible in `GET /api/stats`. |
+| `tarpit` | Hold the source's queries for `abuse-tarpit-delay-ms` then answer **REFUSED** for `block-duration-s` seconds. On TCP/DoT/DoH this keeps the attacker's connection occupied at near-zero cost; a connection cap (`abuse-tarpit-max-conns`) prevents self-DoS. |
 | `notify` | POST a JSON webhook to `notify-url`. Non-blocking — uses a background tokio task. |
+
+> **Anti-spoof gate:** `block` and `tarpit` escalation only applies to **verified
+> sources** — TCP/DoT/DoH/DoQ (connection-proven) or a UDP query carrying a valid
+> DNS Cookie (RFC 7873, `dns-cookies: yes`). An unverified UDP source is never
+> escalated (its IP may be spoofed: banning/tarpitting it would let an attacker get
+> a victim banned, or make Runbound reflect responses toward a spoofed victim).
+> Unverified UDP floods are handled by `rate-limit` + DNS cookies (`BADCOOKIE`).
+
+**Tarpit tuning (server-level):**
+
+| Directive | Default | Description |
+|---|---|---|
+| `abuse-tarpit-delay-ms` | `2000` | How long a tarpitted (verified) source is held before the REFUSED reply. |
+| `abuse-tarpit-max-conns` | `256` | Max concurrent held tarpit requests; over the cap we REFUSE immediately (anti-self-DoS). |
 
 **Webhook payload (`action: notify`):**
 

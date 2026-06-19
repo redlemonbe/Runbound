@@ -136,6 +136,10 @@ pub struct UnboundConfig {
     pub rate_limit_prefix_v4: u8,
     /// IPv6 prefix length for rate-limit subnet bucketing. Default: 48 (/48).
     pub rate_limit_prefix_v6: u8,
+    /// #ddos: how long a tarpitted (verified) source is held before REFUSED (ms).
+    pub abuse_tarpit_delay_ms: u64,
+    /// #ddos: max concurrent held tarpit requests (anti-self-DoS).
+    pub abuse_tarpit_max_conns: usize,
     /// REST API key. Overridden by RUNBOUND_API_KEY env var if both are set.
     pub api_key: Option<String>,
     /// Static scoped API keys from api-key-extra blocks (#13).
@@ -502,6 +506,8 @@ impl UnboundConfig {
             resolv_fallback: true,
             rate_limit_prefix_v4: 24,
             rate_limit_prefix_v6: 48,
+            abuse_tarpit_delay_ms: 2000,
+            abuse_tarpit_max_conns: 256,
             xdp_fill_ring_size: 4096,
             xdp_comp_ring_size: 4096,
             xdp_rx_ring_size: 4096,
@@ -902,6 +908,8 @@ fn parse_server_directive(
         "rate-limit-prefix-v6" => {
             cfg.rate_limit_prefix_v6 = val.parse::<u8>().unwrap_or(48).min(128)
         }
+        "abuse-tarpit-delay-ms" => cfg.abuse_tarpit_delay_ms = val.parse().unwrap_or(2000),
+        "abuse-tarpit-max-conns" => cfg.abuse_tarpit_max_conns = val.parse().unwrap_or(256),
         "api-key" => {
             warn!(
                 "api-key is set in the config file (plaintext). \

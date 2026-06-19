@@ -35,6 +35,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "tls-port" | "https-port" | "quic-port"
                 | "tls-cert-hostname" | "server-hostname" | "dot-client-auth-ca"
                 | "rate-limit" | "rate-limit-prefix-v4" | "rate-limit-prefix-v6"
+                | "abuse-tarpit-delay-ms" | "abuse-tarpit-max-conns"
                 | "api-key" | "api-port" | "api-socket"
                 | "cache-max-ttl" | "cache-min-ttl" | "cache-min-entries"
                 | "private-address"
@@ -141,6 +142,8 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if let Some(v) = cfg.rate_limit { o.push_str(&format!("    rate-limit: {v}\n")); }
     if cfg.rate_limit_prefix_v4 != d.rate_limit_prefix_v4 { o.push_str(&format!("    rate-limit-prefix-v4: {}\n", cfg.rate_limit_prefix_v4)); }
     if cfg.rate_limit_prefix_v6 != d.rate_limit_prefix_v6 { o.push_str(&format!("    rate-limit-prefix-v6: {}\n", cfg.rate_limit_prefix_v6)); }
+    if cfg.abuse_tarpit_delay_ms != d.abuse_tarpit_delay_ms { o.push_str(&format!("    abuse-tarpit-delay-ms: {}\n", cfg.abuse_tarpit_delay_ms)); }
+    if cfg.abuse_tarpit_max_conns != d.abuse_tarpit_max_conns { o.push_str(&format!("    abuse-tarpit-max-conns: {}\n", cfg.abuse_tarpit_max_conns)); }
     if let Some(v) = &cfg.api_key { o.push_str(&format!("    api-key: \"{}\"\n", escape_str(v))); }
     if let Some(v) = cfg.api_port { o.push_str(&format!("    api-port: {v}\n")); }
     if let Some(v) = &cfg.api_socket { o.push_str(&format!("    api-socket: \"{}\"\n", escape_str(v))); }

@@ -62,12 +62,18 @@ use crate::stats::{Stats, CACHE_HIT_THRESHOLD_US};
 // A non-blocking try_acquire returns REFUSED instantly without allocating
 // any additional memory, so the bound is hard even at line rate.
 const MAX_INFLIGHT_REQUESTS: usize = 4_096;
-/// #ddos tarpit: cap on concurrently held (slowed) abuser requests + the hold delay.
-const ABUSE_TARPIT_MAX: usize = 256;
-const ABUSE_TARPIT_DELAY: Duration = Duration::from_secs(2);
+/// #ddos tarpit defaults (overridable via abuse-tarpit-* config directives).
+const ABUSE_TARPIT_MAX_DEFAULT: usize = 256;
+const ABUSE_TARPIT_DELAY_MS_DEFAULT: u64 = 2000;
+/// (hold delay ms, max concurrent held) — set once from config at startup.
+static ABUSE_TARPIT_CFG: std::sync::OnceLock<(u64, usize)> = std::sync::OnceLock::new();
 static TARPIT_SEMA: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
 fn tarpit_sema() -> &'static Semaphore {
-    TARPIT_SEMA.get_or_init(|| Semaphore::new(ABUSE_TARPIT_MAX))
+    let max = ABUSE_TARPIT_CFG.get().map(|c| c.1).unwrap_or(ABUSE_TARPIT_MAX_DEFAULT);
+    TARPIT_SEMA.get_or_init(|| Semaphore::new(max))
+}
+fn tarpit_delay() -> Duration {
+    Duration::from_millis(ABUSE_TARPIT_CFG.get().map(|c| c.0).unwrap_or(ABUSE_TARPIT_DELAY_MS_DEFAULT))
 }
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
@@ -2134,7 +2140,7 @@ async fn tarpit_response<R: ResponseHandler>(
     response_handle: R,
 ) -> ResponseInfo {
     if let Ok(_permit) = tarpit_sema().try_acquire() {
-        tokio::time::sleep(ABUSE_TARPIT_DELAY).await;
+        tokio::time::sleep(tarpit_delay()).await;
     }
     send_error(request, response_handle, ResponseCode::Refused).await
 }
@@ -3526,6 +3532,7 @@ pub async fn run_dns_server(
     cfg_path: String,
     fw: std::sync::Arc<crate::firewall::FirewallManager>,
 ) -> anyhow::Result<()> {
+    let _ = ABUSE_TARPIT_CFG.set((cfg.abuse_tarpit_delay_ms, cfg.abuse_tarpit_max_conns));
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
     if rps == 0 {
         info!("rate limiting disabled (rate-limit: 0)");
