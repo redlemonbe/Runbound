@@ -14,6 +14,10 @@
 //! correct, so the bridge inherits that correctness. It is intended to be
 //! deleted once hickory is gone from the default build.
 
+// Ahead-of-use during the migration: called by tests now, and by the mutation
+// sites / DNSSEC signer as they are wired in. Removed with the module.
+#![allow(dead_code)]
+
 use hickory_proto::rr::Record as HRecord;
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
 

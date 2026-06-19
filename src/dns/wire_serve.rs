@@ -15,6 +15,10 @@
 //! answer stays in the hickory signer for now and is layered on at integration;
 //! this core builds the unsigned authoritative answer.
 
+// Ahead-of-use: exercised by the tests and the UDP round-trip below; wired into
+// the slow-path receive loop at integration. Remove the allow once it is.
+#![allow(dead_code)]
+
 use crate::dns::local::{LocalZoneSet, ZoneAction};
 use crate::dns::wire::consts::{rcode, rtype};
 use crate::dns::wire::{Edns, Message, Rdata, Record};
@@ -96,6 +100,16 @@ pub fn answer_local(query: &Message, zones: &LocalZoneSet) -> Option<Message> {
     }
 
     Some(resp)
+}
+
+/// Datagram-level local serving: parse a query, serve it locally, and return
+/// the response bytes — or `None` if the datagram is malformed or the name is
+/// not locally authoritative (the caller forwards). This is the per-packet seam
+/// the future own UDP/TCP listener calls.
+pub fn serve_datagram(query: &[u8], zones: &LocalZoneSet) -> Option<Vec<u8>> {
+    let msg = Message::parse(query).ok()?;
+    let resp = answer_local(&msg, zones)?;
+    Some(resp.encode())
 }
 
 /// CNAME chain following (RFC 1034 §3.6.2), wire-typed twin of
@@ -256,5 +270,38 @@ mod tests {
         let r = answer_local(&query("host.local.", consts::rtype::A, true), &z).unwrap();
         assert!(r.edns().unwrap().is_some());
         assert_wellformed(&r);
+    }
+
+    /// Full stack over a real socket: client query bytes → our parse → our
+    /// serving core → our encode → back over UDP → hickory validates the wire,
+    /// and our parser reads the content. No hickory in the serving path.
+    #[test]
+    fn udp_roundtrip_serves_local_zone() {
+        use std::net::UdpSocket;
+        let z = zoneset();
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+
+        let q = query("host.local.", consts::rtype::A, true).encode();
+        client.send_to(&q, addr).unwrap();
+
+        let mut buf = [0u8; 1232];
+        let (n, from) = server.recv_from(&mut buf).unwrap();
+        let resp = serve_datagram(&buf[..n], &z).expect("name is locally authoritative");
+        server.send_to(&resp, from).unwrap();
+
+        let (n2, _) = client.recv_from(&mut buf).unwrap();
+        // hickory must accept what actually went over the wire,
+        hickory_proto::op::Message::from_vec(&buf[..n2]).expect("hickory parses the response");
+        // and our own parser reads the expected content back.
+        let parsed = Message::parse(&buf[..n2]).unwrap();
+        assert!(parsed.header.qr() && parsed.header.aa());
+        assert_eq!(parsed.header.rcode_low(), rcode::NOERROR);
+        assert_eq!(parsed.answers.len(), 2);
+        assert_eq!(parsed.header.id, 0x4242);
     }
 }
