@@ -524,9 +524,14 @@
       <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
         <input type="checkbox" id="logs-auto" onchange="toggleAutoLogs(this)" class="accent-cyan-500" /> Auto (3 s)
       </label>
-      <span class="text-xs text-gray-700">Last 100 entries — requires verbosity ≥ 1</span>
+      <input id="logs-search" type="text" oninput="applyLogSearch()" placeholder="Search — IP, name, user, action…" class="input flex-1 min-w-48" />
+      <span class="text-xs text-gray-700 shrink-0">query logs need verbosity ≥ 1</span>
     </div>
     <div id="log-list" class="space-y-0.5 font-mono text-xs"></div>
+    <div class="mt-4 card">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Admin &amp; config audit — who did what</div>
+      <div id="audit-list" class="space-y-0.5 font-mono text-xs" style="max-height:340px;overflow-y:auto"><span class="text-gray-700">—</span></div>
+    </div>
     <div class="mt-4 card">
       <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">WebUI Auth Activity</div>
       <div id="auth-events-logs" class="space-y-1 font-mono text-xs"><span class="text-gray-700">Loading…</span></div>
@@ -665,6 +670,7 @@
       </div>
       <div class="flex gap-2 mt-3 items-center">
         <button onclick="saveRules()" class="btn-primary text-xs">Save rules</button>
+        <button onclick="loadRecommendedRules()" class="btn-secondary text-xs">Load recommended</button>
         <span id="rules-msg" class="text-xs"></span>
       </div>
     </div>
@@ -1488,9 +1494,35 @@ async function loadLogs(){
     const col=r=>r==='NOERROR'?'text-green-400':r==='NXDOMAIN'?'text-yellow-500':'text-red-400';
     document.getElementById('log-list').innerHTML=logs.length===0?'<p class="text-gray-700">No logs — requires verbosity ≥ 1.</p>':
       [...logs].reverse().map(l=>`<div class="flex gap-3 items-baseline py-0.5 border-b border-gray-900/60 hover:bg-gray-900/40"><span class="text-gray-700 w-20 shrink-0">${(l.timestamp??'').slice(11,19)}</span><span class="text-gray-600 w-28 truncate shrink-0">${esc(l.client??'')}</span><span class="text-cyan-400 flex-1 truncate">${esc(l.name??'')}</span><span class="text-gray-600 w-12 shrink-0">${esc(l.qtype??'')}</span><span class="${col(l.rcode)} w-20 shrink-0">${esc(l.rcode??'')}</span><span class="text-gray-700 w-14 text-right shrink-0 tabular-nums">${l.ms!=null?l.ms+' ms':''}</span></div>`).join('');
+    applyLogSearch();
   }catch(e){toast('Logs: '+e.message,true);}
 }
-function toggleAutoLogs(el){clearInterval(logsTimer);if(el.checked){loadLogs();loadAuthEvents();logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}else{logsTimer=null;}}
+async function loadAudit(){
+  try{ const d=await api('GET','/audit/tail?n=200'); renderAudit(d.lines??[]); }catch(_){}
+}
+function renderAudit(lines){
+  const el=document.getElementById('audit-list'); if(!el)return;
+  if(!lines.length){ el.innerHTML='<span class="text-gray-700">— no audit entries (set audit-log: yes)</span>'; return; }
+  el.innerHTML=[...lines].reverse().map(e=>{
+    const f=e.fields||{}, a=f.actor||'system', parts=[];
+    if(f.method) parts.push(f.method+' '+(f.path||''));
+    if(f.status!=null) parts.push('\u2192'+f.status);
+    Object.keys(f).forEach(k=>{ if(!['actor','method','path','status'].includes(k)) parts.push(k+'='+f[k]); });
+    const t=new Date((e.ts||0)*1000).toISOString().slice(11,19);
+    const evcol=e.event==='auth_failure'?'text-red-400':(e.event==='admin_action'?'text-cyan-400':'text-amber-400');
+    const detail=parts.join(' ');
+    return `<div class="flex gap-3 items-baseline py-0.5 border-b border-gray-900/60"><span class="text-gray-700 w-20 shrink-0">${t}</span><span class="text-emerald-400 w-24 truncate shrink-0" title="${esc(a)}">${esc(a)}</span><span class="${evcol} w-32 shrink-0">${esc(e.event||'')}</span><span class="text-gray-400 flex-1 truncate" title="${esc(detail)}">${esc(detail)}</span></div>`;
+  }).join('');
+  applyLogSearch();
+}
+function applyLogSearch(){
+  const q=(document.getElementById('logs-search')?.value||'').trim().toLowerCase();
+  ['log-list','audit-list'].forEach(id=>{
+    const c=document.getElementById(id); if(!c)return;
+    [...c.children].forEach(row=>{ row.style.display=(!q||row.textContent.toLowerCase().includes(q))?'':'none'; });
+  });
+}
+function toggleAutoLogs(el){clearInterval(logsTimer);if(el.checked){loadLogs();loadAuthEvents();loadAudit();logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();loadAudit();},3000);}else{logsTimer=null;}}
 
 // ══════════════════════════════════════════════
 // System
@@ -1660,7 +1692,7 @@ function showTab(name,btn){
   if(name==='feeds'){loadPresets();loadFeeds();}
   if(name==='upstreams'){loadUpstreamPresets();loadUpstreams();}
   if(name==='splithz')loadSplitHorizon();
-  if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
+  if(name==='logs'){loadLogs();loadAuthEvents();loadAudit();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();loadAudit();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
   if(name==='protection'){loadProtection();loadRules();protectionTimer=setInterval(loadProtection,4000);}
   if(name==='settings'){initDnssecToggle();initResolutionToggle();initCaCard();loadTlsStatus();}
@@ -1693,6 +1725,15 @@ function renderRules(){
     const col=r.action==='block'?'bg-red-900 text-red-300':(r.action==='tarpit'?'bg-amber-900 text-amber-300':'bg-gray-800 text-gray-400');
     return `<div class="flex items-center gap-2 text-xs"><span class="text-gray-300 w-36 truncate">${tlsEsc(r.name)}</span><span class="text-gray-500 w-16">${r.window_s}s</span><span class="text-gray-500 w-20">&ge;${r.threshold}</span><span class="px-1.5 py-0.5 rounded ${col}">${tlsEsc(r.action)}</span><span class="text-gray-600 w-16 text-right">${r.block_duration_s}s</span><button onclick="delRule(${i})" class="text-red-500 hover:text-red-400 ml-auto px-1" title="Remove">&times;</button></div>`;
   }).join('');
+}
+function loadRecommendedRules(){
+  _rules=[
+    {name:'observe',     metric:'client-qps', window_s:10, threshold:2000,  action:'log',    block_duration_s:0},
+    {name:'tarpit-abuse',metric:'client-qps', window_s:10, threshold:5000,  action:'tarpit', block_duration_s:60},
+    {name:'ban-flood',   metric:'client-qps', window_s:10, threshold:20000, action:'block',  block_duration_s:3600}
+  ];
+  renderRules();
+  const m=document.getElementById('rules-msg'); if(m){ m.textContent='Recommended rules loaded — review thresholds for your traffic, then Save.'; m.className='text-xs text-amber-400'; }
 }
 function addRule(){
   const name=document.getElementById('rule-name').value.trim(); if(!name){ return; }

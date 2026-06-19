@@ -1361,6 +1361,26 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/aler
 
 ---
 
+### `PUT /api/alerts/rules`
+
+Replace the full alert-rule set (admin only). The rules are validated, persisted to
+`runbound.conf` (whole-config regeneration preserves everything else) and **hot-applied**
+without a restart. `action` is one of `log`, `tarpit`, `block`, `notify`.
+
+```bash
+curl -X PUT http://localhost:8080/api/alerts/rules \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" -H "Content-Type: application/json" \
+  -d '[{"name":"tarpit-abuse","window_s":10,"threshold":5000,"action":"tarpit","block_duration_s":60},
+       {"name":"ban-flood","window_s":10,"threshold":20000,"action":"block","block_duration_s":3600}]'
+```
+
+Editable from the WebUI **Protection** tab ("Load recommended" pre-fills a sane set).
+
+> **Audit:** every authenticated mutating request is logged as an `admin_action` event
+> (`actor`, `method`, `path`, `status`) in the tamper-evident audit log; see `GET /api/audit/tail`.
+
+---
+
 ### `PUT /api/alerts/blocked/:ip`
 
 Manually block an IP address. The block is permanent (no expiry) and persisted to `alert-blocks.json`.

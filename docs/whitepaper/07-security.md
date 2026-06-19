@@ -66,5 +66,34 @@
   (the latest completed cycle, Cycle I, was a two-AI adversarial review — Claude Opus 4.8 ×
   Gemini 2.5 Pro). Marketing language is banned.
 
+## Abuse detection, tarpit & kernel bans (#ddos)
+
+On top of the per-source token-bucket rate limit, an **abuse engine** (per-client
+query-rate rules: `log` / `tarpit` / `block` / `notify`) escalates only **verified
+sources** — connection transports (TCP/DoT/DoH/DoQ) or UDP carrying a valid DNS Cookie
+(RFC 7873). An unverified UDP source is **never** tarpitted or banned: spoofing a
+victim's IP must not let an attacker get the victim banned, nor make Runbound reflect
+responses toward a spoofed victim. Unverified UDP floods are handled by the rate limiter
++ `BADCOOKIE`.
+
+- **Tarpit** holds a verified abuser's request a bounded delay (then REFUSED); on
+  connection transports the relay holds the connection itself, wasting the attacker's
+  time at near-zero cost (capped by a semaphore to prevent self-DoS).
+- **Block** is enforced at the **kernel**: the userspace detector pushes the IP to a BPF
+  map and the XDP program `XDP_DROP`s its DNS before userspace — gated by a `bans_active`
+  flag so an idle server pays only a single array lookup per packet (bench-verified: no
+  fast-path regression). On connection transports the ban is enforced at the relay (the
+  handler sees only the loopback relay address); IPv6 / non-XDP falls back to userspace.
+- Rules are editable **live** (WebUI Protection tab or `PUT /api/alerts/rules`), persisted
+  to config and hot-applied without a restart.
+
+## Audit trail — who did what
+
+Every authenticated **mutating** request (config change, ban, rule edit, …) is recorded
+in the tamper-evident audit log (`audit-log: yes`) as an `admin_action` event carrying the
+**actor** (username), method, path and result status; the actor is inside the HMAC-chained
+fields. The WebUI **Logs** tab surfaces this audit stream alongside the query log, with a
+functional text search across both. Auth failures are recorded too.
+
 ## To expand
 - Full threat model table; the audit cycles (A–I) summary; HSM setup.

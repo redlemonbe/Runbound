@@ -1350,6 +1350,37 @@ alert:
 | `abuse-tarpit-delay-ms` | `2000` | How long a tarpitted (verified) source is held before the REFUSED reply. |
 | `abuse-tarpit-max-conns` | `256` | Max concurrent held tarpit requests; over the cap we REFUSE immediately (anti-self-DoS). |
 
+**Recommended base rules** (also one click in the WebUI Protection tab → *Load recommended*):
+
+```
+dns-cookies: yes     # verify UDP sources so they can be escalated (else rate-limit only)
+audit-log: yes       # record who does what (admin_action events) — see the WebUI Logs tab
+
+alert:
+    name:      observe        # log notable clients, zero traffic impact (action defaults to log)
+    window-s:  10
+    threshold: 2000
+
+alert:
+    name:             tarpit-abuse   # hold a verified abuser, then REFUSED
+    window-s:         10
+    threshold:        5000
+    action:           tarpit
+    block-duration-s: 60
+
+alert:
+    name:             ban-flood      # ban an extreme flood for 1 h (dropped at XDP/kernel)
+    window-s:         10
+    threshold:        20000
+    action:           block
+    block-duration-s: 3600
+```
+
+Tune the thresholds to your traffic — a busy NAT gateway or downstream forwarder can
+legitimately exceed them. With `audit-log: yes`, every authenticated **mutating** API/WebUI
+request is recorded as an `admin_action` event carrying the **actor** (username), method,
+path and status (HMAC-chained), surfaced in the WebUI **Logs** tab with a functional search.
+
 **Webhook payload (`action: notify`):**
 
 ```json

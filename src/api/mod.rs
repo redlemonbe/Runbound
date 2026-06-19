@@ -512,6 +512,8 @@ async fn security_middleware(
     // Exposing version, endpoint list, or RFCs without auth enables
     // fingerprinting and targeted exploitation (AUDIT-HIGH-02).
     let path = req.uri().path();
+    let audit_method = req.method().clone();
+    let audit_path = path.to_string();
     {
         // NEW-HIGH (pentest v0.4.4): timing oracle — pre-auth brute-force brake.
         // The sleep is applied BEFORE constant_time_eq so it cannot be used as
@@ -582,7 +584,23 @@ async fn security_middleware(
     }
 
     // ── 3. Security response headers ──────────────────────────────────
+    // #audit: actor = the authenticated user resolved above (inserted into req).
+    let audit_actor = req
+        .extensions()
+        .get::<crate::multiuser::RequestUser>()
+        .map(|u| u.username.clone());
     let mut response = next.run(req).await;
+    // #audit: record what authenticated users/admins do — every mutating request,
+    // with the actor and the result status (the structured events add the detail).
+    if let Some(actor) = audit_actor {
+        if !matches!(audit_method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS) {
+            let audit = state.audit.clone();
+            let status = response.status().as_u16();
+            tokio::spawn(async move {
+                audit.send_as(actor, AuditEvent::AdminAction { method: audit_method.to_string(), path: audit_path, status });
+            });
+        }
+    }
     let headers = response.headers_mut();
     headers.insert(
         "x-content-type-options",

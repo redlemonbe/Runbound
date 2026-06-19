@@ -56,6 +56,12 @@ pub enum AuditEvent {
     LogsClear {
         count: usize,
     },
+    /// Any authenticated mutating API/WebUI request (who did what + result).
+    AdminAction {
+        method: String,
+        path: String,
+        status: u16,
+    },
 }
 
 impl AuditEvent {
@@ -72,6 +78,7 @@ impl AuditEvent {
             Self::AuthFailure { .. } => "auth_failure",
             Self::ConfigReload => "config_reload",
             Self::LogsClear { .. } => "logs_clear",
+            Self::AdminAction { .. } => "admin_action",
         }
     }
 
@@ -79,6 +86,7 @@ impl AuditEvent {
         match self {
             Self::Startup | Self::Shutdown | Self::ConfigReload => serde_json::json!({}),
             Self::LogsClear { count } => serde_json::json!({ "entries_deleted": count }),
+            Self::AdminAction { method, path, status } => serde_json::json!({ "method": method, "path": path, "status": status }),
             Self::DnsAdd { name, rtype, value } => serde_json::json!({
                 "name": name, "type": rtype, "value": value,
             }),
@@ -98,14 +106,18 @@ impl AuditEvent {
 
 #[derive(Clone)]
 pub struct AuditLogger {
-    tx: mpsc::UnboundedSender<AuditEvent>,
+    tx: mpsc::UnboundedSender<(String, AuditEvent)>,
 }
 
 impl AuditLogger {
     pub fn send(&self, event: AuditEvent) {
-        // Best-effort: never block the hot path. If the channel is closed (shutdown),
-        // silently drop — the task has already exited cleanly.
-        let _ = self.tx.send(event);
+        self.send_as("system", event);
+    }
+
+    /// Record an event attributed to `actor` (the authenticated username, or "system").
+    /// Best-effort: never blocks; silently drops if the channel is closed (shutdown).
+    pub fn send_as(&self, actor: impl Into<String>, event: AuditEvent) {
+        let _ = self.tx.send((actor.into(), event));
     }
 }
 
@@ -122,7 +134,7 @@ pub fn init(
     base_dir: PathBuf,
     checkpoint_every: u64,
 ) -> AuditLogger {
-    let (tx, rx) = mpsc::unbounded_channel::<AuditEvent>();
+    let (tx, rx) = mpsc::unbounded_channel::<(String, AuditEvent)>();
 
     if enabled {
         let resolved_path = log_path.unwrap_or_else(|| base_dir.join("audit.log"));
@@ -203,7 +215,7 @@ fn rand_byte() -> u8 {
 // ── Writer task ────────────────────────────────────────────────────────────────
 
 async fn writer_task(
-    mut rx: mpsc::UnboundedReceiver<AuditEvent>,
+    mut rx: mpsc::UnboundedReceiver<(String, AuditEvent)>,
     log_path: PathBuf,
     key: Vec<u8>,
     start_seq: u64,
@@ -226,14 +238,18 @@ async fn writer_task(
     let mut last_mac;
     let mut block_start_seq = start_seq;
 
-    while let Some(event) = rx.recv().await {
+    while let Some((actor, event)) = rx.recv().await {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
         let event_name = event.event_name();
-        let fields = event.fields();
+        // Attribute the actor inside `fields` so it is covered by the HMAC chain.
+        let mut fields = event.fields();
+        if let Some(o) = fields.as_object_mut() {
+            o.insert("actor".to_string(), serde_json::json!(actor));
+        }
 
         // HMAC-SHA256 over: seq (8 bytes LE) || ts (8 bytes LE) || event name || fields JSON
         let mac = compute_mac(&key, seq, ts, event_name, &fields.to_string());

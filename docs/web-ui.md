@@ -75,7 +75,7 @@ Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
 | **Blacklist** | Add / delete blocked domains (`nxdomain` or `refuse` action) |
 | **Feeds** | Add / delete blocklist feed URLs (hosts or adblock format); preset list; entry count; error text on refresh failure |
 | **Upstreams** | Add / delete resolvers; 9 built-in presets; health dots, DNSSEC badge, latency sparkline, DoT SNI config; **↺ Reconnect DoT** button |
-| **Logs** | Query ring buffer with 3-second auto-refresh; WebUI auth activity log |
+| **Logs** | Query ring buffer with 3-second auto-refresh; **admin & config audit** (who did what — actor, action, result); **WebUI auth activity**; a **functional search** filtering all three. |
 | **Protection** | ICMP XDP flood protection (enable/disable per node; rate / burst / ban-threshold; per-node stats cards); **Banned source IPs** table (IP, source, age) with per-row **Blacklist** (make permanent) and **Unban** buttons; DDoS alerts log. Bans are enforced on both the XDP fast path and the kernel slow path. |
 | **System** | Runtime info (version, XDP mode, memory, CPU); slave list with sync status and version; full backup download / restore; cache flush button |
 | **Settings** | DNSSEC validation toggle; **Resolution mode** (forward to full-recursion, #202); **Encrypted DNS** panel: enable DoT/DoH/DoQ with a self-signed **or** imported certificate — **applied live, no restart** (cert CN/expiry/fingerprint shown); CA certificate download |
@@ -166,7 +166,7 @@ server:
 ### Enforcement
 
 Bans are enforced via the same pipeline as alert blocks: XDP BPF map injection (IPv4) or
-userspace block (IPv6). They persist across restarts in `alert-blocks.json` and are
+userspace block (IPv6). The **Protection** tab also has a live **Alert rules** editor (add/remove rules, action `log`/`tarpit`/`block`/`notify`, `Load recommended` for a sane base set; saved via `PUT /api/alerts/rules`, applied without restart). They persist across restarts in `alert-blocks.json` and are
 automatically purged by a background task when they expire.
 
 ---
