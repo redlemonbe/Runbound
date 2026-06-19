@@ -452,6 +452,10 @@ pub struct UnboundConfig {
     /// RRL slip: when rate-limited, leak 1-in-N over-rate UDP queries as a response
     /// and silently drop the rest (#203). 0 = legacy (answer Refused to all).
     pub rrl_slip: u64,
+    /// Publish DDR (RFC 9462) SVCB records at `_dns.resolver.arpa` advertising this
+    /// node's DoT/DoH/DoQ endpoints, so clients auto-upgrade to encrypted DNS (#204).
+    /// Requires `tls-cert-hostname` (the cert hostname clients validate). Default off.
+    pub ddr: bool,
 }
 
 
@@ -1048,6 +1052,7 @@ fn parse_server_directive(
         "proxy-protocol"            => cfg.proxy_protocol = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
         "dns-cookies"               => cfg.dns_cookies = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
         "rrl-slip"                  => cfg.rrl_slip = val.trim().parse().unwrap_or(0),
+        "ddr"                       => cfg.ddr = matches!(val.trim().trim_matches('"'), "yes" | "true" | "1"),
         "xdp-rx-ring-size" => {
             cfg.xdp_rx_ring_size = parse_xdp_ring_size(val, "xdp-rx-ring-size", lineno)?
         }

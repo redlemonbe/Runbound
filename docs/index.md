@@ -35,6 +35,7 @@ Complete reference for Runbound. Each page targets the current stable release an
 | [internals.md](internals.md) | **Expert** — packet lifecycle, timing budget, implemented optimisations, roadmap |
 | [ha.md](ha.md) | High-availability topologies — active/passive, anycast-ready |
 | [anycast.md](anycast.md) | Anycast deployment — one VIP across nodes, ECMP/BGP, health-driven route withdrawal (bench-validated) |
+| [public-resolver.md](public-resolver.md) | Deploy as a public encrypted resolver — DoT/DoH/DoQ, Let's Encrypt cert, DDR auto-discovery (RFC 9462), access profiles (#204) |
 | [sync.md](sync.md) | Master/slave replication — protocol, zone sync, slave health |
 | [proxmox.md](proxmox.md) | Proxmox / bare-metal deployment with bridge and vmbr NICs |
 | [homelab.md](homelab.md) | Homelab setup — single server, LAN-only, ad-blocking |

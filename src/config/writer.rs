@@ -66,6 +66,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "node-id" | "drain-timeout" | "health-servfail-threshold"
                 | "health-latency-threshold" | "health-min-qps" | "proxy-protocol"
                 | "dns-cookies" | "rrl-slip"
+                | "ddr"
                 | "ui-tls-san"
                 | "bot-ban-duration-secs" | "bot-honeypot-enabled"
                 | "webhook" | "webhook-url" | "webhook-format" | "webhook-token" | "webhook-events"

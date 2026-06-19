@@ -1622,6 +1622,15 @@ If `branding: yes` but `branding.conf` is missing, Runbound logs a warning and
 keeps the built-in defaults (or any `ui-brand-*` directives present). A full
 example ships in [`examples/branding.conf`](../examples/branding.conf).
 
+### Public encrypted resolver — DDR auto-discovery (#204)
+
+| Directive | Default | Description |
+|-----------|---------|-------------|
+| `ddr` | `no` | Publish DDR (RFC 9462) SVCB records at `_dns.resolver.arpa` advertising this node's DoT/DoH/DoQ endpoints (built from `tls-cert-hostname` + `tls-port`/`https-port`/`quic-port`), so clients on plain DNS auto-upgrade to encrypted. Requires `tls-cert-hostname`. |
+
+Full deployment guide (cert/ACME, ports/firewall, access profiles, anycast):
+[public-resolver.md](public-resolver.md).
+
 ### Anti-amplification — public resolver hardening (#203)
 
 For exposing plain UDP `:53` to the internet. Layered with the existing per-IP

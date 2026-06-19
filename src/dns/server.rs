@@ -208,6 +208,8 @@ pub struct RunboundHandler {
     cookie_secret: [u8; 16],
     /// #203: counter driving the RRL slip leak.
     rrl_counter: std::sync::atomic::AtomicU64,
+    /// #204: DDR (RFC 9462) endpoint info, Some when `ddr: yes` + a TLS hostname is set.
+    ddr: Option<DdrInfo>,
 }
 
 /// #10/#186: compiled split-horizon table — (CidrBlock list, per-subnet LocalZoneSet).
@@ -298,6 +300,7 @@ impl RunboundHandler {
         recursor: crate::dns::recursor::SharedRecursor,
         dns_cookies: bool,
         rrl_slip: u64,
+        ddr: Option<DdrInfo>,
     ) -> Self {
         Self {
             zones,
@@ -346,6 +349,7 @@ impl RunboundHandler {
                 sk
             },
             rrl_counter: std::sync::atomic::AtomicU64::new(0),
+            ddr,
             // SEC-20: decode TSIG keys once at startup instead of per-request.
             tsig_keys: tsig_keys_raw.into_iter().filter_map(|(name, alg_str, secret_b64)| {
                 let alg = match alg_str.as_str() {
@@ -1758,6 +1762,38 @@ impl RequestHandler for RunboundHandler {
             return send_error(request, response_handle, ResponseCode::Refused).await;
         }
 
+        // ── 3b-DDR. #204: serve SVCB for _dns.resolver.arpa (RFC 9462) ─
+        if qtype == RecordType::SVCB {
+            if let Some(ddr) = &self.ddr {
+                if qname.to_string().eq_ignore_ascii_case("_dns.resolver.arpa.") {
+                    let answer = ddr.svcb_records();
+                    if !answer.is_empty() {
+                        debug!(%client_ip, "DDR: answering _dns.resolver.arpa SVCB");
+                        let mut metadata = Metadata::response_from_request(&request.metadata);
+                        metadata.authoritative = true;
+                        let opt_edns = make_opt_edns(request);
+                        let mut builder = MessageResponseBuilder::from_message_request(request);
+                        if let Some(ref opt) = opt_edns {
+                            builder.edns(opt);
+                        }
+                        let response = builder.build(
+                            metadata,
+                            answer.iter(),
+                            std::iter::empty(),
+                            std::iter::empty(),
+                            std::iter::empty(),
+                        );
+                        self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
+                        let mut rh = response_handle;
+                        return rh.send_response(response).await.unwrap_or_else(|e| {
+                            error!("send: {e}");
+                            servfail_info(request)
+                        });
+                    }
+                }
+            }
+        }
+
         // ── 3c. Block ANY queries (RFC 8482 — amplification vector) ────
         if qtype == RecordType::ANY {
             // #180: refuse ANY to mitigate amplification. Use REFUSED (RCODE 5) — the
@@ -1939,6 +1975,78 @@ fn make_opt_edns(request: &MessageRequest) -> Option<Edns> {
     e.set_max_payload(req_edns.max_payload().clamp(512, 1232));
     e.flags_mut().dnssec_ok = req_edns.flags().dnssec_ok;
     Some(e)
+}
+
+/// #204: DDR (RFC 9462) endpoint info used to synthesise the `_dns.resolver.arpa`
+/// SVCB answer that points clients at this node's encrypted transports.
+#[derive(Clone)]
+struct DdrInfo {
+    hostname: String,
+    dot_port: u16,
+    doh_port: u16,
+    doq_port: u16,
+}
+
+impl DdrInfo {
+    /// Build the SVCB RRset advertised at `_dns.resolver.arpa` (DoT / DoH / DoQ).
+    #[allow(clippy::vec_init_then_push)] // one push per transport, kept readable
+    fn svcb_records(&self) -> Vec<hickory_proto::rr::Record> {
+        use hickory_proto::rr::rdata::svcb::{Alpn, SvcParamKey, SvcParamValue, Unknown, SVCB};
+        use hickory_proto::rr::{Name, RData, Record};
+        let owner = match Name::from_ascii("_dns.resolver.arpa.") {
+            Ok(n) => n,
+            Err(_) => return Vec::new(),
+        };
+        let target = match Name::from_utf8(format!("{}.", self.hostname.trim_end_matches('.'))) {
+            Ok(n) => n,
+            Err(_) => return Vec::new(),
+        };
+        let mut recs = Vec::new();
+        // DoT (RFC 7858) — priority 1
+        recs.push(Record::from_rdata(
+            owner.clone(),
+            7200,
+            RData::SVCB(SVCB::new(
+                1,
+                target.clone(),
+                vec![
+                    (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec!["dot".to_string()]))),
+                    (SvcParamKey::Port, SvcParamValue::Port(self.dot_port)),
+                ],
+            )),
+        ));
+        // DoH (RFC 8484) — priority 2, with dohpath (SvcParamKey 7, RFC 9461)
+        recs.push(Record::from_rdata(
+            owner.clone(),
+            7200,
+            RData::SVCB(SVCB::new(
+                2,
+                target.clone(),
+                vec![
+                    (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec!["h2".to_string()]))),
+                    (SvcParamKey::Port, SvcParamValue::Port(self.doh_port)),
+                    (
+                        SvcParamKey::Unknown(7),
+                        SvcParamValue::Unknown(Unknown(b"/dns-query{?dns}".to_vec())),
+                    ),
+                ],
+            )),
+        ));
+        // DoQ (RFC 9250) — priority 3
+        recs.push(Record::from_rdata(
+            owner,
+            7200,
+            RData::SVCB(SVCB::new(
+                3,
+                target,
+                vec![
+                    (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec!["doq".to_string()]))),
+                    (SvcParamKey::Port, SvcParamValue::Port(self.doq_port)),
+                ],
+            )),
+        ));
+        recs
+    }
 }
 
 /// #203: DNS Cookie verdict for a UDP query.
@@ -3367,6 +3475,16 @@ pub async fn run_dns_server(
         Arc::clone(&recursor),
         cfg.dns_cookies,
         cfg.rrl_slip,
+        if cfg.ddr {
+            cfg.tls.hostname.clone().map(|h| DdrInfo {
+                hostname: h,
+                dot_port: cfg.tls.dot_port.unwrap_or(853),
+                doh_port: cfg.tls.doh_port.unwrap_or(443),
+                doq_port: cfg.tls.doq_port.unwrap_or(853),
+            })
+        } else {
+            None
+        },
     );
     // Step 3b: wrap handler in Arc for sharing between Server and fallback reader.
     let handler_arc = std::sync::Arc::new(handler);
