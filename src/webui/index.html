@@ -650,6 +650,25 @@
       </div>
     </div>
 
+    <!-- Alert rules editor (#ddos) -->
+    <div class="card mt-4">
+      <div class="text-xs text-gray-600 uppercase tracking-wide mb-3">Alert rules — abuse detection</div>
+      <p class="text-xs text-gray-600 mb-3">Per-client query-rate rules (verified sources only). <span class="text-amber-400">tarpit</span> = hold an abuser then REFUSED; <span class="text-red-400">block</span> = ban (dropped at the XDP/kernel layer); <span class="text-gray-400">notify</span> = webhook; <span class="text-gray-400">log</span>. Changes apply live.</p>
+      <div id="rules-table" class="space-y-1 mb-3"><span class="text-gray-700 italic text-sm">—</span></div>
+      <div class="grid grid-cols-6 gap-2 items-end text-xs">
+        <div><label class="text-gray-500 block mb-1">Name</label><input id="rule-name" class="input w-full" placeholder="ddos-ramp"/></div>
+        <div><label class="text-gray-500 block mb-1">Window&nbsp;s</label><input id="rule-window" type="number" min="1" class="input w-full" value="10"/></div>
+        <div><label class="text-gray-500 block mb-1">Threshold</label><input id="rule-threshold" type="number" min="1" class="input w-full" value="1000"/></div>
+        <div><label class="text-gray-500 block mb-1">Action</label><select id="rule-action" class="input w-full"><option>log</option><option>tarpit</option><option>block</option><option>notify</option></select></div>
+        <div><label class="text-gray-500 block mb-1">Ban/hold&nbsp;s</label><input id="rule-dur" type="number" min="0" class="input w-full" value="300"/></div>
+        <div><button onclick="addRule()" class="btn-secondary text-xs w-full">Add</button></div>
+      </div>
+      <div class="flex gap-2 mt-3 items-center">
+        <button onclick="saveRules()" class="btn-primary text-xs">Save rules</button>
+        <span id="rules-msg" class="text-xs"></span>
+      </div>
+    </div>
+
   </div>
 
   <!-- ═══ ABOUT ═══ -->
@@ -1643,7 +1662,7 @@ function showTab(name,btn){
   if(name==='splithz')loadSplitHorizon();
   if(name==='logs'){loadLogs();loadAuthEvents();const cb=document.getElementById('logs-auto');if(cb)cb.checked=true;logsTimer=setInterval(()=>{loadLogs();loadAuthEvents();},3000);}
   if(name==='system'){loadSystem();loadSlaves();}
-  if(name==='protection'){loadProtection();protectionTimer=setInterval(loadProtection,4000);}
+  if(name==='protection'){loadProtection();loadRules();protectionTimer=setInterval(loadProtection,4000);}
   if(name==='settings'){initDnssecToggle();initResolutionToggle();initCaCard();loadTlsStatus();}
   if(name==='account'){loadAuthEvents();}
   if(name==='users'){loadUsers();}
@@ -1666,6 +1685,33 @@ function protNodeList() {
   return list;
 }
 
+let _rules = [];
+function renderRules(){
+  const t=document.getElementById('rules-table'); if(!t)return;
+  if(!_rules.length){ t.innerHTML='<span class="text-gray-700 italic text-sm">No rules</span>'; return; }
+  t.innerHTML=_rules.map((r,i)=>{
+    const col=r.action==='block'?'bg-red-900 text-red-300':(r.action==='tarpit'?'bg-amber-900 text-amber-300':'bg-gray-800 text-gray-400');
+    return `<div class="flex items-center gap-2 text-xs"><span class="text-gray-300 w-36 truncate">${tlsEsc(r.name)}</span><span class="text-gray-500 w-16">${r.window_s}s</span><span class="text-gray-500 w-20">&ge;${r.threshold}</span><span class="px-1.5 py-0.5 rounded ${col}">${tlsEsc(r.action)}</span><span class="text-gray-600 w-16 text-right">${r.block_duration_s}s</span><button onclick="delRule(${i})" class="text-red-500 hover:text-red-400 ml-auto px-1" title="Remove">&times;</button></div>`;
+  }).join('');
+}
+function addRule(){
+  const name=document.getElementById('rule-name').value.trim(); if(!name){ return; }
+  _rules.push({name, metric:'client-qps',
+    window_s:+document.getElementById('rule-window').value||10,
+    threshold:+document.getElementById('rule-threshold').value||1000,
+    action:document.getElementById('rule-action').value,
+    block_duration_s:+document.getElementById('rule-dur').value||0});
+  document.getElementById('rule-name').value=''; renderRules();
+}
+function delRule(i){ _rules.splice(i,1); renderRules(); }
+async function saveRules(){
+  const m=document.getElementById('rules-msg');
+  try{ const r=await api('PUT','/alerts/rules',_rules); m.textContent='Saved '+(r.rules!=null?r.rules:_rules.length)+' rule(s) — applied live.'; m.className='text-xs text-emerald-400'; }
+  catch(e){ m.textContent='Save failed: '+e.message; m.className='text-xs text-red-400'; }
+}
+async function loadRules(){
+  try{ const a=await api('GET','/alerts'); _rules=(a.rules||[]).map(r=>({name:r.name,metric:r.metric||'client-qps',window_s:r.window_s,threshold:r.threshold,action:r.action,block_duration_s:r.block_duration_s})); renderRules(); }catch(_){}
+}
 async function loadProtection() {
   // Load master config (global)
   try {

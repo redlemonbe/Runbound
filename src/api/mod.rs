@@ -725,6 +725,7 @@ pub fn router(state: AppState) -> Router {
         )
         // Alert thresholds (#12)
         .route("/alerts", get(get_alerts))
+        .route("/alerts/rules", get(get_alerts).put(put_alert_rules))
         .route("/webhooks/test", post(post_webhook_test))
         .route("/alerts/blocked/:ip", delete(delete_blocked_ip).put(put_blocked_ip))
         .route("/protection/banned", get(banned_list_handler))
@@ -7196,6 +7197,85 @@ async fn post_webhook_test(State(state): State<AppState>) -> impl IntoResponse {
 
 // GET /api/alerts — alert rules, blocked clients, recent events (#12)
 // Auth handled by security_middleware.
+#[derive(serde::Deserialize)]
+struct AlertRuleBody {
+    name: String,
+    #[serde(default = "ar_metric")]
+    metric: String,
+    #[serde(default = "ar_window")]
+    window_s: u64,
+    #[serde(default = "ar_threshold")]
+    threshold: u64,
+    #[serde(default = "ar_action")]
+    action: String,
+    #[serde(default)]
+    notify_url: Option<String>,
+    #[serde(default = "ar_blockdur")]
+    block_duration_s: u64,
+}
+fn ar_metric() -> String { "client-qps".to_string() }
+fn ar_window() -> u64 { 10 }
+fn ar_threshold() -> u64 { 1000 }
+fn ar_action() -> String { "log".to_string() }
+fn ar_blockdur() -> u64 { 300 }
+
+/// PUT /api/alerts/rules — replace the full alert-rule set (admin). Persists to the
+/// config (regenerated) and hot-applies via AlertTracker::update_rules — no restart.
+async fn put_alert_rules(
+    State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+    ApiJson(rules): ApiJson<Vec<AlertRuleBody>>,
+) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"alert rules require admin"}))).into_response();
+    }
+    if rules.len() > 64 {
+        return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"TOO_MANY_RULES","details":"max 64 rules"}))).into_response();
+    }
+    let mut out: Vec<crate::config::parser::AlertRule> = Vec::with_capacity(rules.len());
+    for r in rules {
+        let name = r.name.trim().to_string();
+        if name.is_empty() || name.len() > 64 || name.contains(|c: char| c.is_control()) {
+            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_NAME","details":"rule name 1..64 chars, no control chars"}))).into_response();
+        }
+        if !matches!(r.action.as_str(), "log" | "block" | "notify" | "tarpit") {
+            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_ACTION","details":"action must be log, block, notify or tarpit"}))).into_response();
+        }
+        if r.metric != "client-qps" {
+            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_METRIC","details":"only client-qps is supported"}))).into_response();
+        }
+        if r.action == "notify" && r.notify_url.as_deref().unwrap_or("").is_empty() {
+            return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"MISSING_NOTIFY_URL","details":"action=notify requires notify-url"}))).into_response();
+        }
+        out.push(crate::config::parser::AlertRule {
+            name,
+            metric: r.metric,
+            window_s: r.window_s.clamp(1, 86_400),
+            threshold: r.threshold.max(1),
+            action: r.action,
+            notify_url: r.notify_url,
+            block_duration_s: r.block_duration_s.min(31_536_000),
+        });
+    }
+    // Persist (whole-config regeneration preserves everything else).
+    let cfg_path = s.cfg_path.clone();
+    let rules_for_cfg = out.clone();
+    let persist = (|| -> Result<(), String> {
+        let mut c = crate::config::load(&cfg_path).map_err(|e| format!("load config: {e}"))?;
+        c.alerts = rules_for_cfg;
+        crate::config::writer::write_config_atomic(&c, std::path::Path::new(&cfg_path)).map_err(|e| format!("write config: {e}"))
+    })();
+    if let Err(e) = persist {
+        return (StatusCode::INTERNAL_SERVER_ERROR, JsonExtract(serde_json::json!({"error":"CONFIG_WRITE","details":e}))).into_response();
+    }
+    // Hot-apply.
+    s.alert_tracker.update_rules(out.clone());
+    s.audit.send(AuditEvent::ConfigReload);
+    info!(count = out.len(), "Alert rules updated via API (persisted + hot-applied)");
+    JsonExtract(serde_json::json!({"ok": true, "rules": out.len()})).into_response()
+}
+
 async fn get_alerts(State(state): State<AppState>) -> impl IntoResponse {
     JsonExtract(state.alert_tracker.api_snapshot())
 }
