@@ -13,8 +13,7 @@
 // echoes a minimal OPT RR (DO=0, rdlen=0) for non-DNSSEC queries.  DO=1 →
 // fallback to hickory (DNSSEC validation required).
 
-use hickory_proto::rr::{RData, LowerName, Name};
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
+use hickory_proto::rr::RData;
 use smallvec::SmallVec;
 
 // LocalZoneSet/ZoneAction used in worker.rs (wire_qname_to_lower_name caller), not in this module.
@@ -199,24 +198,11 @@ fn parse_opt_rr(buf: &[u8], mut pos: usize, arcount: u16) -> Option<EdnsInfo> {
 
 // ── LowerName from wire QNAME ─────────────────────────────────────────────────
 
-/// Build a `LowerName` from a wire-format QNAME for LocalZoneSet lookups.
-///
-/// This is the **only remaining hickory allocation** in the fast path.
-/// Necessary because `LocalZoneSet::find()` and `local_records()` require
-/// a `&LowerName` key. Follow-up #156: replace LocalZoneSet key with
-/// wire-QNAME/CRC32 to eliminate this last alloc.
-///
-/// # Topology note
-/// On non-contiguous CPU numbering (NUMA exotic), the CPUMAP index/cpu_id
-/// mapping has a known limitation (see FINDINGS.md #155 follow-up).
-/// This function has no such constraint — it is topology-agnostic.
-#[inline]
-#[allow(dead_code)]
-pub fn wire_qname_to_lower_name(qname_wire: &[u8]) -> Option<LowerName> {
-    let mut decoder = BinDecoder::new(qname_wire);
-    let name = Name::read(&mut decoder).ok()?;
-    Some(LowerName::from(name))
-}
+// (removed) wire_qname_to_lower_name — built a hickory LowerName for the old
+// LocalZoneSet key. Its own follow-up #156 (wire-QNAME / CRC32 keys) is now
+// done: the serving path looks records up by lowercased wire QNAME via
+// find_wire / local_records_wire (src/dns/local.rs), so this last fast-path
+// hickory allocation is gone.
 
 /// Normalise a raw wire-format QNAME from a DNS query into a lowercase
 /// `SmallVec<[u8;64]>` suitable for hashing with `hash_wire_qname`.
