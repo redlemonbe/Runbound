@@ -182,8 +182,9 @@ DNS*) or the REST API — no OpenSSL, no file editing:
   — the pair is validated (the key must match the leaf certificate) before being written.
 - **Status / disable:** `GET /api/tls/cert` (CN, expiry, SHA-256 fingerprint, SANs) and `DELETE /api/tls`.
 
-These mutations are **admin-only** and persist the `tls-service-*` directives; **restart**
-Runbound to bind the listeners (`restart_required: true` is returned). See [api.md](api.md).
+These mutations are **admin-only** and persist the `tls-service-*` directives. The DoT/DoH/DoQ
+listeners are then **(re)bound live** — no process restart, and the plain UDP/TCP :53 path is
+never interrupted (`restart_required: false`). See [api.md](api.md).
 
 ## WebUI TLS — auto-generated certificate SANs
 

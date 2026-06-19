@@ -748,7 +748,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/tls
 
 ### `GET /api/tls/cert`
 
-Encrypted-DNS certificate status: `active` (what the running server booted with) vs `configured` (persisted), the ports, hostname, and the parsed certificate (subject/issuer CN, validity, SHA-256 fingerprint, SANs). `restart_required` is true when the persisted config differs from the running listeners.
+Encrypted-DNS certificate status: `active` (what the running server booted with) vs `configured` (persisted), the ports, hostname, and the parsed certificate (subject/issuer CN, validity, SHA-256 fingerprint, SANs). The DoT/DoH/DoQ listeners are (re)bound live on every change (no restart), so `restart_required` is always `false`.
 
 ```bash
 curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/tls/cert

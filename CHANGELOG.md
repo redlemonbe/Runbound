@@ -8,6 +8,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ## [Unreleased]
 
 ### Added
+- **Encrypted DNS applies live — no restart.** Enabling, disabling, re-keying or re-porting DoT/DoH/DoQ from the WebUI/API now (re)binds the listeners on a dedicated supervised ServerFuture; the plain UDP/TCP `:53` path is never interrupted (bench-verified: 0 lost queries across enable/rekey/disable). `restart_required` is now always `false`.
+- **WebUI: dedicated Account tab.** Per-user settings (change password, session info, recent auth events) moved out of Settings into their own tab; centred tabs unified to a consistent width.
 - **White-label branding via a dedicated `branding.conf` file (#25).** Set `branding: yes` in the main config and Runbound loads `branding.conf` from the same directory: `brand-name`, `accent-color`, `logo-url`, `favicon-url`, plus About-tab fields `about-org`, `about-text`, `about-support-url`. Branding is WebUI-only and has **no REST API impact**. Example in `examples/branding.conf`.
 
 ### Fixed

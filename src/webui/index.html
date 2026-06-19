@@ -776,7 +776,7 @@
         <div class="text-xs text-gray-600 uppercase tracking-wide">Encrypted DNS — DoT / DoH / DoQ</div>
         <span id="tls-state-badge" class="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-400">—</span>
       </div>
-      <p class="text-xs text-gray-400 mb-3">Serve DNS over TLS (853), HTTPS (443) and QUIC (853/udp) so clients such as Firefox can encrypt their queries to Runbound. Generate a self-signed certificate, or import your own (e.g. Let&#39;s Encrypt).</p>
+      <p class="text-xs text-gray-400 mb-3">Serve DNS over TLS (853), HTTPS (443) and QUIC (853/udp) so clients such as Firefox can encrypt their queries to Runbound. Generate a self-signed certificate, or import your own (e.g. Let&#39;s Encrypt). Changes are applied live — no restart.</p>
       <div id="tls-restart-note" class="hidden text-xs text-amber-400 bg-amber-950/40 border border-amber-900 rounded px-3 py-2 mb-3">⚠ Configuration saved — restart Runbound to activate the new encrypted-DNS settings.</div>
       <div id="tls-cert-info" class="hidden text-xs text-gray-400 mb-3 space-y-1 font-mono"></div>
       <div class="space-y-3 max-w-sm" style="padding-left:3px">
@@ -2091,7 +2091,7 @@ async function loadTlsStatus(){
 async function tlsGenSelfSigned(){
   const hostname=document.getElementById('tls-hostname').value.trim();
   if(!hostname){ tlsMsg('Enter a server hostname first.', false); return; }
-  try { await api('POST','/tls/self-signed', Object.assign({hostname}, tlsPorts())); tlsMsg('Self-signed certificate generated — restart Runbound to activate.', true); loadTlsStatus(); }
+  try { await api('POST','/tls/self-signed', Object.assign({hostname}, tlsPorts())); tlsMsg('Self-signed certificate generated — applied live, encrypted DNS is active now.', true); loadTlsStatus(); }
   catch(e){ tlsMsg('Error: '+e.message, false); }
 }
 async function tlsImport(){
@@ -2100,12 +2100,12 @@ async function tlsImport(){
   const hn=document.getElementById('tls-hostname').value.trim();
   if(!cert_pem || !key_pem){ tlsMsg('Paste both the certificate and the private key.', false); return; }
   const body=Object.assign({cert_pem, key_pem}, tlsPorts()); if(hn) body.hostname=hn;
-  try { await api('POST','/tls/import', body); tlsMsg('Certificate imported — restart Runbound to activate.', true); document.getElementById('tls-cert-pem').value=''; document.getElementById('tls-key-pem').value=''; document.getElementById('tls-import-box').classList.add('hidden'); loadTlsStatus(); }
+  try { await api('POST','/tls/import', body); tlsMsg('Certificate imported — applied live, encrypted DNS is active now.', true); document.getElementById('tls-cert-pem').value=''; document.getElementById('tls-key-pem').value=''; document.getElementById('tls-import-box').classList.add('hidden'); loadTlsStatus(); }
   catch(e){ tlsMsg('Error: '+e.message, false); }
 }
 async function tlsDisable(){
-  if(!confirm('Disable encrypted DNS? Clients fall back to plaintext after the next restart.')) return;
-  try { await api('DELETE','/tls'); tlsMsg('Encrypted DNS disabled — restart Runbound to apply.', true); loadTlsStatus(); }
+  if(!confirm('Disable encrypted DNS? Clients fall back to plaintext immediately.')) return;
+  try { await api('DELETE','/tls'); tlsMsg('Encrypted DNS disabled — applied live.', true); loadTlsStatus(); }
   catch(e){ tlsMsg('Error: '+e.message, false); }
 }
 

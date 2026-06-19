@@ -187,7 +187,7 @@ async fn async_main(
         resolution_mode,
         recursor,
         blacklist_reload_rx,
-    ) = build_and_launch(&cfg, base_dir, cfg_path).await?;
+    ) = build_and_launch(&cfg, base_dir, cfg_path.clone()).await?;
 
     // #201: latch the local-zone signing flag before any fast-path preload runs, so signed
     // local zones are kept out of the snapshot and served on the slow path.
@@ -663,6 +663,7 @@ async fn async_main(
         icmp_stats,
         resolution_mode,
         recursor,
+        cfg_path,
     )
     .await;
     fw_cleanup.close();

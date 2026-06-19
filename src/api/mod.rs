@@ -4217,12 +4217,6 @@ async fn tls_cert_handler(State(s): State<AppState>) -> impl IntoResponse {
     let boot = s.tls_cfg.as_ref();
     let active = boot.cert_path.is_some() && boot.key_path.is_some();
     let configured = cfg_tls.cert_path.is_some() && cfg_tls.key_path.is_some();
-    let restart_required = cfg_tls.cert_path != boot.cert_path
-        || cfg_tls.key_path != boot.key_path
-        || cfg_tls.dot_port != boot.dot_port
-        || cfg_tls.doh_port != boot.doh_port
-        || cfg_tls.doq_port != boot.doq_port
-        || cfg_tls.hostname != boot.hostname;
     let cert = cfg_tls
         .cert_path
         .as_deref()
@@ -4231,7 +4225,7 @@ async fn tls_cert_handler(State(s): State<AppState>) -> impl IntoResponse {
     JsonExtract(serde_json::json!({
         "active": active,
         "configured": configured,
-        "restart_required": restart_required,
+        "restart_required": false,
         "dot_port": cfg_tls.dot_port.unwrap_or(853),
         "doh_port": cfg_tls.doh_port.unwrap_or(443),
         "doq_port": cfg_tls.doq_port.unwrap_or(853),
@@ -4320,10 +4314,13 @@ async fn tls_self_signed_handler(
     }
     s.audit.send(AuditEvent::ConfigReload);
     info!(cert = %cert_path.display(), "Encrypted DNS: self-signed certificate generated");
+    if let Some(tx) = crate::dns::server::TLS_APPLY_TX.get() {
+        let _ = tx.try_send(());
+    }
     JsonExtract(serde_json::json!({
         "ok": true,
         "mode": "self-signed",
-        "restart_required": true,
+        "restart_required": false,
         "cert": tls_cert_info(&cert_path.to_string_lossy()),
     }))
     .into_response()
@@ -4402,10 +4399,13 @@ async fn tls_import_handler(
     }
     s.audit.send(AuditEvent::ConfigReload);
     info!(cert = %cert_path.display(), "Encrypted DNS: certificate imported");
+    if let Some(tx) = crate::dns::server::TLS_APPLY_TX.get() {
+        let _ = tx.try_send(());
+    }
     JsonExtract(serde_json::json!({
         "ok": true,
         "mode": "import",
-        "restart_required": true,
+        "restart_required": false,
         "cert": tls_cert_info(&cert_path.to_string_lossy()),
     }))
     .into_response()
@@ -4435,7 +4435,10 @@ async fn tls_disable_handler(
     }
     s.audit.send(AuditEvent::ConfigReload);
     info!("Encrypted DNS: disabled via API");
-    JsonExtract(serde_json::json!({ "ok": true, "restart_required": true })).into_response()
+    if let Some(tx) = crate::dns::server::TLS_APPLY_TX.get() {
+        let _ = tx.try_send(());
+    }
+    JsonExtract(serde_json::json!({ "ok": true, "restart_required": false })).into_response()
 }
 
 

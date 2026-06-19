@@ -78,7 +78,8 @@ Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
 | **Logs** | Query ring buffer with 3-second auto-refresh; WebUI auth activity log |
 | **Protection** | ICMP XDP flood protection (enable/disable per node; rate / burst / ban-threshold; per-node stats cards); **Banned source IPs** table (IP, source, age) with per-row **Blacklist** (make permanent) and **Unban** buttons; DDoS alerts log. Bans are enforced on both the XDP fast path and the kernel slow path. |
 | **System** | Runtime info (version, XDP mode, memory, CPU); slave list with sync status and version; full backup download / restore; cache flush button |
-| **Settings** | DNSSEC validation toggle; **Resolution mode** (forward to full-recursion, #202); **Encrypted DNS** panel: enable DoT/DoH/DoQ with a self-signed **or** imported certificate (cert CN/expiry/fingerprint shown); CA certificate download; password change; session info; recent auth event log |
+| **Settings** | DNSSEC validation toggle; **Resolution mode** (forward to full-recursion, #202); **Encrypted DNS** panel: enable DoT/DoH/DoQ with a self-signed **or** imported certificate — **applied live, no restart** (cert CN/expiry/fingerprint shown); CA certificate download |
+| **Account** | Per-user settings: change password, session info (idle / duration, logout now), recent auth event log |
 | **About** | Version badge, uptime, feature list, GitHub links, credits; plus a custom organisation / blurb / support-link card when white-label branding is enabled |
 
 The header bar shows: connection dot (blink green = connected, red = error), live

@@ -2777,6 +2777,218 @@ async fn run_tcp_with_limit(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Process-wide trigger to hot-reload the encrypted-DNS (DoT/DoH/DoQ) listeners
+/// without restarting. Set once by `run_dns_server`; the WebUI `/tls/*` handlers
+/// send `()` after persisting new TLS config — see [`tls_supervisor`].
+pub static TLS_APPLY_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<()>> =
+    std::sync::OnceLock::new();
+
+/// Thin wrapper letting `Arc<RunboundHandler>` be handed to a hickory `Server`
+/// for the encrypted-DNS ServerFuture (shares the main request handler).
+struct TlsArcHandler(std::sync::Arc<RunboundHandler>);
+#[async_trait::async_trait]
+impl hickory_server::server::RequestHandler for TlsArcHandler {
+    async fn handle_request<
+        R: hickory_server::server::ResponseHandler,
+        T: hickory_server::net::runtime::Time,
+    >(
+        &self,
+        request: &hickory_server::server::Request,
+        response_handle: R,
+    ) -> hickory_server::server::ResponseInfo {
+        self.0.handle_request::<R, T>(request, response_handle).await
+    }
+}
+
+/// Bring up the DoT/DoH/DoQ listeners on their own hickory ServerFuture plus the
+/// public relay tasks, sharing `handler`. Returns the JoinHandles so the caller
+/// can abort them for a hot teardown. Empty when TLS is not configured.
+async fn spawn_tls_service(
+    handler: std::sync::Arc<RunboundHandler>,
+    tls_cfg: &TlsConfig,
+    interfaces: &[String],
+    acl: &Arc<Acl>,
+    tcp_tracker: &Arc<TcpConnTracker>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let (certs, key) = match load_tls_materials(tls_cfg) {
+        Some(m) => m,
+        None => {
+            info!("encrypted DNS: not configured — DoT/DoH/DoQ disabled");
+            return handles;
+        }
+    };
+    let dot_port = tls_cfg.dot_port.unwrap_or(853);
+    let doh_port = tls_cfg.doh_port.unwrap_or(443);
+    let doq_port = tls_cfg.doq_port.unwrap_or(853);
+    let hostname = tls_cfg
+        .hostname
+        .clone()
+        .unwrap_or_else(|| "runbound.local".to_string());
+    const TLS_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let dot_config = match build_tls_config(
+        certs.clone(),
+        key.clone_key(),
+        b"dot",
+        false,
+        tls_cfg.dot_client_auth_ca.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(err=%e, "DoT TLS config failed — encrypted DNS not started");
+            return handles;
+        }
+    };
+    let doh_config = match build_tls_config(certs.clone(), key.clone_key(), b"h2", false, None) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(err=%e, "DoH TLS config failed — encrypted DNS not started");
+            return handles;
+        }
+    };
+    let doq_config = match build_tls_config(certs, key, b"doq", true, None) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(err=%e, "DoQ TLS config failed — encrypted DNS not started");
+            return handles;
+        }
+    };
+
+    let mut server = Server::new(TlsArcHandler(handler));
+    for iface in interfaces {
+        // DNS-over-TLS (853 TCP) — public listener relays to a loopback hickory listener.
+        let dot_addr = format!("{}:{}", iface, dot_port);
+        match TcpListener::bind(&dot_addr).await {
+            Ok(public_dot) => match TcpListener::bind("127.0.0.1:0").await {
+                Ok(relay_dot) => {
+                    if let Ok(relay_dot_addr) = relay_dot.local_addr() {
+                        info!(addr=%dot_addr, mtls=tls_cfg.dot_client_auth_ca.is_some(), "DoT (DNS-over-TLS) listening — RFC 7858");
+                        if let Err(e) = server.register_tls_listener_with_tls_config(
+                            relay_dot,
+                            TLS_SESSION_TIMEOUT,
+                            std::sync::Arc::clone(&dot_config),
+                        ) {
+                            warn!(err=%e, "DoT register failed");
+                        } else {
+                            handles.push(tokio::spawn(run_tcp_with_limit(
+                                public_dot,
+                                relay_dot_addr,
+                                std::sync::Arc::clone(tcp_tracker),
+                                TLS_SESSION_TIMEOUT,
+                                std::sync::Arc::clone(acl),
+                            )));
+                        }
+                    }
+                }
+                Err(e) => warn!(addr=%dot_addr, err=%e, "DoT relay bind failed — skipping"),
+            },
+            Err(e) => warn!(addr=%dot_addr, err=%e, "DoT bind failed — skipping"),
+        }
+
+        // DNS-over-HTTPS (443 TCP)
+        let doh_addr = format!("{}:{}", iface, doh_port);
+        match TcpListener::bind(&doh_addr).await {
+            Ok(public_doh) => match TcpListener::bind("127.0.0.1:0").await {
+                Ok(relay_doh) => {
+                    if let Ok(relay_doh_addr) = relay_doh.local_addr() {
+                        info!(addr=%doh_addr, "DoH (DNS-over-HTTPS) listening — RFC 8484");
+                        if let Err(e) = server.register_https_listener_with_tls_config(
+                            relay_doh,
+                            TLS_SESSION_TIMEOUT,
+                            std::sync::Arc::clone(&doh_config),
+                            Some(hostname.clone()),
+                            "/dns-query".to_string(),
+                        ) {
+                            warn!(err=%e, "DoH register failed");
+                        } else {
+                            handles.push(tokio::spawn(run_tcp_with_limit(
+                                public_doh,
+                                relay_doh_addr,
+                                std::sync::Arc::clone(tcp_tracker),
+                                TLS_SESSION_TIMEOUT,
+                                std::sync::Arc::clone(acl),
+                            )));
+                        }
+                    }
+                }
+                Err(e) => warn!(addr=%doh_addr, err=%e, "DoH relay bind failed — skipping"),
+            },
+            Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
+        }
+
+        // DNS-over-QUIC (853 UDP)
+        let doq_addr = format!("{}:{}", iface, doq_port);
+        match UdpSocket::bind(&doq_addr).await {
+            Ok(udp) => {
+                info!(addr=%doq_addr, "DoQ (DNS-over-QUIC) listening — RFC 9250");
+                if let Err(e) = server.register_quic_listener_and_tls_config(
+                    udp,
+                    TLS_SESSION_TIMEOUT,
+                    std::sync::Arc::clone(&doq_config),
+                ) {
+                    warn!(err=%e, "DoQ register failed");
+                }
+            }
+            Err(e) => warn!(addr=%doq_addr, err=%e, "DoQ bind failed — skipping"),
+        }
+    }
+
+    // Run the encrypted-DNS ServerFuture in its own task; aborting this handle
+    // drops the server and releases its loopback + DoQ sockets.
+    handles.push(tokio::spawn(async move {
+        if let Err(e) = server.block_until_done().await {
+            warn!(err=%e, "encrypted-DNS ServerFuture exited");
+        }
+    }));
+    handles
+}
+
+/// Supervise the encrypted-DNS listeners. On each `()` received (sent by the
+/// WebUI after it persists new TLS config), tear the current listeners down
+/// (abort + await, freeing the public ports) and bring them back up from the
+/// freshly re-read config — all without touching the plain :53 path.
+async fn tls_supervisor(
+    mut rx: tokio::sync::mpsc::Receiver<()>,
+    handler: std::sync::Arc<RunboundHandler>,
+    cfg_path: String,
+    interfaces: Vec<String>,
+    acl: Arc<Acl>,
+    tcp_tracker: Arc<TcpConnTracker>,
+) {
+    fn current_tls(cfg_path: &str) -> TlsConfig {
+        crate::config::load(cfg_path)
+            .map(|c| c.tls)
+            .unwrap_or_default()
+    }
+    let mut handles = spawn_tls_service(
+        std::sync::Arc::clone(&handler),
+        &current_tls(&cfg_path),
+        &interfaces,
+        &acl,
+        &tcp_tracker,
+    )
+    .await;
+    while rx.recv().await.is_some() {
+        info!("encrypted DNS: hot-reloading listeners (no restart)");
+        for h in handles.drain(..) {
+            h.abort();
+            let _ = h.await;
+        }
+        // Let the OS fully release the listening sockets before rebinding.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handles = spawn_tls_service(
+            std::sync::Arc::clone(&handler),
+            &current_tls(&cfg_path),
+            &interfaces,
+            &acl,
+            &tcp_tracker,
+        )
+        .await;
+        info!(tasks = handles.len(), "encrypted DNS: hot reload complete");
+    }
+}
+
 pub async fn run_dns_server(
     cfg: &UnboundConfig,
     zones: Arc<ArcSwap<LocalZoneSet>>,
@@ -2797,8 +3009,8 @@ pub async fn run_dns_server(
     icmp_stats: Arc<crate::icmp::IcmpStats>,
     resolution_mode: Arc<std::sync::atomic::AtomicU8>,
     recursor: crate::dns::recursor::SharedRecursor,
+    cfg_path: String,
 ) -> anyhow::Result<()> {
-    let tls_cfg = &cfg.tls;
     let rps = cfg.rate_limit.unwrap_or(RATE_LIMIT_QPS_DEFAULT);
     if rps == 0 {
         info!("rate limiting disabled (rate-limit: 0)");
@@ -3438,119 +3650,20 @@ pub async fn run_dns_server(
         ));
     }
 
-    // ── DoT / DoH / DoQ (RFC 7858 / 8484 / 9250) ───────────────────────────
-    if let Some((certs, key)) = load_tls_materials(tls_cfg) {
-        let dot_port = tls_cfg.dot_port.unwrap_or(853);
-        let doh_port = tls_cfg.doh_port.unwrap_or(443);
-        let doq_port = tls_cfg.doq_port.unwrap_or(853);
-        let hostname = tls_cfg
-            .hostname
-            .clone()
-            .unwrap_or_else(|| "runbound.local".to_string());
-
-        // Build one ServerConfig per protocol (each needs its own ALPN token).
-        // PrivateKeyDer does not implement Clone; use clone_key() for each copy.
-        let dot_config = build_tls_config(
-            certs.clone(),
-            key.clone_key(),
-            b"dot",
-            false,
-            tls_cfg.dot_client_auth_ca.as_deref(),
-        )
-        .map_err(|e| anyhow::anyhow!("DoT TLS config: {e}"))?;
-
-        let doh_config = build_tls_config(certs.clone(), key.clone_key(), b"h2", false, None)
-            .map_err(|e| anyhow::anyhow!("DoH TLS config: {e}"))?;
-
-        // DoQ requires TLS 1.3 exclusively (Quinn constraint).
-        let doq_config = build_tls_config(certs, key, b"doq", true, None)
-            .map_err(|e| anyhow::anyhow!("DoQ TLS config: {e}"))?;
-
-        for iface in &interfaces {
-            // DNS-over-TLS (port 853 TCP)
-            // FIX 1 (VUL-NEW-01): public listener → run_tcp_with_limit → loopback relay → hickory.
-            // Same TcpConnTracker as DNS/TCP; DoT now shares the per-IP cap of 20 connections.
-            let dot_addr = format!("{}:{}", iface, dot_port);
-            match TcpListener::bind(&dot_addr).await {
-                Ok(public_dot) => {
-                    let relay_dot = TcpListener::bind("127.0.0.1:0")
-                        .await
-                        .map_err(|e| anyhow::anyhow!("DoT relay bind: {e}"))?;
-                    let relay_dot_addr = relay_dot
-                        .local_addr()
-                        .map_err(|e| anyhow::anyhow!("DoT relay local_addr: {e}"))?;
-                    info!(addr=%dot_addr, mtls=tls_cfg.dot_client_auth_ca.is_some(), "DoT (DNS-over-TLS) listening — RFC 7858");
-                    server
-                        .register_tls_listener_with_tls_config(
-                            relay_dot,
-                            Duration::from_secs(30),
-                            Arc::clone(&dot_config),
-                        )
-                        .map_err(|e| anyhow::anyhow!("DoT register: {e}"))?;
-                    let tracker_dot = Arc::clone(&tcp_tracker);
-                    tokio::spawn(run_tcp_with_limit(
-                        public_dot,
-                        relay_dot_addr,
-                        tracker_dot,
-                        TCP_SESSION_TIMEOUT,
-                        Arc::clone(&acl),
-                    ));
-                }
-                Err(e) => warn!(addr=%dot_addr, err=%e, "DoT bind failed — skipping"),
-            }
-
-            // DNS-over-HTTPS (port 443 TCP)
-            // FIX 1 (VUL-NEW-01): same relay pattern as DoT above.
-            let doh_addr = format!("{}:{}", iface, doh_port);
-            match TcpListener::bind(&doh_addr).await {
-                Ok(public_doh) => {
-                    let relay_doh = TcpListener::bind("127.0.0.1:0")
-                        .await
-                        .map_err(|e| anyhow::anyhow!("DoH relay bind: {e}"))?;
-                    let relay_doh_addr = relay_doh
-                        .local_addr()
-                        .map_err(|e| anyhow::anyhow!("DoH relay local_addr: {e}"))?;
-                    info!(addr=%doh_addr, "DoH (DNS-over-HTTPS) listening — RFC 8484");
-                    server
-                        .register_https_listener_with_tls_config(
-                            relay_doh,
-                            Duration::from_secs(30),
-                            Arc::clone(&doh_config),
-                            Some(hostname.clone()),
-                            "/dns-query".to_string(),
-                        )
-                        .map_err(|e| anyhow::anyhow!("DoH register: {e}"))?;
-                    let tracker_doh = Arc::clone(&tcp_tracker);
-                    tokio::spawn(run_tcp_with_limit(
-                        public_doh,
-                        relay_doh_addr,
-                        tracker_doh,
-                        TCP_SESSION_TIMEOUT,
-                        Arc::clone(&acl),
-                    ));
-                }
-                Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
-            }
-
-            // DNS-over-QUIC (port 853 UDP)
-            let doq_addr = format!("{}:{}", iface, doq_port);
-            match UdpSocket::bind(&doq_addr).await {
-                Ok(udp) => {
-                    info!(addr=%doq_addr, "DoQ (DNS-over-QUIC) listening — RFC 9250");
-                    server
-                        .register_quic_listener_and_tls_config(
-                            udp,
-                            Duration::from_secs(30),
-                            Arc::clone(&doq_config),
-                        )
-                        .map_err(|e| anyhow::anyhow!("DoQ register: {e}"))?;
-                }
-                Err(e) => warn!(addr=%doq_addr, err=%e, "DoQ bind failed — skipping"),
-            }
-        }
-    } else {
-        info!("TLS not configured — DoT/DoH/DoQ disabled (add tls-service-pem + tls-service-key to enable)");
+    // ── Encrypted DNS (DoT/DoH/DoQ) — supervised, hot-reloadable ──────────
+    // The TLS listeners run on their OWN hickory ServerFuture, supervised so
+    // the WebUI can enable / disable / re-key them live: no process restart and
+    // no blip on the plain UDP/TCP :53 path. See `tls_supervisor`.
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(8);
+        let _ = TLS_APPLY_TX.set(tx);
+        let h = std::sync::Arc::clone(&handler_arc);
+        let ifaces = interfaces.clone();
+        let acl_tls = std::sync::Arc::clone(&acl);
+        let tracker_tls = std::sync::Arc::clone(&tcp_tracker);
+        tokio::spawn(tls_supervisor(rx, h, cfg_path, ifaces, acl_tls, tracker_tls));
     }
+
 
     info!("Runbound ready — RFC 1034/1035/2782/4033/6891/7858/8484/9250");
     server
