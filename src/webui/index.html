@@ -1411,7 +1411,7 @@ async function shAdd(){
   if(!name||!subnets.length)return toast('Name and at least one subnet required',true);
   try{await api('POST','/split-horizon',{name,subnets,local_data});toast('Saved — applied on next restart');document.getElementById('sh-name').value='';document.getElementById('sh-subnets').value='';document.getElementById('sh-data').value='';loadSplitHorizon();}catch(e){toast('Add: '+e.message,true);}
 }
-async function shDelete(name){if(!confirm('Delete split-horizon "'+name+'"?'))return;try{await api('DELETE','/split-horizon/'+encodeURIComponent(name));toast('Deleted — applied on next restart');loadSplitHorizon();}catch(e){toast('Delete: '+e.message,true);}}
+async function shDelete(name){if(!(await showConfirmModal('Delete split-horizon "'+name+'"?')))return;try{await api('DELETE','/split-horizon/'+encodeURIComponent(name));toast('Deleted — applied on next restart');loadSplitHorizon();}catch(e){toast('Delete: '+e.message,true);}}
 async function loadFeeds(){
   try{
     const d=await api('GET','/feeds'),feeds=d.feeds??[];
@@ -1586,7 +1586,7 @@ async function backupExport(){
 }
 async function backupImport(input){
   const f=input.files&&input.files[0];if(!f){return;}
-  if(!confirm('Restore from "'+f.name+'"? This overwrites the current config and state. A service restart is required to apply.')){input.value='';return;}
+  if(!(await showConfirmModal('Restore from "'+f.name+'"? This overwrites the current config and state. A service restart is required to apply.'))){input.value='';return;}
   try{
     const data=JSON.parse(await f.text());
     const r=await api('POST','/backup/import',data);
@@ -1924,6 +1924,14 @@ function _spkRender() {
 }
 
 let _modalResolve=null;
+let _confirmResolve=null;
+function showConfirmModal(message){
+  document.getElementById('confirm-message').textContent=message||'';
+  document.getElementById('confirm-overlay').classList.remove('hidden');
+  return new Promise(r=>{_confirmResolve=r;});
+}
+function confirmOk(){document.getElementById('confirm-overlay').classList.add('hidden');if(_confirmResolve){_confirmResolve(true);_confirmResolve=null;}}
+function confirmCancel(){document.getElementById('confirm-overlay').classList.add('hidden');if(_confirmResolve){_confirmResolve(false);_confirmResolve=null;}}
 function showInputModal(title,hint,value){document.getElementById('modal-title').textContent=title;const h=document.getElementById('modal-hint');h.textContent=hint||'';h.style.display=hint?'':'none';const inp=document.getElementById('modal-input');inp.value=value||'';document.getElementById('modal-overlay').classList.remove('hidden');requestAnimationFrame(()=>{inp.focus();inp.select();});return new Promise(resolve=>{_modalResolve=resolve;});}
 function modalConfirm(){const val=document.getElementById('modal-input').value;document.getElementById('modal-overlay').classList.add('hidden');if(_modalResolve){_modalResolve(val);_modalResolve=null;}}
 function modalCancel(){document.getElementById('modal-overlay').classList.add('hidden');if(_modalResolve){_modalResolve(null);_modalResolve=null;}}
@@ -2070,7 +2078,7 @@ function tlsMsg(m, ok){ const e=document.getElementById('tls-msg'); if(!e)return
 async function tlsToggle(){
   const btn = document.getElementById('tls-toggle-btn');
   if(btn && btn.dataset.value === 'true'){
-    if(!confirm('Disable encrypted DNS? Clients fall back to plaintext immediately.')) return;
+    if(!(await showConfirmModal('Disable encrypted DNS? Clients fall back to plaintext immediately.'))) return;
     await tlsDisable();
   } else {
     // OFF -> reveal the setup so the user can generate/import a certificate to enable it
@@ -2121,7 +2129,6 @@ async function tlsImport(){
   catch(e){ tlsMsg('Error: '+e.message, false); }
 }
 async function tlsDisable(){
-  if(!confirm('Disable encrypted DNS? Clients fall back to plaintext immediately.')) return;
   try { await api('DELETE','/tls'); tlsMsg('Encrypted DNS disabled — applied live.', true); loadTlsStatus(); }
   catch(e){ tlsMsg('Error: '+e.message, false); }
 }
@@ -2212,7 +2219,7 @@ async function userCreate() {
 }
 
 async function userDelete(id, name) {
-  if (!confirm('Delete user ' + name + '?')) return;
+  if (!(await showConfirmModal('Delete user ' + name + '?'))) return;
   try {
     const r = await apiFetch('/api/users/' + id, { method: 'DELETE' });
     if (!r.ok) { const d = await r.json(); toast('Error: ' + (d.error||r.status), true); return; }
@@ -2221,7 +2228,7 @@ async function userDelete(id, name) {
 }
 
 async function userRotateKey(id) {
-  if (!confirm('Rotate API key? The old key will stop working immediately.')) return;
+  if (!(await showConfirmModal('Rotate API key? The old key will stop working immediately.'))) return;
   try {
     const r = await apiFetch('/api/users/' + id + '/rotate-key', { method: 'POST' });
     const d = await r.json();
@@ -2246,6 +2253,15 @@ function showApiKey(key) {
     <div class="flex gap-2 justify-end">
       <button class="btn-secondary" onclick="modalCancel()">Cancel</button>
       <button class="btn-primary" onclick="modalConfirm()">OK</button>
+    </div>
+  </div>
+</div>
+<div id="confirm-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center" style="background:rgba(0,0,0,.72)" onclick="confirmCancel()">
+  <div class="card w-full mx-4" style="max-width:400px" onclick="event.stopPropagation()">
+    <p id="confirm-message" class="text-sm text-gray-200 mb-4"></p>
+    <div class="flex gap-2 justify-end">
+      <button class="btn-secondary" onclick="confirmCancel()">Cancel</button>
+      <button class="btn-primary" onclick="confirmOk()">Confirm</button>
     </div>
   </div>
 </div>
