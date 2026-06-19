@@ -1700,7 +1700,11 @@ impl RequestHandler for RunboundHandler {
 
         // ── 1b. Alert threshold check (#12) ────────────────────────────
         if let Some(at) = &self.alert_tracker {
-            if at.record(client_ip) {
+            // Anti-spoof gate (#ddos): only escalate sources proven not spoofed —
+            // non-UDP transports (connection-verified) or a valid UDP server cookie.
+            let verified = info.protocol != DnsProtocol::Udp
+                || cookie_verified(&self.cookie_secret, request, client_ip);
+            if at.record(client_ip, verified) {
                 self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
                 return send_error(request, response_handle, ResponseCode::Refused).await;
             }
@@ -2069,6 +2073,22 @@ fn cookie_check(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> Cook
     let mut full = client_cookie[..8].to_vec();
     full.extend_from_slice(&expected);
     CookieVerdict::NeedCookie(full)
+}
+
+/// Strict source verification for the abuse gate (#ddos): true only when the UDP
+/// request carries a VALID server cookie (proves the source is not spoofed). A
+/// missing/legacy/client-only cookie returns false — unlike `cookie_check`, which is
+/// lenient and answers no-cookie clients.
+fn cookie_verified(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> bool {
+    let Some(client_cookie) = read_client_cookie(request) else {
+        return false;
+    };
+    if client_cookie.len() < 16 {
+        return false;
+    }
+    let expected = server_cookie(secret, &client_cookie[..8], client_ip);
+    use subtle::ConstantTimeEq;
+    bool::from(client_cookie[8..16].ct_eq(&expected))
 }
 
 /// Send a BADCOOKIE (RFC 7873) response carrying the server cookie so the client retries.

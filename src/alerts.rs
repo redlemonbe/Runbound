@@ -144,14 +144,28 @@ impl AlertTracker {
     }
 
     /// Record a query from `ip`. Returns true if the query should be blocked.
-    pub fn record(&self, ip: IpAddr) -> bool {
+    ///
+    /// `verified` is true only when the source IP is proven not spoofed: TCP / DoT /
+    /// DoH / DoQ (connection), or a UDP query carrying a VALID server cookie. The
+    /// per-IP counters and any escalation (block / notify) fire ONLY for verified
+    /// sources — blocking on a spoofable UDP source would let an attacker spoof a
+    /// victim's IP and get the victim banned (anti-spoof gate, #ddos). Unverified
+    /// UDP floods are handled by the rate limiter + DNS cookies, not by banning.
+    pub fn record(&self, ip: IpAddr, verified: bool) -> bool {
         if self.rules.read().unwrap().is_empty() {
             return false;
         }
 
-        // Already blocked?
+        // Honour an existing block for every source — a ban set while a source was
+        // verified still drops later (possibly spoofed) packets claiming that IP,
+        // which causes no new harm.
         if self.is_blocked(ip) {
             return true;
+        }
+
+        // Anti-spoof: never count or escalate an unverified source.
+        if !verified {
+            return false;
         }
 
         let now = Instant::now();
