@@ -47,6 +47,61 @@ pub async fn handle_datagram(
     forward_udp(query, upstream).await
 }
 
+/// A rustls client config trusting the Mozilla webpki roots, for DoT upstreams.
+/// Built once and shared; rustls needs a crypto provider installed (the binary
+/// installs ring at start-up).
+// Phase-4 seed: proven by forward_dot_live, wired into handle_datagram (choosing
+// UDP vs DoT per upstream config) at the next step.
+#[allow(dead_code)]
+pub fn dot_client_config() -> std::sync::Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// DNS-over-TLS forward (RFC 7858): TLS to `ip:853` with SNI `sni`, then the
+/// same 2-byte length framing as TCP. This is the phase-4 seed that will replace
+/// the hickory resolver's DoT client; no pooling/racing yet — one connection
+/// per query.
+#[allow(dead_code)]
+pub async fn forward_dot(
+    query: &[u8],
+    ip: std::net::IpAddr,
+    sni: &str,
+    config: std::sync::Arc<rustls::ClientConfig>,
+) -> Option<Vec<u8>> {
+    use tokio::net::TcpStream;
+    let server_name = rustls::pki_types::ServerName::try_from(sni.to_owned()).ok()?;
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let tcp = timeout(UPSTREAM_TIMEOUT, TcpStream::connect((ip, 853)))
+        .await
+        .ok()?
+        .ok()?;
+    let mut tls = timeout(UPSTREAM_TIMEOUT, connector.connect(server_name, tcp))
+        .await
+        .ok()?
+        .ok()?;
+
+    let len = (query.len() as u16).to_be_bytes();
+    tls.write_all(&len).await.ok()?;
+    tls.write_all(query).await.ok()?;
+    tls.flush().await.ok()?;
+
+    let mut rlen = [0u8; 2];
+    timeout(UPSTREAM_TIMEOUT, tls.read_exact(&mut rlen))
+        .await
+        .ok()?
+        .ok()?;
+    let n = u16::from_be_bytes(rlen) as usize;
+    let mut resp = vec![0u8; n];
+    tls.read_exact(&mut resp).await.ok()?;
+    Some(resp)
+}
+
 /// Plain-UDP forward: send the query verbatim to `upstream`, return its raw
 /// answer. No pooling/racing yet (phase 4); one ephemeral socket per query.
 async fn forward_udp(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
@@ -263,5 +318,22 @@ mod tests {
             m.answers[0].rdata,
             crate::dns::wire::Rdata::A("10.0.0.1".parse().unwrap())
         );
+    }
+
+    /// Live DoT forward against 1.1.1.1:853 — proves our rustls DoT client end to
+    /// end. Network-dependent, so ignored by default; run with `--ignored`.
+    #[tokio::test]
+    #[ignore = "network: connects to 1.1.1.1:853"]
+    async fn forward_dot_live() {
+        rustls::crypto::ring::default_provider().install_default().ok();
+        let cfg = dot_client_config();
+        let q = query_bytes("example.com.", consts::rtype::A);
+        let resp = forward_dot(&q, "1.1.1.1".parse().unwrap(), "one.one.one.one", cfg)
+            .await
+            .expect("DoT forward to 1.1.1.1:853 succeeds");
+        let m = Message::parse(&resp).unwrap();
+        assert!(m.header.qr());
+        assert_eq!(m.header.rcode_low(), consts::rcode::NOERROR);
+        assert!(!m.answers.is_empty(), "example.com should resolve over DoT");
     }
 }
