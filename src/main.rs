@@ -953,48 +953,60 @@ async fn build_and_launch(
         });
     }
 
-    // ── Hickory-free plain DNS server (de-hickory phase 3) ─────────────────
+    // ── Hickory-free plain DNS server (de-hickory phase 3/4) ───────────────
     // Opt in with RUNBOUND_PLAIN_SERVER_PORT=<port>: own listeners (no
     // hickory-server) that serve local zones with our wire codec and forward the
-    // rest to the first configured upstream over plain UDP. Additive and off by
-    // default — the production hickory-server listeners are left untouched.
+    // rest to the first configured upstream — over DoT when the upstream is TLS
+    // with a hostname, otherwise plain UDP. Additive and off by default; the
+    // production hickory-server listeners are left untouched.
     if let Some(port) = std::env::var("RUNBOUND_PLAIN_SERVER_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
     {
-        let upstream = cfg
-            .forward_zones
-            .iter()
-            .flat_map(|fz| fz.addrs.iter())
-            // accept "1.1.1.1" and "1.1.1.1@853"; the seed forwards plain UDP:53.
-            .find_map(|a| a.split('@').next().unwrap_or(a).parse::<std::net::IpAddr>().ok())
-            .map(|ip| std::net::SocketAddr::new(ip, 53));
+        let upstream = cfg.forward_zones.iter().find_map(|fz| {
+            let raw = fz.addrs.first()?;
+            let ip: std::net::IpAddr = raw.split('@').next().unwrap_or(raw).parse().ok()?;
+            if fz.tls {
+                // DoT needs an SNI hostname; skip TLS upstreams without one.
+                let sni = fz.tls_hostname.clone()?;
+                Some(dns::plain_server::Upstream::Dot {
+                    ip,
+                    sni,
+                    config: dns::plain_server::dot_client_config(),
+                })
+            } else {
+                Some(dns::plain_server::Upstream::Udp(std::net::SocketAddr::new(ip, 53)))
+            }
+        });
         match upstream {
             Some(up) => {
+                let up = Arc::new(up);
                 let bind = format!("0.0.0.0:{port}");
                 let z_udp = Arc::clone(&zones);
+                let up_udp = Arc::clone(&up);
                 let b_udp = bind.clone();
                 tokio::spawn(async move {
                     match tokio::net::UdpSocket::bind(&b_udp).await {
                         Ok(s) => {
-                            let _ = dns::plain_server::run(Arc::new(s), z_udp, up).await;
+                            let _ = dns::plain_server::run(Arc::new(s), z_udp, up_udp).await;
                         }
                         Err(e) => tracing::error!("plain-server UDP bind {b_udp} failed: {e}"),
                     }
                 });
                 let z_tcp = Arc::clone(&zones);
+                let up_tcp = Arc::clone(&up);
                 tokio::spawn(async move {
                     match tokio::net::TcpListener::bind(&bind).await {
                         Ok(l) => {
-                            let _ = dns::plain_server::run_tcp(l, z_tcp, up).await;
+                            let _ = dns::plain_server::run_tcp(l, z_tcp, up_tcp).await;
                         }
                         Err(e) => tracing::error!("plain-server TCP bind {bind} failed: {e}"),
                     }
                 });
-                info!(port, upstream = %up, "hickory-free plain DNS server (phase 3) on UDP+TCP");
+                info!(port, "hickory-free plain DNS server (phase 3/4) on UDP+TCP");
             }
             None => tracing::warn!(
-                "RUNBOUND_PLAIN_SERVER_PORT set but no forward upstream configured — not started"
+                "RUNBOUND_PLAIN_SERVER_PORT set but no usable forward upstream — not started"
             ),
         }
     }

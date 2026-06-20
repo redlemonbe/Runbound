@@ -32,27 +32,42 @@ const MAX_UDP: usize = 1232;
 /// Upstream wait before giving up on a forwarded query.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How to reach the upstream for non-local queries.
+#[derive(Clone)]
+pub enum Upstream {
+    /// Plain DNS over UDP:53 (or any explicit address).
+    Udp(SocketAddr),
+    /// DNS-over-TLS to `ip:853`, verifying the cert against `sni`.
+    Dot {
+        ip: std::net::IpAddr,
+        sni: String,
+        config: std::sync::Arc<rustls::ClientConfig>,
+    },
+}
+
 /// Serve one received datagram: local answer from our codec, or a forwarded
 /// upstream answer. Returns the response bytes to send back, or `None` to stay
 /// silent (malformed query, or upstream gave nothing).
 pub async fn handle_datagram(
     query: &[u8],
     zones: &LocalZoneSet,
-    upstream: SocketAddr,
+    upstream: &Upstream,
 ) -> Option<Vec<u8>> {
     if let Some(local) = serve_datagram(query, zones) {
         return Some(local);
     }
-    // Not locally authoritative — relay to the upstream over plain UDP.
-    forward_udp(query, upstream).await
+    // Not locally authoritative — relay to the configured upstream.
+    match upstream {
+        Upstream::Udp(addr) => forward_udp(query, *addr).await,
+        Upstream::Dot { ip, sni, config } => {
+            forward_dot(query, *ip, sni, std::sync::Arc::clone(config)).await
+        }
+    }
 }
 
 /// A rustls client config trusting the Mozilla webpki roots, for DoT upstreams.
 /// Built once and shared; rustls needs a crypto provider installed (the binary
 /// installs ring at start-up).
-// Phase-4 seed: proven by forward_dot_live, wired into handle_datagram (choosing
-// UDP vs DoT per upstream config) at the next step.
-#[allow(dead_code)]
 pub fn dot_client_config() -> std::sync::Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -67,7 +82,6 @@ pub fn dot_client_config() -> std::sync::Arc<rustls::ClientConfig> {
 /// same 2-byte length framing as TCP. This is the phase-4 seed that will replace
 /// the hickory resolver's DoT client; no pooling/racing yet — one connection
 /// per query.
-#[allow(dead_code)]
 pub async fn forward_dot(
     query: &[u8],
     ip: std::net::IpAddr,
@@ -123,7 +137,7 @@ async fn forward_udp(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
 pub async fn run(
     sock: Arc<UdpSocket>,
     zones: Arc<ArcSwap<LocalZoneSet>>,
-    upstream: SocketAddr,
+    upstream: Arc<Upstream>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; MAX_UDP];
     loop {
@@ -131,8 +145,9 @@ pub async fn run(
         let query = buf[..n].to_vec();
         let sock = Arc::clone(&sock);
         let zones = Arc::clone(&zones);
+        let upstream = Arc::clone(&upstream);
         tokio::spawn(async move {
-            let resp = handle_datagram(&query, &zones.load(), upstream).await;
+            let resp = handle_datagram(&query, &zones.load(), &upstream).await;
             if let Some(bytes) = resp {
                 let _ = sock.send_to(&bytes, peer).await;
             }
@@ -146,11 +161,12 @@ pub async fn run(
 pub async fn run_tcp(
     listener: TcpListener,
     zones: Arc<ArcSwap<LocalZoneSet>>,
-    upstream: SocketAddr,
+    upstream: Arc<Upstream>,
 ) -> std::io::Result<()> {
     loop {
         let (mut stream, _peer) = listener.accept().await?;
         let zones = Arc::clone(&zones);
+        let upstream = Arc::clone(&upstream);
         tokio::spawn(async move {
             loop {
                 let mut len_buf = [0u8; 2];
@@ -165,7 +181,7 @@ pub async fn run_tcp(
                 if stream.read_exact(&mut query).await.is_err() {
                     break;
                 }
-                let Some(resp) = handle_datagram(&query, &zones.load(), upstream).await else {
+                let Some(resp) = handle_datagram(&query, &zones.load(), &upstream).await else {
                     break;
                 };
                 let rlen = (resp.len() as u16).to_be_bytes();
@@ -242,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn serves_local_and_forwards_the_rest() {
         let zones = zoneset();
-        let upstream = mock_upstream().await;
+        let upstream = Arc::new(Upstream::Udp(mock_upstream().await));
 
         // Bring up our server on an ephemeral port.
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -291,7 +307,7 @@ mod tests {
     async fn tcp_serves_local_with_length_framing() {
         use tokio::net::TcpStream;
         let zones = zoneset();
-        let upstream = mock_upstream().await; // unused for a local name
+        let upstream = Arc::new(Upstream::Udp(mock_upstream().await)); // unused for a local name
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
