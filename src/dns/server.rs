@@ -890,6 +890,19 @@ impl RunboundHandler {
     ///     SOA, plus the NSEC3 proof + AD bit when the recursor exposes a validated NODATA denial —
     ///     a bogus denial is refused), not SERVFAIL.
     ///   - On a transient recursion failure, a recent answer is served stale (RFC 8767).
+    /// #202 metrics: increment the rcode counter for a recursion-served response. The rcode
+    /// is known internally here but the returned `ResponseInfo` hides it, so the recursion
+    /// path accounts for it itself (without this nxdomain/servfail/refused stayed 0 on a
+    /// full-recursion forwarder). NoError is intentionally not counted.
+    fn count_recursion_rcode(&self, rcode: ResponseCode) {
+        match rcode {
+            ResponseCode::NXDomain => self.stats.inc_nxdomain(),
+            ResponseCode::ServFail => self.stats.inc_servfail(),
+            ResponseCode::Refused => self.stats.inc_refused(),
+            _ => {}
+        }
+    }
+
     async fn resolve_recursive<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -911,6 +924,7 @@ impl RunboundHandler {
             Ok(r) => r,
             Err(_) => {
                 warn!(%qname, "full-recursion: outer timeout — SERVFAIL");
+                self.count_recursion_rcode(ResponseCode::ServFail);
                 return send_error(request, response_handle, ResponseCode::ServFail).await;
             }
         };
@@ -924,6 +938,7 @@ impl RunboundHandler {
                     .any(|r| r.proof.is_bogus());
                 if bogus && !cd {
                     warn!(%qname, "full-recursion: DNSSEC validation failed (bogus) — SERVFAIL");
+                    self.count_recursion_rcode(ResponseCode::ServFail);
                     return send_error(request, response_handle, ResponseCode::ServFail).await;
                 }
                 // AD bit: authenticated only when every answer + authority record is Secure.
@@ -935,6 +950,7 @@ impl RunboundHandler {
                         .chain(msg.authorities.iter())
                         .all(|r| r.proof.is_secure());
                 let rcode = msg.metadata.response_code;
+                self.count_recursion_rcode(rcode);
                 let mut answers = msg.answers;
                 let mut authority = msg.authorities;
                 let mut additionals = msg.additionals;
@@ -978,6 +994,7 @@ impl RunboundHandler {
                 } else {
                     ResponseCode::NoError
                 };
+                self.count_recursion_rcode(rcode);
                 let mut authority: Vec<Record> = Vec::new();
                 let mut ad = false;
                 // When the recursor surfaces the authenticated-denial records (NODATA →
@@ -993,6 +1010,7 @@ impl RunboundHandler {
                         }
                         if !cd && authority.iter().any(|r| r.proof.is_bogus()) {
                             warn!(%qname, "full-recursion: bogus authenticated denial — SERVFAIL");
+                            self.count_recursion_rcode(ResponseCode::ServFail);
                             return send_error(request, response_handle, ResponseCode::ServFail).await;
                         }
                         ad = validating
@@ -1042,6 +1060,7 @@ impl RunboundHandler {
                 {
                     return info;
                 }
+                self.count_recursion_rcode(ResponseCode::ServFail);
                 send_error(request, response_handle, ResponseCode::ServFail).await
             }
         }
@@ -1126,6 +1145,12 @@ impl RunboundHandler {
         if self.resolution_mode.load(std::sync::atomic::Ordering::Relaxed) == 1 {
             let snap = self.recursor.load_full();
             if let Some(rec) = snap.as_ref() {
+                // #202 metrics: every non-local query on the recursion path is resolved
+                // externally — count it as forwarded. The response rcode (nxdomain/servfail/
+                // refused) is counted inside resolve_recursive where it is known, because the
+                // returned ResponseInfo does not expose it. Without this a full-recursion
+                // forwarder reported 0 forwarded and 0 nxdomain while serving real negatives.
+                self.stats.inc_forwarded();
                 return self
                     .resolve_recursive(request, response_handle, qname, qtype, &**rec)
                     .await;

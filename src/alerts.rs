@@ -284,6 +284,9 @@ impl AlertTracker {
         );
 
         match rule.action.as_str() {
+            "block" if Self::is_ban_exempt(ip) => {
+                tracing::warn!(ip = %ip, rule = %rule.name, "ban skipped: protected IP (loopback/unspecified)");
+            }
             "block" => {
                 if !self.blocked.contains_key(&ip) && self.blocked.len() >= MAX_BLOCKED_ENTRIES {
                     tracing::warn!(ip = %ip, "blocked map full -- ban dropped");
@@ -377,6 +380,16 @@ impl AlertTracker {
         removed
     }
 
+    /// M-1: protected-IP allowlist. An operator misconfiguration (or a spoofed
+    /// source that survives the verified-source gate) must never be able to push
+    /// loopback or the unspecified address into the kernel ban map — that would
+    /// drop the node's own traffic. The allowlist is intentionally conservative:
+    /// loopback (127.0.0.0/8, ::1) and unspecified (0.0.0.0, ::). Upstream-resolver
+    /// addresses are not reachable from this struct, so they are not covered here.
+    fn is_ban_exempt(ip: IpAddr) -> bool {
+        ip.is_loopback() || ip.is_unspecified()
+    }
+
     /// #ddos: push a block/unblock to the XDP ban map (line-rate XDP_DROP) when an
     /// XDP ban channel is wired. IPv4 only (the BPF map is v4); IPv6 blocks stay
     /// enforced in userspace via is_blocked().
@@ -412,6 +425,10 @@ impl AlertTracker {
     /// Immediately block an IP without going through a rule threshold.
     /// Used by ICMP flood detector and relay propagation.
     pub fn block_manual(&self, ip: IpAddr, rule: String) {
+        if Self::is_ban_exempt(ip) {
+            tracing::warn!(ip = %ip, "manual ban skipped: protected IP (loopback/unspecified)");
+            return;
+        }
         if self.is_blocked(ip) {
             return;
         }
@@ -443,6 +460,10 @@ impl AlertTracker {
 
     /// Block an IP for a fixed duration (used by bot defense). Emits an AlertEvent.
     pub fn block_bot(&self, ip: std::net::IpAddr, rule: &str, duration_secs: u64) {
+        if Self::is_ban_exempt(ip) {
+            tracing::warn!(ip = %ip, rule = rule, "bot ban skipped: protected IP (loopback/unspecified)");
+            return;
+        }
         if !self.blocked.contains_key(&ip) && self.blocked.len() >= MAX_BLOCKED_ENTRIES {
             tracing::warn!(ip = %ip, rule = rule, "blocked map full -- bot ban dropped");
             return;
@@ -493,6 +514,24 @@ impl AlertTracker {
     }
 }
 
+/// True if `ip` falls into a range a webhook must never be allowed to reach:
+/// loopback, unspecified, RFC-1918 private, link-local (incl. 169.254.0.0/16
+/// metadata) and IPv6 loopback/unique-local/link-local.
+fn webhook_ip_blocked(ip: std::net::IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            // unique-local fc00::/7 and link-local fe80::/10 — not yet stable as
+            // std helpers, so test the leading bits directly.
+            let seg = v6.segments()[0];
+            (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 /// Returns true if the URL is safe to POST to (scheme is http/https, not a private address).
 fn is_safe_webhook_url(url: &str) -> bool {
     // Reject non-HTTP/HTTPS schemes (file://, ftp://, etc.)
@@ -503,19 +542,12 @@ fn is_safe_webhook_url(url: &str) -> bool {
     // Parse to extract hostname and reject RFC-1918 / loopback / link-local.
     let Ok(parsed) = url::Url::parse(url) else { return false };
     let host = parsed.host_str().unwrap_or("");
+    if host.is_empty() {
+        return false;
+    }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if ip.is_loopback() || ip.is_unspecified() {
+        if webhook_ip_blocked(ip) {
             return false;
-        }
-        if let std::net::IpAddr::V4(v4) = ip {
-            if v4.is_private() || v4.is_link_local() {
-                return false;
-            }
-        }
-        if let std::net::IpAddr::V6(v6) = ip {
-            if v6.is_loopback() {
-                return false;
-            }
         }
     }
     // Reject common localhost/metadata aliases
@@ -526,6 +558,31 @@ fn is_safe_webhook_url(url: &str) -> bool {
         || host_lc == "169.254.169.254"
     {
         return false;
+    }
+    // I-2: when the host is a hostname (not a literal IP), resolve it and re-check
+    // every resolved address. Without this, a DNS name that resolves into a
+    // private/metadata range (DNS-rebinding-style SSRF) would slip past the
+    // literal-IP guard above.
+    if host.parse::<std::net::IpAddr>().is_err() {
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        use std::net::ToSocketAddrs;
+        match (host, port).to_socket_addrs() {
+            Ok(addrs) => {
+                let mut saw_one = false;
+                for sa in addrs {
+                    saw_one = true;
+                    if webhook_ip_blocked(sa.ip()) {
+                        return false;
+                    }
+                }
+                // Unresolvable hostname → fail closed.
+                if !saw_one {
+                    return false;
+                }
+            }
+            // Resolution failure → fail closed rather than deliver blind.
+            Err(_) => return false,
+        }
     }
     true
 }
@@ -597,5 +654,56 @@ mod ddos_tests {
             matches!(rx.try_recv(), Ok(IcmpBanCmd::Ban(_))),
             "verified block must push an XDP Ban"
         );
+    }
+
+    // M-1: protected IPs (loopback / unspecified) must never enter the ban set,
+    // regardless of which ban path is used.
+    #[test]
+    fn ban_exempt_covers_loopback_and_unspecified() {
+        assert!(AlertTracker::is_ban_exempt("127.0.0.1".parse().unwrap()));
+        assert!(AlertTracker::is_ban_exempt("::1".parse().unwrap()));
+        assert!(AlertTracker::is_ban_exempt("0.0.0.0".parse().unwrap()));
+        assert!(AlertTracker::is_ban_exempt("::".parse().unwrap()));
+        assert!(!AlertTracker::is_ban_exempt("203.0.113.7".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn block_manual_and_block_bot_skip_protected_ips() {
+        let t = AlertTracker::new(vec![], None);
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let any: IpAddr = "0.0.0.0".parse().unwrap();
+        t.block_manual(lo, "test".to_string());
+        t.block_bot(any, "test", 60);
+        assert!(!t.is_blocked(lo), "loopback must never be banned");
+        assert!(!t.is_blocked(any), "unspecified must never be banned");
+        // A normal public IP still bans through both paths.
+        let pub_ip: IpAddr = "203.0.113.9".parse().unwrap();
+        t.block_manual(pub_ip, "test".to_string());
+        assert!(t.is_blocked(pub_ip), "public IP must still be bannable");
+    }
+
+    // I-2: the per-IP webhook blocklist must reject private/loopback/link-local
+    // ranges — this is what every resolved hostname address is re-checked against.
+    #[test]
+    fn webhook_ip_blocked_ranges() {
+        assert!(webhook_ip_blocked("127.0.0.1".parse().unwrap()));
+        assert!(webhook_ip_blocked("10.0.0.1".parse().unwrap()));
+        assert!(webhook_ip_blocked("192.168.1.1".parse().unwrap()));
+        assert!(webhook_ip_blocked("169.254.169.254".parse().unwrap())); // cloud metadata
+        assert!(webhook_ip_blocked("::1".parse().unwrap()));
+        assert!(webhook_ip_blocked("fd00::1".parse().unwrap())); // IPv6 unique-local
+        assert!(webhook_ip_blocked("fe80::1".parse().unwrap())); // IPv6 link-local
+        assert!(!webhook_ip_blocked("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn webhook_url_rejects_literal_and_alias_targets() {
+        assert!(!is_safe_webhook_url("http://127.0.0.1/hook"));
+        assert!(!is_safe_webhook_url("http://10.0.0.5/hook"));
+        assert!(!is_safe_webhook_url("http://169.254.169.254/latest/meta-data"));
+        assert!(!is_safe_webhook_url("http://localhost/hook"));
+        assert!(!is_safe_webhook_url("https://foo.local/hook"));
+        assert!(!is_safe_webhook_url("ftp://example.com/hook")); // non-http scheme
+        assert!(!is_safe_webhook_url("http://[::1]/hook"));
     }
 }

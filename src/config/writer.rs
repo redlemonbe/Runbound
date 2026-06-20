@@ -208,26 +208,26 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.block_page_org != d.block_page_org { o.push_str(&format!("    block-page-org: \"{}\"\n", escape_str(&cfg.block_page_org))); }
     if let Some(v) = &cfg.block_page_redirect_ip { o.push_str(&format!("    block-page-redirect-ip: \"{}\"\n", escape_str(v))); }
     if cfg.block_page_allow_bypass != d.block_page_allow_bypass { o.push_str(&format!("    block-page-allow-bypass: {}\n", b(cfg.block_page_allow_bypass))); }
-    if cfg.block_page_bypass_pin != d.block_page_bypass_pin { o.push_str(&format!("    block-page-bypass-pin: \"{}\"\n", cfg.block_page_bypass_pin)); }
+    if cfg.block_page_bypass_pin != d.block_page_bypass_pin { o.push_str(&format!("    block-page-bypass-pin: \"{}\"\n", escape_str(&cfg.block_page_bypass_pin))); }
     for (name, alg, sec) in &cfg.tsig_keys { o.push_str(&format!("    tsig-key: \"{}\" {alg} \"{}\"\n", escape_str(name), escape_str(sec))); }
     if cfg.firewall_manage != d.firewall_manage { o.push_str(&format!("    firewall-manage: {}\n", b(cfg.firewall_manage))); }
     if let Some(v) = &cfg.firewall_backend { o.push_str(&format!("    firewall-backend: \"{}\"\n", escape_str(v))); }
-    if cfg.firewall_tag != d.firewall_tag { o.push_str(&format!("    firewall-tag: \"{}\"\n", cfg.firewall_tag)); }
+    if cfg.firewall_tag != d.firewall_tag { o.push_str(&format!("    firewall-tag: \"{}\"\n", escape_str(&cfg.firewall_tag))); }
     if cfg.ui_enabled != d.ui_enabled { o.push_str(&format!("    ui-enabled: {}\n", b(cfg.ui_enabled))); }
     if cfg.ui_port != d.ui_port { o.push_str(&format!("    ui-port: {}\n", cfg.ui_port)); }
-    if cfg.ui_bind != d.ui_bind { o.push_str(&format!("    ui-bind: \"{}\"\n", cfg.ui_bind)); }
+    if cfg.ui_bind != d.ui_bind { o.push_str(&format!("    ui-bind: \"{}\"\n", escape_str(&cfg.ui_bind))); }
     if cfg.ui_tls != d.ui_tls || cfg.ui_tls_acme != d.ui_tls_acme {
         o.push_str(&format!("    ui-tls: {}\n", if cfg.ui_tls_acme { "acme" } else if cfg.ui_tls { "yes" } else { "no" }));
     }
-    if cfg.ui_cert != d.ui_cert { o.push_str(&format!("    ui-cert: \"{}\"\n", cfg.ui_cert)); }
-    if cfg.ui_key != d.ui_key { o.push_str(&format!("    ui-key: \"{}\"\n", cfg.ui_key)); }
-    if cfg.ui_ca_cert != d.ui_ca_cert { o.push_str(&format!("    ui-ca-cert: \"{}\"\n", cfg.ui_ca_cert)); }
-    if cfg.ui_ca_key != d.ui_ca_key { o.push_str(&format!("    ui-ca-key: \"{}\"\n", cfg.ui_ca_key)); }
-    if cfg.ui_acme_domain != d.ui_acme_domain { o.push_str(&format!("    ui-acme-domain: \"{}\"\n", cfg.ui_acme_domain)); }
-    if cfg.ui_acme_email != d.ui_acme_email { o.push_str(&format!("    ui-acme-email: \"{}\"\n", cfg.ui_acme_email)); }
-    if cfg.ui_acme_dns != d.ui_acme_dns { o.push_str(&format!("    ui-acme-dns: \"{}\"\n", cfg.ui_acme_dns)); }
-    if cfg.ui_acme_cf_token != d.ui_acme_cf_token { o.push_str(&format!("    ui-acme-cf-token: \"{}\"\n", cfg.ui_acme_cf_token)); }
-    if cfg.ui_acme_hook != d.ui_acme_hook { o.push_str(&format!("    ui-acme-hook: \"{}\"\n", cfg.ui_acme_hook)); }
+    if cfg.ui_cert != d.ui_cert { o.push_str(&format!("    ui-cert: \"{}\"\n", escape_str(&cfg.ui_cert))); }
+    if cfg.ui_key != d.ui_key { o.push_str(&format!("    ui-key: \"{}\"\n", escape_str(&cfg.ui_key))); }
+    if cfg.ui_ca_cert != d.ui_ca_cert { o.push_str(&format!("    ui-ca-cert: \"{}\"\n", escape_str(&cfg.ui_ca_cert))); }
+    if cfg.ui_ca_key != d.ui_ca_key { o.push_str(&format!("    ui-ca-key: \"{}\"\n", escape_str(&cfg.ui_ca_key))); }
+    if cfg.ui_acme_domain != d.ui_acme_domain { o.push_str(&format!("    ui-acme-domain: \"{}\"\n", escape_str(&cfg.ui_acme_domain))); }
+    if cfg.ui_acme_email != d.ui_acme_email { o.push_str(&format!("    ui-acme-email: \"{}\"\n", escape_str(&cfg.ui_acme_email))); }
+    if cfg.ui_acme_dns != d.ui_acme_dns { o.push_str(&format!("    ui-acme-dns: \"{}\"\n", escape_str(&cfg.ui_acme_dns))); }
+    if cfg.ui_acme_cf_token != d.ui_acme_cf_token { o.push_str(&format!("    ui-acme-cf-token: \"{}\"\n", escape_str(&cfg.ui_acme_cf_token))); }
+    if cfg.ui_acme_hook != d.ui_acme_hook { o.push_str(&format!("    ui-acme-hook: \"{}\"\n", escape_str(&cfg.ui_acme_hook))); }
     if cfg.ui_brand_name != d.ui_brand_name { o.push_str(&format!("    ui-brand-name: \"{}\"\n", escape_str(&cfg.ui_brand_name))); }
     if cfg.ui_brand_logo_url != d.ui_brand_logo_url { o.push_str(&format!("    ui-brand-logo-url: \"{}\"\n", escape_str(&cfg.ui_brand_logo_url))); }
     if cfg.ui_accent_color != d.ui_accent_color { o.push_str(&format!("    ui-accent-color: \"{}\"\n", escape_str(&cfg.ui_accent_color))); }
