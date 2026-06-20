@@ -782,6 +782,23 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/tls/
 
 ---
 
+### `GET /api/tls/ca`
+
+Download the Runbound Local CA certificate (PEM) that signs the embedded Web UI / self-signed leaf. Served as `application/x-pem-file` with `Content-Disposition: attachment; filename="runbound-ca.pem"`, so it can be imported into a browser/OS trust store to clear TLS warnings on the Web UI and self-signed DoH. No request body; the CA is created on first use if absent. Returns `500` if the CA cannot be read or generated.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  http://localhost:8080/api/tls/ca -o runbound-ca.pem
+```
+
+```
+-----BEGIN CERTIFICATE-----
+MIIBozCCAUmg... (Runbound Local CA)
+-----END CERTIFICATE-----
+```
+
+---
+
 ### `POST /api/tls/self-signed`
 
 Generate a self-signed certificate + key for `hostname` and enable DoT/DoH/DoQ. The key is written `0600` (atomic) in `base_dir`; the config is updated. **Admin only.** Requires a restart to bind the listeners (`restart_required: true`).
@@ -1683,6 +1700,7 @@ to localhost only.
 | `DELETE` | `/api/backup/{id}` | Delete a backup snapshot. |
 | `GET` | `/api/backup/export` | **Full backup** download (JSON): config + all state/secret files, base64-encoded. Contains secrets — store securely. |
 | `POST` | `/api/backup/import` | **Full restore** from an exported backup; writes whitelisted files atomically. Restart to apply. Admin only; slave 503. |
+| `GET` | `/api/tls/ca` | Download the Runbound Local CA certificate (PEM) for importing into a browser/OS trust store. |
 
 ### Examples
 
