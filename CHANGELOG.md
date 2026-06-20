@@ -7,6 +7,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-06-20
+
+### Fixed
+- **Metrics correctness on the sovereign full-recursion path.** The `resolution: full-recursion` resolver now counts forwarded queries and response rcodes (`nxdomain` / `servfail` / `refused`), and `/api/metrics` reads cache hit-rate, hits and misses from one consistent source. On a full-recursion forwarder these were stuck at 0 / mutually inconsistent. Thanks to cschanhniem (Lumi AI Workspace) for the observability work that surfaced this (#208).
+
+### Security
+Two-AI Cycle N audit (Claude Opus 4.8 × Gemini 2.5 Pro) plus a live pentest. All fixes are in the slow-path API / sync / config layers; the packet hot path is unchanged. See `docs/security-audit/SECURITY-AUDIT.md`.
+- **SEC-N1 (HIGH) — backup endpoints admin-gated.** `GET /api/backup/export` no longer exposes the config and secret state files (master API key, relay HMAC key, WebUI CA private key) to a non-admin key; all backup handlers now require admin (a no-op in single-user mode).
+- **SEC-N2 (HIGH) — per-user zone scope enforced on DNS writes.** `add_dns_handler` / `delete_dns_handler` now enforce each user's `zone_prefixes`, so a non-admin Dns/Operator role can no longer write outside its zone.
+- **SEC-N10 / NEW-N1 (live pentest) — RBAC `may_write` checks the original un-stripped path.** axum nest-prefix stripping had broken non-admin write roles (fail-closed regression); `may_write` now evaluates the original path, restoring legitimate non-admin write roles while keeping the gate closed.
+- **SEC-N3 — protected-IP ban allowlist** so the abuse engine cannot ban an infrastructure address.
+- **SEC-N4 / SEC-N5 — relay/register hardening.** Request bodies are size-capped before buffering, and HMAC requests carry an anti-replay nonce cache.
+- **SEC-N6 / SEC-N7 (defence-in-depth) — config-writer field escaping, webhook SSRF re-check of resolved IPs, and explicit admin gates on rotate-key and relay-forward.**
+
+### Docs
+- Document `GET /api/tls/ca` (download the Runbound Local CA) in the API reference.
+- Publish the Cycle N two-AI audit + live pentest in `docs/security-audit/SECURITY-AUDIT.md`.
+
+### Credits
+- Thanks to **cschanhniem (Lumi AI Workspace)** for issue #208 (OpenMetrics `/api/metrics`).
+
 ## [0.21.0] - 2026-06-19
 
 ### Added
