@@ -100,8 +100,48 @@ pub fn hmac_sign(key: &str, method: &str, path: &str, ts: u64, body: &[u8]) -> S
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Constant-time HMAC verification. Returns true iff the signature is valid
-/// AND the timestamp is within ±30 s of the current server clock.
+/// L-2: bounded replay cache of recently-seen valid signatures. A valid signature
+/// is only accepted once within the ±30 s acceptance window; a second presentation
+/// of the same (sig, ts) is rejected as a replay. Only cryptographically-valid
+/// signatures are ever inserted, so an attacker cannot use invalid attempts to grow
+/// the map. Entries outside the window are pruned on every verify; a hard cap is a
+/// belt-and-suspenders guard against clock-skew pathologies.
+const REPLAY_WINDOW_SECS: u64 = 30;
+const REPLAY_CACHE_CAP: usize = 16_384;
+static REPLAY_SEEN: std::sync::LazyLock<Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Returns false if `sig` (valid, with timestamp `ts`) has already been seen inside
+/// the replay window; records it and returns true otherwise. `now` is the current
+/// server unix time. Prunes entries older than the window on each call.
+fn replay_check_and_record(sig: &str, ts: u64, now: u64) -> bool {
+    let Ok(mut seen) = REPLAY_SEEN.lock() else {
+        // Poisoned lock: fail open on the replay check only — the HMAC + ±30 s
+        // window already gate authenticity; do not reject legitimate traffic.
+        return true;
+    };
+    // Prune anything whose timestamp has aged out of the acceptance window.
+    seen.retain(|_, &mut seen_ts| {
+        let age = if now >= seen_ts { now - seen_ts } else { seen_ts - now };
+        age <= REPLAY_WINDOW_SECS
+    });
+    if seen.contains_key(sig) {
+        return false; // replay
+    }
+    // Hard cap: if pruning left us at the cap (extreme skew / flood), drop the
+    // oldest entry so the map stays bounded.
+    if seen.len() >= REPLAY_CACHE_CAP {
+        if let Some(oldest) = seen.iter().min_by_key(|(_, &v)| v).map(|(k, _)| k.clone()) {
+            seen.remove(&oldest);
+        }
+    }
+    seen.insert(sig.to_string(), ts);
+    true
+}
+
+/// Constant-time HMAC verification. Returns true iff the signature is valid,
+/// the timestamp is within ±30 s of the current server clock, AND the signature
+/// has not already been seen within the replay window (L-2).
 pub fn hmac_verify_with_ts(
     key: &str,
     method: &str,
@@ -112,13 +152,18 @@ pub fn hmac_verify_with_ts(
 ) -> bool {
     let now = hmac_unix_now();
     let diff = if now >= ts { now - ts } else { ts - now };
-    if diff > 30 {
+    if diff > REPLAY_WINDOW_SECS {
         return false;
     }
     // SEC-J5 (v0.18.x): only the body-covering signature is accepted. The pre-v0.17.1
     // header-only fallback (which left the request body unauthenticated) was removed now
     // that the fleet is >= v0.17.1. The relay channel is TLS-pinned; this is defence in depth.
-    ct_eq_hex(&hmac_sign(key, method, path, ts, body), sig)
+    if !ct_eq_hex(&hmac_sign(key, method, path, ts, body), sig) {
+        return false;
+    }
+    // L-2: anti-replay — only valid signatures reach this point, so the cache only
+    // ever holds authentic signatures and stays bounded by the legitimate request rate.
+    replay_check_and_record(sig, ts, now)
 }
 
 /// Constant-time comparison of two equal-purpose hex strings (length mismatch also fails).
@@ -929,12 +974,15 @@ async fn handle_sync_request(
             .to_string();
         let ts: u64 = ts_str.parse().unwrap_or(0);
         // SEC-I14: read the body BEFORE verifying so the HMAC can cover it.
-        let body_bytes = match req.collect().await {
+        // L-1: a register payload is tiny — cap at 4 KiB BEFORE buffering so an
+        // oversized body is rejected as it is read, not after.
+        let limited = http_body_util::Limited::new(req.into_body(), 4096);
+        let body_bytes = match limited.collect().await {
             Ok(b) => b.to_bytes(),
-            Err(e) => {
+            Err(_) => {
                 return Ok(json_resp(
-                    400,
-                    serde_json::json!({ "error": format!("body read: {e}") }),
+                    413,
+                    serde_json::json!({ "error": "REQUEST_TOO_LARGE" }),
                 ))
             }
         };
@@ -942,12 +990,6 @@ async fn handle_sync_request(
             return Ok(json_resp(
                 401,
                 serde_json::json!({ "error": "UNAUTHORIZED" }),
-            ));
-        }
-        if body_bytes.len() > 4096 {
-            return Ok(json_resp(
-                413,
-                serde_json::json!({ "error": "REQUEST_TOO_LARGE" }),
             ));
         }
         #[derive(serde::Deserialize)]
@@ -1622,13 +1664,18 @@ async fn handle_relay_request(
     // Strip /relay/ prefix to get the operation path.
     let op = path.strip_prefix("/relay/").unwrap_or("").trim_matches('/');
 
-    // SEC-I14: read the body BEFORE verifying so the HMAC can cover it (max 64 KiB).
-    let body_bytes = match req.collect().await {
+    // SEC-I14: read the body BEFORE verifying so the HMAC can cover it.
+    // L-1: cap the body at 64 KiB BEFORE buffering — http_body_util::Limited
+    // rejects an oversized stream as it is read, so an attacker can no longer
+    // force the receiver to buffer an arbitrarily large body in memory before
+    // the size check. Matches the master-side cap (src/api/relay.rs).
+    let limited = http_body_util::Limited::new(req.into_body(), 65_536);
+    let body_bytes = match limited.collect().await {
         Ok(b) => b.to_bytes(),
-        Err(e) => {
+        Err(_) => {
             return Ok(json_resp(
-                400,
-                serde_json::json!({ "error": format!("body read: {e}") }),
+                413,
+                serde_json::json!({ "error": "REQUEST_TOO_LARGE" }),
             ))
         }
     };
@@ -1636,12 +1683,6 @@ async fn handle_relay_request(
         return Ok(json_resp(
             401,
             serde_json::json!({ "error": "UNAUTHORIZED" }),
-        ));
-    }
-    if body_bytes.len() > 65_536 {
-        return Ok(json_resp(
-            413,
-            serde_json::json!({ "error": "REQUEST_TOO_LARGE" }),
         ));
     }
 
@@ -2157,5 +2198,19 @@ mod sec_i14_hmac_body {
         assert!(!hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &header_only));
         // wrong key is rejected
         assert!(!hmac_verify_with_ts("other", "POST", "/relay/dns", ts, body, &sig));
+    }
+
+    #[test]
+    fn replay_of_valid_signature_is_rejected() {
+        // L-2: a unique (key, body) so this sig cannot collide with any other test's
+        // entry in the process-global replay cache.
+        let key = "l2-replay-key";
+        let body = br#"{"l2":"replay-nonce-test"}"#;
+        let ts = hmac_unix_now();
+        let sig = hmac_sign(key, "POST", "/relay/dns", ts, body);
+        // First presentation of a valid signature is accepted.
+        assert!(hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &sig));
+        // Second presentation of the SAME valid signature is a replay → rejected.
+        assert!(!hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &sig));
     }
 }
