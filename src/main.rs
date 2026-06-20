@@ -953,6 +953,52 @@ async fn build_and_launch(
         });
     }
 
+    // ── Hickory-free plain DNS server (de-hickory phase 3) ─────────────────
+    // Opt in with RUNBOUND_PLAIN_SERVER_PORT=<port>: own listeners (no
+    // hickory-server) that serve local zones with our wire codec and forward the
+    // rest to the first configured upstream over plain UDP. Additive and off by
+    // default — the production hickory-server listeners are left untouched.
+    if let Some(port) = std::env::var("RUNBOUND_PLAIN_SERVER_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    {
+        let upstream = cfg
+            .forward_zones
+            .iter()
+            .flat_map(|fz| fz.addrs.iter())
+            // accept "1.1.1.1" and "1.1.1.1@853"; the seed forwards plain UDP:53.
+            .find_map(|a| a.split('@').next().unwrap_or(a).parse::<std::net::IpAddr>().ok())
+            .map(|ip| std::net::SocketAddr::new(ip, 53));
+        match upstream {
+            Some(up) => {
+                let bind = format!("0.0.0.0:{port}");
+                let z_udp = Arc::clone(&zones);
+                let b_udp = bind.clone();
+                tokio::spawn(async move {
+                    match tokio::net::UdpSocket::bind(&b_udp).await {
+                        Ok(s) => {
+                            let _ = dns::plain_server::run(Arc::new(s), z_udp, up).await;
+                        }
+                        Err(e) => tracing::error!("plain-server UDP bind {b_udp} failed: {e}"),
+                    }
+                });
+                let z_tcp = Arc::clone(&zones);
+                tokio::spawn(async move {
+                    match tokio::net::TcpListener::bind(&bind).await {
+                        Ok(l) => {
+                            let _ = dns::plain_server::run_tcp(l, z_tcp, up).await;
+                        }
+                        Err(e) => tracing::error!("plain-server TCP bind {bind} failed: {e}"),
+                    }
+                });
+                info!(port, upstream = %up, "hickory-free plain DNS server (phase 3) on UDP+TCP");
+            }
+            None => tracing::warn!(
+                "RUNBOUND_PLAIN_SERVER_PORT set but no forward upstream configured — not started"
+            ),
+        }
+    }
+
     // ── Background: feed auto-update ───────────────────────────────────────
     tokio::spawn(async move { feeds::feed_update_loop(86400).await });
 

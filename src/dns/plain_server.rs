@@ -15,10 +15,6 @@
 //! pooling, racing, health) stays on the hickory resolver until phase 4 lifts it
 //! onto our own client; the listener plumbing proven here is what phase 3 grows.
 
-// Ahead-of-use: exercised by the integration test below; wired into the server
-// bring-up (main.rs) behind a config flag at integration. Remove the allow then.
-#![allow(dead_code)]
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

@@ -15,10 +15,6 @@
 //! answer stays in the hickory signer for now and is layered on at integration;
 //! this core builds the unsigned authoritative answer.
 
-// Ahead-of-use: exercised by the tests and the UDP round-trip below; wired into
-// the slow-path receive loop at integration. Remove the allow once it is.
-#![allow(dead_code)]
-
 use smallvec::SmallVec;
 
 use crate::dns::local::{LocalZoneSet, ZoneAction};
@@ -55,6 +51,9 @@ pub fn answer_local(query: &Message, zones: &LocalZoneSet) -> Option<Message> {
     resp.header.set_aa(false);
     resp.header.set_ra(false);
     resp.header.set_tc(false);
+    // We do not validate DNSSEC here, so never claim Authentic Data (RFC 6840
+    // §5.8) even if the client set AD in the query.
+    resp.header.set_ad(false);
     resp.questions.push(question);
 
     let mut rc = rcode::NOERROR;
