@@ -3756,8 +3756,28 @@ fn render_prometheus_metrics(
 
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.stats.snapshot();
-    let cache_hits = s.stats.cache_hits.load(Ordering::Relaxed);
-    let cache_misses = s.stats.cache_misses.load(Ordering::Relaxed);
+    // Use the SAME source as snap.cache_hit_rate (XDP fast-path served/miss, with the
+    // slow-path counters as fallback when XDP is off) so hits_total/misses_total stay
+    // consistent with the rate: they previously read the slow-path counters while the rate
+    // read the XDP ones, giving e.g. hit_rate=14.7 reported alongside hits=0/misses=0.
+    let (cache_hits, cache_misses) = {
+        let xh: u64 = crate::dns::cache_snapshot::XDP_WORKER_PKTS
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        let xm: u64 = crate::dns::cache_snapshot::XDP_WORKER_MISS
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum();
+        if xh + xm > 0 {
+            (xh, xm)
+        } else {
+            (
+                s.stats.cache_hits.load(Ordering::Relaxed),
+                s.stats.cache_misses.load(Ordering::Relaxed),
+            )
+        }
+    };
     let evictions = s.cache_evictions.load(Ordering::Relaxed);
     let xdp_active = s.xdp_active.load(Ordering::Relaxed) > 0;
     let upstreams: Vec<UpstreamMetric> = {
