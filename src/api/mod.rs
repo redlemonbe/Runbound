@@ -512,6 +512,20 @@ async fn security_middleware(
     // Exposing version, endpoint list, or RFCs without auth enables
     // fingerprinting and targeted exploitation (AUDIT-HIGH-02).
     let path = req.uri().path();
+    // NEW-N1 (pentest v0.4.4): this middleware is layered on the INNER
+    // `api_routes`, which the top-level router mounts via `nest("/api", …)`.
+    // axum's `nest` applies `StripPrefix`, so `req.uri().path()` here is the
+    // STRIPPED path (`/dns`), not the original (`/api/dns`). The RBAC matcher
+    // `Role::may_write` keys on `/api/...` prefixes, so the stripped path made
+    // every non-admin write fail-closed (403) and left the per-zone
+    // `may_manage_name` check unreachable. Recover the original, un-stripped
+    // path from the `OriginalUri` extension axum inserts on nesting; fall back
+    // to the visible path if it is ever absent (e.g. a non-nested mount).
+    let full_path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| path.to_string());
     let audit_method = req.method().clone();
     let audit_path = path.to_string();
     {
@@ -543,7 +557,7 @@ async fn security_middleware(
                 // RBAC: enforce role-based write restrictions
                 let method = req.method().clone();
                 let is_write = !matches!(method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS);
-                if is_write && !user.admin && !user.role.may_write(path) {
+                if is_write && !user.admin && !user.role.may_write(&full_path) {
                     return (
                         StatusCode::FORBIDDEN,
                         [(axum::http::header::CONTENT_TYPE, "text/plain")],
@@ -7254,6 +7268,252 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── NEW-N1: RBAC enforcement through the FULL nested router ────────────
+    //
+    // Regression guard for NEW-N1 (pentest v0.4.4): `security_middleware` is
+    // layered on the INNER `api_routes`, which axum mounts under
+    // `nest("/api", …)`. nesting applies `StripPrefix`, so inside the middleware
+    // `req.uri().path()` is `/dns`, NOT `/api/dns`. `Role::may_write` matches
+    // `/api/...` prefixes, so a non-admin write used to fail-closed (403 with
+    // "role does not permit writes") for EVERY endpoint — making the per-role
+    // write-RBAC inert and the per-zone `may_manage_name` check unreachable.
+    //
+    // These tests drive a non-admin `Dns` user and an admin through the real
+    // top-level router (the exact gap two static audits + the unit tests missed,
+    // because none exercised a non-admin role across the `nest` boundary). They
+    // MUST fail against the buggy middleware and pass once it evaluates the
+    // original (un-stripped) path via `OriginalUri`.
+
+    /// Serialises the RBAC tests that perform a *successful* DNS write. The DNS
+    /// store path is derived from the global `BASE_DIR` OnceLock, so every test
+    /// in this binary shares one `dns_entries.json`; two concurrent successful
+    /// writes race on `store::save`'s tmp→rename and intermittently 500. The
+    /// pre-existing harness never hit this because its `/api/dns` POST tests are
+    /// all validation-rejection cases that return before persisting. Holding
+    /// this async mutex across the write keeps these tests deterministic.
+    static DNS_STORE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Build the real top-level router with a populated user registry containing
+    /// a non-admin `Dns` user scoped to `shop.example.com.` and an admin user.
+    /// Returns `(router_factory, dns_key, admin_key)`. The factory rebuilds the
+    /// router per call because `oneshot` consumes the service.
+    fn make_rbac_app() -> (impl Fn() -> Router, String, String) {
+        // Unique dir per invocation for this test's `users.json` (the user
+        // registry). NB: the DNS store path is derived from the global
+        // `BASE_DIR`, not from `state.base_dir`, so successful DNS writes still
+        // share one file — see DNS_STORE_WRITE_LOCK.
+        let uniq = format!(
+            "/tmp/runbound-rbac-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::fs::create_dir_all(&uniq).unwrap();
+
+        let dns_key = "rbac-dns-user-key-0001".to_string();
+        let admin_key = "rbac-admin-user-key-0002".to_string();
+        let users_json = format!(
+            r#"{{"users":[
+                {{"id":"u-dns","username":"dnsuser","api_key":"{dns_key}",
+                  "zone_prefixes":["shop.example.com."],"enabled":true,
+                  "admin":false,"role":"dns"}},
+                {{"id":"u-admin","username":"adminuser","api_key":"{admin_key}",
+                  "zone_prefixes":[],"enabled":true,"admin":true,"role":"admin"}}
+            ]}}"#
+        );
+        let users_path = std::path::PathBuf::from(&uniq).join("users.json");
+        std::fs::write(&users_path, users_json).unwrap();
+        let registry = crate::multiuser::UserRegistry::load(&users_path);
+        assert_eq!(registry.all_users().len(), 2, "test registry must load 2 users");
+
+        init_api_key(Some(TEST_KEY.to_string()));
+        let _ = crate::runtime::BASE_DIR.set(std::path::PathBuf::from("/tmp/runbound-test"));
+
+        let cfg_arc = Arc::new(crate::config::parser::UnboundConfig::default());
+        let base = std::path::PathBuf::from(uniq);
+        let factory = move || {
+            // Each router needs its own AppState (oneshot consumes the service),
+            // but they share the same registry + base dir.
+            let zones = Arc::new(ArcSwap::new(Arc::new(
+                crate::dns::local::LocalZoneSet::from_config(
+                    &cfg_arc.local_zones,
+                    &cfg_arc.local_data,
+                ),
+            )));
+            let log_buffer = crate::logbuffer::new_shared(1000, true);
+            let upstreams = crate::upstreams::init_upstreams(&cfg_arc);
+            let resolver =
+                crate::dns::server::create_shared_resolver(&cfg_arc).expect("test resolver");
+            let stats = crate::stats::Stats::new();
+            let stats_cache = crate::stats::new_snapshot_cache(&stats);
+            let state = AppState {
+                split_horizon: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                node_health: NodeHealth::default(),
+                zones: Arc::clone(&zones),
+                zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
+                tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
+                rate_limiter: ApiRateLimiter::new_public(),
+                reload_limiter: Arc::new(ReloadLimiter::new()),
+                stats,
+                stats_cache,
+                cfg: Arc::clone(&cfg_arc),
+                cfg_path: "/dev/null".to_string(),
+                log_buffer,
+                upstreams,
+                sync_journal: None,
+                sync_key: None,
+                slave_mode: false,
+                base_dir: Arc::new(base.clone()),
+                audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp"), 0),
+                xdp_active: Arc::new(AtomicU8::new(0)),
+                resolver,
+                last_flush_at: Arc::new(std::sync::Mutex::new(None)),
+                cache_evictions: Arc::new(AtomicU64::new(0)),
+                lookup_limiter: Arc::new(ReloadLimiter::new_with_params(10.0, 10.0)),
+                per_upstream_resolvers: crate::dns::server::create_shared_resolvers_vec(),
+                racing_wins: Arc::new(DashMap::with_hasher(ahash::RandomState::new())),
+                events_tx: None,
+                domain_stats: crate::domain_stats::DomainStats::new(),
+                alert_tracker: crate::alerts::AlertTracker::new(vec![], None),
+                webhook_targets: Arc::new(tokio::sync::RwLock::new(vec![])),
+                webhook_dispatcher: {
+                    let targets = Arc::new(tokio::sync::RwLock::new(vec![]));
+                    crate::webhooks::WebhookDispatcher::new(Arc::clone(&targets))
+                },
+                icmp_stats: crate::icmp::IcmpStats::new(),
+                icmp_cfg: Arc::new(std::sync::Mutex::new(crate::icmp::IcmpConfig::default())),
+                dnssec_enabled: Arc::new(AtomicBool::new(cfg_arc.dnssec_validation)),
+                resolution_mode: crate::dns::recursor::mode_atomic(cfg_arc.resolution_mode),
+                recursor: crate::dns::recursor::shared_recursor(
+                    crate::config::parser::ResolutionMode::Forward,
+                    false,
+                ),
+                user_registry: Some(Arc::clone(&registry)),
+                blacklist_reload_tx: None,
+            };
+            router(state)
+        };
+        (factory, dns_key, admin_key)
+    }
+
+    fn dns_write_body(name: &str) -> String {
+        format!(r#"{{"name":"{name}","type":"A","value":"203.0.113.7","ttl":300}}"#)
+    }
+
+    async fn post_json(app: Router, uri: &str, key: &str, body: String) -> StatusCode {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    /// Non-admin `Dns` user writing INSIDE its zone → reaches `may_manage_name`,
+    /// which passes → 201. (Pre-fix: 403 "role does not permit writes".)
+    #[tokio::test]
+    async fn rbac_nonadmin_in_zone_dns_write_is_created() {
+        let _w = DNS_STORE_WRITE_LOCK.lock().await; // serialise shared-store writes
+        let (app, dns_key, _admin) = make_rbac_app();
+        let status = post_json(
+            app(),
+            "/api/dns",
+            &dns_key,
+            dns_write_body("www.shop.example.com"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "in-zone DNS write by a Dns user must reach may_manage_name and be created (201)"
+        );
+    }
+
+    /// Non-admin `Dns` user writing OUTSIDE its zone → `may_write` passes (it's
+    /// `/api/dns`) but `may_manage_name` rejects → 403. This is SEC-N2 finally
+    /// live: it is *unreachable* while NEW-N1 fails-closed at `may_write`.
+    #[tokio::test]
+    async fn rbac_nonadmin_out_of_zone_dns_write_is_forbidden() {
+        let (app, dns_key, _admin) = make_rbac_app();
+        let status = post_json(
+            app(),
+            "/api/dns",
+            &dns_key,
+            dns_write_body("www.evil.example.org"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "out-of-zone DNS write must be rejected by may_manage_name (403)"
+        );
+    }
+
+    /// Non-admin `Dns` user hitting an admin-only endpoint (`/api/users`) →
+    /// `may_write` rejects (Dns role has no write on /api/users) → 403.
+    #[tokio::test]
+    async fn rbac_nonadmin_admin_endpoint_write_is_forbidden() {
+        let (app, dns_key, _admin) = make_rbac_app();
+        let body = r#"{"username":"intruder","role":"admin"}"#.to_string();
+        let status = post_json(app(), "/api/users", &dns_key, body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "Dns role must not be able to write to /api/users (403)"
+        );
+    }
+
+    /// Admin user writes everywhere → 201 on DNS even outside any zone_prefix.
+    #[tokio::test]
+    async fn rbac_admin_write_is_created_everywhere() {
+        let _w = DNS_STORE_WRITE_LOCK.lock().await; // serialise shared-store writes
+        let (app, _dns, admin_key) = make_rbac_app();
+        let status = post_json(
+            app(),
+            "/api/dns",
+            &admin_key,
+            dns_write_body("anything.example.net"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "admin DNS write must succeed regardless of zone (201)"
+        );
+    }
+
+    /// Read for a non-admin user must still work (GET is never gated by may_write).
+    #[tokio::test]
+    async fn rbac_nonadmin_get_is_allowed() {
+        let (app, dns_key, _admin) = make_rbac_app();
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/dns")
+                    .header("Authorization", format!("Bearer {dns_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET (read) by a non-admin user must remain allowed"
+        );
     }
 }
 
