@@ -161,8 +161,19 @@ async fn relay_request(
 pub async fn relay_forward_handler(
     State(s): State<AppState>,
     Path(params): Path<std::collections::HashMap<String, String>>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     req: axum::extract::Request,
 ) -> impl IntoResponse {
+    // Defense-in-depth: forwarding an arbitrary request to a slave is admin-only.
+    // The role middleware already blocks non-admin writes here, but gate explicitly.
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"FORBIDDEN"})),
+        )
+            .into_response();
+    }
     let node_id = params.get("node_id").cloned().unwrap_or_default();
     let relay_path = params.get("path").cloned().unwrap_or_default();
     let (sync_key, journal) = match (&s.sync_key, &s.sync_journal) {

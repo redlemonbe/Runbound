@@ -1800,12 +1800,23 @@ async fn persist_and_swap(
 
 async fn add_dns_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     ApiJson(req): ApiJson<AddDnsRequest>,
 ) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
     let (entry, rr, record) = match validate_dns_entry(&req) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    // F3: a non-admin Dns/Operator user may only create records within their
+    // assigned zone_prefixes. The role middleware (mod.rs:546) only gates the
+    // path, not the per-user zone scope — enforce it explicitly here.
+    if !caller.may_manage_name(&entry.name) {
+        return (
+            StatusCode::FORBIDDEN,
+            JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"name outside your zone scope"})),
+        );
+    }
     if let Err(e) = persist_and_swap(&entry, record, &s).await {
         return e;
     }
@@ -1822,7 +1833,9 @@ async fn add_dns_handler(
 async fn delete_dns_handler(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
 ) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
     let _guard = s.zones_mutex.lock().await;
 
     let mut st = match store::load() {
@@ -1843,6 +1856,15 @@ async fn delete_dns_handler(
             JsonExtract(serde_json::json!({"error":"NOT_FOUND","id":id})),
         );
     };
+
+    // F3: a non-admin Dns/Operator user may only delete records within their
+    // assigned zone_prefixes. Check the loaded entry's name before removing it.
+    if !caller.may_manage_name(&st.entries[pos].name) {
+        return (
+            StatusCode::FORBIDDEN,
+            JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"name outside your zone scope"})),
+        );
+    }
 
     let entry = st.entries.remove(pos);
     if let Err(e) = store::save(&st) {
@@ -3838,8 +3860,15 @@ struct RotateKeyRequest {
 
 async fn rotate_key_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     ApiJson(req): ApiJson<RotateKeyRequest>,
 ) -> impl IntoResponse {
+    // Defense-in-depth: rotating the master API key is admin-only. The role
+    // middleware already blocks non-admin writes here, but gate explicitly.
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
     // Require at least 32 bytes of entropy (64 hex chars) — shorter keys are
     // statistically weak and likely copy-paste mistakes.
     if req.new_key.len() < 32 {
@@ -7445,7 +7474,16 @@ const BACKUP_STATE_FILES: &[&str] = &[
 /// GET /api/backup/export — full backup (admin). Returns a JSON document with the
 /// config and every state/secret file, base64-encoded, as a downloadable attachment.
 /// NOTE: contains secrets (API key, sync key, WebUI auth, private keys) — store securely.
-async fn backup_export_handler(State(s): State<AppState>) -> Response {
+async fn backup_export_handler(
+    State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> Response {
+    // H-1: this endpoint base64-dumps runbound.conf + secret state files
+    // (api.key, sync-key.pem, webui-ca-key.pem, webui-auth.conf) — admin only.
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut files = serde_json::Map::new();
@@ -7477,9 +7515,15 @@ async fn backup_export_handler(State(s): State<AppState>) -> Response {
 /// each whitelisted file atomically (tmp + rename). Restart the service to apply.
 async fn backup_import_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
 ) -> impl IntoResponse {
     use base64::Engine as _;
+    // H-1: restoring a backup overwrites runbound.conf + secret state files — admin only.
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"})));
+    }
     if s.slave_mode {
         return (StatusCode::SERVICE_UNAVAILABLE, JsonExtract(serde_json::json!({"error":"SLAVE_READONLY"})));
     }
@@ -7524,8 +7568,14 @@ async fn backup_import_handler(
 
 async fn backup_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     body: axum::extract::Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // H-1: creating a backup snapshots config + data files — admin only.
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7607,8 +7657,14 @@ async fn list_backups_handler(
 
 async fn restore_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     body: axum::extract::Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // H-1: restoring overwrites runbound.conf + data files — admin only.
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
     let id = match body.get("id").and_then(|v| v.as_str()) {
         Some(s) => s.to_owned(),
         None => return (StatusCode::BAD_REQUEST,
@@ -7655,7 +7711,13 @@ async fn restore_handler(
 async fn delete_backup_handler(
     State(s): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
 ) -> impl IntoResponse {
+    // H-1: deleting backups is a privileged operation — admin only.
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
+    }
     if id.contains('/') || id.contains("..") || !id.starts_with("backup_") {
         return (StatusCode::BAD_REQUEST,
             JsonExtract(serde_json::json!({"error": "Invalid backup id"}))).into_response();
