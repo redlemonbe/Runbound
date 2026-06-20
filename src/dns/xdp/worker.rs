@@ -460,6 +460,13 @@ fn start_xdp_on_iface(
     // to 32 (XSKMAP=64 / 2-NIC budget) — the bench-validated 32-queue config.
     let _tuned = auto_tune_nic_queues(iface, 32);
     let queue_count = get_rx_queue_count(iface).max(1);
+    // Maximize the NIC RX/TX rings *now*, while the device is still free.
+    // SRINGPARAM is rejected with EBUSY once an XDP program or an AF_XDP socket is
+    // attached — and reconfiguring the ring while attached resets the datapath
+    // (TX dies). Doing it here, before load + bind below, is the only safe window;
+    // larger rings absorb RX bursts and cut rx_missed drops under load. (Was run
+    // after attach, where it always failed "busy" → default rings → drops.)
+    let (nic_rx_ring, nic_rx_ring_max) = super::socket::maximize_nic_ring(iface, None);
     let mut handle = XdpHandle::load(iface, queue_count, domain_routing)?;
     let num_cpus = crate::cpu::physical_cores().len().max(1);
     tracing::info!(iface = %iface, queues = queue_count, "Starting XDP workers");
@@ -521,7 +528,7 @@ fn start_xdp_on_iface(
     let queue_modes: Vec<(u32, bool)> = sockets.iter().map(|(q, s)| (*q, s.zerocopy)).collect();
     // #159: register per-interface state in the Vec registry (works for N interfaces).
     // Also feed compat singleton (first iface wins, subsequent skipped silently).
-    let (nic_rx_ring, nic_rx_ring_max) = super::socket::maximize_nic_ring(iface, None);
+    // (nic_rx_ring / nic_rx_ring_max were computed above, before XDP attach.)
     super::socket::register_xdp_iface(super::socket::XdpIfaceState {
         iface:           iface.to_owned(),
         queue_modes:     queue_modes.clone(),
