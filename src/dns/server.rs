@@ -1308,6 +1308,214 @@ impl RunboundHandler {
 }
 
 impl RunboundHandler {
+    /// De-hickory fast path: resolve a query entirely on the own wire codec when
+    /// it needs none of the hickory-typed special handling. Returns
+    /// `Some(response_bytes)` when fully handled, or `None` to fall back to the
+    /// hickory handler (which preserves exact behaviour for the routed-out cases).
+    ///
+    /// Routed to the fallback (before any side-effectful gate, so gates run once):
+    /// non-QUERY opcodes (UPDATE), AXFR/IXFR/ANY, non-IN class (CHAOS), HTTPS-block,
+    /// DNS cookies, split-horizon, signed local zones, recursor mode, alert tracker,
+    /// RRL-with-slip, and any ACL result other than Allow. The dominant forward and
+    /// plain local-zone paths are served here with zero hickory.
+    ///
+    /// Observability note: the per-query web-UI log buffer is hickory-name typed and
+    /// is not written on this fast path; stats counters are. Full parity returns when
+    /// the handler's logging is wire-native.
+    pub async fn serve_wire(&self, query: &[u8], peer: std::net::SocketAddr) -> Option<Vec<u8>> {
+        use crate::dns::wire::consts::{class, opcode, rcode, rtype};
+        use crate::dns::wire::Message as WMessage;
+
+        let msg = WMessage::parse(query).ok()?;
+        let q = msg.first_question()?.clone();
+        let qtype = q.qtype;
+
+        // ── Route-outs (no gate side-effects yet) ───────────────────────────
+        if msg.header.opcode() != opcode::QUERY {
+            return None;
+        }
+        if matches!(qtype, rtype::AXFR | rtype::IXFR | rtype::ANY) {
+            return None;
+        }
+        if q.qclass != class::IN {
+            return None;
+        }
+        if self.block_https_record && qtype == rtype::HTTPS {
+            return None;
+        }
+        if self.dns_cookies {
+            return None; // cookie verification stays on the hickory path
+        }
+        if self.rrl_slip != 0 {
+            return None; // RRL SLIP nuance stays on the hickory path
+        }
+        if self.alert_tracker.is_some() && !peer.ip().is_loopback() {
+            return None; // anti-DDoS escalation stays on the hickory path
+        }
+        if !self.split_horizon.load().is_empty() {
+            return None;
+        }
+        if self.zone_signer.load().is_some() {
+            return None; // DNSSEC signing stays on the hickory path
+        }
+        #[cfg(feature = "recursor")]
+        if self.resolution_mode.load(Ordering::Relaxed) == 1 {
+            return None;
+        }
+
+        let client_ip = peer.ip();
+
+        // ── ACL (read-only): only Allow proceeds; else fall back ────────────
+        if !matches!(self.acl.check(client_ip), AclAction::Allow) {
+            return None;
+        }
+
+        let start = Instant::now();
+        self.stats.inc_total();
+        self.stats.inc_qtype_raw(qtype);
+
+        // ── Rate limit (side-effectful: owned from here, no more fallback) ──
+        if !self.rate_limiter.check(client_ip) {
+            self.stats.inc_refused();
+            return Some(self.wire_error(&msg, rcode::REFUSED));
+        }
+        let _permit = match self.inflight.try_acquire() {
+            Ok(p) => p,
+            Err(_) => return Some(self.wire_error(&msg, rcode::REFUSED)),
+        };
+
+        // ── Local zones (own wire serving core) ─────────────────────────────
+        let zones = self.zones.load();
+        if let Some(resp) = crate::dns::wire_serve::serve_datagram(query, &zones) {
+            self.stats.inc_local_hits();
+            self.stats.record_latency_us(start.elapsed().as_micros() as u64);
+            return Some(resp);
+        }
+
+        // ── Forward upstream (own wire forward pool) ────────────────────────
+        let (fwd, _winner) = self.pool.load().forward(query).await;
+        match fwd {
+            crate::dns::forward::ResolveResult::Answer { mut records } => {
+                // private-address block (#rebinding)
+                if !self.private_addrs.is_empty() {
+                    for r in &records {
+                        let ip = match &r.rdata {
+                            crate::dns::wire::Rdata::A(a) => Some(std::net::IpAddr::V4(*a)),
+                            crate::dns::wire::Rdata::Aaaa(a) => Some(std::net::IpAddr::V6(*a)),
+                            _ => None,
+                        };
+                        if let Some(ip) = ip {
+                            if self.private_addrs.contains(ip) {
+                                self.stats.inc_servfail();
+                                return Some(self.wire_error(&msg, rcode::SERVFAIL));
+                            }
+                        }
+                    }
+                }
+                // TTL clamp
+                for r in records.iter_mut() {
+                    r.ttl = r.ttl.max(self.cache_min_ttl).min(self.cache_max_ttl);
+                }
+                let resp = self.wire_answer(&msg, &records, rcode::NOERROR);
+                self.maybe_cache_wire(&q, &resp, &records);
+                self.stats.inc_forwarded();
+                self.stats.record_forward(start.elapsed().as_micros() as u64);
+                Some(resp)
+            }
+            crate::dns::forward::ResolveResult::NegativeAnswer { rcode: rc, .. } => {
+                if rc == rcode::NXDOMAIN {
+                    self.stats.inc_nxdomain();
+                } else {
+                    self.stats.inc_servfail();
+                }
+                Some(self.wire_error(&msg, rc))
+            }
+            crate::dns::forward::ResolveResult::Servfail => {
+                self.stats.inc_servfail();
+                Some(self.wire_error(&msg, rcode::SERVFAIL))
+            }
+        }
+    }
+
+    /// Build a response carrying `records` for `req` (header copied, QR/RA set,
+    /// EDNS echoed). Wire-native — no hickory.
+    fn wire_answer(
+        &self,
+        req: &crate::dns::wire::Message,
+        records: &[crate::dns::wire::Record],
+        rcode_low: u16,
+    ) -> Vec<u8> {
+        use crate::dns::wire::{Header, Message};
+        let mut h = Header {
+            id: req.header.id,
+            flags: 0,
+            qdcount: 0,
+            ancount: 0,
+            nscount: 0,
+            arcount: 0,
+        };
+        h.set_qr(true);
+        h.set_rd(req.header.rd());
+        h.set_ra(true);
+        h.set_rcode_low(rcode_low);
+        let mut additional = Vec::new();
+        if let Ok(Some(req_edns)) = req.edns() {
+            let mut e = crate::dns::wire::Edns::default();
+            e.udp_payload = req_edns.udp_payload.clamp(512, 1232);
+            e.set_dnssec_ok(req_edns.dnssec_ok());
+            additional.push(e.to_record());
+        }
+        let m = Message {
+            header: h,
+            questions: req.questions.clone(),
+            answers: records.to_vec(),
+            authority: Vec::new(),
+            additional,
+        };
+        m.encode()
+    }
+
+    /// Build an error/empty response (no answers) for `req` with `rcode_low`.
+    fn wire_error(&self, req: &crate::dns::wire::Message, rcode_low: u16) -> Vec<u8> {
+        self.wire_answer(req, &[], rcode_low)
+    }
+
+    /// Insert a positive answer into the XDP cache snapshot (so the fast path can
+    /// serve it). Mirrors the hickory path's cache insert, wire-native. Best-effort.
+    fn maybe_cache_wire(
+        &self,
+        q: &crate::dns::wire::Question,
+        resp_wire: &[u8],
+        records: &[crate::dns::wire::Record],
+    ) {
+        let Some(cache) = &self.xdp_cache else { return };
+        if records.is_empty() {
+            return;
+        }
+        let min_ttl = records
+            .iter()
+            .map(|r| r.ttl)
+            .min()
+            .unwrap_or(60)
+            .max(self.cache_min_ttl)
+            .min(self.cache_max_ttl);
+        let qname_lc = crate::dns::wire_builder::normalize_query_qname(q.name.wire());
+        let raw_key = crate::dns::hasher::hash_wire_qname(&qname_lc);
+        let key: u64 = raw_key ^ ((q.qtype as u64) << 48);
+        let entry = super::cache_snapshot::CacheEntry {
+            wire_payload: Bytes::copy_from_slice(resp_wire),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(min_ttl as u64),
+            wire_qname: bytes::Bytes::copy_from_slice(&qname_lc),
+        };
+        let cache_ref = Arc::clone(cache);
+        let max_ent = self.cache_max_entries;
+        tokio::spawn(async move {
+            super::cache_snapshot::cache_insert(&cache_ref, key, entry, max_ent);
+        });
+    }
+}
+
+impl RunboundHandler {
     /// #ddos: clone of the alert/abuse tracker, so the TCP/DoT/DoH relay can enforce
     /// bans on the REAL client IP — the handler itself only sees the loopback relay
     /// address for connection transports.
@@ -1319,6 +1527,11 @@ impl RunboundHandler {
 
     /// Dispatch a raw DNS wire query and return the wire response.
     pub async fn handle_request_wire(&self, wire: &[u8], peer: std::net::SocketAddr) -> Vec<u8> {
+        // de-hickory fast path: serve on the own wire codec when no hickory-typed
+        // special handling is needed; otherwise fall back to the hickory handler.
+        if let Some(resp) = self.serve_wire(wire, peer).await {
+            return resp;
+        }
         let request = match hickory_server::server::Request::from_bytes(
             wire.to_vec(),
             peer,
