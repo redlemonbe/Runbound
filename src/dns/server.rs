@@ -1138,7 +1138,7 @@ impl RunboundHandler {
                     None => resp,
                 });
             }
-            _ => return None, // NOTIFY/STATUS/etc. stay on the hickory path
+            _ => return Some(self.wire_error(&msg, rcode::NOTIMP)), // NOTIFY/STATUS/etc.
         }
         if matches!(qtype, rtype::AXFR | rtype::IXFR) {
             // ── AXFR/IXFR zone transfer (#22), wire-native ──────────────────
@@ -1188,12 +1188,8 @@ impl RunboundHandler {
                 }
             }
         }
-        if self.rrl_slip != 0 {
-            return None; // RRL SLIP nuance stays on the hickory path
-        }
-        if self.alert_tracker.is_some() && !peer.ip().is_loopback() {
-            return None; // anti-DDoS escalation stays on the hickory path
-        }
+        // Recursor mode keeps the hickory handler (the iterative resolver lives
+        // there, behind the `recursor` feature). Default builds never route out.
         #[cfg(feature = "recursor")]
         if self.resolution_mode.load(Ordering::Relaxed) == 1 {
             return None;
@@ -1201,9 +1197,18 @@ impl RunboundHandler {
 
         let client_ip = peer.ip();
 
-        // ── ACL (read-only): only Allow proceeds; else fall back ────────────
-        if !matches!(self.acl.check(client_ip), AclAction::Allow) {
-            return None;
+        // ── ACL (wire-native) ───────────────────────────────────────────────
+        match self.acl.check(client_ip) {
+            AclAction::Allow => {}
+            AclAction::Deny => {
+                // Silent drop: an empty buffer means the listener sends nothing.
+                self.stats.inc_refused();
+                return Some(Vec::new());
+            }
+            AclAction::Refuse => {
+                self.stats.inc_refused();
+                return Some(self.wire_error(&msg, rcode::REFUSED));
+            }
         }
 
         let start = Instant::now();
@@ -1235,15 +1240,62 @@ impl RunboundHandler {
             }
         }
 
-        // ── Rate limit (side-effectful: owned from here, no more fallback) ──
+        // ── Rate limit, with RRL SLIP (#203) ────────────────────────────────
+        // slip=0 → REFUSED to all. slip>0 → leak 1-in-slip as REFUSED (a legit
+        // client learns it is limited) and drop the rest, so a spoofed flood gets
+        // zero amplification.
         if !self.rate_limiter.check(client_ip) {
             self.stats.inc_refused();
-            return Some(self.wire_error(&msg, rcode::REFUSED));
+            if self.rrl_slip == 0 {
+                return Some(self.wire_error(&msg, rcode::REFUSED));
+            }
+            let n = self.rrl_counter.fetch_add(1, Ordering::Relaxed);
+            if n % self.rrl_slip == 0 {
+                return Some(self.wire_error(&msg, rcode::REFUSED));
+            }
+            return Some(Vec::new()); // drop
         }
         let _permit = match self.inflight.try_acquire() {
             Ok(p) => p,
             Err(_) => return Some(self.wire_error(&msg, rcode::REFUSED)),
         };
+
+        // ── Alert / anti-DDoS escalation (#12), wire-native ─────────────────
+        // Connection transports arrive via the loopback relay (abuse handled there
+        // on the real IP); skip loopback. Only escalate verified (non-spoofed)
+        // sources: non-loopback here is always UDP, so verification = a valid
+        // server cookie.
+        if let Some(at) = &self.alert_tracker {
+            if !client_ip.is_loopback() {
+                let cookie_ok = msg
+                    .edns()
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.options.iter().find(|(c, _)| *c == 10).map(|(_, d)| d.clone()))
+                    .map(|cc| {
+                        cc.len() >= 16 && {
+                            use subtle::ConstantTimeEq;
+                            let expected = server_cookie(&self.cookie_secret, &cc[..8], client_ip);
+                            bool::from(cc[8..16].ct_eq(&expected))
+                        }
+                    })
+                    .unwrap_or(false);
+                match at.record(client_ip, cookie_ok) {
+                    crate::alerts::AbuseVerdict::Block => {
+                        self.stats.inc_refused();
+                        return Some(self.wire_error(&msg, rcode::REFUSED));
+                    }
+                    crate::alerts::AbuseVerdict::Tarpit => {
+                        if let Ok(_p) = tarpit_sema().try_acquire() {
+                            tokio::time::sleep(tarpit_delay()).await;
+                        }
+                        self.stats.inc_refused();
+                        return Some(self.wire_error(&msg, rcode::REFUSED));
+                    }
+                    crate::alerts::AbuseVerdict::Serve => {}
+                }
+            }
+        }
 
         // ── Special query classes/types (RFC-mandated rejections), wire-native ──
         // CHAOS class (version.bind/hostname.bind identity probes) → NOTIMP (RFC 5358).

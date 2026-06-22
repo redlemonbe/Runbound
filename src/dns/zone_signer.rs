@@ -600,7 +600,12 @@ mod tests {
     }
 
     fn signer_for(apex: &str) -> (ZoneSigner, Name) {
-        let tmp = std::env::temp_dir().join(format!("rb201sig-{}-{}", std::process::id(), apex));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        // Unique temp dir per call so parallel tests never race on the same keys.
+        let uniq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir()
+            .join(format!("rb201sig-{}-{}-{}", std::process::id(), uniq, apex));
         let _ = std::fs::remove_dir_all(&tmp);
         let s = ZoneSigner::new(&tmp, &[apex.to_string()], Duration::from_secs(86_400)).unwrap();
         (s, Name::from_ascii(apex).unwrap())
