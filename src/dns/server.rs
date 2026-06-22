@@ -1334,14 +1334,8 @@ impl RunboundHandler {
         if msg.header.opcode() != opcode::QUERY {
             return None;
         }
-        if matches!(qtype, rtype::AXFR | rtype::IXFR | rtype::ANY) {
-            return None;
-        }
-        if q.qclass != class::IN {
-            return None;
-        }
-        if self.block_https_record && qtype == rtype::HTTPS {
-            return None;
+        if matches!(qtype, rtype::AXFR | rtype::IXFR) {
+            return None; // zone transfer stays on the hickory path
         }
         if self.dns_cookies {
             return None; // cookie verification stays on the hickory path
@@ -1383,6 +1377,30 @@ impl RunboundHandler {
             Ok(p) => p,
             Err(_) => return Some(self.wire_error(&msg, rcode::REFUSED)),
         };
+
+        // ── Special query classes/types (RFC-mandated rejections), wire-native ──
+        // CHAOS class (version.bind/hostname.bind identity probes) → NOTIMP (RFC 5358).
+        if q.qclass != class::IN {
+            self.stats.inc_refused();
+            return Some(self.wire_error(&msg, rcode::NOTIMP));
+        }
+        // Identity-probe names regardless of class → REFUSED (defence in depth, SEC-03).
+        let qname_pres = q.name.to_ascii();
+        if matches!(
+            qname_pres.to_ascii_lowercase().as_str(),
+            "version.bind." | "hostname.bind." | "id.server." | "authors.bind."
+        ) {
+            self.stats.inc_refused();
+            return Some(self.wire_error(&msg, rcode::REFUSED));
+        }
+        // ANY → REFUSED (RFC 8482 amplification mitigation).
+        if qtype == rtype::ANY {
+            return Some(self.wire_error(&msg, rcode::REFUSED));
+        }
+        // block-https-record: suppress HTTPS type-65 (QUIC/HTTP3 guard) → empty NOERROR.
+        if self.block_https_record && qtype == rtype::HTTPS {
+            return Some(self.wire_answer(&msg, &[], rcode::NOERROR));
+        }
 
         // ── Local zones (own wire serving core) ─────────────────────────────
         let zones = self.zones.load();
