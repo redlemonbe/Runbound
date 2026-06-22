@@ -363,7 +363,12 @@ impl RunboundHandler {
                     return None;
                 };
                 match base64::engine::general_purpose::STANDARD.decode(&secret_b64) {
-                    Ok(bytes) => Some((name.to_ascii_lowercase(), alg, bytes)),
+                    // Normalize the key name to match the TSIG verifier, which compares
+                    // against the request key name with the trailing dot stripped
+                    // (tsig::verify_request). Storing "key." here while the verifier looks
+                    // up "key" caused UnknownKey for any config name written with a trailing
+                    // dot (e.g. tsig-key: "name." ...). Strip it on both sides.
+                    Ok(bytes) => Some((name.trim_end_matches('.').to_ascii_lowercase(), alg, bytes)),
                     Err(e) => {
                         tracing::error!(key=%name, err=%e, "TSIG: base64 decode failed — key will NOT be loaded, DDNS may be unprotected");
                         None

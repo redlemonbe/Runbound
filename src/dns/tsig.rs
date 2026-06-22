@@ -436,6 +436,32 @@ mod tests {
     }
 
     #[test]
+    fn config_key_name_trailing_dot_is_normalized() {
+        // Regression: `verify_request` looks up the request key name with the trailing
+        // dot stripped, so the handler must store config TSIG key names dot-stripped
+        // too. A config written `tsig-key: "test-key." ...` previously stored "test-key."
+        // (dot kept) while the verifier looked up "test-key" -> UnknownKey, so DDNS with
+        // a dotted key name silently failed. RunboundHandler::new now normalizes with
+        // `trim_end_matches('.').to_ascii_lowercase()`; lock that contract in here.
+        let now = 1_700_000_000u64;
+        let secret = b"super-secret-key-material";
+        let signed = sign(&unsigned_update(), "test-key.", TsigAlg::Sha256, secret, now);
+
+        // Handler-normalized storage (the fix) verifies a dotted-name request.
+        let stored_fixed = vec![(
+            "test-key.".trim_end_matches('.').to_ascii_lowercase(),
+            TsigAlg::Sha256,
+            secret.to_vec(),
+        )];
+        let got = verify_request(&signed, &stored_fixed, now, 300).expect("dotted config key must verify");
+        assert_eq!(got.key_name, "test-key");
+
+        // Pre-fix storage (trailing dot kept) reproduces the bug: UnknownKey.
+        let stored_buggy = vec![("test-key.".to_string(), TsigAlg::Sha256, secret.to_vec())];
+        assert_eq!(verify_request(&signed, &stored_buggy, now, 300), Err(TsigError::UnknownKey));
+    }
+
+    #[test]
     fn rejects_expired_timestamp() {
         let now = 1_700_000_000u64;
         let signed = sign(&unsigned_update(), "ddns-key.", TsigAlg::Sha256, b"super-secret-key-material", now - 1000);
