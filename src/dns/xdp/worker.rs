@@ -187,6 +187,7 @@ pub fn start_xdp(
                     domain_routing,
                     busy_poll,
                     0,   // core_base=0 for virtual parent fallback (mono-iface)
+                    None, // queue_budget: mono-iface keeps full queues
                     ring_size,
                     xdp_ring_sizes,
                     stats,
@@ -219,6 +220,7 @@ pub fn start_xdp(
         domain_routing,
         busy_poll,
         0,          // core_base — mono-interface: always starts at core 0
+        None,       // queue_budget: mono-interface keeps full queues
         ring_size,
         xdp_ring_sizes,
         stats,
@@ -313,6 +315,20 @@ pub fn start_xdp_multi(
     // of physical cores starting at core_base, accumulated across interfaces.
     // iface0 → [0..n0), iface1 → [n0..n0+n1), ...
     // If total_queues > physical_cores.len(), wraps via modulo (WARN below).
+    // #queues: with multiple NICs, divide the physical-core pool by the NIC count so
+    // total XDP workers (= sum of per-NIC queue counts) never exceeds physical cores —
+    // restoring the "1 worker per non-HT core" design (no modulo wrap). Reduce each NIC's
+    // hardware combined-queue count to this budget BEFORE the assignment loop reads it,
+    // so core blocks are contiguous and non-overlapping. Single NIC → budget == cores
+    // (set_combined_queues_xdp is a no-op when target == current).
+    let num_ifaces = ifaces.len().max(1);
+    let per_nic_budget = (total_phys / num_ifaces).max(1) as u32;
+    if num_ifaces > 1 {
+        for &iface in ifaces {
+            let _ = super::socket::set_combined_queues_xdp(iface, per_nic_budget);
+        }
+    }
+
     let mut core_base: usize = 0;
     let mut handles = Vec::new();
 
@@ -351,6 +367,7 @@ pub fn start_xdp_multi(
             domain_routing,
             busy_poll,
             core_base,
+            Some(per_nic_budget), // #queues: cap workers to physical_cores / nic_count
             ring_size,
             xdp_ring_sizes,
             Arc::clone(&stats),
@@ -422,6 +439,7 @@ fn start_xdp_on_iface(
     domain_routing: bool,
     busy_poll: bool,
     core_base: usize,
+    queue_budget: Option<u32>,
     _ring_size: Option<u32>,
     xdp_ring_sizes: XdpRingSizes,
     stats: Arc<crate::stats::Stats>,
@@ -458,7 +476,13 @@ fn start_xdp_on_iface(
     // #169 auto-queues: debride NIC combined queues before attach. Xeon v2 + X520
     // → keep default (16, PCIe-bus-bound); any modern CPU → raise to HW max, capped
     // to 32 (XSKMAP=64 / 2-NIC budget) — the bench-validated 32-queue config.
-    let _tuned = auto_tune_nic_queues(iface, 32);
+    // #queues: multi-NIC passes an explicit per-NIC budget (physical_cores / nic_count)
+    // so total workers never exceed physical cores (no modulo wrap). Mono-NIC passes
+    // None → keep the bench-validated auto-debride to 32 (raise-only; no-op at 64).
+    let _tuned = match queue_budget {
+        Some(budget) => super::socket::set_combined_queues_xdp(iface, budget),
+        None => auto_tune_nic_queues(iface, 32),
+    };
     let queue_count = get_rx_queue_count(iface).max(1);
     // Maximize the NIC RX/TX rings *now*, while the device is still free.
     // SRINGPARAM is rejected with EBUSY once an XDP program or an AF_XDP socket is

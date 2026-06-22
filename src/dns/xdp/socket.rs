@@ -32,6 +32,8 @@ const ETHTOOL_GRINGPARAM: u32 = 0x0000_0010;
 const ETHTOOL_SRINGPARAM: u32 = 0x0000_0011;
 const ETHTOOL_GCHANNELS: u32 = 0x0000_003c;
 const ETHTOOL_SCHANNELS: u32 = 0x0000_003d;
+const ETHTOOL_GRXFHINDIR: u32 = 0x0000_0038;
+const ETHTOOL_SRXFHINDIR: u32 = 0x0000_0039;
 
 /// Matches `struct ethtool_ringparam` in <linux/ethtool.h>.
 #[repr(C)]
@@ -695,6 +697,136 @@ pub fn set_combined_queues(iface: &str, target: u32) -> u32 {
         } else {
             tracing::warn!(iface = %iface, target = tgt, "slow-path: SCHANNELS failed — keeping current queue count");
         }
+    }
+    unsafe { libc::close(fd) };
+    get_rx_queue_count(iface)
+}
+
+/// Remap the RSS indirection table (RETA) to spread equally over the first `n`
+/// RX queues — mirrors `ethtool -X <iface> equal n`.
+///
+/// Required before LOWERING the `combined` channel count on i40e/X710: the driver
+/// rejects SCHANNELS while the RETA still references queues >= the new count
+/// ("requested channel counts are too low for existing indirection table"). Returns
+/// true on success, or when the device exposes no resizable RETA (nothing to do).
+fn set_rss_indir_equal(iface: &str, n: u32) -> bool {
+    let n = n.max(1);
+    let iface_safe = match sanitize_iface_name(iface) {
+        Some(s) => s,
+        None => return false,
+    };
+    // SAFETY: AF_INET/DGRAM socket used only as an ioctl handle.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return false;
+    }
+    // 1. Discover the RETA size: GRXFHINDIR with size=0 returns the table size
+    //    in the `size` field (linux/ethtool.h dev_size query convention).
+    let mut hdr = [0u32; 2]; // [cmd, size]
+    hdr[0] = ETHTOOL_GRXFHINDIR;
+    let mut ifr = build_ifreq(iface_safe, hdr.as_mut_ptr().cast());
+    // SAFETY: fd valid; ifr_data points to a 2-u32 buffer the kernel only writes
+    //         the size field of during a size query.
+    let rc = unsafe {
+        libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>())
+    };
+    if rc < 0 {
+        // No RETA (some virtual NICs) — nothing to remap; treat as success.
+        unsafe { libc::close(fd) };
+        return true;
+    }
+    let size = hdr[1] as usize;
+    if size == 0 {
+        unsafe { libc::close(fd) };
+        return true;
+    }
+    // 2. SET the table: [cmd, size, ring_index[0..size]], ring_index[i] = i % n.
+    //    Variable-length `struct ethtool_rxfh_indir` backed by a Vec<u32>.
+    let mut buf: Vec<u32> = vec![0u32; 2 + size];
+    buf[0] = ETHTOOL_SRXFHINDIR;
+    buf[1] = size as u32;
+    for i in 0..size {
+        buf[2 + i] = (i as u32) % n;
+    }
+    let mut sifr = build_ifreq(iface_safe, buf.as_mut_ptr().cast());
+    // SAFETY: fd valid; ifr_data points to the Vec backing store of exactly
+    //         (2 + size) u32 the kernel reads `size` entries from.
+    let set_rc = unsafe {
+        libc::ioctl(fd, SIOCETHTOOL as _, (&mut sifr as *mut IfReqEthtool).cast::<libc::c_void>())
+    };
+    unsafe { libc::close(fd) };
+    if set_rc >= 0 {
+        tracing::info!(iface = %iface, queues = n, reta_size = size,
+            "XDP queues: RSS indirection table remapped (equal spread over first N queues)");
+        true
+    } else {
+        tracing::warn!(iface = %iface, queues = n,
+            "XDP queues: SRXFHINDIR failed — RETA not remapped (combined-lower may be rejected)");
+        false
+    }
+}
+
+/// Set the NIC `combined` channel count to exactly `target` for the AF_XDP
+/// multi-NIC budget: one worker per queue, capped so the total worker count
+/// across all NICs never exceeds the physical core count (no modulo wrap).
+///
+/// On i40e/X710, LOWERING the count requires the RETA to be remapped first
+/// (see [`set_rss_indir_equal`]) or SCHANNELS is rejected. Uses the #190-correct
+/// SCHANNELS struct (preserves rx/tx/other counts the i40e driver validates).
+/// No-op on Xeon v2 + X520 (PCIe-bus-bound, handled separately). Returns the
+/// resulting RX queue count.
+pub fn set_combined_queues_xdp(iface: &str, target: u32) -> u32 {
+    if is_xeon_v2_x520_host(iface) {
+        return get_rx_queue_count(iface);
+    }
+    let iface_safe = match sanitize_iface_name(iface) {
+        Some(n) => n,
+        None => return get_rx_queue_count(iface),
+    };
+    // SAFETY: AF_INET/DGRAM socket used only as an ioctl handle.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return get_rx_queue_count(iface);
+    }
+    // SAFETY: zeroed() valid for this plain repr(C) struct of u32 fields.
+    let mut ch: EthtoolChannels = unsafe { std::mem::zeroed() };
+    ch.cmd = ETHTOOL_GCHANNELS;
+    let mut ifr = build_ifreq(iface_safe, (&mut ch as *mut EthtoolChannels).cast());
+    // SAFETY: fd valid; ifr fully initialised with a valid ifr_data pointer.
+    let get_rc = unsafe {
+        libc::ioctl(fd, SIOCETHTOOL as _, (&mut ifr as *mut IfReqEthtool).cast::<libc::c_void>())
+    };
+    if get_rc < 0 {
+        unsafe { libc::close(fd) };
+        return get_rx_queue_count(iface);
+    }
+    let hw_max = ch.max_combined.max(ch.max_rx);
+    let tgt = target.min(hw_max).max(1);
+    let from = ch.combined_count;
+    if tgt == from {
+        unsafe { libc::close(fd) };
+        return get_rx_queue_count(iface);
+    }
+    // When lowering, remap the RETA first or the i40e SCHANNELS is rejected
+    // ("requested channel counts are too low for existing indirection table").
+    if tgt < from {
+        let _ = set_rss_indir_equal(iface, tgt);
+    }
+    // #190: reuse the GET'd struct (keep other_count/rx_count/tx_count) — a zeroed
+    // struct makes i40e reject SCHANNELS.
+    ch.cmd = ETHTOOL_SCHANNELS;
+    ch.combined_count = tgt;
+    let mut sifr = build_ifreq(iface_safe, (&mut ch as *mut EthtoolChannels).cast());
+    // SAFETY: same as the GET call above.
+    let set_rc = unsafe {
+        libc::ioctl(fd, SIOCETHTOOL as _, (&mut sifr as *mut IfReqEthtool).cast::<libc::c_void>())
+    };
+    if set_rc >= 0 {
+        tracing::info!(iface = %iface, from, to = tgt, hw_max,
+            "XDP multi-NIC: combined queues set to per-NIC budget (physical_cores / nic_count)");
+    } else {
+        tracing::warn!(iface = %iface, target = tgt,
+            "XDP multi-NIC: SCHANNELS failed — keeping current queue count (may wrap cores)");
     }
     unsafe { libc::close(fd) };
     get_rx_queue_count(iface)
