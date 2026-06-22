@@ -464,6 +464,12 @@ fn build_root_store() -> Arc<rustls::RootCertStore> {
 }
 
 fn dot_client_config(roots: Arc<rustls::RootCertStore>) -> Arc<rustls::ClientConfig> {
+    // Pin the ring provider before building any TLS config: with both ring and
+    // aws-lc-rs in the dependency graph, rustls cannot auto-select a default, so
+    // ClientConfig::builder() would panic. main() installs it for the live binary;
+    // doing it here too covers any path (e.g. tests) that builds a client config
+    // first. Idempotent — .ok() ignores an already-installed provider.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
