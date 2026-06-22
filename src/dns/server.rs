@@ -18,35 +18,51 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use base64::Engine as _;
+#[cfg(feature = "recursor")]
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
+#[cfg(feature = "recursor")]
 use hickory_proto::op::Query as DnsQuery;
+#[cfg(feature = "recursor")]
 use hickory_proto::op::{Edns, Message, MessageType, Metadata, OpCode, ResponseCode};
 use crate::dns::tsig::TsigAlg;
-use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
+use hickory_proto::rr::{LowerName, Name};
+#[cfg(feature = "recursor")]
+use hickory_proto::rr::{RData, Record, RecordType};
+#[cfg(feature = "recursor")]
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+#[cfg(feature = "recursor")]
 use hickory_server::{
     net::{BufDnsStreamHandle, runtime::Time},
     server::{Request, RequestHandler, ResponseHandle, ResponseHandler, ResponseInfo},
     zone_handler::{MessageRequest, MessageResponseBuilder},
 };
+#[cfg(feature = "recursor")]
 use hickory_server::net::xfer::Protocol as DnsProtocol;
 
-use crate::dns::forward::{self as forward_pool, ForwardPool, ResolveResult};
+use crate::dns::forward::{self as forward_pool, ForwardPool};
+#[cfg(feature = "recursor")]
+use crate::dns::forward::ResolveResult;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use super::acl::{Acl, AclAction, PrivateAddressSet};
-use super::local::{LocalZoneSet, ZoneAction};
+use super::local::LocalZoneSet;
+#[cfg(feature = "recursor")]
+use super::local::ZoneAction;
 use super::ratelimit::RateLimiter;
 use super::kernel_loop::FallbackMsg;
 use crate::config::parser::TlsConfig;
 use crate::config::parser::UnboundConfig;
-use crate::logbuffer::{LogAction, SharedLogBuffer};
-use crate::stats::{Stats, CACHE_HIT_THRESHOLD_US};
+use crate::logbuffer::SharedLogBuffer;
+#[cfg(feature = "recursor")]
+use crate::logbuffer::LogAction;
+use crate::stats::Stats;
+#[cfg(feature = "recursor")]
+use crate::stats::CACHE_HIT_THRESHOLD_US;
 
 // ── Concurrency cap — prevents OOM under flood ─────────────────────────────
 //
@@ -338,6 +354,7 @@ impl RunboundHandler {
     /// Record a completed query: latency histogram, log buffer push, tracing log.
     /// Cache metrics (record_forward) and domain counters are updated at call sites.
     #[inline]
+    #[cfg(feature = "recursor")]
     fn record_query(
         &self,
         client: IpAddr,
@@ -400,6 +417,7 @@ impl RunboundHandler {
 
     /// was found and the query should fall through to recursive resolution.
     /// Core zone lookup logic. Accepts an explicit zone set (for split-horizon or global use).
+    #[cfg(feature = "recursor")]
     async fn handle_zone_set<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -578,6 +596,7 @@ impl RunboundHandler {
     }
 
     /// Global local-zone lookup (delegates to handle_zone_set with self.zones).
+    #[cfg(feature = "recursor")]
     async fn handle_local_zone<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -616,6 +635,7 @@ impl RunboundHandler {
         }
     }
 
+    #[cfg(feature = "recursor")]
     #[cfg(feature = "recursor")]
     async fn resolve_recursive<R: ResponseHandler>(
         &self,
@@ -802,6 +822,7 @@ impl RunboundHandler {
     /// #202: RFC 8767 serve-stale on the recursion path — if a recent answer is cached, serve it
     /// (TTL capped at `stale_answer_ttl`) instead of SERVFAIL. Returns `None` if nothing to serve.
     #[cfg(feature = "recursor")]
+    #[cfg(feature = "recursor")]
     async fn try_serve_stale<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -849,6 +870,7 @@ impl RunboundHandler {
     }
 
     /// Recursive upstream resolution with DNSSEC validation and rebinding protection.
+    #[cfg(feature = "recursor")]
     async fn resolve_upstream<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -1672,33 +1694,42 @@ impl RunboundHandler {
         if let Some(resp) = self.serve_wire(wire, peer).await {
             return resp;
         }
-        let request = match hickory_server::server::Request::from_bytes(
-            wire.to_vec(),
-            peer,
-            hickory_server::net::xfer::Protocol::Udp,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!(err=%e, "handle_request_wire: malformed query");
-                return Vec::new();
-            }
-        };
-        let out: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let cap = DohCapture {
-            peer,
-            out: std::sync::Arc::clone(&out),
-        };
-        self.handle_request::<DohCapture, hickory_server::net::runtime::TokioTime>(&request, cap)
-            .await;
-        let result = out.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .unwrap_or_default();
-        result
+        // serve_wire only returns None on a malformed query or, with the
+        // `recursor` feature, a full-recursion query handled by the hickory
+        // handler. Default builds have no handler — drop (empty = no response).
+        #[cfg(feature = "recursor")]
+        {
+            let request = match hickory_server::server::Request::from_bytes(
+                wire.to_vec(),
+                peer,
+                hickory_server::net::xfer::Protocol::Udp,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(err=%e, "handle_request_wire: malformed query");
+                    return Vec::new();
+                }
+            };
+            let out: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let cap = DohCapture {
+                peer,
+                out: std::sync::Arc::clone(&out),
+            };
+            self.handle_request::<DohCapture, hickory_server::net::runtime::TokioTime>(&request, cap)
+                .await;
+            return out
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_default();
+        }
+        #[cfg(not(feature = "recursor"))]
+        Vec::new()
     }
 }
 
+#[cfg(feature = "recursor")]
 #[async_trait]
 impl RequestHandler for RunboundHandler {
     async fn handle_request<R: ResponseHandler, T: Time>(
@@ -1996,8 +2027,10 @@ impl RequestHandler for RunboundHandler {
 /// Returns a lazy Display wrapper so the formatting (and the String allocation)
 /// only happens when the log level is actually enabled, saving one alloc per query
 /// on disabled levels (e.g. debug! in production).
+#[cfg(feature = "recursor")]
 struct SanitizedDnsName<'a>(&'a LowerName);
 
+#[cfg(feature = "recursor")]
 impl std::fmt::Display for SanitizedDnsName<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use std::fmt::Write as _;
@@ -2017,6 +2050,7 @@ impl std::fmt::Display for SanitizedDnsName<'_> {
     }
 }
 
+#[cfg(feature = "recursor")]
 fn sanitize_dns_name(name: &LowerName) -> SanitizedDnsName<'_> {
     SanitizedDnsName(name)
 }
@@ -2024,6 +2058,7 @@ fn sanitize_dns_name(name: &LowerName) -> SanitizedDnsName<'_> {
 /// Follow CNAME records within local zones, up to 8 hops (prevents loops).
 /// Returns a Vec<Record> containing the CNAME chain + final target records,
 /// or an empty Vec if there is no CNAME or the chain leads outside local zones.
+#[cfg(feature = "recursor")]
 fn follow_local_cname(
     zones: &super::local::LocalZoneSet,
     start: &LowerName,
@@ -2062,6 +2097,7 @@ fn follow_local_cname(
 /// Construct a ResponseInfo carrying a SERVFAIL code without sending.
 /// Used as the send-failure fallback when the socket is already broken.
 #[inline]
+#[cfg(feature = "recursor")]
 fn servfail_info(request: &Request) -> ResponseInfo {
     let mut meta = Metadata::response_from_request(&request.metadata);
     meta.response_code = ResponseCode::ServFail;
@@ -2079,6 +2115,7 @@ fn servfail_info(request: &Request) -> ResponseInfo {
 /// If the request carried an OPT RR, returns an Edns struct that should be
 /// attached to the response (cap payload at 1232, reflect DO bit).
 /// Returns None when the request had no OPT (→ respond without OPT).
+#[cfg(feature = "recursor")]
 fn make_opt_edns(request: &MessageRequest) -> Option<Edns> {
     let req_edns = request.edns.as_ref()?;
     let mut e = Edns::new();
@@ -2130,6 +2167,7 @@ impl DdrInfo {
 }
 
 /// #203: DNS Cookie verdict for a UDP query.
+#[cfg(feature = "recursor")]
 enum CookieVerdict {
     /// Verified (valid server cookie) or not applicable (no/legacy cookie) — answer normally.
     Ok,
@@ -2138,6 +2176,7 @@ enum CookieVerdict {
 }
 
 /// Read the raw COOKIE (EDNS option 10) from the request, if present.
+#[cfg(feature = "recursor")]
 fn read_client_cookie(request: &Request) -> Option<Vec<u8>> {
     let edns = request.edns.as_ref()?;
     match edns.option(hickory_proto::rr::rdata::opt::EdnsCode::Cookie)? {
@@ -2164,6 +2203,7 @@ fn server_cookie(secret: &[u8; 16], client_cookie: &[u8], ip: IpAddr) -> [u8; 8]
 
 /// Validate the client's DNS Cookie (RFC 7873). Lenient for no-cookie clients;
 /// BADCOOKIE for clients that present a client cookie without a valid server cookie.
+#[cfg(feature = "recursor")]
 fn cookie_check(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> CookieVerdict {
     let client_cookie = match read_client_cookie(request) {
         Some(c) if c.len() >= 8 => c,
@@ -2185,6 +2225,7 @@ fn cookie_check(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> Cook
 /// request carries a VALID server cookie (proves the source is not spoofed). A
 /// missing/legacy/client-only cookie returns false — unlike `cookie_check`, which is
 /// lenient and answers no-cookie clients.
+#[cfg(feature = "recursor")]
 fn cookie_verified(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> bool {
     let Some(client_cookie) = read_client_cookie(request) else {
         return false;
@@ -2198,6 +2239,7 @@ fn cookie_verified(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> b
 }
 
 /// Send a BADCOOKIE (RFC 7873) response carrying the server cookie so the client retries.
+#[cfg(feature = "recursor")]
 async fn send_cookie_badcookie<R: ResponseHandler>(
     request: &Request,
     mut response_handle: R,
@@ -2221,6 +2263,7 @@ async fn send_cookie_badcookie<R: ResponseHandler>(
 /// Tarpit a verified abuser (#ddos): hold the request a bounded delay, then answer
 /// REFUSED. On TCP/DoT/DoH this keeps the attacker's connection occupied at near-zero
 /// cost to us; the permit cap prevents self-DoS (over the cap we REFUSE immediately).
+#[cfg(feature = "recursor")]
 async fn tarpit_response<R: ResponseHandler>(
     request: &Request,
     response_handle: R,
@@ -2231,6 +2274,7 @@ async fn tarpit_response<R: ResponseHandler>(
     send_error(request, response_handle, ResponseCode::Refused).await
 }
 
+#[cfg(feature = "recursor")]
 async fn send_error<R: ResponseHandler>(
     request: &Request,
     mut response_handle: R,
@@ -3042,12 +3086,14 @@ async fn spawn_tls_service(
 
 
 /// Captures the wire response produced by the DNS handler into `out`.
+#[cfg(feature = "recursor")]
 #[derive(Clone)]
 struct DohCapture {
     peer: SocketAddr,
     out: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
+#[cfg(feature = "recursor")]
 #[async_trait::async_trait]
 impl ResponseHandler for DohCapture {
     async fn send_response<'a>(
@@ -3076,30 +3122,6 @@ impl ResponseHandler for DohCapture {
     }
 }
 
-/// Resolve a DNS wire query through the full handler, returning the wire response.
-async fn doh_resolve(
-    handler: &std::sync::Arc<RunboundHandler>,
-    wire: Vec<u8>,
-    peer: SocketAddr,
-) -> Option<Vec<u8>> {
-    let request = match Request::from_bytes(wire, peer, DnsProtocol::Https) {
-        Ok(r) => r,
-        Err(e) => {
-            debug!(err=%e, "DoH: malformed query");
-            return None;
-        }
-    };
-    let out = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let cap = DohCapture {
-        peer,
-        out: std::sync::Arc::clone(&out),
-    };
-    handler
-        .handle_request::<DohCapture, hickory_server::net::runtime::TokioTime>(&request, cap)
-        .await;
-    let r = out.lock().unwrap_or_else(|e| e.into_inner()).take();
-    r
-}
 
 fn doh_reply(
     status: hyper::StatusCode,
@@ -3183,9 +3205,13 @@ async fn doh_handle(
         }
         _ => return Ok(doh_reply(hyper::StatusCode::METHOD_NOT_ALLOWED, Vec::new())),
     };
-    match doh_resolve(&handler, wire, peer).await {
-        Some(resp) => Ok(doh_reply(hyper::StatusCode::OK, resp)),
-        None => Ok(doh_reply(hyper::StatusCode::BAD_REQUEST, Vec::new())),
+    // DoH terminates here and resolves through the wire fast path, same as the
+    // UDP/TCP/DoT listeners — no hickory handler.
+    let resp = handler.handle_request_wire(&wire, peer).await;
+    if resp.is_empty() {
+        Ok(doh_reply(hyper::StatusCode::BAD_REQUEST, Vec::new()))
+    } else {
+        Ok(doh_reply(hyper::StatusCode::OK, resp))
     }
 }
 

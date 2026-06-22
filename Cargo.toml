@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["full", "io-uring"] }
 # DNS engine — DoT / DoH / DoQ / DNSSEC
 # 0.26.1 fixes RUSTSEC-2026-0119 (O(n²) compression), RUSTSEC-2026-0037 (quinn DoS),
 # RUSTSEC-2025-0009 (ring AES panic), RUSTSEC-2026-0104/0098/0099 (rustls-webpki).
-hickory-server   = { version = "0.26", features = [
+hickory-server   = { version = "0.26", optional = true, features = [
     "dnssec-ring",
     "tls-ring",
     "https-ring",
@@ -177,7 +177,7 @@ fuzz = []
 # Disabled by default (zero cost when off).
 xdp-debug-counters = []
 # Sovereign full-recursion path (hickory-resolver recursor).
-recursor = ["dep:hickory-resolver"]
+recursor = ["dep:hickory-resolver", "dep:hickory-server"]
 
 [dependencies.aya]
 version  = "0.13"
