@@ -1272,7 +1272,7 @@ async fn build_and_launch(
                                     dnssec_enabled: Arc::clone(&dnssec_enabled),
                                     resolver: Arc::clone(&resolver),
                                     resolution_mode: Arc::clone(&resolution_mode),
-                                    recursor: Arc::clone(&recursor),
+                                    recursor: recursor.clone(),
                                     icmp_stats: Arc::clone(&icmp_stats),
                                     icmp_cfg: Arc::clone(&icmp_cfg),
                                     base_dir: Arc::new(base_dir.clone()),
@@ -1393,13 +1393,23 @@ async fn build_and_launch(
                     "prefetch: queuing {} domain(s)",
                     hot.len()
                 );
+                // Prefetch: send dummy A query to warm up DoT connections
                 for name in hot {
                     let r = Arc::clone(&res);
                     tokio::spawn(async move {
-                        use hickory_proto::rr::Name;
-                        use hickory_proto::rr::RecordType;
+                        use hickory_proto::op::{Message, MessageType, OpCode};
+                        use hickory_proto::rr::{Name, RecordType};
+                        use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
                         if let Ok(n) = name.parse::<Name>() {
-                            let _ = r.load().lookup(n, RecordType::A).await;
+                            use hickory_proto::op::Query as DnsQuery;
+                            let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+                            msg.metadata.recursion_desired = true;
+                            msg.add_query(DnsQuery::query(n, RecordType::A));
+                            let mut wire = Vec::with_capacity(256);
+                            let mut enc = BinEncoder::new(&mut wire);
+                            if msg.emit(&mut enc).is_ok() {
+                                let _ = r.load().forward(&wire).await;
+                            }
                         }
                     });
                 }
@@ -1465,7 +1475,7 @@ async fn build_and_launch(
                     interval.tick().await;
                     let mut zones = Vec::new();
                     for a in &apexes {
-                        if let Ok(name) = <hickory_proto::rr::Name as std::str::FromStr>::from_str(a)
+                        if let Ok(name) = crate::dns::wire::Name::from_ascii(a)
                         {
                             if let Some((zone, ksk, zsk)) =
                                 crate::dns::zone_signer::export_keys(base, &name)
@@ -1493,16 +1503,13 @@ async fn build_and_launch(
         }
     }
 
-    // Multi-user registry — load users.json if present, or create ephemeral if extra keys defined.
+    // Multi-user registry — always enabled; users.json created on first POST /api/users.
     let users_json_path = base_dir.join("users.json");
-    let user_registry: Option<Arc<crate::multiuser::UserRegistry>> = if users_json_path.exists() {
+    if users_json_path.exists() {
         tracing::info!(path = %users_json_path.display(), "Loading multi-user registry");
-        Some(crate::multiuser::UserRegistry::load(&users_json_path))
-    } else if !cfg.extra_api_keys.is_empty() {
-        Some(crate::multiuser::UserRegistry::load(&users_json_path))
-    } else {
-        None
-    };
+    }
+    let user_registry: Option<Arc<crate::multiuser::UserRegistry>> =
+        Some(crate::multiuser::UserRegistry::load(&users_json_path));
     // Inject api-key-extra static keys from config (#13).
     if let Some(ref reg) = user_registry {
         for ek in &cfg.extra_api_keys {
@@ -1560,7 +1567,7 @@ async fn build_and_launch(
         icmp_cfg: Arc::clone(&icmp_cfg),
         dnssec_enabled: Arc::clone(&dnssec_enabled),
         resolution_mode: Arc::clone(&resolution_mode),
-        recursor: Arc::clone(&recursor),
+        recursor: recursor.clone(),
         user_registry,
         blacklist_reload_tx: Some(blacklist_reload_tx),
     };

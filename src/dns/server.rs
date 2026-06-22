@@ -397,101 +397,6 @@ impl RunboundHandler {
 }
 
 impl RunboundHandler {
-    /// Current zone-signer snapshot (hot-swappable — the slave adopts the master's replicated keys).
-    fn signer(&self) -> Option<std::sync::Arc<crate::dns::zone_signer::ZoneSigner>> {
-        (*self.zone_signer.load_full()).clone()
-    }
-
-    /// Attempt to answer from local zones (blacklist, static data, CNAME chains).
-    /// Returns `Ok(info)` when a response was sent; `Err(rh)` when no local match
-    /// #201: build + send a DNSSEC-signed negative response (SOA + RRSIG + NSEC3 proof) for a
-    /// signed local zone. Returns `None` (caller falls through to the plain response) when the
-    /// zone is not signed or the client did not set DO.
-    async fn try_signed_negative<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        response_handle: &mut R,
-        qname: &LowerName,
-        is_nxdomain: bool,
-        zones_snap: &LocalZoneSet,
-    ) -> Option<ResponseInfo> {
-        let signer = self.signer()?;
-        let dnssec_ok = request
-            .edns
-            .as_ref()
-            .map(|e| e.flags().dnssec_ok)
-            .unwrap_or(false);
-        if !dnssec_ok {
-            return None;
-        }
-        let apex = signer.apex_for(qname)?;
-        let qname_name: Name = qname.into();
-        let owners = crate::dns::zone_signer::zone_owners(
-            zones_snap
-                .records
-                .iter()
-                .filter(|(n, _)| apex.zone_of(n))
-                .map(|(n, recs)| (n.clone(), recs.iter().map(|r| r.record_type()).collect())),
-            &apex,
-        );
-        // SEC-L2: at this point the zone IS signed and the client set DO (apex_for succeeded).
-        // If the denial proof cannot be built, fail CLOSED with SERVFAIL — never fall through to
-        // serve an UNSIGNED NXDOMAIN/NODATA for a signed zone (a silent downgrade of the
-        // authenticated-denial guarantee).
-        let authority = match signer.signed_negative(is_nxdomain, &qname_name, &owners) {
-            Some(a) => a,
-            None => {
-                warn!(name = %sanitize_dns_name(qname), "signed-zone denial proof failed — SERVFAIL (refusing unsigned downgrade)");
-                let mut md = Metadata::response_from_request(&request.metadata);
-                md.response_code = ResponseCode::ServFail;
-                let opt = make_opt_edns(request);
-                let mut b = MessageResponseBuilder::from_message_request(request);
-                if let Some(ref o) = opt {
-                    b.edns(o);
-                }
-                let resp = b.build(
-                    md,
-                    std::iter::empty::<&Record>(),
-                    std::iter::empty(),
-                    std::iter::empty(),
-                    std::iter::empty(),
-                );
-                return Some(response_handle.send_response(resp).await.unwrap_or_else(|e| {
-                    error!("signed-negative SERVFAIL send: {e}");
-                    servfail_info(request)
-                }));
-            }
-        };
-        let rcode = if is_nxdomain {
-            ResponseCode::NXDomain
-        } else {
-            ResponseCode::NoError
-        };
-        let mut metadata = Metadata::response_from_request(&request.metadata);
-        metadata.authoritative = true;
-        metadata.response_code = rcode;
-        let opt_edns = make_opt_edns(request);
-        let mut builder = MessageResponseBuilder::from_message_request(request);
-        if let Some(ref opt) = opt_edns {
-            builder.edns(opt);
-        }
-        let response = builder.build(
-            metadata,
-            std::iter::empty::<&Record>(),
-            authority.iter(),
-            std::iter::empty(),
-            std::iter::empty(),
-        );
-        Some(
-            response_handle
-                .send_response(response)
-                .await
-                .unwrap_or_else(|e| {
-                    error!("signed-negative send: {e}");
-                    servfail_info(request)
-                }),
-        )
-    }
 
     /// was found and the query should fall through to recursive resolution.
     /// Core zone lookup logic. Accepts an explicit zone set (for split-horizon or global use).
@@ -505,108 +410,6 @@ impl RunboundHandler {
         start: Instant,
         zones_snap: &LocalZoneSet,
     ) -> Result<ResponseInfo, R> {
-        // #201: a DNSKEY query at a signed zone's apex is answered with the synthesized
-        // DNSKEY RRset (KSK + ZSK) + its RRSIG.
-        if qtype == RecordType::DNSKEY {
-            if let Some(signer) = self.signer() {
-                if signer.is_apex(qname) {
-                    if let Some(records) = signer.apex_dnskey(qname) {
-                        let dnssec_ok = request
-                            .edns
-                            .as_ref()
-                            .map(|e| e.flags().dnssec_ok)
-                            .unwrap_or(false);
-                        let answer: Vec<Record> = if dnssec_ok {
-                            records
-                        } else {
-                            records
-                                .into_iter()
-                                .filter(|r| r.record_type() != RecordType::RRSIG)
-                                .collect()
-                        };
-                        let mut metadata = Metadata::response_from_request(&request.metadata);
-                        metadata.authoritative = true;
-                        let opt_edns = make_opt_edns(request);
-                        let mut builder = MessageResponseBuilder::from_message_request(request);
-                        if let Some(ref opt) = opt_edns {
-                            builder.edns(opt);
-                        }
-                        let response = builder.build(
-                            metadata,
-                            answer.iter(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                        );
-                        self.record_query(
-                            client_ip,
-                            qname,
-                            qtype,
-                            ResponseCode::NoError,
-                            LogAction::Local,
-                            start,
-                        );
-                        return Ok(response_handle.send_response(response).await.unwrap_or_else(
-                            |e| {
-                                error!("dnskey send: {e}");
-                                servfail_info(request)
-                            },
-                        ));
-                    }
-                }
-            }
-        }
-
-        // #201: an SOA query at a signed zone's apex returns the synthesized SOA + RRSIG.
-        if qtype == RecordType::SOA {
-            if let Some(signer) = self.signer() {
-                if signer.is_apex(qname) {
-                    if let Some(records) = signer.signed_soa(qname) {
-                        let dnssec_ok = request
-                            .edns
-                            .as_ref()
-                            .map(|e| e.flags().dnssec_ok)
-                            .unwrap_or(false);
-                        let answer: Vec<Record> = if dnssec_ok {
-                            records
-                        } else {
-                            records
-                                .into_iter()
-                                .filter(|r| r.record_type() != RecordType::RRSIG)
-                                .collect()
-                        };
-                        let mut metadata = Metadata::response_from_request(&request.metadata);
-                        metadata.authoritative = true;
-                        let opt_edns = make_opt_edns(request);
-                        let mut builder = MessageResponseBuilder::from_message_request(request);
-                        if let Some(ref opt) = opt_edns {
-                            builder.edns(opt);
-                        }
-                        let response = builder.build(
-                            metadata,
-                            answer.iter(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                        );
-                        self.record_query(
-                            client_ip,
-                            qname,
-                            qtype,
-                            ResponseCode::NoError,
-                            LogAction::Local,
-                            start,
-                        );
-                        return Ok(response_handle.send_response(response).await.unwrap_or_else(
-                            |e| {
-                                error!("soa send: {e}");
-                                servfail_info(request)
-                            },
-                        ));
-                    }
-                }
-            }
-        }
 
         let zone_action = zones_snap.find(qname);
 
@@ -664,24 +467,12 @@ impl RunboundHandler {
                     debug!(name=%sanitize_dns_name(qname), count = records.len(), "local-data answer");
                     let mut metadata = Metadata::response_from_request(&request.metadata);
                     metadata.authoritative = true;
-                    // #201: when local-zone-dnssec is on and the client set DO, append the RRSIG.
-                    // Only clone when DNSSEC is actually needed — the common non-DNSSEC path
-                    // passes records.iter() directly, avoiding Vec allocation + memcpy.
-                    let dnssec_ok = request
-                        .edns
-                        .as_ref()
-                        .map(|e| e.flags().dnssec_ok)
-                        .unwrap_or(false);
-                    let rrsig = if dnssec_ok {
-                        self.signer().and_then(|s| s.sign_answer(qtype, &records))
-                    } else {
-                        None
-                    };
+                    // DNSSEC signing for signed zones is served wire-native in serve_wire;
+                    // this fallback path serves the unsigned RRset.
                     let opt_edns = make_opt_edns(request);
                     let mut builder = MessageResponseBuilder::from_message_request(request);
                     if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                    let mut answer: Vec<Record> = records.iter().map(|r| (*r).clone()).collect();
-                    if let Some(sig) = rrsig { answer.push(sig); }
+                    let answer: Vec<Record> = records.iter().map(|r| (*r).clone()).collect();
                     let response = builder.build(metadata, answer.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
                     self.record_query(
                         client_ip,
@@ -702,19 +493,9 @@ impl RunboundHandler {
 
                 // CNAME chain following (RFC 1034 §3.6.2)
                 if qtype != RecordType::CNAME {
-                    let mut answers = follow_local_cname(&zones_snap, qname, qtype);
+                    let answers = follow_local_cname(&zones_snap, qname, qtype);
                     if !answers.is_empty() {
-                        // SEC-L7: sign each RRset of the CNAME chain (RFC 4035) when the zone is
-                        // signed and the client set DO — otherwise a signed-zone CNAME answer goes
-                        // out unsigned.
-                        let dnssec_ok =
-                            request.edns.as_ref().map(|e| e.flags().dnssec_ok).unwrap_or(false);
-                        if dnssec_ok {
-                            if let Some(signer) = self.signer() {
-                                let sigs = signer.sign_chain(&answers);
-                                answers.extend(sigs);
-                            }
-                        }
+                        // Signed CNAME chains are served wire-native in serve_wire.
                         let mut metadata = Metadata::response_from_request(&request.metadata);
                         metadata.authoritative = true;
                         let opt_edns = make_opt_edns(request);
@@ -748,13 +529,8 @@ impl RunboundHandler {
                 // RFC 1035 §3.7 / RFC 2308: NODATA vs NXDOMAIN
                 if zones_snap.name_has_records(qname) {
                     debug!(name=%sanitize_dns_name(qname), %qtype, "local-zone NODATA");
-                    // #201: signed NODATA proof (matching NSEC3 + SOA) when signed + client DO.
-                    if let Some(info) = self
-                        .try_signed_negative(request, &mut response_handle, qname, false, zones_snap)
-                        .await
-                    {
-                        return Ok(info);
-                    }
+                    // Signed NODATA (NSEC3 + SOA) is served wire-native in serve_wire; this
+                    // fallback path only ever sees unsigned local zones or non-DO clients.
                     let mut metadata = Metadata::response_from_request(&request.metadata);
                     metadata.authoritative = true;
                     let opt_edns = make_opt_edns(request);
@@ -792,14 +568,7 @@ impl RunboundHandler {
                     LogAction::Nxdomain,
                     start,
                 );
-                // #201: serve a DNSSEC-signed NXDOMAIN denial (name is absent — the NODATA case
-                // returned above) when the zone is signed and the client set DO.
-                if let Some(info) = self
-                    .try_signed_negative(request, &mut response_handle, qname, true, zones_snap)
-                    .await
-                {
-                    return Ok(info);
-                }
+                // Signed NXDOMAIN denial is served wire-native in serve_wire.
                 return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
             }
             None => {}
@@ -1391,14 +1160,39 @@ impl RunboundHandler {
                 },
             );
         }
+        // ── DNSSEC: signed-zone serving (wire-native) ───────────────────────
+        // Placed before the RRL/alert route-outs so a query within a signed zone
+        // is never downgraded to an unsigned reply by the fallback handler. Rate
+        // limiting is applied inline (signed responses are amplification-relevant).
+        {
+            let signer_guard = self.zone_signer.load_full();
+            if let Some(signer) = signer_guard.as_ref().as_ref() {
+                let do_bit = msg.edns().ok().flatten().map(|e| e.dnssec_ok()).unwrap_or(false);
+                if do_bit && signer.apex_for(&q.name).is_some() {
+                    let client_ip = peer.ip();
+                    if !matches!(self.acl.check(client_ip), AclAction::Allow) {
+                        return None; // denied client → fallback handler drops it
+                    }
+                    self.stats.inc_total();
+                    self.stats.inc_qtype_raw(qtype);
+                    if !self.rate_limiter.check(client_ip) {
+                        self.stats.inc_refused();
+                        return Some(self.wire_error(&msg, rcode::REFUSED));
+                    }
+                    let _permit = match self.inflight.try_acquire() {
+                        Ok(p) => p,
+                        Err(_) => return Some(self.wire_error(&msg, rcode::REFUSED)),
+                    };
+                    let zones = self.zones.load();
+                    return Some(self.serve_signed(&msg, &q, signer, &zones));
+                }
+            }
+        }
         if self.rrl_slip != 0 {
             return None; // RRL SLIP nuance stays on the hickory path
         }
         if self.alert_tracker.is_some() && !peer.ip().is_loopback() {
             return None; // anti-DDoS escalation stays on the hickory path
-        }
-        if self.zone_signer.load().is_some() {
-            return None; // DNSSEC signing stays on the hickory path
         }
         #[cfg(feature = "recursor")]
         if self.resolution_mode.load(Ordering::Relaxed) == 1 {
@@ -1587,6 +1381,140 @@ impl RunboundHandler {
     /// Build an error/empty response (no answers) for `req` with `rcode_low`.
     fn wire_error(&self, req: &crate::dns::wire::Message, rcode_low: u16) -> Vec<u8> {
         self.wire_answer(req, &[], rcode_low)
+    }
+
+    /// Build an authoritative DNSSEC response (AA set, OPT with DO echoed) carrying
+    /// `answers` and `authority`. Wire-native.
+    fn wire_signed_answer(
+        &self,
+        req: &crate::dns::wire::Message,
+        answers: &[crate::dns::wire::Record],
+        authority: &[crate::dns::wire::Record],
+        rcode_low: u16,
+    ) -> Vec<u8> {
+        use crate::dns::wire::{Edns, Header, Message};
+        let mut h = Header {
+            id: req.header.id,
+            flags: 0,
+            qdcount: 0,
+            ancount: 0,
+            nscount: 0,
+            arcount: 0,
+        };
+        h.set_qr(true);
+        h.set_aa(true);
+        h.set_rd(req.header.rd());
+        h.set_ra(false);
+        h.set_rcode_low(rcode_low);
+        let mut e = Edns::default();
+        if let Ok(Some(req_edns)) = req.edns() {
+            e.udp_payload = req_edns.udp_payload.clamp(512, 1232);
+        }
+        e.set_dnssec_ok(true);
+        let m = Message {
+            header: h,
+            questions: req.questions.clone(),
+            answers: answers.to_vec(),
+            authority: authority.to_vec(),
+            additional: vec![e.to_record()],
+        };
+        m.encode()
+    }
+
+    /// Serve a query within a signed zone (DO bit set), wire-native: DNSKEY/SOA at
+    /// the apex, signed positive answers (RRSIG), signed CNAME chains, and signed
+    /// NSEC3 denials. Fails closed (SERVFAIL) rather than serve an unsigned
+    /// downgrade of a signed zone (SEC-L2).
+    fn serve_signed(
+        &self,
+        msg: &crate::dns::wire::Message,
+        q: &crate::dns::wire::Question,
+        signer: &crate::dns::zone_signer::ZoneSigner,
+        zones: &LocalZoneSet,
+    ) -> Vec<u8> {
+        use crate::dns::wire::consts::{rcode, rtype};
+        use crate::dns::wire::Record;
+        let qtype = q.qtype;
+
+        // Apex meta types: DNSKEY and SOA are synthesized + signed.
+        if qtype == rtype::DNSKEY && signer.is_apex(&q.name) {
+            if let Some(recs) = signer.apex_dnskey(&q.name) {
+                return self.wire_signed_answer(msg, &recs, &[], rcode::NOERROR);
+            }
+        }
+        if qtype == rtype::SOA && signer.is_apex(&q.name) {
+            if let Some(recs) = signer.signed_soa(&q.name) {
+                return self.wire_signed_answer(msg, &recs, &[], rcode::NOERROR);
+            }
+        }
+
+        let key = crate::dns::local::wire_name_key(&q.name);
+        match zones.find_wire(&key) {
+            Some(crate::dns::local::ZoneAction::Refuse) => {
+                return self.wire_error(msg, rcode::REFUSED);
+            }
+            Some(crate::dns::local::ZoneAction::NxDomain) => {
+                return self.signed_negative_resp(msg, q, signer, zones, true);
+            }
+            _ => {}
+        }
+
+        // Exact records of the queried type → signed positive answer.
+        let recs = zones.local_records_wire(&key, qtype);
+        if !recs.is_empty() {
+            let mut answer: Vec<Record> = recs.iter().map(|r| (*r).clone()).collect();
+            if let Some(sig) = signer.sign_answer(qtype, &answer) {
+                answer.push(sig);
+            }
+            return self.wire_signed_answer(msg, &answer, &[], rcode::NOERROR);
+        }
+
+        // CNAME chain → sign each RRset of the chain.
+        if qtype != rtype::CNAME {
+            let chain = crate::dns::wire_serve::follow_cname(zones, &key, qtype);
+            if !chain.is_empty() {
+                let mut answer = chain.clone();
+                answer.extend(signer.sign_chain(&chain));
+                return self.wire_signed_answer(msg, &answer, &[], rcode::NOERROR);
+            }
+        }
+
+        // No record of this type: NODATA if the name exists, else NXDOMAIN.
+        let is_nxdomain = !zones.name_has_records_wire(&key);
+        self.signed_negative_resp(msg, q, signer, zones, is_nxdomain)
+    }
+
+    /// Build a signed negative response (SOA+RRSIG + NSEC3 denial). SEC-L2: on any
+    /// failure to build the proof, return SERVFAIL — never an unsigned downgrade.
+    fn signed_negative_resp(
+        &self,
+        msg: &crate::dns::wire::Message,
+        q: &crate::dns::wire::Question,
+        signer: &crate::dns::zone_signer::ZoneSigner,
+        zones: &LocalZoneSet,
+        is_nxdomain: bool,
+    ) -> Vec<u8> {
+        use crate::dns::wire::consts::rcode;
+        let Some(apex) = signer.apex_for(&q.name) else {
+            return self.wire_error(msg, rcode::SERVFAIL);
+        };
+        let owners = crate::dns::zone_signer::zone_owners(
+            zones.records_wire.values().filter_map(|recs| {
+                let n = recs.first()?.name.clone();
+                Some((n, recs.iter().map(|r| r.rtype).collect::<Vec<u16>>()))
+            }),
+            &apex,
+        );
+        match signer.signed_negative(is_nxdomain, &q.name, &owners) {
+            Some(authority) => {
+                let rc = if is_nxdomain { rcode::NXDOMAIN } else { rcode::NOERROR };
+                self.wire_signed_answer(msg, &[], &authority, rc)
+            }
+            None => {
+                warn!(name = %q.name.to_ascii(), "signed-zone denial proof failed — SERVFAIL");
+                self.wire_error(msg, rcode::SERVFAIL)
+            }
+        }
     }
 
     /// Build an RFC 2136 UPDATE response: opcode UPDATE preserved, QR set, the

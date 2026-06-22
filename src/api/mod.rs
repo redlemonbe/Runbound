@@ -1292,7 +1292,13 @@ async fn dnssec_ds_handler(State(s): State<AppState>) -> impl IntoResponse {
             let ds: Vec<_> = signer
                 .ds_records()
                 .into_iter()
-                .map(|(zone, ds)| serde_json::json!({ "zone": zone, "ds": format!("{ds}") }))
+                .map(|(zone, key_tag, ds)| {
+                    // DS presentation (RFC 4034 §5.3): key_tag alg digest_type HEXDIGEST.
+                    let alg = ds.get(2).copied().unwrap_or(0);
+                    let dtype = ds.get(3).copied().unwrap_or(0);
+                    let digest = data_encoding::HEXUPPER.encode(ds.get(4..).unwrap_or(&[]));
+                    serde_json::json!({ "zone": zone, "ds": format!("{key_tag} {alg} {dtype} {digest}") })
+                })
                 .collect();
             JsonExtract(serde_json::json!({ "enabled": true, "ds": ds }))
         }

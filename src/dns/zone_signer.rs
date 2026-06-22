@@ -1,165 +1,126 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 //
-// #201 — DNSSEC authoritative signing for local zones: key-management foundation.
+// #201 — DNSSEC authoritative signing for local zones — hickory-free.
 //
 // Per-zone KSK + ZSK (ECDSAP256SHA256 / alg 13, RFC 6605), generated on demand and stored as
-// PKCS#8 DER under `<config_dir>/dnssec/<zone>/{ksk,zsk}.key` (mode 0600 from creation). This
-// module owns the key lifecycle and the published DNSKEY / DS records. Online RRset signing
-// (RRSIG / NSEC3) and the serving path land in later increments.
+// PKCS#8 DER under `<config_dir>/dnssec/<zone>/{ksk,zsk}.key` (mode 0600 from creation). Keys and
+// all signing run on the in-house `dns::dnssec_sign` crypto (ring); every record this module
+// produces is one of our own `wire::Record`s. No hickory types here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
-use hickory_proto::dnssec::crypto::{signing_key_from_der, EcdsaSigningKey};
-use hickory_proto::dnssec::rdata::{DNSSECRData, DNSKEY, DS, NSEC3, RRSIG};
-use hickory_proto::dnssec::{Algorithm, DigestType, DnssecSigner, Nsec3HashAlgorithm, SigningKey};
-use hickory_proto::rr::rdata::SOA;
-use hickory_proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use time::OffsetDateTime;
+use crate::dns::dnssec_sign::{self, SigningKey};
+use crate::dns::wire::consts::{class, rtype};
+use crate::dns::wire::{Decoder, Name, Rdata, Record};
 
-/// The single algorithm used for local-zone signing: ECDSA P-256 / SHA-256 (RFC 6605, alg 13).
-const ZONE_ALGORITHM: Algorithm = Algorithm::ECDSAP256SHA256;
+/// Signature validity backdate (SEC-L5): inception is now − 1h so a validator whose clock runs
+/// slightly ahead does not reject a freshly minted signature.
+const INCEPTION_BACKDATE_SECS: u64 = 3600;
 
-/// One zone-signing keypair (KSK or ZSK): the PKCS#8 DER (for storage) + the loaded signer.
-pub struct ZoneKey {
-    pkcs8: Vec<u8>,
-    is_ksk: bool,
-    signer: Box<dyn SigningKey>,
+/// RFC 9276 NSEC3 parameters: SHA-1, 0 iterations, empty salt.
+const NSEC3_ITERATIONS: u16 = 0;
+const NSEC3_SALT: &[u8] = &[];
+
+// ── wire::Name navigation helpers (kept local; the wire codec stays minimal) ──────────────────
+
+/// Strip the leftmost label, yielding the parent name. `None` at the root.
+fn base_name(n: &Name) -> Option<Name> {
+    let w = n.wire();
+    if w.len() <= 1 {
+        return None; // root
+    }
+    let skip = 1 + w[0] as usize;
+    if skip >= w.len() {
+        return None;
+    }
+    let mut d = Decoder::new(&w[skip..]);
+    Name::parse(&mut d).ok()
 }
 
-impl ZoneKey {
-    /// Generate a fresh ECDSAP256SHA256 key (KSK if `is_ksk`, else ZSK).
-    pub fn generate(is_ksk: bool) -> Result<Self, String> {
-        let der = EcdsaSigningKey::generate_pkcs8(ZONE_ALGORITHM)
-            .map_err(|e| format!("dnssec key generation failed: {e}"))?;
-        Self::from_pkcs8(der.secret_pkcs8_der().to_vec(), is_ksk)
-    }
-
-    /// Load a key from its stored PKCS#8 DER bytes.
-    pub fn from_pkcs8(pkcs8: Vec<u8>, is_ksk: bool) -> Result<Self, String> {
-        let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.clone()));
-        let signer = signing_key_from_der(&der, ZONE_ALGORITHM)
-            .map_err(|e| format!("dnssec key load failed: {e}"))?;
-        Ok(Self {
-            pkcs8,
-            is_ksk,
-            signer,
-        })
-    }
-
-    #[allow(dead_code)] // used by tests and later increments
-    pub fn is_ksk(&self) -> bool {
-        self.is_ksk
-    }
-
-    #[allow(dead_code)] // direct signer access reserved for future increments
-    pub fn signer(&self) -> &dyn SigningKey {
-        self.signer.as_ref()
-    }
-
-    pub fn pkcs8(&self) -> &[u8] {
-        &self.pkcs8
-    }
-
-    /// The DNSKEY RR data: zone key, with the Secure Entry Point bit set for the KSK.
-    pub fn dnskey(&self) -> Result<DNSKEY, String> {
-        let public = self
-            .signer
-            .to_public_key()
-            .map_err(|e| format!("dnssec public key: {e}"))?;
-        Ok(DNSKEY::new(true, self.is_ksk, false, public))
-    }
-
-    /// The key tag (RFC 4034 §5.3) for this key's DNSKEY.
-    #[allow(dead_code)] // used by tests and the DS/rollover paths in later increments
-    pub fn key_tag(&self) -> Result<u16, String> {
-        self.dnskey()?
-            .calculate_key_tag()
-            .map_err(|e| format!("dnssec key tag: {e}"))
-    }
-
-    /// The DS RR (SHA-256) to publish at the parent for `zone`.
-    pub fn ds(&self, zone: &Name) -> Result<DS, String> {
-        let dnskey = self.dnskey()?;
-        let key_tag = dnskey
-            .calculate_key_tag()
-            .map_err(|e| format!("dnssec key tag: {e}"))?;
-        let digest = dnskey
-            .to_digest(zone, DigestType::SHA256)
-            .map_err(|e| format!("dnssec DS digest: {e}"))?;
-        Ok(DS::new(
-            key_tag,
-            ZONE_ALGORITHM,
-            DigestType::SHA256,
-            digest.as_ref().to_vec(),
-        ))
-    }
-
-    /// Build a `DnssecSigner` bound to `zone` for producing RRSIGs. The signing key is
-    /// reconstructed from the stored PKCS#8 so the `ZoneKey` itself stays usable afterwards.
-    pub fn dnssec_signer(&self, zone: &Name, sig_validity: Duration) -> Result<DnssecSigner, String> {
-        let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.pkcs8.clone()));
-        let key = signing_key_from_der(&der, ZONE_ALGORITHM)
-            .map_err(|e| format!("dnssec signer key: {e}"))?;
-        let dnskey = self.dnskey()?;
-        Ok(DnssecSigner::new(dnskey, key, zone.clone(), sig_validity))
+/// True if `apex` is equal to, or a suffix of, `name` (i.e. `name` is in the zone).
+fn zone_of(apex: &Name, name: &Name) -> bool {
+    let a = apex.wire();
+    let mut cur: &[u8] = name.wire();
+    loop {
+        if cur.eq_ignore_ascii_case_bytes(a) {
+            return true;
+        }
+        if cur.len() <= 1 {
+            return false;
+        }
+        let skip = 1 + cur[0] as usize;
+        if skip >= cur.len() {
+            return false;
+        }
+        cur = &cur[skip..];
     }
 }
 
-/// Sign an RRset with `signer`, returning the RRSIG as a ready-to-serve `Record` (RFC 4034).
-/// Inception is "now"; expiration is `now + signer.sig_duration()`.
-pub fn sign_rrset(rrset: &RecordSet, signer: &DnssecSigner) -> Result<Record, String> {
-    let now = std::time::SystemTime::now()
+/// Prepend a single presentation label to `name` (used for NSEC3 owners and the wildcard).
+fn prepend_label(label: &str, name: &Name) -> Option<Name> {
+    let base = name.to_ascii();
+    let full = if base == "." {
+        format!("{label}.")
+    } else {
+        format!("{label}.{base}")
+    };
+    Name::from_ascii(&full).ok()
+}
+
+/// Case-insensitive byte comparison over two wire names.
+trait EqIgnoreCaseBytes {
+    fn eq_ignore_ascii_case_bytes(&self, other: &[u8]) -> bool;
+}
+impl EqIgnoreCaseBytes for [u8] {
+    fn eq_ignore_ascii_case_bytes(&self, other: &[u8]) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("clock before epoch: {e}"))?
-        .as_secs() as i64;
-    // SEC-L5: backdate inception by 1h so a validator whose clock runs slightly ahead does
-    // not reject a freshly-minted signature (now < inception). Expiration shifts with it; the
-    // validity window length is unchanged.
-    let inception = OffsetDateTime::from_unix_timestamp(now - 3600)
-        .map_err(|e| format!("inception time: {e}"))?;
-    let rrsig = RRSIG::from_rrset(rrset, DNSClass::IN, inception, signer)
-        .map_err(|e| format!("sign rrset: {e}"))?;
-    Ok(Record::from_rdata(
-        rrset.name().clone(),
-        rrset.ttl(),
-        RData::DNSSEC(DNSSECRData::RRSIG(rrsig)),
-    ))
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
+
+// ── Key file management (unchanged on-disk format: PKCS#8 DER, mode 0600) ──────────────────────
 
 /// Directory holding a zone's keys: `<config_dir>/dnssec/<zone>/`.
 fn zone_key_dir(config_dir: &Path, zone: &Name) -> PathBuf {
-    let label = zone.to_string();
+    let label = zone.to_ascii();
     let label = label.trim_end_matches('.');
     let label = if label.is_empty() { "root" } else { label };
     config_dir.join("dnssec").join(label)
 }
 
 /// Load the zone's KSK + ZSK, generating and persisting them (mode 0600) on first use.
-/// Returns `(ksk, zsk)`.
-pub fn load_or_generate(config_dir: &Path, zone: &Name) -> Result<(ZoneKey, ZoneKey), String> {
+pub fn load_or_generate(config_dir: &Path, zone: &Name) -> Result<(SigningKey, SigningKey), String> {
     let dir = zone_key_dir(config_dir, zone);
     let ksk = load_or_generate_one(&dir, "ksk.key", true)?;
     let zsk = load_or_generate_one(&dir, "zsk.key", false)?;
     Ok((ksk, zsk))
 }
 
-fn load_or_generate_one(dir: &Path, file: &str, is_ksk: bool) -> Result<ZoneKey, String> {
+fn load_or_generate_one(dir: &Path, file: &str, is_ksk: bool) -> Result<SigningKey, String> {
     let path = dir.join(file);
     if let Ok(bytes) = std::fs::read(&path) {
-        return ZoneKey::from_pkcs8(bytes, is_ksk);
+        return SigningKey::from_pkcs8(bytes, is_ksk);
     }
-    let key = ZoneKey::generate(is_ksk)?;
+    let key = SigningKey::generate(is_ksk)?;
     write_key_0600(&path, key.pkcs8())?;
     Ok(key)
 }
 
 /// Remove a zone's key material (called on zone deletion — no orphaned keys, #201 lifecycle).
-#[allow(dead_code)] // wired into zone deletion in #201 increment 7 (lifecycle)
+#[allow(dead_code)]
 pub fn remove_zone_keys(config_dir: &Path, zone: &Name) -> Result<(), String> {
     let dir = zone_key_dir(config_dir, zone);
     match std::fs::remove_dir_all(&dir) {
@@ -185,42 +146,73 @@ fn write_key_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .mode(0o600)
             .open(path)
             .map_err(|e| format!("open {path:?}: {e}"))?;
-        f.write_all(bytes)
-            .map_err(|e| format!("write {path:?}: {e}"))?;
+        f.write_all(bytes).map_err(|e| format!("write {path:?}: {e}"))?;
     }
     #[cfg(not(unix))]
     std::fs::write(path, bytes).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(())
 }
 
+/// Read a zone's stored KSK + ZSK (PKCS#8 DER), base64-encoded for relay transport.
+pub fn export_keys(config_dir: &Path, apex: &Name) -> Option<(String, String, String)> {
+    let dir = zone_key_dir(config_dir, apex);
+    let ksk = std::fs::read(dir.join("ksk.key")).ok()?;
+    let zsk = std::fs::read(dir.join("zsk.key")).ok()?;
+    Some((
+        apex.to_ascii(),
+        data_encoding::BASE64.encode(&ksk),
+        data_encoding::BASE64.encode(&zsk),
+    ))
+}
+
+/// Write a base64-encoded PKCS#8 key (mode 0600) only when it differs. Used on the slave to adopt
+/// the master's replicated keys. SEC-L11: only the two known filenames are ever written.
+pub fn import_key(config_dir: &Path, zone: &str, file: &str, b64: &str) -> Result<bool, String> {
+    if file != "ksk.key" && file != "zsk.key" {
+        return Err(format!("invalid key filename: {file}"));
+    }
+    let bytes = data_encoding::BASE64
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    let zone_name = Name::from_ascii(zone).map_err(|e| format!("invalid zone '{zone}': {e:?}"))?;
+    let path = zone_key_dir(config_dir, &zone_name).join(file);
+    if std::fs::read(&path).map(|c| c == bytes).unwrap_or(false) {
+        return Ok(false);
+    }
+    write_key_0600(&path, &bytes)?;
+    Ok(true)
+}
+
+// ── Online signer ─────────────────────────────────────────────────────────────────────────────
+
 /// One signed zone's key bundle.
 struct ZoneKeys {
     apex: Name,
-    ksk: ZoneKey,
-    zsk: ZoneKey,
-    // SEC-L1: per-zone signers built ONCE at load (not reconstructed from PKCS#8 per RRset per
-    // query). Reused for every RRSIG; sign_rrset still stamps a fresh inception each call.
-    zsk_signer: DnssecSigner,
-    ksk_signer: DnssecSigner,
+    ksk: SigningKey,
+    zsk: SigningKey,
 }
 
 /// Online DNSSEC signer for the configured local zones (#201). Holds each zone's KSK+ZSK and
-/// signs answers / the apex DNSKEY on the slow path. `None` in the handler when the feature is off.
+/// produces signed `wire::Record`s on the serving path.
 pub struct ZoneSigner {
-    zones: HashMap<LowerName, ZoneKeys>,
+    zones: HashMap<Box<[u8]>, ZoneKeys>, // keyed by lowercased wire apex name
+    sig_validity: Duration,
 }
 
-/// Hot-swappable handle to the zone signer, so a slave can adopt the master's replicated keys at
-/// runtime. `None` inner = signing off (or not yet keyed).
-pub type SharedZoneSigner =
-    std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<ZoneSigner>>>>;
+pub type SharedZoneSigner = std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<ZoneSigner>>>>;
 
-/// Process-global handle to the live signer, shared by the DNS handler (run_dns_server) and the
-/// relay key-replication path (sync.rs) without threading it through every constructor.
 pub static SHARED_SIGNER: std::sync::OnceLock<SharedZoneSigner> = std::sync::OnceLock::new();
 
-/// Rebuild the signer for `apexes` under `config_dir` and hot-swap it into the shared handle.
-/// Called on the slave after the master replicates fresh keys to disk. Returns the zone count.
+/// Lowercased wire-name key.
+fn wire_key(n: &Name) -> Box<[u8]> {
+    let mut out = Vec::with_capacity(n.wire().len());
+    for &b in n.wire() {
+        out.push(b.to_ascii_lowercase());
+    }
+    out.into_boxed_slice()
+}
+
+/// Rebuild the signer for `apexes` and hot-swap it into the shared handle (slave key adoption).
 pub fn rebuild_shared(config_dir: &Path, apexes: &[String], sig_validity: Duration) -> Result<usize, String> {
     let signer = ZoneSigner::new(config_dir, apexes, sig_validity)?;
     let n = signer.zones.len();
@@ -230,356 +222,260 @@ pub fn rebuild_shared(config_dir: &Path, apexes: &[String], sig_validity: Durati
     Ok(n)
 }
 
-/// Read a zone's stored KSK + ZSK (PKCS#8 DER) from disk, base64-encoded for relay transport.
-/// `(zone-presentation, ksk_b64, zsk_b64)`; `None` if either key file is missing.
-pub fn export_keys(config_dir: &Path, apex: &Name) -> Option<(String, String, String)> {
-    let dir = zone_key_dir(config_dir, apex);
-    let ksk = std::fs::read(dir.join("ksk.key")).ok()?;
-    let zsk = std::fs::read(dir.join("zsk.key")).ok()?;
-    Some((
-        apex.to_string(),
-        data_encoding::BASE64.encode(&ksk),
-        data_encoding::BASE64.encode(&zsk),
-    ))
-}
-
-/// Write a base64-encoded PKCS#8 key to `<config_dir>/dnssec/<zone>/<file>` (mode 0600), only when
-/// it differs from what is already there. Returns `true` if the file changed. Used on the slave to
-/// adopt the master's replicated keys.
-pub fn import_key(config_dir: &Path, zone: &str, file: &str, b64: &str) -> Result<bool, String> {
-    // SEC-L11 (defence-in-depth): only ever write the two known key filenames. The slave passes
-    // these as hard-coded literals today, but validate here so no future caller can turn the
-    // relayed `file` into a path-traversal write. (Cross-model Gemini finding, disputed-down:
-    // not currently reachable since `file` is not attacker-controlled, but cheap to fence off.)
-    if file != "ksk.key" && file != "zsk.key" {
-        return Err(format!("invalid key filename: {file}"));
-    }
-    let bytes = data_encoding::BASE64
-        .decode(b64.as_bytes())
-        .map_err(|e| format!("base64 decode: {e}"))?;
-    let zone_name = Name::from_str(zone).map_err(|e| format!("invalid zone '{zone}': {e}"))?;
-    let path = zone_key_dir(config_dir, &zone_name).join(file);
-    if std::fs::read(&path).map(|c| c == bytes).unwrap_or(false) {
-        return Ok(false);
-    }
-    write_key_0600(&path, &bytes)?;
-    Ok(true)
-}
-
 impl ZoneSigner {
     /// Load (or generate on first use) the KSK+ZSK for each configured local-zone apex.
     pub fn new(config_dir: &Path, apexes: &[String], sig_validity: Duration) -> Result<Self, String> {
         let mut zones = HashMap::new();
         for a in apexes {
-            let apex = Name::from_str(a).map_err(|e| format!("invalid zone '{a}': {e}"))?;
+            let apex = Name::from_ascii(a).map_err(|e| format!("invalid zone '{a}': {e:?}"))?;
             let (ksk, zsk) = load_or_generate(config_dir, &apex)?;
-            let zsk_signer = zsk.dnssec_signer(&apex, sig_validity)?;
-            let ksk_signer = ksk.dnssec_signer(&apex, sig_validity)?;
-            zones.insert(
-                LowerName::from(apex.clone()),
-                ZoneKeys { apex, ksk, zsk, zsk_signer, ksk_signer },
-            );
+            zones.insert(wire_key(&apex), ZoneKeys { apex, ksk, zsk });
         }
-        Ok(Self { zones })
+        Ok(Self { zones, sig_validity })
     }
 
-    #[allow(dead_code)] // used by startup diagnostics / API in later #201 increments
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.zones.is_empty()
     }
 
     /// Longest-suffix match: the signed zone whose apex is a suffix of (or equal to) `name`.
-    fn zone_for(&self, name: &LowerName) -> Option<&ZoneKeys> {
-        let mut cur = name.clone();
+    fn zone_for(&self, name: &Name) -> Option<&ZoneKeys> {
+        let mut cur: &[u8] = name.wire();
         loop {
-            if let Some(z) = self.zones.get(&cur) {
+            let key: Vec<u8> = cur.iter().map(|b| b.to_ascii_lowercase()).collect();
+            if let Some(z) = self.zones.get(&key[..]) {
                 return Some(z);
             }
-            if cur.is_root() {
+            if cur.len() <= 1 {
                 return None;
             }
-            cur = cur.base_name();
+            let skip = 1 + cur[0] as usize;
+            if skip >= cur.len() {
+                return None;
+            }
+            cur = &cur[skip..];
         }
     }
 
-    /// True if `name` is exactly a signed-zone apex (where the DNSKEY RRset lives).
-    pub fn is_apex(&self, name: &LowerName) -> bool {
-        self.zones.contains_key(name)
+    /// True if `name` is exactly a signed-zone apex.
+    pub fn is_apex(&self, name: &Name) -> bool {
+        self.zones.contains_key(&wire_key(name)[..])
     }
 
     /// The apex of the signed zone containing `name`, if any.
-    pub fn apex_for(&self, name: &LowerName) -> Option<Name> {
+    pub fn apex_for(&self, name: &Name) -> Option<Name> {
         self.zone_for(name).map(|z| z.apex.clone())
     }
 
-    /// Sign a positive answer RRset, returning the RRSIG record to append to the answer section.
-    /// `None` if the name is not within a signed zone.
-    pub fn sign_answer(&self, qtype: RecordType, records: &[&Record]) -> Option<Record> {
-        let first = *records.first()?;
-        let z = self.zone_for(&LowerName::from(first.name.clone()))?;
-        let mut rrset = RecordSet::new(first.name.clone(), qtype, 0);
-        rrset.set_ttl(first.ttl);
-        for r in records {
-            rrset.insert((*r).clone(), 0);
-        }
-        sign_rrset(&rrset, &z.zsk_signer).ok()
+    fn validity_window(&self) -> (u32, u32) {
+        let now = now_secs();
+        let inception = now.saturating_sub(INCEPTION_BACKDATE_SECS) as u32;
+        let expiration = (now + self.sig_validity.as_secs()) as u32;
+        (inception, expiration)
     }
 
-    /// SEC-L7: sign every RRset in a record chain (e.g. a CNAME chain + its terminal RRset).
-    /// Groups by (owner, type) and signs each group with the zone ZSK; returns the RRSIG records
-    /// to append. Records outside any signed zone are skipped (sign_answer returns None).
+    /// Build an RRSIG `wire::Record` over `rdatas` (all sharing `owner`/`type_covered`/`ttl`),
+    /// signed with `key` whose DNSKEY publishes at `apex`.
+    fn rrsig_record(
+        &self,
+        key: &SigningKey,
+        apex: &Name,
+        owner: &Name,
+        type_covered: u16,
+        ttl: u32,
+        rdatas: &[&Rdata],
+    ) -> Option<Record> {
+        let (inception, expiration) = self.validity_window();
+        let p = dnssec_sign::RrsigParams {
+            type_covered,
+            key_tag: key.key_tag(),
+            signer_name: apex.clone(),
+            original_ttl: ttl,
+            inception,
+            expiration,
+        };
+        let rdata = dnssec_sign::sign_rrset(key, &p, owner, class::IN, rdatas).ok()?;
+        Some(Record {
+            name: owner.clone(),
+            rtype: rtype::RRSIG,
+            rclass: class::IN,
+            ttl,
+            rdata: Rdata::Unknown { rtype: rtype::RRSIG, data: rdata },
+        })
+    }
+
+    /// Sign a positive answer RRset, returning the RRSIG record to append. `None` if the name is
+    /// not within a signed zone.
+    pub fn sign_answer(&self, qtype: u16, records: &[Record]) -> Option<Record> {
+        let first = records.first()?;
+        let z = self.zone_for(&first.name)?;
+        let rdatas: Vec<&Rdata> = records.iter().map(|r| &r.rdata).collect();
+        self.rrsig_record(&z.zsk, &z.apex, &first.name, qtype, first.ttl, &rdatas)
+    }
+
+    /// Sign every RRset in a record chain (e.g. a CNAME chain + terminal RRset). Groups by
+    /// (owner, type); returns the RRSIG records to append.
     pub fn sign_chain(&self, records: &[Record]) -> Vec<Record> {
-        let mut groups: Vec<(Name, RecordType, Vec<&Record>)> = Vec::new();
+        let mut groups: Vec<(Name, u16, Vec<&Record>)> = Vec::new();
         for r in records {
-            let n = r.name.clone();
-            let ty = r.record_type();
-            if let Some(g) = groups.iter_mut().find(|(gn, gt, _)| *gn == n && *gt == ty) {
+            if let Some(g) = groups
+                .iter_mut()
+                .find(|(gn, gt, _)| gn.eq_ignore_ascii_case(&r.name) && *gt == r.rtype)
+            {
                 g.2.push(r);
             } else {
-                groups.push((n, ty, vec![r]));
+                groups.push((r.name.clone(), r.rtype, vec![r]));
             }
         }
         let mut out = Vec::new();
-        for (_, ty, recs) in &groups {
-            if let Some(rrsig) = self.sign_answer(*ty, recs) {
-                out.push(rrsig);
+        for (owner, ty, recs) in &groups {
+            if let Some(z) = self.zone_for(owner) {
+                let rdatas: Vec<&Rdata> = recs.iter().map(|r| &r.rdata).collect();
+                if let Some(sig) =
+                    self.rrsig_record(&z.zsk, &z.apex, owner, *ty, recs[0].ttl, &rdatas)
+                {
+                    out.push(sig);
+                }
             }
         }
         out
     }
 
     /// The apex DNSKEY RRset (KSK + ZSK) plus its RRSIG (signed by the KSK), for a DNSKEY query.
-    pub fn apex_dnskey(&self, apex: &LowerName) -> Option<Vec<Record>> {
-        let z = self.zones.get(apex)?;
-        let mut rrset = RecordSet::new(z.apex.clone(), RecordType::DNSKEY, 0);
-        rrset.set_ttl(3600);
-        rrset.add_rdata(RData::DNSSEC(DNSSECRData::DNSKEY(z.ksk.dnskey().ok()?)));
-        rrset.add_rdata(RData::DNSSEC(DNSSECRData::DNSKEY(z.zsk.dnskey().ok()?)));
-        let rrsig = sign_rrset(&rrset, &z.ksk_signer).ok()?;
-        let mut out: Vec<Record> = rrset.records_without_rrsigs().cloned().collect();
-        out.push(rrsig);
+    pub fn apex_dnskey(&self, apex: &Name) -> Option<Vec<Record>> {
+        let z = self.zones.get(&wire_key(apex)[..])?;
+        let ttl = 3600;
+        let ksk_rd = Rdata::Unknown { rtype: rtype::DNSKEY, data: z.ksk.dnskey_rdata() };
+        let zsk_rd = Rdata::Unknown { rtype: rtype::DNSKEY, data: z.zsk.dnskey_rdata() };
+        let mk = |rd: &Rdata| Record {
+            name: z.apex.clone(),
+            rtype: rtype::DNSKEY,
+            rclass: class::IN,
+            ttl,
+            rdata: rd.clone(),
+        };
+        let mut out = vec![mk(&ksk_rd), mk(&zsk_rd)];
+        let rdatas = [&ksk_rd, &zsk_rd];
+        let sig = self.rrsig_record(&z.ksk, &z.apex, &z.apex, rtype::DNSKEY, ttl, &rdatas)?;
+        out.push(sig);
         Some(out)
     }
 
-    /// DS records (SHA-256) for every signed zone — surfaced to the operator to publish at the parent.
-    pub fn ds_records(&self) -> Vec<(String, DS)> {
-        let mut out = Vec::new();
-        for z in self.zones.values() {
-            if let Ok(ds) = z.ksk.ds(&z.apex) {
-                out.push((z.apex.to_string(), ds));
-            }
+    /// Synthesize the apex SOA RDATA (Runbound local zones carry none).
+    fn synth_soa_rdata(apex: &Name) -> Rdata {
+        let serial = (now_secs() / 60) as u32;
+        let rname = prepend_label("hostmaster", apex).unwrap_or_else(|| apex.clone());
+        Rdata::Soa {
+            mname: apex.clone(),
+            rname,
+            serial,
+            refresh: 3600,
+            retry: 900,
+            expire: 604_800,
+            minimum: 300,
         }
-        out
     }
 
-    /// Synthesize the apex SOA for a signed zone (Runbound local zones carry none). Minute-resolution
-    /// serial so it advances monotonically across restarts; conservative timers.
-    fn synth_soa(apex: &Name) -> SOA {
-        let serial = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            / 60) as u32;
-        let rname = apex.prepend_label("hostmaster").unwrap_or_else(|_| apex.clone());
-        SOA::new(apex.clone(), rname, serial, 3600, 900, 604_800, 300)
+    /// The signed apex SOA RRset (SOA queries, and the authority of negative responses).
+    pub fn signed_soa(&self, apex: &Name) -> Option<Vec<Record>> {
+        let z = self.zones.get(&wire_key(apex)[..])?;
+        let ttl = 300;
+        let rd = Self::synth_soa_rdata(&z.apex);
+        let soa = Record {
+            name: z.apex.clone(),
+            rtype: rtype::SOA,
+            rclass: class::IN,
+            ttl,
+            rdata: rd.clone(),
+        };
+        let sig = self.rrsig_record(&z.zsk, &z.apex, &z.apex, rtype::SOA, ttl, &[&rd])?;
+        Some(vec![soa, sig])
     }
 
-    /// The signed apex SOA RRset (for SOA queries and the authority of negative responses).
-    pub fn signed_soa(&self, apex: &LowerName) -> Option<Vec<Record>> {
-        let z = self.zones.get(apex)?;
-        let mut rrset = RecordSet::new(z.apex.clone(), RecordType::SOA, 0);
-        rrset.set_ttl(300);
-        rrset.add_rdata(RData::SOA(Self::synth_soa(&z.apex)));
-        let rrsig = sign_rrset(&rrset, &z.zsk_signer).ok()?;
-        let mut out: Vec<Record> = rrset.records_without_rrsigs().cloned().collect();
-        out.push(rrsig);
-        Some(out)
-    }
-
-    /// Authority section for a signed negative response: SOA + RRSIG, then the NSEC3 denial
-    /// (closest-encloser for NXDOMAIN, matching for NODATA). `owners` = the zone owner set.
+    /// Authority section for a signed negative response: SOA + RRSIG, then the NSEC3 denial.
     pub fn signed_negative(
         &self,
         is_nxdomain: bool,
         qname: &Name,
-        owners: &[(Name, Vec<RecordType>)],
+        owners: &[(Name, Vec<u16>)],
     ) -> Option<Vec<Record>> {
-        let z = self.zone_for(&LowerName::from(qname.clone()))?;
-        let apex = LowerName::from(z.apex.clone());
-        let mut authority = self.signed_soa(&apex)?;
+        let z = self.zone_for(qname)?;
+        let mut authority = self.signed_soa(&z.apex)?;
         let denial = if is_nxdomain {
-            self.nsec3_nxdomain(qname, owners)?
+            self.nsec3_nxdomain(z, qname, owners)?
         } else {
-            self.nsec3_nodata(qname, owners)?
+            self.nsec3_nodata(z, qname, owners)?
         };
         authority.extend(denial);
         Some(authority)
     }
-}
 
-/// Compute the zone's owner set for NSEC3: every name at/under `apex` with its present RR types,
-/// the apex augmented with SOA + DNSKEY + NSEC3PARAM, and the empty non-terminals between names
-/// and the apex. `entries` yields each existing owner name with its present types.
-pub fn zone_owners(
-    entries: impl Iterator<Item = (Name, Vec<RecordType>)>,
-    apex: &Name,
-) -> Vec<(Name, Vec<RecordType>)> {
-    use std::collections::{HashMap, HashSet};
-    let mut map: HashMap<Name, HashSet<RecordType>> = HashMap::new();
-    // Apex always exists with these meta types.
-    let apex_entry = map.entry(apex.clone()).or_default();
-    apex_entry.insert(RecordType::SOA);
-    apex_entry.insert(RecordType::DNSKEY);
-    apex_entry.insert(RecordType::NSEC3PARAM);
-    for (name, types) in entries {
-        if !apex.zone_of(&name) {
-            continue; // outside this zone
+    /// DS RDATA (SHA-256) for every signed zone — surfaced to the operator to publish at the parent.
+    /// Returns `(zone-presentation, key_tag, ds_rdata_bytes)`.
+    pub fn ds_records(&self) -> Vec<(String, u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        for z in self.zones.values() {
+            let ds = z.ksk.ds_rdata(&z.apex);
+            let key_tag = u16::from_be_bytes([ds[0], ds[1]]);
+            out.push((z.apex.to_ascii(), key_tag, ds));
         }
-        // Empty non-terminals: every ancestor between `name` and the apex must exist.
-        let mut cur = name.clone();
-        while cur.num_labels() > apex.num_labels() {
-            map.entry(cur.clone()).or_default();
-            cur = cur.base_name();
-        }
-        let e = map.entry(name).or_default();
-        for t in types {
-            e.insert(t);
-        }
+        out
     }
-    map.into_iter()
-        .map(|(n, ts)| (n, ts.into_iter().collect()))
-        .collect()
-}
 
-// ── #201: NSEC3 authenticated denial of existence (RFC 5155, params per RFC 9276) ───────────
-// Generation is complete + unit-tested here; it is wired into the negative serve path (with the
-// zone owner-set + SOA) in the following increment, hence the module-scoped dead-code allowance.
-mod nsec3_gen {
-    #![allow(dead_code)]
-    use super::*;
+    // ── NSEC3 authenticated denial (RFC 5155, params per RFC 9276) ─────────────────────────────
 
-// RFC 9276: SHA-1, 0 iterations, empty salt.
-const NSEC3_ITERATIONS: u16 = 0;
-
-/// Raw 20-byte NSEC3 SHA-1 hash of `name`.
-fn nsec3_hash(name: &Name, salt: &[u8]) -> Option<Vec<u8>> {
-    Nsec3HashAlgorithm::SHA1
-        .hash(salt, name, NSEC3_ITERATIONS)
-        .ok()
-        .map(|d| d.as_ref().to_vec())
-}
-
-/// NSEC3 owner name: `<base32hex(hash)>.<apex>`.
-fn nsec3_owner(apex: &Name, hash: &[u8]) -> Option<Name> {
-    apex.prepend_label(data_encoding::BASE32_DNSSEC.encode(hash).as_str())
-        .ok()
-}
-
-/// One node of the sorted NSEC3 hash ring.
-struct Nsec3Node {
-    hash: Vec<u8>,
-    types: Vec<RecordType>,
-}
-
-/// Build the NSEC3 chain over the zone's owner names, sorted ascending by hash (deduped).
-fn build_nsec3_chain(owners: &[(Name, Vec<RecordType>)], salt: &[u8]) -> Option<Vec<Nsec3Node>> {
-    let mut nodes: Vec<Nsec3Node> = Vec::with_capacity(owners.len());
-    for (name, types) in owners {
-        let hash = nsec3_hash(name, salt)?;
-        let mut t = types.clone();
-        t.push(RecordType::RRSIG);
-        nodes.push(Nsec3Node { hash, types: t });
-    }
-    nodes.sort_by(|a, b| a.hash.cmp(&b.hash));
-    nodes.dedup_by(|a, b| a.hash == b.hash);
-    (!nodes.is_empty()).then_some(nodes)
-}
-
-/// The `next hashed owner name` for node `i` (wraps to node 0).
-fn next_hash(nodes: &[Nsec3Node], i: usize) -> Vec<u8> {
-    nodes[(i + 1) % nodes.len()].hash.clone()
-}
-
-/// True if node `i` *covers* `target` (owner < target < next, with ring wraparound).
-fn covers(nodes: &[Nsec3Node], i: usize, target: &[u8]) -> bool {
-    let owner = nodes[i].hash.as_slice();
-    let next = nodes[(i + 1) % nodes.len()].hash.as_slice();
-    if owner < next {
-        owner < target && target < next
-    } else {
-        target > owner || target < next // last node wraps the ring
-    }
-}
-
-impl ZoneSigner {
-    /// Build + sign one NSEC3 RR (node `i`): returns `[NSEC3 record, RRSIG]`.
+    /// Build + sign one NSEC3 RR for `hash` with `next_hash` and `types`: `[NSEC3, RRSIG]`.
     fn signed_nsec3(
         &self,
         z: &ZoneKeys,
-        nodes: &[Nsec3Node],
-        i: usize,
-        salt: &[u8],
+        hash: &[u8],
+        next_hash: &[u8],
+        types: &[u16],
     ) -> Option<Vec<Record>> {
-        let owner = nsec3_owner(&z.apex, &nodes[i].hash)?;
-        let nsec3 = NSEC3::new(
-            Nsec3HashAlgorithm::SHA1,
-            false,
-            NSEC3_ITERATIONS,
-            salt.to_vec(),
-            next_hash(nodes, i),
-            nodes[i].types.iter().copied(),
-        );
-        let rec = Record::from_rdata(owner.clone(), 300, RData::DNSSEC(DNSSECRData::NSEC3(nsec3)));
-        let mut rrset = RecordSet::new(owner, RecordType::NSEC3, 0);
-        rrset.set_ttl(300);
-        rrset.insert(rec.clone(), 0);
-        let rrsig = sign_rrset(&rrset, &z.zsk_signer).ok()?;
-        Some(vec![rec, rrsig])
+        let owner = prepend_label(&dnssec_sign::nsec3_owner_label(hash), &z.apex)?;
+        let ttl = 300;
+        let nsec3_rd = dnssec_sign::nsec3_rdata(0, NSEC3_ITERATIONS, NSEC3_SALT, next_hash, types);
+        let rd = Rdata::Unknown { rtype: rtype::NSEC3, data: nsec3_rd };
+        let rec = Record {
+            name: owner.clone(),
+            rtype: rtype::NSEC3,
+            rclass: class::IN,
+            ttl,
+            rdata: rd.clone(),
+        };
+        let sig = self.rrsig_record(&z.zsk, &z.apex, &owner, rtype::NSEC3, ttl, &[&rd])?;
+        Some(vec![rec, sig])
     }
 
-    /// NSEC3 NODATA proof: the signed NSEC3 matching `qname` (which exists, but lacks the qtype).
-    pub fn nsec3_nodata(
-        &self,
-        qname: &Name,
-        owners: &[(Name, Vec<RecordType>)],
-    ) -> Option<Vec<Record>> {
-        let z = self.zone_for(&LowerName::from(qname.clone()))?;
-        let salt: &[u8] = &[];
-        let nodes = build_nsec3_chain(owners, salt)?;
-        let qhash = nsec3_hash(qname, salt)?;
+    /// NSEC3 NODATA proof: the signed NSEC3 matching `qname` (exists, lacks the qtype).
+    fn nsec3_nodata(&self, z: &ZoneKeys, qname: &Name, owners: &[(Name, Vec<u16>)]) -> Option<Vec<Record>> {
+        let nodes = build_nsec3_chain(owners)?;
+        let qhash = nsec3_hash_name(qname);
         let i = nodes.iter().position(|n| n.hash == qhash)?;
-        self.signed_nsec3(z, &nodes, i, salt)
+        self.signed_nsec3(z, &nodes[i].hash, &next_hash(&nodes, i), &nodes[i].types)
     }
 
     /// NSEC3 NXDOMAIN proof (RFC 5155 §7.2.2): match the closest encloser, cover the next-closer
-    /// name, cover the wildcard at the closest encloser. `owners` must include empty non-terminals.
-    pub fn nsec3_nxdomain(
-        &self,
-        qname: &Name,
-        owners: &[(Name, Vec<RecordType>)],
-    ) -> Option<Vec<Record>> {
-        let z = self.zone_for(&LowerName::from(qname.clone()))?;
-        let salt: &[u8] = &[];
-        let nodes = build_nsec3_chain(owners, salt)?;
-        let existing: std::collections::HashSet<Vec<u8>> =
-            owners.iter().filter_map(|(n, _)| nsec3_hash(n, salt)).collect();
+    /// name, cover the wildcard at the closest encloser.
+    fn nsec3_nxdomain(&self, z: &ZoneKeys, qname: &Name, owners: &[(Name, Vec<u16>)]) -> Option<Vec<Record>> {
+        let nodes = build_nsec3_chain(owners)?;
+        let existing: std::collections::HashSet<[u8; 20]> =
+            owners.iter().map(|(n, _)| nsec3_hash_name(n)).collect();
 
-        // Closest encloser: the longest existing ancestor of qname. Next closer: one label longer.
+        // Closest encloser: longest existing ancestor of qname. Next closer: one label longer.
         let mut child = qname.clone();
         let (ce, next_closer) = loop {
-            if child.is_root() {
-                return None;
-            }
-            let parent = child.base_name();
-            if existing.contains(&nsec3_hash(&parent, salt)?) {
+            let parent = base_name(&child)?;
+            if existing.contains(&nsec3_hash_name(&parent)) {
                 break (parent, child);
             }
             child = parent;
         };
 
-        let ce_hash = nsec3_hash(&ce, salt)?;
-        let nc_hash = nsec3_hash(&next_closer, salt)?;
-        let wc_hash = nsec3_hash(&ce.prepend_label("*").ok()?, salt)?;
+        let ce_hash = nsec3_hash_name(&ce);
+        let nc_hash = nsec3_hash_name(&next_closer);
+        let wc_hash = nsec3_hash_name(&prepend_label("*", &ce)?);
 
         let ce_i = nodes.iter().position(|n| n.hash == ce_hash)?;
         let nc_i = (0..nodes.len()).find(|&i| covers(&nodes, i, &nc_hash));
@@ -589,194 +485,166 @@ impl ZoneSigner {
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for i in [Some(ce_i), nc_i, wc_i].into_iter().flatten() {
             if seen.insert(i) {
-                out.extend(self.signed_nsec3(z, &nodes, i, salt)?);
+                out.extend(self.signed_nsec3(z, &nodes[i].hash, &next_hash(&nodes, i), &nodes[i].types)?);
             }
         }
         Some(out)
     }
 }
-} // mod nsec3_gen
+
+/// Compute the zone's owner set for NSEC3: every name at/under `apex` with its present RR types,
+/// the apex augmented with SOA + DNSKEY + NSEC3PARAM, plus the empty non-terminals between names
+/// and the apex. `entries` yields each existing owner name with its present types.
+pub fn zone_owners(
+    entries: impl Iterator<Item = (Name, Vec<u16>)>,
+    apex: &Name,
+) -> Vec<(Name, Vec<u16>)> {
+    use std::collections::{HashMap, HashSet};
+    let mut map: HashMap<Box<[u8]>, (Name, HashSet<u16>)> = HashMap::new();
+    let apex_entry = map
+        .entry(wire_key(apex))
+        .or_insert_with(|| (apex.clone(), HashSet::new()));
+    apex_entry.1.insert(rtype::SOA);
+    apex_entry.1.insert(rtype::DNSKEY);
+    apex_entry.1.insert(rtype::NSEC3PARAM);
+    for (name, types) in entries {
+        if !zone_of(apex, &name) {
+            continue;
+        }
+        // Empty non-terminals: every ancestor between `name` and the apex must exist.
+        let mut cur = name.clone();
+        while cur.label_count() > apex.label_count() {
+            let Some(parent) = base_name(&cur) else { break };
+            map.entry(wire_key(&cur))
+                .or_insert_with(|| (cur.clone(), HashSet::new()));
+            cur = parent;
+        }
+        let e = map
+            .entry(wire_key(&name))
+            .or_insert_with(|| (name.clone(), HashSet::new()));
+        for t in types {
+            e.1.insert(t);
+        }
+    }
+    map.into_values()
+        .map(|(n, ts)| (n, ts.into_iter().collect()))
+        .collect()
+}
+
+/// One node of the sorted NSEC3 hash ring.
+struct Nsec3Node {
+    hash: [u8; 20],
+    types: Vec<u16>,
+}
+
+fn nsec3_hash_name(name: &Name) -> [u8; 20] {
+    let canon = dnssec_sign::canonical_name_wire(name);
+    dnssec_sign::nsec3_hash(&canon, NSEC3_SALT, NSEC3_ITERATIONS)
+}
+
+/// Build the NSEC3 chain over the zone's owner names, sorted ascending by hash (deduped).
+fn build_nsec3_chain(owners: &[(Name, Vec<u16>)]) -> Option<Vec<Nsec3Node>> {
+    let mut nodes: Vec<Nsec3Node> = Vec::with_capacity(owners.len());
+    for (name, types) in owners {
+        let hash = nsec3_hash_name(name);
+        let mut t = types.clone();
+        t.push(rtype::RRSIG);
+        nodes.push(Nsec3Node { hash, types: t });
+    }
+    nodes.sort_by(|a, b| a.hash.cmp(&b.hash));
+    nodes.dedup_by(|a, b| a.hash == b.hash);
+    (!nodes.is_empty()).then_some(nodes)
+}
+
+fn next_hash(nodes: &[Nsec3Node], i: usize) -> [u8; 20] {
+    nodes[(i + 1) % nodes.len()].hash
+}
+
+/// True if node `i` covers `target` (owner < target < next, with ring wraparound).
+fn covers(nodes: &[Nsec3Node], i: usize, target: &[u8; 20]) -> bool {
+    let owner = &nodes[i].hash;
+    let next = &nodes[(i + 1) % nodes.len()].hash;
+    if owner < next {
+        owner < target && target < next
+    } else {
+        target > owner || target < next
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     #[test]
     fn generate_dnskey_and_ds() {
-        let ksk = ZoneKey::generate(true).unwrap();
-        let zone = Name::from_str("example.com.").unwrap();
-        // DNSKEY + key tag are computable and the DS references the same key tag.
-        let tag = ksk.key_tag().unwrap();
-        let ds = ksk.ds(&zone).unwrap();
-        assert_eq!(ds.key_tag(), tag);
-        assert!(!ds.digest().is_empty(), "DS digest must not be empty");
-    }
-
-    #[test]
-    fn pkcs8_load_roundtrip_stable_key_tag() {
-        let k1 = ZoneKey::generate(false).unwrap();
-        let der = k1.pkcs8().to_vec();
-        let k2 = ZoneKey::from_pkcs8(der, false).unwrap();
-        assert_eq!(k1.key_tag().unwrap(), k2.key_tag().unwrap());
+        let ksk = SigningKey::generate(true).unwrap();
+        let zone = Name::from_ascii("example.com.").unwrap();
+        let ds = ksk.ds_rdata(&zone);
+        let tag = u16::from_be_bytes([ds[0], ds[1]]);
+        assert_eq!(tag, ksk.key_tag(), "DS references the DNSKEY key tag");
+        assert_eq!(ds.len(), 36);
     }
 
     #[test]
     fn load_or_generate_persists_and_reloads() {
-        let tmp = std::env::temp_dir().join(format!("rb201test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("rb201wtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let zone = Name::from_str("test.example.").unwrap();
+        let zone = Name::from_ascii("test.example.").unwrap();
         let (k1, z1) = load_or_generate(&tmp, &zone).unwrap();
-        let (k2, z2) = load_or_generate(&tmp, &zone).unwrap(); // second call reloads from disk
-        assert_eq!(k1.key_tag().unwrap(), k2.key_tag().unwrap());
-        assert_eq!(z1.key_tag().unwrap(), z2.key_tag().unwrap());
+        let (k2, z2) = load_or_generate(&tmp, &zone).unwrap();
+        assert_eq!(k1.key_tag(), k2.key_tag());
+        assert_eq!(z1.key_tag(), z2.key_tag());
         assert!(k1.is_ksk() && !z1.is_ksk());
         remove_zone_keys(&tmp, &zone).unwrap();
-        assert!(!tmp.join("dnssec").join("test.example").exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    fn signer_for(apex: &str) -> (ZoneSigner, Name) {
+        let tmp = std::env::temp_dir().join(format!("rb201sig-{}-{}", std::process::id(), apex));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = ZoneSigner::new(&tmp, &[apex.to_string()], Duration::from_secs(86_400)).unwrap();
+        (s, Name::from_ascii(apex).unwrap())
+    }
+
     #[test]
-    fn sign_rrset_produces_valid_rrsig() {
-        use hickory_proto::dnssec::{PublicKey, TBS};
-        use hickory_proto::rr::rdata::A;
-        use hickory_proto::rr::RecordType;
-        let zsk = ZoneKey::generate(false).unwrap();
-        let zone = Name::from_str("example.com.").unwrap();
-        let mut rrset = RecordSet::new(zone.clone(), RecordType::A, 0);
-        rrset.add_rdata(RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 1))));
-        let signer = zsk
-            .dnssec_signer(&zone, Duration::from_secs(86_400))
-            .unwrap();
-        let rec = sign_rrset(&rrset, &signer).unwrap();
-        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &rec.data else {
-            panic!("expected an RRSIG record");
+    fn apex_dnskey_has_two_keys_and_rrsig() {
+        let (s, apex) = signer_for("signed.test.");
+        let recs = s.apex_dnskey(&apex).unwrap();
+        assert_eq!(recs.iter().filter(|r| r.rtype == rtype::DNSKEY).count(), 2);
+        assert_eq!(recs.iter().filter(|r| r.rtype == rtype::RRSIG).count(), 1);
+    }
+
+    #[test]
+    fn signed_soa_and_positive_answer_have_rrsig() {
+        let (s, apex) = signer_for("signed.test.");
+        let soa = s.signed_soa(&apex).unwrap();
+        assert!(soa.iter().any(|r| r.rtype == rtype::SOA));
+        assert!(soa.iter().any(|r| r.rtype == rtype::RRSIG));
+
+        let a = Record {
+            name: Name::from_ascii("www.signed.test.").unwrap(),
+            rtype: rtype::A,
+            rclass: class::IN,
+            ttl: 300,
+            rdata: Rdata::A("192.0.2.1".parse().unwrap()),
         };
-        // The RRSIG must validate against the ZSK public key over the canonical RRset.
-        let tbs = TBS::from_input(
-            rrset.name(),
-            DNSClass::IN,
-            rrsig.input(),
-            rrset.records_without_rrsigs(),
-        )
-        .unwrap();
-        let pubkey = signer.key().to_public_key().unwrap();
-        assert!(
-            pubkey.verify(tbs.as_ref(), rrsig.sig()).is_ok(),
-            "RRSIG must validate against the ZSK public key"
-        );
+        let sig = s.sign_answer(rtype::A, &[a]).unwrap();
+        assert_eq!(sig.rtype, rtype::RRSIG);
     }
 
     #[test]
-    fn nsec3_nodata_and_nxdomain_proofs() {
-        let tmp = std::env::temp_dir().join(format!("rb201n3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let signer =
-            ZoneSigner::new(&tmp, &["example.com.".to_string()], Duration::from_secs(86_400))
-                .unwrap();
-        // Owner set: apex (SOA/DNSKEY) + www (A).
-        let owners = vec![
-            (
-                Name::from_str("example.com.").unwrap(),
-                vec![RecordType::SOA, RecordType::DNSKEY, RecordType::NSEC3PARAM],
-            ),
-            (Name::from_str("www.example.com.").unwrap(), vec![RecordType::A]),
-        ];
-        // NODATA: www exists but has no MX -> matching NSEC3 for www.
-        let nodata = signer
-            .nsec3_nodata(&Name::from_str("www.example.com.").unwrap(), &owners)
-            .expect("NODATA proof");
-        assert!(nodata
-            .iter()
-            .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::NSEC3(_)))));
-        assert!(nodata
-            .iter()
-            .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::RRSIG(_)))));
-        // NXDOMAIN: nope.example.com -> closest-encloser proof (CE=apex, cover next-closer + wildcard).
-        let nx = signer
-            .nsec3_nxdomain(&Name::from_str("nope.example.com.").unwrap(), &owners)
-            .expect("NXDOMAIN proof");
-        let n3 = nx
-            .iter()
-            .filter(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::NSEC3(_))))
-            .count();
-        assert!((1..=3).contains(&n3), "expected 1..3 NSEC3 RRs, got {n3}");
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn signed_negative_has_soa_nsec3_and_owners_have_ents() {
-        let tmp = std::env::temp_dir().join(format!("rb201neg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let apex = Name::from_str("example.com.").unwrap();
-        let signer =
-            ZoneSigner::new(&tmp, &["example.com.".to_string()], Duration::from_secs(86_400))
-                .unwrap();
-        // A record under a deep name forces an empty non-terminal (b.example.com).
+    fn nsec3_nxdomain_produces_covering_records() {
+        let (s, apex) = signer_for("signed.test.");
         let owners = zone_owners(
-            vec![(
-                Name::from_str("a.b.example.com.").unwrap(),
-                vec![RecordType::A],
-            )]
-            .into_iter(),
+            [(Name::from_ascii("www.signed.test.").unwrap(), vec![rtype::A])].into_iter(),
             &apex,
         );
-        assert!(owners
-            .iter()
-            .any(|(n, ts)| *n == apex && ts.contains(&RecordType::SOA)));
-        assert!(owners
-            .iter()
-            .any(|(n, _)| *n == Name::from_str("b.example.com.").unwrap()));
-        let neg = signer
-            .signed_negative(true, &Name::from_str("nope.example.com.").unwrap(), &owners)
-            .expect("signed negative");
-        assert!(neg.iter().any(|r| matches!(&r.data, RData::SOA(_))));
-        assert!(neg
-            .iter()
-            .any(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::NSEC3(_)))));
-        assert!(
-            neg.iter()
-                .filter(|r| matches!(&r.data, RData::DNSSEC(DNSSECRData::RRSIG(_))))
-                .count()
-                >= 2
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn zone_signer_signs_answer_and_apex_dnskey() {
-        use hickory_proto::rr::rdata::A;
-        let tmp = std::env::temp_dir().join(format!("rb201zs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let signer =
-            ZoneSigner::new(&tmp, &["example.com.".to_string()], Duration::from_secs(86_400))
-                .unwrap();
-        assert!(!signer.is_empty());
-
-        // Apex DNSKEY RRset: 2 DNSKEY (KSK+ZSK) + 1 RRSIG.
-        let apex = LowerName::from(Name::from_str("example.com.").unwrap());
-        assert!(signer.is_apex(&apex));
-        let dnskey = signer.apex_dnskey(&apex).unwrap();
-        assert_eq!(dnskey.len(), 3, "DNSKEY RRset must be KSK + ZSK + RRSIG");
-
-        // Sign a positive answer for a name inside the zone.
-        let rec = Record::from_rdata(
-            Name::from_str("www.example.com.").unwrap(),
-            300,
-            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 1))),
-        );
-        let rrsig = signer.sign_answer(RecordType::A, &[&rec]).unwrap();
-        assert!(matches!(&rrsig.data, RData::DNSSEC(DNSSECRData::RRSIG(_))));
-
-        // A name outside any signed zone yields no signature.
-        let foreign = Record::from_rdata(
-            Name::from_str("www.other.net.").unwrap(),
-            300,
-            RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 2))),
-        );
-        assert!(signer.sign_answer(RecordType::A, &[&foreign]).is_none());
-
-        assert!(!signer.ds_records().is_empty());
-        let _ = std::fs::remove_dir_all(&tmp);
+        let proof = s
+            .signed_negative(true, &Name::from_ascii("absent.signed.test.").unwrap(), &owners)
+            .unwrap();
+        // SOA + its RRSIG, plus at least one NSEC3 + RRSIG pair.
+        assert!(proof.iter().any(|r| r.rtype == rtype::SOA));
+        assert!(proof.iter().filter(|r| r.rtype == rtype::NSEC3).count() >= 1);
+        assert!(proof.iter().filter(|r| r.rtype == rtype::RRSIG).count() >= 2);
     }
 }

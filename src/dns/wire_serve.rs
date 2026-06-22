@@ -128,7 +128,7 @@ pub fn serve_datagram(query: &[u8], zones: &LocalZoneSet) -> Option<Vec<u8>> {
 /// CNAME chain following (RFC 1034 §3.6.2), wire-typed twin of
 /// `follow_local_cname`. Returns the CNAME(s) plus the resolved target records,
 /// or empty if the chain does not resolve within the local zones.
-fn follow_cname(zones: &LocalZoneSet, start: &[u8], qtype: u16) -> Vec<Record> {
+pub(crate) fn follow_cname(zones: &LocalZoneSet, start: &[u8], qtype: u16) -> Vec<Record> {
     let mut chain: Vec<Record> = Vec::with_capacity(8);
     let mut current: SmallVec<[u8; 64]> = SmallVec::from_slice(start);
 
