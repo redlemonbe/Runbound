@@ -222,6 +222,52 @@ impl Rdata {
             Rdata::Unknown { data, .. } => e.bytes(data),
         }
     }
+
+    /// Emit RDATA in DNSSEC canonical form (RFC 4034 §6.2): identical to
+    /// [`Rdata::emit`] except every embedded domain name is lowercased. Every
+    /// name-bearing type modelled here (NS/CNAME/PTR/SOA/MX/SRV) is on the §6.2
+    /// downcase list, so the rule is simply "downcase every name".
+    pub fn emit_canonical(&self, e: &mut Encoder) {
+        match self {
+            Rdata::A(ip) => e.bytes(&ip.octets()),
+            Rdata::Aaaa(ip) => e.bytes(&ip.octets()),
+            Rdata::Ns(n) | Rdata::Cname(n) | Rdata::Ptr(n) => n.emit_canonical(e),
+            Rdata::Soa {
+                mname, rname, serial, refresh, retry, expire, minimum,
+            } => {
+                mname.emit_canonical(e);
+                rname.emit_canonical(e);
+                e.u32(*serial);
+                e.u32(*refresh);
+                e.u32(*retry);
+                e.u32(*expire);
+                e.u32(*minimum);
+            }
+            Rdata::Mx { preference, exchange } => {
+                e.u16(*preference);
+                exchange.emit_canonical(e);
+            }
+            Rdata::Txt(strings) => {
+                for s in strings {
+                    e.u8(s.len() as u8);
+                    e.bytes(s);
+                }
+            }
+            Rdata::Srv { priority, weight, port, target } => {
+                e.u16(*priority);
+                e.u16(*weight);
+                e.u16(*port);
+                target.emit_canonical(e);
+            }
+            Rdata::Caa { flags, tag, value } => {
+                e.u8(*flags);
+                e.u8(tag.len() as u8);
+                e.bytes(tag);
+                e.bytes(value);
+            }
+            Rdata::Unknown { data, .. } => e.bytes(data),
+        }
+    }
 }
 
 #[cfg(test)]

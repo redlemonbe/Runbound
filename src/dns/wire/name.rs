@@ -210,6 +210,16 @@ impl Name {
         e.bytes(&self.wire);
     }
 
+    /// Emit the name in DNSSEC canonical form (RFC 4034 §6.2): uncompressed and
+    /// fully lowercased. Length octets (0–63) are below `A`, so a blanket
+    /// ASCII-lowercase leaves them untouched.
+    #[inline]
+    pub fn emit_canonical(&self, e: &mut Encoder) {
+        for &b in &self.wire {
+            e.u8(b.to_ascii_lowercase());
+        }
+    }
+
     /// Render in presentation format (`example.com.`) with RFC 1035 §5.1
     /// escaping of `.`, `\`, and non-printable octets.
     pub fn to_ascii(&self) -> String {

@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "runbound"
-version = "0.21.1"
+version = "0.22.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2342,6 +2342,7 @@ dependencies = [
  "rcgen 0.13.2",
  "regex",
  "reqwest",
+ "ring",
  "rkyv",
  "rustls",
  "rustls-native-certs",
