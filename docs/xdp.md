@@ -73,9 +73,16 @@ An eBPF XDP program attaches to the NIC at startup. UDP/port-53 packets are
 intercepted at the driver level before reaching the kernel network stack:
 
 - **Local zones** → answered entirely in user space (zero syscalls, **<1 ms** latency (below dnsmark resolution))
-- **Recursive / forwarded / unknown** → `XDP_PASS` to normal hickory-server path
+- **Recursive / forwarded / unknown** → `XDP_PASS` to the normal wire-native `serve_wire` slow path
 - **Rate-limited clients** → silently dropped at NIC level
 - **ACL deny** → silently dropped; ACL refuse → REFUSED response crafted in XDP path
+
+> The XDP / AF_XDP / eBPF datapath is **unchanged** by the v0.22 de-hickory work — the
+> kernel fast loop, SIMD/asm, cache snapshot and benchmark methodology are identical.
+> Only the slow path that XDP falls through to is now wire-native (`serve_wire`) instead
+> of the removed hickory-server handler. Note that **XDP mode is what requires the extra
+> capabilities** (`CAP_NET_RAW`/`CAP_NET_ADMIN`/`CAP_BPF`/`CAP_PERFMON`), which are an
+> explicit opt-in in v0.22 (see [hardening.md](hardening.md)).
 
 ## SIMD acceleration in the XDP worker (v0.9.46)
 
@@ -118,8 +125,10 @@ reliable figure.)
 
 Everything the wire builder does not cover — NXDOMAIN, NODATA, **wildcard
 local-data**, CNAME/MX/TXT, EDNS (OPT), ACL Deny, ANY, malformed — transparently
-**falls back to hickory**, so behaviour is unchanged outside the A/AAAA answer case.
-See [benchmark/](benchmark/) for the current benchmark methodology.
+**falls through (`XDP_PASS`) to the wire-native `serve_wire` slow path**, so behaviour is
+unchanged outside the A/AAAA answer case. (Pre-v0.22 this slow path was the hickory-server
+handler; de-hickory replaced it with the in-house wire codec — the XDP worker itself is
+unchanged.) See [benchmark/](benchmark/) for the current benchmark methodology.
 
 ## domain-routing (CPUMAP) and zero-copy (v0.9.66, #155)
 

@@ -133,7 +133,9 @@ The per-query answer is `answer_dns_wire`, which returns a three-way result rath
 ambiguous `Option<usize>` (`src/dns/xdp/worker.rs:WireResult`):
 
 - `Answered(len)` — response written into the TX frame, send it.
-- `Fallback` — wire builder doesn't handle this case → hand to hickory `answer_dns()`.
+- `Fallback` — wire builder doesn't handle this case → hand to the slow-path handler over a
+  bounded channel (`FallbackMsg`, `src/dns/xdp/worker.rs:1350`). Since v0.22 that handler is
+  the wire-native `serve_wire`, not a hickory handler.
 - `Drop` — ACL Deny or unrecoverable error → silent drop, no TX, no fallback.
 
 The explicit enum exists because an earlier `Some(0)` sentinel was a footgun (#155 review).
@@ -169,8 +171,9 @@ File: `src/dns/xdp/wire_builder.rs`. This replaces hickory's
   any EDNS OPT RR. No heap allocation — the `qname_wire` is a slice into the original
   buffer (zero copy).
 - **EDNS / DNSSEC** (`EdnsInfo`, `src/dns/xdp/wire_builder.rs:55`): if the OPT RR has the
-  DO bit set, the query wants DNSSEC → the wire builder returns `Fallback` so hickory
-  handles it. The wire path never fakes DNSSEC.
+  DO bit set, the query wants DNSSEC → the wire builder returns `Fallback` so the slow-path
+  handler (`serve_wire`, which does the DNSSEC signing/serving) handles it. The wire fast
+  path never fakes DNSSEC.
 - **Build**: writes the answer directly into the output (TX UMEM) slice. The response uses
   a DNS **name-compression pointer** (`0xC0 0x0C`, `src/dns/xdp/wire_builder.rs:37`) to
   point the answer's owner name back at the question at offset 12 — so the name is not
@@ -193,8 +196,9 @@ it are the code that runs.
 
 ## 2.6 The recursion-miss reply socket (a subtle correctness bug, fixed)
 
-When the XDP path cannot answer (a recursive query, a cache miss), it falls back to
-hickory. But XDP workers have **no kernel arrival socket** to reply on. Replying from an
+When the XDP path cannot answer (a forwarded query, a cache miss), it falls back to the
+slow-path handler (`serve_wire`). But XDP workers have **no kernel arrival socket** to reply
+on. Replying from an
 ephemeral port causes clients to silently reject the answer (the source port doesn't match
 :53). The fix (#167) is a shared reply socket bound to `:53`, `XDP_FALLBACK_REPLY_SOCK`
 (`src/dns/kernel_loop.rs:55`), used for all XDP-mode fallback replies. This is the kind of
@@ -205,7 +209,8 @@ the code.
 
 ## 2.7 What the fast path deliberately does *not* do
 
-- It does not handle TCP, DoT, DoH, DoQ — those `XDP_PASS` to the kernel and hickory.
+- It does not handle TCP, DoT, DoH, DoQ — those `XDP_PASS` to the kernel and the slow-path
+  handler (`serve_wire`).
 - It does not validate DNSSEC — DO-bit queries fall back.
 - It does not do recursion — misses fall back.
 - IPv6 blacklist hits fall through to the slow path (only IPv4 NXDOMAIN is forged in eBPF).

@@ -56,29 +56,43 @@ pipeline:
   case), so it is free on the hot path.
 - **Then the shared SIMD/ASM responder** — `answer_dns_wire` (local-data / wire) and
   `answer_from_cache` (cache snapshot, §05). Only `WireResult::Fallback` (cache miss,
-  CNAME/MX/DNSSEC DO=1, ANY) is handed to the hickory fallback via a bounded channel.
+  CNAME/MX/DNSSEC DO=1, ANY) is handed to the slow-path handler `serve_wire`
+  (`src/dns/server.rs:1195`) via a bounded channel.
 
 The net effect: in `xdp: no` the cache-hit path is the same hand-written wire builder as
-XDP, on a kernel UDP socket; hickory only sees the genuine misses.
+XDP, on a kernel UDP socket; the wire-native `serve_wire` handler only sees the genuine
+misses.
 
 ## 4.1 Backpressure against flood — a hard inflight cap
 
-hickory-server spawns one Tokio task per incoming request **with no backpressure**; under
-a flood this exhausts RAM. Runbound bounds it with a semaphore of `MAX_INFLIGHT_REQUESTS =
-4096` (`src/dns/server.rs:62`). A **non-blocking** `try_acquire` returns `REFUSED`
-instantly without allocating, so the bound holds even at line rate. This is a deliberate
-availability trade-off: shed load rather than OOM.
+A spawn-per-request handler with no backpressure (as the old hickory `ServerFuture` was)
+exhausts RAM under a flood. The wire-native handler bounds concurrency with a semaphore of
+`MAX_INFLIGHT_REQUESTS = 4096` (`src/dns/server.rs:71`). A **non-blocking** `try_acquire`
+returns `REFUSED` instantly without allocating, so the bound holds even at line rate. This
+is a deliberate availability trade-off: shed load rather than OOM.
 
-## 4.2 Recursion, racing, and the hard timeout
+## 4.2 Forwarding, racing, and the hard timeout
 
-- **Upstream racing** (`upstream-racing: yes`): the resolver issues queries to multiple
-  upstreams in parallel and takes the first success via `futures_util::future::select_ok`
-  (`src/dns/server.rs`).
-- **Hard lookup timeout** (#83): resolver lookups are wrapped in a hard timeout to prevent
-  a stuck upstream from pinning a task/Tokio worker indefinitely (a deadlock root cause
-  that was measured and fixed).
+Forwarding is wire-native since v0.22 — the in-house forward pool (`src/dns/forward.rs`),
+not a hickory resolver:
+
+- **Upstream racing** (`upstream-racing: yes`): the forward pool queries all upstreams in
+  parallel and the first **definitive** result (positive or authoritative negative) ends
+  the race; a `Servfail` is not definitive (`Forward::is_definitive`,
+  `src/dns/forward.rs:56`; race at `src/dns/forward.rs:345`).
+- **txid + question validation** (SEC-O1): a plain-UDP upstream response is accepted only
+  when its transaction ID and its question (name case-insensitive + type + class) match the
+  query (`src/dns/forward.rs:272`) — a cache-poisoning defence the de-hickory forwarder
+  added.
+- **Hard lookup timeout** (#83): forward lookups are wrapped in a hard timeout so a stuck
+  upstream cannot pin a task/Tokio worker indefinitely (a measured-and-fixed deadlock root
+  cause).
 - **TLS** via `rustls` 0.23 (TLS 1.2 + 1.3) for DoT/DoH/DoQ.
-- **TSIG** supported (`hickory_proto::rr::rdata::tsig`).
+- **TSIG** is wire-native on `ring` HMAC (RFC 8945), `src/dns/tsig.rs` — no longer
+  `hickory_proto`'s TSIG; the key-name lookup is constant-time (§07).
+
+The optional `recursor` Cargo feature adds the sovereign full-recursion path
+(`src/dns/recursor.rs`, still on `hickory-resolver`); it is not part of the default build.
 
 ## 4.3 Upstream health monitoring
 
@@ -96,9 +110,9 @@ availability trade-off: shed load rather than OOM.
 In `xdp: no` the kernel fast loop (§4.0) answers cache hits directly from the **same
 cache snapshot** the AF_XDP path reads (`answer_from_cache`, chapter 05) — built in both
 modes since the #183 fix. Before that fix the snapshot was built only for `xdp: yes` and
-the racing resolvers carried no cache, so `xdp: no` forwarded *every* query (cache-hit ≈
+the racing forwarders carried no cache, so `xdp: no` forwarded *every* query (cache-hit ≈
 0 %) — the production-relevant regression that motivated the unified slow-path cache. The
-hickory **fallback** still infers a hit from latency (a lookup under
+`serve_wire` **fallback** still infers a hit from latency (a lookup under
 `CACHE_HIT_THRESHOLD_US`, `crate::stats`).
 
 ## 4.5 NIC auto-tune at startup (v0.17.0, `xdp: no` only)
@@ -143,9 +157,24 @@ card (which NUMA node it sits on) and the CPU (node size); NIC families with har
 steering (e.g. mlx5 aRFS) may prefer a different strategy — a driver-aware path is future
 work.
 
+## 4.6 Feature parity restored on the wire path (v0.22)
+
+These features had lived only in the now-default-disabled hickory handler; v0.22 re-implements
+them in `serve_wire` so the default (wire) path keeps them:
+
+- **Query logging** — wire-native, feeds the WebUI Logs panel and `GET /api/logs`
+  (`src/dns/server.rs:1137`).
+- **serve-stale** (#108, RFC 8767) — a wire-native stale cache (`stale_cache_wire`,
+  `src/dns/server.rs:186`) keyed by `(name, type)`, serving an expired answer on a transient
+  upstream SERVFAIL (the legacy hickory-typed `stale_cache` survives only on the `recursor`
+  path).
+- **resolv.conf emergency fallback** (#94) — when all configured upstreams are down the
+  forward path falls back to `/etc/resolv.conf` and recovers automatically
+  (`src/dns/server.rs:948`, recovery probe at `:3644`).
+- **Per-upstream racing-win metric** (#33, in `GET /api/system`) and **top-domains
+  slow-path counting** (#5) are likewise restored on the wire path.
+
 ## To expand (verify against code)
-- serve-stale (#108) exact TTL policy.
-- resolv.conf emergency fallback (#94).
 - (Negative caching #166 is documented in [02-fast-path-xdp.md](02-fast-path-xdp.md) §2.5
   — the kloop serves the same snapshot, see §4.4.)
 

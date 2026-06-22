@@ -48,7 +48,7 @@ Directives that work but with noted differences from Unbound's behavior.
 
 | Directive | Caveat |
 |---|---|
-| `dnssec-validation` | Runbound enables DNSSEC in forwarder mode only — it trusts the upstream AD bit rather than performing full RRSIG chain validation. Full recursive DNSSEC is planned for v1.x. |
+| `dnssec-validation` | In the **default build** (forwarding resolver), Runbound trusts the upstream AD bit rather than performing full RRSIG chain validation. Full RRSIG-chain validation is performed under sovereign full recursion (`resolution: full-recursion`), which is built from the optional `recursor` Cargo feature — not part of the default release binary. |
 | `rate-limit` | Runbound uses a per-IP token bucket compatible with Unbound's semantics. Runbound extends this with per-subnet bucketing via `rate-limit-prefix-v4` / `rate-limit-prefix-v6` (Runbound-specific directives). |
 | `tls-cert-bundle` | Accepted as an alias for `tls-service-pem`. Unbound uses `tls-cert-bundle` for the CA bundle, not the server certificate — if you use both, set `tls-service-pem` explicitly. |
 
@@ -157,9 +157,9 @@ Directives accepted by Runbound but not understood by Unbound. Unbound will warn
 ### 1. Install Runbound
 
 ```bash
-curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-linux-x86_64-musl
-chmod +x runbound-linux-x86_64-musl
-sudo mv runbound-linux-x86_64-musl /usr/local/sbin/runbound
+curl -LO https://github.com/redlemonbe/Runbound/releases/latest/download/runbound-x86_64-linux-musl
+chmod +x runbound-x86_64-linux-musl
+sudo mv runbound-x86_64-linux-musl /usr/local/sbin/runbound
 ```
 
 ### 2. Test against your existing config

@@ -345,7 +345,8 @@ pub struct UnboundConfig {
     pub ui_enabled: bool,
     /// Port for the web UI listener. Default: 8091.
     pub ui_port: u16,
-    /// Bind address for the web UI listener. Default: 0.0.0.0.
+    /// Bind address for the web UI listener. Default: 127.0.0.1 (loopback) —
+    /// set `ui-bind: 0.0.0.0` to expose the admin panel on the network.
     pub ui_bind: String,
     /// Enable TLS on the web UI listener. Default: true.
     pub ui_tls: bool,

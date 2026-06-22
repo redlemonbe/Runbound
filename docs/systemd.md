@@ -26,10 +26,16 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# Capabilities — CAP_NET_ADMIN + CAP_BPF required for XDP attach
-# CAP_NET_RAW required for AF_XDP socket
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+# Capabilities — least privilege. The default (xdp: no) path only needs
+# CAP_NET_BIND_SERVICE to bind :53. The XDP fast path (xdp: yes) additionally
+# needs CAP_NET_RAW (AF_XDP socket), CAP_NET_ADMIN (attach the XDP program),
+# CAP_BPF + CAP_PERFMON (load eBPF) — and the firewall-manage feature needs
+# CAP_NET_ADMIN. If you enable any of those, switch to the wider set below.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# XDP (xdp: yes) / firewall-manage — uncomment instead of the two lines above:
+# AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 
 # AF_XDP socket family
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP

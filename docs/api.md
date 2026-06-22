@@ -182,10 +182,10 @@ curl -X DELETE "http://localhost:8080/api/blacklist/$ID" \
 
 When XDP is active, blacklisted domains are pushed into a BPF hash map
 (`dns_blacklist`, 500 000 entries). IPv4 DNS queries matching a blocked domain are
-answered with **NXDOMAIN in-place at the XDP layer** — no kernel stack, no hickory
+answered with **NXDOMAIN in-place at the XDP layer** — no kernel stack, no slow-path
 overhead (~1 µs RTT).
 
-- IPv6 queries for blocked domains fall through to the hickory slow path (still blocked).
+- IPv6 queries for blocked domains fall through to the wire-native slow path (still blocked).
 - The map is updated atomically after every `POST /api/blacklist` and `DELETE /api/blacklist/:id`.
 - `GET /api/stats` includes `xdp_blocked_total` — packets blocked at the XDP layer.
 - `GET /api/blacklist` includes `xdp_active: true` when the BPF map is loaded.
@@ -348,8 +348,8 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stat
 | `qps_1m` / `qps_5m` | Average queries/second over the last 1 and 5 minutes |
 | `qps_peak` | All-time highest queries in any single second |
 | `latency_p50/95/99_ms` | Latency percentiles from a fixed 10-bucket histogram (zero-alloc) |
-| `cache_hit_rate` | Percentage of forwarded lookups served from hickory's in-process cache (< 2 ms) |
-| `cache_entries` | Approximate distinct domains cached (saturates at resolver `cache_size = 8192`) |
+| `cache_hit_rate` | Percentage of forwarded lookups served from the in-process DNS cache (< 2 ms) |
+| `cache_entries` | Approximate distinct domains cached |
 | `dnssec.secure` | Queries validated with a full RRSIG chain (requires `dnssec-validation: yes`) |
 | `dnssec.bogus` | Queries where DNSSEC validation failed — potential tampering or misconfiguration |
 | `dnssec.insecure` | Queries for zones with no DNSSEC signatures (unsigned delegations) |
@@ -386,6 +386,9 @@ The stream is a standard SSE event stream (`Content-Type: text/event-stream`). E
 Most-queried domain names since process start, sorted by query count descending.
 Tracks up to 10,000 distinct domains. Counter is cumulative (not windowed).
 
+> **v0.22:** slow-path domain counting is done on the default wire serving path, so
+> top-domains is populated independently of the optional hickory recursor.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `limit` | integer | 10 | Number of results (1–100) |
@@ -414,6 +417,10 @@ Once the cap is reached, new domains are silently ignored until the process rest
 ### `GET /api/logs`
 
 Recent DNS query log, newest first. Entries are kept in a fixed-size ring buffer pre-allocated at startup (zero allocation per query). The buffer size is controlled by `log-retention` in `runbound.conf` (default: **1,000**, compile-time max: 10,000). Set to `0` to disable the buffer entirely.
+
+> **v0.22:** query logging is populated by the default wire serving path (`serve_wire`).
+> It is no longer tied to the (now optional) hickory recursor handler — every served
+> query is logged regardless of build features.
 
 ```bash
 # Last 100 queries (default)
@@ -473,7 +480,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 | Action | Meaning |
 |---|---|
 | `forwarded` | Network round-trip to upstream (cache miss) |
-| `cached` | Served from hickory's in-process DNS cache (< 2 ms) |
+| `cached` | Served from the in-process DNS cache (< 2 ms) |
 | `local` | Answered from local zone data (config or `POST /dns`) |
 | `blocked` | Domain blocked by blacklist or feeds |
 | `nxdomain` | NXDOMAIN from upstream or local zone |
@@ -874,6 +881,8 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
   "nic_rx_ring": 4096,
   "nic_rx_ring_max": 4096,
   "nic_rx_dropped": 0,
+  "upstream_racing": true,
+  "upstream_racing_wins": { "1.1.1.1@853": 8123, "9.9.9.9@853": 5012 },
   "anycast": { "configured": true, "address": "198.51.100.53/32", "announced": true, "peer": "192.168.1.1", "local_as": 65001 }
 }
 ```
@@ -888,6 +897,8 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 | `nic_rx_ring` | u32 | Current RX ring depth applied to the NIC (descriptors). `0` when XDP is disabled or the driver does not support ethtool ring queries. |
 | `nic_rx_ring_max` | u32 | Maximum RX ring depth supported by the driver. Equal to `nic_rx_ring` when auto-sizing succeeded. |
 | `nic_rx_dropped` | u64 | Hardware-level RX drops read from `/sys/class/net/<iface>/statistics/rx_dropped`. A non-zero value under load indicates the NIC FIFO is overflowing before XDP sees the packets. |
+| `upstream_racing` | bool | `true` when `upstream-racing: yes` is set. |
+| `upstream_racing_wins` | object | Per-upstream racing-win counters (#33), `{ "<ip>": count }`. The number of times each upstream returned the first valid answer for a raced query. Empty `{}` until the first raced win. Populated on the default wire serving path (v0.22). |
 | `anycast` | object | Anycast announcer state (see [anycast.md](../docs/anycast.md)). `{ configured, address, peer, local_as, announced }` when an `anycast:` block is set; `{ "configured": false }` otherwise. `announced` is `true` while the exabgp child is up (route advertised). The WebUI **System** tab renders this per node (master + each slave via the relay). |
 
 ---

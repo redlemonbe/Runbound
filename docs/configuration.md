@@ -263,16 +263,20 @@ Runbound can serve the management dashboard itself — no nginx required.
 
 ```
 server:
-    ui-enabled: yes   # default: no
-    ui-port:    8090  # default: 8090
-    ui-bind:    0.0.0.0   # default: 0.0.0.0 (all interfaces)
+    ui-enabled: yes        # default: no
+    ui-port:    8091       # default: 8091
+    ui-bind:    127.0.0.1  # default: 127.0.0.1 (localhost only)
 ```
 
 | Directive | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `ui-enabled` | bool (`yes`/`no`) | `no` | Enable the embedded web UI server |
-| `ui-port` | integer | `8090` | TCP port the UI server binds to |
-| `ui-bind` | string | `0.0.0.0` | Bind address for the UI server |
+| `ui-port` | integer | `8091` | TCP port the UI server binds to |
+| `ui-bind` | string | `127.0.0.1` | Bind address for the UI server |
+
+> **Security (v0.22):** `ui-bind` defaults to `127.0.0.1` (localhost only) — the
+> admin panel is **not** reachable from the network out of the box. To expose the
+> WebUI on the LAN, set this explicitly, e.g. `ui-bind: 0.0.0.0`.
 
 The embedded server serves `index.html` at `GET /` and transparently proxies
 every `/api/*` request to `http://127.0.0.1:<api-port>` — the REST API remains
@@ -320,8 +324,11 @@ dnssec-validation: no    # default — trust upstream AD bit (forwarder mode)
 dnssec-validation: yes   # local re-validation (recursive mode only)
 ```
 
-Mirrors Unbound's `dnssec-validation` directive. When set to `yes`, hickory-resolver
-performs local DNSSEC re-validation of every response.
+Mirrors Unbound's `dnssec-validation` directive. When set to `yes`, the sovereign
+recursor performs local DNSSEC re-validation of every response. This requires
+`resolution: full-recursion` on a binary built with the `recursor` feature (see
+[Resolution mode](#resolution-mode--forward-vs-full-recursion-202)); in the default
+forwarder build Runbound trusts the upstream AD bit.
 
 **Warning:** Only enable in full recursive deployments where upstream resolvers return
 complete RRSIG/DNSKEY chains. In forwarder mode (the typical setup with Cloudflare or
@@ -342,7 +349,7 @@ Return expired cache entries while fetching a fresh answer in the background. Pr
 
 ```
 server:
-    serve-expired: yes             # Serve stale entries. Default: no.
+    serve-expired: yes             # Serve stale entries. Default: yes.
     serve-expired-ttl: 86400       # Max age of stale entries in seconds. 0 = unlimited.
     serve-expired-reply-ttl: 30    # TTL returned to clients for stale answers.
 ```
@@ -514,8 +521,8 @@ configuration required.
 # Excess requests receive REFUSED immediately, zero allocation.
 ```
 
-`hickory-server` spawns one tokio task per incoming DNS request with no backpressure.
-Under a flood (DDoS or benchmark), this exhausts RAM and triggers the Linux OOM killer.
+The async serving path spawns one tokio task per incoming DNS request. Without a bound,
+a flood (DDoS or benchmark) would exhaust RAM and trigger the Linux OOM killer.
 Runbound imposes a semaphore of **4,096 concurrent in-flight requests**. When the limit
 is reached, new requests receive `REFUSED` instantly without allocating any memory.
 This bound is hard even at line rate.
@@ -534,7 +541,7 @@ reaches **80 %**, two caches are flushed atomically:
 | Cache | Action | Recovery |
 |---|---|---|
 | Rate-limiter DashMap | All token buckets cleared | Rebuilds naturally on next query per IP |
-| hickory-resolver cache | Resolver rebuilt, ArcSwap pointer swapped | In-flight queries keep old resolver; new queries use fresh empty cache |
+| Forwarder / resolver cache | Resolver rebuilt, ArcSwap pointer swapped | In-flight queries keep old resolver; new queries use fresh empty cache |
 
 After purging, usage and whether the 50 % target was reached are logged at `WARN` level.
 On non-Linux systems or containers without `/proc/meminfo`, the guard silently skips
@@ -706,7 +713,7 @@ server:
 ```
 
 Enable the XDP cache snapshot path: cache hits are answered directly by the XDP worker
-thread from an `ArcSwap<HashMap>` without entering the hickory resolver.
+thread from an `ArcSwap<HashMap>` without entering the slow path at all.
 Requires `xdp: yes`. Reduces per-query latency for cached responses to < 1 µs.
 
 Cache entries are stored with a pre-serialized wire-format payload (`wire_payload: Bytes`).
@@ -863,7 +870,16 @@ server:
 `full-recursion` makes Runbound a **sovereign recursive resolver**: it resolves iteratively
 from the root servers itself, so no third-party resolver ever sees your queries.
 
-When full-recursion is active:
+> **Build requirement (v0.22):** since the de-hickory rewrite the default binary serves
+> DNS entirely on Runbound's own wire codec and contains **no DNS request handler from
+> hickory**. The sovereign recursor is the one component that still uses
+> `hickory-resolver`, so it ships behind an optional **`recursor` Cargo feature**
+> (`cargo build --features recursor`). On a default build, `resolution: full-recursion`
+> is parsed but the recursor is a no-op and Runbound silently stays in `forward` mode.
+> Everything else (forward & local-zone resolution, split-horizon, AXFR/IXFR, TSIG, DDNS,
+> DNSSEC signing) is served wire-native with no hickory handler.
+
+When full-recursion is active (on a `recursor`-enabled build):
 - **DNSSEC is validated and enforced** when `dnssec-validation: yes` — a Bogus answer is
   refused with SERVFAIL, the AD bit is set only for fully-Secure answers, and DNSSEC records
   are stripped for non-DO clients (RFC 4035 §3.2.1).
@@ -1185,6 +1201,11 @@ io-uring {
 |---|---|---|---|
 | `enable` | bool (`yes`/`no`) | `no` | Enable io_uring for async DNS and API I/O. |
 
+> **Parser note (v0.22):** `io-uring:` is a sub-block of `server:` and owns only the
+> `enable` key. A `server:` directive written **after** an `io-uring { … }` block (still
+> inside `server:`) is now correctly parsed as a `server:` directive — previously it was
+> dispatched to the `io-uring` sub-block and silently dropped.
+
 **Startup detection:** Runbound reads `/proc/sys/kernel/io_uring_disabled` at
 startup. If the value is `1` or `2` (restricted or disabled), io_uring is
 silently skipped even when `enable: yes` is set, and a `WARN` is emitted.
@@ -1237,6 +1258,16 @@ axfr {
 |---|---|---|---|
 | `enable` | bool (`yes`/`no`) | `no` | Enable AXFR zone transfer responses on TCP port 53. |
 | `allow` | CIDR | — | IP range allowed to request AXFR. Repeat for multiple ranges. Required when `enable: yes`. |
+
+> **Parser note (v0.22):** `axfr:` is a sub-block of `server:` and owns only the `enable`
+> and `allow` keys. A `server:` directive written **after** an `axfr { … }` block (still
+> inside `server:`) is now correctly parsed as a `server:` directive — previously it was
+> dispatched to the `axfr` sub-block and silently dropped.
+>
+> **Real client IP (v0.22):** the `allow:` ACL now evaluates the **true** source address.
+> TCP/DoT/DoH are proxied through an internal loopback relay; the relay carries the real
+> client IP to the handler via a PROXY v2 header, so AXFR requests are no longer matched
+> against `127.0.0.1`.
 
 **Security model:** AXFR exposes your full zone contents in a single TCP
 connection. Always restrict `allow:` to trusted secondary nameserver IPs.
@@ -1608,7 +1639,7 @@ unless a section header is shown.
 | `allow-update` | `yes` | Allow live record updates via the REST API. Set `no` for read-only. |
 | `audit-checkpoint-every` | `10000` | Write an audit-log checkpoint every N entries (fast crash recovery). `0` disables. |
 | `sync-allow-private-relay` | `no` | Master: accept slave relay hosts in RFC 1918 / ULA ranges (local deployments). |
-| `tsig-key` | — | AXFR/IXFR TSIG key: `tsig-key: "name" <algorithm> "base64secret"`. May repeat. |
+| `tsig-key` | — | AXFR/IXFR/DDNS TSIG key: `tsig-key: "name" <algorithm> "base64secret"`. May repeat. The key name is normalized (trailing dot stripped, lower-cased) so a name written with a trailing dot — `"name."` — matches the verifier. Lookup against an incoming request's key name is constant-time. |
 
 ### XDP fine-tuning
 

@@ -25,15 +25,24 @@ tiers, fastest first:
                          └───────────────┬─────────────────────────────┘
                                          │ fallback channel
                          ┌───────────────▼─────────────────────────────┐
-                         │ Tier 3 — hickory ServerFuture (slow path)    │
-                         │   recursion, TCP, DoT/DoH/DoQ, DNSSEC, TSIG,  │
-                         │   AXFR, CNAME/MX, EDNS DO=1                    │
+                         │ Tier 3 — wire-native handler `serve_wire`    │
+                         │   forward, TCP, DoT/DoH/DoQ, DNSSEC signing,  │
+                         │   TSIG, AXFR/IXFR, DDNS, CNAME/MX, EDNS DO=1   │
+                         │   (optional `recursor` feature = full         │
+                         │    recursion via hickory-resolver)            │
                          └───────────────────────────────────────────────┘
 ```
 
 Tier 1 and Tier 2 are mutually exclusive at runtime (chosen by the `xdp` config
-directive). Both share the **same** zero-allocation wire answer routine and both demote
-hickory to a pure fallback. Tier 3 is always present.
+directive). Both share the **same** zero-allocation wire answer routine. Tier 3 is always
+present. As of **v0.22 ("de-hickory")** Tier 3 is the in-house wire handler `serve_wire`
+(`src/dns/server.rs:1195`, codec in `src/dns/wire/`): the `hickory-server` request handler
+is gone from the default binary. The only place a hickory request handler still runs is the
+sovereign full-recursion resolver, gated behind the optional `recursor` Cargo feature
+(`Cargo.toml:180`, `dep:hickory-resolver` + `dep:hickory-server`). `hickory-proto` stays a
+default dependency — it backs part of the in-memory data model and the XDP response
+builders, and is a differential-oracle dev-dependency for tests — but no hickory handler is
+on the default serving path.
 
 ## 1.2 Why this shape — the measurement that drove it
 
@@ -50,7 +59,9 @@ That is **1.78× more instructions per query** than Unbound, and the root cause 
 identified as the hickory `ServerFuture` model: one `tokio::spawn` per UDP query plus a
 generic `Message::emit` codec on the hot path. The wire fast path
 (`answer_dns_wire`) and the cache fast path exist to take the common queries *out* of that
-model entirely; hickory then only handles what genuinely needs a full server.
+model entirely; the wire-native `serve_wire` handler then deals with what genuinely needs a
+full server. The v0.22 de-hickory work removed the hickory request handler from the default
+build outright, so even the fallback path no longer pays the `ServerFuture` per-query cost.
 
 > This is also why the whitepaper is careful with performance claims: the slow path was
 > measurably heavier than Unbound, and the fast paths are the remedy. The end-to-end
@@ -98,7 +109,9 @@ fast-path lookups would silently miss, so the test is the guard against a silent
 | XDP fast path | `src/dns/xdp/` | eBPF loader, AF_XDP sockets, UMEM, worker, wire builder |
 | eBPF program | `ebpf/dns_xdp.c` | XDP hook compiled at build, embedded in the binary |
 | Kernel UDP fast loop | `src/dns/kernel_loop.rs` | `SO_REUSEPORT` per-core fast loop (xdp: no) |
-| Slow path | `src/dns/server.rs` | hickory ServerFuture, recursion, DoT/DoH, DNSSEC |
+| Slow path (wire-native) | `src/dns/server.rs` (`serve_wire`), `src/dns/wire_serve.rs` | forward, DoT/DoH, AXFR/IXFR, TSIG, DDNS, DNSSEC signing |
+| Wire DNS codec | `src/dns/wire/` | in-house message/name/rdata encode+decode (de-hickory) |
+| Optional recursor | `src/dns/recursor.rs` (`recursor` feature) | sovereign full recursion (hickory-resolver) |
 | SIMD/ASM kernels | `src/dns/simd.rs`, `src/dns/hasher.rs` | lowercasing, comparison, hashing |
 | Local zones | `src/dns/local.rs` | `LocalZoneSet`, `WireRecordIndex` |
 | REST API | `src/api/` | axum CRUD, relay, SSE, backup, split-horizon |

@@ -106,10 +106,13 @@ firehose, and an earlier latency knee — its rate under a sub-millisecond media
 the magnitude of that headroom is not measured here. (v0.16.1 X520 fast-path and slow-path
 reports archived — in git history pre-`6ff6ae4`; the current round is in [benchmark/INDEX.md](../benchmark/INDEX.md).)
 
-> The slow path serves from cache only since the #183 fix: the racing resolvers were built
+> The slow path serves from cache only since the #183 fix: the racing forwarders were built
 > cache-less and the cache snapshot was built for `xdp: yes` only, leaving `xdp: no`
-> forwarding every query since v0.6.12. The "1.78x hickory" note below is the *fallback*
-> path (cache misses, CNAME/MX/TSIG); cache hits now take the shared ASM responder.
+> forwarding every query since v0.6.12. The "1.78× hickory" figure above is historical — it
+> measured the pre-v0.22 hickory `ServerFuture` fallback (cache misses, CNAME/MX); as of
+> v0.22 even the fallback is the wire-native `serve_wire` handler, and cache hits take the
+> shared ASM responder. The DNS datapath is byte-identical across the de-hickory work, so the
+> measured throughput/latency numbers in this chapter are unchanged.
 
 ## Independent cross-validation (dnsperf)
 

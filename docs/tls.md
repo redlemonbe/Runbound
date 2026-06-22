@@ -213,7 +213,7 @@ to use DoH from a browser:
 
 ## WebUI TLS — auto-generated certificate SANs
 
-### Default SANs (as of v0.9.44)
+### Default SANs
 
 When Runbound generates a WebUI TLS certificate automatically (the default when no
 `ui-cert`/`ui-key` is configured), the certificate always includes the following

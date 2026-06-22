@@ -13,25 +13,39 @@ runbound --check-config /etc/runbound/unbound.conf
 
 ## Capabilities
 
-| Parameter | Effect if missing |
-|---|---|
-| `CAP_NET_BIND_SERVICE` | Cannot bind to port 53 — server fails to start |
-| `CAP_NET_RAW` | XDP disabled silently — server runs normally on SO_REUSEPORT fallback |
-| `CAP_NET_ADMIN` | XDP disabled silently |
-| `CAP_BPF` | XDP disabled silently |
+**Least-privilege default (v0.22, PENT-3):** the shipped `runbound.service` and
+`install.sh` grant **only `CAP_NET_BIND_SERVICE`**. The default `xdp: no` path needs
+nothing else. The XDP fast path (`xdp: yes`) and the firewall-manage feature each need
+the wider set — an **explicit, commented opt-in** in the unit file.
 
-The recommended way to grant capabilities to the binary (without running as root):
+| Parameter | When needed | Effect if missing |
+|---|---|---|
+| `CAP_NET_BIND_SERVICE` | always (bind :53) | Cannot bind to port 53 — server fails to start |
+| `CAP_NET_RAW` | XDP only | XDP disabled silently — server runs normally on SO_REUSEPORT fallback |
+| `CAP_NET_ADMIN` | XDP + firewall-manage | XDP / firewall-manage disabled silently |
+| `CAP_BPF` | XDP only | XDP disabled silently |
+| `CAP_PERFMON` | XDP only | eBPF load may fail — XDP disabled silently |
 
-```bash
-sudo setcap cap_net_bind_service,cap_net_raw,cap_net_admin,cap_bpf+eip $(which runbound)
-```
-
-Or via systemd unit:
+**Default (no XDP, no firewall-manage) — what the shipped unit uses:**
 
 ```ini
 [Service]
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
+
+**XDP fast path / firewall-manage — uncomment the wider set instead:**
+
+```ini
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+```
+
+To grant the XDP capabilities to the binary directly (without running as root):
+
+```bash
+sudo setcap cap_net_bind_service,cap_net_raw,cap_net_admin,cap_bpf,cap_perfmon+eip $(which runbound)
 ```
 
 ---
@@ -167,9 +181,11 @@ RestartSec=5
 User=runbound
 Group=runbound
 
-# Capabilities — port 53 + XDP kernel-bypass
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+# Capabilities — port 53 + XDP kernel-bypass.
+# NOTE: this is the XDP profile. For the default xdp:no deployment, drop everything
+# except CAP_NET_BIND_SERVICE (see the Capabilities section above).
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 NoNewPrivileges=yes
 
 # XDP requires AF_XDP + unlocked memory + eBPF JIT

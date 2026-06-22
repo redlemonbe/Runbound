@@ -4,6 +4,12 @@ This document describes the tooling, cadence, and procedures used to keep Runbou
 dependency tree free of known vulnerabilities, licence violations, and stale crates,
 and to guide internal or third-party source-code audits.
 
+> **Audit cycle history** lives under [`docs/security-audit/`](security-audit/): the
+> per-cycle white-box report ([`SECURITY-AUDIT.md`](security-audit/SECURITY-AUDIT.md)),
+> the v0.22 de-hickory cycle ([`CYCLE-O-dehickory-2026-06-22.md`](security-audit/CYCLE-O-dehickory-2026-06-22.md)),
+> and the aggressive pentest ([`pentest-aggressive-2026-06-22.md`](security-audit/pentest-aggressive-2026-06-22.md)).
+> Those files are point-in-time snapshots — do not rewrite them.
+
 ---
 
 ## Tools
@@ -81,7 +87,9 @@ check of the RUSTSEC advisory database and the upstream changelog before merging
 |---|---|---|
 | `rustls` / `rustls-webpki` | `src/main.rs`, `src/sync.rs` | TLS stack — CVE here breaks DoT/DoH/DoQ security |
 | `tokio` | everywhere | Async runtime — attack surface for all network I/O |
-| `hickory-server` / `hickory-resolver` | `src/dns/server.rs` | DNS parsing — processes untrusted network input |
+| in-house wire codec (`src/dns/wire/`) | `src/dns/server.rs` → `serve_wire`, `src/dns/forward.rs` | DNS parsing — the default network-facing path processes untrusted input here (no hickory request handler in the default build) |
+| `hickory-proto` | `src/dns/`, XDP builders | Default dep — backs part of the data model and XDP response builders (no request handler) |
+| `hickory-server` / `hickory-resolver` | `recursor` feature only | Optional sovereign full-recursion path — **not** in the default build |
 | `axum` / `hyper` | `src/api/mod.rs` | HTTP server — injection, path traversal, request smuggling |
 | `serde_json` | `src/store.rs`, `src/api/mod.rs` | JSON deserialisation — parses external (API) input |
 | `ring` | transitive via `rustls` | Cryptographic backend — AEAD, HMAC, ECDSA |
@@ -148,7 +156,10 @@ and should be reviewed first.
 | **HSM key management** | `src/hsm.rs` → `load_and_store`, `extract_key` | Key extraction path, `Zeroizing<T>` usage, session close after extraction, fatal-on-failure guarantee |
 | **Store integrity** | `src/store.rs`, `src/integrity.rs` | HMAC-SHA256 verification before deserialisation; timing-safe MAC comparison |
 | **DNS name parsing** | `src/api/mod.rs` → `validate_dns_name` | RFC 1035 §2.3.4 boundaries (253-char total, 63-char label, ASCII only); applies to `name` field AND CNAME/MX/NS/PTR/SRV targets |
-| **DNS query handler** | `src/dns/server.rs` | ACL bypass vectors, ANY/AXFR blocking, CHAOS-class identity probe suppression |
+| **DNS query handler (wire-native)** | `src/dns/server.rs` → `serve_wire` | Default serving path on the in-house wire codec (no hickory handler): ACL bypass vectors, ANY/AXFR blocking, CHAOS-class identity probe suppression |
+| **Real client IP / PROXY v2** | `src/dns/server.rs` → `read_proxy_v2`, `proxy_v2_header`, loopback relay | Real client IP carried over the loopback relay (PROXY v2, read before the TLS handshake for DoT/DoH); `axfr-allow`, split-horizon and ACL must evaluate the true source, not `127.0.0.1` |
+| **TSIG** | `src/dns/tsig.rs` | Constant-time key-name lookup (`subtle::ConstantTimeEq`), `ring::hmac::verify` MAC check, trailing-dot key-name normalisation |
+| **Forward path** | `src/dns/forward.rs` → `response_matches` | Upstream response transaction-ID + question (name/type/class) validation before acceptance (cache-poisoning defence) |
 | **HA sync** | `src/sync.rs` | mTLS TOFU cert pinning, constant-time sync-token comparison, write-block on slave |
 | **Rate limiting** | `src/api/mod.rs` → `ApiRateLimiter`, `src/dns/ratelimit.rs` | Token-bucket correctness, IPv4-mapped IPv6 normalisation, XFF rejection |
 

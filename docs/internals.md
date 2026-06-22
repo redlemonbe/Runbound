@@ -1,7 +1,7 @@
 # Runbound Internals — Packet Lifecycle & Architecture
 
 Audience: kernel/network engineers, performance analysts, contributors.  
-Version: v0.15.0.
+Version: v0.22.0.
 
 ---
 
@@ -22,15 +22,26 @@ NIC hardware
     │
     └─── [XDP_PASS] ─── kernel UDP stack ─── SO_REUSEPORT ─── Tokio worker
                                                                      │
-                                                             hickory-server:
-                                                             · recursive resolve
+                                                             serve_wire (wire-native):
+                                                             · local-zone + split-horizon
                                                              · upstream forward (DoT/UDP)
-                                                             · DNSSEC validation
+                                                             · AXFR/IXFR · TSIG · DDNS
+                                                             · DNSSEC signing
                                                              · blacklist / feeds
 ```
 
 The XDP path handles the hot path (local zones + cache hits) at kernel-bypass speed.  
-The Tokio path handles everything else (cache misses, recursion, management API).
+The Tokio path handles everything else (cache misses, forwarding, management API).
+
+> **v0.22 — de-hickory.** The default build serves DNS **entirely on Runbound's own DNS
+> wire codec** (`src/dns/wire/`, the `serve_wire` path in `src/dns/server.rs`). The
+> hickory-dns request handler (`hickory-server`) is **removed from the default binary** —
+> `cargo tree -i hickory-server` is empty by default. The sovereign **full-recursion**
+> resolver (which still uses `hickory-resolver`) lives behind an optional **`recursor`
+> Cargo feature** and is the *only* place hickory still handles requests. `hickory-proto`
+> remains a default dependency: it backs part of the in-memory data model, the XDP
+> response builders, and a differential test oracle — but **no hickory request handler
+> runs on the default serving path**. The XDP fast path is unchanged.
 
 ---
 
@@ -327,7 +338,14 @@ automatically when XDP is active (XDP workers spin-poll AF_XDP rings natively).
 
 ### Resolver
 
-`hickory-server` with `hickory-resolver` for upstream forwarding.
+The slow path is **wire-native** (`serve_wire` in `src/dns/server.rs`): incoming queries
+are parsed and answered with Runbound's own DNS wire codec (`src/dns/wire/`). Cache misses
+in `forward` mode are forwarded by the in-house forwarder (`src/dns/forward.rs`, which
+replaces `hickory-resolver`'s resolver on this path). The forwarder validates the upstream
+response's transaction ID and question (name/type/class) before accepting it — a
+cache-poisoning defence added by the de-hickory rewrite (`forward.rs::response_matches`).
+The sovereign full-recursion resolver (the only component still using `hickory-resolver`)
+is an optional `recursor`-feature path; see [§5 Full-recursion](#full-recursion-recursor-feature).
 
 - **Local zones:** `ArcSwap<LocalZoneSet>` — reads are lock-free, writes clone + swap
 - **Blacklist / feeds:** `ArcSwap<BlacklistSet>` — same pattern
@@ -335,7 +353,7 @@ automatically when XDP is active (XDP workers spin-poll AF_XDP rings natively).
 
 ### DoT pool
 
-**Fixed v0.6.9 (#77).** `hickory-resolver` opens TLS connections lazily. On first query after idle, the pool is empty → SERVFAIL. Fix: `rebuild_and_swap` calls `warm_up()` (3 × 250 ms probes) before atomically swapping the resolver. `POST /api/upstreams/reconnect` triggers a synchronous reconnect + warm-up.
+**Fixed v0.6.9 (#77).** The DoT upstream pool opens TLS connections lazily. On first query after idle, the pool is empty → SERVFAIL. Fix: `rebuild_and_swap` calls `warm_up()` (3 × 250 ms probes) before atomically swapping the resolver. `POST /api/upstreams/reconnect` triggers a synchronous reconnect + warm-up.
 
 ### Cache insertion
 
@@ -412,14 +430,17 @@ alert:
 
 Multiple `alert:` blocks supported. Managed via `GET/POST/DELETE /api/alerts`.
 
-### Zone transfer — AXFR / IXFR (v0.9.13)
+### Zone transfer — AXFR / IXFR (v0.9.13; wire-native since v0.22)
 
-`src/dns/axfr.rs` implements outgoing zone transfers (RFC 5936 AXFR, RFC 1995 IXFR)
-for secondary nameservers.
+`src/dns/axfr.rs` + `src/dns/wire_serve.rs::axfr_response` implement outgoing zone
+transfers (RFC 5936 AXFR, RFC 1995 IXFR) for secondary nameservers, served entirely on
+Runbound's own wire codec (no hickory handler). `serve_wire` dispatches AXFR/IXFR before
+the generic query path; IXFR is answered as a full AXFR.
 
-**AXFR (TCP only):** SOA serial checked, `allow-axfr` ACL enforced, records streamed in
-batches of 64 to avoid holding the zone lock across the full transfer. TSIG
-(HMAC-SHA256 or HMAC-SHA512) supported.
+**AXFR (TCP only):** SOA serial checked, `axfr-allow` ACL enforced against the **real
+client IP** (carried to the handler over the loopback relay via a PROXY v2 header), records
+streamed in batches of 64 to avoid holding the zone lock across the full transfer. TSIG
+(RFC 8945, `ring` HMAC — SHA-1/256/384/512, `src/dns/tsig.rs`) supported.
 
 **IXFR (incremental):** Runbound keeps a per-zone journal (ring buffer, last 10 changes).
 If the client's SOA serial is within the journal window → incremental diff; otherwise
@@ -437,13 +458,15 @@ tsig-key "axfr-key" {
 }
 ```
 
-### RFC 2136 DDNS + TSIG (v0.9.3)
+### RFC 2136 DDNS + TSIG (v0.9.3; wire-native since v0.22)
 
-`src/dns/ddns.rs` implements RFC 2136 dynamic DNS updates. Clients (`nsupdate`, DHCP
-servers, router firmware) send DNS UPDATE messages to add, modify, or delete records
-without a Runbound restart.
+`src/dns/ddns.rs::handle_update_wire` implements RFC 2136 dynamic DNS updates, dispatched
+from `serve_wire` and answered on Runbound's own wire codec (no hickory handler). Clients
+(`nsupdate`, DHCP servers, router firmware) send DNS UPDATE messages to add, modify, or
+delete records without a Runbound restart.
 
-All UPDATE messages must carry a valid TSIG RR (RFC 2845). Unsigned updates are refused.
+All UPDATE messages must carry a valid TSIG RR (RFC 8945, verified on `ring` HMAC via
+`src/dns/tsig.rs`; the key-name lookup is constant-time). Unsigned updates are refused.
 Anti-replay: `|now − ts| > 300 s` → RCODE=BADTIME.
 
 ```
@@ -457,6 +480,23 @@ apply to LocalZoneSet → ArcSwap swap → persist to dns_entries.json (async)
     ↓
 RCODE=NOERROR
 ```
+
+### Full-recursion (`recursor` feature)
+
+The sovereign full-recursion resolver (`src/dns/recursor.rs`) is the **only** component
+that still uses `hickory-resolver`, so it is gated behind the optional **`recursor` Cargo
+feature** (`default` = forwarder, hickory-free). With the feature compiled in and
+`resolution: full-recursion` set, cache misses are resolved **iteratively from the root**
+(QNAME minimisation, 0x20 case-randomisation, serve-stale, anti-SSRF guards on glue/NS/CNAME
+addresses, and DNSSEC validation when `dnssec-validation: yes`). When full-recursion is
+*requested* on a default build (feature absent) the recursor is a no-op and Runbound
+silently stays in `forward` mode (`dns::recursor` stub in `src/dns/mod.rs`). The mode is
+toggled live via `PUT /api/resolution` (master propagates to slaves over the relay);
+`src/dns/recursor.rs::rebuild_shared` hot-swaps the `ArcSwap<Option<…>>` handle.
+
+When the `recursor` feature is enabled, `handle_request_wire` falls back to the hickory
+request handler (`handle_request`) only for the full-recursion query path; every other
+query — including a malformed one — is handled by `serve_wire`.
 
 ---
 
@@ -533,8 +573,13 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 |---------|-------|-------|
 | io_uring slow path | #65 | Replace recvmsg/sendmsg on Tokio UDP path with io_uring SQEs. Useful for containers/cloud VMs without XDP. |
 | rkyv zero-copy cache persistence | #29 | Replace bincode with rkyv. Target: < 5 ms restart with 1M entries. |
-| DNSSEC full validation | #34 | Chain of trust from root, NSEC/NSEC3, DS/DNSKEY. Full resolver mode — not a patch. |
 | eBPF XDP program in Rust (aya-bpf) | — | Rewrite `ebpf/dns_xdp.c` in Rust using `aya-bpf` crate. Eliminates clang build dependency. |
+
+> **DNSSEC full validation (#34) — delivered.** Chain-of-trust validation from the root
+> (NSEC/NSEC3, DS/DNSKEY) ships in the sovereign full-recursion resolver behind the
+> `recursor` feature (`src/dns/recursor.rs`), enforced when `dnssec-validation: yes`.
+> Separately, **authoritative DNSSEC signing** for local zones (in-house ECDSA P-256 on
+> `ring`, RFC 6605/4034/5155/9276) is served wire-native on the default path.
 
 ---
 
@@ -544,7 +589,7 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 |-----------|----------|---------|
 | `ArcSwap<LocalZoneSet>` | `src/dns/zones.rs` | Local DNS records — zero-lock reads |
 | `ArcSwap<BlacklistSet>` | `src/dns/blacklist.rs` | Blocked domains — zero-lock reads |
-| `ArcSwap<SharedResolver>` | `src/dns/resolver.rs` | Upstream forwarder — atomic swap on change |
+| `ArcSwap<ForwardPool>` (`SharedPool`) | `src/dns/forward.rs` | In-house upstream forwarder pool — atomic swap on change (replaces hickory-resolver) |
 | `ArcSwap<CacheSnapshot>` | `src/dns/cache_snapshot.rs` | XDP-readable cache — generation-skipping publish |
 | `DashMap<QuestionKey, CacheEntry>` | `src/dns/cache_snapshot.rs` | Mutable cache — lock-free inserts |
 | `DashMap<IpAddr, TokenBucket>` | `src/dns/xdp/worker.rs` | Per-IP rate limiter |
@@ -565,16 +610,24 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 
 | Feature | Default | Effect |
 |---------|---------|--------|
-| `xdp` | ✅ enabled | Compile eBPF program and AF_XDP code |
-| `jemalloc` | ✅ enabled | Replace system allocator — better multi-thread perf |
+| `xdp` | ✅ enabled (`default`) | Compile eBPF program and AF_XDP code (`dep:aya`) |
+| `recursor` | ❌ disabled | Sovereign full-recursion resolver (`resolution: full-recursion`). Pulls in `hickory-resolver` + `hickory-server` — **the only path that runs a hickory request handler.** The default build is hickory-handler-free. |
 | `hsm` | ❌ disabled | PKCS#11 hardware key support |
 
+> **de-hickory (v0.22):** `cargo tree -i hickory-server` is empty for the default build.
+> `hickory-proto` is still a default dependency (in-memory data model + XDP response
+> builders + a differential test oracle), but no hickory request handler is on the default
+> serving path. Build the recursor with `--features recursor`.
+
 ```bash
-# Full release build (all targets)
+# Default release build — hickory-handler-free, wire-native serving path
 cargo build --release --target x86_64-unknown-linux-gnu
 cargo build --release --target x86_64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-gnu
 cargo build --release --target aarch64-unknown-linux-musl
+
+# Enable the sovereign full-recursion resolver (adds hickory-resolver/-server)
+cargo build --release --features recursor
 
 # Disable XDP (containers, cloud VMs without CAP_BPF)
 cargo build --release --no-default-features

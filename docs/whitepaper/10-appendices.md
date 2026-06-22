@@ -5,8 +5,14 @@
 
 ## A. Configuration reference
 See `docs/configuration.md`. Notable directives: `xdp`, `api-port`, `api-key`,
-`api-socket` (#174), `log-format` (#175, json/text), `upstream-racing`, `serve-stale`,
+`api-socket` (#174), `ui-bind` (default `127.0.0.1` since v0.22 — set `0.0.0.0` to expose
+the WebUI on the network), `log-format` (#175, json/text), `upstream-racing`, `serve-stale`,
 DoT upstreams, split-horizon, firewall.
+
+> **Build note (v0.22 de-hickory).** The default build is hickory-free on the request path
+> (`default = ["xdp"]`, `Cargo.toml:170`). Sovereign full recursion is the optional
+> `recursor` Cargo feature (`Cargo.toml:180`, pulls `hickory-resolver` + `hickory-server`);
+> build it with `--features recursor`.
 
 ## B. API reference
 See `docs/api.md`. Endpoint groups: zones, blacklist/feeds, upstreams, `/system`, stats,

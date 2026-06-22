@@ -1,7 +1,17 @@
 # Security Architecture
 
 This document covers the security model, defensive layers, and all audit findings
-fixed across Runbound releases through v0.17.1 (see docs/security-audit/SECURITY-AUDIT.md for the per-cycle history).
+fixed across Runbound releases through v0.22.0 (see docs/security-audit/SECURITY-AUDIT.md for the per-cycle history, and docs/security-audit/CYCLE-O-dehickory-2026-06-22.md plus docs/security-audit/pentest-aggressive-2026-06-22.md for the v0.22 de-hickory cycle and aggressive pentest).
+
+> **v0.22 attack-surface note.** The default build is now **hickory-free on the
+> network-facing serving path**: DNS is served by the in-house wire codec
+> (`src/dns/wire/`) via `serve_wire` in `src/dns/server.rs`. The hickory-dns request
+> handler (`hickory-server`) is no longer in the default binary — it, and the
+> sovereign full-recursion resolver (`hickory-resolver`), live behind the optional
+> `recursor` Cargo feature. `hickory-proto` remains a default dependency (it backs
+> part of the in-memory data model and the XDP response builders), but **no hickory
+> request handler runs on the default path**, removing a large untrusted-input
+> message-parsing dependency from the default network-facing surface.
 
 ---
 
@@ -23,8 +33,8 @@ Internet / LAN
 │  AF/XDP fast path (default on)                      │  ← local-zone answered in user   │
 │    ACL + rate limit enforced before any reply       │    space, XDP_PASS for recursive  │
 ├─────────────────────────────────────────────────────┤
-│  DNS engine (hickory-server 0.26)                   │
-│  Zone lookup / forwarding                           │
+│  DNS engine — wire-native serve_wire (in-house codec)│  ← src/dns/wire/, no hickory handler
+│  Zone lookup / forwarding / AXFR / TSIG / DNSSEC    │  ← upstream txid+question validated
 │  CPU-pinned workers (physical cores, HT excluded)   │  ← per-core tokio + DNS workers
 └─────────────────────────────────────────────────────┘
       │
@@ -89,14 +99,23 @@ A pre-accept filter limits the number of concurrent TCP DNS connections per sour
 immediately after a rate-throttled warning log.
 
 **Architecture — loopback relay:** A relay listener sits between the public TCP port and
-hickory-server's internal TCP listener (bound on `127.0.0.1:0`). The relay's accept loop:
+the internal wire-native TCP listener (bound on `127.0.0.1:0`). The relay's accept loop:
 1. Checks the per-IP counter in a `DashMap<IpAddr, Arc<AtomicU16>>` (with `/48` aggregation
    for IPv6).
 2. If the cap is reached, drops the connection.
-3. Otherwise increments the counter, opens a connection to hickory's loopback listener, proxies
+3. Otherwise increments the counter, opens a connection to the loopback listener, proxies
    the session via `tokio::io::copy_bidirectional`, then decrements the counter on close.
 
 Loopback addresses (`127.x.x.x`, `::1`) are exempt from the cap.
+
+**Real client IP via PROXY v2 (v0.22, PENT-1/PENT-2):** Because the handler sees the relay's
+loopback address as the source, the relay now prepends a **PROXY protocol v2 header**
+carrying the true client IP to the loopback handler (`proxy_v2_header()` in
+`src/dns/server.rs`). For DoT/DoH the real client IP is read from an inbound PROXY v2 header
+**before** the TLS handshake. As a result `axfr-allow` and split-horizon (#10) now evaluate the
+**real** source IP instead of `127.0.0.1` — closing a bypass where any TCP/DoT/DoH client was
+treated as loopback. The source-IP ACL (allow/deny/refuse) is likewise enforced on the real
+client IP at the relay before any DNS message is parsed.
 
 This prevents FD exhaustion attacks where a single source opens thousands of TCP connections to
 exhaust the process file-descriptor limit and deny service to all clients.
@@ -124,9 +143,10 @@ bands based on `used = 1 − MemAvailable / MemTotal`:
 | **70 – 80 %** | Moderate pressure: halve cache size (floor 512 entries) |
 | **≥ 80 %** | High pressure: recalculate cache from current RAM + flush rate-limiter buckets |
 
-Cache changes take effect by rebuilding the hickory resolver and atomically swapping
-it via **ArcSwap**. In-flight queries keep their `Arc` reference until completion —
-no query is dropped mid-flight.
+The DNS cache lives in the wire-native `ForwardPool`; cache changes take effect by
+atomically swapping the pool via **ArcSwap**. In-flight queries keep their `Arc`
+reference until completion — no query is dropped mid-flight. Under high pressure the
+guard also flushes the rate-limiter buckets.
 
 **Auto-sized cache at startup:** cache capacity is computed from `MemAvailable`
 at launch (10 % of available RAM ÷ 512 B per entry), clamped to **[512, 65 536]**
@@ -322,7 +342,8 @@ cpu-affinity: no   # default: yes
 at the NIC driver level via an eBPF XDP program, answers **local-zone queries
 entirely in user space**, and returns `XDP_PASS` for everything else (recursive
 queries, AAAA on an A-only name, ANY, etc.) so they continue up through the normal
-hickory-server path.
+wire-native `serve_wire` path. (The XDP/eBPF datapath itself is unchanged by the
+v0.22 de-hickory work; only the slow-path it falls through to is now wire-native.)
 
 **ACL and rate-limit enforcement in XDP:** Both checks run inside the XDP worker
 before any DNS response is constructed.
@@ -339,8 +360,10 @@ silently skipped instead of producing undefined behaviour.
 
 **Systemd requirements:** `LimitMEMLOCK=infinity` is required in the service file
 for AF/XDP UMEM allocation. The provided `runbound.service` sets this automatically.
-`install.sh` detects Intel XDP-native NICs (ixgbe/i40e/ice/igc) and configures
-the appropriate capabilities (`CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF`).
+The XDP fast path additionally needs `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF` and
+`CAP_PERFMON` — these are **not** granted by default (see *Systemd hardening* below).
+Enabling `xdp: yes` requires switching the service to the commented-out wider
+capability set in `runbound.service` / `install.sh`.
 
 **Fallback:** If XDP initialisation fails (missing capabilities, unsupported NIC,
 kernel < 5.10), Runbound logs a descriptive `WARN` with an actionable hint and
@@ -385,9 +408,18 @@ The provided unit file applies:
 - `ProtectSystem=strict`
 - `ProtectHome=yes`
 - `ProtectKernelTunables=yes`
-- `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (port 53 only — no root)
+- `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` and `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+  (port 53 only — no root)
 
-See [systemd.md](systemd.md) for the full unit file.
+**Least-privilege default (v0.22, PENT-3):** the shipped `runbound.service` and
+`install.sh` grant **only `CAP_NET_BIND_SERVICE`** by default. The XDP fast path
+(`xdp: yes`) and the firewall-manage feature need `CAP_NET_RAW`, `CAP_NET_ADMIN`,
+`CAP_BPF` and `CAP_PERFMON` — these are an **explicit, commented opt-in** (uncomment
+the wider `AmbientCapabilities` / `CapabilityBoundingSet` lines). The default
+`xdp: no` path holds none of them, shrinking the blast radius of any compromise.
+
+See [systemd.md](systemd.md) for the full unit file and [hardening.md](hardening.md)
+for the per-parameter breakdown.
 
 ---
 
@@ -599,27 +631,23 @@ make audit-full  # all three + cargo outdated
 
 ## Known limitations
 
-### TCP rate limiting — loopback proxy (VUL-NEW-02)
+### TCP rate limiting — loopback proxy (VUL-NEW-02) — RESOLVED in v0.22
 
-**Status:** Accepted design trade-off — not a vulnerability, documented for transparency.
+**Status:** Resolved by the PROXY v2 relay (PENT-1/PENT-2).
 
-The TCP relay architecture (public TcpListener → loopback relay → hickory-server) causes
-hickory to see `127.0.0.1` as the source for all relayed TCP connections. The per-IP DNS
-rate limiter therefore uses a shared loopback bucket for all TCP clients rather than
-individual per-client buckets.
+Previously the TCP relay (public TcpListener → loopback relay → DNS handler) caused the
+handler to see `127.0.0.1` as the source for all relayed TCP connections, so the per-IP DNS
+rate limiter shared a single loopback bucket across all TCP clients.
 
-**Impact:** A client sending many queries over DNS/TCP, DoT, or DoH can consume the shared
-loopback rate-limit bucket, potentially affecting the measured rate for other TCP clients.
+In v0.22 the relay prepends a **PROXY protocol v2 header** carrying the real client IP, and
+the loopback listener reconstructs `peer` from it before dispatching to `serve_wire`
+(`src/dns/server.rs`). The ACL, per-IP rate limiter, `axfr-allow` and split-horizon therefore
+now evaluate the **real** client IP for TCP/DoT/DoH, not the loopback address.
 
-**Mitigations in place:**
-- The TCP connection cap (`TCP_CONN_PER_IP_MAX = 20` per source IP) is the primary DoS
-  control and is applied before the relay, so FD exhaustion attacks are blocked at source.
-- TCP is inherently low-volume; most DNS traffic uses UDP.
-- The loopback rate-limit bucket is sized generously (same `rps` × burst as any single IP).
-
-**Resolution path:** Replacing the relay with an in-process per-query source-IP annotation
-inside hickory-server would eliminate the limitation; this requires a non-trivial upstream
-change or a custom hickory fork and is deferred.
+**Mitigations still in place (defence in depth):**
+- The TCP connection cap (`TCP_CONN_PER_IP_MAX = 20` per source IP) remains the primary
+  per-source DoS control and is applied before the relay.
+- The relay enforces the source-IP ACL on the real client before any DNS message is parsed.
 
 ---
 

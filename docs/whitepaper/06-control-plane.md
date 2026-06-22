@@ -69,4 +69,7 @@ restart (split-horizon, whose resolver table is built at boot).
   state files + `runbound.conf`; import is path-whitelisted and written atomically.
 - **Split-horizon**: per-client-network answer sets, CRUD via API + web UI.
 - **Embedded web UI**: static HTML gzipped at build (`include_bytes!` of
-  `OUT_DIR/index.html.gz`), served by the binary — no nginx since v0.9.0.
+  `OUT_DIR/index.html.gz`), served by the binary — no nginx since v0.9.0. Since **v0.22** the
+  admin panel **binds `127.0.0.1` by default** (`ui-bind` default changed from `0.0.0.0`,
+  `src/config/parser.rs:522`); exposing it on the network now requires an explicit
+  `ui-bind: 0.0.0.0`.

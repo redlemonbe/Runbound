@@ -12,8 +12,8 @@ Only the **latest released version** receives security fixes — there is no LTS
 
 | Version | Supported |
 |---------|-----------|
-| 0.21.x  | ✅ |
-| < 0.21  | ❌ |
+| 0.22.x  | ✅ |
+| < 0.22  | ❌ |
 
 ## Reporting a vulnerability
 
@@ -38,17 +38,33 @@ Do **not** open a public issue for security problems. Reports are handled on a
   TOFU certificate-fingerprint pinning.
 - **Audit log:** optional HMAC-SHA256 hash-chained, tamper-evident.
 - **WebUI ↔ API:** HTTP-only session cookies + CSRF tokens on mutating requests.
+- **DNSSEC signing:** in-house ECDSA P-256 signer on `ring` (RFC 6605 / 4034 / 5155 / 9276),
+  served wire-native on the default path.
+- **TSIG (RFC 8945):** HMAC on `ring`, with constant-time key-name lookup
+  (`subtle::ConstantTimeEq`).
 
 ## Built-in hardening
 
 - **DNS amplification:** `ANY` queries are refused (REFUSED) to mitigate amplification; per-source-IP query
   rate limiting (`rate-limit`, with configurable v4/v6 prefix bucketing).
 - **DNS rebinding:** `private-address` CIDRs are stripped from upstream answers.
+- **Cache poisoning:** the forward path validates the upstream response transaction-ID and
+  question before accepting it.
+- **Reduced attack surface (v0.22):** the default build is **hickory-free on the
+  network-facing serving path** — DNS is served by the in-house wire codec (`serve_wire`).
+  The hickory-dns request handler and the sovereign full-recursion resolver live behind the
+  optional `recursor` Cargo feature (`hickory-proto` remains, backing the data model and XDP
+  builders).
 - **Access control:** `access-control` ACLs; the REST API binds to localhost only
-  (the WebUI server proxies `/api/*` internally).
-- **systemd:** the shipped unit runs as a non-root `runbound` user with a scoped
-  `CapabilityBoundingSet` (`CAP_NET_BIND_SERVICE`, `CAP_NET_RAW`, `CAP_NET_ADMIN`,
-  `CAP_BPF`), `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`.
+  (the WebUI server proxies `/api/*` internally). The WebUI itself binds `127.0.0.1` by
+  default (`ui-bind`); network exposure requires an explicit `ui-bind: 0.0.0.0`. For
+  TCP/DoT/DoH the real client IP is carried to the handler via a PROXY v2 header so
+  `axfr-allow` and split-horizon evaluate the true source.
+- **systemd:** the shipped unit runs as a non-root `runbound` user with a least-privilege
+  `CapabilityBoundingSet`/`AmbientCapabilities` of **`CAP_NET_BIND_SERVICE`** only,
+  `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`. The XDP fast path and the
+  firewall-manage feature need `CAP_NET_RAW`/`CAP_NET_ADMIN`/`CAP_BPF`/`CAP_PERFMON` — an
+  explicit, commented opt-in.
 - **Bot/scanner defense:** honeypot trap routes with configurable banning.
 - **Supply chain:** release binaries are signed with **minisign** and ship a
   **CycloneDX SBOM** plus `SHA256SUMS`; reproducible-build and signature-verification

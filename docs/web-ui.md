@@ -14,8 +14,13 @@ Add these lines inside the `server:` section of your `runbound.conf`:
 server:
     ui-enabled: yes
     ui-port:    8091
-    # ui-bind:  0.0.0.0   # default — all interfaces
+    # ui-bind:  127.0.0.1   # default — loopback only
+    # ui-bind:  0.0.0.0     # expose the dashboard on the LAN (explicit opt-in)
 ```
+
+The dashboard binds **`127.0.0.1` by default** — reachable only from the host
+itself. To reach it from other machines on your network, set `ui-bind: 0.0.0.0`
+(or a specific interface IP) explicitly.
 
 Restart the service:
 
@@ -23,7 +28,8 @@ Restart the service:
 sudo systemctl restart runbound
 ```
 
-The dashboard is then available at `https://<server-ip>:8091`.
+The dashboard is then available at `https://127.0.0.1:8091` (default loopback
+bind), or at `https://<server-ip>:8091` once you set `ui-bind: 0.0.0.0`.
 
 ---
 
