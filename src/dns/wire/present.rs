@@ -69,6 +69,27 @@ pub fn parse_rr_line(rr: &str) -> Option<Record> {
         "AAAA" => Rdata::Aaaa(rest[0].parse().ok()?),
         "NS" => Rdata::Ns(Name::from_ascii(rest[0]).ok()?),
         "CNAME" => Rdata::Cname(Name::from_ascii(rest[0]).ok()?),
+        // SOA: mname rname serial refresh retry expire minimum (RFC 1035 §3.3.13).
+        // Needed so AXFR can serve the zone's configured apex SOA rather than a
+        // synthesised one.
+        "SOA" => {
+            let mname = Name::from_ascii(rest.first()?).ok()?;
+            let rname = Name::from_ascii(rest.get(1)?).ok()?;
+            let serial: u32 = rest.get(2)?.parse().ok()?;
+            let refresh: u32 = rest.get(3)?.parse().ok()?;
+            let retry: u32 = rest.get(4)?.parse().ok()?;
+            let expire: u32 = rest.get(5)?.parse().ok()?;
+            let minimum: u32 = rest.get(6)?.parse().ok()?;
+            Rdata::Soa {
+                mname,
+                rname,
+                serial,
+                refresh,
+                retry,
+                expire,
+                minimum,
+            }
+        }
         "PTR" => Rdata::Ptr(Name::from_ascii(rest[0]).ok()?),
         "MX" => {
             let preference: u16 = rest[0].parse().ok()?;
@@ -205,4 +226,25 @@ mod tests {
         let r = parse_rr_line("bare A 10.0.0.1").unwrap();
         assert_eq!(r.name.to_ascii(), "bare.");
     }
+
+    #[test]
+    fn parses_soa() {
+        let r = parse_rr_line(
+            "example.test. 3600 IN SOA ns1.example.test. admin.example.test. 2026010101 3600 900 604800 300",
+        )
+        .unwrap();
+        assert_eq!(r.rtype, rtype::SOA);
+        match r.rdata {
+            Rdata::Soa { serial, refresh, retry, expire, minimum, .. } => {
+                assert_eq!(serial, 2026010101);
+                assert_eq!(refresh, 3600);
+                assert_eq!(retry, 900);
+                assert_eq!(expire, 604800);
+                assert_eq!(minimum, 300);
+            }
+            other => panic!("expected SOA, got {other:?}"),
+        }
+    }
+    // Note: our SOA RDATA wire encoding is held byte-identical to hickory by the
+    // `oracle_soa_authority` differential test in `wire::oracle`.
 }

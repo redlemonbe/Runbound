@@ -18,8 +18,8 @@
 use smallvec::SmallVec;
 
 use crate::dns::local::{LocalZoneSet, ZoneAction};
-use crate::dns::wire::consts::{rcode, rtype};
-use crate::dns::wire::{Edns, Message, Rdata, Record};
+use crate::dns::wire::consts::{class, rcode, rtype};
+use crate::dns::wire::{Edns, Message, Name, Rdata, Record};
 
 /// Lowercased wire key for a name already in wire form — on the stack.
 ///
@@ -154,6 +154,110 @@ fn follow_cname(zones: &LocalZoneSet, start: &[u8], qtype: u16) -> Vec<Record> {
         current = next;
     }
     Vec::new()
+}
+
+/// True if wire name `name` is equal to, or a descendant of, `zone` — both in
+/// lowercased length-prefixed wire form. Walks `name`'s parents by stripping its
+/// leftmost label until it equals `zone` (or runs out). The twin of the parent
+/// walk in [`LocalZoneSet::find_wire`].
+fn wire_name_in_zone(mut name: &[u8], zone: &[u8]) -> bool {
+    loop {
+        if name == zone {
+            return true;
+        }
+        if name.len() <= 1 {
+            return false; // reached the root without matching
+        }
+        let skip = 1 + name[0] as usize;
+        if skip >= name.len() {
+            return false;
+        }
+        name = &name[skip..];
+    }
+}
+
+/// Synthesise a zone SOA when the zone data carries none — mirrors the values
+/// the previous hickory AXFR used so secondaries see stable apex metadata.
+fn synthetic_soa(zone: &Name, serial: u32) -> Record {
+    let mname = Name::from_ascii("ns1.runbound.local.").unwrap_or_else(|_| zone.clone());
+    let rname = Name::from_ascii("hostmaster.runbound.local.").unwrap_or_else(|_| zone.clone());
+    Record {
+        name: zone.clone(),
+        rtype: rtype::SOA,
+        rclass: class::IN,
+        ttl: 3600,
+        rdata: Rdata::Soa {
+            mname,
+            rname,
+            serial,
+            refresh: 3600,
+            retry: 900,
+            expire: 86400,
+            minimum: 300,
+        },
+    }
+}
+
+/// Build a wire-native AXFR/IXFR response for the zone named by `query`'s
+/// question — a single message carrying `SOA … records … SOA` (RFC 5936 §2.2),
+/// entirely with our own wire types. IXFR is served as a full AXFR (matching the
+/// prior behaviour). Returns `None` when the zone holds no local records, so the
+/// caller can answer NXDOMAIN. Access control (axfr-allow) is the caller's job.
+///
+/// Single-message transfer: large zones that would exceed 64 KiB are not split
+/// across messages here — the same limitation the previous hickory path had; the
+/// local zones Runbound serves are well within one message.
+pub fn axfr_response(query: &Message, zones: &LocalZoneSet) -> Option<Vec<u8>> {
+    let question = query.first_question()?.clone();
+    let zone_key = lower_key(question.name.wire());
+
+    // Every local record whose owner name falls within the requested zone.
+    let mut records: Vec<Record> = Vec::new();
+    for (name_key, recs) in &zones.records_wire {
+        if wire_name_in_zone(name_key, &zone_key) {
+            for r in recs {
+                let mut r = r.clone();
+                r.rclass = class::IN;
+                records.push(r);
+            }
+        }
+    }
+    if records.is_empty() {
+        return None;
+    }
+
+    let serial = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 60) as u32)
+        .unwrap_or(1);
+    let soa = records
+        .iter()
+        .find(|r| r.rtype == rtype::SOA)
+        .cloned()
+        .unwrap_or_else(|| synthetic_soa(&question.name, serial));
+
+    let mut answers: Vec<Record> = Vec::with_capacity(records.len() + 2);
+    answers.push(soa.clone());
+    for r in records.into_iter() {
+        if r.rtype != rtype::SOA {
+            answers.push(r);
+        }
+    }
+    answers.push(soa);
+
+    let mut resp = Message {
+        header: query.header,
+        ..Default::default()
+    };
+    resp.header.set_qr(true);
+    resp.header.set_aa(true);
+    resp.header.set_ra(false);
+    resp.header.set_tc(false);
+    resp.header.set_ad(false);
+    resp.header.set_rcode_low(rcode::NOERROR);
+    resp.questions.push(question);
+    resp.answers = answers;
+    Some(resp.encode())
 }
 
 #[cfg(test)]
@@ -316,5 +420,61 @@ mod tests {
         assert_eq!(parsed.header.rcode_low(), rcode::NOERROR);
         assert_eq!(parsed.answers.len(), 2);
         assert_eq!(parsed.header.id, 0x4242);
+    }
+
+    #[test]
+    fn axfr_brackets_records_with_soa() {
+        let z = zoneset();
+        let req = query("local.", consts::rtype::AXFR, false);
+        let bytes = axfr_response(&req, &z).expect("local. has records");
+        // Must be valid on the wire and self-parseable.
+        hickory_proto::op::Message::from_vec(&bytes).expect("hickory parses AXFR");
+        let parsed = Message::parse(&bytes).unwrap();
+        assert!(parsed.header.qr() && parsed.header.aa());
+        assert_eq!(parsed.header.rcode_low(), rcode::NOERROR);
+        // SOA … records … SOA: at least 3 answers, first and last are SOA.
+        assert!(parsed.answers.len() >= 3, "got {}", parsed.answers.len());
+        assert_eq!(parsed.answers.first().unwrap().rtype, consts::rtype::SOA);
+        assert_eq!(parsed.answers.last().unwrap().rtype, consts::rtype::SOA);
+        // The host.local. A/AAAA and alias.local. CNAME records are inside.
+        let inner = &parsed.answers[1..parsed.answers.len() - 1];
+        assert!(inner.iter().any(|r| r.rtype == consts::rtype::A));
+        assert!(inner.iter().any(|r| r.rtype == consts::rtype::CNAME));
+        assert!(inner.iter().all(|r| r.rtype != consts::rtype::SOA));
+    }
+
+    #[test]
+    fn axfr_unknown_zone_returns_none() {
+        let z = zoneset();
+        let req = query("nonexistent.example.", consts::rtype::AXFR, false);
+        assert!(axfr_response(&req, &z).is_none());
+    }
+
+    #[test]
+    fn axfr_serves_configured_soa_not_synthetic() {
+        // A zone whose local-data carries an explicit SOA: AXFR must serve that
+        // SOA (configured serial), not a synthesised one.
+        let zones = vec![LocalZone {
+            name: "example.test.".into(),
+            zone_type: "static".into(),
+        }];
+        let data = vec![
+            LocalData {
+                rr: "example.test. 3600 IN SOA ns1.example.test. admin.example.test. 2026010101 3600 900 604800 300".into(),
+            },
+            LocalData {
+                rr: "www.example.test. 300 A 192.0.2.10".into(),
+            },
+        ];
+        let z = LocalZoneSet::from_config(&zones, &data);
+        let req = query("example.test.", consts::rtype::AXFR, false);
+        let bytes = axfr_response(&req, &z).expect("zone has records");
+        let parsed = Message::parse(&bytes).unwrap();
+        let soa = parsed.answers.first().unwrap();
+        assert_eq!(soa.rtype, consts::rtype::SOA);
+        match &soa.rdata {
+            Rdata::Soa { serial, .. } => assert_eq!(*serial, 2026010101, "configured serial"),
+            other => panic!("expected SOA, got {other:?}"),
+        }
     }
 }

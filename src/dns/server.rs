@@ -1335,7 +1335,24 @@ impl RunboundHandler {
             return None;
         }
         if matches!(qtype, rtype::AXFR | rtype::IXFR) {
-            return None; // zone transfer stays on the hickory path
+            // ── AXFR/IXFR zone transfer (#22), wire-native ──────────────────
+            // Gated solely by axfr-allow (not the normal ACL), matching the
+            // prior hickory dispatch order. IXFR is served as a full AXFR.
+            self.stats.inc_total();
+            self.stats.inc_qtype_raw(qtype);
+            if self.axfr_allow.is_empty()
+                || !crate::dns::axfr::is_transfer_allowed(peer.ip(), &self.axfr_allow)
+            {
+                warn!(ip = %peer.ip(), "AXFR/IXFR refused — not in axfr-allow");
+                self.stats.inc_refused();
+                return Some(self.wire_error(&msg, rcode::REFUSED));
+            }
+            return Some(
+                match crate::dns::wire_serve::axfr_response(&msg, &self.zones.load()) {
+                    Some(bytes) => bytes,
+                    None => self.wire_error(&msg, rcode::NXDOMAIN),
+                },
+            );
         }
         if self.rrl_slip != 0 {
             return None; // RRL SLIP nuance stays on the hickory path
@@ -1664,21 +1681,8 @@ impl RequestHandler for RunboundHandler {
         self.stats.inc_qtype_raw(u16::from(qtype));
         self.domain_stats.inc(&qname_str);
 
-        // ── 0b. AXFR/IXFR zone transfer dispatch (#22) ────────────────
-        if qtype == RecordType::AXFR || qtype == RecordType::IXFR {
-            let axfr_zones = self.zones.load();
-            if !self.axfr_allow.is_empty() {
-                return crate::dns::axfr::handle_axfr(
-                    request,
-                    response_handle,
-                    &axfr_zones,
-                    client_ip,
-                    &qname_str,
-                    &self.axfr_allow,
-                ).await;
-            }
-            return send_error(request, response_handle, ResponseCode::Refused).await;
-        }
+        // AXFR/IXFR is now served entirely in the wire fast path
+        // (serve_wire → wire_serve::axfr_response); it never reaches here.
 
         // ── 0a. RFC 2136 DNS UPDATE dispatch ────────────────────────────
         if request.metadata.op_code == OpCode::Update {
