@@ -70,6 +70,10 @@ pub struct LocalZoneSet {
     /// De-hickory migration: zone actions keyed by lowercased wire QNAME, the
     /// wire-typed twin of `zones`. Walked by `find_wire`.
     pub zones_wire: HashMap<Box<[u8]>, ZoneAction>,
+    /// SEC-AGV-01, wire-typed twin of `static_names`: lowercased wire QNAMEs of
+    /// every statically configured zone/record name. DDNS DELETE on any of these
+    /// is rejected. Built at config load; never mutated by DDNS.
+    pub static_names_wire: HashSet<Box<[u8]>>,
 }
 
 
@@ -187,7 +191,9 @@ impl LocalZoneSet {
         }
         // zones_wire mirrors `zones`: explicit zone actions plus an implicit
         // Static for every local-data name (Unbound behaviour), keyed by wire.
+        // static_names_wire records the same names for the DDNS delete guard.
         let mut zones_wire: HashMap<Box<[u8]>, ZoneAction> = HashMap::new();
+        let mut static_names_wire: HashSet<Box<[u8]>> = HashSet::new();
         for z in zones {
             let n = if z.name.ends_with('.') {
                 z.name.clone()
@@ -195,11 +201,14 @@ impl LocalZoneSet {
                 format!("{}.", z.name)
             };
             if let Ok(wn) = crate::dns::wire::Name::from_ascii(&n) {
-                zones_wire.insert(wire_name_key(&wn), ZoneAction::from(z.zone_type.as_str()));
+                let key = wire_name_key(&wn);
+                static_names_wire.insert(key.clone());
+                zones_wire.insert(key, ZoneAction::from(z.zone_type.as_str()));
             }
         }
         for key in records_wire.keys() {
             zones_wire.entry(key.clone()).or_insert(ZoneAction::Static);
+            static_names_wire.insert(key.clone());
         }
 
         // ── Build wire-record index (#156 item 3) ──────────────────────────────
@@ -262,6 +271,7 @@ impl LocalZoneSet {
             wire_records: wire_idx,
             records_wire,
             zones_wire,
+            static_names_wire,
         }
     }
 

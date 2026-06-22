@@ -204,19 +204,28 @@ fn request_digest_data(raw: &[u8], tsig_start: usize, arcount: u16, tsig: &TsigR
     buf
 }
 
+/// A successfully verified request. `request_mac` is needed to sign the response
+/// (RFC 8945 §5.4.1 prepends the request MAC to the response digest).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verified {
+    /// Matched key name, lowercased, no trailing dot.
+    pub key_name: String,
+    /// The MAC carried in the request's TSIG RR.
+    pub request_mac: Vec<u8>,
+}
+
 /// Verify a TSIG-signed DNS request against the configured keys.
 ///
-/// On success returns the matched key name (lowercased, no trailing dot) for
-/// logging. The MAC comparison is constant-time (`ring::hmac::verify`). The
-/// accepted clock skew is ±`window_secs` around `now_secs` (RFC 8945 §5.2.3
-/// recommends the fudge; Runbound keeps a fixed window for parity with the prior
-/// handler).
+/// On success returns the matched key and the request MAC. The MAC comparison is
+/// constant-time (`ring::hmac::verify`). The accepted clock skew is ±`window_secs`
+/// around `now_secs` (RFC 8945 §5.2.3 recommends the fudge; Runbound keeps a
+/// fixed window for parity with the prior handler).
 pub fn verify_request(
     raw: &[u8],
     keys: &[(String, TsigAlg, Vec<u8>)],
     now_secs: u64,
     window_secs: u64,
-) -> Result<String, TsigError> {
+) -> Result<Verified, TsigError> {
     let (tsig, tsig_start, arcount) = parse_for_tsig(raw)?;
 
     let key_name = tsig.key_name.to_ascii().to_ascii_lowercase();
@@ -237,13 +246,142 @@ pub fn verify_request(
     let tbs = request_digest_data(raw, tsig_start, arcount, &tsig);
     let key = hmac::Key::new(alg.ring_alg(), secret);
     hmac::verify(&key, &tbs, &tsig.mac).map_err(|_| TsigError::BadSig)?;
-    Ok(key_name)
+    Ok(Verified {
+        key_name,
+        request_mac: tsig.mac,
+    })
+}
+
+/// Append a TSIG RR to a message: bump ARCOUNT and write the RR at the end.
+/// Shared by response signing and the test signer.
+fn append_tsig_rr(
+    msg: &mut Vec<u8>,
+    key_name: &Name,
+    alg_name: &Name,
+    time_signed: u64,
+    fudge: u16,
+    mac: &[u8],
+    original_id: u16,
+) {
+    let ar = u16::from_be_bytes([msg[10], msg[11]]).wrapping_add(1);
+    msg[10] = (ar >> 8) as u8;
+    msg[11] = (ar & 0xff) as u8;
+
+    let mut rr = Encoder::uncompressed();
+    key_name.emit_raw(&mut rr);
+    rr.u16(rtype::TSIG);
+    rr.u16(crate::dns::wire::consts::class::ANY);
+    rr.u32(0);
+    let at = rr.reserve_u16();
+    alg_name.emit_raw(&mut rr);
+    rr.u16((time_signed >> 32) as u16);
+    rr.u32(time_signed as u32);
+    rr.u16(fudge);
+    rr.u16(mac.len() as u16);
+    rr.bytes(mac);
+    rr.u16(original_id);
+    rr.u16(0); // error
+    rr.u16(0); // other len
+    rr.patch_u16_len(at);
+    msg.extend_from_slice(rr.as_slice());
+}
+
+/// Sign a response to a TSIG-authenticated request (RFC 8945 §5.4.1): the digest
+/// covers the request MAC (length-prefixed), the response message, and the
+/// response TSIG variables. Returns the response with a signed TSIG RR appended.
+///
+/// `response` must be the full unsigned response wire (ARCOUNT not yet counting
+/// the TSIG). `key_name` is the verified key name (trailing dot optional).
+pub fn sign_response(
+    response: &[u8],
+    request_mac: &[u8],
+    key_name: &str,
+    alg: TsigAlg,
+    secret: &[u8],
+    time_signed: u64,
+    fudge: u16,
+) -> Vec<u8> {
+    let kname = match Name::from_ascii(key_name) {
+        Ok(n) => n,
+        Err(_) => return response.to_vec(), // unsignable name → return unsigned
+    };
+    let aname = Name::from_ascii(alg.wire_name()).expect("static alg name parses");
+
+    // TBS = u16(len(request_mac)) || request_mac || response || response variables.
+    let mut tbs = Vec::with_capacity(2 + request_mac.len() + response.len() + 32);
+    tbs.extend_from_slice(&(request_mac.len() as u16).to_be_bytes());
+    tbs.extend_from_slice(request_mac);
+    tbs.extend_from_slice(response);
+    let mut e = Encoder::uncompressed();
+    kname.emit_canonical(&mut e);
+    e.u16(crate::dns::wire::consts::class::ANY);
+    e.u32(0);
+    aname.emit_canonical(&mut e);
+    e.u16((time_signed >> 32) as u16);
+    e.u32(time_signed as u32);
+    e.u16(fudge);
+    e.u16(0); // error
+    e.u16(0); // other len
+    tbs.extend_from_slice(e.as_slice());
+
+    let key = hmac::Key::new(alg.ring_alg(), secret);
+    let mac = hmac::sign(&key, &tbs).as_ref().to_vec();
+
+    let original_id = u16::from_be_bytes([response[0], response[1]]);
+    let mut out = response.to_vec();
+    append_tsig_rr(&mut out, &kname, &aname, time_signed, fudge, &mac, original_id);
+    out
+}
+
+/// Test-only TSIG signing, shared with the DDNS handler's tests. Mirrors the
+/// verify path's TBS reconstruction; hickory provides the independent oracle in
+/// `digest_buffer_matches_hickory`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::dns::wire::consts::class;
+
+    /// Append a TSIG RR signing `msg_unsigned` with `secret` under `alg` at
+    /// `time_signed`, returning the full signed wire bytes.
+    pub fn sign(
+        msg_unsigned: &[u8],
+        key_name: &str,
+        alg: TsigAlg,
+        secret: &[u8],
+        time_signed: u64,
+    ) -> Vec<u8> {
+        let kname = Name::from_ascii(key_name).unwrap();
+        let aname = Name::from_ascii(alg.wire_name()).unwrap();
+
+        // To-be-signed = message (ARCOUNT as-is == final − 1) || TSIG variables.
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(msg_unsigned);
+        let mut e = Encoder::uncompressed();
+        kname.emit_canonical(&mut e);
+        e.u16(class::ANY);
+        e.u32(0);
+        aname.emit_canonical(&mut e);
+        e.u16((time_signed >> 32) as u16);
+        e.u32(time_signed as u32);
+        e.u16(300); // fudge
+        e.u16(0); // error
+        e.u16(0); // other len
+        tbs.extend_from_slice(e.as_slice());
+
+        let key = hmac::Key::new(alg.ring_alg(), secret);
+        let mac = hmac::sign(&key, &tbs).as_ref().to_vec();
+
+        let orig_id = u16::from_be_bytes([msg_unsigned[0], msg_unsigned[1]]);
+        let mut signed = msg_unsigned.to_vec();
+        super::append_tsig_rr(&mut signed, &kname, &aname, time_signed, 300, &mac, orig_id);
+        signed
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::wire::consts::{class, opcode, rtype};
+    use crate::dns::wire::consts::{opcode, rtype};
     use crate::dns::wire::{Header, Message, Question};
 
     /// Build an unsigned UPDATE message (header + a question/zone), encoded.
@@ -260,69 +398,7 @@ mod tests {
         m.encode()
     }
 
-    /// Append a TSIG RR signing `msg_unsigned` with `key` under `alg` at
-    /// `time_signed`, returning the full signed wire bytes. Mirrors the verify
-    /// path's reconstruction so the two are exercised together; hickory provides
-    /// the *independent* correctness oracle below.
-    fn sign(msg_unsigned: &[u8], key_name: &str, alg: TsigAlg, secret: &[u8], time_signed: u64) -> Vec<u8> {
-        let kname = Name::from_ascii(key_name).unwrap();
-        let aname = Name::from_ascii(alg.wire_name()).unwrap();
-        // Variables digest = message (arcount unchanged, = 0 additionals) || vars.
-        let tsig_for_vars = TsigRr {
-            key_name: kname.clone(),
-            algorithm: aname.clone(),
-            time_signed,
-            fudge: 300,
-            mac: Vec::new(),
-            original_id: 0x1234,
-            error: 0,
-            other: Vec::new(),
-        };
-        // tsig_start for an unsigned message == its full length (TSIG appended at end),
-        // and arcount there is (current additionals + 1) so the −1 restores the original.
-        // Build the to-be-signed buffer directly: msg bytes (arcount already final-1) || vars.
-        let mut tbs = Vec::new();
-        tbs.extend_from_slice(msg_unsigned); // arcount = 0 here, which is final(1)-1
-        let mut e = Encoder::uncompressed();
-        tsig_for_vars.key_name.emit_canonical(&mut e);
-        e.u16(class::ANY);
-        e.u32(0);
-        tsig_for_vars.algorithm.emit_canonical(&mut e);
-        e.u16((time_signed >> 32) as u16);
-        e.u32(time_signed as u32);
-        e.u16(tsig_for_vars.fudge);
-        e.u16(0); // error
-        e.u16(0); // other len
-        tbs.extend_from_slice(e.as_slice());
-
-        let key = hmac::Key::new(alg.ring_alg(), secret);
-        let mac = hmac::sign(&key, &tbs).as_ref().to_vec();
-
-        // Now assemble the signed message: bump ARCOUNT to 1, append TSIG RR.
-        let mut signed = msg_unsigned.to_vec();
-        let ar = u16::from_be_bytes([signed[10], signed[11]]) + 1;
-        signed[10] = (ar >> 8) as u8;
-        signed[11] = (ar & 0xff) as u8;
-
-        let mut rr = Encoder::uncompressed();
-        kname.emit_raw(&mut rr);
-        rr.u16(rtype::TSIG);
-        rr.u16(class::ANY);
-        rr.u32(0);
-        let at = rr.reserve_u16();
-        aname.emit_raw(&mut rr);
-        rr.u16((time_signed >> 32) as u16);
-        rr.u32(time_signed as u32);
-        rr.u16(300); // fudge
-        rr.u16(mac.len() as u16);
-        rr.bytes(&mac);
-        rr.u16(0x1234); // original id
-        rr.u16(0); // error
-        rr.u16(0); // other len
-        rr.patch_u16_len(at);
-        signed.extend_from_slice(rr.as_slice());
-        signed
-    }
+    use super::test_support::sign;
 
     fn keys() -> Vec<(String, TsigAlg, Vec<u8>)> {
         vec![("ddns-key".into(), TsigAlg::Sha256, b"super-secret-key-material".to_vec())]
@@ -333,7 +409,7 @@ mod tests {
         let now = 1_700_000_000u64;
         let signed = sign(&unsigned_update(), "ddns-key.", TsigAlg::Sha256, b"super-secret-key-material", now);
         let got = verify_request(&signed, &keys(), now, 300).expect("valid TSIG");
-        assert_eq!(got, "ddns-key");
+        assert_eq!(got.key_name, "ddns-key");
     }
 
     #[test]
@@ -400,6 +476,42 @@ mod tests {
         assert!(
             htsig.algorithm.verify_mac(secret, &theirs, &htsig.mac).is_ok(),
             "hickory verify_mac accepts our ring MAC"
+        );
+    }
+
+    /// Oracle: a response we sign (RFC 8945 §5.4.1, request MAC prepended) must
+    /// verify under hickory's response verifier — proving the response-side
+    /// digest layout and HMAC interoperate. This is what makes `nsupdate`
+    /// accept the UPDATE reply.
+    #[test]
+    fn response_signature_accepted_by_hickory() {
+        use hickory_proto::rr::rdata::tsig::signed_bitmessage_to_buf;
+        let now = 1_700_000_000u64;
+        let secret = b"super-secret-key-material";
+
+        // Sign a request, verify it, take the request MAC.
+        let req = sign(&unsigned_update(), "ddns-key.", TsigAlg::Sha256, secret, now);
+        let v = verify_request(&req, &keys(), now, 300).expect("request verifies");
+
+        // Build and sign a response.
+        let mut h = Header::default();
+        h.id = 0x1234;
+        h.set_opcode(opcode::UPDATE);
+        h.set_qr(true);
+        let mut resp = Message { header: h, ..Default::default() };
+        resp.questions
+            .push(Question::new(Name::from_ascii("example.test.").unwrap(), rtype::SOA));
+        let resp_bytes = resp.encode();
+        let signed = sign_response(&resp_bytes, &v.request_mac, "ddns-key.", TsigAlg::Sha256, secret, now, 300);
+
+        // hickory verifies the response against the request MAC context. A
+        // request/response pair signs the response as a "first message" (full
+        // TSIG variables) with the request MAC prepended (RFC 8945 §5.4.1).
+        let (htbs, htsig_rec) = signed_bitmessage_to_buf(&signed, Some(&v.request_mac), true)
+            .expect("hickory response buf");
+        assert!(
+            htsig_rec.data.algorithm.verify_mac(secret, &htbs, &htsig_rec.data.mac).is_ok(),
+            "hickory accepts our response TSIG"
         );
     }
 }

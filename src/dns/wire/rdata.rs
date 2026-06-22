@@ -92,6 +92,17 @@ impl Rdata {
             return Err(WireError::BadRdataLength);
         }
 
+        // A zero-length RDATA appears in RFC 2136 UPDATE delete records (class
+        // ANY/NONE, "delete an RRset" / "delete all"): no typed parser can read
+        // an empty body, so represent it as empty opaque RDATA regardless of the
+        // record type. (For normal answers a typed RR always carries its fields.)
+        if rdlength == 0 {
+            return Ok(Rdata::Unknown {
+                rtype: rtype_num,
+                data: Vec::new(),
+            });
+        }
+
         let rd = match rtype_num {
             rtype::A => {
                 let s = d.slice(4)?;
@@ -292,6 +303,17 @@ mod tests {
     fn a_aaaa() {
         roundtrip(Rdata::A(Ipv4Addr::new(192, 0, 2, 1)));
         roundtrip(Rdata::Aaaa("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn zero_length_rdata_is_empty_unknown() {
+        // RFC 2136 "delete an RRset" carries a typed record with RDLENGTH 0.
+        // It must parse (as empty opaque RDATA) rather than failing as a
+        // truncated A/AAAA/etc.
+        let buf: [u8; 0] = [];
+        let mut d = Decoder::new(&buf);
+        let got = Rdata::parse(&mut d, rtype::A, 0).unwrap();
+        assert_eq!(got, Rdata::Unknown { rtype: rtype::A, data: Vec::new() });
     }
 
     #[test]

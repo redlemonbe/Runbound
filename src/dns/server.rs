@@ -23,7 +23,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use hickory_proto::op::Query as DnsQuery;
 use hickory_proto::op::{Edns, Message, MessageType, Metadata, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
+use crate::dns::tsig::TsigAlg;
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use hickory_server::{
@@ -165,7 +165,7 @@ pub struct RunboundHandler {
 
     /// #14: TSIG keys for DNS UPDATE authentication: (name, algorithm, base64-secret).
     /// SEC-20: pre-decoded TSIG keys (name_lower, algorithm, key_bytes) — decoded once at startup.
-    tsig_keys: Vec<(String, TsigAlgorithm, Vec<u8>)>,
+    tsig_keys: Vec<(String, TsigAlg, Vec<u8>)>,
     axfr_allow: Vec<String>,
     /// #10/#186: compiled split-horizon table — live-swappable so API edits
     /// apply without a restart. Read once per slow-path query via ArcSwap.
@@ -320,15 +320,9 @@ impl RunboundHandler {
             ddr,
             // SEC-20: decode TSIG keys once at startup instead of per-request.
             tsig_keys: tsig_keys_raw.into_iter().filter_map(|(name, alg_str, secret_b64)| {
-                let alg = match alg_str.as_str() {
-                    "hmac-sha256" | "HMAC-SHA256" => TsigAlgorithm::HmacSha256,
-                    "hmac-sha512" | "HMAC-SHA512" => TsigAlgorithm::HmacSha512,
-                    "hmac-sha384" | "HMAC-SHA384" => TsigAlgorithm::HmacSha384,
-                    "hmac-sha1"   | "HMAC-SHA1"   => TsigAlgorithm::HmacSha1,
-                    other => {
-                        tracing::error!(alg=%other, key=%name, "TSIG: unsupported algorithm — key will NOT be loaded, DDNS may be unprotected");
-                        return None;
-                    }
+                let Some(alg) = TsigAlg::parse(&alg_str) else {
+                    tracing::error!(alg=%alg_str, key=%name, "TSIG: unsupported algorithm — key will NOT be loaded, DDNS may be unprotected");
+                    return None;
                 };
                 match base64::engine::general_purpose::STANDARD.decode(&secret_b64) {
                     Ok(bytes) => Some((name.to_ascii_lowercase(), alg, bytes)),
@@ -1331,8 +1325,51 @@ impl RunboundHandler {
         let qtype = q.qtype;
 
         // ── Route-outs (no gate side-effects yet) ───────────────────────────
-        if msg.header.opcode() != opcode::QUERY {
-            return None;
+        match msg.header.opcode() {
+            opcode::QUERY => {}
+            opcode::UPDATE => {
+                // ── RFC 2136 DNS UPDATE, wire-native (TSIG via crate::dns::tsig) ──
+                if !self.allow_update {
+                    debug!(ip = %peer.ip(), "DNS UPDATE refused — allow-update: no");
+                    return Some(self.wire_update_response(&msg, rcode::REFUSED));
+                }
+                let (rc, verified) = crate::dns::ddns::handle_update_wire(
+                    query,
+                    &msg,
+                    &self.zones,
+                    &self.tsig_keys,
+                    peer.ip(),
+                );
+                let resp = self.wire_update_response(&msg, rc);
+                // RFC 8945 §5.4.1: a TSIG-authenticated request gets a signed
+                // response (whatever the rcode) so the client can verify it.
+                return Some(match verified {
+                    Some(v) => match self
+                        .tsig_keys
+                        .iter()
+                        .find(|(n, _, _)| *n == v.key_name)
+                    {
+                        Some((_, alg, secret)) => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            crate::dns::tsig::sign_response(
+                                &resp,
+                                &v.request_mac,
+                                &v.key_name,
+                                *alg,
+                                secret,
+                                now,
+                                300,
+                            )
+                        }
+                        None => resp,
+                    },
+                    None => resp,
+                });
+            }
+            _ => return None, // NOTIFY/STATUS/etc. stay on the hickory path
         }
         if matches!(qtype, rtype::AXFR | rtype::IXFR) {
             // ── AXFR/IXFR zone transfer (#22), wire-native ──────────────────
@@ -1552,6 +1589,30 @@ impl RunboundHandler {
         self.wire_answer(req, &[], rcode_low)
     }
 
+    /// Build an RFC 2136 UPDATE response: opcode UPDATE preserved, QR set, the
+    /// zone (question) section echoed, `rcode_low` set, no RA. Wire-native.
+    fn wire_update_response(&self, req: &crate::dns::wire::Message, rcode_low: u16) -> Vec<u8> {
+        use crate::dns::wire::consts::opcode;
+        use crate::dns::wire::{Header, Message};
+        let mut h = Header {
+            id: req.header.id,
+            flags: 0,
+            qdcount: 0,
+            ancount: 0,
+            nscount: 0,
+            arcount: 0,
+        };
+        h.set_qr(true);
+        h.set_opcode(opcode::UPDATE);
+        h.set_rcode_low(rcode_low);
+        let m = Message {
+            header: h,
+            questions: req.questions.clone(),
+            ..Default::default()
+        };
+        m.encode()
+    }
+
     /// Build a BADCOOKIE (extended RCODE 23, RFC 7873) response carrying the
     /// 16-byte server cookie so the client can retry with a valid cookie.
     fn wire_badcookie(&self, req: &crate::dns::wire::Message, full_cookie: Vec<u8>) -> Vec<u8> {
@@ -1684,20 +1745,8 @@ impl RequestHandler for RunboundHandler {
         // AXFR/IXFR is now served entirely in the wire fast path
         // (serve_wire → wire_serve::axfr_response); it never reaches here.
 
-        // ── 0a. RFC 2136 DNS UPDATE dispatch ────────────────────────────
-        if request.metadata.op_code == OpCode::Update {
-            if !self.allow_update {
-                debug!(%client_ip, "DNS UPDATE refused — allow-update: no");
-                return send_error(request, response_handle, ResponseCode::Refused).await;
-            }
-            return super::ddns::handle_update(
-                request,
-                response_handle,
-                &self.zones,
-                &self.tsig_keys,
-                client_ip,
-            ).await;
-        }
+        // DNS UPDATE is now served entirely in the wire fast path
+        // (serve_wire → ddns::handle_update_wire); it never reaches here.
 
         // ── 0. Access-control list ──────────────────────────────────────
         match self.acl.check(client_ip) {
