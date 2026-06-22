@@ -1,6 +1,6 @@
 # 10 — Appendices
 
-> **Status: current (v0.21.1)** — intentionally pointer-style: references
+> **Status: current (v0.22.0)** — intentionally pointer-style: references
 > `docs/configuration.md` and `docs/api.md` rather than duplicating them.
 
 ## A. Configuration reference

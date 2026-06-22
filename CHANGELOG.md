@@ -7,6 +7,68 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-23
+
+Major release: the default build now serves DNS **entirely on an in-house wire codec** — the
+hickory-dns request handler is removed from the default binary (the sovereign full-recursion
+resolver stays available behind the `recursor` feature). Every serving path was reimplemented
+wire-native and validated against hickory as a differential oracle.
+
+### Changed
+- **De-hickory: in-house DNS wire codec on the default serving path.** Forward/local-zone
+  resolution, split-horizon, DNS cookies (RFC 7873), and the CHAOS/ANY/HTTPS rejections are served
+  by `serve_wire` with no hickory handler. `cargo tree -i hickory-server` is empty for the default
+  build.
+- **In-house DNSSEC signing crypto** (ECDSA P-256 on `ring`, RFC 6605/4034/5155/9276) replacing
+  hickory's signer — proven byte-identical to hickory by differential oracles and `delv`-validated
+  (positive, SOA, CNAME chains, NSEC3 NXDOMAIN/NODATA all "fully validated").
+- **AXFR/IXFR (#22), TSIG (RFC 8945) and DNS UPDATE / DDNS (RFC 2136)** reimplemented wire-native;
+  the TSIG verifier runs on `ring` HMAC and is oracle-checked against hickory, DDNS validated with
+  the BIND `nsupdate` client.
+- **Default Linux capabilities reduced to `CAP_NET_BIND_SERVICE`** in `runbound.service` /
+  `install.sh`; the XDP and firewall-manage capabilities (`NET_RAW`/`NET_ADMIN`/`BPF`/`PERFMON`) are
+  now an explicit, commented opt-in (PENT-3).
+- **WebUI binds `127.0.0.1` by default** — exposing the admin panel on the network now requires an
+  explicit `ui-bind: 0.0.0.0` (PENT-4).
+
+### Added
+- **Wire serving path feature parity** (these lived only in the now-default-disabled hickory
+  handler and were silently inactive in the shipped binary): query logging → `GET /api/logs`,
+  serve-stale (#108, RFC 8767), resolv.conf emergency fallback (#94), per-upstream racing-win
+  metric (#33), and top-domains slow-path counting (#5). All proven live.
+
+### Security
+Aggressive two-AI pentest (Claude Opus 4.8 live attacks × Gemini source pass) on a live install,
+plus a prior Cycle O audit. See `docs/security-audit/`.
+- **PENT-1 (HIGH) — AXFR allow-list bypass fixed.** Zone transfers are TCP (and DoT/DoH), proxied
+  through a loopback relay, so the handler saw `127.0.0.1` and the `axfr-allow` list matched
+  everyone (or no one). The relay now carries the **real client IP via a PROXY v2 header** to every
+  loopback listener (plain TCP, and DoT/DoH before the TLS handshake), so `axfr-allow` and
+  split-horizon evaluate the true source. Re-tested: external transfer `REFUSED`, loopback served.
+- **PENT-2 (MEDIUM) — split-horizon now sees the real client IP** on TCP, DoT and DoH (same fix);
+  proven with a per-subnet view over UDP/DoT/DoH.
+- **PENT-5 (LOW) — TSIG key-name lookup is constant-time** (`subtle::ConstantTimeEq`, no early-exit
+  timing oracle).
+- **SEC-O1 (HIGH) — forward cache-poisoning fixed:** the de-hickory UDP forwarder now validates the
+  upstream response transaction-ID and question before accepting it.
+- Plus PENT-3 / PENT-4 hardening (see Changed). Negative space confirmed robust: 2091 hostile
+  packets caused 0 crashes; no log injection, blacklist bypass, path traversal, secret leak,
+  command injection, or config-write RCE; rate-limit and per-IP TCP cap enforced.
+
+### Fixed
+- **TSIG key name with a trailing dot** (`tsig-key: "name." …`) silently failed every signed UPDATE
+  with `UnknownKey`; the handler now normalizes the stored name to match the verifier (VAL-1).
+- **Config `axfr:` / `io-uring:` sub-blocks** no longer swallow the `server:` directives written
+  after them (e.g. `api-port`, `ui-enabled`) — they were misattributed to the sub-block section and
+  dropped (VAL-2).
+- **`RLIMIT_NOFILE` self-raised at startup** so a forward burst (one socket per query) never hits
+  `EMFILE` regardless of the launcher's limit.
+- Dead-code cleanup: 0 dead-code/unused warnings in both the default and `recursor` builds.
+
+### Tests
+- `cargo test --release --bin runbound` → **413 passed / 0 failed**; default and `recursor` builds
+  both compile; 4 cross targets (x86_64/aarch64 × gnu/musl) build.
+
 ## [0.21.1] - 2026-06-20
 
 ### Fixed

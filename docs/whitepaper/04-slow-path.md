@@ -1,17 +1,25 @@
-# 04 — The slow path (hickory-server)
+# 04 — The slow path (wire-native `serve_wire`)
 
-In `xdp: no` mode the receive side is the **kernel fast loop** (§4.0), not hickory: it
-serves cache hits through the same wire responder the AF_XDP fast path uses, and only
-genuine misses (recursion, CNAME/MX/TSIG, DNSSEC) reach the full
-[hickory](https://github.com/hickory-dns/hickory-dns) stack
-(`hickory-server`/`-resolver`/`-proto` 0.26, `src/dns/server.rs`) described below. The
-hickory **fallback** pipeline:
+> **Status: current (v0.22.0).** As of v0.22 the default build is **hickory-free**: the slow path
+> is served entirely by the in-house wire codec (`serve_wire`, `src/dns/server.rs`); the
+> hickory-dns request handler is removed from the default binary and only re-introduced behind the
+> optional `recursor` feature (the sovereign iterative resolver). The pipeline below is unchanged
+> in behaviour — only its implementation moved from hickory to the wire codec.
 
-1. **ACL check** per source IP (from `unbound.conf`) — `src/dns/acl.rs`.
+In `xdp: no` mode the receive side is the **kernel fast loop** (§4.0): it serves cache hits through
+the same wire responder the AF_XDP fast path uses, and genuine misses (forward, CNAME/MX, TSIG,
+AXFR, DDNS, DNSSEC signing) are handled by `serve_wire` — no hickory handler. The **fallback**
+pipeline:
+
+1. **ACL check** per source IP (from `unbound.conf`) — `src/dns/acl.rs`. For TCP/DoT/DoH the real
+   client IP is carried to the handler via a PROXY v2 header on the loopback relay (so `axfr-allow`
+   and split-horizon evaluate the true source).
 2. **Rate limit** per source IP, token bucket, default 200 qps (`RATE_LIMIT_QPS_DEFAULT`,
    `src/dns/server.rs`).
-3. **Local zones** (local-data, blacklist, feeds) in memory → instant answer.
-4. Otherwise → **recursive resolver** (hickory-resolver), UDP+TCP on the configured port.
+3. **Local zones** (local-data, blacklist, feeds), AXFR/IXFR, TSIG-authenticated DDNS, and
+   DNSSEC-signed serving (in-house ECDSA P-256 signer) → answered wire-native.
+4. Otherwise → **forward** over the own wire forward pool (plain UDP / DoT), or, with the `recursor`
+   feature, the sovereign iterative resolver.
 
 ## 4.0 The kernel fast loop — the real `xdp: no` hot path
 
