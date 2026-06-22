@@ -610,6 +610,20 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
         // Each handler strips its own quotes where needed.
         let val = val.trim();
 
+        // VAL-2: `axfr:` and `io-uring:` are sub-blocks of `server:` in this flat
+        // section model (they only own `enable`/`allow`). Without nesting, a `server:`
+        // directive written *after* such a sub-block (e.g. `api-port:` following an
+        // `axfr:` block, still inside `server:`) would otherwise be dispatched to the
+        // sub-block section and silently dropped. When the key is not one of the
+        // sub-block's own keys, the sub-block has ended — fall back to the parent
+        // `server` section (before the managed-directive gate) so the directive is
+        // parsed where it belongs.
+        match current_section.as_str() {
+            "axfr" if !matches!(key, "enable" | "allow") => current_section = "server".to_string(),
+            "io-uring" if key != "enable" => current_section = "server".to_string(),
+            _ => {}
+        }
+
         // Capture directives the writer does not regenerate (accepted-but-unused
         // tuning knobs + unknown lines) so full config regeneration never drops them.
         if !crate::config::writer::is_managed_directive(&current_section, key) {
@@ -1189,6 +1203,39 @@ mod tests {
     fn full_line_hash_comment_is_ignored() {
         let cfg = parse_str("server:\n  # just a comment\n  ui-brand-name: \"X\"\n").unwrap();
         assert_eq!(cfg.ui_brand_name, "X");
+    }
+
+    // -- VAL-2: a server directive after an `axfr:` sub-block is not dropped -----
+    #[test]
+    fn server_directive_after_axfr_subblock_is_parsed() {
+        let cfg = parse_str(
+            "server:\n\
+            \x20   interface: 127.0.0.1\n\
+            \x20   axfr:\n\
+            \x20       enable: yes\n\
+            \x20       allow: 127.0.0.1\n\
+            \x20   api-port: 8085\n\
+            \x20   ui-enabled: yes\n",
+        )
+        .unwrap();
+        // the axfr sub-block still parsed
+        assert!(cfg.axfr_enabled);
+        assert_eq!(cfg.axfr_allow, vec!["127.0.0.1".to_string()]);
+        // and the directives written *after* it are no longer swallowed
+        assert_eq!(cfg.api_port, Some(8085));
+        assert!(cfg.ui_enabled);
+    }
+
+    #[test]
+    fn io_uring_subblock_does_not_swallow_following_directives() {
+        let cfg = parse_str(
+            "server:\n\
+            \x20   io-uring:\n\
+            \x20       enable: yes\n\
+            \x20   ui-enabled: yes\n",
+        )
+        .unwrap();
+        assert!(cfg.ui_enabled);
     }
 
     // ── #202: resolution mode (forward vs full-recursion) ─────────────────

@@ -41,8 +41,9 @@ them is correctly rejected) → 303 + session cookie → protected endpoints (`/
 | ID | Severity | Status | Finding |
 |---|---|---|---|
 | VAL-1 | MEDIUM | ✅ Fixed | **TSIG key-name trailing-dot mismatch.** `verify_request` looks up the request key name with the trailing dot stripped, but the handler stored the config name verbatim (`"name."`). A config `tsig-key: "name." …` therefore failed every signed UPDATE with `UnknownKey` (silent DDNS breakage). Fixed: the handler now stores `name.trim_end_matches('.').to_ascii_lowercase()` (server.rs). Regression test added (`tsig::tests::config_key_name_trailing_dot_is_normalized`). |
-| VAL-2 | LOW | 🟡 Doc | **Config footgun: `axfr:` is a *section*.** Writing `axfr:` (colon) inside the `server:` block starts a new "axfr" section; subsequent `server:` directives (e.g. `api-port`, `ui-enabled`) fall into it and are dropped (with a `warn!("unknown axfr directive … — ignored")`). The documented form is `axfr { … }` (braces); with the colon form, place it last or re-open `server:` after it. No code change — unbound-style section semantics. |
+| VAL-2 | LOW | ✅ Fixed | **Config footgun: directives after an `axfr:` sub-block were dropped.** `axfr:`/`io-uring:` are sub-blocks of `server:` but the flat section parser treated them as terminal sections, so a `server:` directive written after them (e.g. `api-port`, `ui-enabled`, `local-data`) was misattributed to the sub-block section and silently dropped — e.g. the WebUI never started. Fixed in `config/parser.rs`: when in an `axfr`/`io-uring` section and the key is not one of the sub-block's own keys (`enable`/`allow`), the sub-block has ended → fall back to the parent `server` section (before the managed-directive gate). Proven live with the trap config: `api-port: 8085` (non-default, after `axfr:`) → API on 8085; `ui-enabled` after `axfr:` → WebUI on 8090; `local-data` after `axfr:` served; the `axfr:` sub-block itself still parses (AXFR NOERROR, allow honoured). 2 parser regression tests added. |
 
 ## Verification
-`cargo test --release --bin runbound` → **411 passed / 0 failed**. Both default and `recursor`
-builds compile. Live checks above run against the systemd-installed binary on worker-dr.
+`cargo test --release --bin runbound` → **413 passed / 0 failed** (VAL-1 + VAL-2 regression
+tests included). Both default and `recursor` builds compile. Live checks above run against the
+systemd-installed binary on worker-dr.
