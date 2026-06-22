@@ -3197,6 +3197,17 @@ async fn spawn_tls_service(
                                 let acceptor = acceptor.clone();
                                 let hh = std::sync::Arc::clone(&h_dot);
                                 tokio::spawn(async move {
+                                    // PENT-2: the relay prepends a PROXY v2 header with the real
+                                    // client IP before the TLS bytes; recover it so split-horizon /
+                                    // per-IP handler logic see the true source for DoT clients.
+                                    let mut tcp = tcp;
+                                    let real_ip = match tokio::time::timeout(
+                                        Duration::from_secs(5), read_proxy_v2(&mut tcp)).await
+                                    {
+                                        Ok(Some(ip)) => ip,
+                                        _ => return,
+                                    };
+                                    let peer = SocketAddr::new(real_ip, peer.port());
                                     let mut tls = match acceptor.accept(tcp).await {
                                         Ok(s) => s,
                                         Err(e) => { debug!(err=%e, "DoT TLS handshake"); return; }
@@ -3226,7 +3237,7 @@ async fn spawn_tls_service(
                                 std::sync::Arc::clone(acl),
                                 proxy_protocol,
                                 alert.clone(),
-                                false, // DoT: loopback listener terminates TLS — no PROXY prepend
+                                true, // DoT: relay prepends real client IP; loopback reads it pre-TLS (PENT-2)
                             )));
                     }
                 }
@@ -3260,7 +3271,7 @@ async fn spawn_tls_service(
                             std::sync::Arc::clone(acl),
                             proxy_protocol,
                             alert.clone(),
-                            false, // DoH: loopback listener terminates TLS — no PROXY prepend
+                            true, // DoH: relay prepends real client IP; doh_service reads it pre-TLS (PENT-2)
                         )));
                     }
                 }
@@ -3444,6 +3455,17 @@ async fn doh_service(
         let path = std::sync::Arc::clone(&path);
         let hostname = std::sync::Arc::clone(&hostname);
         tokio::spawn(async move {
+            // PENT-2: recover the real client IP from the relay's PROXY v2 header
+            // (prepended before the TLS bytes) so split-horizon / per-IP handler
+            // logic see the true source for DoH clients.
+            let mut tcp = tcp;
+            let real_ip = match tokio::time::timeout(
+                Duration::from_secs(5), read_proxy_v2(&mut tcp)).await
+            {
+                Ok(Some(ip)) => ip,
+                _ => return,
+            };
+            let peer = SocketAddr::new(real_ip, peer.port());
             let tls_stream = match acceptor.accept(tcp).await {
                 Ok(s) => s,
                 Err(e) => {
