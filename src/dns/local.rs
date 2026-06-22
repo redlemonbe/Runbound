@@ -213,40 +213,37 @@ impl LocalZoneSet {
 
         // ── Build wire-record index (#156 item 3) ──────────────────────────────
         // Pre-serialise A/AAAA rdata into WireRdata (stack SmallVec) keyed by
-        // hash_wire_qname(name_to_wire_qname(name)).  Built once at load; the hot
-        // path answer_dns_wire() uses this index to avoid Name::read per packet.
+        // hash_wire_qname(wire_qname). Built once at load from the wire record
+        // store (records_wire) — no hickory in the fast-path index source. The
+        // hot path answer_dns_wire() uses this index to avoid Name::read per packet.
+        // records_wire keys are already the lowercased wire QNAME == name_to_wire_qname.
         let mut wire_idx = WireRecordIndex::new();
-        for (name, recs) in &record_map {
-            let wq = name_to_wire_qname(name);
+        for (key_bytes, recs) in &records_wire {
+            let wq: SmallVec<[u8; 64]> = SmallVec::from_slice(key_bytes);
             let key = hash_wire_qname(&wq);
             let entry = wire_idx.map.entry(key).or_insert_with(|| WireRecordEntry {
                 wire_qname:   wq.clone(),
                 a_records:    SmallVec::new(),
                 aaaa_records: SmallVec::new(),
             });
-            // Anti-collision: if two names hash to the same key, we keep the
-            // first one in the index and skip the rest.  The collision rate for
-            // CRC32c Fibonacci-spread over ≤10k zone names is negligible, but
-            // correctness is preserved — colliding names fall back to hickory.
+            // Anti-collision: if two names hash to the same key, keep the first
+            // and skip the rest. CRC32c Fibonacci-spread over ≤10k names makes
+            // this negligible, and colliding names still serve on the slow path.
             if entry.wire_qname != wq {
-                tracing::warn!(
-                    name = %name,
-                    "WireRecordIndex: CRC32c hash collision — name falls back to hickory slow path"
-                );
+                tracing::warn!("WireRecordIndex: CRC32c hash collision — name skipped on the fast path");
                 continue;
             }
             for rec in recs {
-                let ttl = rec.ttl;
-                match rec.data {
-                    RData::A(ref a) => {
+                match &rec.rdata {
+                    crate::dns::wire::Rdata::A(a) => {
                         entry.a_records.push(WireRdata {
-                            ttl,
+                            ttl: rec.ttl,
                             rdata: SmallVec::from_slice(&a.octets()),
                         });
                     }
-                    RData::AAAA(ref aaaa) => {
+                    crate::dns::wire::Rdata::Aaaa(aaaa) => {
                         entry.aaaa_records.push(WireRdata {
-                            ttl,
+                            ttl: rec.ttl,
                             rdata: SmallVec::from_slice(&aaaa.octets()),
                         });
                     }
@@ -634,4 +631,39 @@ pub fn parse_local_data(rr: &str) -> Option<Record> {
     };
 
     Some(Record::from_rdata(name, ttl, rdata))
+}
+
+#[cfg(test)]
+mod wire_index_tests {
+    use super::*;
+    use crate::config::parser::{LocalData, LocalZone};
+
+    /// The XDP fast-path index (wire_records) is now built from the wire record
+    /// store (records_wire), not the hickory map. It must still hold every A/AAAA
+    /// RR under hash_wire_qname(wire QNAME), so the kernel fast path serves them.
+    #[test]
+    fn wire_records_index_built_from_wire_store() {
+        let zones = vec![LocalZone { name: "fast.test.".into(), zone_type: "static".into() }];
+        let data = vec![
+            LocalData { rr: "h.fast.test. 300 A 10.0.0.1".into() },
+            LocalData { rr: "h.fast.test. 300 A 10.0.0.2".into() },
+            LocalData { rr: "h.fast.test. 300 AAAA 2001:db8::9".into() },
+            LocalData { rr: "c.fast.test. 300 CNAME h.fast.test.".into() },
+        ];
+        let z = LocalZoneSet::from_config(&zones, &data);
+
+        // h.fast.test. → 2 A + 1 AAAA in the index, keyed by the wire QNAME hash.
+        let wq = name_to_wire_qname(&Name::from_str("h.fast.test.").unwrap());
+        let key = crate::dns::hasher::hash_wire_qname(&wq);
+        let entry = z.wire_records.map.get(&key).expect("h.fast.test. indexed");
+        assert_eq!(entry.a_records.len(), 2, "two A records");
+        assert_eq!(entry.aaaa_records.len(), 1, "one AAAA record");
+        assert_eq!(entry.a_records[0].rdata.as_slice(), &[10, 0, 0, 1]);
+        assert_eq!(entry.wire_qname.as_slice(), wq.as_slice());
+
+        // CNAME-only name has no A/AAAA fast-path entry (slow path serves it).
+        let cwq = name_to_wire_qname(&Name::from_str("c.fast.test.").unwrap());
+        let ckey = crate::dns::hasher::hash_wire_qname(&cwq);
+        assert!(z.wire_records.map.get(&ckey).map(|e| e.a_records.is_empty() && e.aaaa_records.is_empty()).unwrap_or(true));
+    }
 }
