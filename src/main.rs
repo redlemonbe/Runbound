@@ -2541,26 +2541,25 @@ pub async fn schedule_enforce_loop(
 }
 
 pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
-    let mut zone_set = LocalZoneSet::from_config(&cfg.local_zones, &cfg.local_data);
-
-    // Persisted DNS entries (from REST API POST /dns)
+    // Persisted DNS entries (REST API POST /dns) are folded into the local-data set
+    // BEFORE building the zone set, so from_config populates BOTH the wire stores
+    // (records_wire/zones_wire/static_names_wire, read by serve_wire) and the
+    // hickory maps. Appending only to the hickory maps afterwards left API records
+    // invisible to the wire serving path.
+    let mut local_data = cfg.local_data.clone();
     if let Ok(st) = store::load() {
+        let mut added = 0usize;
         for entry in &st.entries {
             if let Some(rr) = entry.to_rr_string() {
-                if let Some(record) = dns::local::parse_local_data(&rr) {
-                    let name = record.name.clone();
-                    zone_set
-                        .zones
-                        .entry(name.clone())
-                        .or_insert(dns::ZoneAction::Static);
-                    zone_set.records.entry(name).or_default().push(record);
-                }
+                local_data.push(crate::config::parser::LocalData { rr });
+                added += 1;
             }
         }
-        if !st.entries.is_empty() {
-            tracing::info!(count = st.entries.len(), "Loaded persisted DNS entries");
+        if added > 0 {
+            tracing::info!(count = added, "Loaded persisted DNS entries");
         }
     }
+    let mut zone_set = LocalZoneSet::from_config(&cfg.local_zones, &local_data);
 
     // Persisted blacklist (override_zone so blacklist always shadows static zones)
     // #9: only apply entries whose schedule is currently active (or have no schedule)
@@ -2595,7 +2594,18 @@ pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
                 .collect();
             for name in zone_keys {
                 let rec = Record::from_rdata(name.clone(), 10, RData::A(rdata::A(bp_ip)));
-                zone_set.records.entry(name).or_default().push(rec);
+                zone_set.records.entry(name.clone()).or_default().push(rec);
+                // Wire twin (serve_wire BlockPage path reads records_wire).
+                if let Ok(wn) = dns::wire::Name::from_ascii(&name.to_string()) {
+                    let key = dns::local::wire_name_key(&wn);
+                    zone_set.records_wire.entry(key).or_default().push(dns::wire::Record {
+                        name: wn,
+                        rtype: dns::wire::consts::rtype::A,
+                        rclass: dns::wire::consts::class::IN,
+                        ttl: 10,
+                        rdata: dns::wire::Rdata::A(bp_ip),
+                    });
+                }
             }
         }
     }

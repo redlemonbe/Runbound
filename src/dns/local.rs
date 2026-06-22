@@ -319,7 +319,13 @@ impl LocalZoneSet {
             format!("{}.", name)
         };
         if let Ok(n) = Name::from_str(&name_str) {
-            self.zones.insert(n, action);
+            self.zones.insert(n, action.clone());
+        }
+        // Keep the wire trie in sync: serve_wire enforces blacklist/feed overrides
+        // through `find_wire` (zones_wire), so an override that only touched the
+        // hickory `zones` map would be silently bypassed on the wire serving path.
+        if let Ok(wn) = crate::dns::wire::Name::from_ascii(&name_str) {
+            self.zones_wire.insert(wire_name_key(&wn), action);
         }
     }
 
@@ -332,6 +338,26 @@ impl LocalZoneSet {
         };
         if let Ok(n) = Name::from_str(&name_str) {
             self.zones.remove(&n);
+        }
+        if let Ok(wn) = crate::dns::wire::Name::from_ascii(&name_str) {
+            self.zones_wire.remove(&wire_name_key(&wn)[..]);
+        }
+    }
+
+    /// Insert a local-data record (presentation form, e.g. `host.zone. 300 A 1.2.3.4`)
+    /// into BOTH the hickory maps and the wire stores, marking the owner a Static
+    /// zone. Used by API / relay zone management so serve_wire (records_wire) and
+    /// the legacy maps stay consistent.
+    pub fn insert_record_str(&mut self, rr: &str) {
+        if let Some(record) = parse_local_data(rr) {
+            let name = record.name.clone();
+            self.zones.entry(name.clone()).or_insert(ZoneAction::Static);
+            self.records.entry(name).or_default().push(record);
+        }
+        if let Some(wr) = crate::dns::wire::present::parse_rr_line(rr) {
+            let key = wire_name_key(&wr.name);
+            self.zones_wire.entry(key.clone()).or_insert(ZoneAction::Static);
+            self.records_wire.entry(key).or_default().push(wr);
         }
     }
 

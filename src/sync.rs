@@ -480,13 +480,25 @@ impl SyncJournal {
 
 
     /// Return all registered nodes with relay_host set (for config push).
+    /// Recomputes last_seen_secs and status at query time (stored value is always 0).
     pub fn registered_slaves(&self) -> Vec<SlaveInfo> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         self.registered_nodes
             .lock()
             .unwrap_or_else(|e| panic!("sync: registered_nodes mutex poisoned: {e}"))
             .values()
             .filter(|s| s.relay_host.is_some())
-            .cloned()
+            .map(|s| {
+                let secs = now.saturating_sub(s.last_seen_at);
+                SlaveInfo {
+                    last_seen_secs: secs,
+                    status: if secs < 30 { "connected".into() } else { "disconnected".into() },
+                    ..s.clone()
+                }
+            })
             .collect()
     }
 
@@ -1467,15 +1479,10 @@ impl SlaveClient {
                     save(&st).map_err(|e| anyhow::anyhow!("{e}"))?;
                     // Mirror the same zone injection the API handler does.
                     if let Some(rr) = entry.to_rr_string() {
-                        if let Some(record) = parse_local_data(&rr) {
+                        {
                             let current = self.zones.load_full();
                             let mut new_zones = (*current).clone();
-                            let name = record.name.clone();
-                            new_zones
-                                .zones
-                                .entry(name.clone())
-                                .or_insert(ZoneAction::Static);
-                            new_zones.records.entry(name).or_default().push(record);
+                            new_zones.insert_record_str(&rr);
                             self.zones.store(Arc::new(new_zones));
                         }
                     }
@@ -1574,7 +1581,9 @@ pub struct NodeRelay {
     pub domain_stats: Arc<crate::domain_stats::DomainStats>,
     pub dnssec_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub resolver: crate::dns::server::SharedResolver,
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     pub resolution_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     pub recursor: crate::dns::recursor::SharedRecursor,
     pub icmp_stats: std::sync::Arc<crate::icmp::IcmpStats>,
     pub icmp_cfg: std::sync::Arc<std::sync::Mutex<crate::icmp::IcmpConfig>>,
@@ -1702,15 +1711,10 @@ async fn handle_relay_request(
             let mut st = load().unwrap_or_default();
             if !st.entries.iter().any(|e| e.id == entry.id) {
                 if let Some(rr) = entry.to_rr_string() {
-                    if let Some(record) = parse_local_data(&rr) {
+                    {
                         let current = relay.zones.load_full();
                         let mut new_zones = (*current).clone();
-                        let name = record.name.clone();
-                        new_zones
-                            .zones
-                            .entry(name.clone())
-                            .or_insert(ZoneAction::Static);
-                        new_zones.records.entry(name).or_default().push(record);
+                        new_zones.insert_record_str(&rr);
                         relay.zones.store(Arc::new(new_zones));
                     }
                 }
@@ -2058,16 +2062,18 @@ async fn handle_relay_request(
         // #202: resolution-mode toggle propagated from the master.
         ("PUT", "resolution") => {
             #[derive(serde::Deserialize)]
+            #[allow(dead_code)]
             struct ResPatch {
                 mode: Option<String>,
             }
-            let p: ResPatch = match serde_json::from_slice(&body_bytes) {
+            let _p: ResPatch = match serde_json::from_slice(&body_bytes) {
                 Ok(v) => v,
                 Err(e) => {
                     return Ok(json_resp(400, serde_json::json!({ "error": format!("parse: {e}") })))
                 }
             };
-            if let Some(m) = p
+            #[cfg(feature = "recursor")]
+            if let Some(m) = _p
                 .mode
                 .as_deref()
                 .and_then(crate::config::parser::ResolutionMode::parse_value)
@@ -2088,6 +2094,8 @@ async fn handle_relay_request(
                         tracing::warn!(%e, "relay: recursor build failed on slave — staying forward");
                     }
                 }
+                #[cfg(not(feature = "recursor"))]
+                relay.resolution_mode.store(0, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(json_ok(serde_json::json!({ "ok": true })))
         }

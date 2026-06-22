@@ -1834,6 +1834,17 @@ async fn persist_and_swap(
             .entry(name.clone())
             .or_insert(ZoneAction::Static);
         new_zones.records.entry(name).or_default().push(record);
+        // Wire twin so serve_wire (records_wire) serves API-added records.
+        if let Some(rr) = entry.to_rr_string() {
+            if let Some(wr) = crate::dns::wire::present::parse_rr_line(&rr) {
+                let key = crate::dns::local::wire_name_key(&wr.name);
+                new_zones
+                    .zones_wire
+                    .entry(key.clone())
+                    .or_insert(crate::dns::local::ZoneAction::Static);
+                new_zones.records_wire.entry(key).or_default().push(wr);
+            }
+        }
         resync_xdp_cache(s, &new_zones);
         s.zones.store(Arc::new(new_zones));
     }
@@ -1956,6 +1967,25 @@ async fn delete_dns_handler(
                 if recs.is_empty() {
                     new_zones.records.remove(&name);
                     new_zones.zones.remove(&name);
+                }
+            }
+            // Wire twin removal, same exact match (name + type + rdata).
+            if let Some(wr) = crate::dns::wire_bridge::from_hickory(&record) {
+                let key = crate::dns::local::wire_name_key(&wr.name);
+                if let Some(wrecs) = new_zones.records_wire.get_mut(&key[..]) {
+                    let mut removed = false;
+                    wrecs.retain(|r| {
+                        if !removed && r.rtype == wr.rtype && r.rdata == wr.rdata {
+                            removed = true;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if wrecs.is_empty() {
+                        new_zones.records_wire.remove(&key[..]);
+                        new_zones.zones_wire.remove(&key[..]);
+                    }
                 }
             }
             resync_xdp_cache(&s, &new_zones);
