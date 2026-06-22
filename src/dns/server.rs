@@ -1337,9 +1337,6 @@ impl RunboundHandler {
         if matches!(qtype, rtype::AXFR | rtype::IXFR) {
             return None; // zone transfer stays on the hickory path
         }
-        if self.dns_cookies {
-            return None; // cookie verification stays on the hickory path
-        }
         if self.rrl_slip != 0 {
             return None; // RRL SLIP nuance stays on the hickory path
         }
@@ -1367,6 +1364,31 @@ impl RunboundHandler {
         let start = Instant::now();
         self.stats.inc_total();
         self.stats.inc_qtype_raw(qtype);
+
+        // ── DNS Cookies (RFC 7873) — anti-spoof on real UDP clients ─────────
+        // Loopback peers are the TCP/DoT/DoH relay (connection-verified): skip.
+        if self.dns_cookies && !peer.ip().is_loopback() {
+            let client_cookie = msg
+                .edns()
+                .ok()
+                .flatten()
+                .and_then(|e| e.options.iter().find(|(c, _)| *c == 10).map(|(_, d)| d.clone()));
+            if let Some(cc) = client_cookie {
+                if cc.len() >= 8 {
+                    let expected = server_cookie(&self.cookie_secret, &cc[..8], peer.ip());
+                    let verified = cc.len() >= 16 && {
+                        use subtle::ConstantTimeEq;
+                        bool::from(cc[8..16].ct_eq(&expected))
+                    };
+                    if !verified {
+                        let mut full = cc[..8].to_vec();
+                        full.extend_from_slice(&expected);
+                        self.stats.inc_refused();
+                        return Some(self.wire_badcookie(&msg, full));
+                    }
+                }
+            }
+        }
 
         // ── Rate limit (side-effectful: owned from here, no more fallback) ──
         if !self.rate_limiter.check(client_ip) {
@@ -1496,6 +1518,33 @@ impl RunboundHandler {
     /// Build an error/empty response (no answers) for `req` with `rcode_low`.
     fn wire_error(&self, req: &crate::dns::wire::Message, rcode_low: u16) -> Vec<u8> {
         self.wire_answer(req, &[], rcode_low)
+    }
+
+    /// Build a BADCOOKIE (extended RCODE 23, RFC 7873) response carrying the
+    /// 16-byte server cookie so the client can retry with a valid cookie.
+    fn wire_badcookie(&self, req: &crate::dns::wire::Message, full_cookie: Vec<u8>) -> Vec<u8> {
+        use crate::dns::wire::{Edns, Header, Message};
+        const BADCOOKIE: u16 = 23;
+        let mut h = Header { id: req.header.id, flags: 0, qdcount: 0, ancount: 0, nscount: 0, arcount: 0 };
+        h.set_qr(true);
+        h.set_rd(req.header.rd());
+        h.set_ra(true);
+        h.set_rcode_low(BADCOOKIE & 0x0F); // low nibble in the header
+        let mut e = Edns::default();
+        if let Ok(Some(req_edns)) = req.edns() {
+            e.udp_payload = req_edns.udp_payload.clamp(512, 1232);
+            e.set_dnssec_ok(req_edns.dnssec_ok());
+        }
+        e.ext_rcode = (BADCOOKIE >> 4) as u8; // high 8 bits of the 12-bit extended RCODE
+        e.options.push((10, full_cookie)); // COOKIE option
+        let m = Message {
+            header: h,
+            questions: req.questions.clone(),
+            answers: Vec::new(),
+            authority: Vec::new(),
+            additional: vec![e.to_record()],
+        };
+        m.encode()
     }
 
     /// Insert a positive answer into the XDP cache snapshot (so the fast path can
