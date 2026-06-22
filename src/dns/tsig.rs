@@ -14,6 +14,7 @@
 //! helper, kept behind `#[cfg(test)]`.
 
 use ring::hmac;
+use subtle::ConstantTimeEq;
 
 use crate::dns::wire::consts::rtype;
 use crate::dns::wire::{Decoder, Encoder, Name};
@@ -230,7 +231,20 @@ pub fn verify_request(
 
     let key_name = tsig.key_name.to_ascii().to_ascii_lowercase();
     let key_name = key_name.trim_end_matches('.').to_string();
-    let Some((_, alg, secret)) = keys.iter().find(|(n, _, _)| *n == key_name) else {
+    // PENT-5: look the key up without an early-exit, so the lookup time does not
+    // reveal which (or how many) configured key names were compared before a match
+    // — i.e. no timing oracle for key-name enumeration. The name length is not
+    // sensitive (it is sent in clear in the TSIG RR); the key *secret* is verified
+    // separately in constant time by `ring::hmac::verify`.
+    let mut matched: Option<(&TsigAlg, &Vec<u8>)> = None;
+    for (n, alg, secret) in keys.iter() {
+        let eq = n.len() == key_name.len()
+            && bool::from(n.as_bytes().ct_eq(key_name.as_bytes()));
+        if eq {
+            matched = Some((alg, secret));
+        }
+    }
+    let Some((alg, secret)) = matched else {
         return Err(TsigError::UnknownKey);
     };
 

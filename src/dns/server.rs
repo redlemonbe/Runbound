@@ -2947,6 +2947,12 @@ async fn run_tcp_with_limit(
     acl: Arc<Acl>,
     proxy_protocol: bool,
     alert: Option<Arc<crate::alerts::AlertTracker>>,
+    // PENT-1/PENT-2: when true, prepend a PROXY v2 header carrying the REAL client IP
+    // to the loopback relay connection so the handler (serve_wire) sees the real source
+    // instead of 127.0.0.1. Required for the plain-TCP loopback listener (AXFR allow-list
+    // + split-horizon). MUST be false for the DoT/DoH relays — their loopback listeners
+    // expect a TLS handshake, not a PROXY header.
+    forward_real_ip: bool,
 ) {
     loop {
         let (mut client, peer) = match public_tcp.accept().await {
@@ -3014,6 +3020,13 @@ async fn run_tcp_with_limit(
         tokio::spawn(async move {
             let r = tokio::time::timeout(conn_timeout, async {
                 let mut relay = TcpStream::connect(relay_addr).await?;
+                // PENT-1/PENT-2: hand the REAL client IP to the loopback handler via a
+                // PROXY v2 header so per-IP handler logic (AXFR allow-list, split-horizon)
+                // sees the true source. Only the plain-TCP loopback listener parses it.
+                if forward_real_ip {
+                    use tokio::io::AsyncWriteExt;
+                    relay.write_all(&proxy_v2_header(raw_ip)).await?;
+                }
                 tokio::io::copy_bidirectional(&mut client, &mut relay).await?;
                 Ok::<_, std::io::Error>(())
             })
@@ -3025,6 +3038,35 @@ async fn run_tcp_with_limit(
             ACTIVE_TCP_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
+}
+
+/// Build a PROXY protocol v2 header carrying `ip` as the source address (dst and
+/// ports are zero — the loopback reader only consumes the source IP). Used by the
+/// plain-TCP relay to hand the real client IP to the loopback handler (PENT-1/PENT-2).
+fn proxy_v2_header(ip: std::net::IpAddr) -> Vec<u8> {
+    const SIG: [u8; 12] = [
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+    let mut h = Vec::with_capacity(16 + 36);
+    h.extend_from_slice(&SIG);
+    h.push(0x21); // version 2, command PROXY
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            h.push(0x11); // AF_INET, STREAM
+            h.extend_from_slice(&12u16.to_be_bytes());
+            h.extend_from_slice(&v4.octets()); // src
+            h.extend_from_slice(&[0u8; 4]); // dst
+            h.extend_from_slice(&[0u8; 4]); // src/dst ports
+        }
+        std::net::IpAddr::V6(v6) => {
+            h.push(0x21); // AF_INET6, STREAM
+            h.extend_from_slice(&36u16.to_be_bytes());
+            h.extend_from_slice(&v6.octets()); // src
+            h.extend_from_slice(&[0u8; 16]); // dst
+            h.extend_from_slice(&[0u8; 4]); // src/dst ports
+        }
+    }
+    h
 }
 
 /// Parse a PROXY protocol v2 header (HAProxy/Envoy) off the front of a TCP stream
@@ -3184,6 +3226,7 @@ async fn spawn_tls_service(
                                 std::sync::Arc::clone(acl),
                                 proxy_protocol,
                                 alert.clone(),
+                                false, // DoT: loopback listener terminates TLS — no PROXY prepend
                             )));
                     }
                 }
@@ -3217,6 +3260,7 @@ async fn spawn_tls_service(
                             std::sync::Arc::clone(acl),
                             proxy_protocol,
                             alert.clone(),
+                            false, // DoH: loopback listener terminates TLS — no PROXY prepend
                         )));
                     }
                 }
@@ -4069,6 +4113,18 @@ pub async fn run_dns_server(
                     let hh = std::sync::Arc::clone(&h);
                     tokio::spawn(async move {
                         let _ = stream.set_nodelay(true);
+                        // PENT-1/PENT-2: the public relay prepends a PROXY v2 header with the
+                        // REAL client IP. Recover it so AXFR allow-list + split-horizon see the
+                        // true source instead of the loopback relay address. Mandatory: a
+                        // connection without a valid header is dropped (only the relay reaches
+                        // this loopback listener).
+                        let real_ip = match tokio::time::timeout(
+                            Duration::from_secs(5), read_proxy_v2(&mut stream)).await
+                        {
+                            Ok(Some(ip)) => ip,
+                            _ => return,
+                        };
+                        let peer = SocketAddr::new(real_ip, peer.port());
                         let mut len_buf = [0u8; 2];
                         loop {
                             if tokio::time::timeout(TCP_SESSION_TIMEOUT, stream.read_exact(&mut len_buf)).await.is_err() { return; }
@@ -4096,6 +4152,7 @@ pub async fn run_dns_server(
             Arc::clone(&acl),
             cfg.proxy_protocol,
             Some(Arc::clone(&alert_tracker)),
+            true, // plain TCP: forward real client IP to the loopback handler (PENT-1/PENT-2)
         ));
     }
 

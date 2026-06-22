@@ -517,7 +517,9 @@ impl UnboundConfig {
             stale_max_age: 86400,
             ui_enabled: false,
             ui_port: 8091,
-            ui_bind: "0.0.0.0".to_owned(),
+            // PENT-4: bind the WebUI to loopback by default — exposing the admin panel
+            // on every interface must be an explicit opt-in (`ui-bind: 0.0.0.0`).
+            ui_bind: "127.0.0.1".to_owned(),
             ui_tls: true,
             ui_cert: String::new(),
             ui_key: String::new(),
