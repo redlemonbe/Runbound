@@ -46,4 +46,4 @@ them is correctly rejected) → 303 + session cookie → protected endpoints (`/
 ## Verification
 `cargo test --release --bin runbound` → **413 passed / 0 failed** (VAL-1 + VAL-2 regression
 tests included). Both default and `recursor` builds compile. Live checks above run against the
-systemd-installed binary on worker-dr.
+systemd-installed binary on attacker-host.
