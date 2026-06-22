@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use arc_swap::ArcSwap;
 
 use crate::config::parser::UnboundConfig;
-use crate::dns::local::{parse_local_data, LocalZoneSet};
+use crate::dns::local::LocalZoneSet;
 use crate::dns::ZoneAction;
 use crate::feeds::{load_feeds, save_feeds, update_one_feed, Feed, FeedsConfig};
 use crate::store::{

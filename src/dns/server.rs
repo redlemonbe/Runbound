@@ -58,10 +58,8 @@ use super::kernel_loop::FallbackMsg;
 use crate::config::parser::TlsConfig;
 use crate::config::parser::UnboundConfig;
 use crate::logbuffer::SharedLogBuffer;
-#[cfg(feature = "recursor")]
 use crate::logbuffer::LogAction;
 use crate::stats::Stats;
-#[cfg(feature = "recursor")]
 use crate::stats::CACHE_HIT_THRESHOLD_US;
 
 // ── Concurrency cap — prevents OOM under flood ─────────────────────────────
@@ -95,8 +93,11 @@ const RECURSION_TIMEOUT: Duration = Duration::from_secs(5);
 // ── Identity-probe name set (zero-alloc hot path) ──────────────────────────
 // Initialised once on first DNS query; compared directly as LowerName.
 // Avoids a String allocation per request for the CHAOS identity-probe check.
+// recursor-only: the wire serving path uses an inline literal-match identity probe.
+#[cfg_attr(not(feature = "recursor"), allow(dead_code))]
 static IDENTITY_PROBE_NAMES: OnceLock<[LowerName; 4]> = OnceLock::new();
 
+#[cfg_attr(not(feature = "recursor"), allow(dead_code))]
 fn identity_probe_names() -> &'static [LowerName; 4] {
     IDENTITY_PROBE_NAMES.get_or_init(|| {
         [
@@ -137,6 +138,9 @@ pub struct RunboundHandler {
     pub stats: Arc<Stats>,
     pub log_buffer: SharedLogBuffer,
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
+    /// Read by the recursor's forward-validation path; the wire path's DNSSEC is
+    /// served by `zone_signer` (local signed zones), so this is unread by default.
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// #201: online DNSSEC signer for local zones — hot-swappable so the slave adopts the
     /// master's replicated keys at runtime. Inner `None` when local-zone-dnssec is off.
@@ -148,6 +152,10 @@ pub struct RunboundHandler {
     #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     recursor: crate::dns::recursor::SharedRecursor,
     /// Optional prefetch tracker — None when prefetch: no (default).
+    /// NOTE: the tracker is incremented only on the recursor path and no executor
+    /// ever drains it (`take_hot` is test-only) — prefetch is an incomplete feature
+    /// pending a prefetch loop (see audit finding). Unread on the default path.
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
     /// #60: mutable cache map shared with XDP workers (via publish_loop).
     /// None when xdp-cache-snapshot: no or XDP feature not compiled.
@@ -169,8 +177,13 @@ pub struct RunboundHandler {
     resolv_fallback: bool,
     /// #94: true while resolv.conf fallback is active.
     pub fallback_active: Arc<std::sync::atomic::AtomicBool>,
-    /// #108: serve-stale cache — stores last successful records per (name, qtype).
+    /// #108: serve-stale cache (recursor path) — hickory-typed, fed by the legacy handler.
+    #[cfg(feature = "recursor")]
     stale_cache: Option<Arc<dashmap::DashMap<(hickory_proto::rr::LowerName, hickory_proto::rr::RecordType), (Vec<hickory_proto::rr::Record>, std::time::Instant), ahash::RandomState>>>,
+    /// #108: serve-stale cache (default wire serving path) — wire-native, keyed by
+    /// (lowercased presentation name, qtype). Fed on a successful forward, served on
+    /// a transient upstream SERVFAIL (RFC 8767). `None` when serve-stale is off.
+    stale_cache_wire: Option<Arc<dashmap::DashMap<(String, u16), (Vec<crate::dns::wire::Record>, std::time::Instant), ahash::RandomState>>>,
     /// #108: TTL to advertise for stale answers (seconds).
     stale_answer_ttl: u32,
     /// #108: max age of a stale entry (seconds).
@@ -195,6 +208,9 @@ pub struct RunboundHandler {
     /// #203: counter driving the RRL slip leak.
     rrl_counter: std::sync::atomic::AtomicU64,
     /// #204: DDR (RFC 9462) endpoint info, Some when `ddr: yes` + a TLS hostname is set.
+    /// DDR SVCB synthesis is not yet ported to the wire serving path — recursor-only
+    /// (the synthesiser returns hickory records). See audit finding.
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     ddr: Option<DdrInfo>,
 }
 
@@ -314,7 +330,13 @@ impl RunboundHandler {
             domain_stats,
             resolv_fallback,
             fallback_active,
+            #[cfg(feature = "recursor")]
             stale_cache: if serve_stale {
+                Some(Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default())))
+            } else {
+                None
+            },
+            stale_cache_wire: if serve_stale {
                 Some(Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default())))
             } else {
                 None
@@ -1107,6 +1129,64 @@ impl RunboundHandler {
     /// Observability note: the per-query web-UI log buffer is hickory-name typed and
     /// is not written on this fast path; stats counters are. Full parity returns when
     /// the handler's logging is wire-native.
+    /// Wire-native query log — feeds the webui Logs panel / `GET /api/logs`.
+    /// Latency stats are recorded inline by `serve_wire`; this only emits the
+    /// structured log entry (mirrors the recursor `record_query`, no hickory types).
+    fn log_query_wire(&self, client: IpAddr, name: &str, qtype: u16, action: LogAction, start: Instant) {
+        let is_notable = matches!(
+            action,
+            LogAction::Nxdomain | LogAction::Servfail | LogAction::Refused | LogAction::Blocked
+        );
+        if tracing::enabled!(tracing::Level::INFO)
+            || (is_notable && tracing::enabled!(tracing::Level::WARN) && self.log_buffer.is_enabled())
+        {
+            let elapsed_ms = start.elapsed().as_millis() as u32;
+            // MED-06: sanitize the name before structured log emission (log injection).
+            let safe = sanitize_name_str(name);
+            let client_log = self.log_buffer.push_query(&safe, &client, qtype, action, elapsed_ms);
+            info!(client = %client_log, name = %safe, qtype = qtype, action = action.as_str(), ms = elapsed_ms, "query");
+        }
+    }
+
+    /// #108: store the last successful records for a (name, qtype) — wire-native
+    /// serve-stale source. Evicts the oldest entry when at `cache_max_entries`.
+    fn store_stale_wire(&self, name_lc: &str, qtype: u16, records: &[crate::dns::wire::Record]) {
+        if let Some(ref sc) = self.stale_cache_wire {
+            if !records.is_empty() {
+                if sc.len() >= self.cache_max_entries {
+                    if let Some(old) = sc.iter().next().map(|e| e.key().clone()) {
+                        sc.remove(&old);
+                    }
+                }
+                sc.insert(
+                    (name_lc.to_string(), qtype),
+                    (records.to_vec(), std::time::Instant::now()),
+                );
+            }
+        }
+    }
+
+    /// #108 / RFC 8767: return a stale answer for (name, qtype) if one is cached and
+    /// younger than `stale_max_age`, with the TTL rewritten to `stale_answer_ttl`.
+    fn try_stale_wire(&self, name_lc: &str, qtype: u16) -> Option<Vec<crate::dns::wire::Record>> {
+        let sc = self.stale_cache_wire.as_ref()?;
+        let entry = sc.get(&(name_lc.to_string(), qtype))?;
+        let (ref recs, stored_at) = *entry;
+        if stored_at.elapsed().as_secs() > self.stale_max_age || recs.is_empty() {
+            return None;
+        }
+        let ttl = self.stale_answer_ttl;
+        Some(
+            recs.iter()
+                .map(|r| {
+                    let mut rc = r.clone();
+                    rc.ttl = ttl;
+                    rc
+                })
+                .collect(),
+        )
+    }
+
     pub async fn serve_wire(&self, query: &[u8], peer: std::net::SocketAddr) -> Option<Vec<u8>> {
         use crate::dns::wire::consts::{class, opcode, rcode, rtype};
         use crate::dns::wire::Message as WMessage;
@@ -1327,8 +1407,9 @@ impl RunboundHandler {
         }
         // Identity-probe names regardless of class → REFUSED (defence in depth, SEC-03).
         let qname_pres = q.name.to_ascii();
+        let qname_lc = qname_pres.to_ascii_lowercase();
         if matches!(
-            qname_pres.to_ascii_lowercase().as_str(),
+            qname_lc.as_str(),
             "version.bind." | "hostname.bind." | "id.server." | "authors.bind."
         ) {
             self.stats.inc_refused();
@@ -1343,6 +1424,11 @@ impl RunboundHandler {
             return Some(self.wire_answer(&msg, &[], rcode::NOERROR));
         }
 
+        // #5: per-domain counter (feeds GET /api/stats/top-domains). The XDP fast
+        // path counts cache hits in the kernel loop; the slow path counts here so
+        // forwarded/local queries are not missing from top-domains in noxdp mode.
+        self.domain_stats.inc(&qname_lc);
+
         // ── Split-horizon (#10): per-subnet zone override, wire-native ──────
         // Clone only the matching per-subnet zone Arc, dropping the table guard.
         let sh_match: Option<std::sync::Arc<LocalZoneSet>> = {
@@ -1356,6 +1442,7 @@ impl RunboundHandler {
             if let Some(resp) = crate::dns::wire_serve::serve_datagram(query, &sh_zones) {
                 self.stats.inc_local_hits();
                 self.stats.record_latency_us(start.elapsed().as_micros() as u64);
+                self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Local, start);
                 return Some(resp);
             }
             // No match in the split-horizon zone → fall through to global zones.
@@ -1366,11 +1453,41 @@ impl RunboundHandler {
         if let Some(resp) = crate::dns::wire_serve::serve_datagram(query, &zones) {
             self.stats.inc_local_hits();
             self.stats.record_latency_us(start.elapsed().as_micros() as u64);
+            self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Local, start);
             return Some(resp);
         }
 
         // ── Forward upstream (own wire forward pool) ────────────────────────
-        let (fwd, _winner) = self.pool.load().forward(query).await;
+        let (fwd, winner) = self.pool.load().forward(query).await;
+        // #33: record the racing win for the upstream that answered first.
+        if let Some(ref w) = winner {
+            self.racing_wins
+                .entry(w.clone())
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // #94: resolv.conf fallback when ALL configured upstreams are down. The
+        // recovery loop (start_server) removes the temporary entries once a primary
+        // upstream recovers. Spawned off the hot path; guarded by a CAS so a flood of
+        // SERVFAILs triggers the rebuild exactly once.
+        if matches!(fwd, crate::dns::forward::ResolveResult::Servfail)
+            && self.resolv_fallback
+            && !self.fallback_active.load(Ordering::Relaxed)
+            && crate::upstreams::all_non_temporary_unhealthy(&self.upstreams)
+            && self
+                .fallback_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            let ups = Arc::clone(&self.upstreams);
+            let pool_rebuild = Arc::clone(&self.pool);
+            tokio::spawn(async move {
+                crate::upstreams::add_resolv_fallback(&ups);
+                let addrs = crate::upstreams::upstream_addrs(&ups);
+                let _ = rebuild_and_swap(&pool_rebuild, &addrs, false).await;
+                warn!("resolv.conf fallback activated");
+            });
+        }
         match fwd {
             crate::dns::forward::ResolveResult::Answer { mut records } => {
                 // private-address block (#rebinding)
@@ -1384,6 +1501,7 @@ impl RunboundHandler {
                         if let Some(ip) = ip {
                             if self.private_addrs.contains(ip) {
                                 self.stats.inc_servfail();
+                                self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Servfail, start);
                                 return Some(self.wire_error(&msg, rcode::SERVFAIL));
                             }
                         }
@@ -1395,20 +1513,41 @@ impl RunboundHandler {
                 }
                 let resp = self.wire_answer(&msg, &records, rcode::NOERROR);
                 self.maybe_cache_wire(&q, &resp, &records);
+                // #108: remember this answer so a later transient SERVFAIL can serve it stale.
+                self.store_stale_wire(&qname_lc, qtype, &records);
+                let fwd_us = start.elapsed().as_micros() as u64;
                 self.stats.inc_forwarded();
-                self.stats.record_forward(start.elapsed().as_micros() as u64);
+                self.stats.record_forward(fwd_us);
+                let action = if fwd_us < CACHE_HIT_THRESHOLD_US {
+                    LogAction::Cached
+                } else {
+                    LogAction::Forwarded
+                };
+                self.log_query_wire(client_ip, &qname_pres, qtype, action, start);
                 Some(resp)
             }
             crate::dns::forward::ResolveResult::NegativeAnswer { rcode: rc, .. } => {
-                if rc == rcode::NXDOMAIN {
+                let action = if rc == rcode::NXDOMAIN {
                     self.stats.inc_nxdomain();
+                    LogAction::Nxdomain
                 } else {
                     self.stats.inc_servfail();
-                }
+                    LogAction::Servfail
+                };
+                self.log_query_wire(client_ip, &qname_pres, qtype, action, start);
                 Some(self.wire_error(&msg, rc))
             }
             crate::dns::forward::ResolveResult::Servfail => {
+                // #108 / RFC 8767: a transient upstream failure serves the last good
+                // answer (stale) instead of SERVFAIL, when serve-stale is enabled.
+                if let Some(stale) = self.try_stale_wire(&qname_lc, qtype) {
+                    self.stats.inc_stale_served();
+                    let resp = self.wire_answer(&msg, &stale, rcode::NOERROR);
+                    self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Cached, start);
+                    return Some(resp);
+                }
                 self.stats.inc_servfail();
+                self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Servfail, start);
                 Some(self.wire_error(&msg, rcode::SERVFAIL))
             }
         }
@@ -2021,6 +2160,19 @@ impl RequestHandler for RunboundHandler {
 // ============================================================
 
 // is_pool_exhausted removed (uses NetError from hickory_resolver).
+/// MED-06: wire-path name sanitizer — replaces any non-printable / non-ASCII byte
+/// with '?' before the name reaches the structured log (prevents log injection).
+/// Returns the input unchanged (borrow-free fast path) when already clean.
+fn sanitize_name_str(s: &str) -> String {
+    if s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        s.to_string()
+    } else {
+        s.chars()
+            .map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '?' })
+            .collect()
+    }
+}
+
 /// MED-06: Strip control characters from DNS names before structured log emission.
 /// Prevents log injection via carefully crafted query names containing \n, \r, etc.
 ///
@@ -2127,6 +2279,7 @@ fn make_opt_edns(request: &MessageRequest) -> Option<Edns> {
 /// #204: DDR (RFC 9462) endpoint info used to synthesise the `_dns.resolver.arpa`
 /// SVCB answer that points clients at this node's encrypted transports.
 #[derive(Clone)]
+#[cfg_attr(not(feature = "recursor"), allow(dead_code))]
 struct DdrInfo {
     hostname: String,
     dot_port: u16,
@@ -2136,6 +2289,7 @@ struct DdrInfo {
 
 impl DdrInfo {
     /// Build the SVCB RRset advertised at `_dns.resolver.arpa` (DoT / DoH / DoQ).
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     fn svcb_records(&self) -> Vec<hickory_proto::rr::Record> {
         use hickory_proto::rr::rdata::svcb::{Alpn, SvcParamKey, SvcParamValue, Unknown, SVCB};
         use hickory_proto::rr::{Name, RData, Record};

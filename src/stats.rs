@@ -206,6 +206,9 @@ impl Stats {
     pub fn inc_total(&self) {
         self.total.fetch_add(1, Ordering::Relaxed);
     }
+    // recursor-only stat: the wire path serves blocklist hits via the local-zone
+    // path (counted as local hits); a dedicated "blocked" category is not split out.
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     #[inline]
     pub fn inc_blocked(&self) {
         self.blocked.fetch_add(1, Ordering::Relaxed);
@@ -232,14 +235,17 @@ impl Stats {
         self.local_hits.fetch_add(1, Ordering::Relaxed);
     }
     #[inline]
+    #[cfg(feature = "recursor")]
     pub fn inc_dnssec_secure(&self) {
         self.dnssec_secure.fetch_add(1, Ordering::Relaxed);
     }
     #[inline]
+    #[cfg(feature = "recursor")]
     pub fn inc_dnssec_bogus(&self) {
         self.dnssec_bogus.fetch_add(1, Ordering::Relaxed);
     }
     #[inline]
+    #[cfg(feature = "recursor")]
     pub fn inc_dnssec_insecure(&self) {
         self.dnssec_insecure.fetch_add(1, Ordering::Relaxed);
     }
@@ -478,6 +484,7 @@ pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
     };
     serde_json::json!({
         "total":            snap.total,
+        "total_queries":    snap.total,
         "blocked":          snap.blocked,
         "forwarded":        snap.forwarded,
         "nxdomain":         snap.nxdomain,

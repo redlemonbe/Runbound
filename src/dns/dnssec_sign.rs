@@ -56,6 +56,8 @@ impl SigningKey {
         Ok(Self { pkcs8, is_ksk, key })
     }
 
+    /// Only consumed by the zone-signer test oracle (KSK/ZSK split assertion).
+    #[cfg(test)]
     pub fn is_ksk(&self) -> bool {
         self.is_ksk
     }

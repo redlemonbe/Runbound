@@ -39,8 +39,14 @@ const POOL_IDLE_TTL: Duration = Duration::from_secs(90);
 pub enum ResolveResult {
     /// NOERROR with one or more answer records
     Answer { records: Vec<wire::Record> },
-    /// Authoritative negative: NXDOMAIN or NOERROR+empty ANSWER (NODATA)
-    NegativeAnswer { rcode: u16, neg_ttl: u32 },
+    /// Authoritative negative: NXDOMAIN or NOERROR+empty ANSWER (NODATA).
+    /// `neg_ttl` drives the recursor's negative cache; the wire slow path does not
+    /// negative-cache yet (the XDP fast path has its own), so it is unread by default.
+    NegativeAnswer {
+        rcode: u16,
+        #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+        neg_ttl: u32,
+    },
     /// Transient error: timeout, connection failure, SERVFAIL, REFUSED
     Servfail,
 }
