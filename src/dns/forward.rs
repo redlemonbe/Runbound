@@ -232,14 +232,50 @@ impl UdpUpstream {
             debug!(addr=%self.addr, err=%e, "UDP send failed");
             return ResolveResult::Servfail;
         }
+        // SEC-O1: capture the query transaction ID and question so the response can
+        // be validated. Over plain UDP the connected socket only filters the source
+        // address; without an ID/question check a spoofed datagram from the upstream
+        // address would be accepted verbatim → cache poisoning. (DoT is authenticated
+        // by TLS and does not need this.)
+        let qid = u16::from_be_bytes([wire[0], wire[1]]);
+        let qquestion = wire::Message::parse(wire)
+            .ok()
+            .and_then(|m| m.first_question().cloned());
         let mut buf = vec![0u8; 4096];
-        match sock.recv(&mut buf).await {
-            Ok(n) => parse_response(&buf[..n]),
-            Err(e) => {
-                debug!(addr=%self.addr, err=%e, "UDP recv failed");
-                ResolveResult::Servfail
+        // Keep reading until a datagram matching the query arrives; a single spoofed
+        // / stale non-matching datagram no longer aborts resolution. The outer
+        // UDP_QUERY_TIMEOUT (in `query()`) bounds the total wait.
+        loop {
+            match sock.recv(&mut buf).await {
+                Ok(n) => {
+                    if response_matches(&buf[..n], qid, qquestion.as_ref()) {
+                        return parse_response(&buf[..n]);
+                    }
+                    debug!(addr=%self.addr, "UDP forward: response did not match query (id/question) — ignored");
+                    // loop and wait for the genuine reply (bounded by the outer timeout)
+                }
+                Err(e) => {
+                    debug!(addr=%self.addr, err=%e, "UDP recv failed");
+                    return ResolveResult::Servfail;
+                }
             }
         }
+    }
+}
+
+/// SEC-O1: a plain-UDP upstream response is only accepted when its transaction ID
+/// and its question (name case-insensitive + type + class) match the query.
+fn response_matches(resp: &[u8], qid: u16, qq: Option<&wire::Question>) -> bool {
+    if resp.len() < 4 || u16::from_be_bytes([resp[0], resp[1]]) != qid {
+        return false;
+    }
+    let Ok(msg) = wire::Message::parse(resp) else { return false };
+    match (msg.first_question(), qq) {
+        (Some(rq), Some(qq)) => {
+            rq.qtype == qq.qtype && rq.qclass == qq.qclass && rq.name.eq_ignore_ascii_case(&qq.name)
+        }
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -561,5 +597,65 @@ fn split_addr_port(s: &str, default_port: u16) -> (&str, u16) {
         (&s[..at], port)
     } else {
         (s, default_port)
+    }
+}
+
+#[cfg(test)]
+mod sec_o1_tests {
+    use super::*;
+    use crate::dns::wire::consts::{opcode, rtype};
+    use crate::dns::wire::{Header, Message, Name, Question};
+
+    fn query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+        let mut h = Header { id, flags: 0, qdcount: 0, ancount: 0, nscount: 0, arcount: 0 };
+        h.set_opcode(opcode::QUERY);
+        h.set_rd(true);
+        Message {
+            header: h,
+            questions: vec![Question::new(Name::from_ascii(name).unwrap(), qtype)],
+            answers: vec![], authority: vec![], additional: vec![],
+        }
+        .encode()
+    }
+    fn response(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+        let mut h = Header { id, flags: 0, qdcount: 0, ancount: 0, nscount: 0, arcount: 0 };
+        h.set_opcode(opcode::QUERY);
+        h.set_qr(true);
+        Message {
+            header: h,
+            questions: vec![Question::new(Name::from_ascii(name).unwrap(), qtype)],
+            answers: vec![], authority: vec![], additional: vec![],
+        }
+        .encode()
+    }
+
+    #[test]
+    fn accepts_matching_response() {
+        let q = query(0x1234, "example.com.", rtype::A);
+        let qq = Message::parse(&q).unwrap().first_question().cloned();
+        let r = response(0x1234, "EXAMPLE.com.", rtype::A); // case-insensitive name
+        assert!(response_matches(&r, 0x1234, qq.as_ref()));
+    }
+
+    #[test]
+    fn rejects_wrong_txid() {
+        let q = query(0x1234, "example.com.", rtype::A);
+        let qq = Message::parse(&q).unwrap().first_question().cloned();
+        let spoof = response(0x9999, "example.com.", rtype::A);
+        assert!(!response_matches(&spoof, 0x1234, qq.as_ref()));
+    }
+
+    #[test]
+    fn rejects_wrong_question() {
+        let q = query(0x1234, "example.com.", rtype::A);
+        let qq = Message::parse(&q).unwrap().first_question().cloned();
+        // right id, wrong name and wrong type — must be rejected (cache-poison guard)
+        assert!(!response_matches(&response(0x1234, "evil.com.", rtype::A), 0x1234, qq.as_ref()));
+        assert!(!response_matches(&response(0x1234, "example.com.", rtype::AAAA), 0x1234, qq.as_ref()));
+    }
+
+    #[test]
+    fn rejects_truncated() {
+        assert!(!response_matches(&[0x12, 0x34], 0x1234, None));
     }
 }

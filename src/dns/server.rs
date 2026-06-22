@@ -3866,7 +3866,7 @@ pub async fn run_dns_server(
         });
 
     // Step 3b: hickory no longer has UDP sockets — fast loop covers all cores.
-    // Hickory handles recursion/TSIG/AXFR via the fallback channel only.
+    // TSIG/AXFR/UPDATE are served wire-native; only the (feature-gated) recursor uses the fallback.
     // TCP is kept intact (low volume, handled by run_tcp_with_limit).
     let port = cfg.port;
 
