@@ -77,7 +77,48 @@ use stats::Stats;
 
 const API_BIND: &str = "127.0.0.1"; // API must not be exposed externally
 
+#[cfg(target_os = "linux")]
+fn raise_nofile_to_hard() {
+    // SAFETY: get/setrlimit over a stack rlimit; no aliasing, no invalid memory.
+    unsafe {
+        // Target a generous FD budget; root (CAP_SYS_RESOURCE) may raise the hard
+        // cap too, so set both. Never lower an already-higher limit.
+        const TARGET: libc::rlim_t = 1_048_576;
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+            let new_max = rl.rlim_max.max(TARGET);
+            let new_cur = new_max; // soft = hard
+            if new_cur > rl.rlim_cur {
+                let prev = rl.rlim_cur;
+                rl.rlim_cur = new_cur;
+                rl.rlim_max = new_max;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 {
+                    info!(from = prev, to = new_cur, "RLIMIT_NOFILE raised");
+                } else {
+                    // Fall back to raising the soft limit up to the existing hard cap.
+                    rl.rlim_max = libc::rlimit { rlim_cur: 0, rlim_max: 0 }.rlim_max;
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < rl.rlim_max {
+                        let cap = rl.rlim_max; rl.rlim_cur = cap;
+                        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+                        info!(soft = cap, "RLIMIT_NOFILE raised to hard cap (could not raise hard)");
+                    } else {
+                        tracing::warn!("RLIMIT_NOFILE: could not raise — staying at the soft limit");
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    // FIRST thing, before any fork/daemonization or socket setup: a DNS forwarder
+    // must not depend on the launcher for its FD budget. A MAX_INFLIGHT forward
+    // burst opens one UDP socket per in-flight query, so a default soft
+    // RLIMIT_NOFILE (1024) yields EMFILE under load outside the systemd unit's
+    // LimitNOFILE. Raise it eagerly.
+    #[cfg(target_os = "linux")]
+    raise_nofile_to_hard();
+
     let args: Vec<String> = std::env::args().collect();
 
     if handle_cli_flags(&args)? {
