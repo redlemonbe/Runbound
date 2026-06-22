@@ -1343,9 +1343,6 @@ impl RunboundHandler {
         if self.alert_tracker.is_some() && !peer.ip().is_loopback() {
             return None; // anti-DDoS escalation stays on the hickory path
         }
-        if !self.split_horizon.load().is_empty() {
-            return None;
-        }
         if self.zone_signer.load().is_some() {
             return None; // DNSSEC signing stays on the hickory path
         }
@@ -1422,6 +1419,24 @@ impl RunboundHandler {
         // block-https-record: suppress HTTPS type-65 (QUIC/HTTP3 guard) → empty NOERROR.
         if self.block_https_record && qtype == rtype::HTTPS {
             return Some(self.wire_answer(&msg, &[], rcode::NOERROR));
+        }
+
+        // ── Split-horizon (#10): per-subnet zone override, wire-native ──────
+        // Clone only the matching per-subnet zone Arc, dropping the table guard.
+        let sh_match: Option<std::sync::Arc<LocalZoneSet>> = {
+            let table = self.split_horizon.load();
+            table
+                .iter()
+                .find(|(subnets, _)| subnets.iter().any(|cb| cb.contains(client_ip)))
+                .map(|(_, z)| std::sync::Arc::clone(z))
+        };
+        if let Some(sh_zones) = sh_match {
+            if let Some(resp) = crate::dns::wire_serve::serve_datagram(query, &sh_zones) {
+                self.stats.inc_local_hits();
+                self.stats.record_latency_us(start.elapsed().as_micros() as u64);
+                return Some(resp);
+            }
+            // No match in the split-horizon zone → fall through to global zones.
         }
 
         // ── Local zones (own wire serving core) ─────────────────────────────
