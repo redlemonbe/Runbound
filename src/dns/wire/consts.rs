@@ -37,6 +37,7 @@ pub mod rtype {
     pub const ANY: u16 = 255;
     pub const AXFR: u16 = 252;
     pub const IXFR: u16 = 251;
+    pub const TSIG: u16 = 250;
 }
 
 /// DNS classes. Only IN is used in practice; the rest exist for completeness.

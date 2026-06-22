@@ -10,6 +10,7 @@ pub mod wire_builder;
 pub mod kernel_loop;
 pub mod local;
 pub mod axfr;
+pub mod tsig;
 pub mod prefetch;
 pub mod ratelimit;
 pub mod server;
