@@ -696,7 +696,7 @@ pub fn router(state: AppState) -> Router {
         // DNS CRUD
         .route("/dns/lookup", post(dns_lookup_handler))
         .route("/dns", get(list_dns_handler).post(add_dns_handler))
-        .route("/dns/:id", delete(delete_dns_handler))
+        .route("/dns/:id", get(get_dns_handler).delete(delete_dns_handler))
         // Blacklist
         .route(
             "/blacklist",
@@ -813,6 +813,7 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"POST",   "path":"/api/reload",           "description":"Hot-reload zones and blacklist from disk"},
             {"method":"GET",    "path":"/api/dns",              "description":"List all local DNS entries"},
             {"method":"POST",   "path":"/api/dns",              "description":"Add a local DNS entry (A/AAAA/CNAME/TXT/MX/SRV/CAA/PTR/NAPTR/SSHFP/TLSA/NS)"},
+            {"method":"GET",    "path":"/api/dns/:id",          "description":"Get a single DNS entry by UUID"},
             {"method":"DELETE", "path":"/api/dns/:id",          "description":"Remove a DNS entry by UUID"},
             {"method":"GET",    "path":"/api/blacklist",        "description":"List blacklist entries"},
             {"method":"POST",   "path":"/api/blacklist",        "description":"Add a domain to the blacklist (refuse/nxdomain)"},
@@ -841,7 +842,6 @@ async fn help_handler() -> impl IntoResponse {
             {"method":"GET",    "path":"/api/clients/:ip/logs", "description":"Recent log entries for a specific client IP (#6)"},
             {"method":"GET",    "path":"/api/logs",             "description":"Recent query log (newest first) — ?limit=100&page=0&action=blocked&client=1.2.3.4&since=<unix>"},
             {"method":"DELETE", "path":"/api/logs",             "description":"Clear the in-memory query log ring buffer (GDPR right-to-erasure)"},
-            {"method":"GET",    "path":"/api/audit/tail",       "description":"Last N audit log entries — ?n=100"},
             {"method":"GET",    "path":"/api/metrics",          "description":"Prometheus/OpenMetrics exposition (text/plain; version=0.0.4)"},
             {"method":"POST",   "path":"/api/rotate-key",       "description":"Atomically rotate API key — reads new key from RUNBOUND_API_KEY env var"},
             {"method":"POST",   "path":"/api/backup",            "description":"Snapshot config + DNS entries + blacklist + feeds to base_dir/backups/"},
@@ -1470,6 +1470,7 @@ async fn patch_config_handler(
         // validation policy actually takes effect. Otherwise the recursor keeps the DNSSEC
         // policy captured when it was last built, and Bogus->SERVFAIL enforcement silently
         // desyncs from what the API/config reports.
+        #[cfg(feature = "recursor")]
         if s.resolution_mode.load(Ordering::Relaxed) == 1 {
             if let Err(e) = crate::dns::recursor::rebuild_shared(
                 &s.recursor,
@@ -1548,9 +1549,11 @@ async fn resolution_put_handler(
             )
         }
     };
-    let dnssec = s.dnssec_enabled.load(Ordering::Relaxed);
     // Build the recursor first; only flip the hot-path atomic once it is actually ready so we
     // never route queries to full-recursion with no backend.
+    #[cfg(feature = "recursor")]
+    let dnssec = s.dnssec_enabled.load(Ordering::Relaxed);
+    #[cfg(feature = "recursor")]
     if let Err(e) = crate::dns::recursor::rebuild_shared(&s.recursor, mode, dnssec) {
         warn!(%e, "resolution: full-recursion requested but recursor build failed — staying in forward");
         s.resolution_mode.store(0, Ordering::Relaxed);
@@ -1610,6 +1613,41 @@ async fn list_dns_handler(State(_s): State<AppState>) -> impl IntoResponse {
 }
 
 type ApiError = (StatusCode, JsonExtract<serde_json::Value>);
+
+/// GET /api/dns/:id — return a single DNS entry by UUID.
+async fn get_dns_handler(
+    State(_s): State<AppState>,
+    Path(id): Path<String>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> impl IntoResponse {
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    match store::load() {
+        Ok(st) => {
+            match st.entries.iter().find(|e| e.id == id) {
+                Some(entry) => {
+                    if !caller.may_manage_name(&entry.name) {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            JsonExtract(serde_json::json!({"error":"FORBIDDEN"})),
+                        ).into_response();
+                    }
+                    (StatusCode::OK, JsonExtract(serde_json::json!({"entry": entry}))).into_response()
+                }
+                None => (
+                    StatusCode::NOT_FOUND,
+                    JsonExtract(serde_json::json!({"error":"NOT_FOUND","id":id})),
+                ).into_response(),
+            }
+        }
+        Err(e) => {
+            warn!(err = %e, "store load failed in get_dns");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({"error": sanitize_error(&e)})),
+            ).into_response()
+        }
+    }
+}
 
 /// Validate all fields of an AddDnsRequest and build the DnsEntry + RR + Record.
 /// Returns the triple on success, or a (StatusCode, JSON error) ready to return.
@@ -2047,16 +2085,34 @@ async fn dns_lookup_handler(
         }
     }
 
-    // Resolve upstream
+    // Resolve upstream via ForwardPool
+    use hickory_proto::op::{Message, MessageType, OpCode, Query as DnsQuery};
+    use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
     let start = std::time::Instant::now();
-    match s.resolver.load().lookup(name, qtype).await {
-        Ok(lookup) => {
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            let from_cache = elapsed_ms * 1000 < crate::stats::CACHE_HIT_THRESHOLD_US;
-            let answers: Vec<serde_json::Value> = lookup
-                .answers()
+    let query_wire: Vec<u8> = {
+        let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.add_query(DnsQuery::query(name.clone(), qtype));
+        let mut wire = Vec::with_capacity(256);
+        let mut enc = BinEncoder::new(&mut wire);
+        msg.emit(&mut enc).unwrap_or_default();
+        wire
+    };
+    let (fwd_result, _winner) = s.resolver.load().forward(&query_wire).await;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let from_cache = elapsed_ms * 1000 < crate::stats::CACHE_HIT_THRESHOLD_US;
+    use crate::dns::forward::ResolveResult;
+    match fwd_result {
+        ResolveResult::Answer { records } => {
+            let answers: Vec<serde_json::Value> = records
                 .iter()
-                .map(|r| serde_json::json!({ "ttl": r.ttl, "data": r.data.to_string() }))
+                .map(|r| {
+                    // de-hickory transitional: present via the bridge until the API moves to wire.
+                    let data = crate::dns::wire_bridge::to_hickory(r)
+                        .map(|h| h.data.to_string())
+                        .unwrap_or_default();
+                    serde_json::json!({ "ttl": r.ttl, "data": data })
+                })
                 .collect();
             (
                 StatusCode::OK,
@@ -2068,25 +2124,28 @@ async fn dns_lookup_handler(
             )
                 .into_response()
         }
-        Err(e) => {
-            use hickory_resolver::net::{DnsError, NetError, NoRecords};
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            let status = match &e {
-                NetError::Dns(DnsError::NoRecordsFound(NoRecords { response_code, .. })) => {
-                    use hickory_proto::op::ResponseCode;
-                    match response_code {
-                        ResponseCode::NXDomain => "NXDOMAIN",
-                        ResponseCode::Refused => "REFUSED",
-                        _ => "SERVFAIL",
-                    }
-                }
-                _ => "SERVFAIL",
+        ResolveResult::NegativeAnswer { rcode, .. } => {
+            let status = match rcode {
+                3 => "NXDOMAIN",
+                5 => "REFUSED",
+                _ => "NODATA",
             };
             (
                 StatusCode::OK,
                 JsonExtract(serde_json::json!({
                     "name": p.name, "type": p.qtype,
                     "answers": [], "status": status,
+                    "elapsed_ms": elapsed_ms, "from_cache": false
+                })),
+            )
+                .into_response()
+        }
+        ResolveResult::Servfail => {
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "name": p.name, "type": p.qtype,
+                    "answers": [], "status": "SERVFAIL",
                     "elapsed_ms": elapsed_ms, "from_cache": false
                 })),
             )
@@ -4048,7 +4107,7 @@ async fn list_users_handler(
         return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
     }
     let Some(ref reg) = s.user_registry else {
-        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
     };
     let users: Vec<serde_json::Value> = reg.all_users().iter().map(|u| serde_json::json!({
         "id": u.id,
@@ -4083,7 +4142,7 @@ async fn create_user_handler(
         return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
     }
     let Some(ref reg) = s.user_registry else {
-        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
     };
     if body.username.trim().is_empty() || body.username.len() > 64 {
         return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_USERNAME"}))).into_response();
@@ -4116,7 +4175,7 @@ async fn delete_user_handler(
         return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
     }
     let Some(ref reg) = s.user_registry else {
-        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
     };
     if reg.delete_user(&id) {
         info!(id = %id, "User deleted");
@@ -4166,7 +4225,7 @@ async fn rotate_user_key_handler(
         return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"FORBIDDEN"}))).into_response();
     }
     let Some(ref reg) = s.user_registry else {
-        return (StatusCode::NOT_FOUND, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
+        return (StatusCode::FORBIDDEN, JsonExtract(serde_json::json!({"error":"MULTI_USER_DISABLED"}))).into_response();
     };
     match reg.rotate_key(&id) {
         Some(new_key) => {

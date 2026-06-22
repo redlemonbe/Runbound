@@ -1,0 +1,559 @@
+//! Own DNS upstream forwarder — replaces hickory-resolver's TokioResolver.
+//!
+//! `ForwardPool` provides:
+//! - Per-upstream persistent DoT connections (RFC 7858 TCP framing), pooled
+//! - UDP upstream forwarding
+//! - Parallel racing: all upstreams queried simultaneously, first definitive wins
+//! - Automatic reconnection on failure
+//! - Keepalive probes for DoT connections
+
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::{Duration, Instant};
+use arc_swap::ArcSwap;
+use futures_util::StreamExt;
+use crate::dns::wire;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Mutex;
+use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
+use tracing::{debug, warn};
+
+// ─────────────────────── Timeouts ────────────────────────────────────────────
+
+const DOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DOT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const UDP_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Max idle connections held per DoT upstream
+const POOL_CONNS: usize = 4;
+/// Discard pooled connections idle longer than this
+const POOL_IDLE_TTL: Duration = Duration::from_secs(90);
+
+// ─────────────────────── Public result type ───────────────────────────────────
+
+/// Result of a forward query. Non-`Servfail` variants are "definitive" — in
+/// racing mode a definitive result ends the race immediately.
+#[derive(Debug)]
+pub enum ResolveResult {
+    /// NOERROR with one or more answer records
+    Answer { records: Vec<wire::Record> },
+    /// Authoritative negative: NXDOMAIN or NOERROR+empty ANSWER (NODATA)
+    NegativeAnswer { rcode: u16, neg_ttl: u32 },
+    /// Transient error: timeout, connection failure, SERVFAIL, REFUSED
+    Servfail,
+}
+
+impl ResolveResult {
+    /// True if this is a definitive result (positive or authoritative negative).
+    pub fn is_definitive(&self) -> bool {
+        !matches!(self, Self::Servfail)
+    }
+
+}
+
+// ─────────────────────── Upstream spec ───────────────────────────────────────
+
+/// Config for a single upstream (built from UnboundConfig forward-zones or API).
+#[derive(Clone, Debug)]
+pub struct UpstreamSpec {
+    /// Display label, e.g. "1.1.1.1@853"
+    pub label: String,
+    pub addr: SocketAddr,
+    pub kind: UpstreamKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum UpstreamKind {
+    Udp,
+    Dot {
+        sni: Arc<str>,
+        tls: Arc<rustls::ClientConfig>,
+    },
+}
+
+// ─────────────────────── Connection pool internals ───────────────────────────
+
+struct DotConn {
+    stream: tokio_rustls::client::TlsStream<TcpStream>,
+    last_used: Instant,
+}
+
+struct DotUpstream {
+    addr: SocketAddr,
+    sni: Arc<str>,
+    tls: Arc<rustls::ClientConfig>,
+    pool: Mutex<Vec<Option<DotConn>>>,
+}
+
+impl DotUpstream {
+    fn new(addr: SocketAddr, sni: Arc<str>, tls: Arc<rustls::ClientConfig>) -> Self {
+        Self {
+            addr,
+            sni,
+            tls,
+            pool: Mutex::new((0..POOL_CONNS).map(|_| None).collect()),
+        }
+    }
+
+    async fn take_conn(&self) -> Option<DotConn> {
+        let mut slots = self.pool.lock().await;
+        for slot in slots.iter_mut() {
+            if let Some(c) = slot.take() {
+                if c.last_used.elapsed() < POOL_IDLE_TTL {
+                    return Some(c);
+                }
+                // Too old — drop it
+            }
+        }
+        None
+    }
+
+    async fn return_conn(&self, mut c: DotConn) {
+        c.last_used = Instant::now();
+        let mut slots = self.pool.lock().await;
+        for slot in slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(c);
+                return;
+            }
+        }
+        // Pool full — drop
+    }
+
+    async fn new_conn(&self) -> anyhow::Result<DotConn> {
+        let tcp = timeout(DOT_CONNECT_TIMEOUT, TcpStream::connect(self.addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("DoT TCP timeout to {}", self.addr))?
+            .map_err(|e| anyhow::anyhow!("DoT TCP to {}: {e}", self.addr))?;
+        let _ = tcp.set_nodelay(true);
+        let connector = TlsConnector::from(Arc::clone(&self.tls));
+        let sni = rustls::pki_types::ServerName::try_from(self.sni.as_ref().to_owned())
+            .map_err(|_| anyhow::anyhow!("invalid DoT SNI: {}", self.sni))?;
+        let stream = timeout(DOT_CONNECT_TIMEOUT, connector.connect(sni, tcp))
+            .await
+            .map_err(|_| anyhow::anyhow!("DoT TLS timeout to {}", self.addr))?
+            .map_err(|e| anyhow::anyhow!("DoT TLS to {}: {e}", self.addr))?;
+        Ok(DotConn { stream, last_used: Instant::now() })
+    }
+
+    /// Send/recv over an existing connection. RFC 7858: 2-byte length prefix.
+    async fn send_recv(conn: &mut DotConn, wire: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let len = u16::try_from(wire.len())
+            .map_err(|_| anyhow::anyhow!("DNS query too large for DoT framing"))?;
+        conn.stream.write_all(&len.to_be_bytes()).await?;
+        conn.stream.write_all(wire).await?;
+        conn.stream.flush().await?;
+        let mut len_buf = [0u8; 2];
+        conn.stream.read_exact(&mut len_buf).await?;
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        if resp_len == 0 {
+            anyhow::bail!("DoT zero-length response");
+        }
+        let mut buf = vec![0u8; resp_len];
+        conn.stream.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
+    async fn query(&self, wire: &[u8]) -> ResolveResult {
+        match timeout(DOT_QUERY_TIMEOUT, self.do_query(wire)).await {
+            Ok(r) => r,
+            Err(_) => {
+                debug!(addr=%self.addr, "DoT upstream timeout");
+                ResolveResult::Servfail
+            }
+        }
+    }
+
+    async fn do_query(&self, wire: &[u8]) -> ResolveResult {
+        // Try a pooled connection first.
+        if let Some(mut c) = self.take_conn().await {
+            match Self::send_recv(&mut c, wire).await {
+                Ok(resp) => {
+                    self.return_conn(c).await;
+                    return parse_response(&resp);
+                }
+                Err(e) => {
+                    debug!(addr=%self.addr, err=%e, "DoT pooled conn broken, reconnecting");
+                    // c is dropped (TLS session closed)
+                }
+            }
+        }
+        // Fresh connection.
+        match self.new_conn().await {
+            Ok(mut c) => match Self::send_recv(&mut c, wire).await {
+                Ok(resp) => {
+                    self.return_conn(c).await;
+                    parse_response(&resp)
+                }
+                Err(e) => {
+                    debug!(addr=%self.addr, err=%e, "DoT fresh conn query failed");
+                    ResolveResult::Servfail
+                }
+            },
+            Err(e) => {
+                debug!(addr=%self.addr, err=%e, "DoT connect failed");
+                ResolveResult::Servfail
+            }
+        }
+    }
+}
+
+struct UdpUpstream {
+    addr: SocketAddr,
+}
+
+impl UdpUpstream {
+    async fn query(&self, wire: &[u8]) -> ResolveResult {
+        match timeout(UDP_QUERY_TIMEOUT, self.do_query(wire)).await {
+            Ok(r) => r,
+            Err(_) => {
+                debug!(addr=%self.addr, "UDP upstream timeout");
+                ResolveResult::Servfail
+            }
+        }
+    }
+
+    async fn do_query(&self, wire: &[u8]) -> ResolveResult {
+        let bind = if self.addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let sock = match UdpSocket::bind(bind).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(err=%e, "UDP forward: bind failed");
+                return ResolveResult::Servfail;
+            }
+        };
+        if let Err(e) = sock.connect(self.addr).await {
+            debug!(addr=%self.addr, err=%e, "UDP connect failed");
+            return ResolveResult::Servfail;
+        }
+        if let Err(e) = sock.send(wire).await {
+            debug!(addr=%self.addr, err=%e, "UDP send failed");
+            return ResolveResult::Servfail;
+        }
+        let mut buf = vec![0u8; 4096];
+        match sock.recv(&mut buf).await {
+            Ok(n) => parse_response(&buf[..n]),
+            Err(e) => {
+                debug!(addr=%self.addr, err=%e, "UDP recv failed");
+                ResolveResult::Servfail
+            }
+        }
+    }
+}
+
+enum Upstream {
+    Udp(UdpUpstream),
+    Dot(DotUpstream),
+}
+
+impl Upstream {
+    async fn query(&self, wire: &[u8]) -> ResolveResult {
+        match self {
+            Self::Udp(u) => u.query(wire).await,
+            Self::Dot(d) => d.query(wire).await,
+        }
+    }
+
+    fn is_dot(&self) -> bool {
+        matches!(self, Self::Dot(_))
+    }
+}
+
+// ─────────────────────── ForwardPool (public) ─────────────────────────────────
+
+/// The forward pool. Held behind `Arc<ArcSwap<ForwardPool>>` so it can be
+/// hot-swapped when upstreams change (API edits, resolv.conf fallback).
+pub struct ForwardPool {
+    entries: Vec<(String, Arc<Upstream>)>,
+}
+
+impl ForwardPool {
+    /// Build a pool from a slice of upstream specs.
+    pub fn build(specs: &[UpstreamSpec]) -> Arc<Self> {
+        let entries = specs
+            .iter()
+            .map(|spec| {
+                let up = match &spec.kind {
+                    UpstreamKind::Udp => Upstream::Udp(UdpUpstream { addr: spec.addr }),
+                    UpstreamKind::Dot { sni, tls } => {
+                        Upstream::Dot(DotUpstream::new(spec.addr, Arc::clone(sni), Arc::clone(tls)))
+                    }
+                };
+                (spec.label.clone(), Arc::new(up))
+            })
+            .collect();
+        Arc::new(Self { entries })
+    }
+
+    /// Forward a raw DNS wire query to all upstreams in parallel.
+    /// Returns `(result, winning_upstream_label)`. The winning label is `None`
+    /// when all upstreams returned `Servfail`.
+    pub async fn forward(&self, query_wire: &[u8]) -> (ResolveResult, Option<String>) {
+        if self.entries.is_empty() {
+            return (ResolveResult::Servfail, None);
+        }
+        if self.entries.len() == 1 {
+            let (label, up) = &self.entries[0];
+            let result = up.query(query_wire).await;
+            let winner = result.is_definitive().then(|| label.clone());
+            return (result, winner);
+        }
+        // Race all upstreams — first definitive result wins.
+        let wire: Arc<[u8]> = Arc::from(query_wire);
+        let mut futs: futures_util::stream::FuturesUnordered<_> = self
+            .entries
+            .iter()
+            .map(|(label, up)| {
+                let label = label.clone();
+                let up = Arc::clone(up);
+                let wire = Arc::clone(&wire);
+                Box::pin(async move {
+                    let result = up.query(&wire).await;
+                    (result, label)
+                })
+            })
+            .collect();
+
+        while let Some((result, label)) = futs.next().await {
+            if result.is_definitive() {
+                return (result, Some(label));
+            }
+        }
+        (ResolveResult::Servfail, None)
+    }
+
+    /// Send a SOA keepalive probe to each DoT upstream to keep TLS sessions alive.
+    pub async fn keepalive(&self) {
+        let probe = keepalive_wire();
+        for (label, up) in &self.entries {
+            if up.is_dot() {
+                match timeout(DOT_QUERY_TIMEOUT, up.query(&probe)).await {
+                    Ok(r) if r.is_definitive() => {
+                        debug!(upstream=%label, "DoT keepalive OK");
+                    }
+                    Ok(_) => debug!(upstream=%label, "DoT keepalive SERVFAIL"),
+                    Err(_) => debug!(upstream=%label, "DoT keepalive timeout"),
+                }
+            }
+        }
+    }
+
+}
+
+// ─────────────────────── Spec builders from config ───────────────────────────
+
+/// Build upstream specs from config `forward-zone` blocks.
+pub fn specs_from_config(cfg: &crate::config::parser::UnboundConfig) -> Vec<UpstreamSpec> {
+    let root_store = build_root_store();
+    let mut out = Vec::new();
+    for fz in &cfg.forward_zones {
+        let use_tls = fz.tls;
+        let default_port = if use_tls { 853u16 } else { 53u16 };
+        for addr_str in &fz.addrs {
+            let (ip_str, port) = split_addr_port(addr_str, default_port);
+            let Ok(ip) = ip_str.parse::<IpAddr>() else { continue };
+            let addr = SocketAddr::new(ip, port);
+            if use_tls {
+                let sni = fz.tls_hostname.as_deref()
+                    .map(Arc::from)
+                    .unwrap_or_else(|| dot_tls_name(&ip, None));
+                let tls = dot_client_config(Arc::clone(&root_store));
+                out.push(UpstreamSpec {
+                    label: format!("{ip_str}@{port}"),
+                    addr,
+                    kind: UpstreamKind::Dot { sni, tls },
+                });
+            } else {
+                out.push(UpstreamSpec {
+                    label: format!("{ip_str}@{port}"),
+                    addr,
+                    kind: UpstreamKind::Udp,
+                });
+            }
+        }
+    }
+    // Fallback: Cloudflare DoT (same behaviour as old build_resolver)
+    if out.is_empty() {
+        warn!(
+            "No forward-zone configured — falling back to Cloudflare DoT (1.1.1.1@853). \
+             Add forward-zone blocks to runbound.conf to suppress this warning."
+        );
+        let tls = dot_client_config(Arc::clone(&root_store));
+        for (ip_str, sni_str) in [("1.1.1.1", "cloudflare-dns.com"), ("1.0.0.1", "cloudflare-dns.com")] {
+            let ip: IpAddr = ip_str.parse().unwrap();
+            out.push(UpstreamSpec {
+                label: format!("{ip_str}@853"),
+                addr: SocketAddr::new(ip, 853),
+                kind: UpstreamKind::Dot {
+                    sni: Arc::from(sni_str),
+                    tls: Arc::clone(&tls),
+                },
+            });
+        }
+    }
+    out
+}
+
+/// Build upstream specs from the live upstream list `(addr, port, use_tls, tls_hostname_override)`.
+/// Used when upstreams change via the API.
+pub fn specs_from_addrs(addrs: &[(String, u16, bool, Option<String>)]) -> Vec<UpstreamSpec> {
+    let root_store = build_root_store();
+    let mut out = Vec::new();
+    for (addr_str, port, use_tls, tls_hostname) in addrs {
+        let Ok(ip) = addr_str.parse::<IpAddr>() else { continue };
+        let addr = SocketAddr::new(ip, *port);
+        if *use_tls {
+            let sni = tls_hostname.as_deref()
+                .map(Arc::from)
+                .unwrap_or_else(|| dot_tls_name(&ip, None));
+            let tls = dot_client_config(Arc::clone(&root_store));
+            out.push(UpstreamSpec {
+                label: format!("{addr_str}@{port}"),
+                addr,
+                kind: UpstreamKind::Dot { sni, tls },
+            });
+        } else {
+            out.push(UpstreamSpec {
+                label: format!("{addr_str}@{port}"),
+                addr,
+                kind: UpstreamKind::Udp,
+            });
+        }
+    }
+    out
+}
+
+// ─────────────────────── Shared resolver type ────────────────────────────────
+
+/// Hot-swappable forward pool, shared across the server.
+pub type SharedPool = Arc<ArcSwap<ForwardPool>>;
+
+/// Create the initial SharedPool from config.
+pub fn create_shared_pool(cfg: &crate::config::parser::UnboundConfig) -> SharedPool {
+    let specs = specs_from_config(cfg);
+    let pool = ForwardPool::build(&specs);
+    Arc::new(ArcSwap::from(pool))
+}
+
+/// Replace the current pool with a freshly built one (called on upstream changes
+/// and after resolv.conf fallback recovery).
+pub async fn rebuild_pool(shared: &SharedPool, addrs: &[(String, u16, bool, Option<String>)]) {
+    let specs = specs_from_addrs(addrs);
+    let pool = ForwardPool::build(&specs);
+    shared.store(pool);
+}
+
+// ─────────────────────── TLS helpers ─────────────────────────────────────────
+
+fn build_root_store() -> Arc<rustls::RootCertStore> {
+    let mut store = rustls::RootCertStore::empty();
+    // Prefer system CA bundle; fall back to the bundled webpki roots.
+    let native = rustls_native_certs::load_native_certs();
+    let mut loaded = 0usize;
+    for cert in native.certs {
+        if store.add(cert).is_ok() {
+            loaded += 1;
+        }
+    }
+    if loaded == 0 {
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    Arc::new(store)
+}
+
+fn dot_client_config(roots: Arc<rustls::RootCertStore>) -> Arc<rustls::ClientConfig> {
+    let mut cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"dot".to_vec()];
+    Arc::new(cfg)
+}
+
+/// Return the canonical DoT SNI hostname for well-known resolvers.
+/// Matches the logic in server.rs `dot_tls_name`.
+pub(crate) fn dot_tls_name(ip: &IpAddr, override_: Option<&str>) -> Arc<str> {
+    if let Some(h) = override_ {
+        return Arc::from(h);
+    }
+    match ip.to_string().as_str() {
+        "1.1.1.1" | "1.0.0.1" => Arc::from("cloudflare-dns.com"),
+        "8.8.8.8" | "8.8.4.4" => Arc::from("dns.google"),
+        "9.9.9.9" | "149.112.112.112" => Arc::from("dns.quad9.net"),
+        other => Arc::from(other),
+    }
+}
+
+// ─────────────────────── Wire helpers ────────────────────────────────────────
+
+/// Parse a DNS wire response into a `ResolveResult`.
+fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
+    use crate::dns::wire::consts::rcode;
+    let msg = match wire::Message::parse(wire_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            debug!(err = ?e, "failed to parse upstream DNS response");
+            return ResolveResult::Servfail;
+        }
+    };
+    let rc = msg.header.rcode_low();
+    match rc {
+        rcode::NOERROR => {
+            if msg.answers.is_empty() {
+                // NODATA — authoritative empty answer
+                ResolveResult::NegativeAnswer { rcode: rcode::NOERROR, neg_ttl: soa_min_ttl(&msg) }
+            } else {
+                ResolveResult::Answer { records: msg.answers }
+            }
+        }
+        rcode::NXDOMAIN => ResolveResult::NegativeAnswer { rcode: rcode::NXDOMAIN, neg_ttl: soa_min_ttl(&msg) },
+        other => {
+            debug!(rcode = other, "upstream returned error rcode");
+            ResolveResult::Servfail
+        }
+    }
+}
+
+/// Extract the SOA minimum TTL from the authority section (RFC 2308 §5).
+fn soa_min_ttl(msg: &wire::Message) -> u32 {
+    msg.authority
+        .iter()
+        .find_map(|r| {
+            if let wire::Rdata::Soa { minimum, .. } = &r.rdata {
+                Some(*minimum)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(300)
+        .clamp(60, 900)
+}
+
+/// Build a keepalive SOA query for "." in DNS wire format.
+fn keepalive_wire() -> Vec<u8> {
+    static KA_ID: AtomicU16 = AtomicU16::new(0xCA11);
+    let id = KA_ID.fetch_add(1, Ordering::Relaxed);
+    use crate::dns::wire::consts::{opcode, rtype};
+    let mut h = wire::Header { id, flags: 0, qdcount: 0, ancount: 0, nscount: 0, arcount: 0 };
+    h.set_opcode(opcode::QUERY);
+    h.set_rd(true);
+    let msg = wire::Message {
+        header: h,
+        questions: vec![wire::Question::new(wire::Name::root(), rtype::SOA)],
+        answers: vec![],
+        authority: vec![],
+        additional: vec![],
+    };
+    msg.encode()
+}
+
+/// Split "addr@port" into (addr_str, port), defaulting port when absent.
+fn split_addr_port(s: &str, default_port: u16) -> (&str, u16) {
+    if let Some(at) = s.find('@') {
+        let port = s[at + 1..].parse().unwrap_or(default_port);
+        (&s[..at], port)
+    } else {
+        (s, default_port)
+    }
+}

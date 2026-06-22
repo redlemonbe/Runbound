@@ -12,37 +12,30 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use base64::Engine as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures_util::future::select_ok;
 use hickory_proto::op::Query as DnsQuery;
 use hickory_proto::op::{Edns, Message, MessageType, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-use hickory_resolver::{
-    config::{ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts},
-    lookup::Lookup,
-    net::runtime::TokioRuntimeProvider,
-    net::{DnsError, NetError, NoRecords},
-    TokioResolver,
-};
 use hickory_server::{
     net::{BufDnsStreamHandle, runtime::Time},
     server::{Request, RequestHandler, ResponseHandle, ResponseHandler, ResponseInfo},
     zone_handler::{MessageRequest, MessageResponseBuilder},
-    Server,
 };
 use hickory_server::net::xfer::Protocol as DnsProtocol;
+
+use crate::dns::forward::{self as forward_pool, ForwardPool, ResolveResult};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
@@ -78,49 +71,10 @@ fn tarpit_delay() -> Duration {
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 
-// ── Resolver lookup hard timeout (#83) ─────────────────────────────────────
-//
-// hickory-resolver's internal timeout is opts.timeout × opts.attempts = 3 s × 2 = 6 s.
-// Under sustained pool exhaustion (upstream unreachable or pool not yet established),
-// N concurrent queries each block a Tokio worker for up to 6 s.  When N ≥ num_cpus
-// all workers are occupied, preventing the background reconnect task from running —
-// the runtime deadlocks completely (even loopback stops responding).
-//
-// RESOLVER_LOOKUP_TIMEOUT is a hard outer fuse applied by Runbound independently of
-// hickory's internal retry/timeout mechanism.  The tokio::time::timeout future is
-// cancelled when it fires, immediately freeing the worker regardless of hickory's
-// internal state.  2500 ms keeps latency low while remaining above 1 RTT for any
-// realistic upstream.
-const RESOLVER_LOOKUP_TIMEOUT: Duration = Duration::from_millis(2500);
-
-// SEC-L6: outer fuse for the sovereign full-recursion path (#202). The forward path is bounded
-// by timed_lookup/RESOLVER_LOOKUP_TIMEOUT; recursion has only hickory per-NS timeouts + the
-// recursion-depth limits, so a flood toward deep/slow delegations could occupy a worker far
-// longer. 5s caps total worker occupancy while tolerating a legitimately cold deep lookup.
+// SEC-L6: outer fuse for the sovereign full-recursion path (#202). 5s caps total
+// worker occupancy while tolerating a legitimately cold deep lookup.
+#[cfg(feature = "recursor")]
 const RECURSION_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Wrap a resolver lookup with a hard external timeout.
-/// Returns `Err(NetError::Timeout)` if hickory does not respond within
-/// `RESOLVER_LOOKUP_TIMEOUT`, cancelling the hickory future and freeing the
-/// Tokio worker immediately.
-async fn timed_lookup(
-    resolver: &TokioResolver,
-    name: Name,
-    qtype: RecordType,
-) -> Result<Lookup, NetError> {
-    match tokio::time::timeout(RESOLVER_LOOKUP_TIMEOUT, resolver.lookup(name, qtype)).await {
-        Ok(r) => r,
-        Err(_) => Err(NetError::Timeout),
-    }
-}
-
-// ── DoT rebuild rate-limiter ────────────────────────────────────────────────
-// At most one resolver rebuild every 2 s. Under sustained DoT pool exhaustion
-// every failed query would otherwise trigger its own rebuild, creating a
-// positive-feedback loop that saturates the Tokio runtime with rebuild tasks.
-// DOT_REBUILD_LAST_LOG_SECS throttles the log to at most one message per 10 s.
-static DOT_REBUILD_LAST_SECS: AtomicU64 = AtomicU64::new(0);
-static DOT_REBUILD_LAST_LOG_SECS: AtomicU64 = AtomicU64::new(0);
 
 // ── Identity-probe name set (zero-alloc hot path) ──────────────────────────
 // Initialised once on first DNS query; compared directly as LowerName.
@@ -155,7 +109,7 @@ fn identity_probe_names() -> &'static [LowerName; 4] {
 
 pub struct RunboundHandler {
     pub zones: Arc<ArcSwap<LocalZoneSet>>,
-    resolver: Arc<ArcSwap<TokioResolver>>,
+    pool: Arc<ArcSwap<ForwardPool>>,
     rate_limiter: Arc<RateLimiter>,
     alert_tracker: Option<Arc<crate::alerts::AlertTracker>>,
     inflight: Arc<Semaphore>,
@@ -168,13 +122,14 @@ pub struct RunboundHandler {
     pub log_buffer: SharedLogBuffer,
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
-    dnssec_log_bogus: bool,
     /// #201: online DNSSEC signer for local zones — hot-swappable so the slave adopts the
     /// master's replicated keys at runtime. Inner `None` when local-zone-dnssec is off.
     zone_signer: crate::dns::zone_signer::SharedZoneSigner,
     /// #202: resolution mode — 0 = forward (default), 1 = full-recursion. Hot-swappable.
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     resolution_mode: Arc<std::sync::atomic::AtomicU8>,
     /// #202: sovereign full-recursion backend; `Some(..)` only when resolution=full-recursion.
+    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     recursor: crate::dns::recursor::SharedRecursor,
     /// Optional prefetch tracker — None when prefetch: no (default).
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
@@ -185,7 +140,9 @@ pub struct RunboundHandler {
     /// #77: upstream list for transparent pool reconnection on DoT exhaustion.
     upstreams: crate::upstreams::SharedUpstreams,
     /// #33: per-upstream resolvers for racing mode.
+    #[allow(dead_code)]
     per_upstream_resolvers: SharedResolversVec,
+    #[allow(dead_code)]
     upstream_racing: bool,
     /// #33: per-upstream win counters — how many times each upstream answered first.
     pub racing_wins:
@@ -275,7 +232,7 @@ impl RunboundHandler {
     #[allow(clippy::too_many_arguments)]
     fn new(
         zones: Arc<ArcSwap<LocalZoneSet>>,
-        resolver: Arc<ArcSwap<TokioResolver>>,
+        pool: Arc<ArcSwap<ForwardPool>>,
         rate_limiter: Arc<RateLimiter>,
         acl: Arc<Acl>,
         private_addrs: Arc<PrivateAddressSet>,
@@ -284,7 +241,6 @@ impl RunboundHandler {
         stats: Arc<Stats>,
         log_buffer: SharedLogBuffer,
         dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
-        dnssec_log_bogus: bool,
         zone_signer: crate::dns::zone_signer::SharedZoneSigner,
         prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
         xdp_cache: Option<super::cache_snapshot::MutableCacheMap>,
@@ -317,7 +273,7 @@ impl RunboundHandler {
     ) -> Self {
         Self {
             zones,
-            resolver,
+            pool,
             rate_limiter,
             alert_tracker,
             axfr_allow,
@@ -329,7 +285,6 @@ impl RunboundHandler {
             stats,
             log_buffer,
             dnssec_enabled,
-            dnssec_log_bogus,
             zone_signer,
             resolution_mode,
             recursor,
@@ -715,31 +670,25 @@ impl RunboundHandler {
                     debug!(name=%sanitize_dns_name(qname), count = records.len(), "local-data answer");
                     let mut metadata = Metadata::response_from_request(&request.metadata);
                     metadata.authoritative = true;
-                    // #201: when local-zone-dnssec is on and the client set DO, append the RRSIG
-                    // for this RRset (online signing on the slow path).
-                    let mut answer: Vec<Record> = records.iter().map(|r| (*r).clone()).collect();
+                    // #201: when local-zone-dnssec is on and the client set DO, append the RRSIG.
+                    // Only clone when DNSSEC is actually needed — the common non-DNSSEC path
+                    // passes records.iter() directly, avoiding Vec allocation + memcpy.
                     let dnssec_ok = request
                         .edns
                         .as_ref()
                         .map(|e| e.flags().dnssec_ok)
                         .unwrap_or(false);
-                    if dnssec_ok {
-                        if let Some(signer) = self.signer() {
-                            if let Some(rrsig) = signer.sign_answer(qtype, &records) {
-                                answer.push(rrsig);
-                            }
-                        }
-                    }
+                    let rrsig = if dnssec_ok {
+                        self.signer().and_then(|s| s.sign_answer(qtype, &records))
+                    } else {
+                        None
+                    };
                     let opt_edns = make_opt_edns(request);
                     let mut builder = MessageResponseBuilder::from_message_request(request);
                     if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                    let response = builder.build(
-                        metadata,
-                        answer.iter(),
-                        std::iter::empty(),
-                        std::iter::empty(),
-                        std::iter::empty(),
-                    );
+                    let mut answer: Vec<Record> = records.iter().map(|r| (*r).clone()).collect();
+                    if let Some(sig) = rrsig { answer.push(sig); }
+                    let response = builder.build(metadata, answer.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
                     self.record_query(
                         client_ip,
                         qname,
@@ -879,6 +828,7 @@ impl RunboundHandler {
         self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, &zones_guard).await
     }
 
+    #[cfg(feature = "recursor")]
     /// #202: sovereign full-recursion — resolve from the root via the recursor, then build
     /// and send the response with correct DNSSEC semantics.
     ///
@@ -903,6 +853,7 @@ impl RunboundHandler {
         }
     }
 
+    #[cfg(feature = "recursor")]
     async fn resolve_recursive<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -938,6 +889,7 @@ impl RunboundHandler {
                     .any(|r| r.proof.is_bogus());
                 if bogus && !cd {
                     warn!(%qname, "full-recursion: DNSSEC validation failed (bogus) — SERVFAIL");
+                    self.stats.inc_dnssec_bogus();
                     self.count_recursion_rcode(ResponseCode::ServFail);
                     return send_error(request, response_handle, ResponseCode::ServFail).await;
                 }
@@ -1067,6 +1019,7 @@ impl RunboundHandler {
     }
 
     /// #108/#202: remember a fresh positive answer in the serve-stale cache (LRU-evicted).
+    #[cfg(feature = "recursor")]
     fn store_stale(&self, qname: &LowerName, qtype: RecordType, records: &[Record]) {
         if let Some(ref sc) = self.stale_cache {
             if !records.is_empty() {
@@ -1085,6 +1038,7 @@ impl RunboundHandler {
 
     /// #202: RFC 8767 serve-stale on the recursion path — if a recent answer is cached, serve it
     /// (TTL capped at `stale_answer_ttl`) instead of SERVFAIL. Returns `None` if nothing to serve.
+    #[cfg(feature = "recursor")]
     async fn try_serve_stale<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -1142,6 +1096,7 @@ impl RunboundHandler {
         start: Instant,
     ) -> ResponseInfo {
         // #202: sovereign full-recursion path — resolve iteratively from the root.
+        #[cfg(feature = "recursor")]
         if self.resolution_mode.load(std::sync::atomic::Ordering::Relaxed) == 1 {
             let snap = self.recursor.load_full();
             if let Some(rec) = snap.as_ref() {
@@ -1158,135 +1113,55 @@ impl RunboundHandler {
             // recursor not available (build failed) — fall through to forwarding.
         }
         // #33: racing mode — send to all upstreams simultaneously, first wins.
-        // All lookup calls go through timed_lookup (#83) to cap worker occupancy.
-        let result = if self.upstream_racing {
-            let resolvers = self.per_upstream_resolvers.load();
-            if resolvers.len() >= 2 {
-                let name = Name::from(qname);
-                let futs: Vec<_> = resolvers
-                    .iter()
-                    .map(|(addr, r)| {
-                        let r = Arc::clone(r);
-                        let n = name.clone();
-                        let addr = addr.clone();
-                        Box::pin(async move {
-                            let res = timed_lookup(&r, n, qtype).await;
-                            // #179: a DEFINITIVE result must win the race immediately — an
-                            // answer (Ok) OR an authoritative negative (NXDOMAIN / NODATA,
-                            // which hickory returns as Err(NoRecordsFound)). select_ok only
-                            // short-circuits on Ok, so without mapping the negative to a
-                            // "win" the race would wait for the slowest/stalled upstream up
-                            // to the 2.5s fuse, pushing the negative reply past the client
-                            // timeout (~18% NXDOMAIN loss, issue #179). Only TRANSIENT errors
-                            // (timeout / connection / SERVFAIL / REFUSED) stay Err so we fail
-                            // over to the other upstreams.
-                            let definitive = match &res {
-                                Ok(_) => true,
-                                Err(NetError::Dns(DnsError::NoRecordsFound(NoRecords {
-                                    response_code, ..
-                                }))) => matches!(
-                                    response_code,
-                                    ResponseCode::NXDomain | ResponseCode::NoError
-                                ),
-                                _ => false,
-                            };
-                            if definitive {
-                                Ok((res, addr))
-                            } else {
-                                Err(res.unwrap_err())
-                            }
-                        })
-                    })
-                    .collect();
-                match select_ok(futs).await {
-                    Ok(((res, winner), _rest)) => {
-                        // Record win for the upstream that produced the first definitive result.
-                        self.racing_wins
-                            .entry(winner)
-                            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
-                            .fetch_add(1, Ordering::Relaxed);
-                        res
-                    }
-                    Err(e) => Err(e),
-                }
-            } else {
-                timed_lookup(&self.resolver.load(), Name::from(qname), qtype).await
+        // Forward the query via ForwardPool (races all upstreams, first definitive wins).
+        let query_wire: Vec<u8> = {
+            let mut msg = Message::new(request.metadata.id, MessageType::Query, OpCode::Query);
+            msg.metadata.recursion_desired = true;
+            if let Ok(info) = request.request_info() {
+                msg.add_query(info.query.original().clone());
             }
-        } else {
-            timed_lookup(&self.resolver.load(), Name::from(qname), qtype).await
+            let mut wire = Vec::with_capacity(512);
+            let mut enc = BinEncoder::new(&mut wire);
+            msg.emit(&mut enc).unwrap_or_default();
+            wire
         };
-
-        // Level 2: transparent reconnection on DoT pool exhaustion (#77 + #83).
-        // Rate-limited to one rebuild every 2 s: under sustained pool exhaustion,
-        // every failed query would otherwise spawn its own rebuild task, creating
-        // a positive-feedback loop that saturates the Tokio scheduler.
-        // Queries that lose the CAS race return SERVFAIL immediately — no rebuild.
-        //
-        // #83: the rebuild is spawned as a background task instead of being awaited
-        // in the query handler.  Awaiting rebuild_and_swap() (which calls warm_up()
-        // internally) could block the current worker for up to 3 s, compounding the
-        // worker-exhaustion problem.  The next query will use the rebuilt resolver.
-        if let Err(ref e) = result {
-            if is_pool_exhausted(e) {
-                let now_s = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let last = DOT_REBUILD_LAST_SECS.load(Ordering::Relaxed);
-                if now_s.saturating_sub(last) >= 2
-                    && DOT_REBUILD_LAST_SECS
-                        .compare_exchange(last, now_s, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    // At most one log line per 10 s so the event is visible without spam.
-                    let last_log = DOT_REBUILD_LAST_LOG_SECS.load(Ordering::Relaxed);
-                    if now_s.saturating_sub(last_log) >= 10 {
-                        DOT_REBUILD_LAST_LOG_SECS.store(now_s, Ordering::Relaxed);
-                        info!(name=%sanitize_dns_name(qname), "DoT pool exhausted — rebuilding resolver");
-                    }
-                    let addrs = crate::upstreams::upstream_addrs(&self.upstreams);
-                    let resolver_rebuild = Arc::clone(&self.resolver);
-                    let stats_rebuild = Arc::clone(&self.stats);
-                    let dnssec = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
-                    tokio::spawn(async move {
-                        if rebuild_and_swap(&resolver_rebuild, &addrs, dnssec)
-                            .await
-                            .is_ok()
-                        {
-                            stats_rebuild.record_dot_reconnect();
-                        }
-                    });
-                    // This query returns SERVFAIL; the next query will find the rebuilt resolver.
-                }
-            }
-
-            // #94: resolv.conf fallback — activate when all real upstreams are unhealthy.
+        let (fwd_result, winner) = self.pool.load().forward(&query_wire).await;
+        // #33: record racing win for the upstream that produced the first definitive result.
+        if let Some(ref w) = winner {
+            self.racing_wins
+                .entry(w.clone())
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // #94: resolv.conf fallback when all configured upstreams fail.
+        if matches!(fwd_result, ResolveResult::Servfail) {
             if self.resolv_fallback
                 && !self.fallback_active.load(Ordering::Relaxed)
                 && crate::upstreams::all_non_temporary_unhealthy(&self.upstreams)
-                && self
-                    .fallback_active
+                && self.fallback_active
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
                 let ups = Arc::clone(&self.upstreams);
-                let res = Arc::clone(&self.resolver);
-                let dnssec = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
+                let pool_rebuild = Arc::clone(&self.pool);
                 tokio::spawn(async move {
                     crate::upstreams::add_resolv_fallback(&ups);
                     let addrs = crate::upstreams::upstream_addrs(&ups);
-                    let _ = rebuild_and_swap(&res, &addrs, dnssec).await;
-                    warn!("resolv.conf fallback activated — all configured upstreams are down");
+                    let _ = rebuild_and_swap(&pool_rebuild, &addrs, false).await;
+                    warn!("resolv.conf fallback activated");
                 });
             }
         }
-
-        match result {
-            Ok(lookup) => {
-                // DNS rebinding protection: SERVFAIL if any A/AAAA record falls
-                // within a configured private-address range (Unbound compatible).
+        match fwd_result {
+            ResolveResult::Answer { records } => {
+                // de-hickory: forward returns wire::Record; bridge to hickory at the
+                // response-building boundary (transitional — bridge drops with the handler rewrite).
+                let records: Vec<Record> = records
+                    .iter()
+                    .filter_map(crate::dns::wire_bridge::to_hickory)
+                    .collect();
                 if !self.private_addrs.is_empty() {
-                    for rec in lookup.answers() {
+                    for rec in &records {
                         let private_ip = match &rec.data {
                             RData::A(a) => Some(IpAddr::V4(a.0)),
                             RData::AAAA(a) => Some(IpAddr::V6(a.0)),
@@ -1294,317 +1169,139 @@ impl RunboundHandler {
                         };
                         if let Some(ip) = private_ip {
                             if self.private_addrs.contains(ip) {
-                                warn!(name=%sanitize_dns_name(qname), %ip, "private-address block → SERVFAIL");
-                                self.record_query(
-                                    client_ip,
-                                    qname,
-                                    qtype,
-                                    ResponseCode::ServFail,
-                                    LogAction::Servfail,
-                                    start,
-                                );
-                                return send_error(
-                                    request,
-                                    response_handle,
-                                    ResponseCode::ServFail,
-                                )
-                                .await;
+                                warn!(name=%sanitize_dns_name(qname), %ip, "private-address block SERVFAIL");
+                                self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
+                                return send_error(request, response_handle, ResponseCode::ServFail).await;
                             }
                         }
                     }
                 }
-
                 let ttl_cap = self.cache_max_ttl;
                 let ttl_floor = self.cache_min_ttl;
-                let needs_cap = lookup.answers().iter().any(|r| r.ttl > ttl_cap || r.ttl < ttl_floor);
-                let capped: Vec<Record>;
-                let records: &[Record] = if needs_cap {
-                    capped = lookup
-                        .answers()
-                        .iter()
-                        .map(|r| {
-                            let new_ttl = r.ttl.max(ttl_floor).min(ttl_cap);
-                            if new_ttl != r.ttl {
-                                let mut rc = r.clone();
-                                rc.ttl = new_ttl;
-                                rc
-                            } else {
-                                r.clone()
-                            }
-                        })
-                        .collect();
-                    &capped
-                } else {
-                    lookup.answers()
-                };
-
-                // DNSSEC: check for bogus proof on individual records in success path.
-                if self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                    let has_bogus = records.iter().any(|r| r.proof.is_bogus());
-                    if has_bogus {
-                        self.stats.inc_dnssec_bogus();
-                        if self.dnssec_log_bogus {
-                            warn!(name=%sanitize_dns_name(qname), "DNSSEC bogus — SERVFAIL");
-                        }
-                        self.record_query(
-                            client_ip,
-                            qname,
-                            qtype,
-                            ResponseCode::ServFail,
-                            LogAction::Servfail,
-                            start,
-                        );
-                        return send_error(request, response_handle, ResponseCode::ServFail).await;
-                    }
-                    let has_rrsig = records.iter().any(|r| r.record_type() == RecordType::RRSIG);
-                    if has_rrsig {
-                        self.stats.inc_dnssec_secure();
-                    } else {
-                        self.stats.inc_dnssec_insecure();
-                    }
+                let mut records_owned: Vec<Record> = records;
+                for r in records_owned.iter_mut() {
+                    let new_ttl = r.ttl.max(ttl_floor).min(ttl_cap);
+                    r.ttl = new_ttl;
                 }
-
+                let records: &[Record] = &records_owned;
+                if self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    let has_rrsig = records.iter().any(|r| r.record_type() == RecordType::RRSIG);
+                    if has_rrsig { self.stats.inc_dnssec_secure(); } else { self.stats.inc_dnssec_insecure(); }
+                }
                 debug!(name=%sanitize_dns_name(qname), %qtype, count = records.len(), "resolved");
-
-                // #60 / #64: populate the XDP cache snapshot with wire-format response.
-                // Key uses wire-format DNS name bytes + qclass for fast XDP lookup.
-                // Stored with QID=0; XDP workers patch bytes [0..2] before sending.
-                // Insert is spawned to avoid blocking the response path.
                 if let Some(ref cache) = self.xdp_cache {
                     if !records.is_empty() {
-                        let min_ttl = records
-                            .iter()
-                            .map(|r| r.ttl)
-                            .min()
-                            .unwrap_or(60)
-                            .max(self.cache_min_ttl)
-                            .min(self.cache_max_ttl);
-                        // Build wire-format name key
+                        let min_ttl = records.iter().map(|r| r.ttl).min().unwrap_or(60).max(self.cache_min_ttl).min(self.cache_max_ttl);
                         let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
                         let mut name_enc = BinEncoder::new(&mut name_tmp);
                         if Name::from(qname).emit(&mut name_enc).is_ok() {
-                            // CRC32c key (same as answer_dns_wire hot path).
                             let qname_lc = crate::dns::wire_builder::normalize_query_qname(&name_tmp);
                             let raw_key = crate::dns::hasher::hash_wire_qname(&qname_lc);
                             let key: u64 = raw_key ^ ((u16::from(qtype) as u64) << 48);
                             let mut wire: Vec<u8> = Vec::with_capacity(512);
-                            let mut cache_msg =
-                                Message::new(0, MessageType::Response, OpCode::Query);
+                            let mut cache_msg = Message::new(0, MessageType::Response, OpCode::Query);
                             cache_msg.metadata.recursion_available = true;
                             cache_msg.metadata.response_code = ResponseCode::NoError;
                             cache_msg.add_query(DnsQuery::query(Name::from(qname), qtype));
-                            for r in records {
-                                cache_msg.add_answer((*r).clone());
-                            }
+                            for r in records { cache_msg.add_answer((*r).clone()); }
                             let mut enc = BinEncoder::new(&mut wire);
                             if cache_msg.emit(&mut enc).is_ok() {
-                                let expires_at = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(min_ttl as u64);
-                                let entry = super::cache_snapshot::CacheEntry {
-                                    wire_payload: Bytes::from(wire),
-                                    expires_at,
-                                    wire_qname: bytes::Bytes::copy_from_slice(&qname_lc),
-                                };
+                                let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(min_ttl as u64);
+                                let entry = super::cache_snapshot::CacheEntry { wire_payload: Bytes::from(wire), expires_at, wire_qname: bytes::Bytes::copy_from_slice(&qname_lc) };
                                 let cache_ref = Arc::clone(cache);
                                 let max_ent = self.cache_max_entries;
-                                tokio::spawn(async move {
-                                    super::cache_snapshot::cache_insert(
-                                        &cache_ref, key, entry, max_ent,
-                                    );
-                                });
+                                tokio::spawn(async move { super::cache_snapshot::cache_insert(&cache_ref, key, entry, max_ent); });
                             }
                         }
                     }
                 }
-
-                // #108: Update stale cache with fresh records.
-                // SEC-21: evict oldest entry if at capacity (simple LRU approximation).
                 if let Some(ref sc) = self.stale_cache {
                     if !records.is_empty() {
                         let stale_key = (qname.clone(), qtype);
                         if sc.len() >= self.cache_max_entries {
-                            if let Some(old_key) = sc.iter().next().map(|e| e.key().clone()) {
-                                sc.remove(&old_key);
-                            }
+                            if let Some(old_key) = sc.iter().next().map(|e| e.key().clone()) { sc.remove(&old_key); }
                         }
                         sc.insert(stale_key, (records.to_vec(), std::time::Instant::now()));
                     }
                 }
-
-                // Prefetch: count forwarded queries so hot domains can be refreshed before expiry.
-                if let Some(ref tracker) = self.prefetch_tracker {
-                    tracker.increment(&qname.to_string());
-                }
-                // DNSSEC: set the AD (authentic_data) flag when validation is on and
-                // the answer is Secure (hickory per-record proof). Bogus already
-                // SERVFAILed above; Insecure/unsigned -> AD stays clear.
-                let dnssec_ad = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed)
-                    && records.iter().any(|r| r.proof.is_secure());
+                if let Some(ref tracker) = self.prefetch_tracker { tracker.increment(&qname.to_string()); }
                 let mut metadata = Metadata::response_from_request(&request.metadata);
                 metadata.recursion_available = true;
-                metadata.authentic_data = dnssec_ad;
                 let opt_edns = make_opt_edns(request);
-                    let mut builder = MessageResponseBuilder::from_message_request(request);
-                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                let response = builder.build(
-                    metadata,
-                    records.iter(),
-                    std::iter::empty(),
-                    std::iter::empty(),
-                    std::iter::empty(),
-                );
+                let mut builder = MessageResponseBuilder::from_message_request(request);
+                if let Some(ref opt) = opt_edns { builder.edns(opt); }
+                let response = builder.build(metadata, records.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
                 self.stats.inc_forwarded();
                 let fwd_us = start.elapsed().as_micros() as u64;
                 self.stats.record_forward(fwd_us);
-                let fwd_action = if fwd_us < CACHE_HIT_THRESHOLD_US {
-                    LogAction::Cached
-                } else {
-                    LogAction::Forwarded
-                };
-                self.record_query(
-                    client_ip,
-                    qname,
-                    qtype,
-                    ResponseCode::NoError,
-                    fwd_action,
-                    start,
-                );
-                response_handle
-                    .send_response(response)
-                    .await
-                    .unwrap_or_else(|e| {
-                        error!("send: {e}");
-                        servfail_info(request)
-                    })
+                let fwd_action = if fwd_us < CACHE_HIT_THRESHOLD_US { LogAction::Cached } else { LogAction::Forwarded };
+                self.record_query(client_ip, qname, qtype, ResponseCode::NoError, fwd_action, start);
+                response_handle.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) })
             }
-            Err(e) => {
-                // DNSSEC bogus via NSEC denial: validated proof the record does not exist.
-                let is_dnssec_bogus = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed)
-                    && matches!(&e, NetError::Dns(DnsError::Nsec { proof, .. }) if proof.is_bogus());
-
-                if is_dnssec_bogus {
-                    self.stats.inc_dnssec_bogus();
-                    if self.dnssec_log_bogus {
-                        warn!(name=%sanitize_dns_name(qname), "DNSSEC bogus — SERVFAIL (NSEC denial)");
-                    }
-                }
-
-                let (rcode, neg_ttl_secs) = match &e {
-                    NetError::Dns(DnsError::NoRecordsFound(NoRecords {
-                        response_code, negative_ttl, ..
-                    })) => {
-                        debug!(name=%sanitize_dns_name(qname), ?response_code, "no records from resolver");
-                        // RFC 2308: negative TTL from the SOA MINIMUM (hickory pre-computes
-                        // it into negative_ttl). Clamp prudently [60, 900]s so a flood of
-                        // random sub-domains under an existing zone cannot bloat the cache.
-                        (*response_code, negative_ttl.unwrap_or(300).clamp(60, 900))
-                    }
-                    _ => {
-                        if !is_dnssec_bogus {
-                            // was warn! per query → log-spam under SERVFAIL-heavy load.
-                            debug!(name=%sanitize_dns_name(qname), err=%e, "resolver error → SERVFAIL");
-                        }
-                        (ResponseCode::ServFail, 0)
-                    }
+            ResolveResult::NegativeAnswer { rcode: rcode_u16, neg_ttl } => {
+                let rcode = match rcode_u16 {
+                    0 => ResponseCode::NoError,
+                    3 => ResponseCode::NXDomain,
+                    _ => ResponseCode::ServFail,
                 };
+                let neg_ttl_secs = neg_ttl.clamp(60, 900);
                 let err_action = match rcode {
-                    ResponseCode::NXDomain => {
-                        self.stats.inc_nxdomain();
-                        LogAction::Nxdomain
-                    }
-                    ResponseCode::ServFail => {
-                        self.stats.inc_servfail();
-                        LogAction::Servfail
-                    }
-                    ResponseCode::Refused => {
-                        self.stats.inc_refused();
-                        LogAction::Refused
-                    }
-                    _ => LogAction::Servfail,
+                    ResponseCode::NXDomain => { self.stats.inc_nxdomain(); LogAction::Nxdomain }
+                    _ => { self.stats.inc_servfail(); LogAction::Servfail }
                 };
-                // #108: serve-stale — if SERVFAIL and we have a cached entry, serve it.
-                if rcode == ResponseCode::ServFail {
-                    if let Some(ref sc) = self.stale_cache {
-                        let stale_key = (qname.clone(), qtype);
-                        if let Some(entry) = sc.get(&stale_key) {
-                            let (ref stale_records, stored_at) = *entry;
-                            let age = stored_at.elapsed().as_secs();
-                            if age <= self.stale_max_age && !stale_records.is_empty() {
-                                let stale_ttl = self.stale_answer_ttl;
-                                let capped: Vec<hickory_proto::rr::Record> = stale_records
-                                    .iter()
-                                    .map(|r| { let mut rc = r.clone(); rc.ttl = stale_ttl; rc })
-                                    .collect();
-                                drop(entry);
-                                info!(name=%sanitize_dns_name(qname), age_secs=age, ttl=stale_ttl, "serve-stale");
-                                self.stats.inc_stale_served();
-                                self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Cached, start);
-                                let mut metadata = Metadata::response_from_request(&request.metadata);
-                                metadata.recursion_available = true;
-                                let opt_edns = make_opt_edns(request);
-                    let mut builder = MessageResponseBuilder::from_message_request(request);
-                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                                let response = builder.build(metadata, capped.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
-                                return response_handle.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
-                            }
-                        }
-                    }
-                }
-
+                debug!(name=%sanitize_dns_name(qname), ?rcode, "negative answer from upstream");
                 self.record_query(client_ip, qname, qtype, rcode, err_action, start);
-
-                // #166: negative-cache NXDOMAIN (RFC 2308).
-                // NXDOMAIN = authoritative non-existence -> safe to cache.
-                // SERVFAIL = transient under load (measured: 5.77% -> 0.71% after warmup)
-                //            -> do NOT cache (false negatives would mask real domains).
-                // Insert is SYNCHRONOUS (tokio::spawn may not execute under saturated runtime).
-                // #166: negative-cache NXDOMAIN (RFC 2308) AND NODATA (NOERROR-empty).
-                // Both are authoritative non-existence facts, stable for the SOA TTL, and
-                // otherwise re-recurse on every query — under flood that drowns the Rust
-                // fallback (measured 17% drop). SERVFAIL is transient -> neg_ttl_secs=0 -> skip.
-                if (rcode == ResponseCode::NXDomain || rcode == ResponseCode::NoError)
-                    && neg_ttl_secs > 0
-                {
+                if (rcode == ResponseCode::NXDomain || rcode == ResponseCode::NoError) && neg_ttl_secs > 0 {
                     if let Some(ref cache) = self.xdp_cache {
                         let ttl = neg_ttl_secs;
-                        // Build wire-format name key (same pattern as positive-cache insert).
                         let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
                         let mut name_enc = BinEncoder::new(&mut name_tmp);
                         if Name::from(qname).emit(&mut name_enc).is_ok() {
-                            // CRC32c key — same routine as answer_dns_wire.
                             let qname_lc_neg = crate::dns::wire_builder::normalize_query_qname(&name_tmp);
                             let raw_key_neg = crate::dns::hasher::hash_wire_qname(&qname_lc_neg);
                             let key: u64 = raw_key_neg ^ ((u16::from(qtype) as u64) << 48);
-                            // Build a minimal NXDOMAIN wire response.
                             let mut wire: Vec<u8> = Vec::with_capacity(64);
-                            let mut neg_msg = Message::new(
-                                0,
-                                MessageType::Response,
-                                OpCode::Query,
-                            );
+                            let mut neg_msg = Message::new(0, MessageType::Response, OpCode::Query);
                             neg_msg.metadata.response_code = rcode;
                             neg_msg.metadata.recursion_available = true;
-                            neg_msg.add_query(DnsQuery::query(
-                                Name::from(qname), qtype,
-                            ));
+                            neg_msg.add_query(DnsQuery::query(Name::from(qname), qtype));
                             let mut enc = BinEncoder::new(&mut wire);
                             if neg_msg.emit(&mut enc).is_ok() {
-                                let entry = super::cache_snapshot::CacheEntry {
-                                    wire_payload: Bytes::from(wire),
-                                    expires_at: std::time::Instant::now()
-                                        + std::time::Duration::from_secs(ttl as u64),
-                                    wire_qname: bytes::Bytes::copy_from_slice(&qname_lc_neg),
-                                };
-                                // SYNCHRONOUS insert (no spawn).
-                                super::cache_snapshot::cache_insert(
-                                    cache, key, entry, self.cache_max_entries,
-                                );
+                                let entry = super::cache_snapshot::CacheEntry { wire_payload: Bytes::from(wire), expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl as u64), wire_qname: bytes::Bytes::copy_from_slice(&qname_lc_neg) };
+                                super::cache_snapshot::cache_insert(cache, key, entry, self.cache_max_entries);
                             }
                         }
                     }
                 }
-
                 send_error(request, response_handle, rcode).await
+            }
+            ResolveResult::Servfail => {
+                debug!(name=%sanitize_dns_name(qname), "all upstreams SERVFAIL");
+                if let Some(ref sc) = self.stale_cache {
+                    let stale_key = (qname.clone(), qtype);
+                    if let Some(entry) = sc.get(&stale_key) {
+                        let (ref stale_records, stored_at) = *entry;
+                        let age = stored_at.elapsed().as_secs();
+                        if age <= self.stale_max_age && !stale_records.is_empty() {
+                            let stale_ttl = self.stale_answer_ttl;
+                            let capped: Vec<hickory_proto::rr::Record> = stale_records.iter().map(|r| { let mut rc = r.clone(); rc.ttl = stale_ttl; rc }).collect();
+                            drop(entry);
+                            info!(name=%sanitize_dns_name(qname), age_secs=age, ttl=stale_ttl, "serve-stale");
+                            self.stats.inc_stale_served();
+                            self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Cached, start);
+                            let mut metadata = Metadata::response_from_request(&request.metadata);
+                            metadata.recursion_available = true;
+                            let opt_edns = make_opt_edns(request);
+                            let mut builder = MessageResponseBuilder::from_message_request(request);
+                            if let Some(ref opt) = opt_edns { builder.edns(opt); }
+                            let response = builder.build(metadata, capped.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
+                            return response_handle.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
+                        }
+                    }
+                }
+                self.stats.inc_servfail();
+                self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
+                send_error(request, response_handle, ResponseCode::ServFail).await
             }
         }
     }
@@ -1616,6 +1313,36 @@ impl RunboundHandler {
     /// address for connection transports.
     pub fn alert_tracker(&self) -> Option<Arc<crate::alerts::AlertTracker>> {
         self.alert_tracker.clone()
+    }
+
+    // ─────────── Wire-based request dispatch (replaces hickory Server) ───────────
+
+    /// Dispatch a raw DNS wire query and return the wire response.
+    pub async fn handle_request_wire(&self, wire: &[u8], peer: std::net::SocketAddr) -> Vec<u8> {
+        let request = match hickory_server::server::Request::from_bytes(
+            wire.to_vec(),
+            peer,
+            hickory_server::net::xfer::Protocol::Udp,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(err=%e, "handle_request_wire: malformed query");
+                return Vec::new();
+            }
+        };
+        let out: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let cap = DohCapture {
+            peer,
+            out: std::sync::Arc::clone(&out),
+        };
+        self.handle_request::<DohCapture, hickory_server::net::runtime::TokioTime>(&request, cap)
+            .await;
+        let result = out.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default();
+        result
     }
 }
 
@@ -1636,10 +1363,11 @@ impl RequestHandler for RunboundHandler {
         let qname = info.query.name();
         let qtype = info.query.query_type();
         let client_ip = info.src.ip();
+        let qname_str = qname.to_string();
 
         self.stats.inc_total();
         self.stats.inc_qtype_raw(u16::from(qtype));
-        self.domain_stats.inc(&qname.to_string());
+        self.domain_stats.inc(&qname_str);
 
         // ── 0b. AXFR/IXFR zone transfer dispatch (#22) ────────────────
         if qtype == RecordType::AXFR || qtype == RecordType::IXFR {
@@ -1650,7 +1378,7 @@ impl RequestHandler for RunboundHandler {
                     response_handle,
                     &axfr_zones,
                     client_ip,
-                    &qname.to_string(),
+                    &qname_str,
                     &self.axfr_allow,
                 ).await;
             }
@@ -1830,7 +1558,7 @@ impl RequestHandler for RunboundHandler {
         // ── 3b-DDR. #204: serve SVCB for _dns.resolver.arpa (RFC 9462) ─
         if qtype == RecordType::SVCB {
             if let Some(ddr) = &self.ddr {
-                if qname.to_string().eq_ignore_ascii_case("_dns.resolver.arpa.") {
+                if qname_str.eq_ignore_ascii_case("_dns.resolver.arpa.") {
                     let answer = ddr.svcb_records();
                     if !answer.is_empty() {
                         debug!(%client_ip, "DDR: answering _dns.resolver.arpa SVCB");
@@ -1933,18 +1661,7 @@ impl RequestHandler for RunboundHandler {
 // Helpers
 // ============================================================
 
-/// Returns true when the hickory error indicates the DoT connection pool is exhausted
-/// or all underlying TCP connections were reset by the peer (#77).
-fn is_pool_exhausted(e: &NetError) -> bool {
-    matches!(e, NetError::NoConnections)
-        || matches!(e, NetError::Io(io) if matches!(
-            io.kind(),
-            std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionAborted
-        ))
-}
-
+// is_pool_exhausted removed (uses NetError from hickory_resolver).
 /// MED-06: Strip control characters from DNS names before structured log emission.
 /// Prevents log injection via carefully crafted query names containing \n, \r, etc.
 ///
@@ -2206,39 +1923,30 @@ async fn send_error<R: ResponseHandler>(
 }
 
 /// Shared, hot-swappable DNS resolver used by the server handler and the API.
-pub type SharedResolver = Arc<ArcSwap<TokioResolver>>;
+/// Hot-swappable forward pool — replaces the old hickory TokioResolver.
+pub type SharedResolver = Arc<ArcSwap<ForwardPool>>;
 
-/// One resolver per upstream, used for DNS racing (#33).
-/// Each entry is `(upstream_addr, resolver)`.
-pub type SharedResolversVec = Arc<ArcSwap<Vec<(String, Arc<TokioResolver>)>>>;
+/// Per-upstream resolvers for racing — no-op now, racing is inside ForwardPool.
+/// Kept for API compatibility with main.rs / api/mod.rs.
+pub type SharedResolversVec = Arc<ArcSwap<Vec<(String, ())>>>;
 
-/// Build one TokioResolver per upstream for racing mode.
+/// Racing is now handled inside ForwardPool â no-op kept for API compat.
 pub fn build_per_upstream_resolvers(
-    addrs: &[(String, u16, bool, Option<String>)],
-    dnssec: bool,
-) -> anyhow::Result<Vec<(String, Arc<TokioResolver>)>> {
-    let mut result = Vec::with_capacity(addrs.len());
-    for (addr_str, port, use_tls, tls_hostname) in addrs {
-        let single = build_resolver_from_addrs(
-            &[(addr_str.clone(), *port, *use_tls, tls_hostname.clone())],
-            cache_size_from_meminfo(), // #183: per-upstream cache so the racing slow path serves from cache (was 0 — only the fast path cached)
-            dnssec,
-        )?;
-        result.push((addr_str.clone(), Arc::new(single)));
-    }
-    Ok(result)
+    _addrs: &[(String, u16, bool, Option<String>)],
+    _dnssec: bool,
+) -> anyhow::Result<Vec<(String, ())>> {
+    Ok(Vec::new())
 }
 
-/// Create an empty SharedResolversVec — populated when upstream-racing is enabled.
+/// Create an empty SharedResolversVec â racing is now inside ForwardPool, this is a stub.
 pub fn create_shared_resolvers_vec() -> SharedResolversVec {
-    Arc::new(ArcSwap::new(Arc::new(Vec::new())))
+    Arc::new(ArcSwap::from_pointee(Vec::new()))
 }
 
-/// Create a SharedResolver from config at startup. Call once in build_and_launch.
+/// Create a SharedResolver (ForwardPool) from config at startup.
 pub fn create_shared_resolver(cfg: &UnboundConfig) -> anyhow::Result<SharedResolver> {
-    let size = cache_size_from_meminfo();
-    let resolver = build_resolver(cfg, size, cfg.dnssec_validation)?;
-    Ok(Arc::new(ArcSwap::new(Arc::new(resolver))))
+    let pool = forward_pool::create_shared_pool(cfg);
+    Ok(pool)
 }
 
 /// Derive a TLS SNI hostname for a DoT upstream.
@@ -2248,6 +1956,7 @@ pub fn create_shared_resolver(cfg: &UnboundConfig) -> anyhow::Result<SharedResol
 /// (produces a DnsName from the IP literal, which will fail TLS validation on
 /// servers that only advertise their DNS name as a SAN — the correct behaviour
 /// is to set `tls_hostname` explicitly for such servers).
+#[allow(dead_code)]
 pub fn dot_tls_name(ip: &IpAddr, explicit: Option<&str>) -> Arc<str> {
     if let Some(h) = explicit {
         return Arc::from(h);
@@ -2266,82 +1975,44 @@ pub fn dot_tls_name(ip: &IpAddr, explicit: Option<&str>) -> Arc<str> {
     }
 }
 
-/// Try to establish at least one live TCP/TLS connection in `resolver`.
-/// Hickory opens connections lazily, so we must probe BEFORE making the
-/// resolver visible via ArcSwap — otherwise the first real query races
-/// against connection setup and gets `NetError::NoConnections`.
-///
-/// Retries up to 3 times with 250 ms delay on `NoConnections`; treats
-/// every other outcome (including DNS errors) as "connection established".
-/// Returns `true` when the pool is confirmed live, `false` after 3 failures.
-async fn warm_up(resolver: &TokioResolver) -> bool {
-    let probe = Name::from_str("example.com.").unwrap_or_else(|_| unreachable!("static DNS name"));
-    for _ in 0..3u8 {
-        match resolver.lookup(probe.clone(), RecordType::A).await {
-            Ok(_) => return true,
-            Err(ref e) if matches!(e, NetError::NoConnections) => {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Err(_) => return true, // connected but query failed (NXDOMAIN etc.) — pool is live
-        }
-    }
-    false
+/// Keepalive probe for the ForwardPool (replaces the old hickory warm_up).
+async fn warm_up(pool: &ForwardPool) -> bool {
+    pool.keepalive().await;
+    true
 }
-
-/// Rebuild the resolver from an explicit list of (addr_string, port, use_tls, tls_hostname) tuples
-/// and atomically swap it in. Used by POST /api/cache/flush and upstreams CRUD.
-///
-/// Calls `warm_up()` on the new resolver **before** the ArcSwap::store so that
-/// TCP/TLS connections are established before any query can reach it (#77).
-/// Returns `Ok(true)` when warm-up succeeded, `Ok(false)` when it timed out
-/// (3 × 250 ms with no response) — the resolver is still stored in both cases.
+/// Rebuild the ForwardPool from an explicit upstream list and atomically swap it in.
+/// Replaces the old hickory-based rebuild_and_swap. Signature kept for API compat.
 pub async fn rebuild_and_swap(
     shared: &SharedResolver,
     addrs: &[(String, u16, bool, Option<String>)],
-    dnssec: bool,
+    _dnssec: bool,
 ) -> anyhow::Result<bool> {
-    let size = cache_size_from_meminfo();
-    let new_res = build_resolver_from_addrs(addrs, size, dnssec)?;
-    let warmed = warm_up(&new_res).await;
-    shared.store(Arc::new(new_res));
-    Ok(warmed)
+    forward_pool::rebuild_pool(shared, addrs).await;
+    // Keepalive probe so DoT connections are established before the pool goes live.
+    let pool_snap = shared.load();
+    warm_up(&pool_snap).await;
+    Ok(true)
 }
 
-/// Level 1 (#77): proactively warm up DoT TCP connections at startup.
-/// Sends `dot_count` parallel probe queries so the pool has live connections
-/// before the first real query arrives.
-pub async fn warm_up_dot_connections(resolver: &SharedResolver, dot_count: usize) {
+/// Proactively warm up DoT connections at startup via ForwardPool::keepalive().
+pub async fn warm_up_dot_connections(pool: &SharedResolver, dot_count: usize) {
     if dot_count == 0 {
         return;
     }
-    let probe = Name::from_str("example.com.").unwrap_or_else(|_| unreachable!("static DNS name"));
-    let mut joins = Vec::with_capacity(dot_count);
-    for _ in 0..dot_count {
-        let res = Arc::clone(resolver);
-        let name = probe.clone();
-        joins.push(tokio::spawn(async move {
-            let _ = res.load().lookup(name, RecordType::A).await;
-        }));
-    }
-    for j in joins {
-        let _ = j.await;
-    }
+    pool.load().keepalive().await;
     info!(connections = dot_count, "DoT pool warmed up");
 }
 
-/// Level 3 (#77): periodic keepalive to prevent idle DoT TCP connections from being
-/// closed by the peer.  Fires every 90 s; sends one probe query per DoT upstream.
-/// Rebuilds the resolver transparently if the pool is exhausted.
+/// Periodic keepalive for DoT connections inside ForwardPool. Fires every 90 s.
 pub async fn dot_keepalive_loop(
-    resolver: SharedResolver,
+    pool: SharedResolver,
     upstreams: crate::upstreams::SharedUpstreams,
     stats: Arc<crate::stats::Stats>,
-    dnssec: bool,
+    _dnssec: bool,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(90));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await; // skip the immediate first tick
-    let probe = Name::from_str("example.com.").unwrap_or_else(|_| unreachable!("static DNS name"));
     loop {
         interval.tick().await;
         let dot_count = upstreams
@@ -2351,174 +2022,15 @@ pub async fn dot_keepalive_loop(
         if dot_count == 0 {
             continue;
         }
-        let mut joins = Vec::with_capacity(dot_count);
-        for _ in 0..dot_count {
-            let res = Arc::clone(&resolver);
-            let name = probe.clone();
-            joins.push(tokio::spawn(async move {
-                res.load().lookup(name, RecordType::A).await
-            }));
-        }
-        let mut any_exhausted = false;
-        for j in joins {
-            if let Ok(Err(ref e)) = j.await {
-                if is_pool_exhausted(e) {
-                    any_exhausted = true;
-                }
-            }
-        }
-        if any_exhausted {
-            let addrs = crate::upstreams::upstream_addrs(&upstreams);
-            match rebuild_and_swap(&resolver, &addrs, dnssec).await {
-                Ok(warmed) => {
-                    stats.record_dot_reconnect();
-                    info!(warmed, "DoT keepalive: pool rebuilt after connection loss");
-                }
-                Err(e) => warn!(err=%e, "DoT keepalive: resolver rebuild failed"),
-            }
-        } else {
-            debug!(
-                connections = dot_count,
-                "DoT keepalive: connections refreshed"
-            );
-        }
+        pool.load().keepalive().await;
+        stats.record_dot_reconnect();
+        debug!(connections = dot_count, "DoT keepalive: connections refreshed");
     }
 }
 
-/// Build resolver from an explicit (addr, port, use_tls, tls_hostname) list — used for runtime rebuilds.
-pub fn build_resolver_from_addrs(
-    addrs: &[(String, u16, bool, Option<String>)],
-    cache_size: usize,
-    dnssec: bool,
-) -> anyhow::Result<TokioResolver> {
-    let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
 
-    for (addr_str, port, use_tls, tls_hostname) in addrs {
-        if let Ok(ip) = addr_str.parse::<IpAddr>() {
-            if *use_tls {
-                let tls_name = dot_tls_name(&ip, tls_hostname.as_deref());
-                let mut cc = ConnectionConfig::tls(tls_name);
-                cc.port = *port;
-                resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc]));
-            } else {
-                let mut cc_udp = ConnectionConfig::udp();
-                cc_udp.port = *port;
-                let mut cc_tcp = ConnectionConfig::tcp();
-                cc_tcp.port = *port;
-                resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc_udp, cc_tcp]));
-            }
-        }
-    }
-
-    if resolver_cfg.name_servers().is_empty() {
-        for ip_str in ["1.1.1.1", "1.0.0.1"] {
-            let ip: IpAddr = ip_str
-                .parse()
-                .unwrap_or_else(|_| unreachable!("hardcoded Cloudflare IP is valid"));
-            resolver_cfg.add_name_server(NameServerConfig::new(
-                ip,
-                true,
-                vec![ConnectionConfig::udp(), ConnectionConfig::tcp()],
-            ));
-        }
-    }
-
-    let mut opts = ResolverOpts::default();
-    opts.recursion_desired = true;
-    opts.cache_size = cache_size as u64;
-    opts.timeout = Duration::from_secs(3);
-    opts.attempts = 2;
-    opts.validate = dnssec;
-    opts.use_hosts_file = ResolveHosts::Never;
-
-    TokioResolver::builder_with_config(resolver_cfg, TokioRuntimeProvider::default())
-        .with_options(opts)
-        .build()
-        .map_err(|e| anyhow::anyhow!("resolver build: {e}"))
-}
-
-/// Build resolver from forward-zones in unbound.conf, fallback to system resolvers.
-fn build_resolver(cfg: &UnboundConfig, cache_size: usize, dnssec: bool) -> anyhow::Result<TokioResolver> {
-    let mut resolver_cfg = ResolverConfig::from_parts(None, vec![], vec![]);
-
-    for fwd in &cfg.forward_zones {
-        for addr_str in &fwd.addrs {
-            // Supports Unbound addr@port syntax: "1.1.1.1@853"
-            let default_port = if fwd.tls { 853u16 } else { 53u16 };
-            let (ip_str, port) = if let Some(at) = addr_str.find('@') {
-                let p: u16 = addr_str[at + 1..].parse().unwrap_or(default_port);
-                (&addr_str[..at], p)
-            } else {
-                (addr_str.as_str(), default_port)
-            };
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                if fwd.tls {
-                    // DNS-over-TLS: encrypted channel, single TCP connection per server.
-                    // dot_tls_name derives the correct SNI hostname for well-known resolvers.
-                    // forward-tls-hostname overrides the built-in map for custom DoT servers.
-                    let tls_name = dot_tls_name(&ip, fwd.tls_hostname.as_deref());
-                    let mut cc = ConnectionConfig::tls(tls_name);
-                    cc.port = port;
-                    resolver_cfg.add_name_server(NameServerConfig::new(ip, true, vec![cc]));
-                } else {
-                    // UDP for normal queries (fast path)
-                    let mut cc_udp = ConnectionConfig::udp();
-                    cc_udp.port = port;
-                    // TCP mandatory for DNSSEC: DNSKEY RRsets exceed UDP MTU and
-                    // arrive truncated (TC=1). Without TCP, the DNSSEC chain cannot
-                    // be completed and every signed domain returns SERVFAIL.
-                    let mut cc_tcp = ConnectionConfig::tcp();
-                    cc_tcp.port = port;
-                    resolver_cfg.add_name_server(NameServerConfig::new(
-                        ip,
-                        true,
-                        vec![cc_udp, cc_tcp],
-                    ));
-                }
-            }
-        }
-    }
-
-    // No forward-zone configured — fall back to Cloudflare.
-    // WARNING: This sends all DNS queries to a third-party cloud resolver.
-    // For privacy-sensitive or high-threat deployments, configure explicit forward-zone
-    // blocks with trusted upstream resolvers. This fallback should never trigger
-    // in production; it exists only to make Runbound usable out of the box.
-    if resolver_cfg.name_servers().is_empty() {
-        warn!(
-            "No forward-zone configured — falling back to Cloudflare (1.1.1.1). \
-             All DNS queries will be sent to a third-party resolver. \
-             Add forward-zone blocks to runbound.conf to suppress this warning."
-        );
-        for ip_str in ["1.1.1.1", "1.0.0.1"] {
-            let ip: IpAddr = ip_str
-                .parse()
-                .unwrap_or_else(|_| unreachable!("hardcoded Cloudflare IP is valid"));
-            resolver_cfg.add_name_server(NameServerConfig::new(
-                ip,
-                true,
-                vec![ConnectionConfig::udp(), ConnectionConfig::tcp()],
-            ));
-        }
-    }
-
-    let mut opts = ResolverOpts::default();
-    opts.recursion_desired = true;
-    opts.cache_size = cache_size as u64;
-    opts.timeout = Duration::from_secs(3); // hard timeout per upstream query
-    opts.attempts = 2; // retry once before SERVFAIL
-                       // DNSSEC: controlled by `dnssec-validation` directive (default: off for forwarders).
-                       // Enable only when operating as a full recursive resolver with complete RRSIG chains.
-                       // Forwarders must leave this off: upstreams strip RRSIGs before forwarding,
-                       // causing spurious SERVFAIL for every signed domain (gmail.com, google.com…).
-    opts.validate = dnssec;
-    opts.use_hosts_file = ResolveHosts::Never; // don't leak host file data
-
-    TokioResolver::builder_with_config(resolver_cfg, TokioRuntimeProvider::default())
-        .with_options(opts)
-        .build()
-        .map_err(|e| anyhow::anyhow!("resolver build: {e}"))
-}
+// build_resolver_from_addrs removed â replaced by forward_pool::rebuild_pool().
+// build_resolver removed â replaced by forward_pool::create_shared_pool().
 
 // ============================================================
 // Memory pressure guard
@@ -2527,11 +2039,8 @@ fn build_resolver(cfg: &UnboundConfig, cache_size: usize, dnssec: bool) -> anyho
 // Check memory every 30 s. On Linux /proc/meminfo is a cheap kernel read.
 const MEM_CHECK_SECS: u64 = 30;
 // Scale-up cooldown: do not increase cache more often than every 5 minutes.
-const MEM_SCALEUP_COOLDOWN: u64 = 300;
 // Halving cooldown: do not halve more often than once every 5 minutes.
-const CACHE_HALVE_COOLDOWN: Duration = Duration::from_secs(300);
 // Memory pressure thresholds (used ratio = 1 - MemAvailable/MemTotal):
-const MEM_LOW_WATERMARK: f64 = 0.60; // below → scale up if cache was reduced
 const MEM_MOD_WATERMARK: f64 = 0.70; // [0.70, 0.80) → halve cache
 const MEM_HIGH_WATERMARK: f64 = 0.80; // ≥ 0.80 → recalc + flush rate limiter
 
@@ -2656,37 +2165,25 @@ fn read_meminfo() -> Option<(u64, u64)> {
 ///
 /// Cache changes take effect by rebuilding the hickory resolver and atomically
 /// swapping it via ArcSwap. In-flight queries keep their Arc until completion.
+/// Background task: monitors system memory and adjusts rate limiter under pressure.
+/// The DNS cache now lives in ForwardPool (no hickory resolver cache to resize);
+/// we keep the memory watermark logic to flush the rate limiter under high pressure.
 pub async fn memory_guard_loop(
     rate_limiter: Arc<RateLimiter>,
-    resolver: Arc<ArcSwap<TokioResolver>>,
+    pool: Arc<ArcSwap<ForwardPool>>,
     cfg: Arc<UnboundConfig>,
     stats: Arc<Stats>,
     initial_cache_size: usize,
     upstreams: crate::upstreams::SharedUpstreams,
-    dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
+    _dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let _ = initial_cache_size; // ForwardPool has no resolver cache to resize
     let mut interval = tokio::time::interval(Duration::from_secs(MEM_CHECK_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let mut current_cache_size = initial_cache_size;
-    let mut last_scale_up = Instant::now()
-        .checked_sub(Duration::from_secs(MEM_SCALEUP_COOLDOWN))
-        .unwrap_or_else(Instant::now);
-
-    // Halving guards
-    let mut last_halved: Instant = Instant::now()
-        .checked_sub(CACHE_HALVE_COOLDOWN)
-        .unwrap_or_else(Instant::now);
-    // used_ratio captured just before the last halving; cleared after one check cycle.
-    let mut pct_before_last_halve: Option<f64> = None;
-    // Set permanently when halving is proven to have no measurable effect on RSS.
-    let mut halving_disabled = false;
 
     loop {
         interval.tick().await;
 
-        // spawn_blocking: read_meminfo calls std::fs::read_to_string("/proc/meminfo")
-        // which is blocking I/O — must not run on the async thread pool.
         let Some((avail_kb, total_kb)) = tokio::task::spawn_blocking(read_meminfo)
             .await
             .ok()
@@ -2696,131 +2193,26 @@ pub async fn memory_guard_loop(
         };
         let used_ratio = 1.0 - (avail_kb as f64 / total_kb as f64);
 
-        // No-effect detection: check whether the previous halving reduced pressure.
-        if let Some(pct_before) = pct_before_last_halve.take() {
-            if used_ratio >= pct_before - 0.05 {
-                halving_disabled = true;
-                warn!(
-                    pct_before = format!("{:.1}%", pct_before * 100.0),
-                    pct_after = format!("{:.1}%", used_ratio * 100.0),
-                    "cache halving has no effect on memory pressure \
-                     (pct before={:.1}% after={:.1}%) — cache floor reached, \
-                     consider increasing MemoryMax in the service file or reducing other workloads",
-                    pct_before * 100.0,
-                    used_ratio * 100.0,
-                );
-            }
-        }
-
         if used_ratio >= MEM_HIGH_WATERMARK {
-            // High pressure — recalc from current RAM state, flush rate limiter.
-            let new_size = cache_size_from_meminfo();
-            {
-                let _mg_addrs = crate::upstreams::upstream_addrs(&upstreams);
-                let _mg_built = if _mg_addrs.is_empty() {
-                    build_resolver(&cfg, new_size, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
-                } else {
-                    build_resolver_from_addrs(&_mg_addrs, new_size, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
-                };
-                match _mg_built {
-                    Ok(new_res) => {
-                        let _ = warm_up(&new_res).await;
-                        resolver.store(Arc::new(new_res));
-                        stats.reset_cache();
-                        let freed = rate_limiter.clear();
-                        warn!(
-                            used_pct = format!("{:.1}%", used_ratio * 100.0),
-                            cache_from = current_cache_size,
-                            cache_to = new_size,
-                            freed_buckets = freed,
-                            "memory pressure high — cache flushed, resized, rate limiter cleared"
-                        );
-                        current_cache_size = new_size;
-                    }
-                    Err(e) => warn!(%e, "memory guard: resolver rebuild failed (high pressure)"),
-                }
-            }
+            // High pressure: rebuild pool (may help with DoT connection churn) + flush rate limiter.
+            let addrs = crate::upstreams::upstream_addrs(&upstreams);
+            let _ = rebuild_and_swap(&pool, &addrs, false).await;
+            stats.reset_cache();
+            let freed = rate_limiter.clear();
+            warn!(
+                used_pct = format!("{:.1}%", used_ratio * 100.0),
+                freed_buckets = freed,
+                "memory pressure high: pool rebuilt, rate limiter cleared"
+            );
         } else if used_ratio >= MEM_MOD_WATERMARK {
-            // Moderate pressure — halve cache, floor at cache_min_entries.
+            // Moderate pressure: nothing to halve in ForwardPool, just log.
             let min = cfg.cache_min_entries;
-            if halving_disabled {
-                // no-op: halving proven ineffective, avoid log spam
-            } else if current_cache_size <= min {
-                warn!(
-                    cache_size = current_cache_size,
-                    cache_min = min,
-                    used_pct = format!("{:.1}%", used_ratio * 100.0),
-                    "cache at minimum size ({}) — memory pressure ignored",
-                    min,
-                );
-            } else if last_halved.elapsed() < CACHE_HALVE_COOLDOWN {
-                // cooldown active — skip this cycle silently
-            } else {
-                let new_size = (current_cache_size / 2).max(min);
-                {
-                    let _mg_addrs = crate::upstreams::upstream_addrs(&upstreams);
-                    let _mg_built = if _mg_addrs.is_empty() {
-                        build_resolver(&cfg, new_size, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
-                    } else {
-                        build_resolver_from_addrs(&_mg_addrs, new_size, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
-                    };
-                    match _mg_built {
-                        Ok(new_res) => {
-                            let _ = warm_up(&new_res).await;
-                            resolver.store(Arc::new(new_res));
-                            stats.reset_cache();
-                            warn!(
-                                used_pct = format!("{:.1}%", used_ratio * 100.0),
-                                cache_from = current_cache_size,
-                                cache_to = new_size,
-                                "memory pressure — cache halved"
-                            );
-                            current_cache_size = new_size;
-                            last_halved = Instant::now();
-                            pct_before_last_halve = Some(used_ratio);
-                        }
-                        Err(e) => {
-                            warn!(%e, "memory guard: resolver rebuild failed (moderate pressure)")
-                        }
-                    }
-                }
-            }
-        } else if used_ratio < MEM_LOW_WATERMARK {
-            // Memory freed — scale up toward optimal if cooldown elapsed.
-            let optimal = cache_size_from_meminfo();
-            let elapsed = last_scale_up.elapsed();
-            if optimal > current_cache_size && elapsed >= Duration::from_secs(MEM_SCALEUP_COOLDOWN)
-            {
-                {
-                    let _mg_addrs = crate::upstreams::upstream_addrs(&upstreams);
-                    let _mg_built = if _mg_addrs.is_empty() {
-                        build_resolver(&cfg, optimal, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
-                    } else {
-                        build_resolver_from_addrs(&_mg_addrs, optimal, dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed))
-                    };
-                    match _mg_built {
-                        Ok(new_res) => {
-                            let _ = warm_up(&new_res).await;
-                            resolver.store(Arc::new(new_res));
-                            stats.reset_cache();
-                            info!(
-                                used_pct = format!("{:.1}%", used_ratio * 100.0),
-                                cache_from = current_cache_size,
-                                cache_to = optimal,
-                                "memory pressure resolved — cache scaled up"
-                            );
-                            current_cache_size = optimal;
-                            last_scale_up = Instant::now();
-                        }
-                        Err(e) => warn!(%e, "memory guard: resolver rebuild failed (scale up)"),
-                    }
-                }
-            }
+            let _ = min;
+            debug!(used_pct = format!("{:.1}%", used_ratio * 100.0), "memory moderate pressure");
         }
-        // 60–70 %: stable band — no action.
+        // Low/stable band: no action.
     }
 }
-
 // ============================================================
 // TLS helpers
 // ============================================================
@@ -3149,26 +2541,8 @@ async fn read_proxy_v2(stream: &mut TcpStream) -> Option<std::net::IpAddr> {
 pub static TLS_APPLY_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<()>> =
     std::sync::OnceLock::new();
 
-/// Thin wrapper letting `Arc<RunboundHandler>` be handed to a hickory `Server`
-/// for the encrypted-DNS ServerFuture (shares the main request handler).
-struct TlsArcHandler(std::sync::Arc<RunboundHandler>);
-#[async_trait::async_trait]
-impl hickory_server::server::RequestHandler for TlsArcHandler {
-    async fn handle_request<
-        R: hickory_server::server::ResponseHandler,
-        T: hickory_server::net::runtime::Time,
-    >(
-        &self,
-        request: &hickory_server::server::Request,
-        response_handle: R,
-    ) -> hickory_server::server::ResponseInfo {
-        self.0.handle_request::<R, T>(request, response_handle).await
-    }
-}
 
-/// Bring up the DoT/DoH/DoQ listeners on their own hickory ServerFuture plus the
-/// public relay tasks, sharing `handler`. Returns the JoinHandles so the caller
-/// can abort them for a hot teardown. Empty when TLS is not configured.
+
 async fn spawn_tls_service(
     handler: std::sync::Arc<RunboundHandler>,
     tls_cfg: &TlsConfig,
@@ -3214,7 +2588,7 @@ async fn spawn_tls_service(
             return handles;
         }
     };
-    let doq_config = match build_tls_config(certs, key, b"doq", true, None) {
+    let _doq_config = match build_tls_config(certs, key, b"doq", true, None) {
         Ok(c) => c,
         Err(e) => {
             warn!(err=%e, "DoQ TLS config failed — encrypted DNS not started");
@@ -3226,7 +2600,8 @@ async fn spawn_tls_service(
     // shared handler before `handler` is moved into the hickory server below.
     let doh_handler = std::sync::Arc::clone(&handler);
     let alert = handler.alert_tracker();
-    let mut server = Server::new(TlsArcHandler(handler));
+    let handler_dot_sup = std::sync::Arc::clone(&handler);
+    drop(handler); // consumed; DoT now uses handler_dot_sup clone
     for iface in interfaces {
         // DNS-over-TLS (853 TCP) — public listener relays to a loopback hickory listener.
         let dot_addr = format!("{}:{}", iface, dot_port);
@@ -3235,14 +2610,42 @@ async fn spawn_tls_service(
                 Ok(relay_dot) => {
                     if let Ok(relay_dot_addr) = relay_dot.local_addr() {
                         info!(addr=%dot_addr, mtls=tls_cfg.dot_client_auth_ca.is_some(), "DoT (DNS-over-TLS) listening — RFC 7858");
-                        if let Err(e) = server.register_tls_listener_with_tls_config(
-                            relay_dot,
-                            TLS_SESSION_TIMEOUT,
-                            std::sync::Arc::clone(&dot_config),
-                        ) {
-                            warn!(err=%e, "DoT register failed");
-                        } else {
-                            handles.push(tokio::spawn(run_tcp_with_limit(
+                        // Own DoT relay: TLS-terminated own listener calling handle_request_wire.
+                        let h_dot = std::sync::Arc::clone(&handler_dot_sup);
+                        let dc = std::sync::Arc::clone(&dot_config);
+                        handles.push(tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let acceptor = tokio_rustls::TlsAcceptor::from(dc);
+                            loop {
+                                let (tcp, peer) = match relay_dot.accept().await {
+                                    Ok(x) => x,
+                                    Err(e) => { debug!(err=%e, "DoT relay accept"); continue; }
+                                };
+                                let acceptor = acceptor.clone();
+                                let hh = std::sync::Arc::clone(&h_dot);
+                                tokio::spawn(async move {
+                                    let mut tls = match acceptor.accept(tcp).await {
+                                        Ok(s) => s,
+                                        Err(e) => { debug!(err=%e, "DoT TLS handshake"); return; }
+                                    };
+                                    let _ = tls.get_ref().0.set_nodelay(true);
+                                    let mut len_buf = [0u8; 2];
+                                    loop {
+                                        if tokio::time::timeout(TLS_SESSION_TIMEOUT, tls.read_exact(&mut len_buf)).await.is_err() { return; }
+                                        let msg_len = u16::from_be_bytes(len_buf) as usize;
+                                        if msg_len == 0 || msg_len > 65535 { return; }
+                                        let mut buf = vec![0u8; msg_len];
+                                        if tokio::time::timeout(TLS_SESSION_TIMEOUT, tls.read_exact(&mut buf)).await.is_err() { return; }
+                                        let resp = hh.handle_request_wire(&buf, peer).await;
+                                        if resp.is_empty() { continue; }
+                                        let rlen = (resp.len() as u16).to_be_bytes();
+                                        if tls.write_all(&rlen).await.is_err() { return; }
+                                        if tls.write_all(&resp).await.is_err() { return; }
+                                    }
+                                });
+                            }
+                        }));
+                        handles.push(tokio::spawn(run_tcp_with_limit(
                                 public_dot,
                                 relay_dot_addr,
                                 std::sync::Arc::clone(tcp_tracker),
@@ -3251,7 +2654,6 @@ async fn spawn_tls_service(
                                 proxy_protocol,
                                 alert.clone(),
                             )));
-                        }
                     }
                 }
                 Err(e) => warn!(addr=%dot_addr, err=%e, "DoT relay bind failed — skipping"),
@@ -3292,30 +2694,11 @@ async fn spawn_tls_service(
             Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
         }
 
-        // DNS-over-QUIC (853 UDP)
-        let doq_addr = format!("{}:{}", iface, doq_port);
-        match UdpSocket::bind(&doq_addr).await {
-            Ok(udp) => {
-                info!(addr=%doq_addr, "DoQ (DNS-over-QUIC) listening — RFC 9250");
-                if let Err(e) = server.register_quic_listener_and_tls_config(
-                    udp,
-                    TLS_SESSION_TIMEOUT,
-                    std::sync::Arc::clone(&doq_config),
-                ) {
-                    warn!(err=%e, "DoQ register failed");
-                }
-            }
-            Err(e) => warn!(addr=%doq_addr, err=%e, "DoQ bind failed — skipping"),
-        }
+        // DNS-over-QUIC: not supported in this build (requires --features doq).
+        let _ = doq_port; // suppress unused warning
     }
 
-    // Run the encrypted-DNS ServerFuture in its own task; aborting this handle
-    // drops the server and releases its loopback + DoQ sockets.
-    handles.push(tokio::spawn(async move {
-        if let Err(e) = server.block_until_done().await {
-            warn!(err=%e, "encrypted-DNS ServerFuture exited");
-        }
-    }));
+    // All DoT/DoH listeners are already spawned as tasks in handles above.
     handles
 }
 
@@ -3328,6 +2711,7 @@ async fn spawn_tls_service(
 // (application/dns-message), resolves through the shared RunboundHandler, and
 // returns application/dns-message. TLS + HTTP/2 terminate here, behind the same
 // public relay that enforces the source-IP ACL / per-IP conn cap / PROXY protocol.
+
 
 /// Captures the wire response produced by the DNS handler into `out`.
 #[derive(Clone)]
@@ -3756,7 +3140,6 @@ pub async fn run_dns_server(
         stats,
         log_buffer,
         Arc::clone(&dnssec_enabled),
-        cfg.dnssec_log_bogus,
         zone_signer,
         prefetch_tracker,
         xdp_cache,
@@ -3788,7 +3171,7 @@ pub async fn run_dns_server(
             live
         },
         Arc::clone(&resolution_mode),
-        Arc::clone(&recursor),
+        recursor.clone(),
         cfg.dns_cookies,
         cfg.rrl_slip,
         if cfg.ddr {
@@ -3806,27 +3189,8 @@ pub async fn run_dns_server(
     let handler_arc = std::sync::Arc::new(handler);
     let handler_arc2 = std::sync::Arc::clone(&handler_arc);
 
-    let mut server = Server::new({
-        // Server takes ownership. We implement RequestHandler for Arc<RunboundHandler>
-        // by delegating. Since we cannot implement foreign trait on foreign type,
-        // we pass handler_arc2 directly but Server needs T: RequestHandler + 'static.
-        // The cleanest approach: implement RequestHandler for Arc<RunboundHandler>.
-        // RunboundHandler: RequestHandler already, Arc<T>: RequestHandler via deref.
-        // hickory_server does not blanket impl RequestHandler for Arc<T>.
-        // → Use a thin wrapper struct.
-        struct ArcHandler(std::sync::Arc<RunboundHandler>);
-        #[async_trait::async_trait]
-        impl hickory_server::server::RequestHandler for ArcHandler {
-            async fn handle_request<R: hickory_server::server::ResponseHandler, T: hickory_server::net::runtime::Time>(
-                &self,
-                request: &hickory_server::server::Request,
-                response_handle: R,
-            ) -> hickory_server::server::ResponseInfo {
-                self.0.handle_request::<R, T>(request, response_handle).await
-            }
-        }
-        ArcHandler(std::sync::Arc::clone(&handler_arc2))
-    });
+    // handler_arc2 is used by the fallback reader; TLS supervisor uses handler_arc.
+    // No hickory Server needed — all listeners use handle_request_wire().
 
     let _port = cfg.port;
     let interfaces: Vec<String> = if cfg.interfaces.is_empty() {
@@ -4117,53 +3481,6 @@ pub async fn run_dns_server(
 
 
     // ── Step 3b: real hickory fallback reader ────────────────────────────────
-    // UdpResponseHandler: implements hickory ResponseHandler for UDP.
-    // Uses BufDnsStreamHandle channel internally, then drains it synchronously
-    // to send via the bound std::net::UdpSocket.
-    {
-        /// Wraps a bound UDP socket + peer addr; implements hickory ResponseHandler.
-        /// send_response encodes the reply into wire bytes and sends via sendto.
-        #[derive(Clone)]
-        struct UdpResponseHandler {
-            socket: std::sync::Arc<std::net::UdpSocket>,
-            peer:   std::net::SocketAddr,
-        }
-
-        #[async_trait::async_trait]
-        impl ResponseHandler for UdpResponseHandler {
-            async fn send_response<'a>(
-                &mut self,
-                response: hickory_server::zone_handler::MessageResponse<
-                    '_,
-                    'a,
-                    impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
-                    impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
-                    impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
-                    impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
-                >,
-            ) -> Result<ResponseInfo, hickory_server::net::NetError> {
-                // Encode into wire bytes using the existing ResponseHandle pattern.
-                // We create a throwaway BufDnsStreamHandle, encode, then drain.
-                let (stream_handle, mut receiver) =
-                    BufDnsStreamHandle::new(self.peer);
-                let mut rh = ResponseHandle::new(self.peer, stream_handle, DnsProtocol::Udp);
-                let info = rh.send_response(response).await?;
-                // Drop rh (and its stream_handle/sender) BEFORE draining.
-                // Without this, the mpsc sender stays open → receiver.next().await
-                // blocks forever after the first message (deadlock on recursion).
-                // RFC: futures::channel::mpsc receiver yields None only when all
-                // senders are dropped; drop(rh) closes the last sender here.
-                drop(rh);
-                // Drain the channel — there should be exactly one SerialMessage.
-                use futures_util::StreamExt;
-                while let Some(serial_msg) = receiver.next().await {
-                    let (bytes, dst) = serial_msg.into_parts();
-                    let _ = self.socket.send_to(&bytes, dst);
-                }
-                Ok(info)
-            }
-        }
-
         // #179: reply via the per-message arrival socket (msg.socket), which is the
         // DRAINED socket the query came in on (kernel-loop: the worker's 8 MiB
         // SO_REUSEPORT socket; XDP: the #167 reply socket). A separate fb_sock bound
@@ -4185,31 +3502,14 @@ pub async fn run_dns_server(
                 let handler_c = std::sync::Arc::clone(&handler_fb);
                 let sock_c = std::sync::Arc::clone(&msg.socket);
                 tokio::spawn(async move {
-                    let _permit = permit; // released when this task ends
-                    let request = match Request::from_bytes(
-                        msg.query.to_vec(),
-                        msg.peer,
-                        DnsProtocol::Udp,
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::debug!("fallback: could not decode request: {e}");
-                            return;
-                        }
-                    };
-                    let resp_handler = UdpResponseHandler {
-                        socket: sock_c,
-                        peer:   msg.peer,
-                    };
-                    // Full hickory handler — recursion, TSIG, AXFR, CNAME, EDNS DO=1...
-                    handler_c.handle_request::<UdpResponseHandler, hickory_server::net::runtime::TokioTime>(
-                        &request,
-                        resp_handler,
-                    ).await;
+                    let _permit = permit;
+                    let resp = handler_c.handle_request_wire(&msg.query, msg.peer).await;
+                    if !resp.is_empty() {
+                        let _ = sock_c.send_to(&resp, msg.peer);
+                    }
                 });
             }
         });
-    }
 
     // Step 3b: hickory no longer has UDP sockets — fast loop covers all cores.
     // Hickory handles recursion/TSIG/AXFR via the fallback channel only.
@@ -4242,10 +3542,37 @@ pub async fn run_dns_server(
             .local_addr()
             .map_err(|e| anyhow::anyhow!("TCP relay local_addr: {e}"))?;
         info!(addr=%tcp_addr, "DNS TCP listening (per-IP cap: {} conns)", TCP_CONN_PER_IP_MAX);
-        // 30s idle timeout — enough for slow DNSSEC responses while limiting FD exhaustion.
-        // 4096-byte response buffer fits any DNS response (max UDP payload is 65535 bytes but
-        // typical responses are well under 4 KiB; EDNS0 handles larger).
-        server.register_listener(relay_tcp, TCP_SESSION_TIMEOUT, 4096);
+        // Own TCP relay listener: reads 2-byte-length-prefixed DNS messages (RFC 1035),
+        // dispatches through handle_request_wire, writes the wire response back.
+        {
+            let h = std::sync::Arc::clone(&handler_arc);
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                loop {
+                    let (mut stream, peer) = match relay_tcp.accept().await {
+                        Ok(x) => x,
+                        Err(e) => { debug!(err=%e, "TCP relay accept"); continue; }
+                    };
+                    let hh = std::sync::Arc::clone(&h);
+                    tokio::spawn(async move {
+                        let _ = stream.set_nodelay(true);
+                        let mut len_buf = [0u8; 2];
+                        loop {
+                            if tokio::time::timeout(TCP_SESSION_TIMEOUT, stream.read_exact(&mut len_buf)).await.is_err() { return; }
+                            let msg_len = u16::from_be_bytes(len_buf) as usize;
+                            if msg_len == 0 || msg_len > 65535 { return; }
+                            let mut buf = vec![0u8; msg_len];
+                            if tokio::time::timeout(TCP_SESSION_TIMEOUT, stream.read_exact(&mut buf)).await.is_err() { return; }
+                            let resp = hh.handle_request_wire(&buf, peer).await;
+                            if resp.is_empty() { continue; }
+                            let rlen = (resp.len() as u16).to_be_bytes();
+                            if stream.write_all(&rlen).await.is_err() { return; }
+                            if stream.write_all(&resp).await.is_err() { return; }
+                        }
+                    });
+                }
+            });
+        }
 
         let tracker2 = Arc::clone(&tcp_tracker);
         tokio::spawn(run_tcp_with_limit(
@@ -4276,10 +3603,8 @@ pub async fn run_dns_server(
 
 
     info!("Runbound ready — RFC 1034/1035/2782/4033/6891/7858/8484/9250");
-    server
-        .block_until_done()
-        .await
-        .map_err(|e| anyhow::anyhow!("Server error: {e}"))
+    // All listeners are spawned as tokio tasks; block here until process exits.
+    std::future::pending::<anyhow::Result<()>>().await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
