@@ -381,25 +381,42 @@ impl SyncJournal {
             .unwrap_or_default()
             .as_secs();
         let ip = slave_ip(&addr);
-        let mut map = self
-            .connected_slaves
-            .lock()
-            .unwrap_or_else(|e| panic!("sync: slaves mutex poisoned: {e}"));
-        map.insert(
-            ip.clone(),
-            SlaveInfo {
-                node_id: None,
-                addr: ip,
-                relay_host: None,
-                cert_fingerprint: None,
-                last_seen_at: now,
-                last_seen_secs: 0,
-                status: String::new(),
-                last_seq: seq,
-                zones_synced: 0,
-                version: None,
-            },
-        );
+        {
+            let mut map = self
+                .connected_slaves
+                .lock()
+                .unwrap_or_else(|e| panic!("sync: slaves mutex poisoned: {e}"));
+            map.insert(
+                ip.clone(),
+                SlaveInfo {
+                    node_id: None,
+                    addr: ip.clone(),
+                    relay_host: None,
+                    cert_fingerprint: None,
+                    last_seen_at: now,
+                    last_seen_secs: 0,
+                    status: String::new(),
+                    last_seq: seq,
+                    zones_synced: 0,
+                    version: None,
+                },
+            );
+        }
+        // Refresh the matching registered node (node_id view) so GET /api/nodes — and
+        // the WebUI — reflect live sync activity, not just registration time. Without
+        // this the registered_nodes `last_seen_at` stayed frozen at registration, so a
+        // healthily-polling slave still showed "disconnected" after 30 s in /api/nodes
+        // even though /api/sync/slaves (fed by connected_slaves above) showed it
+        // connected. Locks are taken sequentially (connected_slaves dropped first) to
+        // avoid any cross-lock ordering hazard.
+        if let Ok(mut nodes) = self.registered_nodes.lock() {
+            for n in nodes.values_mut() {
+                if slave_ip(&n.addr) == ip {
+                    n.last_seen_at = now;
+                    n.last_seq = seq;
+                }
+            }
+        }
     }
 
     /// Return a snapshot of recently-seen slaves (last-seen ≤ 5 min ago).
@@ -2220,5 +2237,39 @@ mod sec_i14_hmac_body {
         assert!(hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &sig));
         // Second presentation of the SAME valid signature is a replay → rejected.
         assert!(!hmac_verify_with_ts(key, "POST", "/relay/dns", ts, body, &sig));
+    }
+}
+
+#[cfg(test)]
+mod node_status_reflects_sync {
+    use super::SyncJournal;
+
+    /// A delta-journal poll (record_slave, IP-keyed) must refresh the registered node
+    /// (node_id-keyed) so GET /api/nodes tracks live sync, not just registration time.
+    // tokio runtime needed: SyncJournal::new() spawns the slave-status watcher task.
+    #[tokio::test]
+    async fn poll_refreshes_registered_node() {
+        // register_node persists via save_nodes() → base_dir(); point it at a temp dir.
+        let _ = crate::runtime::BASE_DIR.set(std::env::temp_dir());
+        let j = SyncJournal::new();
+        j.register_node(
+            "node-1".into(),
+            "192.168.8.11".into(),
+            "192.168.8.11:8082".into(),
+            "fp".into(),
+            None,
+        );
+        // At registration the node carries last_seq 0.
+        let before = j.registered_slaves();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].last_seq, 0);
+
+        // A poll from the same IP (ephemeral source port) must bump the registered
+        // node's last_seq — without the fix only connected_slaves was updated.
+        j.record_slave("192.168.8.11:54321".into(), 7);
+        let after = j.registered_slaves();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].last_seq, 7, "registered node not refreshed by poll");
+        assert_eq!(after[0].status, "connected");
     }
 }
