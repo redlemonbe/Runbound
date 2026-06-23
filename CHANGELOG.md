@@ -7,6 +7,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-06-23
+
+### Fixed
+- **#165 reintroduced: resolver cache capped at ~10 000 entries regardless of RAM.** The cache
+  cap (`cache_max_entries`) was wired to `xdp-cache-snapshot-size` (default 10 000) at the
+  `run_dns_server` call site, while `cache-size` was parsed into the "accepted but unused" bucket
+  and the RAM-scaled `cache_size_from_meminfo()` value was computed, logged, then discarded. With
+  long cache TTLs (nothing to evict) the cache plateaued at 10 000 entries on any host — even with
+  512 GiB of RAM. Now `cache_max_entries` is the RAM-scaled ceiling (or an explicit `cache-size`
+  when set), fully decoupled from `xdp-cache-snapshot-size`; `cache-size` is honoured.
+- **XDP throughput collapse at high domain cardinality (regression introduced in 0.22.1).** The
+  per-hit top-domains attribution added in 0.22.1 (`domain_stats::inc_wire`) flushed the shared
+  top-domains map on the XDP cache hot path; at a large working set the shard-lock contention on
+  flush crushed throughput ~26× (≈11.1M → ≈0.42M pps at 100 K unique names; invisible at 8 K).
+  `inc_wire` now **samples 1/32 of hits and weights the count by 32** (statistically unbiased
+  top-N), so the hot path pays only a thread-local counter bump on the other 31/32. Throughput at
+  100 K recovers to the 8 K level. qtype attribution (256-slot thread-local array, no shared map)
+  is unchanged.
+
 ## [0.22.1] - 2026-06-23
 
 ### Fixed

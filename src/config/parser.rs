@@ -257,6 +257,11 @@ pub struct UnboundConfig {
     pub xdp_cache_snapshot: bool,
     /// Maximum entries in the XDP cache snapshot. Default: 10 000.
     pub xdp_cache_snapshot_size: usize,
+    /// Max resolver cache entries. `None` = auto-size from available RAM
+    /// (`cache_size_from_meminfo`). An explicit value overrides the auto-sizing.
+    /// (#165: this must NOT be tied to `xdp_cache_snapshot_size`, or the cache caps
+    /// at 10 000 entries regardless of host RAM.)
+    pub cache_size: Option<usize>,
     /// Route DNS queries by question name hash to a dedicated CPU via CPUMAP (#67).
     /// Improves XDP cache locality for repeated lookups of the same domain.
     /// Default: false. Falls back silently to RSS if CPUMAP is unavailable.
@@ -500,6 +505,7 @@ impl UnboundConfig {
             xdp_busy_poll: true,
             xdp_cache_snapshot: true,
             xdp_cache_snapshot_size: 10_000,
+            cache_size: None,
             cache_min_entries: 2048,
             prefetch: false,
             prefetch_threshold: 5,
@@ -1007,6 +1013,9 @@ fn parse_server_directive(
         "xdp-hugepages" => cfg.xdp_hugepages = val.trim_matches('"') != "no",
         "xdp-cache-snapshot" => cfg.xdp_cache_snapshot = val.trim_matches('"') != "no",
         "xdp-cache-snapshot-size" => cfg.xdp_cache_snapshot_size = val.parse().unwrap_or(10_000),
+        // #165: resolver cache cap. An explicit value overrides RAM auto-sizing; absent →
+        // sized from available memory. Must stay decoupled from xdp-cache-snapshot-size.
+        "cache-size" => cfg.cache_size = val.trim_matches('"').parse().ok(),
         "xdp-domain-routing" => cfg.xdp_domain_routing = val.trim_matches('"') == "yes",
         "xdp-busy-poll" => cfg.xdp_busy_poll = val.trim_matches('"') != "no",
         "xdp-ring-size" => {
@@ -1129,7 +1138,6 @@ fn parse_server_directive(
         }
         // Accepted but unused — common Unbound tuning directives
         "num-threads"
-        | "cache-size"
         | "msg-cache-size"
         | "rrset-cache-size"
         | "so-rcvbuf"
@@ -1433,6 +1441,18 @@ mod tests {
     fn xdp_interface_single() {
         let cfg = parse_str("server:\n  xdp-interface: nic3\n").unwrap();
         assert_eq!(cfg.xdp_interface.as_deref(), Some("nic3"));
+    }
+
+    #[test]
+    fn cache_size_parsed_not_ignored() {
+        // #165: cache-size must parse into cfg.cache_size (was silently "accepted but unused"),
+        // and must NOT be coupled to xdp-cache-snapshot-size.
+        let cfg = parse_str("server:\n  cache-size: 500000\n").unwrap();
+        assert_eq!(cfg.cache_size, Some(500_000), "got {:?}", cfg.cache_size);
+        assert_eq!(cfg.xdp_cache_snapshot_size, 10_000, "cache-size must not touch the snapshot size");
+        // Absent → None (auto-size from RAM at runtime).
+        let cfg2 = parse_str("server:\n  do-udp: yes\n").unwrap();
+        assert_eq!(cfg2.cache_size, None);
     }
 
     #[test]

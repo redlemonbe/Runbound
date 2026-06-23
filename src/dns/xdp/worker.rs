@@ -1666,6 +1666,11 @@ fn answer_from_cache(
             // qtype_stats and top-domains include XDP fast-path cache hits instead of only
             // the slow path. The hit itself is still counted by XDP_WORKER_PKTS in the
             // worker loop, so total/cache_hits are unaffected (no double-count).
+            // Per-hit observability, contention-free AND high-cardinality-safe (v0.22.2):
+            // qtype uses a 256-slot thread-local array (cheap, no shared map). Domain
+            // attribution is SAMPLED inside inc_wire — flushing the shared top-domains map
+            // every hit crushed XDP throughput ~26× at high domain cardinality in v0.22.1.
+            // The hit itself is counted by XDP_WORKER_PKTS in the worker loop.
             if let Some(st) = stats {
                 st.inc_qtype_tl(qtype);
             }

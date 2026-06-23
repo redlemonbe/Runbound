@@ -3586,6 +3586,16 @@ pub async fn run_dns_server(
         cache_size = initial_cache_size,
         "cache size auto-sized from MemAvailable"
     );
+    // #165: the resolver cache cap MUST scale with RAM (or honour an explicit cache-size),
+    // NOT the xdp-cache-snapshot-size that was mis-wired into this parameter — otherwise the
+    // cache plateaus at ~10 000 entries no matter how much memory the host has.
+    let _ = cache_max_entries; // deprecated source (was cfg.xdp_cache_snapshot_size)
+    let cache_max_entries = cfg.cache_size.filter(|&n| n > 0).unwrap_or(initial_cache_size);
+    info!(
+        cache_max_entries,
+        explicit = cfg.cache_size.is_some(),
+        "resolver cache cap (#165: RAM-scaled or explicit cache-size)"
+    );
 
     // Spawn memory pressure guard — monitors /proc/meminfo every 30 s and
     // adjusts the DNS cache size and flushes the rate limiter under pressure.

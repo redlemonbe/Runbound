@@ -37,7 +37,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "rate-limit" | "rate-limit-prefix-v4" | "rate-limit-prefix-v6"
                 | "abuse-tarpit-delay-ms" | "abuse-tarpit-max-conns"
                 | "api-key" | "api-port" | "api-socket"
-                | "cache-max-ttl" | "cache-min-ttl" | "cache-min-entries"
+                | "cache-max-ttl" | "cache-min-ttl" | "cache-min-entries" | "cache-size"
                 | "private-address"
                 | "dnssec-validation" | "dnssec-log-bogus" | "local-zone-dnssec" | "resolution"
                 | "log-retention" | "log-client-ip"
@@ -147,6 +147,7 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if let Some(v) = &cfg.api_key { o.push_str(&format!("    api-key: \"{}\"\n", escape_str(v))); }
     if let Some(v) = cfg.api_port { o.push_str(&format!("    api-port: {v}\n")); }
     if let Some(v) = &cfg.api_socket { o.push_str(&format!("    api-socket: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = cfg.cache_size { o.push_str(&format!("    cache-size: {v}\n")); }
     if let Some(v) = cfg.cache_max_ttl { o.push_str(&format!("    cache-max-ttl: {v}\n")); }
     if let Some(v) = cfg.cache_min_ttl { o.push_str(&format!("    cache-min-ttl: {v}\n")); }
     if cfg.cache_min_entries != d.cache_min_entries { o.push_str(&format!("    cache-min-entries: {}\n", cfg.cache_min_entries)); }
@@ -474,11 +475,11 @@ mod roundtrip_tests {
     /// (raw_passthrough), and the config must round-trip. Guards #177.
     #[test]
     fn roundtrip_preserves_passthrough_and_unused() {
-        let cfg = "server:\n    interface: 0.0.0.0\n    num-threads: 4\n    cache-size: 256m\n    x-unknown-directive: hello world\n    dnssec-validation: yes\n";
+        let cfg = "server:\n    interface: 0.0.0.0\n    num-threads: 4\n    msg-cache-size: 256m\n    x-unknown-directive: hello world\n    dnssec-validation: yes\n";
         let c1 = parse_str(cfg).unwrap();
         let rendered = render_config(&c1);
         assert!(rendered.contains("num-threads: 4"), "num-threads dropped:\n{rendered}");
-        assert!(rendered.contains("cache-size: 256m"), "cache-size dropped:\n{rendered}");
+        assert!(rendered.contains("msg-cache-size: 256m"), "msg-cache-size dropped:\n{rendered}");
         assert!(rendered.contains("x-unknown-directive: hello world"), "unknown directive dropped:\n{rendered}");
         let c2 = parse_str(&rendered).unwrap();
         assert_eq!(format!("{:#?}", c1), format!("{:#?}", c2), "passthrough round-trip mismatch:\n{rendered}");

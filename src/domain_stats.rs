@@ -18,10 +18,19 @@ const MAX_TRACKED: usize = 10_000;
 /// Reduces atomic contention on hot domains by up to FLUSH_INTERVAL× (PERF-4 / #136).
 const FLUSH_INTERVAL: u64 = 512;
 
+/// Sampling rate for the XDP cache-hit hot path (inc_wire). The path can run at >10 M/s;
+/// touching the shared top-domains map every hit contends and crushes throughput at high
+/// domain cardinality (v0.22.1 regression). We process 1 in INC_WIRE_SAMPLE hits and weight
+/// the count by INC_WIRE_SAMPLE so the top-N estimate stays statistically unbiased. Must be
+/// a power of two for the cheap `& mask` test.
+const INC_WIRE_SAMPLE: u64 = 32;
+
 thread_local! {
     static TL_DS_BUF: RefCell<StdHashMap<Box<str>, u64>> =
         RefCell::new(StdHashMap::new());
     static TL_DS_CALLS: Cell<u64> = const { Cell::new(0) };
+    // Per-thread sampling counter for the XDP hot path (inc_wire).
+    static TL_DS_SAMPLE: Cell<u64> = const { Cell::new(0) };
     // Reused scratch for wire→dotted QNAME conversion on the XDP hot path (inc_wire),
     // so cache-hit attribution allocates nothing in steady state.
     static TL_NAME_BUF: RefCell<String> = RefCell::new(String::with_capacity(256));
@@ -72,6 +81,25 @@ impl DomainStats {
     /// trailing-dot, lowercase key as the slow path so the two datapaths merge into one
     /// count. Contention-free: writes a thread-local accumulator, flushed periodically.
     pub fn inc_wire(&self, wire_qname: &[u8]) {
+        // Sample 1/INC_WIRE_SAMPLE hits: on the other (SAMPLE-1)/SAMPLE the hot path pays
+        // only a thread-local counter bump and returns, keeping XDP throughput at line rate
+        // even with a huge working set. The sampled hit is weighted by INC_WIRE_SAMPLE so the
+        // top-N estimate stays statistically unbiased.
+        let n = TL_DS_SAMPLE.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
+        if n & (INC_WIRE_SAMPLE - 1) != 0 {
+            return;
+        }
+        self.inc_wire_one(wire_qname, INC_WIRE_SAMPLE);
+    }
+
+    /// Decode a wire QNAME into the reused thread-local String and add `weight` to its
+    /// count (allocation-free in steady state). Returns silently on a malformed QNAME.
+    /// `inc_wire` wraps this with sampling; tests call it directly for deterministic decode.
+    fn inc_wire_one(&self, wire_qname: &[u8], weight: u64) {
         let counted = TL_NAME_BUF.with(|nb| {
             let mut name = nb.borrow_mut();
             name.clear();
@@ -98,9 +126,9 @@ impl DomainStats {
             TL_DS_BUF.with(|buf| {
                 let mut b = buf.borrow_mut();
                 if let Some(v) = b.get_mut(name.as_str()) {
-                    *v += 1;
+                    *v += weight;
                 } else {
-                    b.insert(name.as_str().into(), 1);
+                    b.insert(name.as_str().into(), weight);
                 }
             });
             true
@@ -182,13 +210,13 @@ mod tests {
     }
 
     #[test]
-    fn inc_wire_decodes_and_merges_with_inc() {
+    fn inc_wire_one_decodes_and_merges_with_inc() {
         let ds = DomainStats::new();
         // Wire QNAME for "health.curseforge.com." : length-prefixed labels + root NUL.
         // health=6, curseforge=10 (0x0a), com=3.
         let wire = b"\x06health\x0acurseforge\x03com\x00";
         for _ in 0..3 {
-            ds.inc_wire(wire);
+            ds.inc_wire_one(wire, 1);
         }
         // The slow-path string API must produce the SAME dotted key and merge into one count.
         ds.inc("health.curseforge.com.");
@@ -196,20 +224,39 @@ mod tests {
         assert_eq!(
             top[0],
             ("health.curseforge.com.".to_string(), 4),
-            "inc_wire must decode to the same dotted, trailing-dot key as inc() and sum"
+            "inc_wire decode must produce the same dotted, trailing-dot key as inc() and sum"
         );
     }
 
     #[test]
-    fn inc_wire_rejects_malformed() {
+    fn inc_wire_one_rejects_malformed() {
         let ds = DomainStats::new();
-        ds.inc_wire(b"\x40toolong");      // label length 64 > 63 max → skip
-        ds.inc_wire(b"\x06ab");           // claims 6 bytes, only 2 present → skip
-        ds.inc_wire(b"\x02ok\x00");        // well-formed "ok."
+        ds.inc_wire_one(b"\x40toolong", 1); // label length 64 > 63 max → skip
+        ds.inc_wire_one(b"\x06ab", 1); // claims 6 bytes, only 2 present → skip
+        ds.inc_wire_one(b"\x02ok\x00", 1); // well-formed "ok."
         assert_eq!(
             ds.top(10),
             vec![("ok.".to_string(), 1)],
             "malformed wire QNAMEs must be skipped, not counted"
+        );
+    }
+
+    #[test]
+    fn inc_wire_sampling_is_weighted_and_unbiased() {
+        let ds = DomainStats::new();
+        let wire = b"\x03ex1\x03com\x00";
+        // Any window of INC_WIRE_SAMPLE consecutive calls crosses exactly one sample boundary
+        // (multiples of the power-of-two rate are INC_WIRE_SAMPLE apart), so the weighted
+        // estimate equals the real count regardless of the thread-local counter's start value.
+        for _ in 0..INC_WIRE_SAMPLE {
+            ds.inc_wire(wire);
+        }
+        let top = ds.top(10);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].0, "ex1.com.");
+        assert_eq!(
+            top[0].1, INC_WIRE_SAMPLE,
+            "1 sampled hit weighted by INC_WIRE_SAMPLE estimates INC_WIRE_SAMPLE real hits"
         );
     }
 
