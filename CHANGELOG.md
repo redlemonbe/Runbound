@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-06-23
+
+### Fixed
+- **#209: XDP dual-NIC throughput collapse at high domain cardinality.** `DomainStats::flush_tl`
+  called `DashMap::len()` — which read-locks *every* shard — for each untracked domain key. Once the
+  top-domains map is full at `MAX_TRACKED` (10 000), a large working set makes nearly every flushed
+  key take that all-shard lock; with 64 XDP workers (dual-NIC) the lock storm halved aggregate
+  serving. Single-NIC and ≤10 K cardinality were unaffected, which masked it behind the 0.22.2
+  `inc_wire` sampling fix until the dual-card 100 K bench. `len()` is replaced by an approximate
+  `entries: AtomicUsize` maintained on insert (a cheap relaxed load); top-N tracking is unchanged
+  (the `Entry` API bumps the counter only on a genuine insert). Measured on an X710 + X520 dual-link
+  receiver with a 100 K-name working set: **12.4M → 21.1M pps** (both links back at line rate),
+  matching the ≤10 K and pre-de-hickory (v0.19.3, 20.3M) numbers.
+
 ## [0.22.2] - 2026-06-23
 
 ### Fixed

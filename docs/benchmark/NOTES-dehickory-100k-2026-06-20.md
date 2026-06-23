@@ -1,6 +1,13 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 # Bench notes — de-hickory branch, 100k corpus (2026-06-20)
 
+> **RESOLVED in v0.22.3 (2026-06-23, #209).** The 100 K dual-NIC throughput question this file
+> left open turned out to be a real regression: `DomainStats::flush_tl` called `DashMap::len()`
+> (all-shard read lock) per untracked key, and at >`MAX_TRACKED` cardinality with many workers that
+> lock storm halved aggregate serving (dual X710+X520: 12.4M → 21.1M after the fix). It was *not*
+> a cache/memory-bandwidth limit (a 100 K table is ~10 MB, fits the 5995WX's 256 MB L3 25×). See
+> CHANGELOG `[0.22.3]` and issue #209.
+
 Run of the fast/slow-path bench against the `feat/dehickory` build with a
 **100 000-domain** corpus (vs the standard 10 000), per request. This file is
 **notes, not a results report** — the throughput A/B came out **inconclusive**
