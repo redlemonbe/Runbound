@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.22.4] - 2026-06-23
+
+### Fixed
+- **`GET /api/nodes` (and the WebUI) showed a healthily-syncing slave as `disconnected`.**
+  `register_node` set the registered node's `last_seen_at` once, at registration time, and the
+  node status was derived from it (`connected` if < 30 s). The slave's delta-journal poll refreshed
+  the legacy IP-keyed `connected_slaves` map (so `GET /api/sync/slaves` stayed `connected`) but never
+  the node_id-keyed `registered_nodes`, so after 30 s `/api/nodes` always reported `disconnected`
+  even while the slave polled and applied config deltas normally. `record_slave` now also refreshes
+  the matching registered node's `last_seen_at`/`last_seq` (matched by IP), so the node_id view
+  tracks live sync. Locks are taken sequentially to avoid any cross-lock ordering hazard.
+
 ## [0.22.3] - 2026-06-23
 
 ### Fixed

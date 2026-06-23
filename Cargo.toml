@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 [package]
 name = "runbound"
-version = "0.22.3"
+version = "0.22.4"
 edition = "2021"
 authors = ["redlemonbe <https://github.com/redlemonbe>"]
 license = "AGPL-3.0-or-later"
