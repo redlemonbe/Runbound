@@ -14,7 +14,7 @@
 //
 // Slow path (recursive / unknown name):
 //   The XDP program was configured with XDP_PASS fallback, so these packets
-//   never reached the AF_XDP socket — hickory-server handles them normally.
+//   never reached the AF_XDP socket — the wire-native serving path handles them.
 //   Within the worker, a query whose name isn't found locally returns None
 //   from process_packet(); the frame is recycled without a TX response.
 
@@ -30,7 +30,7 @@ use super::loader::XdpHandle;
 ///
 /// Using an explicit enum instead of the footgun `Some(0)` sentinel (#155 review):
 ///   - `Answered(len)` : response written into `out[0..len]`, send it.
-///   - `Fallback`      : case not handled by wire builder → try hickory answer_dns().
+///   - `Fallback`      : case not handled by wire builder → try the wire serving core answer_dns().
 ///   - `Drop`          : ACL Deny or unrecoverable error → silent drop, no TX, no fallback.
 #[derive(Debug)]
 pub(crate) enum WireResult {
@@ -1295,7 +1295,7 @@ fn process_packet(
     // UDP checksum covers the actual response bytes (fixing a latent bug where
     // the checksum was computed over uninitialised tx bytes).
     // ── DNS fast path ────────────────────────────────────────────────────────
-    // Priority: wire fast path > cache snapshot > hickory local zone > drop.
+    // Priority: wire fast path > cache snapshot > wire local zone (answer_dns) > drop.
     //
     // ── SINGLE-LOOKUP HOT PATH ────────────────────────────────────────────────
     // 1. Cache (local-data preloaded + recursive hits) — ONE ASM lookup (CRC32c + identity).
@@ -1472,7 +1472,7 @@ fn process_packet(
 /// ACL semantics mirror `answer_dns`:
 ///   Allow  → proceed with cache lookup.
 ///   Deny   → silent drop (return None, no TX frame crafted).
-///   Refuse → return None (let hickory send a proper REFUSED response).
+///   Refuse → return None (let the wire serving core send a proper REFUSED response).
 
 /// Public (crate-visible) wrapper for `answer_dns_wire` — used by `kernel_loop.rs`.
 /// Maps internal `WireResult` to `WireResultPub` (identical enum, re-exported).
@@ -1626,7 +1626,7 @@ fn answer_from_cache(
         return None;
     }
 
-    // ANY queries are not cached (hickory returns NOTIMP per RFC 8482).
+    // ANY queries are not cached (handled off the fast path per RFC 8482).
     const QTYPE_ANY: u16 = 255;
     if qtype == QTYPE_ANY {
         return None;
@@ -1827,14 +1827,14 @@ mod cache_tests {
 
 // ── Wire fast path (#156) ─────────────────────────────────────���──────────────
 //
-// answer_dns_wire() replaces the hickory hot path for the common case:
+// answer_dns_wire() is the zero-alloc hot path for the common case:
 // A/AAAA/NXDOMAIN/NODATA/REFUSED on static/redirect zones.
 //
 // Return semantics (THREE distinct outcomes — caller must honour all three):
 //
 //   Some(len)  → response written into out[0..len], send it.
 //   None       → unsupported case (EDNS, CNAME, MX, complex…) → fallback to
-//                answer_dns() hickory.  DO NOT DROP.
+//                answer_dns() (wire serving core).  DO NOT DROP.
 //
 // Drop (ACL Deny, malformed parse) is signalled by returning Some(0) — a
 // zero-length DNS payload that process_packet() turns into a drop because
@@ -1842,7 +1842,7 @@ mod cache_tests {
 // meaning "try next path".
 //
 // NOTE ON EDNS (#156 must-fix):
-//   If wq.has_edns == true, we return None → hickory handles it correctly.
+//   If wq.has_edns == true, we return None → the wire serving core handles it correctly.
 //   Sending arcount=0 to an EDNS client breaks EDNS negotiation (clients
 //   retry with smaller UDP sizes, performance regression for real traffic).
 //   EDNS echo in the fast path is a follow-up once this code is stable.
@@ -1858,22 +1858,22 @@ fn answer_dns_wire(
     // qtype, qclass, and has_edns (arcount scan).  Returns None on malformed.
     let wq = match parse_query(query_bytes) {
         Some(q) => q,
-        None => return WireResult::Fallback, // malformed → hickory fallback
+        None => return WireResult::Fallback, // malformed → wire serving-core fallback
     };
 
-    // EDNS gate (#156): DO=1 (DNSSEC) → hickory; otherwise handle with OPT echo.
+    // EDNS gate (#156): DO=1 (DNSSEC) → fallback; otherwise handle with OPT echo.
     // RFC 6891 §7: "If a query included an OPT record, the response MUST include one."
     // The wire path echoes a minimal OPT RR (DO=0, rdlen=0) for non-DNSSEC queries.
-    // DO=1 → fallback hickory (DNSSEC validation required, wire path cannot handle).
+    // DO=1 → fallback to serving core (DNSSEC validation required, wire path cannot handle).
     let edns_info: Option<EdnsInfo> = wq.edns;
     if let Some(ref e) = edns_info {
         if e.do_bit {
-            return WireResult::Fallback; // DNSSEC → hickory
+            return WireResult::Fallback; // DNSSEC → serving core
         }
         // else: non-DNSSEC EDNS — continue, wire path will echo OPT in response
     }
 
-    // ANY queries: RFC 8482 HINFO response — let hickory handle it.
+    // ANY queries: RFC 8482 HINFO response — let the serving core handle it.
     const QTYPE_ANY: u16 = 255;
     if wq.qtype == QTYPE_ANY {
         return WireResult::Fallback;
@@ -1908,8 +1908,8 @@ fn answer_dns_wire(
     //   5. build_answer_a_aaaa_wire: writes RR from pre-serialised WireRdata (no hickory)
     //
     // All other cases (NXDOMAIN zone, Refuse zone, BlockPage, wildcard, parent-walk,
-    // CNAME, MX, TXT, non-exact-match) -> Fallback -> answer_dns() hickory handles them.
-    // Correctness is preserved: the wire path is strictly additive over hickory.
+    // CNAME, MX, TXT, non-exact-match) -> Fallback -> answer_dns() serving core handles them.
+    // Correctness is preserved: the wire path is strictly additive over the serving core.
     const QTYPE_A:    u16 = 1;
     const QTYPE_AAAA: u16 = 28;
 
@@ -1938,20 +1938,20 @@ fn answer_dns_wire(
                     ) {
                         return WireResult::Answered(len);
                     }
-                    // Buffer too small (extremely unlikely for A/AAAA) -> hickory.
+                    // Buffer too small (extremely unlikely for A/AAAA) -> serving core.
                 }
                 // Exact name match but no A/AAAA records for this qtype
-                // (e.g. AAAA query on an A-only zone) -> Fallback -> hickory NODATA.
+                // (e.g. AAAA query on an A-only zone) -> Fallback -> serving-core NODATA.
             }
-            // CRC32c collision (astronomically rare) -> Fallback -> hickory.
+            // CRC32c collision (astronomically rare) -> Fallback -> serving core.
         }
-        // No exact wire-record hit -> Fallback -> hickory handles:
+        // No exact wire-record hit -> Fallback -> serving core handles:
         //   - NxDomain zones, Refuse zones, BlockPage zones
         //   - parent-walk (local-zone bench.test. without explicit local-data)
         //   - wildcard zones (*.example.)
         //   - CNAME, MX, TXT and any non-A/AAAA record type
     }
-    // Non-A/AAAA qtype (MX, TXT, SRV, NS...) -> hickory unconditionally.
+    // Non-A/AAAA qtype (MX, TXT, SRV, NS...) -> serving core unconditionally.
 
     WireResult::Fallback
 }

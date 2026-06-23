@@ -8,12 +8,12 @@
 //
 // EDNS (RFC 6891): if the query carries an OPT RR (arcount > 0, has_edns=true),
 // the caller must either echo a minimal OPT RR in the response or fall back to
-// hickory. This module exposes has_edns so the caller can decide.
+// the wire serving core. This module exposes has_edns so the caller can decide.
 //
 // Correctness contract:
 //   - Writes directly into `out: &mut [u8]` (TX UMEM slice) — zero extra copy.
 //   - Returns Some(len) on success, None on parse error or unsupported case
-//     (caller falls back to hickory answer_dns()).
+//     (caller falls back to the wire serving core answer_dns()).
 //   - Only handles qtype A (1) and AAAA (28) records.
 //   - NXDOMAIN, NODATA, REFUSED, EDNS echo: next deliveries.
 
@@ -49,13 +49,13 @@ const CLASS_IN: u16 = 1;
 /// EDNS0 OPT RR info extracted from the query's additional section.
 ///
 /// Only populated when arcount>0 and an OPT RR (type=41) is found.
-/// `do_bit=true` means the client requests DNSSEC → caller must fallback to hickory.
+/// `do_bit=true` means the client requests DNSSEC → caller must fallback to the serving core.
 #[derive(Clone, Copy, Debug)]
 pub struct EdnsInfo {
     /// UDP payload size (class field of OPT RR) — echo in response.
     pub udp_payload: u16,
     /// DNSSEC OK bit (bit 15 of OPT TTL extended field).
-    /// If true → caller MUST fallback to hickory (DNSSEC not handled in wire path).
+    /// If true → caller MUST fallback to the serving core (DNSSEC not handled in wire path).
     pub do_bit: bool,
 }
 
@@ -72,7 +72,7 @@ pub struct WireQuery<'a> {
     pub qclass: u16,
     /// EDNS0 info if the query carries an OPT RR (arcount > 0).
     /// None = no EDNS (dnsmark, legacy clients).
-    /// Some(e) with do_bit=true → DNSSEC requested → fallback hickory.
+    /// Some(e) with do_bit=true → DNSSEC requested → fallback to serving core.
     pub edns: Option<EdnsInfo>,
 }
 
@@ -245,7 +245,7 @@ fn put_u32(buf: &mut [u8], pos: usize, val: u32) -> usize {
 /// 0x00 0x29     (2B  type = OPT = 41)
 /// payload(2B)   (2B  class = requestor UDP payload size, echoed)
 /// 0x00 0x00     (2B  ext-rcode=0, EDNS version=0)
-/// 0x00 0x00     (2B  Z flags: DO=0 — DNSSEC handled by hickory only)
+/// 0x00 0x00     (2B  Z flags: DO=0 — DNSSEC not handled in the wire fast path)
 /// 0x00 0x00     (2B  rdlen=0 — no RDATA options)
 /// ```
 /// Total: 1+2+2+4+2 = 11 bytes.
@@ -267,7 +267,7 @@ fn write_opt_rr(buf: &mut [u8], pos: usize, udp_payload: u16) -> usize {
 ///
 /// Covers: `ZoneAction::Static` and `ZoneAction::Redirect` with A/AAAA records.
 /// Returns `Some(len)` on success, `None` if the case is unsupported or `out`
-/// is too small (caller falls back to hickory).
+/// is too small (caller falls back to the wire serving core).
 ///
 /// # Wire layout
 /// ```text
@@ -276,7 +276,7 @@ fn write_opt_rr(buf: &mut [u8], pos: usize, udp_payload: u16) -> usize {
 ///
 /// # EDNS
 /// Does NOT echo OPT RR. Caller must check `wq.has_edns` and fall back to
-/// hickory if EDNS echo is required (until EDNS echo is implemented in
+/// the wire serving core if EDNS echo is required (until EDNS echo is implemented in
 /// a subsequent delivery).
 /// Build a DNS A/AAAA answer directly from pre-fetched records.
 ///
@@ -431,7 +431,7 @@ const FLAGS_REFUSED: u16 = 0x8585;
 /// zero hickory in the hot path. (#156 item 3, Livraison C)
 ///
 /// `recs` must be non-empty (caller's responsibility, filtered by qtype in `answer_dns_wire`).
-/// Returns `None` if `out` is too small (caller falls back to hickory).
+/// Returns `None` if `out` is too small (caller falls back to the wire serving core).
 pub fn build_answer_a_aaaa_wire(
     wq: &WireQuery<'_>,
     out: &mut [u8],
@@ -501,7 +501,7 @@ pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8], edns: Option<&EdnsInfo
 /// Returns `Some(len)` on success, `None` if `out` is too small.
 ///
 /// Reserved for a future wildcard-aware fast path (#156): the wire path
-/// currently falls back to hickory for empty-exact-match cases (which may be
+/// currently falls back to the serving core for empty-exact-match cases (which may be
 /// wildcards), so this is not yet wired into `answer_dns_wire`. Kept + unit-tested.
 #[allow(dead_code)]
 pub fn build_nodata(wq: &WireQuery<'_>, out: &mut [u8], edns: Option<&EdnsInfo>) -> Option<usize> {

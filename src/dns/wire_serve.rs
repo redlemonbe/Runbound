@@ -12,7 +12,7 @@
 //!
 //! It returns `None` when the name is **not** locally authoritative, which is
 //! the signal for the caller to forward upstream. DNSSEC online-signing of the
-//! answer stays in the hickory signer for now and is layered on at integration;
+//! answer is done wire-native by `zone_signer` on the serving path (serve_wire);
 //! this core builds the unsigned authoritative answer.
 
 use smallvec::SmallVec;

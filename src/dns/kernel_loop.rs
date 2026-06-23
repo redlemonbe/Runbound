@@ -13,10 +13,11 @@
 // and run a tight OS-thread loop:
 //   recv_from → answer_dns_wire (zero alloc, wire-direct) → send_to   [fast]
 //             → answer_from_cache (SIMD lookup, zero hickory)  → send_to   [fast]
-//             → fallback to hickory via tokio channel                  [slow, rare]
+//             → fallback to the wire serving core via tokio channel     [slow, rare]
 //
-// The hickory ServerFuture is demoted to a pure fallback (EDNS DO=1, CNAME,
-// MX, TSIG, AXFR, TCP, recursion) — it never sees the local-zone hot path.
+// The serving-core fallback (handle_request_wire → serve_wire) handles the
+// cases the fast path cannot (EDNS DO=1 signed zones, CNAME, MX, TSIG, AXFR,
+// forwarding) — it never sees the local-zone hot path.
 //
 // SO_RCVBUF/SO_SNDBUF set to 8 MiB per socket (fixes udp_RcvbufErrors=93k/s
 // measured on the Xeon v2 rig with the previous default-buffer path).
@@ -33,7 +34,7 @@ use tracing::{debug, info, warn};
 use crate::dns::acl::Acl;
 use crate::dns::local::LocalZoneSet;
 
-/// Message sent to the hickory fallback handler when the wire fast path
+/// Message sent to the wire serving-core fallback reader when the wire fast path
 /// cannot answer a query (EDNS DO=1, CNAME, MX, TSIG, AXFR, recursion…).
 pub struct FallbackMsg {
     pub query:  Vec<u8>,
@@ -43,7 +44,7 @@ pub struct FallbackMsg {
 }
 
 /// Global sender so XDP workers (no kernel arrival socket) can hand
-/// recursion/complex misses to the same hickory fallback reader.
+/// recursion/complex misses to the same wire serving-core fallback reader.
 /// Set once by run_dns_server(); None until then (early-startup misses dropped).
 pub static XDP_FALLBACK_TX: std::sync::OnceLock<tokio::sync::mpsc::Sender<FallbackMsg>> =
     std::sync::OnceLock::new();
@@ -133,7 +134,7 @@ fn bind_kernel_udp(addr: &str) -> anyhow::Result<UdpSocket> {
 /// NUMA-local core.  Each thread owns one SO_REUSEPORT socket.
 ///
 /// Returns a `KernelLoopHandle` whose lifetime keeps the threads alive,
-/// and a `tokio::sync::mpsc::Sender` for the hickory fallback channel.
+/// and a `tokio::sync::mpsc::Sender` for the wire serving-core fallback channel.
 #[allow(clippy::too_many_arguments)]
 pub fn start_kernel_fast_loop(
     bind_addr: &str,           // e.g. "0.0.0.0:53"
@@ -360,7 +361,7 @@ fn worker_loop(
                         continue;
                     }
                     WireResultPub::Drop => continue, // ACL Deny — silent drop
-                    WireResultPub::Fallback => {}     // try cache, then hickory
+                    WireResultPub::Fallback => {}     // try cache, then the wire serving core
                 }
             }
 
@@ -383,9 +384,9 @@ fn worker_loop(
                 }
             }
 
-            // ── Slow path: hickory fallback (CNAME, MX, TSIG, recursion…) ────
-            // Clone the query bytes and send to the async hickory handler.
-            // The handler replies directly on sock_clone.
+            // ── Slow path: wire serving-core fallback (CNAME, MX, TSIG, recursion…) ────
+            // Clone the query bytes and send to the async serving-core reader
+            // (handle_request_wire). The handler replies directly on sock_clone.
             let msg = FallbackMsg {
                 query:  query.to_vec(), // one alloc per fallback query — acceptable
                 peer,

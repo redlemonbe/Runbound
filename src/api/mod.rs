@@ -1361,7 +1361,7 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
 /// so a stale *forwarded* answer that was cached before a rule was written keeps
 /// shadowing that rule until its TTL expires or the service restarts — breaking
 /// the no-restart guarantee for local-data, and silently defeating freshly-added
-/// blacklist/feed blocks (a security issue for a DNS filter). The hickory slow
+/// blacklist/feed blocks (a security issue for a DNS filter). The wire-native slow
 /// path checks the live zone first and is unaffected.
 ///
 /// Fix entirely on the rare WRITE path (zero added per-query work, hot paths
@@ -3036,7 +3036,7 @@ async fn delete_upstream_handler(
 
 async fn upstream_presets_handler() -> impl IntoResponse {
     // FIX #42: DoT entries use a separate `port` field — addr contains only the IP.
-    // #56: DoT presets include tls_hostname so the hickory resolver uses the correct SNI.
+    // #56: DoT presets include tls_hostname so the DoT forwarder uses the correct SNI.
     JsonExtract(serde_json::json!({ "presets": [
         {"name":"Cloudflare",          "addr":"1.1.1.1",        "port":53,  "protocol":"udp","description":"Cloudflare DNS — privacy-focused, fast"},
         {"name":"Cloudflare alt",      "addr":"1.0.0.1",        "port":53,  "protocol":"udp","description":"Cloudflare secondary"},

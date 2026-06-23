@@ -138,7 +138,7 @@ fn main() -> Result<()> {
     // Kernel slow path: OS scheduler floats on all cores (+39% vs naive pin, Xeon v2+X520).
     // XDP fast path: workers auto-pinned to NUMA-local physical cores in start_xdp_on_iface().
     info!(cores = core_count, "CPU placement: automatic (OS scheduler + XDP NUMA-local pin)");
-    // #physical-only: pin every tokio thread (control plane + hickory fallback + API) to a
+    // #physical-only: pin every tokio thread (control plane + wire serving-core fallback + API) to a
     // PHYSICAL core, never an SMT sibling. The cache-hit hot path is the kloop / AF_XDP worker
     // (already physical-only); a tokio async thread floating onto the HT sibling of a busy SIMD
     // core steals that core's execution units (HT only helps code that leaves units idle —
@@ -241,7 +241,7 @@ async fn async_main(
     // #183: build the cache snapshot whenever xdp-cache-snapshot is on — it feeds
     // BOTH the XDP fast path (xdp: yes) AND the kernel fast loop (xdp: no). Gating it
     // on cfg.xdp left the kernel fast loop with no snapshot -> every slow-path query
-    // fell back to hickory instead of the shared ASM answer_from_cache path.
+    // fell back to the serving-core slow path instead of the shared ASM answer_from_cache path.
     #[cfg(feature = "xdp")]
     if cfg.xdp_cache_snapshot {
         let mutable = dns::cache_snapshot::new_mutable_cache();
@@ -999,7 +999,7 @@ async fn build_and_launch(
     // hickory-server) that serve local zones with our wire codec and forward the
     // rest to the first configured upstream — over DoT when the upstream is TLS
     // with a hostname, otherwise plain UDP. Additive and off by default; the
-    // production hickory-server listeners are left untouched.
+    // production wire-native listeners (run_dns_server) are left untouched.
     if let Some(port) = std::env::var("RUNBOUND_PLAIN_SERVER_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())

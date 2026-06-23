@@ -17,7 +17,7 @@
 //
 //   4. Queries that cannot be answered locally (recursive, ANY, non-local name)
 //      are dropped — the XDP program is configured with XDP_PASS fallback so
-//      they continue up through the normal hickory-server path.
+//      they continue up through the normal wire-native serving path.
 //
 // Enabled via: cargo build --features xdp
 

@@ -43,13 +43,13 @@ pub const QPS_RING_SIZE: usize = 300;
 // Per-minute latency ring: 1440 slots x 1 min = 24 h, for windowed min/avg/max.
 pub const LAT_RING_MINUTES: usize = 1440;
 
-// ── Hickory resolver cache size ────────────────────────────────────────────
-// Configured in build_resolver(); used to cap the cache_entries approximation.
-const HICKORY_CACHE_SIZE: u64 = 8_192;
+// ── Forward resolver cache size ────────────────────────────────────────────
+// Nominal upstream-cache capacity; used to cap the cache_entries approximation.
+const UPSTREAM_CACHE_SIZE: u64 = 8_192;
 
 // ── Cache hit threshold ────────────────────────────────────────────────────
 // Forward lookups completing in < 2 ms are almost certainly served from
-// hickory's in-process cache (real upstream RTT is typically 5–200 ms).
+// the in-process upstream cache (real upstream RTT is typically 5–200 ms).
 pub const CACHE_HIT_THRESHOLD_US: u64 = 2_000;
 
 // ── Cache-line padding (#70) ───────────────────────────────────────────────
@@ -112,7 +112,7 @@ pub struct Stats {
     // Cache / local resolution metrics
     // cache_hits: forwarded lookups < CACHE_HIT_THRESHOLD_US (likely in-process cache)
     // cache_misses: forwarded lookups ≥ threshold (network round-trip)
-    // cache_entries: approximate count of distinct cached domains (0..HICKORY_CACHE_SIZE)
+    // cache_entries: approximate count of distinct cached domains (0..UPSTREAM_CACHE_SIZE)
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub cache_entries: AtomicU64,
@@ -290,7 +290,7 @@ impl Stats {
     }
 
     /// Record a completed forwarded lookup and update cache metrics.
-    /// elapsed_us < 2 ms → cache hit (hickory served from its in-process DNS cache).
+    /// elapsed_us < 2 ms → cache hit (served from the in-process DNS cache).
     /// elapsed_us ≥ 2 ms → cache miss (round-trip to upstream resolver).
     #[inline]
     pub fn record_forward(&self, elapsed_us: u64) {
@@ -298,11 +298,11 @@ impl Stats {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
         } else {
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
-            // Approximate cache fill: increment up to hickory's cache size.
-            // Saturates at HICKORY_CACHE_SIZE (matching hickory's eviction behaviour).
+            // Approximate cache fill: increment up to the upstream cache size.
+            // Saturates at UPSTREAM_CACHE_SIZE (matching the cache's eviction behaviour).
             self.cache_entries
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    if n < HICKORY_CACHE_SIZE {
+                    if n < UPSTREAM_CACHE_SIZE {
                         Some(n + 1)
                     } else {
                         None

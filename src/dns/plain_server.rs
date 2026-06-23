@@ -12,8 +12,9 @@
 //! shared with UDP.
 //!
 //! Scope of the seed: plain UDP/TCP. The richer forwarding (DoT connection
-//! pooling, racing, health) stays on the hickory resolver until phase 4 lifts it
-//! onto our own client; the listener plumbing proven here is what phase 3 grows.
+//! pooling, racing, health) lives in the in-house forward pool
+//! (`crate::dns::forward`); this seed module itself still does one connection
+//! per query. The listener plumbing proven here is what phase 3 grows.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -79,9 +80,9 @@ pub fn dot_client_config() -> std::sync::Arc<rustls::ClientConfig> {
 }
 
 /// DNS-over-TLS forward (RFC 7858): TLS to `ip:853` with SNI `sni`, then the
-/// same 2-byte length framing as TCP. This is the phase-4 seed that will replace
-/// the hickory resolver's DoT client; no pooling/racing yet — one connection
-/// per query.
+/// same 2-byte length framing as TCP. A minimal seed alongside the in-house
+/// forward pool's DoT client (`crate::dns::forward`); no pooling/racing here —
+/// one connection per query.
 pub async fn forward_dot(
     query: &[u8],
     ip: std::net::IpAddr,

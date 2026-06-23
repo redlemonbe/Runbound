@@ -60,7 +60,7 @@ pub struct LocalZoneSet {
     pub static_names: HashSet<Name>,
     /// Fast-path wire-key A/AAAA index (#156 item 3).
     /// Exact-match only; parent-walk / wildcard / other types fall through
-    /// to the hickory slow path via answer_dns().
+    /// to the wire serving core via answer_dns().
     pub wire_records: WireRecordIndex,
     /// De-hickory migration: the full record set as our own `wire::Record`,
     /// keyed by the lowercased wire QNAME. Built alongside `records` from the
@@ -420,7 +420,7 @@ impl LocalZoneSet {
 ///
 /// Only exact A/AAAA records are preloaded.  Wildcards, CNAME, MX, TXT,
 /// BlockPage and other special zones are NOT preloaded — they remain handled
-/// by `answer_dns()` (hickory slow path).
+/// by `answer_dns()` (the wire serving core).
 /// Build (cache_key, CacheEntry) pairs for every A/AAAA name in a zone set.
 /// Shared by `preload_into_cache` (global XDP snapshot seed) and the per-view
 /// split-horizon snapshots (#187) so both paths serialise records identically.

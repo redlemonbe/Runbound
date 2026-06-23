@@ -285,7 +285,7 @@ pub struct UnboundConfig {
     /// Send the same query to ALL configured upstreams simultaneously and return
     /// the first valid response.  Remaining in-flight queries are cancelled.
     /// Reduces p99 latency to the fastest upstream when 2+ are configured.
-    /// Default: false (backward-compatible round-robin/failover via hickory).
+    /// Default: false (backward-compatible round-robin/failover).
     pub upstream_racing: bool,
 
     // ── resolv.conf fallback (#94) ────────────────────────────────────────────

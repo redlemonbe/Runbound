@@ -6,7 +6,8 @@
 //   1. Access-control list check (per source IP, from unbound.conf)
 //   2. Rate limiting (per source IP token bucket)
 //   3. Check local zones (local-data, blacklist, feeds) in memory → instant
-//   4. Otherwise → recursive resolver (hickory-resolver)
+//   4. Otherwise → forward upstream via the in-house wire forward pool
+//      (src/dns/forward.rs); full recursion is behind the optional `recursor` feature.
 //
 // UDP + TCP on the configured port (default 53).
 
@@ -64,8 +65,8 @@ use crate::stats::CACHE_HIT_THRESHOLD_US;
 
 // ── Concurrency cap — prevents OOM under flood ─────────────────────────────
 //
-// hickory-server spawns one tokio task per incoming DNS request with no
-// backpressure. Under a flood (DDoS or perf test) this exhausts RAM.
+// The wire request dispatch spawns one tokio task per incoming DNS request with
+// no inherent backpressure. Under a flood (DDoS or perf test) this exhausts RAM.
 // A non-blocking try_acquire returns REFUSED instantly without allocating
 // any additional memory, so the bound is hard even at line rate.
 const MAX_INFLIGHT_REQUESTS: usize = 4_096;
@@ -1122,8 +1123,9 @@ impl RunboundHandler {
 impl RunboundHandler {
     /// De-hickory fast path: resolve a query entirely on the own wire codec when
     /// it needs none of the hickory-typed special handling. Returns
-    /// `Some(response_bytes)` when fully handled, or `None` to fall back to the
-    /// hickory handler (which preserves exact behaviour for the routed-out cases).
+    /// `Some(response_bytes)` when fully handled, or `None` for the routed-out
+    /// cases (with the `recursor` feature, the recursor handler takes them;
+    /// default builds drop on `None`).
     ///
     /// Routed to the fallback (before any side-effectful gate, so gates run once):
     /// non-QUERY opcodes (UPDATE), AXFR/IXFR/ANY, non-IN class (CHAOS), HTTPS-block,
@@ -1581,8 +1583,10 @@ impl RunboundHandler {
         h.set_rcode_low(rcode_low);
         let mut additional = Vec::new();
         if let Ok(Some(req_edns)) = req.edns() {
-            let mut e = crate::dns::wire::Edns::default();
-            e.udp_payload = req_edns.udp_payload.clamp(512, 1232);
+            let mut e = crate::dns::wire::Edns {
+                udp_payload: req_edns.udp_payload.clamp(512, 1232),
+                ..Default::default()
+            };
             e.set_dnssec_ok(req_edns.dnssec_ok());
             additional.push(e.to_record());
         }
@@ -1834,7 +1838,8 @@ impl RunboundHandler {
     /// Dispatch a raw DNS wire query and return the wire response.
     pub async fn handle_request_wire(&self, wire: &[u8], peer: std::net::SocketAddr) -> Vec<u8> {
         // de-hickory fast path: serve on the own wire codec when no hickory-typed
-        // special handling is needed; otherwise fall back to the hickory handler.
+        // special handling is needed; otherwise (recursor feature only) fall back
+        // to the recursor handler — default builds drop on None.
         if let Some(resp) = self.serve_wire(wire, peer).await {
             return resp;
         }
@@ -2694,7 +2699,7 @@ fn read_meminfo() -> Option<(u64, u64)> {
 ///   3. No-effect detection: if halving does not reduce used_pct by ≥ 5 %,
 ///      halvings are disabled for this process lifetime with a clear WARN.
 ///
-/// Cache changes take effect by rebuilding the hickory resolver and atomically
+/// Cache changes take effect by rebuilding the forward pool and atomically
 /// swapping it via ArcSwap. In-flight queries keep their Arc until completion.
 /// Background task: monitors system memory and adjusts rate limiter under pressure.
 /// The DNS cache now lives in ForwardPool (no hickory resolver cache to resize);
@@ -2822,7 +2827,7 @@ fn build_tls_config(
 #[cfg(unix)]
 /// #167: bind a blocking std UDP socket on the server port with SO_REUSEPORT so
 /// the XDP recursion-miss fallback can reply FROM the server port. We only ever
-/// send on it; SO_REUSEPORT lets it coexist with the XDP/hickory port bindings.
+/// send on it; SO_REUSEPORT lets it coexist with the XDP / kernel-loop port bindings.
 fn bind_xdp_reply_sock(port: u16) -> anyhow::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -2929,9 +2934,9 @@ impl TcpConnTracker {
 
 /// Accept-with-limit loop for a public-facing TCP listener.
 /// Connections within the per-IP cap are relayed to `relay_addr` (a loopback
-/// listener owned by hickory-server) via bidirectional byte copy.
+/// listener served by the wire handler `handle_request_wire`) via bidirectional byte copy.
 ///
-/// Trade-off: hickory sees 127.0.0.1 as the source for all relayed TCP
+/// Trade-off: the handler sees 127.0.0.1 as the source for all relayed TCP
 /// connections, so the DNS per-IP rate limiter uses a shared loopback bucket
 /// for TCP clients. Acceptable because TCP DNS traffic is inherently low-volume
 /// (large responses, DNSSEC chains). The TCP connection cap enforced here
@@ -2981,7 +2986,7 @@ async fn run_tcp_with_limit(
             normalize_tcp_ip(raw_ip)
         };
         // SEC (Cycle I, SEC-I23): enforce the source-IP ACL on the REAL client. The relay
-        // to the loopback hickory listener makes the DNS handler see 127.0.0.1, so without
+        // to the loopback wire listener makes the DNS handler see 127.0.0.1, so without
         // this check TCP/DoT/DoH would bypass allow/deny/refuse rules. Deny and Refuse both
         // drop the connection here (no DNS message parsed yet); loopback follows the same
         // ACL as the UDP path.
@@ -3176,7 +3181,7 @@ async fn spawn_tls_service(
     let handler_dot_sup = std::sync::Arc::clone(&handler);
     drop(handler); // consumed; DoT now uses handler_dot_sup clone
     for iface in interfaces {
-        // DNS-over-TLS (853 TCP) — public listener relays to a loopback hickory listener.
+        // DNS-over-TLS (853 TCP) — public listener relays to a loopback wire listener.
         let dot_addr = format!("{}:{}", iface, dot_port);
         match TcpListener::bind(&dot_addr).await {
             Ok(public_dot) => match TcpListener::bind("127.0.0.1:0").await {
@@ -3618,7 +3623,7 @@ pub async fn run_dns_server(
     // DNS sockets open immediately.  Cache hits and local-zone queries are served
     // from the first packet; upstream forwarding becomes available ~800ms later
     // once the DoT pool is ready.  Queries that miss the cache before the pool
-    // is live will wait for hickory's lazy-connect retry (no SERVFAIL storm).
+    // is live will wait for the forward pool's lazy-connect retry (no SERVFAIL storm).
     let dot_count = upstreams
         .read()
         .map(|u| u.iter().filter(|s| s.protocol == "dot").count())
@@ -3764,7 +3769,7 @@ pub async fn run_dns_server(
             None
         },
     );
-    // Step 3b: wrap handler in Arc for sharing between Server and fallback reader.
+    // Step 3b: wrap handler in Arc for sharing between the TLS supervisor and the fallback reader.
     let handler_arc = std::sync::Arc::new(handler);
     let handler_arc2 = std::sync::Arc::clone(&handler_arc);
 
@@ -3781,15 +3786,15 @@ pub async fn run_dns_server(
     // ── Kernel UDP fast loop (#kernel-fastloop) ─────────────────────────────
     // One blocking OS thread per physical NUMA-local core.  Handles local-zone
     // A/AAAA + cache hits with zero hickory allocs (wire builder + SIMD).
-    // Fallback queries (CNAME, MX, TSIG, recursion…) are sent to hickory via
-    // the fallback channel below.
+    // Fallback queries (CNAME, MX, TSIG, recursion…) are sent to the wire
+    // serving-core reader (handle_request_wire) via the fallback channel below.
     //
     // Kernel UDP fast loop: ONLY when XDP is NOT managing this NIC.
     // xdp:yes → XDP workers own the UDP path; kernel loop would pin OS threads
     // on the SAME cores as XDP workers → CPU contention → ~2.5x throughput regression.
-    // xdp:no  → kernel loop handles all UDP, hickory handles TCP + fallback only.
+    // xdp:no  → kernel loop handles all UDP, the wire handler serves TCP + fallback only.
     // #fix(xdp-recursion): fallback channel created unconditionally so XDP-mode
-    // misses also reach the hickory recursion reader (forward upstream + fill cache).
+    // misses also reach the wire serving-core reader (forward upstream + fill cache).
     let (fallback_tx, mut fallback_rx) = tokio::sync::mpsc::channel::<FallbackMsg>(4096);
     let _ = crate::dns::kernel_loop::XDP_FALLBACK_TX.set(fallback_tx.clone());
 
@@ -3846,7 +3851,7 @@ pub async fn run_dns_server(
     }
 
     if !cfg.xdp {
-        // SO_REUSEPORT: the fast-loop sockets and the hickory sockets share the
+        // SO_REUSEPORT: the per-core fast-loop sockets all share the
         // same port.  The kernel balances across ALL sockets by 4-tuple hash, so
         // fast-loop threads see their fair share of the traffic without RPS/steering.
         //
@@ -3860,8 +3865,8 @@ pub async fn run_dns_server(
             // #183: honour the same core budget as the XDP fast path.
             //  - Xeon v2 + X520: the X520 PCIe bus is served by ~16 cores
             //    (10 NIC-local + 6 cross-NUMA); past that the QPI/bus collapses.
-            //  - otherwise: NUMA-sorted physical cores, but keep one for hickory
-            //    fallback / TCP / API / the rest of the program.
+            //  - otherwise: NUMA-sorted physical cores, but keep one for the wire
+            //    serving-core fallback / TCP / API / the rest of the program.
             let cap = if crate::dns::xdp::socket::is_xeon_v2_x520_host(kernel_loop_iface) {
                 16.min(total)
             } else {
@@ -4013,8 +4018,8 @@ pub async fn run_dns_server(
                 );
             }
         }
-        // Reserve at least 2 physical cores for hickory fallback/TCP/API.
-        let _n_hickory = (crate::cpu::physical_cores().len().saturating_sub(n_fast)).max(2);
+        // Reserve at least 2 physical cores for the wire serving-core fallback/TCP/API.
+        let _n_fallback = (crate::cpu::physical_cores().len().saturating_sub(n_fast)).max(2);
 
         // Channel + XDP_FALLBACK_TX global created before this guard.
 
@@ -4037,7 +4042,7 @@ pub async fn run_dns_server(
         // Start one kernel UDP thread per fast core.
         // MULTI-INTERFACE NOTE: currently binds to interfaces[0] only.
         // If multiple interfaces are configured, the additional interfaces have no
-        // kernel fast loop — they fall back to hickory UDP (future follow-up).
+        // kernel fast loop — they have no UDP listener at all (future follow-up).
         let kernel_loop_bind = format!("{}:{}", kernel_loop_iface, cfg.port);
         let _kloop_handle = crate::dns::kernel_loop::start_kernel_fast_loop(
             &kernel_loop_bind,
@@ -4054,7 +4059,7 @@ pub async fn run_dns_server(
         info!(
             threads = fast_cores.len(),
             addr = %kernel_loop_bind,
-            "kernel UDP fast loop started (hickory handles TCP + fallback only)"
+            "kernel UDP fast loop started (wire handler serves TCP + fallback only)"
         );
     } // end kernel fast loop guard — kernel UDP threads only (#fix: reader is now unconditional)
 
@@ -4104,16 +4109,16 @@ pub async fn run_dns_server(
         let tcp_addr = format!("{}:{}", iface, port);
 
         // UDP sockets are now owned by the kernel fast loop (Step 3b).
-        // Hickory no longer binds UDP sockets — it serves only TCP + fallback channel.
-        info!(addr=%udp_addr, "DNS UDP handled by kernel fast loop (hickory=TCP+fallback only)");
+        // No UDP sockets are bound here — the wire handler serves only TCP + fallback channel.
+        info!(addr=%udp_addr, "DNS UDP handled by kernel fast loop (wire handler = TCP + fallback only)");
 
         // FIX 6.2: public-facing TCP listener feeds our per-IP accept gate.
-        // hickory-server gets a loopback relay listener so its internal accept
+        // The wire handler gets a loopback relay listener so its accept
         // loop never sees connections from over-limit source IPs.
         let public_tcp = TcpListener::bind(&tcp_addr)
             .await
             .map_err(|e| anyhow::anyhow!("TCP bind {tcp_addr}: {e}"))?;
-        // Relay listener: loopback, ephemeral port — hickory owns this listener.
+        // Relay listener: loopback, ephemeral port — the own wire relay loop owns this listener.
         let relay_tcp = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| anyhow::anyhow!("TCP relay bind: {e}"))?;
@@ -4179,7 +4184,8 @@ pub async fn run_dns_server(
     }
 
     // ── Encrypted DNS (DoT/DoH/DoQ) — supervised, hot-reloadable ──────────
-    // The TLS listeners run on their OWN hickory ServerFuture, supervised so
+    // The TLS listeners run on their OWN wire-native listeners (handle_request_wire
+    // / doh_service), supervised so
     // the WebUI can enable / disable / re-key them live: no process restart and
     // no blip on the plain UDP/TCP :53 path. See `tls_supervisor`.
     {
