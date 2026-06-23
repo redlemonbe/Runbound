@@ -1,6 +1,6 @@
 # 04 — The slow path (wire-native `serve_wire`)
 
-> **Status: current (v0.22.0).** As of v0.22 the default build is **hickory-free**: the slow path
+> **Status: current (v0.22.4).** As of v0.22 the default build is **hickory-free**: the slow path
 > is served entirely by the in-house wire codec (`serve_wire`, `src/dns/server.rs`); the
 > hickory-dns request handler is removed from the default binary and only re-introduced behind the
 > optional `recursor` feature (the sovereign iterative resolver). The pipeline below is unchanged

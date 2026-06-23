@@ -1,7 +1,7 @@
 # Security Architecture
 
 This document covers the security model, defensive layers, and all audit findings
-fixed across Runbound releases through v0.22.0 (see docs/security-audit/SECURITY-AUDIT.md for the per-cycle history, and docs/security-audit/CYCLE-O-dehickory-2026-06-22.md plus docs/security-audit/pentest-aggressive-2026-06-22.md for the v0.22 de-hickory cycle and aggressive pentest).
+fixed across Runbound releases through v0.22.4 (see docs/security-audit/SECURITY-AUDIT.md for the per-cycle history, and docs/security-audit/CYCLE-O-dehickory-2026-06-22.md plus docs/security-audit/pentest-aggressive-2026-06-22.md for the v0.22 de-hickory cycle and aggressive pentest).
 
 > **v0.22 attack-surface note.** The default build is now **hickory-free on the
 > network-facing serving path**: DNS is served by the in-house wire codec
