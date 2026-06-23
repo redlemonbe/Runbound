@@ -24,7 +24,9 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Self-hosted 32-core builder (worker-dr). Only this tag-triggered workflow uses
+    # it; CI/fuzz stay on GitHub-hosted runners so fork PRs never reach the runner.
+    runs-on: [self-hosted, rb-builder]
 
     steps:
       - name: Checkout
@@ -67,26 +69,34 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # ── Builds ───────────────────────────────────────────────────────────
-      - name: Build x86_64-gnu
-        run: cargo build --release --target x86_64-unknown-linux-gnu
-
-      - name: Build x86_64-musl
-        run: cargo build --release --target x86_64-unknown-linux-musl
-
-      - name: Build aarch64-gnu
+      # ── Builds (all 4 targets in parallel on the 32-core self-hosted runner) ──
+      # Each target gets its own CARGO_TARGET_DIR so the concurrent cargo
+      # invocations never contend on a shared target/ lock. Wall-clock ≈ one
+      # target's build instead of the sum of four.
+      - name: Build all targets in parallel
         env:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-          RING_HOST_CC: gcc
-        run: cargo build --release --target aarch64-unknown-linux-gnu
-
-      - name: Build aarch64-musl
-        env:
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
           RING_HOST_CC: gcc
-        run: cargo build --release --target aarch64-unknown-linux-musl
+        run: |
+          set -u
+          targets="x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl"
+          declare -A pid
+          for t in $targets; do
+            CARGO_TARGET_DIR="target-$t" cargo build --release --target "$t" > "build-$t.log" 2>&1 &
+            pid[$t]=$!
+          done
+          rc=0
+          for t in $targets; do
+            if wait "${pid[$t]}"; then
+              echo "::notice::build OK $t"
+            else
+              echo "::error::build FAILED $t"; tail -n 30 "build-$t.log"; rc=1
+            fi
+          done
+          exit $rc
 
       # ── SBOM (CycloneDX) ──
       - name: Generate SBOM (CycloneDX)
@@ -98,10 +108,10 @@ jobs:
       # ── Package ──────────────────────────────────────────────────────────
       - name: Package binaries
         run: |
-          cp target/x86_64-unknown-linux-gnu/release/runbound  runbound-x86_64-linux-gnu
-          cp target/x86_64-unknown-linux-musl/release/runbound runbound-x86_64-linux-musl
-          cp target/aarch64-unknown-linux-gnu/release/runbound  runbound-aarch64-linux-gnu
-          cp target/aarch64-unknown-linux-musl/release/runbound runbound-aarch64-linux-musl
+          cp target-x86_64-unknown-linux-gnu/x86_64-unknown-linux-gnu/release/runbound    runbound-x86_64-linux-gnu
+          cp target-x86_64-unknown-linux-musl/x86_64-unknown-linux-musl/release/runbound  runbound-x86_64-linux-musl
+          cp target-aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/release/runbound  runbound-aarch64-linux-gnu
+          cp target-aarch64-unknown-linux-musl/aarch64-unknown-linux-musl/release/runbound runbound-aarch64-linux-musl
           sha256sum \
             runbound-x86_64-linux-gnu \
             runbound-x86_64-linux-musl \
