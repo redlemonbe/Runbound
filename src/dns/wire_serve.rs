@@ -49,7 +49,12 @@ pub fn answer_local(query: &Message, zones: &LocalZoneSet) -> Option<Message> {
     };
     resp.header.set_qr(true);
     resp.header.set_aa(false);
-    resp.header.set_ra(false);
+    // RA=1: Runbound is a recursive/forwarding resolver, so every response must
+    // advertise recursion-available — consistent with the forward path and the XDP
+    // fast-path builders (FLAGS_*_NXDOMAIN/REFUSED). Serving a blacklist/local-zone
+    // block without RA made dig warn "recursion not available" and could nudge a
+    // client to retry the name on a secondary resolver, bypassing the block.
+    resp.header.set_ra(true);
     resp.header.set_tc(false);
     // We do not validate DNSSEC here, so never claim Authentic Data (RFC 6840
     // §5.8) even if the client set AD in the query.
@@ -352,6 +357,9 @@ mod tests {
         let z = zoneset();
         let r = answer_local(&query("x.refuse.test.", consts::rtype::A, false), &z).unwrap();
         assert_eq!(r.header.rcode_low(), rcode::REFUSED);
+        // v0.22.1: blocked/local responses must advertise recursion-available (RA),
+        // consistent with the forward + XDP paths.
+        assert!(r.header.ra(), "REFUSED block must set RA");
         assert_wellformed(&r);
     }
 
@@ -360,6 +368,7 @@ mod tests {
         let z = zoneset();
         let r = answer_local(&query("anything.gone.test.", consts::rtype::A, false), &z).unwrap();
         assert_eq!(r.header.rcode_low(), rcode::NXDOMAIN);
+        assert!(r.header.ra(), "NXDOMAIN block must set RA");
         assert_wellformed(&r);
     }
 

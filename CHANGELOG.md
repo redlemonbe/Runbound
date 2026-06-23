@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-06-23
+
+### Fixed
+- **RA flag missing on local-zone / blacklist / split-horizon responses.** The wire local
+  serving path (`wire_serve::answer_local`) set `RA=0` on every blocked or local answer (feed
+  `refuse`→REFUSED, `nxdomain`→NXDOMAIN, block-page, and split-horizon views), while the forward
+  path and the XDP fast-path builders set `RA=1`. A recursive/forwarding resolver must advertise
+  recursion-available consistently: without it, `dig` warned "recursion requested but not
+  available", and a client could treat the resolver as non-recursive and retry a blocked name on a
+  secondary resolver, bypassing the block. `answer_local` now sets `RA=1`, matching the rest of the
+  serving paths.
+
 ## [0.22.0] - 2026-06-23
 
 Major release: the default build now serves DNS **entirely on an in-house wire codec** — the
