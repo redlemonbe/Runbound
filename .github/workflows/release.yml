@@ -55,9 +55,13 @@ jobs:
       # ── Rust toolchain ───────────────────────────────────────────────────
       - name: Install Rust toolchain
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          # Idempotent: the self-hosted runner already has rustup; rustup-init
+          # refuses to run over an existing install, so only bootstrap if absent.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+          "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
 
       # ── Cargo cache ──────────────────────────────────────────────────────
       - name: Cache Cargo registry
