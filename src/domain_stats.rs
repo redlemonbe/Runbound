@@ -8,7 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap as StdHashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -38,12 +38,18 @@ thread_local! {
 
 pub struct DomainStats {
     map: DashMap<Box<str>, AtomicU64, ahash::RandomState>,
+    /// Approximate live entry count, maintained on insert. Used by `flush_tl` instead of
+    /// `DashMap::len()` (which read-locks EVERY shard): at high domain cardinality the map
+    /// stays full at MAX_TRACKED, so every untracked key hit the all-shard `len()` lock —
+    /// with N workers that collapsed XDP throughput ~2× (the dual-NIC 100K regression, #209).
+    entries: AtomicUsize,
 }
 
 impl DomainStats {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             map: DashMap::with_hasher(ahash::RandomState::default()),
+            entries: AtomicUsize::new(0),
         })
     }
 
@@ -153,11 +159,20 @@ impl DomainStats {
             for (k, n) in map.drain() {
                 if let Some(v) = self.map.get(k.as_ref()) {
                     v.fetch_add(n, Ordering::Relaxed);
-                } else if self.map.len() < MAX_TRACKED {
-                    self.map
-                        .entry(k)
-                        .or_insert_with(|| AtomicU64::new(0))
-                        .fetch_add(n, Ordering::Relaxed);
+                } else if self.entries.load(Ordering::Relaxed) < MAX_TRACKED {
+                    // Cheap atomic load instead of DashMap::len() (all-shard read lock).
+                    // Use the Entry API so we only bump `entries` when WE create the key;
+                    // a small over-count under a race is fine (MAX_TRACKED is a soft cap).
+                    use dashmap::mapref::entry::Entry;
+                    match self.map.entry(k) {
+                        Entry::Occupied(e) => {
+                            e.get().fetch_add(n, Ordering::Relaxed);
+                        }
+                        Entry::Vacant(e) => {
+                            e.insert(AtomicU64::new(n));
+                            self.entries.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             }
         });
