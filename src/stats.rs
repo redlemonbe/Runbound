@@ -14,6 +14,17 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use serde_json::Value as JsonValue;
 
+/// Flush a thread's qtype accumulator into the shared counters every N calls.
+const QTYPE_FLUSH: u64 = 512;
+
+thread_local! {
+    // Per-thread qtype accumulator for the XDP cache-hit hot path: contention-free (no
+    // shared atomic on the line-rate path), flushed into the shared `qtype_counts` every
+    // QTYPE_FLUSH calls. Mirrors the domain_stats thread-local pattern.
+    static TL_QTYPE: std::cell::RefCell<[u64; 256]> = const { std::cell::RefCell::new([0u64; 256]) };
+    static TL_QTYPE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Shared, lock-free snapshot cache.
 /// Updated every second by `qps_update_loop`; API handlers read it
 /// instead of calling `snapshot()` on every request (avoids ~360 atomic
@@ -202,6 +213,40 @@ impl Stats {
         }
     }
 
+    /// Contention-free qtype increment for the XDP cache-hit hot path. Accumulates in a
+    /// thread-local array (no shared atomic on the line-rate path), flushing into the
+    /// shared `qtype_counts` every QTYPE_FLUSH calls — same bounded-tail approximation as
+    /// `domain_stats`. `build_qtype_stats` then reads the shared counters unchanged.
+    #[inline]
+    pub fn inc_qtype_tl(&self, type_code: u16) {
+        if (type_code as usize) < 256 {
+            TL_QTYPE.with(|q| q.borrow_mut()[type_code as usize] += 1);
+        } else {
+            self.qtype_high.fetch_add(1, Ordering::Relaxed);
+        }
+        let calls = TL_QTYPE_CALLS.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
+        if calls % QTYPE_FLUSH == 0 {
+            self.flush_qtype_tl();
+        }
+    }
+
+    /// Drain this thread's qtype accumulator into the shared counters.
+    pub fn flush_qtype_tl(&self) {
+        TL_QTYPE.with(|q| {
+            let mut arr = q.borrow_mut();
+            for (i, v) in arr.iter_mut().enumerate() {
+                if *v > 0 {
+                    self.qtype_counts[i].fetch_add(*v, Ordering::Relaxed);
+                    *v = 0;
+                }
+            }
+        });
+    }
+
     #[inline]
     pub fn inc_total(&self) {
         self.total.fetch_add(1, Ordering::Relaxed);
@@ -375,22 +420,28 @@ impl Stats {
     }
 
     pub fn snapshot(&self) -> StatsSnapshot {
-        let total = self.total.load(Ordering::Relaxed);
         let blocked = self.blocked.load(Ordering::Relaxed);
         let nxdomain = self.nxdomain.load(Ordering::Relaxed);
-        let ch = self.cache_hits.load(Ordering::Relaxed);
-        let cm = self.cache_misses.load(Ordering::Relaxed);
-        // XDP fast path counts served packets (hits) per-worker and now misses too.
-        // When XDP is active use those; otherwise fall back to the slow-path counters.
+        let ch_slow = self.cache_hits.load(Ordering::Relaxed);
+        let cm_slow = self.cache_misses.load(Ordering::Relaxed);
+        // Cache hits/misses are SUMMED across BOTH datapaths — never switched:
+        //  - slow path (incl. XDP recursion-miss fallbacks, which go through serve_wire):
+        //    ch_slow / cm_slow via record_forward.
+        //  - XDP fast-path cache HITS: counted per-worker (XDP_WORKER_PKTS, contention-free);
+        //    they never touch the slow path, so they are added here. XDP MISSES fall back to
+        //    serve_wire and are already in cm_slow — adding XDP_WORKER_MISS would double-count.
         let xh: u64 = crate::dns::cache_snapshot::XDP_WORKER_PKTS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        let xm: u64 = crate::dns::cache_snapshot::XDP_WORKER_MISS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        let cache_hit_rate = if xh + xm > 0 {
-            (xh as f64 / (xh + xm) as f64 * 1000.0).round() / 10.0
-        } else if ch + cm > 0 {
-            (ch as f64 / (ch + cm) as f64 * 1000.0).round() / 10.0
+        let cache_hits = ch_slow + xh;
+        let cache_misses = cm_slow;
+        let cache_hit_rate = if cache_hits + cache_misses > 0 {
+            (cache_hits as f64 / (cache_hits + cache_misses) as f64 * 1000.0).round() / 10.0
         } else {
             0.0
         };
+        // total: self.total counts slow-path + XDP recursion-miss fallbacks; XDP fast-path
+        // hits are NOT counted on the line-rate hot path, so add them here (the exact same
+        // sum qps_update_loop already uses, so QPS and total stay consistent).
+        let total = self.total.load(Ordering::Relaxed) + xh;
         let (qps_1m, qps_5m, qps_peak) = self.qps_stats();
         let qtype_stats = Self::build_qtype_stats(&self.qtype_counts, self.qtype_high.load(Ordering::Relaxed));
         StatsSnapshot {
@@ -412,6 +463,9 @@ impl Stats {
             latency_avg_ms: { let c = self.lat_count.load(Ordering::Relaxed); if c > 0 { self.lat_sum_us.load(Ordering::Relaxed) as f64 / c as f64 / 1000.0 } else { 0.0 } },
             latency_max_ms: { let c = self.lat_count.load(Ordering::Relaxed); if c > 0 { self.lat_max_us.load(Ordering::Relaxed) as f64 / 1000.0 } else { 0.0 } },
             cache_hit_rate,
+            cache_hits,
+            cache_misses,
+            xdp_cache_hits: xh,
             cache_entries: self.cache_entries.load(Ordering::Relaxed),
             local_hits: self.local_hits.load(Ordering::Relaxed),
             dnssec_secure: self.dnssec_secure.load(Ordering::Relaxed),
@@ -465,6 +519,12 @@ pub struct StatsSnapshot {
     pub latency_avg_ms: f64,
     pub latency_max_ms: f64,
     pub cache_hit_rate: f64,
+    /// Raw cache-hit count, summed across slow path + XDP fast-path workers.
+    pub cache_hits: u64,
+    /// Raw cache-miss count (slow path incl. XDP recursion-miss fallbacks).
+    pub cache_misses: u64,
+    /// XDP fast-path cache hits alone (per-worker), for the "XDP fast path" UI/metric.
+    pub xdp_cache_hits: u64,
     pub cache_entries: u64,
     pub local_hits: u64,
     pub dnssec_secure: u64,
@@ -504,6 +564,9 @@ pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
         "latency_avg_ms":   snap.latency_avg_ms,
         "latency_max_ms":   snap.latency_max_ms,
         "cache_hit_rate":   snap.cache_hit_rate,
+        "cache_hits":       snap.cache_hits,
+        "cache_misses":     snap.cache_misses,
+        "xdp_cache_hits":   snap.xdp_cache_hits,
         "cache_entries":    snap.cache_entries,
         "dnssec": {
             "secure":   snap.dnssec_secure,
@@ -515,6 +578,46 @@ pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
             .map(|(k, v)| serde_json::json!({"type": k, "count": v}))
             .collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_sums_cache_counters() {
+        let s = Stats::new();
+        // record_forward: <2ms → cache hit, ≥2ms → cache miss.
+        s.record_forward(100);
+        s.record_forward(100);
+        s.record_forward(100);
+        s.record_forward(5000);
+        let snap = s.snapshot();
+        // No XDP workers run in a unit test → XDP_WORKER_PKTS sum (xh) is 0, so the
+        // canonical cache_hits equals the slow-path hits. This guards the SUM semantics
+        // (cache_hits = slow + xh) against a regression back to the XDP-only switch.
+        assert_eq!(snap.cache_hits, 3, "cache_hits must include slow-path hits");
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.cache_hit_rate, 75.0, "rate = hits/(hits+misses)");
+        assert_eq!(snap.xdp_cache_hits, 0, "no XDP traffic in unit test");
+    }
+
+    #[test]
+    fn qtype_tl_flushes_into_shared_counters() {
+        let s = Stats::new();
+        // Drain any thread-local residue from a previous test on this thread first.
+        s.flush_qtype_tl();
+        let base = s.qtype_counts[1].load(Ordering::Relaxed);
+        for _ in 0..10 {
+            s.inc_qtype_tl(1); // A records; <512 so they stay in the TL accumulator
+        }
+        s.flush_qtype_tl();
+        assert_eq!(
+            s.qtype_counts[1].load(Ordering::Relaxed) - base,
+            10,
+            "thread-local qtype accumulator must flush exactly into the shared counter"
+        );
+    }
 }
 
 // ── QPS + snapshot background task ────────────────────────────────────────

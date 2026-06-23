@@ -18,6 +18,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   available", and a client could treat the resolver as non-recursive and retry a blocked name on a
   secondary resolver, bypassing the block. `answer_local` now sets `RA=1`, matching the rest of the
   serving paths.
+- **Observability blind to the XDP fast path (stats under-counted in `xdp: yes`).** The XDP
+  cache-hit hot path intentionally skipped all per-query stats, counting only `XDP_WORKER_PKTS`.
+  In `xdp: yes` this left `total_queries`, `cache_hits/misses`, `cache_hit_rate`, `qtype_stats`
+  and `top-domains` blind to fast-path cache hits (e.g. `total` showed slow-path/fallback traffic
+  only; a cache-friendly hot domain was under-counted). Latent because production ran `xdp: no`.
+  Fixed:
+  - `total_queries` now adds the per-worker XDP hits (same sum `qps_update_loop` already used).
+  - `cache_hits`/`cache_misses`/`cache_hit_rate` are **summed across both datapaths** instead of
+    switching to XDP-only when XDP is active; raw `cache_hits`/`cache_misses` are now exposed in
+    `/api/stats`, and `xdp_cache_hits`/`xdp_cache_misses` plus the in-kernel
+    `xdp_kernel_snapshot_*` counters in `/api/system`.
+  - `qtype_stats` and `top-domains` now include XDP fast-path cache hits, attributed on the hot
+    path via **contention-free, allocation-free thread-local accumulators** (no shared atomic — the
+    pattern that caused the v0.9.9 regression — and `inc_wire` decodes the wire QNAME into a reused
+    buffer, allocating only when a domain is first seen).
+- **OpenMetrics mislabelled / XDP-only.** `runbound_cache_hits_total` reported XDP-worker hits only
+  when XDP was active (ignoring the slow path); `runbound_xdp_cache_hits_total` reported the
+  in-kernel eBPF snapshot (0 in AF_XDP copy mode) so it read 0 even while the workers served the
+  bulk of traffic. Now `runbound_cache_hits_total` is the true cross-datapath total,
+  `runbound_xdp_cache_hits_total` is the XDP fast-path (per-worker) hits, and the in-kernel snapshot
+  is exposed separately as `runbound_xdp_kernel_snapshot_{hits,misses}_total`.
+
+### Changed
+- **Huge pages now work under the unprivileged `runbound` user.** Reserving the 2 MiB pool needs
+  root, but consuming it (`mmap(MAP_HUGETLB)`) needs no privilege. The unit now reserves the pool at
+  boot via `ExecStartPre=+` (full privileges, outside the sandbox) driven by `RUNBOUND_HUGEPAGES_2M`
+  (default `0`; set per worker `ceil(UMEM/2MiB)` for `xdp: yes`), so the daemon no longer needs to
+  run as root or hold `CAP_SYS_ADMIN` to get huge pages. The fallback warning now points to this
+  knob instead of "run as root".
 
 ## [0.22.0] - 2026-06-23
 

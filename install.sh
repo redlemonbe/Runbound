@@ -273,6 +273,13 @@ Type=simple
 User=${RUN_USER}
 Group=${RUN_GROUP}
 EnvironmentFile=-${CONFIG_DIR}/env
+# Huge pages for the XDP/AF_XDP UMEM (PERF): reserving the 2 MiB pool needs root, but
+# consuming it (mmap MAP_HUGETLB) needs none — so reserve once at boot here and let the
+# unprivileged ${RUN_USER} user mmap them. ExecStartPre=+ runs with full privileges
+# outside the service sandbox. 0 = disabled (default, xdp: no); set to cover
+# ceil(UMEM_bytes/2MiB) per worker (e.g. 512 ≈ 1 GiB) when running xdp: yes.
+Environment=RUNBOUND_HUGEPAGES_2M=0
+ExecStartPre=+/bin/sh -c '[ "\${RUNBOUND_HUGEPAGES_2M:-0}" = 0 ] || echo "\${RUNBOUND_HUGEPAGES_2M}" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true'
 ExecStart=${BINARY_DST} ${CONFIG_DIR}/runbound.conf
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure

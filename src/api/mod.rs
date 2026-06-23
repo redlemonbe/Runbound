@@ -1101,13 +1101,21 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         .map(serde_json::Value::String)
         .unwrap_or(serde_json::Value::Null);
 
-    // XDP wire-format cache stats (#64)
+    // XDP wire-format cache stats (#64).
     let xdp_cache_entries =
         crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_ENTRIES.load(Ordering::Relaxed);
-    let xdp_hits = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS.load(Ordering::Relaxed);
-    let xdp_misses = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES.load(Ordering::Relaxed);
-    let xdp_cache_hit_rate = if xdp_hits + xdp_misses > 0 {
-        (xdp_hits as f64 / (xdp_hits + xdp_misses) as f64 * 1000.0).round() / 10.0
+    // In-kernel eBPF snapshot hits/misses: the BPF program answers directly, before the
+    // AF_XDP worker. 0 when the snapshot path isn't serving (e.g. copy mode on a VM).
+    let xdp_snapshot_hits = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS.load(Ordering::Relaxed);
+    let xdp_snapshot_misses = crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES.load(Ordering::Relaxed);
+    // XDP fast-path (per-worker) cache hits/misses — what the XDP datapath actually served
+    // from cache. This is the meaningful "is XDP serving from cache?" rate.
+    let xdp_cache_hits: u64 = crate::dns::cache_snapshot::XDP_WORKER_PKTS
+        .iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    let xdp_cache_misses: u64 = crate::dns::cache_snapshot::XDP_WORKER_MISS
+        .iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    let xdp_cache_hit_rate = if xdp_cache_hits + xdp_cache_misses > 0 {
+        (xdp_cache_hits as f64 / (xdp_cache_hits + xdp_cache_misses) as f64 * 1000.0).round() / 10.0
     } else {
         0.0
     };
@@ -1173,6 +1181,10 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
         "last_reconnect_at":    last_reconnect_at,
         "xdp_cache_entries":       xdp_cache_entries,
         "xdp_cache_hit_rate":      xdp_cache_hit_rate,
+        "xdp_cache_hits":          xdp_cache_hits,
+        "xdp_cache_misses":        xdp_cache_misses,
+        "xdp_kernel_snapshot_hits":   xdp_snapshot_hits,
+        "xdp_kernel_snapshot_misses": xdp_snapshot_misses,
         "xdp_domain_routing":      s.cfg.xdp_domain_routing,
         "xdp_worker_distribution": crate::dns::cache_snapshot::XDP_WORKER_PKTS
             .iter()
@@ -3802,15 +3814,33 @@ fn render_prometheus_metrics(
         "Whether XDP fast path is active (1=yes, 0=no)",
         xdp_active as u8,
     ));
+    // XDP fast-path cache: per-worker counters = what the XDP datapath actually served
+    // from cache / missed. This is the meaningful "is XDP serving cache?" signal — NOT
+    // the in-kernel eBPF snapshot below, which is 0 whenever the snapshot path isn't
+    // answering (e.g. AF_XDP copy mode on a VM) even though the workers serve at line rate.
+    let xdp_worker_hits: u64 = crate::dns::cache_snapshot::XDP_WORKER_PKTS
+        .iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).sum();
+    let xdp_worker_misses: u64 = crate::dns::cache_snapshot::XDP_WORKER_MISS
+        .iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).sum();
     out.push_str(&fmt_counter(
         "runbound_xdp_cache_hits_total",
-        "DNS responses served from XDP cache snapshot",
+        "DNS responses served from the XDP fast-path cache (per-worker)",
+        xdp_worker_hits,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_xdp_cache_misses_total",
+        "XDP fast-path cache lookups that missed (fell back to recursion)",
+        xdp_worker_misses,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_xdp_kernel_snapshot_hits_total",
+        "DNS responses answered directly by the in-kernel eBPF cache snapshot",
         crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_HITS
             .load(std::sync::atomic::Ordering::Relaxed),
     ));
     out.push_str(&fmt_counter(
-        "runbound_xdp_cache_misses_total",
-        "XDP cache lookups that missed",
+        "runbound_xdp_kernel_snapshot_misses_total",
+        "Lookups the in-kernel eBPF cache snapshot could not answer",
         crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
             .load(std::sync::atomic::Ordering::Relaxed),
     ));
@@ -3887,28 +3917,11 @@ fn render_prometheus_metrics(
 
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     let snap = s.stats.snapshot();
-    // Use the SAME source as snap.cache_hit_rate (XDP fast-path served/miss, with the
-    // slow-path counters as fallback when XDP is off) so hits_total/misses_total stay
-    // consistent with the rate: they previously read the slow-path counters while the rate
-    // read the XDP ones, giving e.g. hit_rate=14.7 reported alongside hits=0/misses=0.
-    let (cache_hits, cache_misses) = {
-        let xh: u64 = crate::dns::cache_snapshot::XDP_WORKER_PKTS
-            .iter()
-            .map(|c| c.load(Ordering::Relaxed))
-            .sum();
-        let xm: u64 = crate::dns::cache_snapshot::XDP_WORKER_MISS
-            .iter()
-            .map(|c| c.load(Ordering::Relaxed))
-            .sum();
-        if xh + xm > 0 {
-            (xh, xm)
-        } else {
-            (
-                s.stats.cache_hits.load(Ordering::Relaxed),
-                s.stats.cache_misses.load(Ordering::Relaxed),
-            )
-        }
-    };
+    // Canonical cache hits/misses = snapshot()'s SUMMED counters (slow path + XDP
+    // fast-path worker hits, no double-count). Reusing the snapshot fields guarantees
+    // hits_total/misses_total stay consistent with cache_hit_rate — both come from the
+    // same source instead of one reading XDP-only and the other slow-only.
+    let (cache_hits, cache_misses) = (snap.cache_hits, snap.cache_misses);
     let evictions = s.cache_evictions.load(Ordering::Relaxed);
     let xdp_active = s.xdp_active.load(Ordering::Relaxed) > 0;
     let upstreams: Vec<UpstreamMetric> = {

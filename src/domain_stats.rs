@@ -22,6 +22,9 @@ thread_local! {
     static TL_DS_BUF: RefCell<StdHashMap<Box<str>, u64>> =
         RefCell::new(StdHashMap::new());
     static TL_DS_CALLS: Cell<u64> = const { Cell::new(0) };
+    // Reused scratch for wire→dotted QNAME conversion on the XDP hot path (inc_wire),
+    // so cache-hit attribution allocates nothing in steady state.
+    static TL_NAME_BUF: RefCell<String> = RefCell::new(String::with_capacity(256));
 }
 
 pub struct DomainStats {
@@ -42,9 +45,69 @@ impl DomainStats {
     /// window may be temporarily invisible to GET /api/stats/top-domains —
     /// acceptable for a monitoring dashboard.
     pub fn inc(&self, domain: &str) {
+        // Check-then-insert: a repeat domain (the common case) only bumps a u64 and never
+        // allocates; a Box<str> key is built only the first time a domain appears in this
+        // thread's window. (Previously `entry(domain.into())` allocated on every call.)
         TL_DS_BUF.with(|buf| {
-            *buf.borrow_mut().entry(domain.into()).or_insert(0) += 1;
+            let mut b = buf.borrow_mut();
+            if let Some(v) = b.get_mut(domain) {
+                *v += 1;
+            } else {
+                b.insert(domain.into(), 1);
+            }
         });
+        let calls = TL_DS_CALLS.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
+        if calls % FLUSH_INTERVAL == 0 {
+            self.flush_tl();
+        }
+    }
+
+    /// Increment from a wire-format QNAME (length-prefixed labels, NUL-terminated) —
+    /// the form the XDP cache-hit hot path holds. Converts into a reused thread-local
+    /// String (zero per-hit heap allocation in steady state), producing the same dotted,
+    /// trailing-dot, lowercase key as the slow path so the two datapaths merge into one
+    /// count. Contention-free: writes a thread-local accumulator, flushed periodically.
+    pub fn inc_wire(&self, wire_qname: &[u8]) {
+        let counted = TL_NAME_BUF.with(|nb| {
+            let mut name = nb.borrow_mut();
+            name.clear();
+            let mut i = 0usize;
+            while i < wire_qname.len() {
+                let len = wire_qname[i] as usize;
+                if len == 0 {
+                    break; // root label → end of name
+                }
+                if len > 63 || i + 1 + len > wire_qname.len() {
+                    return false; // malformed wire → skip, count nothing
+                }
+                i += 1;
+                // Wire QNAME bytes are ASCII (already lowercased by the caller).
+                for &b in &wire_qname[i..i + len] {
+                    name.push(b as char);
+                }
+                name.push('.');
+                i += len;
+            }
+            if name.is_empty() {
+                return false;
+            }
+            TL_DS_BUF.with(|buf| {
+                let mut b = buf.borrow_mut();
+                if let Some(v) = b.get_mut(name.as_str()) {
+                    *v += 1;
+                } else {
+                    b.insert(name.as_str().into(), 1);
+                }
+            });
+            true
+        });
+        if !counted {
+            return;
+        }
         let calls = TL_DS_CALLS.with(|c| {
             let v = c.get().wrapping_add(1);
             c.set(v);
@@ -116,6 +179,38 @@ mod tests {
         ds.inc("b.com");
         ds.inc("c.com");
         assert_eq!(ds.top(2).len(), 2);
+    }
+
+    #[test]
+    fn inc_wire_decodes_and_merges_with_inc() {
+        let ds = DomainStats::new();
+        // Wire QNAME for "health.curseforge.com." : length-prefixed labels + root NUL.
+        // health=6, curseforge=10 (0x0a), com=3.
+        let wire = b"\x06health\x0acurseforge\x03com\x00";
+        for _ in 0..3 {
+            ds.inc_wire(wire);
+        }
+        // The slow-path string API must produce the SAME dotted key and merge into one count.
+        ds.inc("health.curseforge.com.");
+        let top = ds.top(10);
+        assert_eq!(
+            top[0],
+            ("health.curseforge.com.".to_string(), 4),
+            "inc_wire must decode to the same dotted, trailing-dot key as inc() and sum"
+        );
+    }
+
+    #[test]
+    fn inc_wire_rejects_malformed() {
+        let ds = DomainStats::new();
+        ds.inc_wire(b"\x40toolong");      // label length 64 > 63 max → skip
+        ds.inc_wire(b"\x06ab");           // claims 6 bytes, only 2 present → skip
+        ds.inc_wire(b"\x02ok\x00");        // well-formed "ok."
+        assert_eq!(
+            ds.top(10),
+            vec![("ok.".to_string(), 1)],
+            "malformed wire QNAMEs must be skipped, not counted"
+        );
     }
 
     #[test]

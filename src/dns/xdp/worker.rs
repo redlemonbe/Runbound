@@ -1660,13 +1660,18 @@ fn answer_from_cache(
             // Patch QID (bytes [0..2]) with the client's actual transaction ID.
             tx_dns[0] = qid[0];
             tx_dns[1] = qid[1];
-            // #perf: ZERO per-packet stats on the cache hot path. A server at line
-            // rate does not count per-packet cache stats (the v0.9.9 instrumentation
-            // made the cache SLOWER than the zero-alloc local-zone path). Total served
-            // is already counted per-worker in the worker loop (XDP_WORKER_PKTS,
-            // contention-free) and summed by qps_update_loop. This path is now as lean
-            // as answer_dns_wire.
-            let _ = (stats, domain_stats); // intentionally unused on the hot path
+            // Per-hit observability via CONTENTION-FREE, ALLOCATION-FREE thread-local
+            // accumulators (no shared atomic on the line-rate path, no heap per hit — the
+            // v0.9.9 regression came from shared atomics, which these avoid). This makes
+            // qtype_stats and top-domains include XDP fast-path cache hits instead of only
+            // the slow path. The hit itself is still counted by XDP_WORKER_PKTS in the
+            // worker loop, so total/cache_hits are unaffected (no double-count).
+            if let Some(st) = stats {
+                st.inc_qtype_tl(qtype);
+            }
+            if let Some(ds) = domain_stats {
+                ds.inc_wire(&qname_lc);
+            }
             return Some(wire.len());
         }
     }

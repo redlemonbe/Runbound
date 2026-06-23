@@ -352,10 +352,12 @@ fn alloc_umem_area(size: usize, hugepages: bool) -> Result<*mut libc::c_void, St
         // 4) Give up on huge pages — LOUD, actionable warning (not silent debug).
         tracing::warn!(
             size,
-            "UMEM: NO huge pages available and auto-reserve failed (not running as root?). \
-             Falling back to standard 4 KiB pages — EXPECT rx_no_dma drops and lower \
-             throughput under flood. Run runbound as root (it self-provisions huge pages) \
-             or pre-allocate at boot: sysctl -w vm.nr_hugepages=<N>."
+            "UMEM: no 2 MiB huge pages available — falling back to standard 4 KiB pages \
+             (EXPECT rx_no_dma drops and lower throughput under flood). Reserve them at boot \
+             so the unprivileged runbound user can mmap them (no CAP_SYS_ADMIN needed to \
+             consume a pre-reserved pool): set RUNBOUND_HUGEPAGES_2M in the systemd unit \
+             (its ExecStartPre reserves the 2 MiB pool as root), or manually: \
+             echo <N> > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages."
         );
     }
 
