@@ -14,8 +14,6 @@ pub mod tsig;
 pub mod prefetch;
 pub mod ratelimit;
 pub mod server;
-#[cfg(feature = "recursor")]
-pub mod recursor;
 // In-house iterative recursive resolver + DNSSEC validation (hickory-free).
 // The default serving path uses these for `resolution: full-recursion`.
 pub mod recursor_wire;
@@ -28,7 +26,7 @@ pub mod plain_server;
 pub mod wire;
 // hickory <-> wire converter — only the recursor handler and the differential
 // oracle tests still cross the boundary; gone from the default release build.
-#[cfg(any(feature = "recursor", test))]
+#[cfg(test)]
 pub mod wire_bridge;
 pub mod wire_serve;
 pub mod xdp;
@@ -73,43 +71,32 @@ impl From<&BlacklistAction> for ZoneAction {
     }
 }
 
-/// Stub types and functions exported when the `recursor` feature is disabled.
-/// Allows callers to use `dns::recursor::SharedRecursor`, `dns::recursor::mode_atomic()`,
-/// and `dns::recursor::shared_recursor()` unconditionally — they produce no-ops.
-#[cfg(not(feature = "recursor"))]
+/// Resolution-mode control. Iterative resolution + DNSSEC validation live in
+/// [`recursor_wire`] / [`dnssec_chain`] and run on the serving path; this module
+/// only carries the hot-swappable mode flag and a (stateless) handle for the API
+/// and relay plumbing.
 pub mod recursor {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU8;
     use crate::config::parser::ResolutionMode;
+    use std::sync::atomic::AtomicU8;
+    use std::sync::Arc;
 
-    /// Opaque no-op handle — forward mode only when recursor feature is off.
+    /// Stateless handle kept for API/relay plumbing; the validating resolver
+    /// holds no per-mode state of its own.
     #[derive(Clone)]
     pub struct SharedRecursor(());
 
     impl SharedRecursor {
-        pub fn load_full(&self) -> Option<Arc<()>> { None }
+        pub fn load_full(&self) -> Option<Arc<()>> {
+            None
+        }
     }
 
-    /// 1 for full-recursion, 0 for forward. The in-house validating resolver
-    /// (dns::recursor_wire + dns::dnssec_chain) serves full-recursion in the
-    /// default build, so this honours the configured mode even without the
-    /// (hickory) `recursor` feature.
+    /// 1 for full-recursion, 0 for forward — read on the serving hot path.
     pub fn mode_atomic(mode: ResolutionMode) -> Arc<AtomicU8> {
         Arc::new(AtomicU8::new(u8::from(mode == ResolutionMode::FullRecursion)))
     }
 
-    /// Returns a no-op SharedRecursor handle.
     pub fn shared_recursor(_mode: ResolutionMode, _dnssec: bool) -> SharedRecursor {
         SharedRecursor(())
-    }
-
-    /// No-op — recursor feature is off, rebuild always returns an error.
-    #[allow(dead_code)]
-    pub fn rebuild_shared(
-        _handle: &SharedRecursor,
-        _mode: ResolutionMode,
-        _dnssec: bool,
-    ) -> Result<(), String> {
-        Err("recursor feature not compiled in".into())
     }
 }

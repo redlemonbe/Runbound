@@ -44,7 +44,7 @@ pub enum ResolveResult {
     /// negative-cache yet (the XDP fast path has its own), so it is unread by default.
     NegativeAnswer {
         rcode: u16,
-        #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+        #[allow(dead_code)]
         neg_ttl: u32,
     },
     /// Transient error: timeout, connection failure, SERVFAIL, REFUSED

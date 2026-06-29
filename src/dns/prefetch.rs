@@ -26,7 +26,7 @@ impl PrefetchTracker {
     /// Increment the request counter for `domain` — lock-free on the fast path.
     /// Incomplete feature: only the recursor increments, and no executor drains the
     /// tracker (`take_hot` is test-only), so this is unused on the default path.
-    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn increment(&self, domain: &str) {
         if let Some(v) = self.inner.get(domain) {
             v.fetch_add(1, Ordering::Relaxed);

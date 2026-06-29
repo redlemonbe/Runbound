@@ -29,23 +29,9 @@ tokio = { version = "1", features = ["full", "io-uring"] }
 # DNS engine — DoT / DoH / DoQ / DNSSEC
 # 0.26.1 fixes RUSTSEC-2026-0119 (O(n²) compression), RUSTSEC-2026-0037 (quinn DoS),
 # RUSTSEC-2025-0009 (ring AES panic), RUSTSEC-2026-0104/0098/0099 (rustls-webpki).
-hickory-server   = { version = "0.26", optional = true, features = [
-    "dnssec-ring",
-    "tls-ring",
-    "https-ring",
-    "quic-ring",
-] }
-hickory-resolver = { version = "0.26", optional = true, features = [
-    "dnssec-ring",
-    "tokio",
-    "tls-ring",
-    "https-ring",
-    "recursor",
-    "webpki-roots",
-] }
-hickory-proto    = { version = "0.26", features = [
-    "dnssec-ring",
-], optional = true }
+# hickory is fully removed from the runtime: recursion + DNSSEC validation are
+# in-house (dns::recursor_wire + dns::dnssec_*). hickory-proto remains only as a
+# dev-dependency for the differential oracle tests (see [dev-dependencies]).
 
 # TLS — rustls 0.23 (TLS 1.3 default, rustls-webpki CVEs fixed)
 rustls              = { version = "0.23", features = ["tls12"] }
@@ -180,8 +166,6 @@ fuzz = []
 # Adds 6 AtomicU64 per interface + a logger thread — NEVER enable in production benchmarks.
 # Disabled by default (zero cost when off).
 xdp-debug-counters = []
-# Sovereign full-recursion path (hickory-resolver recursor).
-recursor = ["dep:hickory-resolver", "dep:hickory-server", "dep:hickory-proto"]
 
 [dependencies.aya]
 version  = "0.13"

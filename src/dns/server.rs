@@ -12,44 +12,17 @@
 // UDP + TCP on the configured port (default 53).
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-// FromStr / bare OnceLock are only used by the recursor-gated identity-probe set.
-#[cfg(feature = "recursor")]
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
-#[cfg(feature = "recursor")]
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use base64::Engine as _;
-#[cfg(feature = "recursor")]
-use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-#[cfg(feature = "recursor")]
-use hickory_proto::op::Query as DnsQuery;
-#[cfg(feature = "recursor")]
-use hickory_proto::op::{Edns, Message, MessageType, Metadata, OpCode, ResponseCode};
 use crate::dns::tsig::TsigAlg;
-#[cfg(feature = "recursor")]
-use hickory_proto::rr::{LowerName, Name};
-#[cfg(feature = "recursor")]
-use hickory_proto::rr::{RData, Record, RecordType};
-#[cfg(feature = "recursor")]
-use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-#[cfg(feature = "recursor")]
-use hickory_server::{
-    net::{BufDnsStreamHandle, runtime::Time},
-    server::{Request, RequestHandler, ResponseHandle, ResponseHandler, ResponseInfo},
-    zone_handler::{MessageRequest, MessageResponseBuilder},
-};
-#[cfg(feature = "recursor")]
-use hickory_server::net::xfer::Protocol as DnsProtocol;
 
 use crate::dns::forward::{self as forward_pool, ForwardPool};
-#[cfg(feature = "recursor")]
-use crate::dns::forward::ResolveResult;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -57,8 +30,6 @@ use tracing::{debug, error, info, warn};
 
 use super::acl::{Acl, AclAction, PrivateAddressSet};
 use super::local::LocalZoneSet;
-#[cfg(feature = "recursor")]
-use super::local::ZoneAction;
 use super::ratelimit::RateLimiter;
 use super::kernel_loop::FallbackMsg;
 use crate::config::parser::TlsConfig;
@@ -91,40 +62,6 @@ fn tarpit_delay() -> Duration {
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 
-// SEC-L6: outer fuse for the sovereign full-recursion path (#202). 5s caps total
-// worker occupancy while tolerating a legitimately cold deep lookup.
-#[cfg(feature = "recursor")]
-const RECURSION_TIMEOUT: Duration = Duration::from_secs(5);
-
-// ── Identity-probe name set (zero-alloc hot path) ──────────────────────────
-// Initialised once on first DNS query; compared directly as LowerName.
-// Avoids a String allocation per request for the CHAOS identity-probe check.
-// recursor-only: the wire serving path uses an inline literal-match identity probe.
-#[cfg(feature = "recursor")]
-static IDENTITY_PROBE_NAMES: OnceLock<[LowerName; 4]> = OnceLock::new();
-
-#[cfg(feature = "recursor")]
-fn identity_probe_names() -> &'static [LowerName; 4] {
-    IDENTITY_PROBE_NAMES.get_or_init(|| {
-        [
-            LowerName::from(
-                Name::from_str("version.bind.")
-                    .unwrap_or_else(|e| panic!("bad static DNS name: {e}")),
-            ),
-            LowerName::from(
-                Name::from_str("hostname.bind.")
-                    .unwrap_or_else(|e| panic!("bad static DNS name: {e}")),
-            ),
-            LowerName::from(
-                Name::from_str("id.server.").unwrap_or_else(|e| panic!("bad static DNS name: {e}")),
-            ),
-            LowerName::from(
-                Name::from_str("version.server.")
-                    .unwrap_or_else(|e| panic!("bad static DNS name: {e}")),
-            ),
-        ]
-    })
-}
 
 // ============================================================
 // Handler
@@ -146,22 +83,22 @@ pub struct RunboundHandler {
     /// DNSSEC tracking enabled — mirrors `dnssec-validation: yes` in config.
     /// Read by the recursor's forward-validation path; the wire path's DNSSEC is
     /// served by `zone_signer` (local signed zones), so this is unread by default.
-    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+    #[allow(dead_code)]
     dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// #201: online DNSSEC signer for local zones — hot-swappable so the slave adopts the
     /// master's replicated keys at runtime. Inner `None` when local-zone-dnssec is off.
     zone_signer: crate::dns::zone_signer::SharedZoneSigner,
     /// #202: resolution mode — 0 = forward (default), 1 = full-recursion. Hot-swappable.
-    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
     resolution_mode: Arc<std::sync::atomic::AtomicU8>,
-    /// #202: sovereign full-recursion backend; `Some(..)` only when resolution=full-recursion.
-    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+    /// #202: stateless handle for the API/relay plumbing (the validating resolver
+    /// itself is stateless).
+    #[allow(dead_code)]
     recursor: crate::dns::recursor::SharedRecursor,
     /// Optional prefetch tracker — None when prefetch: no (default).
     /// NOTE: the tracker is incremented only on the recursor path and no executor
     /// ever drains it (`take_hot` is test-only) — prefetch is an incomplete feature
     /// pending a prefetch loop (see audit finding). Unread on the default path.
-    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+    #[allow(dead_code)]
     prefetch_tracker: Option<Arc<crate::dns::prefetch::PrefetchTracker>>,
     /// #60: mutable cache map shared with XDP workers (via publish_loop).
     /// None when xdp-cache-snapshot: no or XDP feature not compiled.
@@ -183,9 +120,6 @@ pub struct RunboundHandler {
     resolv_fallback: bool,
     /// #94: true while resolv.conf fallback is active.
     pub fallback_active: Arc<std::sync::atomic::AtomicBool>,
-    /// #108: serve-stale cache (recursor path) — hickory-typed, fed by the legacy handler.
-    #[cfg(feature = "recursor")]
-    stale_cache: Option<Arc<dashmap::DashMap<(hickory_proto::rr::LowerName, hickory_proto::rr::RecordType), (Vec<hickory_proto::rr::Record>, std::time::Instant), ahash::RandomState>>>,
     /// #108: serve-stale cache (default wire serving path) — wire-native, keyed by
     /// (lowercased presentation name, qtype). Fed on a successful forward, served on
     /// a transient upstream SERVFAIL (RFC 8767). `None` when serve-stale is off.
@@ -216,7 +150,7 @@ pub struct RunboundHandler {
     /// #204: DDR (RFC 9462) endpoint info, Some when `ddr: yes` + a TLS hostname is set.
     /// DDR SVCB synthesis is not yet ported to the wire serving path — recursor-only
     /// (the synthesiser returns hickory records). See audit finding.
-    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+    #[allow(dead_code)]
     ddr: Option<DdrInfo>,
 }
 
@@ -336,12 +270,6 @@ impl RunboundHandler {
             domain_stats,
             resolv_fallback,
             fallback_active,
-            #[cfg(feature = "recursor")]
-            stale_cache: if serve_stale {
-                Some(Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default())))
-            } else {
-                None
-            },
             stale_cache_wire: if serve_stale {
                 Some(Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default())))
             } else {
@@ -384,745 +312,6 @@ impl RunboundHandler {
         }
     }
 
-    /// Record a completed query: latency histogram, log buffer push, tracing log.
-    /// Cache metrics (record_forward) and domain counters are updated at call sites.
-    #[inline]
-    #[cfg(feature = "recursor")]
-    fn record_query(
-        &self,
-        client: IpAddr,
-        qname: &hickory_proto::rr::LowerName,
-        qtype: RecordType,
-        rcode: ResponseCode,
-        action: LogAction,
-        start: Instant,
-    ) {
-        let elapsed = start.elapsed();
-        let elapsed_us = elapsed.as_micros() as u64;
-        let elapsed_ms = elapsed.as_millis() as u32;
-
-        self.stats.record_latency_us(elapsed_us);
-        if action == LogAction::Local {
-            self.stats.inc_local_hits();
-        }
-
-        // MED-06: sanitize the DNS name before structured log emission to prevent
-        // log injection via control characters embedded in query names.
-        //
-        // Notable = any non-NoError response or explicitly blocked action.
-        // Rate-limited queries arrive here as ResponseCode::Refused + LogAction::Refused,
-        // so they are covered by the rcode check.
-        //
-        // Guard levels:
-        //   verbosity:0 (ERROR) — WARN disabled → outer check false → zero alloc, zero mutex.
-        //   verbosity:1 (WARN)  — notable queries only: log buffer push + warn!, NOERROR skipped.
-        //   verbosity:2 (INFO)  — all queries: log buffer push + info!.
-        let is_notable = rcode != ResponseCode::NoError || matches!(action, LogAction::Blocked);
-
-        if tracing::enabled!(tracing::Level::INFO)
-            || (is_notable
-                && tracing::enabled!(tracing::Level::WARN)
-                && self.log_buffer.is_enabled())
-        {
-            let safe_name = sanitize_dns_name(qname);
-            let safe_name_str = safe_name.to_string();
-            let client_log = self.log_buffer.push_query(
-                &safe_name_str,
-                &client,
-                u16::from(qtype),
-                action,
-                elapsed_ms,
-            );
-            info!(
-                client = %client_log,
-                name   = %safe_name,
-                qtype  = %qtype,
-                rcode  = %rcode,
-                action = action.as_str(),
-                ms     = elapsed_ms,
-                "query"
-            );
-        }
-    }
-}
-
-impl RunboundHandler {
-
-    /// was found and the query should fall through to recursive resolution.
-    /// Core zone lookup logic. Accepts an explicit zone set (for split-horizon or global use).
-    #[cfg(feature = "recursor")]
-    async fn handle_zone_set<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        mut response_handle: R,
-        qname: &LowerName,
-        qtype: RecordType,
-        client_ip: IpAddr,
-        start: Instant,
-        zones_snap: &LocalZoneSet,
-    ) -> Result<ResponseInfo, R> {
-
-        let zone_action = zones_snap.find(qname);
-
-        match zone_action {
-            Some(ZoneAction::Refuse) => {
-                debug!(name=%sanitize_dns_name(qname), "local-zone REFUSED");
-                self.stats.inc_blocked();
-                self.stats.inc_refused();
-                self.record_query(
-                    client_ip,
-                    qname,
-                    qtype,
-                    ResponseCode::Refused,
-                    LogAction::Blocked,
-                    start,
-                );
-                return Ok(send_error(request, response_handle, ResponseCode::Refused).await);
-            }
-            Some(ZoneAction::NxDomain) => {
-                debug!(name=%sanitize_dns_name(qname), "local-zone NXDOMAIN");
-                self.stats.inc_blocked();
-                self.stats.inc_nxdomain();
-                self.record_query(
-                    client_ip,
-                    qname,
-                    qtype,
-                    ResponseCode::NXDomain,
-                    LogAction::Blocked,
-                    start,
-                );
-                return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
-            }
-            Some(ZoneAction::BlockPage) => {
-                debug!(name=%sanitize_dns_name(qname), "local-zone BlockPage redirect");
-                self.stats.inc_blocked();
-                self.record_query(client_ip, qname, qtype, ResponseCode::NXDomain, LogAction::Blocked, start);
-                // If block_page_ip is configured, it was pre-inserted as a Static A record.
-                // Fall through to NxDomain if no record found.
-                let bp_records = zones_snap.local_records(qname, qtype);
-                if !bp_records.is_empty() {
-                    let mut metadata = Metadata::response_from_request(&request.metadata);
-                    metadata.authoritative = true;
-                    let opt_edns = make_opt_edns(request);
-                    let mut builder = MessageResponseBuilder::from_message_request(request);
-                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                    let response = builder.build(metadata, bp_records, std::iter::empty(), std::iter::empty(), std::iter::empty());
-                    return Ok(response_handle.send_response(response).await.unwrap_or_else(|e| { tracing::error!("bp send: {e}"); servfail_info(request) }));
-                }
-                return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
-            }
-            Some(ZoneAction::Static) | Some(ZoneAction::Redirect) => {
-                let records = zones_snap.local_records(qname, qtype);
-
-                if !records.is_empty() {
-                    debug!(name=%sanitize_dns_name(qname), count = records.len(), "local-data answer");
-                    let mut metadata = Metadata::response_from_request(&request.metadata);
-                    metadata.authoritative = true;
-                    // DNSSEC signing for signed zones is served wire-native in serve_wire;
-                    // this fallback path serves the unsigned RRset.
-                    let opt_edns = make_opt_edns(request);
-                    let mut builder = MessageResponseBuilder::from_message_request(request);
-                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                    let answer: Vec<Record> = records.iter().map(|r| (*r).clone()).collect();
-                    let response = builder.build(metadata, answer.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
-                    self.record_query(
-                        client_ip,
-                        qname,
-                        qtype,
-                        ResponseCode::NoError,
-                        LogAction::Local,
-                        start,
-                    );
-                    return Ok(response_handle
-                        .send_response(response)
-                        .await
-                        .unwrap_or_else(|e| {
-                            error!("send: {e}");
-                            servfail_info(request)
-                        }));
-                }
-
-                // CNAME chain following (RFC 1034 §3.6.2)
-                if qtype != RecordType::CNAME {
-                    let answers = follow_local_cname(&zones_snap, qname, qtype);
-                    if !answers.is_empty() {
-                        // Signed CNAME chains are served wire-native in serve_wire.
-                        let mut metadata = Metadata::response_from_request(&request.metadata);
-                        metadata.authoritative = true;
-                        let opt_edns = make_opt_edns(request);
-                    let mut builder = MessageResponseBuilder::from_message_request(request);
-                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                        let response = builder.build(
-                            metadata,
-                            answers.iter(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                        );
-                        self.record_query(
-                            client_ip,
-                            qname,
-                            qtype,
-                            ResponseCode::NoError,
-                            LogAction::Local,
-                            start,
-                        );
-                        return Ok(response_handle
-                            .send_response(response)
-                            .await
-                            .unwrap_or_else(|e| {
-                                error!("send: {e}");
-                                servfail_info(request)
-                            }));
-                    }
-                }
-
-                // RFC 1035 §3.7 / RFC 2308: NODATA vs NXDOMAIN
-                if zones_snap.name_has_records(qname) {
-                    debug!(name=%sanitize_dns_name(qname), %qtype, "local-zone NODATA");
-                    // Signed NODATA (NSEC3 + SOA) is served wire-native in serve_wire; this
-                    // fallback path only ever sees unsigned local zones or non-DO clients.
-                    let mut metadata = Metadata::response_from_request(&request.metadata);
-                    metadata.authoritative = true;
-                    let opt_edns = make_opt_edns(request);
-                    let mut builder = MessageResponseBuilder::from_message_request(request);
-                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                    let response = builder.build(
-                        metadata,
-                        std::iter::empty::<&Record>(),
-                        std::iter::empty(),
-                        std::iter::empty(),
-                        std::iter::empty(),
-                    );
-                    self.record_query(
-                        client_ip,
-                        qname,
-                        qtype,
-                        ResponseCode::NoError,
-                        LogAction::Local,
-                        start,
-                    );
-                    return Ok(response_handle
-                        .send_response(response)
-                        .await
-                        .unwrap_or_else(|e| {
-                            error!("send: {e}");
-                            servfail_info(request)
-                        }));
-                }
-                debug!(name=%sanitize_dns_name(qname), "local-zone NXDOMAIN (name not found)");
-                self.record_query(
-                    client_ip,
-                    qname,
-                    qtype,
-                    ResponseCode::NXDomain,
-                    LogAction::Nxdomain,
-                    start,
-                );
-                // Signed NXDOMAIN denial is served wire-native in serve_wire.
-                return Ok(send_error(request, response_handle, ResponseCode::NXDomain).await);
-            }
-            None => {}
-        }
-        // Reached only via the None arm — response_handle was not consumed.
-        Err(response_handle)
-    }
-
-    /// Global local-zone lookup (delegates to handle_zone_set with self.zones).
-    #[cfg(feature = "recursor")]
-    async fn handle_local_zone<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        response_handle: R,
-        qname: &LowerName,
-        qtype: RecordType,
-        client_ip: IpAddr,
-        start: Instant,
-    ) -> Result<ResponseInfo, R> {
-        let zones_guard = self.zones.load();
-        self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, &zones_guard).await
-    }
-
-    #[cfg(feature = "recursor")]
-    /// #202: sovereign full-recursion — resolve from the root via the recursor, then build
-    /// and send the response with correct DNSSEC semantics.
-    ///
-    /// The hickory recursor attaches a `Proof` (Secure / Insecure / Bogus / Indeterminate) to
-    /// every record but does **not** itself enforce it; enforcement is the resolver's job here:
-    ///   - Bogus data is refused with SERVFAIL (RFC 4035), unless the client set the CD bit.
-    ///   - The AD bit is set only when every answer + authority record is cryptographically Secure.
-    ///   - NXDOMAIN / NODATA come back as errors; turned into proper negative responses (rcode +
-    ///     SOA, plus the NSEC3 proof + AD bit when the recursor exposes a validated NODATA denial —
-    ///     a bogus denial is refused), not SERVFAIL.
-    ///   - On a transient recursion failure, a recent answer is served stale (RFC 8767).
-    /// #202 metrics: increment the rcode counter for a recursion-served response. The rcode
-    /// is known internally here but the returned `ResponseInfo` hides it, so the recursion
-    /// path accounts for it itself (without this nxdomain/servfail/refused stayed 0 on a
-    /// full-recursion forwarder). NoError is intentionally not counted.
-    fn count_recursion_rcode(&self, rcode: ResponseCode) {
-        match rcode {
-            ResponseCode::NXDomain => self.stats.inc_nxdomain(),
-            ResponseCode::ServFail => self.stats.inc_servfail(),
-            ResponseCode::Refused => self.stats.inc_refused(),
-            _ => {}
-        }
-    }
-
-    #[cfg(feature = "recursor")]
-    #[cfg(feature = "recursor")]
-    async fn resolve_recursive<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        mut response_handle: R,
-        qname: &LowerName,
-        qtype: RecordType,
-        recursor: &crate::dns::recursor::SovereignRecursor,
-    ) -> ResponseInfo {
-        let dnssec_ok = request.edns.as_ref().map(|e| e.flags().dnssec_ok).unwrap_or(false);
-        let cd = request.metadata.checking_disabled;
-        let validating = self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed);
-        let query = hickory_proto::op::Query::query(Name::from(qname), qtype);
-        let resolved = match tokio::time::timeout(
-            RECURSION_TIMEOUT,
-            crate::dns::recursor::recursor_resolve(recursor, query, dnssec_ok),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => {
-                warn!(%qname, "full-recursion: outer timeout — SERVFAIL");
-                self.count_recursion_rcode(ResponseCode::ServFail);
-                return send_error(request, response_handle, ResponseCode::ServFail).await;
-            }
-        };
-        match resolved {
-            Ok(msg) => {
-                // DNSSEC enforcement: never serve Bogus data unless the client disabled checking.
-                let bogus = msg
-                    .answers
-                    .iter()
-                    .chain(msg.authorities.iter())
-                    .any(|r| r.proof.is_bogus());
-                if bogus && !cd {
-                    warn!(%qname, "full-recursion: DNSSEC validation failed (bogus) — SERVFAIL");
-                    self.stats.inc_dnssec_bogus();
-                    self.count_recursion_rcode(ResponseCode::ServFail);
-                    return send_error(request, response_handle, ResponseCode::ServFail).await;
-                }
-                // AD bit: authenticated only when every answer + authority record is Secure.
-                let has_records = !msg.answers.is_empty() || !msg.authorities.is_empty();
-                let all_secure = has_records
-                    && msg
-                        .answers
-                        .iter()
-                        .chain(msg.authorities.iter())
-                        .all(|r| r.proof.is_secure());
-                let rcode = msg.metadata.response_code;
-                self.count_recursion_rcode(rcode);
-                let mut answers = msg.answers;
-                let mut authority = msg.authorities;
-                let mut additionals = msg.additionals;
-                // RFC 8767: remember the fresh answer so a later recursion failure can serve it stale.
-                self.store_stale(qname, qtype, &answers);
-                // RFC 4035 §3.2.1: strip DNSSEC records when the client did not set DO. We do this
-                // by hand against the known qtype — the recursor's own strip is a no-op here
-                // because its response carries no question section to infer the type from.
-                if !dnssec_ok {
-                    let keep =
-                        |r: &Record| r.record_type() == qtype || !r.record_type().is_dnssec();
-                    answers.retain(keep);
-                    authority.retain(keep);
-                    additionals.retain(keep);
-                }
-                let mut metadata = Metadata::response_from_request(&request.metadata);
-                metadata.recursion_available = true;
-                metadata.response_code = rcode;
-                metadata.authentic_data = validating && !cd && all_secure;
-                let opt_edns = make_opt_edns(request);
-                let mut builder = MessageResponseBuilder::from_message_request(request);
-                if let Some(ref opt) = opt_edns {
-                    builder.edns(opt);
-                }
-                let response = builder.build(
-                    metadata,
-                    answers.iter(),
-                    authority.iter(),
-                    std::iter::empty(),
-                    additionals.iter(),
-                );
-                response_handle.send_response(response).await.unwrap_or_else(|e| {
-                    error!("recursive send: {e}");
-                    servfail_info(request)
-                })
-            }
-            // NXDOMAIN / NODATA: build a proper negative response.
-            Err(e) if e.is_nx_domain() || e.is_no_records_found() => {
-                let rcode = if e.is_nx_domain() {
-                    ResponseCode::NXDomain
-                } else {
-                    ResponseCode::NoError
-                };
-                self.count_recursion_rcode(rcode);
-                let mut authority: Vec<Record> = Vec::new();
-                let mut ad = false;
-                // When the recursor surfaces the authenticated-denial records (NODATA →
-                // RecursorError::Negative), include the NSEC3/SOA proof and set AD when it is Secure
-                // (RFC 6840); refuse a bogus denial. NXDOMAIN comes back as Net(NetError), which does
-                // not expose the proof records, so we fall back to the SOA alone (AD stays unset).
-                match e {
-                    hickory_resolver::recursor::RecursorError::Negative(ad_data) => {
-                        if let Some(a) = ad_data.authorities {
-                            authority.extend(a.iter().cloned());
-                        } else if let Some(s) = ad_data.soa {
-                            authority.push((*s).into_record_of_rdata());
-                        }
-                        if !cd && authority.iter().any(|r| r.proof.is_bogus()) {
-                            warn!(%qname, "full-recursion: bogus authenticated denial — SERVFAIL");
-                            self.count_recursion_rcode(ResponseCode::ServFail);
-                            return send_error(request, response_handle, ResponseCode::ServFail).await;
-                        }
-                        ad = validating
-                            && !cd
-                            && !authority.is_empty()
-                            && authority.iter().all(|r| r.proof.is_secure());
-                    }
-                    other => {
-                        if let Some(s) = other.into_soa() {
-                            authority.push((*s).into_record_of_rdata());
-                        }
-                    }
-                }
-                // RFC 4035 §3.2.1: strip DNSSEC (NSEC3/RRSIG) records when the client did not set DO.
-                if !dnssec_ok {
-                    let keep =
-                        |r: &Record| r.record_type() == qtype || !r.record_type().is_dnssec();
-                    authority.retain(keep);
-                }
-                let mut metadata = Metadata::response_from_request(&request.metadata);
-                metadata.recursion_available = true;
-                metadata.response_code = rcode;
-                metadata.authentic_data = ad;
-                let opt_edns = make_opt_edns(request);
-                let mut builder = MessageResponseBuilder::from_message_request(request);
-                if let Some(ref opt) = opt_edns {
-                    builder.edns(opt);
-                }
-                let response = builder.build(
-                    metadata,
-                    std::iter::empty::<&Record>(),
-                    authority.iter(),
-                    std::iter::empty(),
-                    std::iter::empty(),
-                );
-                response_handle.send_response(response).await.unwrap_or_else(|e| {
-                    error!("recursive neg send: {e}");
-                    servfail_info(request)
-                })
-            }
-            // Transient failure: RFC 8767 serve-stale if we have a recent answer, else SERVFAIL.
-            Err(e) => {
-                warn!(%qname, "full-recursion failed: {e}");
-                if let Some(info) = self
-                    .try_serve_stale(request, &mut response_handle, qname, qtype)
-                    .await
-                {
-                    return info;
-                }
-                self.count_recursion_rcode(ResponseCode::ServFail);
-                send_error(request, response_handle, ResponseCode::ServFail).await
-            }
-        }
-    }
-
-    /// #108/#202: remember a fresh positive answer in the serve-stale cache (LRU-evicted).
-    #[cfg(feature = "recursor")]
-    fn store_stale(&self, qname: &LowerName, qtype: RecordType, records: &[Record]) {
-        if let Some(ref sc) = self.stale_cache {
-            if !records.is_empty() {
-                if sc.len() >= self.cache_max_entries {
-                    if let Some(old_key) = sc.iter().next().map(|e| e.key().clone()) {
-                        sc.remove(&old_key);
-                    }
-                }
-                sc.insert(
-                    (qname.clone(), qtype),
-                    (records.to_vec(), std::time::Instant::now()),
-                );
-            }
-        }
-    }
-
-    /// #202: RFC 8767 serve-stale on the recursion path — if a recent answer is cached, serve it
-    /// (TTL capped at `stale_answer_ttl`) instead of SERVFAIL. Returns `None` if nothing to serve.
-    #[cfg(feature = "recursor")]
-    #[cfg(feature = "recursor")]
-    async fn try_serve_stale<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        response_handle: &mut R,
-        qname: &LowerName,
-        qtype: RecordType,
-    ) -> Option<ResponseInfo> {
-        let sc = self.stale_cache.as_ref()?;
-        let capped: Vec<Record> = {
-            let entry = sc.get(&(qname.clone(), qtype))?;
-            let (ref stale_records, stored_at) = *entry;
-            if stored_at.elapsed().as_secs() > self.stale_max_age || stale_records.is_empty() {
-                return None;
-            }
-            let stale_ttl = self.stale_answer_ttl;
-            stale_records
-                .iter()
-                .map(|r| {
-                    let mut rc = r.clone();
-                    rc.ttl = stale_ttl;
-                    rc
-                })
-                .collect()
-        };
-        self.stats.inc_stale_served();
-        info!(name = %sanitize_dns_name(qname), ttl = self.stale_answer_ttl, "serve-stale (recursion)");
-        let mut metadata = Metadata::response_from_request(&request.metadata);
-        metadata.recursion_available = true;
-        let opt_edns = make_opt_edns(request);
-        let mut builder = MessageResponseBuilder::from_message_request(request);
-        if let Some(ref opt) = opt_edns {
-            builder.edns(opt);
-        }
-        let response = builder.build(
-            metadata,
-            capped.iter(),
-            std::iter::empty(),
-            std::iter::empty(),
-            std::iter::empty(),
-        );
-        Some(response_handle.send_response(response).await.unwrap_or_else(|e| {
-            error!("stale send: {e}");
-            servfail_info(request)
-        }))
-    }
-
-    /// Recursive upstream resolution with DNSSEC validation and rebinding protection.
-    #[cfg(feature = "recursor")]
-    async fn resolve_upstream<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        mut response_handle: R,
-        qname: &LowerName,
-        qtype: RecordType,
-        client_ip: IpAddr,
-        start: Instant,
-    ) -> ResponseInfo {
-        // #202: sovereign full-recursion path — resolve iteratively from the root.
-        #[cfg(feature = "recursor")]
-        if self.resolution_mode.load(std::sync::atomic::Ordering::Relaxed) == 1 {
-            let snap = self.recursor.load_full();
-            if let Some(rec) = snap.as_ref() {
-                // #202 metrics: every non-local query on the recursion path is resolved
-                // externally — count it as forwarded. The response rcode (nxdomain/servfail/
-                // refused) is counted inside resolve_recursive where it is known, because the
-                // returned ResponseInfo does not expose it. Without this a full-recursion
-                // forwarder reported 0 forwarded and 0 nxdomain while serving real negatives.
-                self.stats.inc_forwarded();
-                return self
-                    .resolve_recursive(request, response_handle, qname, qtype, &**rec)
-                    .await;
-            }
-            // recursor not available (build failed) — fall through to forwarding.
-        }
-        // #33: racing mode — send to all upstreams simultaneously, first wins.
-        // Forward the query via ForwardPool (races all upstreams, first definitive wins).
-        let query_wire: Vec<u8> = {
-            let mut msg = Message::new(request.metadata.id, MessageType::Query, OpCode::Query);
-            msg.metadata.recursion_desired = true;
-            if let Ok(info) = request.request_info() {
-                msg.add_query(info.query.original().clone());
-            }
-            let mut wire = Vec::with_capacity(512);
-            let mut enc = BinEncoder::new(&mut wire);
-            msg.emit(&mut enc).unwrap_or_default();
-            wire
-        };
-        let (fwd_result, winner) = self.pool.load().forward(&query_wire).await;
-        // #33: record racing win for the upstream that produced the first definitive result.
-        if let Some(ref w) = winner {
-            self.racing_wins
-                .entry(w.clone())
-                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        // #94: resolv.conf fallback when all configured upstreams fail.
-        if matches!(fwd_result, ResolveResult::Servfail) {
-            if self.resolv_fallback
-                && !self.fallback_active.load(Ordering::Relaxed)
-                && crate::upstreams::all_non_temporary_unhealthy(&self.upstreams)
-                && self.fallback_active
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let ups = Arc::clone(&self.upstreams);
-                let pool_rebuild = Arc::clone(&self.pool);
-                tokio::spawn(async move {
-                    crate::upstreams::add_resolv_fallback(&ups);
-                    let addrs = crate::upstreams::upstream_addrs(&ups);
-                    let _ = rebuild_and_swap(&pool_rebuild, &addrs, false).await;
-                    warn!("resolv.conf fallback activated");
-                });
-            }
-        }
-        match fwd_result {
-            ResolveResult::Answer { records } => {
-                // de-hickory: forward returns wire::Record; bridge to hickory at the
-                // response-building boundary (transitional — bridge drops with the handler rewrite).
-                let records: Vec<Record> = records
-                    .iter()
-                    .filter_map(crate::dns::wire_bridge::to_hickory)
-                    .collect();
-                if !self.private_addrs.is_empty() {
-                    for rec in &records {
-                        let private_ip = match &rec.data {
-                            RData::A(a) => Some(IpAddr::V4(a.0)),
-                            RData::AAAA(a) => Some(IpAddr::V6(a.0)),
-                            _ => None,
-                        };
-                        if let Some(ip) = private_ip {
-                            if self.private_addrs.contains(ip) {
-                                warn!(name=%sanitize_dns_name(qname), %ip, "private-address block SERVFAIL");
-                                self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
-                                return send_error(request, response_handle, ResponseCode::ServFail).await;
-                            }
-                        }
-                    }
-                }
-                let ttl_cap = self.cache_max_ttl;
-                let ttl_floor = self.cache_min_ttl;
-                let mut records_owned: Vec<Record> = records;
-                for r in records_owned.iter_mut() {
-                    let new_ttl = r.ttl.max(ttl_floor).min(ttl_cap);
-                    r.ttl = new_ttl;
-                }
-                let records: &[Record] = &records_owned;
-                if self.dnssec_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                    let has_rrsig = records.iter().any(|r| r.record_type() == RecordType::RRSIG);
-                    if has_rrsig { self.stats.inc_dnssec_secure(); } else { self.stats.inc_dnssec_insecure(); }
-                }
-                debug!(name=%sanitize_dns_name(qname), %qtype, count = records.len(), "resolved");
-                if let Some(ref cache) = self.xdp_cache {
-                    if !records.is_empty() {
-                        let min_ttl = records.iter().map(|r| r.ttl).min().unwrap_or(60).max(self.cache_min_ttl).min(self.cache_max_ttl);
-                        let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
-                        let mut name_enc = BinEncoder::new(&mut name_tmp);
-                        if Name::from(qname).emit(&mut name_enc).is_ok() {
-                            let qname_lc = crate::dns::wire_builder::normalize_query_qname(&name_tmp);
-                            let raw_key = crate::dns::hasher::hash_wire_qname(&qname_lc);
-                            let key: u64 = raw_key ^ ((u16::from(qtype) as u64) << 48);
-                            let mut wire: Vec<u8> = Vec::with_capacity(512);
-                            let mut cache_msg = Message::new(0, MessageType::Response, OpCode::Query);
-                            cache_msg.metadata.recursion_available = true;
-                            cache_msg.metadata.response_code = ResponseCode::NoError;
-                            cache_msg.add_query(DnsQuery::query(Name::from(qname), qtype));
-                            for r in records { cache_msg.add_answer((*r).clone()); }
-                            let mut enc = BinEncoder::new(&mut wire);
-                            if cache_msg.emit(&mut enc).is_ok() {
-                                let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(min_ttl as u64);
-                                let entry = super::cache_snapshot::CacheEntry { wire_payload: Bytes::from(wire), expires_at, wire_qname: bytes::Bytes::copy_from_slice(&qname_lc) };
-                                let cache_ref = Arc::clone(cache);
-                                let max_ent = self.cache_max_entries;
-                                tokio::spawn(async move { super::cache_snapshot::cache_insert(&cache_ref, key, entry, max_ent); });
-                            }
-                        }
-                    }
-                }
-                if let Some(ref sc) = self.stale_cache {
-                    if !records.is_empty() {
-                        let stale_key = (qname.clone(), qtype);
-                        if sc.len() >= self.cache_max_entries {
-                            if let Some(old_key) = sc.iter().next().map(|e| e.key().clone()) { sc.remove(&old_key); }
-                        }
-                        sc.insert(stale_key, (records.to_vec(), std::time::Instant::now()));
-                    }
-                }
-                if let Some(ref tracker) = self.prefetch_tracker { tracker.increment(&qname.to_string()); }
-                let mut metadata = Metadata::response_from_request(&request.metadata);
-                metadata.recursion_available = true;
-                let opt_edns = make_opt_edns(request);
-                let mut builder = MessageResponseBuilder::from_message_request(request);
-                if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                let response = builder.build(metadata, records.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
-                self.stats.inc_forwarded();
-                let fwd_us = start.elapsed().as_micros() as u64;
-                self.stats.record_forward(fwd_us);
-                let fwd_action = if fwd_us < CACHE_HIT_THRESHOLD_US { LogAction::Cached } else { LogAction::Forwarded };
-                self.record_query(client_ip, qname, qtype, ResponseCode::NoError, fwd_action, start);
-                response_handle.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) })
-            }
-            ResolveResult::NegativeAnswer { rcode: rcode_u16, neg_ttl } => {
-                let rcode = match rcode_u16 {
-                    0 => ResponseCode::NoError,
-                    3 => ResponseCode::NXDomain,
-                    _ => ResponseCode::ServFail,
-                };
-                let neg_ttl_secs = neg_ttl.clamp(60, 900);
-                let err_action = match rcode {
-                    ResponseCode::NXDomain => { self.stats.inc_nxdomain(); LogAction::Nxdomain }
-                    _ => { self.stats.inc_servfail(); LogAction::Servfail }
-                };
-                debug!(name=%sanitize_dns_name(qname), ?rcode, "negative answer from upstream");
-                self.record_query(client_ip, qname, qtype, rcode, err_action, start);
-                if (rcode == ResponseCode::NXDomain || rcode == ResponseCode::NoError) && neg_ttl_secs > 0 {
-                    if let Some(ref cache) = self.xdp_cache {
-                        let ttl = neg_ttl_secs;
-                        let mut name_tmp: Vec<u8> = Vec::with_capacity(64);
-                        let mut name_enc = BinEncoder::new(&mut name_tmp);
-                        if Name::from(qname).emit(&mut name_enc).is_ok() {
-                            let qname_lc_neg = crate::dns::wire_builder::normalize_query_qname(&name_tmp);
-                            let raw_key_neg = crate::dns::hasher::hash_wire_qname(&qname_lc_neg);
-                            let key: u64 = raw_key_neg ^ ((u16::from(qtype) as u64) << 48);
-                            let mut wire: Vec<u8> = Vec::with_capacity(64);
-                            let mut neg_msg = Message::new(0, MessageType::Response, OpCode::Query);
-                            neg_msg.metadata.response_code = rcode;
-                            neg_msg.metadata.recursion_available = true;
-                            neg_msg.add_query(DnsQuery::query(Name::from(qname), qtype));
-                            let mut enc = BinEncoder::new(&mut wire);
-                            if neg_msg.emit(&mut enc).is_ok() {
-                                let entry = super::cache_snapshot::CacheEntry { wire_payload: Bytes::from(wire), expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl as u64), wire_qname: bytes::Bytes::copy_from_slice(&qname_lc_neg) };
-                                super::cache_snapshot::cache_insert(cache, key, entry, self.cache_max_entries);
-                            }
-                        }
-                    }
-                }
-                send_error(request, response_handle, rcode).await
-            }
-            ResolveResult::Servfail => {
-                debug!(name=%sanitize_dns_name(qname), "all upstreams SERVFAIL");
-                if let Some(ref sc) = self.stale_cache {
-                    let stale_key = (qname.clone(), qtype);
-                    if let Some(entry) = sc.get(&stale_key) {
-                        let (ref stale_records, stored_at) = *entry;
-                        let age = stored_at.elapsed().as_secs();
-                        if age <= self.stale_max_age && !stale_records.is_empty() {
-                            let stale_ttl = self.stale_answer_ttl;
-                            let capped: Vec<hickory_proto::rr::Record> = stale_records.iter().map(|r| { let mut rc = r.clone(); rc.ttl = stale_ttl; rc }).collect();
-                            drop(entry);
-                            info!(name=%sanitize_dns_name(qname), age_secs=age, ttl=stale_ttl, "serve-stale");
-                            self.stats.inc_stale_served();
-                            self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Cached, start);
-                            let mut metadata = Metadata::response_from_request(&request.metadata);
-                            metadata.recursion_available = true;
-                            let opt_edns = make_opt_edns(request);
-                            let mut builder = MessageResponseBuilder::from_message_request(request);
-                            if let Some(ref opt) = opt_edns { builder.edns(opt); }
-                            let response = builder.build(metadata, capped.iter(), std::iter::empty(), std::iter::empty(), std::iter::empty());
-                            return response_handle.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
-                        }
-                    }
-                }
-                self.stats.inc_servfail();
-                self.record_query(client_ip, qname, qtype, ResponseCode::ServFail, LogAction::Servfail, start);
-                send_error(request, response_handle, ResponseCode::ServFail).await
-            }
-        }
-    }
 }
 
 impl RunboundHandler {
@@ -1473,6 +662,11 @@ impl RunboundHandler {
                 .unwrap_or(0);
             match crate::dns::recursor_wire::resolve_validated(&q.name, qtype, now).await {
                 Some(val) if val.verdict != Verdict::Bogus => {
+                    if val.verdict == Verdict::Secure {
+                        self.stats.inc_dnssec_secure();
+                    } else {
+                        self.stats.inc_dnssec_insecure();
+                    }
                     // AD only when the data is Secure and the client is DNSSEC-aware.
                     let do_bit = msg.edns().ok().flatten().map(|e| e.dnssec_ok()).unwrap_or(false);
                     let set_ad = val.verdict == Verdict::Secure && do_bit;
@@ -1499,7 +693,15 @@ impl RunboundHandler {
                     self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Forwarded, start);
                     return Some(resp);
                 }
-                _ => {
+                Some(_bogus) => {
+                    // Bogus DNSSEC data is never served (RFC 4035) → SERVFAIL.
+                    self.stats.inc_dnssec_bogus();
+                    self.stats.inc_servfail();
+                    self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Servfail, start);
+                    return Some(self.wire_error(&msg, rcode::SERVFAIL));
+                }
+                None => {
+                    // Resolution failure (timeout / no reachable authority).
                     self.stats.inc_servfail();
                     self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Servfail, start);
                     return Some(self.wire_error(&msg, rcode::SERVFAIL));
@@ -1878,335 +1080,15 @@ impl RunboundHandler {
 
     // ─────────── Wire-based request dispatch (replaces hickory Server) ───────────
 
-    /// Dispatch a raw DNS wire query and return the wire response.
+    /// Dispatch a raw DNS wire query and return the wire response. The in-house
+    /// wire serving core (`serve_wire`) handles every path — local zones,
+    /// forwarding and full-recursion (with DNSSEC validation). It returns `None`
+    /// only on a malformed query, which we drop (empty = no response).
     pub async fn handle_request_wire(&self, wire: &[u8], peer: std::net::SocketAddr) -> Vec<u8> {
-        // de-hickory fast path: serve on the own wire codec when no hickory-typed
-        // special handling is needed; otherwise (recursor feature only) fall back
-        // to the recursor handler — default builds drop on None.
-        if let Some(resp) = self.serve_wire(wire, peer).await {
-            return resp;
-        }
-        // serve_wire only returns None on a malformed query or, with the
-        // `recursor` feature, a full-recursion query handled by the hickory
-        // handler. Default builds have no handler — drop (empty = no response).
-        #[cfg(feature = "recursor")]
-        {
-            let request = match hickory_server::server::Request::from_bytes(
-                wire.to_vec(),
-                peer,
-                hickory_server::net::xfer::Protocol::Udp,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!(err=%e, "handle_request_wire: malformed query");
-                    return Vec::new();
-                }
-            };
-            let out: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(None));
-            let cap = DohCapture {
-                peer,
-                out: std::sync::Arc::clone(&out),
-            };
-            self.handle_request::<DohCapture, hickory_server::net::runtime::TokioTime>(&request, cap)
-                .await;
-            return out
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-                .unwrap_or_default();
-        }
-        #[cfg(not(feature = "recursor"))]
-        Vec::new()
+        self.serve_wire(wire, peer).await.unwrap_or_default()
     }
 }
 
-#[cfg(feature = "recursor")]
-#[async_trait]
-impl RequestHandler for RunboundHandler {
-    async fn handle_request<R: ResponseHandler, T: Time>(
-        &self,
-        request: &Request,
-        response_handle: R,
-    ) -> ResponseInfo {
-        let start = Instant::now();
-
-        // Require exactly one query — RFC 1035 §4.1.2.
-        let Ok(info) = request.request_info() else {
-            self.stats.inc_total();
-            return servfail_info(request);
-        };
-        let qname = info.query.name();
-        let qtype = info.query.query_type();
-        let client_ip = info.src.ip();
-        let qname_str = qname.to_string();
-
-        self.stats.inc_total();
-        self.stats.inc_qtype_raw(u16::from(qtype));
-        self.domain_stats.inc(&qname_str);
-
-        // AXFR/IXFR is now served entirely in the wire fast path
-        // (serve_wire → wire_serve::axfr_response); it never reaches here.
-
-        // DNS UPDATE is now served entirely in the wire fast path
-        // (serve_wire → ddns::handle_update_wire); it never reaches here.
-
-        // ── 0. Access-control list ──────────────────────────────────────
-        match self.acl.check(client_ip) {
-            AclAction::Allow => {}
-            AclAction::Deny => {
-                // Silently drop — no response sent, just track the event.
-                debug!(%client_ip, name=%sanitize_dns_name(qname), "ACL deny (silent drop)");
-                self.record_query(
-                    client_ip,
-                    qname,
-                    qtype,
-                    ResponseCode::Refused,
-                    LogAction::Refused,
-                    start,
-                );
-                let mut meta = Metadata::response_from_request(&request.metadata);
-                meta.response_code = ResponseCode::Refused;
-                return ResponseInfo::from(hickory_proto::op::Header {
-                    metadata: meta,
-                    counts: hickory_proto::op::HeaderCounts::default(),
-                });
-            }
-            AclAction::Refuse => {
-                debug!(%client_ip, name=%sanitize_dns_name(qname), "ACL refuse");
-                self.record_query(
-                    client_ip,
-                    qname,
-                    qtype,
-                    ResponseCode::Refused,
-                    LogAction::Refused,
-                    start,
-                );
-                return send_error(request, response_handle, ResponseCode::Refused).await;
-            }
-        }
-
-        // ── 0. DNS Cookies (RFC 7873) — anti-spoofing on UDP (#203) ────
-        if self.dns_cookies && info.protocol == DnsProtocol::Udp {
-            if let CookieVerdict::NeedCookie(cookie) = cookie_check(&self.cookie_secret, request, client_ip) {
-                debug!(%client_ip, "DNS cookie missing/invalid — BADCOOKIE (anti-spoof)");
-                self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
-                return send_cookie_badcookie(request, response_handle, cookie).await;
-            }
-        }
-
-        // ── 1. Rate limiting (per source IP) ───────────────────────────
-        if !self.rate_limiter.check(client_ip) {
-            self.record_query(
-                client_ip,
-                qname,
-                qtype,
-                ResponseCode::Refused,
-                LogAction::Refused,
-                start,
-            );
-            // #203: RRL with SLIP. slip=0 → legacy (answer Refused to all). slip>0 →
-            // leak 1-in-slip as a Refused response (a legit client learns it is limited)
-            // and silently drop the rest, so a spoofed flood gets zero amplification.
-            if self.rrl_slip == 0 {
-                warn!(%client_ip, "rate limited");
-                return send_error(request, response_handle, ResponseCode::Refused).await;
-            }
-            let n = self.rrl_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n % self.rrl_slip == 0 {
-                return send_error(request, response_handle, ResponseCode::Refused).await;
-            }
-            let mut meta = Metadata::response_from_request(&request.metadata);
-            meta.response_code = ResponseCode::Refused;
-            return ResponseInfo::from(hickory_proto::op::Header {
-                metadata: meta,
-                counts: hickory_proto::op::HeaderCounts::default(),
-            });
-        }
-
-        // ── 1b. Alert threshold check (#12) ────────────────────────────
-        // Connection transports (TCP/DoT/DoH) reach the handler as 127.0.0.1 via the
-        // loopback relay; their abuse detection + ban enforcement happen in the relay
-        // on the REAL client IP (#ddos). Skip loopback here so connection-transport
-        // queries are never mis-attributed to 127.0.0.1 (which would self-DoS by
-        // banning the loopback relay), and so local loopback clients are never banned.
-        if let Some(at) = &self.alert_tracker {
-            // Anti-spoof gate (#ddos): only escalate sources proven not spoofed —
-            // non-UDP transports (connection-verified) or a valid UDP server cookie.
-            let verified = info.protocol != DnsProtocol::Udp
-                || cookie_verified(&self.cookie_secret, request, client_ip);
-            if !client_ip.is_loopback() {
-            match at.record(client_ip, verified) {
-                crate::alerts::AbuseVerdict::Block => {
-                    self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
-                    return send_error(request, response_handle, ResponseCode::Refused).await;
-                }
-                crate::alerts::AbuseVerdict::Tarpit => {
-                    self.record_query(client_ip, qname, qtype, ResponseCode::Refused, LogAction::Refused, start);
-                    return tarpit_response(request, response_handle).await;
-                }
-                crate::alerts::AbuseVerdict::Serve => {}
-            }
-            }
-        }
-
-        // ── 2. Concurrency cap (anti-OOM) ──────────────────────────────
-        let _permit = match self.inflight.try_acquire() {
-            Ok(p) => p,
-            Err(_) => {
-                warn!(%client_ip, inflight = MAX_INFLIGHT_REQUESTS, "inflight cap reached — REFUSED");
-                self.record_query(
-                    client_ip,
-                    qname,
-                    qtype,
-                    ResponseCode::Refused,
-                    LogAction::Refused,
-                    start,
-                );
-                return send_error(request, response_handle, ResponseCode::Refused).await;
-            }
-        };
-
-        // ── 3a. Block CHAOS class queries (version.bind, hostname.bind) ───
-        // CHAOS class (numeric 3) exposes server identity. Compare by wire value
-        // to avoid any hickory Unknown(3) vs CH variant mismatch.
-        // RFC 5358 §4: responders that do not implement CHAOS SHOULD return NOTIMP.
-        if u16::from(info.query.query_class()) == 3 {
-            debug!(%client_ip, name=%sanitize_dns_name(qname), "CHAOS class query → NOTIMP");
-            self.stats.inc_refused();
-            self.record_query(
-                client_ip,
-                qname,
-                qtype,
-                ResponseCode::NotImp,
-                LogAction::Refused,
-                start,
-            );
-            return send_error(request, response_handle, ResponseCode::NotImp).await;
-        }
-
-        // ── 3b. SEC-03: defense-in-depth — block identity-probe names ───────
-        // Block well-known identity-probe names by name regardless of query
-        // class. hickory may normalise the CHAOS class (numeric 3) to IN
-        // before invoking our handler, which bypasses the class check above
-        // (observed: version.bind → NOERROR, hostname.bind → NXDOMAIN).
-        // Zero allocation: qname is already a LowerName; compared against a
-        // static set initialised once on first request.
-        if identity_probe_names().iter().any(|n| n == qname) {
-            debug!(%client_ip, name=%sanitize_dns_name(qname), "identity probe → REFUSED");
-            self.stats.inc_refused();
-            self.record_query(
-                client_ip,
-                qname,
-                qtype,
-                ResponseCode::Refused,
-                LogAction::Refused,
-                start,
-            );
-            return send_error(request, response_handle, ResponseCode::Refused).await;
-        }
-
-        // ── 3b-DDR. #204: serve SVCB for _dns.resolver.arpa (RFC 9462) ─
-        if qtype == RecordType::SVCB {
-            if let Some(ddr) = &self.ddr {
-                if qname_str.eq_ignore_ascii_case("_dns.resolver.arpa.") {
-                    let answer = ddr.svcb_records();
-                    if !answer.is_empty() {
-                        debug!(%client_ip, "DDR: answering _dns.resolver.arpa SVCB");
-                        let mut metadata = Metadata::response_from_request(&request.metadata);
-                        metadata.authoritative = true;
-                        let opt_edns = make_opt_edns(request);
-                        let mut builder = MessageResponseBuilder::from_message_request(request);
-                        if let Some(ref opt) = opt_edns {
-                            builder.edns(opt);
-                        }
-                        let response = builder.build(
-                            metadata,
-                            answer.iter(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                            std::iter::empty(),
-                        );
-                        self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
-                        let mut rh = response_handle;
-                        return rh.send_response(response).await.unwrap_or_else(|e| {
-                            error!("send: {e}");
-                            servfail_info(request)
-                        });
-                    }
-                }
-            }
-        }
-
-        // ── 3c. Block ANY queries (RFC 8482 — amplification vector) ────
-        if qtype == RecordType::ANY {
-            // #180: refuse ANY to mitigate amplification. Use REFUSED (RCODE 5) — the
-            // OPCODE (QUERY) IS implemented, only QTYPE=ANY is declined, so NOTIMP was
-            // semantically wrong and some clients treat it as "server broken".
-            debug!(%client_ip, "ANY query refused (amplification mitigation)");
-            self.record_query(
-                client_ip,
-                qname,
-                qtype,
-                ResponseCode::Refused,
-                LogAction::Refused,
-                start,
-            );
-            return send_error(request, response_handle, ResponseCode::Refused).await;
-        }
-
-        // ── 3d. block-https-record: suppress HTTPS type-65 hints (QUIC/HTTP3 guard) ──
-        if self.block_https_record && qtype == RecordType::HTTPS {
-            self.record_query(client_ip, qname, qtype, ResponseCode::NoError, LogAction::Local, start);
-            let mut rh = response_handle;
-            let mut metadata = Metadata::response_from_request(&request.metadata);
-            metadata.authoritative = false;
-            let opt_edns = make_opt_edns(request);
-                    let mut builder = MessageResponseBuilder::from_message_request(request);
-                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
-            let response = builder.build(metadata, std::iter::empty::<&Record>(), std::iter::empty(), std::iter::empty(), std::iter::empty());
-            return rh.send_response(response).await.unwrap_or_else(|e| { error!("send: {e}"); servfail_info(request) });
-        }
-
-        debug!(%client_ip, name=%sanitize_dns_name(qname), type=%qtype, "DNS query");
-
-        // ── 3e. Split-horizon DNS (#10) — per-subnet zone overrides ───────
-        // Find first split-horizon entry whose subnets contain client_ip.
-        // If the query name resolves in that zone, answer immediately.
-        // If no match (None zone action), fall through to global zones.
-        // #186: load the live (hot-swappable) split-horizon table. Clone only the
-        // matching per-subnet zone Arc so the ArcSwap guard is dropped before the
-        // await (never held across .await); zero clone when there is no match.
-        let sh_match: Option<std::sync::Arc<LocalZoneSet>> = {
-            let table = self.split_horizon.load();
-            table
-                .iter()
-                .find(|(subnets, _)| subnets.iter().any(|cb| cb.contains(client_ip)))
-                .map(|(_, z)| std::sync::Arc::clone(z))
-        };
-        let response_handle = if let Some(sh_zones) = sh_match {
-            match self.handle_zone_set(request, response_handle, qname, qtype, client_ip, start, &sh_zones).await {
-                Ok(info) => return info,
-                Err(rh) => rh,
-            }
-        } else {
-            response_handle
-        };
-
-        // ── 4. Local zones ──────────────────────────────────────────────
-        let response_handle = match self
-            .handle_local_zone(request, response_handle, qname, qtype, client_ip, start)
-            .await
-        {
-            Ok(info) => return info,
-            Err(rh) => rh,
-        };
-
-        // ── 5. Recursive resolution ─────────────────────────────────────
-        self.resolve_upstream(request, response_handle, qname, qtype, client_ip, start)
-            .await
-    }
-}
 
 // ============================================================
 // Helpers
@@ -2226,113 +1108,10 @@ fn sanitize_name_str(s: &str) -> String {
     }
 }
 
-/// MED-06: Strip control characters from DNS names before structured log emission.
-/// Prevents log injection via carefully crafted query names containing \n, \r, etc.
-///
-/// Returns a lazy Display wrapper so the formatting (and the String allocation)
-/// only happens when the log level is actually enabled, saving one alloc per query
-/// on disabled levels (e.g. debug! in production).
-#[cfg(feature = "recursor")]
-struct SanitizedDnsName<'a>(&'a LowerName);
-
-#[cfg(feature = "recursor")]
-impl std::fmt::Display for SanitizedDnsName<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use std::fmt::Write as _;
-        let s = self.0.to_string();
-        if s.bytes().any(|b| !(0x20..0x7f).contains(&b)) {
-            for c in s.chars() {
-                f.write_char(if c.is_ascii() && !c.is_ascii_control() {
-                    c
-                } else {
-                    '?'
-                })?;
-            }
-        } else {
-            f.write_str(&s)?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "recursor")]
-fn sanitize_dns_name(name: &LowerName) -> SanitizedDnsName<'_> {
-    SanitizedDnsName(name)
-}
-
-/// Follow CNAME records within local zones, up to 8 hops (prevents loops).
-/// Returns a Vec<Record> containing the CNAME chain + final target records,
-/// or an empty Vec if there is no CNAME or the chain leads outside local zones.
-#[cfg(feature = "recursor")]
-fn follow_local_cname(
-    zones: &super::local::LocalZoneSet,
-    start: &LowerName,
-    qtype: RecordType,
-) -> Vec<Record> {
-    let mut chain: Vec<Record> = Vec::with_capacity(8);
-    let mut current = start.clone();
-
-    for _ in 0..8 {
-        let cnames = zones.local_records(&current, RecordType::CNAME);
-        if cnames.is_empty() {
-            break;
-        }
-        let cname_rec = (*cnames[0]).clone();
-        let next = match &cname_rec.data {
-            RData::CNAME(c) => LowerName::from(c.0.clone()),
-            _ => break,
-        };
-        chain.push(cname_rec);
-        let resolved: Vec<Record> = zones
-            .local_records(&next, qtype)
-            .into_iter()
-            .map(|r| (*r).clone())
-            .collect();
-        if !resolved.is_empty() {
-            chain.extend(resolved);
-            return chain;
-        }
-        current = next;
-    }
-    // Chain incomplete (target not in local zones) — return nothing;
-    // the caller will fall through to NODATA / NXDOMAIN as appropriate.
-    Vec::new()
-}
-
-/// Construct a ResponseInfo carrying a SERVFAIL code without sending.
-/// Used as the send-failure fallback when the socket is already broken.
-#[inline]
-#[cfg(feature = "recursor")]
-fn servfail_info(request: &Request) -> ResponseInfo {
-    let mut meta = Metadata::response_from_request(&request.metadata);
-    meta.response_code = ResponseCode::ServFail;
-    ResponseInfo::from(hickory_proto::op::Header {
-        metadata: meta,
-        counts: hickory_proto::op::HeaderCounts::default(),
-    })
-}
-
-/// Send an error response, mirroring the request's EDNS0 OPT record if present.
-/// RFC 6891 §7: "If a query included an OPT record, the response MUST include one."
-#[inline(always)]
-/// RFC 6891 §7 — build an EDNS OPT echo for responses.
-///
-/// If the request carried an OPT RR, returns an Edns struct that should be
-/// attached to the response (cap payload at 1232, reflect DO bit).
-/// Returns None when the request had no OPT (→ respond without OPT).
-#[cfg(feature = "recursor")]
-fn make_opt_edns(request: &MessageRequest) -> Option<Edns> {
-    let req_edns = request.edns.as_ref()?;
-    let mut e = Edns::new();
-    e.set_max_payload(req_edns.max_payload().clamp(512, 1232));
-    e.flags_mut().dnssec_ok = req_edns.flags().dnssec_ok;
-    Some(e)
-}
-
 /// #204: DDR (RFC 9462) endpoint info used to synthesise the `_dns.resolver.arpa`
 /// SVCB answer that points clients at this node's encrypted transports.
 #[derive(Clone)]
-#[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+#[allow(dead_code)]
 struct DdrInfo {
     hostname: String,
     dot_port: u16,
@@ -2340,59 +1119,8 @@ struct DdrInfo {
     doq_port: u16,
 }
 
-impl DdrInfo {
-    /// Build the SVCB RRset advertised at `_dns.resolver.arpa` (DoT / DoH / DoQ).
-    #[cfg(feature = "recursor")]
-    fn svcb_records(&self) -> Vec<hickory_proto::rr::Record> {
-        use hickory_proto::rr::rdata::svcb::{Alpn, SvcParamKey, SvcParamValue, Unknown, SVCB};
-        use hickory_proto::rr::{Name, RData, Record};
-        /// DDR SVCB TTL (RFC 9462): 2 h — long enough for clients to cache the upgrade.
-        const TTL: u32 = 7200;
-        let owner = match Name::from_ascii("_dns.resolver.arpa.") {
-            Ok(n) => n,
-            Err(_) => return Vec::new(),
-        };
-        let target = match Name::from_utf8(format!("{}.", self.hostname.trim_end_matches('.'))) {
-            Ok(n) => n,
-            Err(_) => return Vec::new(),
-        };
-        let alpn = |a: &str| (SvcParamKey::Alpn, SvcParamValue::Alpn(Alpn(vec![a.to_string()])));
-        let port = |p: u16| (SvcParamKey::Port, SvcParamValue::Port(p));
-        let dohpath = (
-            SvcParamKey::Unknown(7),
-            SvcParamValue::Unknown(Unknown(b"/dns-query{?dns}".to_vec())),
-        );
-        vec![
-            // DoT (RFC 7858) — priority 1
-            Record::from_rdata(owner.clone(), TTL, RData::SVCB(SVCB::new(1, target.clone(), vec![alpn("dot"), port(self.dot_port)]))),
-            // DoH (RFC 8484) — priority 2, with dohpath (SvcParamKey 7, RFC 9461)
-            Record::from_rdata(owner.clone(), TTL, RData::SVCB(SVCB::new(2, target.clone(), vec![alpn("h2"), port(self.doh_port), dohpath]))),
-            // DoQ (RFC 9250) — priority 3
-            Record::from_rdata(owner, TTL, RData::SVCB(SVCB::new(3, target, vec![alpn("doq"), port(self.doq_port)]))),
-        ]
-    }
-}
-
-/// #203: DNS Cookie verdict for a UDP query.
-#[cfg(feature = "recursor")]
-enum CookieVerdict {
-    /// Verified (valid server cookie) or not applicable (no/legacy cookie) — answer normally.
-    Ok,
-    /// Unverified client — return BADCOOKIE plus this 16-byte cookie so it retries.
-    NeedCookie(Vec<u8>),
-}
-
-/// Read the raw COOKIE (EDNS option 10) from the request, if present.
-#[cfg(feature = "recursor")]
-fn read_client_cookie(request: &Request) -> Option<Vec<u8>> {
-    let edns = request.edns.as_ref()?;
-    match edns.option(hickory_proto::rr::rdata::opt::EdnsCode::Cookie)? {
-        hickory_proto::rr::rdata::opt::EdnsOption::Unknown(_, data) => Some(data.clone()),
-        _ => None,
-    }
-}
-
-/// Compute the 8-byte server cookie = HMAC-SHA256(secret, client_cookie || client_ip)[..8].
+/// RFC 7873 server cookie: HMAC-SHA256(secret, client_cookie || client_ip)[..8].
+/// Used by the wire serving path to verify DNS Cookies on UDP queries.
 fn server_cookie(secret: &[u8; 16], client_cookie: &[u8], ip: IpAddr) -> [u8; 8] {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -2408,98 +1136,7 @@ fn server_cookie(secret: &[u8; 16], client_cookie: &[u8], ip: IpAddr) -> [u8; 8]
     c
 }
 
-/// Validate the client's DNS Cookie (RFC 7873). Lenient for no-cookie clients;
-/// BADCOOKIE for clients that present a client cookie without a valid server cookie.
-#[cfg(feature = "recursor")]
-fn cookie_check(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> CookieVerdict {
-    let client_cookie = match read_client_cookie(request) {
-        Some(c) if c.len() >= 8 => c,
-        _ => return CookieVerdict::Ok, // no / malformed cookie → legacy client, answer
-    };
-    let expected = server_cookie(secret, &client_cookie[..8], client_ip);
-    if client_cookie.len() >= 16 {
-        use subtle::ConstantTimeEq;
-        if bool::from(client_cookie[8..16].ct_eq(&expected)) {
-            return CookieVerdict::Ok; // valid server cookie → verified, not spoofed
-        }
-    }
-    let mut full = client_cookie[..8].to_vec();
-    full.extend_from_slice(&expected);
-    CookieVerdict::NeedCookie(full)
-}
 
-/// Strict source verification for the abuse gate (#ddos): true only when the UDP
-/// request carries a VALID server cookie (proves the source is not spoofed). A
-/// missing/legacy/client-only cookie returns false — unlike `cookie_check`, which is
-/// lenient and answers no-cookie clients.
-#[cfg(feature = "recursor")]
-fn cookie_verified(secret: &[u8; 16], request: &Request, client_ip: IpAddr) -> bool {
-    let Some(client_cookie) = read_client_cookie(request) else {
-        return false;
-    };
-    if client_cookie.len() < 16 {
-        return false;
-    }
-    let expected = server_cookie(secret, &client_cookie[..8], client_ip);
-    use subtle::ConstantTimeEq;
-    bool::from(client_cookie[8..16].ct_eq(&expected))
-}
-
-/// Send a BADCOOKIE (RFC 7873) response carrying the server cookie so the client retries.
-#[cfg(feature = "recursor")]
-async fn send_cookie_badcookie<R: ResponseHandler>(
-    request: &Request,
-    mut response_handle: R,
-    cookie: Vec<u8>,
-) -> ResponseInfo {
-    let mut e = make_opt_edns(request).unwrap_or_default();
-    e.options_mut()
-        .insert(hickory_proto::rr::rdata::opt::EdnsOption::Unknown(10, cookie));
-    let mut builder = MessageResponseBuilder::from_message_request(request);
-    builder.edns(&e);
-    let response = builder.error_msg(&request.metadata, ResponseCode::BADCOOKIE);
-    response_handle
-        .send_response(response)
-        .await
-        .unwrap_or_else(|err| {
-            error!("send: {err}");
-            servfail_info(request)
-        })
-}
-
-/// Tarpit a verified abuser (#ddos): hold the request a bounded delay, then answer
-/// REFUSED. On TCP/DoT/DoH this keeps the attacker's connection occupied at near-zero
-/// cost to us; the permit cap prevents self-DoS (over the cap we REFUSE immediately).
-#[cfg(feature = "recursor")]
-async fn tarpit_response<R: ResponseHandler>(
-    request: &Request,
-    response_handle: R,
-) -> ResponseInfo {
-    if let Ok(_permit) = tarpit_sema().try_acquire() {
-        tokio::time::sleep(tarpit_delay()).await;
-    }
-    send_error(request, response_handle, ResponseCode::Refused).await
-}
-
-#[cfg(feature = "recursor")]
-async fn send_error<R: ResponseHandler>(
-    request: &Request,
-    mut response_handle: R,
-    rcode: ResponseCode,
-) -> ResponseInfo {
-    // `error_msg` mirrors the request's EDNS0 OPT record, satisfying RFC 6891 §7.
-    let opt_edns = make_opt_edns(request);
-                    let mut builder = MessageResponseBuilder::from_message_request(request);
-                    if let Some(ref opt) = opt_edns { builder.edns(opt); }
-    let response = builder.error_msg(&request.metadata, rcode);
-    response_handle
-        .send_response(response)
-        .await
-        .unwrap_or_else(|e| {
-            error!("send: {e}");
-            servfail_info(request)
-        })
-}
 
 /// Shared, hot-swappable DNS resolver used by the server handler and the API.
 /// Hot-swappable forward pool — replaces the old hickory TokioResolver.
@@ -3347,42 +1984,6 @@ async fn spawn_tls_service(
 // public relay that enforces the source-IP ACL / per-IP conn cap / PROXY protocol.
 
 
-/// Captures the wire response produced by the DNS handler into `out`.
-#[cfg(feature = "recursor")]
-#[derive(Clone)]
-struct DohCapture {
-    peer: SocketAddr,
-    out: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-}
-
-#[cfg(feature = "recursor")]
-#[async_trait::async_trait]
-impl ResponseHandler for DohCapture {
-    async fn send_response<'a>(
-        &mut self,
-        response: hickory_server::zone_handler::MessageResponse<
-            '_,
-            'a,
-            impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
-            impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
-            impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
-            impl Iterator<Item = &'a hickory_proto::rr::Record> + Send + 'a,
-        >,
-    ) -> Result<ResponseInfo, hickory_server::net::NetError> {
-        let (stream_handle, mut receiver) = BufDnsStreamHandle::new(self.peer);
-        let mut rh = ResponseHandle::new(self.peer, stream_handle, DnsProtocol::Https);
-        let info = rh.send_response(response).await?;
-        // Drop the sender before draining (see UdpResponseHandler note) to avoid a
-        // deadlock: the mpsc receiver yields None only once all senders are dropped.
-        drop(rh);
-        use futures_util::StreamExt;
-        if let Some(serial_msg) = receiver.next().await {
-            let (bytes, _dst) = serial_msg.into_parts();
-            *self.out.lock().unwrap_or_else(|e| e.into_inner()) = Some(bytes);
-        }
-        Ok(info)
-    }
-}
 
 
 fn doh_reply(

@@ -1486,20 +1486,9 @@ async fn patch_config_handler(
         if let Err(e) = crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, v).await {
             warn!(%e, "resolver rebuild after DNSSEC toggle — continuing");
         }
-        // SEC-L4: when the sovereign recursor is the active resolver, rebuild it so the new
-        // validation policy actually takes effect. Otherwise the recursor keeps the DNSSEC
-        // policy captured when it was last built, and Bogus->SERVFAIL enforcement silently
-        // desyncs from what the API/config reports.
-        #[cfg(feature = "recursor")]
-        if s.resolution_mode.load(Ordering::Relaxed) == 1 {
-            if let Err(e) = crate::dns::recursor::rebuild_shared(
-                &s.recursor,
-                crate::config::parser::ResolutionMode::FullRecursion,
-                v,
-            ) {
-                warn!(%e, "recursor rebuild after DNSSEC toggle — continuing");
-            }
-        }
+        // The in-house validating resolver validates every recursive answer
+        // (fail-closed) and holds no per-policy state, so there is nothing to
+        // rebuild when the DNSSEC-validation flag is toggled.
         s.audit.send(AuditEvent::ConfigReload);
         info!(dnssec = v, "DNSSEC validation toggled via API");
         persist_config(&s);
@@ -1569,23 +1558,8 @@ async fn resolution_put_handler(
             )
         }
     };
-    // Build the recursor first; only flip the hot-path atomic once it is actually ready so we
-    // never route queries to full-recursion with no backend.
-    #[cfg(feature = "recursor")]
-    let dnssec = s.dnssec_enabled.load(Ordering::Relaxed);
-    #[cfg(feature = "recursor")]
-    if let Err(e) = crate::dns::recursor::rebuild_shared(&s.recursor, mode, dnssec) {
-        warn!(%e, "resolution: full-recursion requested but recursor build failed — staying in forward");
-        s.resolution_mode.store(0, Ordering::Relaxed);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            JsonExtract(serde_json::json!({
-                "error": "RECURSOR_BUILD_FAILED",
-                "details": "failed to initialise the sovereign recursor",
-                "mode": "forward"
-            })),
-        );
-    }
+    // The in-house validating resolver is always available (no backend to build),
+    // so applying a mode is just flipping the hot-path atomic.
     let val = u8::from(mode == crate::config::parser::ResolutionMode::FullRecursion);
     s.resolution_mode.store(val, Ordering::Relaxed);
     s.audit.send(AuditEvent::ConfigReload);
@@ -1604,7 +1578,7 @@ async fn resolution_put_handler(
         JsonExtract(serde_json::json!({
             "ok": true,
             "mode": mode.as_str(),
-            "recursor_active": s.recursor.load_full().is_some(),
+            "recursor_active": s.resolution_mode.load(Ordering::Relaxed) == 1,
         })),
     )
 }
