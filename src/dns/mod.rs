@@ -20,6 +20,9 @@ pub mod recursor;
 // tested under the recursor feature; not yet dispatched to (Phase 2 = DNSSEC).
 #[cfg(any(feature = "recursor", test))]
 pub mod recursor_wire;
+// In-house DNSSEC validation (Phase 2). Increment 1 = RRSIG verification.
+#[cfg(any(feature = "recursor", test))]
+pub mod dnssec_verify;
 pub mod zone_signer;
 pub mod dnssec_sign;
 pub mod plain_server;
