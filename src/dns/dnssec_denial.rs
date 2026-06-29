@@ -223,6 +223,30 @@ pub fn nsec3_proves_nodata(nsec3s: &[Nsec3], qname: &Name, qtype: u16) -> bool {
     })
 }
 
+/// Does the NSEC3 set prove `name` has no DS — an INSECURE delegation? Either a
+/// matching NSEC3 lists NS but not DS (and not SOA, so it is a delegation, not the
+/// apex), or — under opt-out (RFC 5155 §6, what .com/.net use) — an opt-out NSEC3
+/// covers the name.
+pub fn nsec3_proves_no_ds(nsec3s: &[Nsec3], name: &Name) -> bool {
+    nsec3s.iter().any(|n3| {
+        n3.matches(name)
+            && type_in_bitmap(n3.bitmap, consts::rtype::NS)
+            && !type_in_bitmap(n3.bitmap, consts::rtype::DS)
+            && !type_in_bitmap(n3.bitmap, consts::rtype::SOA)
+    }) || nsec3s.iter().any(|n3| n3.opt_out() && n3.covers(name))
+}
+
+/// NSEC variant of the no-DS (insecure delegation) proof: a matching NSEC at the
+/// delegation lists NS but neither DS nor SOA.
+pub fn nsec_proves_no_ds(nsecs: &[Nsec], name: &Name) -> bool {
+    nsecs.iter().any(|nz| {
+        nz.owner.eq_ignore_ascii_case(name)
+            && type_in_bitmap(nz.bitmap, consts::rtype::NS)
+            && !type_in_bitmap(nz.bitmap, consts::rtype::DS)
+            && !type_in_bitmap(nz.bitmap, consts::rtype::SOA)
+    })
+}
+
 /// `*.name` — the wildcard at `name` (prepend a `*` label).
 fn wildcard_of(name: &Name) -> Option<Name> {
     Name::from_ascii(&format!("*.{}", name.to_ascii())).ok()

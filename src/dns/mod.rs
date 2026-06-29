@@ -27,6 +27,9 @@ pub mod dnssec_verify;
 // In-house DNSSEC denial of existence (Phase 2, increment 3): NSEC / NSEC3.
 #[cfg(any(feature = "recursor", test))]
 pub mod dnssec_denial;
+// In-house DNSSEC chain walk + verdict (Phase 2, increment 4): Secure/Insecure/Bogus.
+#[cfg(any(feature = "recursor", test))]
+pub mod dnssec_chain;
 pub mod zone_signer;
 pub mod dnssec_sign;
 pub mod plain_server;
