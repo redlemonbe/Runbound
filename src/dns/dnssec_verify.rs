@@ -224,6 +224,125 @@ pub fn verify_rrsig(
     verify_signature(sig.algorithm, dnskey_pubkey, &msg, &sig.signature)
 }
 
+// ── Phase 2, increment 2: DS ↔ DNSKEY chain of trust ─────────────────────────
+
+/// DS digest types we accept. SHA-256 (RFC 4509) and SHA-384 (RFC 6605); the
+/// deprecated SHA-1 (type 1) is rejected — an attacker must not be able to
+/// downgrade a delegation to a forgeable digest.
+const DS_DIGEST_SHA256: u8 = 2;
+const DS_DIGEST_SHA384: u8 = 4;
+
+/// A delegation-signer commitment: the parent's hash of a child DNSKEY
+/// (RFC 4034 §5.1). Borrows its digest so both the hardcoded root anchor
+/// (`'static`) and DS parsed from the wire share one type.
+#[derive(Clone, Copy)]
+pub struct Ds<'a> {
+    pub key_tag: u16,
+    pub algorithm: u8,
+    pub digest_type: u8,
+    pub digest: &'a [u8],
+}
+
+/// The IANA root trust anchors (DS of the root KSKs) — the one piece of state
+/// that MUST come out of band, never from the network. Published in
+/// <https://data.iana.org/root-anchors/root-anchors.xml>.
+///   - KSK-2017: key tag 20326 (cross-checkable against the well-known digest).
+///   - KSK-2024: key tag 38696 (current KSK).
+/// Both are algorithm 8 (RSA/SHA-256), digest type 2 (SHA-256).
+const ROOT_KSK_2017: [u8; 32] =
+    hex32("E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D");
+const ROOT_KSK_2024: [u8; 32] =
+    hex32("683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16");
+
+pub const ROOT_ANCHORS: &[Ds<'static>] = &[
+    Ds { key_tag: 20326, algorithm: 8, digest_type: DS_DIGEST_SHA256, digest: &ROOT_KSK_2017 },
+    Ds { key_tag: 38696, algorithm: 8, digest_type: DS_DIGEST_SHA256, digest: &ROOT_KSK_2024 },
+];
+
+/// Decode a 64-char hex string to 32 bytes at compile time, so the anchors read
+/// as the published hex without a runtime hex-decode dependency.
+const fn hex32(s: &str) -> [u8; 32] {
+    let b = s.as_bytes();
+    assert!(b.len() == 64, "trust anchor digest must be 64 hex chars");
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = (hex_nibble(b[2 * i]) << 4) | hex_nibble(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+const fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => panic!("invalid hex digit in trust anchor"),
+    }
+}
+
+/// Compute the DS digest of a DNSKEY (RFC 4034 §5.1.4): `digest(owner_canonical
+/// || DNSKEY_RDATA)`. Returns `None` for unsupported (e.g. SHA-1) digest types.
+fn compute_ds_digest(owner: &Name, dnskey_rdata: &[u8], digest_type: u8) -> Option<Vec<u8>> {
+    let alg = match digest_type {
+        DS_DIGEST_SHA256 => &ring::digest::SHA256,
+        DS_DIGEST_SHA384 => &ring::digest::SHA384,
+        _ => return None,
+    };
+    let mut input = crate::dns::dnssec_sign::canonical_name_wire(owner);
+    input.extend_from_slice(dnskey_rdata);
+    Some(ring::digest::digest(alg, &input).as_ref().to_vec())
+}
+
+/// Does this DNSKEY match the DS commitment (key tag + algorithm + digest)?
+fn dnskey_matches_ds(owner: &Name, dnskey_rdata: &[u8], ds: &Ds) -> bool {
+    if dnskey_rdata.len() < 4 || dnskey_rdata[3] != ds.algorithm {
+        return false;
+    }
+    if crate::dns::dnssec_sign::key_tag(dnskey_rdata) != ds.key_tag {
+        return false;
+    }
+    match compute_ds_digest(owner, dnskey_rdata, ds.digest_type) {
+        Some(d) => ring::constant_time::verify_slices_are_equal(&d, ds.digest).is_ok(),
+        None => false,
+    }
+}
+
+/// Validate a zone's DNSKEY RRset against a set of trusted DS records (the
+/// secure entry point): a DNSKEY must match one DS, and an RRSIG over the whole
+/// DNSKEY RRset must verify under that DS-matched key. On success the full
+/// DNSKEY RRset is returned as the zone's now-trusted keys (KSK + ZSKs).
+///
+/// Fail-closed: no DS match, or no self-signature under the matched key → `None`.
+pub fn validate_dnskey_rrset<'k>(
+    owner: &Name,
+    dnskeys: &[&'k [u8]],
+    rrsigs: &[&[u8]],
+    trusted_ds: &[Ds],
+    now: u32,
+) -> Option<Vec<&'k [u8]>> {
+    let rdatas: Vec<Rdata> = dnskeys
+        .iter()
+        .map(|d| Rdata::Unknown { rtype: consts::rtype::DNSKEY, data: d.to_vec() })
+        .collect();
+    let refs: Vec<&Rdata> = rdatas.iter().collect();
+
+    for &key in dnskeys {
+        // 1. Is this key anchored by a trusted DS?
+        if !trusted_ds.iter().any(|ds| dnskey_matches_ds(owner, key, ds)) {
+            continue;
+        }
+        // 2. Does an RRSIG over the DNSKEY RRset verify under this key?
+        for &sig in rrsigs {
+            if verify_rrsig(owner, consts::class::IN, consts::rtype::DNSKEY, &refs, sig, key, now) {
+                return Some(dnskeys.to_vec());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +496,73 @@ mod tests {
             dnskeys.len(),
             rrsigs.len()
         );
+    }
+
+    // Fetch the root DNSKEY RRset (DNSKEY rdatas, RRSIG rdatas) over TCP/DO=1.
+    async fn fetch_root_dnskey() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        use crate::dns::wire;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut idb = [0u8; 2];
+        let _ = getrandom::fill(&mut idb);
+        let mut enc = wire::Encoder::uncompressed();
+        wire::Header { id: u16::from_be_bytes(idb), flags: 0, qdcount: 1, ancount: 0, nscount: 0, arcount: 1 }
+            .emit(&mut enc);
+        wire::Question::new(Name::root(), consts::rtype::DNSKEY).emit(&mut enc);
+        enc.u8(0);
+        enc.u16(consts::rtype::OPT);
+        enc.u16(1232);
+        enc.u32(0x0000_8000);
+        enc.u16(0);
+        let q = enc.into_vec();
+        let mut s = tokio::net::TcpStream::connect("198.41.0.4:53").await.unwrap();
+        s.write_all(&(q.len() as u16).to_be_bytes()).await.unwrap();
+        s.write_all(&q).await.unwrap();
+        let mut lb = [0u8; 2];
+        s.read_exact(&mut lb).await.unwrap();
+        let mut resp = vec![0u8; u16::from_be_bytes(lb) as usize];
+        s.read_exact(&mut resp).await.unwrap();
+        let msg = wire::Message::parse(&resp).expect("parse root DNSKEY");
+        let keys = msg.answers.iter().filter(|r| r.rtype == consts::rtype::DNSKEY)
+            .filter_map(|r| match &r.rdata { Rdata::Unknown { data, .. } => Some(data.clone()), _ => None }).collect();
+        let sigs = msg.answers.iter().filter(|r| r.rtype == consts::rtype::RRSIG)
+            .filter_map(|r| match &r.rdata { Rdata::Unknown { data, .. } => Some(data.clone()), _ => None }).collect();
+        (keys, sigs)
+    }
+
+    // Live: validate the real root DNSKEY RRset against the HARDCODED anchor.
+    // This exercises increment 2 end to end (DS digest match + RRSIG over the
+    // DNSKEY set under the DS-matched key) and cross-checks the anchor digests.
+    //   cargo test -- --ignored validate_root_dnskey_against_anchor
+    #[tokio::test]
+    #[ignore]
+    async fn validate_root_dnskey_against_anchor() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let (keys, sigs) = fetch_root_dnskey().await;
+        for k in &keys {
+            // SEP (KSK) bit is the LSB of the 16-bit flags field.
+            if k.len() >= 2 && (u16::from_be_bytes([k[0], k[1]]) & 0x0001) != 0 {
+                let tag = key_tag(k);
+                let ds = compute_ds_digest(&Name::root(), k, DS_DIGEST_SHA256).unwrap();
+                let hexd: String = ds.iter().map(|b| format!("{b:02X}")).collect();
+                eprintln!("ROOT KSK tag={tag} DS-SHA256={hexd}");
+            }
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let kr: Vec<&[u8]> = keys.iter().map(|v| v.as_slice()).collect();
+        let sr: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
+        let validated = validate_dnskey_rrset(&Name::root(), &kr, &sr, ROOT_ANCHORS, now);
+        assert!(validated.is_some(), "root DNSKEY did NOT validate against the hardcoded anchor");
+        eprintln!("ROOT DNSKEY validated against hardcoded anchor: {} trusted keys", validated.unwrap().len());
+    }
+
+    #[test]
+    fn hex32_decodes_known_anchor() {
+        // Cross-check the const decoder against the well-known KSK-2017 digest.
+        assert_eq!(
+            ROOT_KSK_2017[..4],
+            [0xE0, 0x6D, 0x44, 0xB8]
+        );
+        assert_eq!(ROOT_KSK_2017.len(), 32);
     }
 
     #[test]
