@@ -653,21 +653,27 @@ impl RunboundHandler {
 
         // ── Full recursion (own validating resolver) ───────────────────────
         // resolution: full-recursion → resolve iteratively from the root and
-        // DNSSEC-validate. A Bogus answer is never served (fail-closed → SERVFAIL).
+        // DNSSEC-validate. A Bogus answer is never served (fail-closed → SERVFAIL)
+        // UNLESS the client set CD (Checking Disabled): RFC 4035 §3.2.2 requires a
+        // validating resolver to return the data unvalidated so the client can
+        // validate it itself (the answer never carries AD in that case).
         if self.resolution_mode.load(Ordering::Relaxed) == 1 {
             use crate::dns::dnssec_chain::Verdict;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
                 .unwrap_or(0);
+            let cd_bit = msg.header.cd();
             match crate::dns::recursor_wire::resolve_validated(&q.name, qtype, now).await {
-                Some(val) if val.verdict != Verdict::Bogus => {
-                    if val.verdict == Verdict::Secure {
-                        self.stats.inc_dnssec_secure();
-                    } else {
-                        self.stats.inc_dnssec_insecure();
+                Some(val) if val.verdict != Verdict::Bogus || cd_bit => {
+                    match val.verdict {
+                        Verdict::Secure => self.stats.inc_dnssec_secure(),
+                        Verdict::Insecure => self.stats.inc_dnssec_insecure(),
+                        // Reached only with CD=1 — counted as bogus, served unvalidated.
+                        Verdict::Bogus => self.stats.inc_dnssec_bogus(),
                     }
-                    // AD only when the data is Secure and the client is DNSSEC-aware.
+                    // AD only when the data is genuinely Secure and the client is
+                    // DNSSEC-aware — never on a CD-served (unvalidated/Bogus) answer.
                     let do_bit = msg.edns().ok().flatten().map(|e| e.dnssec_ok()).unwrap_or(false);
                     let set_ad = val.verdict == Verdict::Secure && do_bit;
                     if val.rcode == rcode::NXDOMAIN {
@@ -696,7 +702,7 @@ impl RunboundHandler {
                     return Some(resp);
                 }
                 Some(_bogus) => {
-                    // Bogus DNSSEC data is never served (RFC 4035) → SERVFAIL.
+                    // Bogus and the client did NOT set CD → never served (RFC 4035) → SERVFAIL.
                     self.stats.inc_dnssec_bogus();
                     self.stats.inc_servfail();
                     self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Servfail, start);
