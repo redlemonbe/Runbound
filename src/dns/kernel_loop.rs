@@ -383,12 +383,13 @@ fn worker_loop(
                     // Count this fast-path cache hit. `stats.cache_hits` is reported as
                     // `ch_slow + Σ XDP_WORKER_PKTS`; the AF_XDP loop bumps that per-worker
                     // counter (worker.rs), but the kernel-fast-loop datapath did not — so
-                    // cache_hits / cache_hit_rate read 0 here despite real hits. Same
-                    // contention-free per-worker slot, indexed by this thread.
-                    if thread_idx < crate::dns::cache_snapshot::XDP_WORKER_PKTS.len() {
-                        crate::dns::cache_snapshot::XDP_WORKER_PKTS[thread_idx]
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    // cache_hits / cache_hit_rate read 0 here despite real hits. Index by
+                    // thread, MODULO the array length so a host with >64 fast-loop threads
+                    // still counts every hit (aggregate Σ stays exact; only the per-slot
+                    // distribution view loses precision past 64 threads).
+                    let slot = thread_idx % crate::dns::cache_snapshot::XDP_WORKER_PKTS.len();
+                    crate::dns::cache_snapshot::XDP_WORKER_PKTS[slot]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
             }

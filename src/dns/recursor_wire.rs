@@ -457,9 +457,9 @@ impl crate::dns::dnssec_chain::Fetcher for ResolverFetcher {
 pub struct Validated {
     /// Answer records (CNAME chain followed), without RRSIG/OPT.
     pub records: Vec<Record>,
-    /// Authority section of the terminal reply (SOA + any NSEC/NSEC3 + RRSIGs,
-    /// OPT excluded) — carried so a negative answer can include the zone SOA
-    /// (RFC 2308 §3) and the DNSSEC denial proof. Empty for positive answers.
+    /// VALIDATED authority for a negative answer (RFC 2308 §3): the RRSIG-checked,
+    /// in-bailiwick SOA plus the DNSSEC denial proof (NSEC/NSEC3 + RRSIGs). Empty for
+    /// a positive answer. A forged/unsigned SOA is never carried here.
     pub authority: Vec<Record>,
     /// Response code (NOERROR / NXDOMAIN).
     pub rcode: u16,
@@ -484,10 +484,13 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
         // every record we serve is covered by the verdict we report.
         let msg = resolve_message(&target, qtype).await?;
         let rcode = msg.header.rcode_low();
-        verdict = worst_verdict(
-            verdict,
-            crate::dns::dnssec_chain::validate(&ResolverFetcher, &target, qtype, &msg, now).await,
-        );
+        // validate_full also returns the VALIDATED authority to serve with a negative
+        // answer (SOA RRSIG-checked + in-bailiwick + denial proof) — never the raw
+        // upstream authority, so a forged SOA can't ride out under AD=1.
+        let (hop_verdict, hop_authority) =
+            crate::dns::dnssec_chain::validate_full(&ResolverFetcher, &target, qtype, &msg, now)
+                .await;
+        verdict = worst_verdict(verdict, hop_verdict);
 
         // CNAME owned by this hop → serve it and follow; otherwise terminal.
         let cname = msg.answers.iter().find_map(|r| {
@@ -523,15 +526,9 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
                 .filter(|r| r.rtype == qtype && r.name.eq_ignore_ascii_case(&target))
                 .cloned(),
         );
-        // Carry the authority (SOA + denial proof, OPT excluded) so a negative
-        // answer can echo the zone SOA per RFC 2308 §3.
-        let authority = msg
-            .authority
-            .iter()
-            .filter(|r| r.rtype != consts::rtype::OPT)
-            .cloned()
-            .collect();
-        return Some(Validated { records, authority, rcode, verdict });
+        // Serve only the VALIDATED authority from this terminal hop (RFC 2308 §3 SOA,
+        // RRSIG-checked & in-bailiwick) — empty for a positive answer.
+        return Some(Validated { records, authority: hop_authority, rcode, verdict });
     }
 }
 

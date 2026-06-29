@@ -330,6 +330,23 @@ pub async fn validate<F: Fetcher>(
     msg: &wire::Message,
     now: u32,
 ) -> Verdict {
+    validate_full(fetcher, qname, qtype, msg, now).await.0
+}
+
+/// Like [`validate`] but also returns the authority records to serve with a NEGATIVE
+/// answer (RFC 2308 §3). For a Secure denial these are ONLY the SOA RRset at the zone
+/// apex that itself RRSIG-validates under the zone keys (a forged/unsigned/out-of-
+/// bailiwick SOA is dropped, so it can never ride out under AD=1 — audit Finding 1),
+/// plus the in-bailiwick NSEC/NSEC3 denial records and RRSIGs. For an Insecure
+/// (proven-unsigned) zone, the in-bailiwick SOA served WITHOUT AD. Empty for positive
+/// answers and for Bogus.
+pub async fn validate_full<F: Fetcher>(
+    fetcher: &F,
+    qname: &Name,
+    qtype: u16,
+    msg: &wire::Message,
+    now: u32,
+) -> (Verdict, Vec<wire::Record>) {
     // Determine the signing zone from an RRSIG; absent any RRSIG the data is
     // unsigned — only call that Insecure if the enclosing zone is PROVEN unsigned.
     // The signing zone of a legitimate answer is always at or above qname. An
@@ -344,15 +361,15 @@ pub async fn validate<F: Fetcher>(
             .filter(|z| qname.is_in_zone(z))
             .unwrap_or_else(|| qname.clone());
         return match trusted_keys_for(fetcher, &z, now).await.0 {
-            Verdict::Insecure => Verdict::Insecure,
-            _ => Verdict::Bogus,
+            Verdict::Insecure => (Verdict::Insecure, inbailiwick_soa(msg, qname)),
+            _ => (Verdict::Bogus, Vec::new()),
         };
     };
 
     let (chain, keys) = trusted_keys_for(fetcher, &zone, now).await;
     match chain {
-        Verdict::Bogus => return Verdict::Bogus,
-        Verdict::Insecure => return Verdict::Insecure,
+        Verdict::Bogus => return (Verdict::Bogus, Vec::new()),
+        Verdict::Insecure => return (Verdict::Insecure, inbailiwick_soa(msg, qname)),
         Verdict::Secure => {}
     }
     let key_refs: Vec<&[u8]> = keys.iter().map(|v| v.as_slice()).collect();
@@ -383,7 +400,7 @@ pub async fn validate<F: Fetcher>(
             .collect();
         let (_rd, sigs) = split(&msg.answers, t);
         let sig_refs: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
-        return match verify::validate_rrset_wc(
+        let verdict = match verify::validate_rrset_wc(
             qname,
             consts::class::IN,
             t,
@@ -406,14 +423,81 @@ pub async fn validate<F: Fetcher>(
                 }
             }
         };
+        return (verdict, Vec::new()); // positive answer: no authority served
     }
 
     // Negative answer: the denial proof must validate under the zone keys.
     if validate_denial(msg, qname, qtype, &zone, &key_refs, now) {
-        Verdict::Secure
+        (
+            Verdict::Secure,
+            validated_negative_authority(msg, &zone, &key_refs, now),
+        )
     } else {
-        Verdict::Bogus
+        (Verdict::Bogus, Vec::new())
     }
+}
+
+/// In-bailiwick SOA records (owner encloses qname) — for an Insecure (proven-unsigned)
+/// negative answer, where the SOA is served WITHOUT AD (there is no signature to check).
+fn inbailiwick_soa(msg: &wire::Message, qname: &Name) -> Vec<wire::Record> {
+    msg.authority
+        .iter()
+        .filter(|r| r.rtype == consts::rtype::SOA && qname.is_in_zone(&r.name))
+        .cloned()
+        .collect()
+}
+
+/// Validated authority for a SECURE negative answer: the SOA RRset at the zone apex,
+/// included ONLY if it RRSIG-validates under the zone keys (a forged/unsigned SOA is
+/// dropped so it can never be served under AD=1 — audit Finding 1), plus the
+/// in-bailiwick NSEC/NSEC3 denial records and RRSIGs. DO-gating is applied by the
+/// serving layer (`wire_negative`).
+fn validated_negative_authority(
+    msg: &wire::Message,
+    zone: &Name,
+    keys: &[&[u8]],
+    now: u32,
+) -> Vec<wire::Record> {
+    let mut out: Vec<wire::Record> = Vec::new();
+    // SOA at the zone apex — only when its RRset RRSIG-validates.
+    let soa_rdatas: Vec<&Rdata> = msg
+        .authority
+        .iter()
+        .filter(|r| r.rtype == consts::rtype::SOA && r.name.eq_ignore_ascii_case(zone))
+        .map(|r| &r.rdata)
+        .collect();
+    let (_rd, soa_sigs) = split(&msg.authority, consts::rtype::SOA);
+    let soa_sig_refs: Vec<&[u8]> = soa_sigs.iter().map(|v| v.as_slice()).collect();
+    if !soa_rdatas.is_empty()
+        && verify::validate_rrset(
+            zone,
+            consts::class::IN,
+            consts::rtype::SOA,
+            &soa_rdatas,
+            &soa_sig_refs,
+            keys,
+            now,
+        )
+    {
+        out.extend(
+            msg.authority
+                .iter()
+                .filter(|r| r.rtype == consts::rtype::SOA && r.name.eq_ignore_ascii_case(zone))
+                .cloned(),
+        );
+    }
+    // Denial proof (NSEC/NSEC3) + signatures, restricted to records within the zone.
+    out.extend(
+        msg.authority
+            .iter()
+            .filter(|r| {
+                (matches!(r.rtype, consts::rtype::NSEC | consts::rtype::NSEC3)
+                    || r.rtype == consts::rtype::RRSIG)
+                    && r.name.is_in_zone(zone)
+            })
+            .cloned(),
+    );
+    out
 }
 
 #[cfg(test)]
