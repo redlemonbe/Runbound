@@ -93,6 +93,33 @@ impl Name {
         n
     }
 
+    /// The parent name (this name with its leftmost label removed), or `None`
+    /// for the root. Used by the iterative resolver to walk the delegation chain.
+    pub fn parent(&self) -> Option<Name> {
+        if self.is_root() {
+            return None;
+        }
+        let skip = 1 + self.wire[0] as usize;
+        let mut wire: SmallVec<[u8; 24]> = SmallVec::new();
+        wire.extend_from_slice(&self.wire[skip..]);
+        Some(Name { wire })
+    }
+
+    /// True if `self` is `zone` or a subdomain of it (case-insensitive). Walks the
+    /// label hierarchy, so the suffix match is always label-aligned.
+    pub fn is_in_zone(&self, zone: &Name) -> bool {
+        let mut cur = self.clone();
+        loop {
+            if cur.eq_ignore_ascii_case(zone) {
+                return true;
+            }
+            match cur.parent() {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+    }
+
     /// Lowercased copy of the wire form (length octets untouched, label data
     /// ASCII-lowercased). This is both the comparison key and the compression
     /// table key.

@@ -16,6 +16,10 @@ pub mod ratelimit;
 pub mod server;
 #[cfg(feature = "recursor")]
 pub mod recursor;
+// In-house iterative resolver (Phase 1 of the recursor de-hickory). Built and
+// tested under the recursor feature; not yet dispatched to (Phase 2 = DNSSEC).
+#[cfg(any(feature = "recursor", test))]
+pub mod recursor_wire;
 pub mod zone_signer;
 pub mod dnssec_sign;
 pub mod plain_server;
