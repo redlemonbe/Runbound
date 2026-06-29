@@ -38,6 +38,9 @@ pub enum LogAction {
     Nxdomain = 4,
     Refused = 5,
     Servfail = 6,
+    /// Answered by the in-house iterative resolver (full-recursion mode), as
+    /// opposed to `Forwarded` (answer relayed from a configured upstream).
+    Recursed = 7,
 }
 
 impl LogAction {
@@ -50,6 +53,7 @@ impl LogAction {
             Self::Nxdomain => "nxdomain",
             Self::Refused => "refused",
             Self::Servfail => "servfail",
+            Self::Recursed => "recursed",
         }
     }
 
@@ -62,6 +66,7 @@ impl LogAction {
             "nxdomain" => Some(Self::Nxdomain),
             "refused" => Some(Self::Refused),
             "servfail" => Some(Self::Servfail),
+            "recursed" => Some(Self::Recursed),
             _ => None,
         }
     }

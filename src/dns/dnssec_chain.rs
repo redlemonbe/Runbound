@@ -257,6 +257,26 @@ fn soa_owner(msg: &wire::Message) -> Option<Name> {
         .map(|r| r.name.clone())
 }
 
+/// Does `msg` carry a validated NSEC/NSEC3 proving `qname` has no exact match?
+/// Required to accept a wildcard-expanded positive answer as Secure (RFC 4035
+/// §5.3.4): a name that actually exists cannot be proven non-existent, so this
+/// defeats replay of a wildcard signature onto a real name. Only RRSIG-validated
+/// denial records are considered. Fail-closed (no proof → false → Bogus).
+fn proves_no_exact_match(
+    msg: &wire::Message,
+    qname: &Name,
+    zone: &Name,
+    keys: &[&[u8]],
+    now: u32,
+) -> bool {
+    let nsecs = collect_validated_nsec(msg, keys, now);
+    if denial::nsec_proves_nonexistence(&nsecs, qname) {
+        return true;
+    }
+    let nsec3s = collect_validated_nsec3(msg, keys, now);
+    denial::nsec3_proves_name_nonexistent(&nsec3s, qname, zone)
+}
+
 /// Validate the denial of existence in `msg` for `qname`/`qtype` under `zone`'s
 /// `keys` (NXDOMAIN or NODATA). Only validated NSEC/NSEC3 records are trusted.
 fn validate_denial(
@@ -297,8 +317,16 @@ pub async fn validate<F: Fetcher>(
 ) -> Verdict {
     // Determine the signing zone from an RRSIG; absent any RRSIG the data is
     // unsigned — only call that Insecure if the enclosing zone is PROVEN unsigned.
-    let Some(zone) = zone_apex(msg) else {
-        let z = soa_owner(msg).unwrap_or_else(|| qname.clone());
+    // The signing zone of a legitimate answer is always at or above qname. An
+    // attacker can attach a junk RRSIG (or forge the SOA owner) whose name points
+    // at an unrelated, genuinely-insecure zone to coerce an `Insecure` verdict on
+    // a signed name (DNSSEC downgrade — the forged answer would then be served
+    // without SERVFAIL). Bind the zone to qname: any signer / SOA owner that does
+    // not enclose qname is ignored, and such data falls through to Bogus.
+    let Some(zone) = zone_apex(msg).filter(|z| qname.is_in_zone(z)) else {
+        let z = soa_owner(msg)
+            .filter(|z| qname.is_in_zone(z))
+            .unwrap_or_else(|| qname.clone());
         return match trusted_keys_for(fetcher, &z, now).await.0 {
             Verdict::Insecure => Verdict::Insecure,
             _ => Verdict::Bogus,
@@ -339,10 +367,28 @@ pub async fn validate<F: Fetcher>(
             .collect();
         let (_rd, sigs) = split(&msg.answers, t);
         let sig_refs: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
-        return if verify::validate_rrset(qname, consts::class::IN, t, &rdatas, &sig_refs, &key_refs, now) {
-            Verdict::Secure
-        } else {
-            Verdict::Bogus
+        return match verify::validate_rrset_wc(
+            qname,
+            consts::class::IN,
+            t,
+            &rdatas,
+            &sig_refs,
+            &key_refs,
+            now,
+        ) {
+            None => Verdict::Bogus,
+            Some(false) => Verdict::Secure,
+            // RFC 4035 §5.3.4: a wildcard-expanded answer is Secure only if the
+            // response also proves qname has no exact match (a validated NSEC/NSEC3
+            // covering it). Without that, a wildcard RRSIG could be replayed onto an
+            // existing name. Fail-closed: no proof → Bogus.
+            Some(true) => {
+                if proves_no_exact_match(msg, qname, &zone, &key_refs, now) {
+                    Verdict::Secure
+                } else {
+                    Verdict::Bogus
+                }
+            }
         };
     }
 

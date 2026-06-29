@@ -88,11 +88,21 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 || o[0] >= 240) // 240.0.0.0/4 reserved
         }
         IpAddr::V6(a) => {
+            // An IPv4-mapped address (::ffff:a.b.c.d) is routed by the kernel to the
+            // embedded IPv4 on a dual-stack host — re-run the (thorough) v4 checks so
+            // ::ffff:10.0.0.1 / ::ffff:127.0.0.1 can't bypass the SSRF guard.
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
+            let s = a.segments();
             !(a.is_loopback()
                 || a.is_unspecified()
                 || a.is_multicast()
-                || (a.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
-                || (a.segments()[0] & 0xffc0) == 0xfe80) // fe80::/10 link-local
+                || (s[0] & 0xfe00) == 0xfc00                 // fc00::/7 ULA
+                || (s[0] & 0xffc0) == 0xfe80                 // fe80::/10 link-local
+                || (s[0] == 0x64 && s[1] == 0xff9b)          // 64:ff9b::/96 NAT64 → v4
+                || (s[0] == 0x2001 && s[1] == 0x0db8)        // 2001:db8::/32 documentation
+                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)) // ::/96 (incl. IPv4-compatible)
         }
     }
 }
@@ -101,8 +111,15 @@ fn is_public_ip(ip: IpAddr) -> bool {
 /// answers set TC and we retry over TCP, so 512-byte UDP is fine here.
 fn build_query(qname: &Name, qtype: u16) -> (u16, Vec<u8>) {
     let mut idb = [0u8; 2];
-    let _ = getrandom::fill(&mut idb);
-    let id = u16::from_be_bytes(idb);
+    let id = if getrandom::fill(&mut idb).is_ok() {
+        u16::from_be_bytes(idb)
+    } else {
+        // getrandom failing is near-impossible on Linux, but never emit a constant
+        // id: a predictable transaction id collapses off-path spoof resistance.
+        use std::sync::atomic::{AtomicU16, Ordering};
+        static FALLBACK: AtomicU16 = AtomicU16::new(0x1357);
+        FALLBACK.fetch_add(0x9e37, Ordering::Relaxed) ^ qtype.rotate_left(7)
+    };
     let header = wire::Header {
         id,
         flags: 0, // QR=0, opcode=QUERY, RD=0 (iterative), rcode=0
@@ -450,19 +467,70 @@ pub struct Validated {
 /// serving records follow CNAMEs (via [`resolve`]); the verdict comes from the
 /// authoritative reply for `qname`. `None` only on a hard resolution failure.
 pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Validated> {
-    let msg = resolve_message(qname, qtype).await?;
-    let verdict = crate::dns::dnssec_chain::validate(&ResolverFetcher, qname, qtype, &msg, now).await;
-    let rcode = msg.header.rcode_low();
-    let records = match resolve(qname, qtype).await {
-        Outcome::Answer(recs) => recs,
-        _ => msg
-            .answers
-            .iter()
-            .filter(|r| r.rtype != consts::rtype::RRSIG && r.rtype != consts::rtype::OPT)
-            .cloned()
-            .collect(),
-    };
-    Some(Validated { records, rcode, verdict })
+    use crate::dns::dnssec_chain::Verdict;
+    let mut target = qname.clone();
+    let mut cname_left = MAX_CNAME;
+    let mut records: Vec<Record> = Vec::new();
+    let mut verdict = Verdict::Secure; // worst-of across every served hop
+
+    loop {
+        // The verdict AND the served records both come from THIS authoritative
+        // message — never a divergent second descent. Following a CNAME re-queries
+        // its target so that hop's RRset is validated under ITS own zone keys, so
+        // every record we serve is covered by the verdict we report.
+        let msg = resolve_message(&target, qtype).await?;
+        let rcode = msg.header.rcode_low();
+        verdict = worst_verdict(
+            verdict,
+            crate::dns::dnssec_chain::validate(&ResolverFetcher, &target, qtype, &msg, now).await,
+        );
+
+        // CNAME owned by this hop → serve it and follow; otherwise terminal.
+        let cname = msg.answers.iter().find_map(|r| {
+            if r.rtype == consts::rtype::CNAME && r.name.eq_ignore_ascii_case(&target) {
+                if let Rdata::Cname(next) = &r.rdata {
+                    return Some((r.clone(), next.clone()));
+                }
+            }
+            None
+        });
+
+        if let Some((cn_rec, next)) = cname {
+            records.push(cn_rec);
+            if cname_left == 0 {
+                // Refuse to serve a too-long / looping chain.
+                return Some(Validated { records, rcode, verdict: Verdict::Bogus });
+            }
+            cname_left -= 1;
+            target = next;
+            continue;
+        }
+
+        // Terminal: serve exactly the qtype RRset at `target` — the records
+        // `validate(&target, qtype, …)` just covered (RRSIG/OPT excluded).
+        records.extend(
+            msg.answers
+                .iter()
+                .filter(|r| r.rtype == qtype && r.name.eq_ignore_ascii_case(&target))
+                .cloned(),
+        );
+        return Some(Validated { records, rcode, verdict });
+    }
+}
+
+/// Combine two hop verdicts into the verdict for the whole served chain: any
+/// `Bogus` → `Bogus` (SERVFAIL); else any `Insecure` → `Insecure` (no AD); else
+/// `Secure`. A chain is only as trustworthy as its weakest validated link.
+fn worst_verdict(
+    a: crate::dns::dnssec_chain::Verdict,
+    b: crate::dns::dnssec_chain::Verdict,
+) -> crate::dns::dnssec_chain::Verdict {
+    use crate::dns::dnssec_chain::Verdict::*;
+    match (a, b) {
+        (Bogus, _) | (_, Bogus) => Bogus,
+        (Insecure, _) | (_, Insecure) => Insecure,
+        _ => Secure,
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +549,16 @@ mod tests {
         assert!(!is_public_ip("::1".parse().unwrap()));
         assert!(!is_public_ip("fe80::1".parse().unwrap()));
         assert!(!is_public_ip("fc00::1".parse().unwrap()));
+        assert!(is_public_ip("2001:4860:4860::8888".parse().unwrap())); // public v6
+        // DV-06: IPv4-mapped IPv6 must be re-evaluated against the embedded v4 —
+        // on a dual-stack host the kernel routes ::ffff:a.b.c.d to that v4.
+        assert!(!is_public_ip("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("::ffff:169.254.0.1".parse().unwrap()));
+        assert!(is_public_ip("::ffff:8.8.8.8".parse().unwrap())); // mapped public v4
+        assert!(!is_public_ip("64:ff9b::8.8.8.8".parse().unwrap())); // NAT64 → v4
+        assert!(!is_public_ip("2001:db8::1".parse().unwrap())); // documentation
+        assert!(!is_public_ip("::1.2.3.4".parse().unwrap())); // IPv4-compatible (::/96)
     }
 
     // Live test (needs outbound UDP/53 to the internet). Run with:

@@ -55,6 +55,23 @@ pub fn physical_cores() -> Vec<usize> {
     }
 }
 
+/// CPU cores actually usable by this process: the host physical-core count
+/// clamped by the cgroup / CPU-affinity quota.
+///
+/// `physical_cores()` reads host sysfs topology, which is NOT namespaced inside a
+/// container — in an LXC/cgroup-limited deployment it reports every host core even
+/// when the cpuset grants only a few. `available_parallelism()` honours
+/// `sched_getaffinity` and the cgroup cpu quota, so the minimum of the two is the
+/// truthful "cores available here". Used for reporting and worker sizing, mirroring
+/// the cgroup-aware `memory.max` cache sizing — never over-report/over-subscribe.
+pub fn available_cores() -> usize {
+    let physical = physical_cores().len().max(1);
+    let quota = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(physical);
+    physical.min(quota).max(1)
+}
+
 
 /// Pin NIC queue IRQs to their corresponding XDP worker cores.
 ///

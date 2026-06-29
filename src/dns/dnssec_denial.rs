@@ -14,6 +14,13 @@
 
 use crate::dns::wire::{consts, Decoder, Name};
 
+/// Maximum NSEC3 hash iterations a validator will compute (RFC 9276 §3.1). Modern
+/// signed zones use 0; legacy zones rarely exceed ~10. Capping bounds the per-query
+/// SHA-1 work so a hostile signed zone cannot weaponise `iterations = 65535`
+/// (amplified across the ancestor chain) into a CPU-exhaustion DoS. A record above
+/// the cap is treated as unusable → its proof fails closed (→ Bogus).
+pub const NSEC3_MAX_ITERATIONS: u16 = 100;
+
 /// Is `rtype` present in an NSEC/NSEC3 type bitmap (RFC 4034 §4.1.2)? The bitmap
 /// is a sequence of `window(1) | length(1) | bits(length)` blocks.
 pub fn type_in_bitmap(mut bm: &[u8], rtype: u16) -> bool {
@@ -183,8 +190,14 @@ impl<'a> Nsec3<'a> {
     }
 
     /// Hash `name` under this NSEC3's params (only SHA-1, hash alg 1, is defined).
+    ///
+    /// Iterations above [`NSEC3_MAX_ITERATIONS`] are rejected (→ `None`): an
+    /// attacker-signed zone could otherwise set `iterations = 65535` and force
+    /// unbounded SHA-1 work, amplified across the qname's ancestor chain (CPU
+    /// exhaustion DoS). A record above the cap cannot satisfy match/cover, so the
+    /// proof fails closed (→ Bogus).
     fn hash(&self, name: &Name) -> Option<[u8; 20]> {
-        if self.hash_alg != 1 {
+        if self.hash_alg != 1 || self.iterations > NSEC3_MAX_ITERATIONS {
             return None;
         }
         let canon = crate::dns::dnssec_sign::canonical_name_wire(name);
@@ -285,6 +298,37 @@ pub fn nsec3_proves_nxdomain(nsec3s: &[Nsec3], qname: &Name, zone: &Name) -> boo
     false
 }
 
+/// NSEC3 proof that `qname` itself has no exact match — required to accept a
+/// wildcard-expanded positive answer as Secure (RFC 4035 §5.3.4 / RFC 5155 §8.8):
+/// a closest encloser CE (a proper ancestor of `qname` with a MATCHING NSEC3)
+/// exists and the next-closer name (one label longer than CE, toward `qname`) is
+/// COVERED. Unlike [`nsec3_proves_nxdomain`] the wildcard need NOT be covered —
+/// the wildcard is precisely what produced the answer. An existing `qname` cannot
+/// satisfy this (it would be matched, not covered), so it defeats replay of a
+/// wildcard signature onto a real name.
+pub fn nsec3_proves_name_nonexistent(nsec3s: &[Nsec3], qname: &Name, zone: &Name) -> bool {
+    let mut chain = vec![qname.clone()];
+    let mut cur = qname.clone();
+    while !cur.eq_ignore_ascii_case(zone) {
+        match cur.parent() {
+            Some(p) => {
+                cur = p.clone();
+                chain.push(p);
+            }
+            None => return false, // qname is not under zone
+        }
+    }
+    for i in 1..chain.len() {
+        let ce = &chain[i];
+        if !nsec3s.iter().any(|n3| n3.matches(ce)) {
+            continue;
+        }
+        let next_closer = &chain[i - 1];
+        return nsec3s.iter().any(|n3| n3.covers(next_closer));
+    }
+    false
+}
+
 /// NSEC NXDOMAIN proof (RFC 4035 §5.4): an NSEC covers `qname` (it does not
 /// exist) and an NSEC covers the wildcard `*.CE`, where CE is the closest
 /// encloser — the owner of the NSEC that covers `qname` shares CE as a suffix,
@@ -317,6 +361,35 @@ mod tests {
 
     fn n(s: &str) -> Name {
         Name::from_ascii(s).unwrap()
+    }
+
+    // DV-05: an NSEC3 whose `iterations` exceed the cap is never hashed, so it can
+    // satisfy neither match nor cover — the attacker's CPU-exhaustion lever is gone.
+    #[test]
+    fn nsec3_iterations_above_cap_are_rejected() {
+        let name = n("a.example.com.");
+        let high = Nsec3 {
+            hash_alg: 1,
+            flags: 0,
+            iterations: NSEC3_MAX_ITERATIONS + 1,
+            salt: &[],
+            owner_hash: vec![0u8; 20],
+            next_hash: &[0u8; 20],
+            bitmap: &[],
+        };
+        assert!(high.hash(&name).is_none());
+        assert!(!high.matches(&name));
+        assert!(!high.covers(&name));
+        let ok = Nsec3 {
+            hash_alg: 1,
+            flags: 0,
+            iterations: NSEC3_MAX_ITERATIONS,
+            salt: &[],
+            owner_hash: vec![0u8; 20],
+            next_hash: &[0u8; 20],
+            bitmap: &[],
+        };
+        assert!(ok.hash(&name).is_some());
     }
 
     // Type bitmap with a single window 0 holding A (1), NS (2), SOA (6), RRSIG (46).

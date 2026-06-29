@@ -81,15 +81,10 @@ pub mod recursor {
     use std::sync::Arc;
 
     /// Stateless handle kept for API/relay plumbing; the validating resolver
-    /// holds no per-mode state of its own.
+    /// holds no per-mode state of its own. (de-hickory: there is no backend object
+    /// to load — `resolution_mode` alone drives the serving hot path.)
     #[derive(Clone)]
     pub struct SharedRecursor(());
-
-    impl SharedRecursor {
-        pub fn load_full(&self) -> Option<Arc<()>> {
-            None
-        }
-    }
 
     /// 1 for full-recursion, 0 for forward — read on the serving hot path.
     pub fn mode_atomic(mode: ResolutionMode) -> Arc<AtomicU8> {

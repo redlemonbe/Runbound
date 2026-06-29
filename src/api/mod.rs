@@ -349,7 +349,10 @@ pub struct AppState {
     /// #202: resolution mode (0 = forward, 1 = full-recursion). Hot-swapped by PUT /api/resolution
     /// (admin-only); the DNS data path reads it on the hot path. Shared with the running handler.
     pub resolution_mode: Arc<std::sync::atomic::AtomicU8>,
-    /// #202: sovereign recursor handle, rebuilt in place when the mode is toggled.
+    /// #202: stateless recursor plumbing handle (de-hickory: the validating
+    /// resolver is stateless; `resolution_mode` alone drives serving). Retained
+    /// for relay/handler construction symmetry — never read.
+    #[allow(dead_code)]
     pub recursor: crate::dns::recursor::SharedRecursor,
     /// Multi-user registry (None = single-user mode, only master API key works).
     pub user_registry: Option<Arc<crate::multiuser::UserRegistry>>,
@@ -1075,8 +1078,10 @@ async fn system_handler(State(s): State<AppState>) -> impl IntoResponse {
     // Approximate average CPU% for this process since start.
     let cpu_percent = process_cpu_percent();
 
-    // Worker count: one XDP worker per NIC queue + tokio thread pool.
-    let cpu_cores = crate::cpu::physical_cores().len().max(1);
+    // Worker count: one XDP worker per NIC queue + tokio thread pool. Use the
+    // cgroup-aware count so a container reports the cores it can actually use
+    // (host sysfs topology is not namespaced) rather than the host's total.
+    let cpu_cores = crate::cpu::available_cores();
 
     // FEAT #47: upstream health counts
     let (upstreams_healthy, upstreams_total) = {
@@ -1520,7 +1525,11 @@ async fn resolution_get_handler(State(s): State<AppState>) -> impl IntoResponse 
     let full = s.resolution_mode.load(Ordering::Relaxed) == 1;
     JsonExtract(serde_json::json!({
         "mode": if full { "full-recursion" } else { "forward" },
-        "recursor_active": s.recursor.load_full().is_some(),
+        // The in-house validating resolver has no separate backend handle (the
+        // de-hickory refactor dropped `SharedRecursor`); it is active exactly when
+        // the serving hot path is in full-recursion mode. `load_full()` is always
+        // None now, so report the real serving state instead.
+        "recursor_active": full,
     }))
 }
 

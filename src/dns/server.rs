@@ -690,7 +690,9 @@ impl RunboundHandler {
                     self.maybe_cache_wire(&q, &resp, &records);
                     self.stats.inc_forwarded();
                     self.stats.record_forward(start.elapsed().as_micros() as u64);
-                    self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Forwarded, start);
+                    // full-recursion: the answer came from our own iterative resolver,
+                    // not a configured upstream — log it as `recursed`, not `forwarded`.
+                    self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Recursed, start);
                     return Some(resp);
                 }
                 Some(_bogus) => {

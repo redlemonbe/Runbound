@@ -1880,7 +1880,8 @@ async fn handle_relay_request(
         // ── System info (for WebUI node overview) ───────────────────────────
         ("GET", "system") => {
             let snap = relay.stats_cache.load();
-            let cpu_cores = crate::cpu::physical_cores().len().max(1);
+            // cgroup-aware: report cores usable here, not the host topology total.
+            let cpu_cores = crate::cpu::available_cores();
 
             // Memory: cgroup v2 if available, else /proc/meminfo
             let (mem_avail_mb, mem_total_mb): (u64, u64) = {

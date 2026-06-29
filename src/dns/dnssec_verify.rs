@@ -36,7 +36,6 @@ const ALG_ED25519: u8 = 15;
 struct Rrsig<'a> {
     type_covered: u16,
     algorithm: u8,
-    #[allow(dead_code)]
     labels: u8,
     original_ttl: u32,
     expiration: u32,
@@ -191,6 +190,32 @@ fn verify_signature(algorithm: u8, dnskey_pubkey: &[u8], msg: &[u8], sig: &[u8])
     }
 }
 
+/// Canonical TBS owner for an RRSIG with `labels` (RFC 4034 §3.1.3, RFC 4035
+/// §5.3.2). When `labels` equals the owner's label count the owner is used as-is;
+/// when it is smaller the RRset was synthesised from a wildcard and the signed
+/// owner is `*.` followed by the `labels` rightmost labels of the queried owner.
+/// `labels` greater than the owner's label count is malformed → `None` (reject).
+fn rrsig_owner_name(owner: &Name, labels: u8) -> Option<Name> {
+    let lab = owner.labels_lower();
+    let n = labels as usize;
+    if n > lab.len() {
+        return None;
+    }
+    if n == lab.len() {
+        return Some(owner.clone());
+    }
+    // Wildcard expansion: `*.<n rightmost labels>`.
+    let mut s = String::from("*");
+    for l in &lab[lab.len() - n..] {
+        s.push('.');
+        for &b in l {
+            s.push(b as char); // canonical labels are ASCII-lowercased
+        }
+    }
+    s.push('.');
+    Name::from_ascii(&s).ok()
+}
+
 /// Verify one RRSIG (`rrsig_rdata`) over the RRset (`owner`/`rclass`/`rdatas`)
 /// using the candidate DNSKEY (`dnskey_rdata`), at unix time `now`.
 ///
@@ -224,7 +249,13 @@ pub fn verify_rrsig(
         return false;
     }
     let dnskey_pubkey = &dnskey_rdata[4..];
-    let msg = signed_data(&sig, owner, rclass, rdatas);
+    // RFC 4035 §5.3.2: a wildcard-expanded RRset (RRSIG.labels < owner labels) was
+    // signed under `*.<suffix>`, not the queried name — reconstruct the TBS owner
+    // accordingly. `labels` exceeding the owner's label count is malformed → reject.
+    let Some(tbs_owner) = rrsig_owner_name(owner, sig.labels) else {
+        return false;
+    };
+    let msg = signed_data(&sig, &tbs_owner, rclass, rdatas);
     verify_signature(sig.algorithm, dnskey_pubkey, &msg, &sig.signature)
 }
 
@@ -360,6 +391,12 @@ pub fn rrsig_type_covered(rdata: &[u8]) -> Option<u16> {
     (rdata.len() >= 2).then(|| u16::from_be_bytes([rdata[0], rdata[1]]))
 }
 
+/// The `labels` field of an RRSIG RDATA (RFC 4034 §3.1.3) — the number of labels
+/// in the original (pre-wildcard-expansion) owner name.
+pub fn rrsig_labels(rdata: &[u8]) -> Option<u8> {
+    (rdata.len() >= 4).then(|| rdata[3])
+}
+
 /// Parse a DS RDATA (RFC 4034 §5.1): key tag | algorithm | digest type | digest.
 pub fn parse_ds(rdata: &[u8]) -> Option<Ds<'_>> {
     if rdata.len() < 5 {
@@ -384,11 +421,34 @@ pub fn validate_rrset(
     trusted_keys: &[&[u8]],
     now: u32,
 ) -> bool {
-    rrsigs.iter().any(|sig| {
-        trusted_keys
-            .iter()
-            .any(|key| verify_rrsig(owner, rclass, rtype, rdatas, sig, key, now))
-    })
+    validate_rrset_wc(owner, rclass, rtype, rdatas, rrsigs, trusted_keys, now).is_some()
+}
+
+/// Like [`validate_rrset`], but also reports whether the signature that validated
+/// was a wildcard expansion (RRSIG.labels < the owner's label count). `None` = no
+/// valid signature; `Some(false)` = ordinary validation; `Some(true)` = validated
+/// via a wildcard — the caller MUST then require a no-exact-match denial proof
+/// (RFC 4035 §5.3.4), else a wildcard RRSIG could be replayed onto an existing name.
+pub fn validate_rrset_wc(
+    owner: &Name,
+    rclass: u16,
+    rtype: u16,
+    rdatas: &[&Rdata],
+    rrsigs: &[&[u8]],
+    trusted_keys: &[&[u8]],
+    now: u32,
+) -> Option<bool> {
+    for sig in rrsigs {
+        for key in trusted_keys {
+            if verify_rrsig(owner, rclass, rtype, rdatas, sig, key, now) {
+                let wildcard = rrsig_labels(sig)
+                    .map(|l| (l as usize) < owner.label_count())
+                    .unwrap_or(false);
+                return Some(wildcard);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -396,6 +456,20 @@ mod tests {
     use super::*;
     use crate::dns::dnssec_sign::{key_tag, sign_rrset, RrsigParams, SigningKey};
     use std::net::Ipv4Addr;
+
+    // DV-04: RRSIG.labels drives the canonical TBS owner (RFC 4035 §5.3.2).
+    #[test]
+    fn rrsig_owner_name_reconstructs_wildcard() {
+        let owner = Name::from_ascii("foo.example.com.").unwrap();
+        // labels == owner labels → owner verbatim.
+        assert_eq!(rrsig_owner_name(&owner, 3).unwrap().to_ascii(), "foo.example.com.");
+        // labels < owner labels → wildcard at the closest encloser.
+        assert_eq!(rrsig_owner_name(&owner, 2).unwrap().to_ascii(), "*.example.com.");
+        let deep = Name::from_ascii("a.b.example.com.").unwrap();
+        assert_eq!(rrsig_owner_name(&deep, 2).unwrap().to_ascii(), "*.example.com.");
+        // labels > owner labels → malformed → reject (fail-closed).
+        assert!(rrsig_owner_name(&owner, 4).is_none());
+    }
 
     // Round-trip: sign an A RRset with our ECDSA P-256 signer (oracle-proven vs
     // hickory), then verify it here. Proves the canonical TBS + ECDSA path.
