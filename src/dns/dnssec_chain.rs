@@ -123,7 +123,7 @@ pub async fn trusted_keys_for<F: Fetcher>(
         if ds_rd.is_empty() {
             // No DS: must be a PROVEN insecure delegation (NSEC/NSEC3 in authority,
             // validated under the parent's keys). Otherwise Bogus.
-            return if denial_secure(&ds_msg, &child, consts::rtype::DS, &key_refs, now) {
+            return if denial_secure(&ds_msg, &child, &key_refs, now) {
                 (Verdict::Insecure, vec![])
             } else {
                 (Verdict::Bogus, vec![])
@@ -165,28 +165,16 @@ pub async fn trusted_keys_for<F: Fetcher>(
     (Verdict::Secure, keys)
 }
 
-/// Are the denial (NSEC/NSEC3) records in `msg`'s authority a VALID proof — signed
-/// under `keys` — that `name` has no record of `qtype` (here: no DS → insecure)?
-fn denial_secure(msg: &wire::Message, name: &Name, qtype: u16, keys: &[&[u8]], now: u32) -> bool {
-    // Every NSEC/NSEC3 used must itself be validated under the zone keys.
-    let nsec_ok = msg.authority.iter().any(|r| {
-        r.rtype == consts::rtype::NSEC && rrset_validated(msg, &r.name, consts::rtype::NSEC, keys, now)
-    });
-    let nsec3_ok = msg.authority.iter().any(|r| {
-        r.rtype == consts::rtype::NSEC3
-            && rrset_validated(msg, &r.name, consts::rtype::NSEC3, keys, now)
-    });
-    if !nsec_ok && !nsec3_ok {
-        return false;
-    }
-    debug_assert_eq!(qtype, consts::rtype::DS);
-    // Prove the delegation `name` has no DS — the zone exists but is unsigned.
-    let nsecs = collect_nsec(msg);
+/// Are the denial records in `msg`'s authority a VALID, signed proof that `name`
+/// has no DS (an insecure delegation)? Only NSEC/NSEC3 RRsets that themselves
+/// validate under `keys` are considered — forged records mixed in are ignored.
+fn denial_secure(msg: &wire::Message, name: &Name, keys: &[&[u8]], now: u32) -> bool {
+    let nsecs = collect_validated_nsec(msg, keys, now);
     if !nsecs.is_empty() {
         return denial::nsec_proves_no_ds(&nsecs, name);
     }
-    let nsec3s = collect_nsec3(msg);
-    denial::nsec3_proves_no_ds(&nsec3s, name)
+    let nsec3s = collect_validated_nsec3(msg, keys, now);
+    !nsec3s.is_empty() && denial::nsec3_proves_no_ds(&nsec3s, name)
 }
 
 /// Validate the RRset of `rtype` owned by `owner` within `msg`'s authority under `keys`.
@@ -218,10 +206,14 @@ fn rrset_validated(msg: &wire::Message, owner: &Name, rtype: u16, keys: &[&[u8]]
     verify::validate_rrset(owner, consts::class::IN, rtype, &refs, &sig_refs, keys, now)
 }
 
-fn collect_nsec(msg: &wire::Message) -> Vec<denial::Nsec<'_>> {
+/// NSEC records whose RRset validated under `keys` (only these may back a proof).
+fn collect_validated_nsec<'a>(msg: &'a wire::Message, keys: &[&[u8]], now: u32) -> Vec<denial::Nsec<'a>> {
     msg.authority
         .iter()
-        .filter(|r| r.rtype == consts::rtype::NSEC)
+        .filter(|r| {
+            r.rtype == consts::rtype::NSEC
+                && rrset_validated(msg, &r.name, consts::rtype::NSEC, keys, now)
+        })
         .filter_map(|r| match &r.rdata {
             Rdata::Unknown { data, .. } => denial::Nsec::parse(r.name.clone(), data),
             _ => None,
@@ -229,10 +221,14 @@ fn collect_nsec(msg: &wire::Message) -> Vec<denial::Nsec<'_>> {
         .collect()
 }
 
-fn collect_nsec3(msg: &wire::Message) -> Vec<denial::Nsec3<'_>> {
+/// NSEC3 records whose RRset validated under `keys` (only these may back a proof).
+fn collect_validated_nsec3<'a>(msg: &'a wire::Message, keys: &[&[u8]], now: u32) -> Vec<denial::Nsec3<'a>> {
     msg.authority
         .iter()
-        .filter(|r| r.rtype == consts::rtype::NSEC3)
+        .filter(|r| {
+            r.rtype == consts::rtype::NSEC3
+                && rrset_validated(msg, &r.name, consts::rtype::NSEC3, keys, now)
+        })
         .filter_map(|r| match &r.rdata {
             Rdata::Unknown { data, .. } => denial::Nsec3::parse(&r.name, data),
             _ => None,
@@ -240,35 +236,118 @@ fn collect_nsec3(msg: &wire::Message) -> Vec<denial::Nsec3<'_>> {
         .collect()
 }
 
-/// Validate a positive answer `(qname, qtype)` end to end and return the verdict.
-/// `answer` is the message holding the answer RRset and its RRSIGs.
-pub async fn validate_positive<F: Fetcher>(
+/// The zone apex for a message: the signer of any RRSIG it carries.
+fn zone_apex(msg: &wire::Message) -> Option<Name> {
+    msg.answers
+        .iter()
+        .chain(msg.authority.iter())
+        .filter(|r| r.rtype == consts::rtype::RRSIG)
+        .filter_map(|r| match &r.rdata {
+            Rdata::Unknown { data, .. } => verify::rrsig_signer(data),
+            _ => None,
+        })
+        .next()
+}
+
+/// The SOA owner (zone apex) in the authority section, if any.
+fn soa_owner(msg: &wire::Message) -> Option<Name> {
+    msg.authority
+        .iter()
+        .find(|r| r.rtype == consts::rtype::SOA)
+        .map(|r| r.name.clone())
+}
+
+/// Validate the denial of existence in `msg` for `qname`/`qtype` under `zone`'s
+/// `keys` (NXDOMAIN or NODATA). Only validated NSEC/NSEC3 records are trusted.
+fn validate_denial(
+    msg: &wire::Message,
+    qname: &Name,
+    qtype: u16,
+    zone: &Name,
+    keys: &[&[u8]],
+    now: u32,
+) -> bool {
+    let nsecs = collect_validated_nsec(msg, keys, now);
+    let nsec3s = collect_validated_nsec3(msg, keys, now);
+    if nsecs.is_empty() && nsec3s.is_empty() {
+        return false;
+    }
+    if msg.header.rcode_low() == consts::rcode::NXDOMAIN {
+        denial::nsec_proves_nxdomain(&nsecs, qname, zone)
+            || denial::nsec3_proves_nxdomain(&nsec3s, qname, zone)
+    } else {
+        // NODATA: the name exists, the type does not.
+        nsecs
+            .iter()
+            .any(|nz| denial::nsec_proves_nodata(&nz.owner, nz.bitmap, qname, qtype))
+            || denial::nsec3_proves_nodata(&nsec3s, qname, qtype)
+    }
+}
+
+/// Full DNSSEC verdict for a resolved message (positive answer or negative).
+/// Fetches DNSKEY/DS through `fetcher` (the resolver's own DO descent) to build
+/// the chain of trust, then validates the data. Fail-closed: a signed zone whose
+/// data carries no usable signature/proof is Bogus.
+pub async fn validate<F: Fetcher>(
     fetcher: &F,
     qname: &Name,
     qtype: u16,
-    answer: &wire::Message,
-    zone: &Name,
+    msg: &wire::Message,
     now: u32,
 ) -> Verdict {
-    let (chain, keys) = trusted_keys_for(fetcher, zone, now).await;
+    // Determine the signing zone from an RRSIG; absent any RRSIG the data is
+    // unsigned — only call that Insecure if the enclosing zone is PROVEN unsigned.
+    let Some(zone) = zone_apex(msg) else {
+        let z = soa_owner(msg).unwrap_or_else(|| qname.clone());
+        return match trusted_keys_for(fetcher, &z, now).await.0 {
+            Verdict::Insecure => Verdict::Insecure,
+            _ => Verdict::Bogus,
+        };
+    };
+
+    let (chain, keys) = trusted_keys_for(fetcher, &zone, now).await;
     match chain {
         Verdict::Bogus => return Verdict::Bogus,
         Verdict::Insecure => return Verdict::Insecure,
         Verdict::Secure => {}
     }
     let key_refs: Vec<&[u8]> = keys.iter().map(|v| v.as_slice()).collect();
-    let rdatas: Vec<&Rdata> = answer
+
+    // Positive answer for the queried type, or a CNAME for the name.
+    let ans_type = if msg
         .answers
         .iter()
-        .filter(|r| r.rtype == qtype && r.name.eq_ignore_ascii_case(qname))
-        .map(|r| &r.rdata)
-        .collect();
-    let (_rd, sigs) = split(&answer.answers, qtype);
-    let sig_refs: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
-    if rdatas.is_empty() {
-        return Verdict::Bogus; // expected an answer, none present
+        .any(|r| r.rtype == qtype && r.name.eq_ignore_ascii_case(qname))
+    {
+        Some(qtype)
+    } else if msg
+        .answers
+        .iter()
+        .any(|r| r.rtype == consts::rtype::CNAME && r.name.eq_ignore_ascii_case(qname))
+    {
+        Some(consts::rtype::CNAME)
+    } else {
+        None
+    };
+
+    if let Some(t) = ans_type {
+        let rdatas: Vec<&Rdata> = msg
+            .answers
+            .iter()
+            .filter(|r| r.rtype == t && r.name.eq_ignore_ascii_case(qname))
+            .map(|r| &r.rdata)
+            .collect();
+        let (_rd, sigs) = split(&msg.answers, t);
+        let sig_refs: Vec<&[u8]> = sigs.iter().map(|v| v.as_slice()).collect();
+        return if verify::validate_rrset(qname, consts::class::IN, t, &rdatas, &sig_refs, &key_refs, now) {
+            Verdict::Secure
+        } else {
+            Verdict::Bogus
+        };
     }
-    if verify::validate_rrset(qname, consts::class::IN, qtype, &rdatas, &sig_refs, &key_refs, now) {
+
+    // Negative answer: the denial proof must validate under the zone keys.
+    if validate_denial(msg, qname, qtype, &zone, &key_refs, now) {
         Verdict::Secure
     } else {
         Verdict::Bogus
@@ -329,13 +408,13 @@ mod tests {
 
         let cf = Name::from_ascii("cloudflare.com.").unwrap();
         let am = f.fetch(&cf, consts::rtype::A).await.unwrap();
-        let v = validate_positive(&f, &cf, consts::rtype::A, &am, &cf, now).await;
+        let v = validate(&f, &cf, consts::rtype::A, &am, now).await;
         eprintln!("cloudflare.com A -> {v:?}");
         assert_eq!(v, Verdict::Secure);
 
         let bad = Name::from_ascii("dnssec-failed.org.").unwrap();
         let bm = f.fetch(&bad, consts::rtype::A).await.unwrap();
-        let vb = validate_positive(&f, &bad, consts::rtype::A, &bm, &bad, now).await;
+        let vb = validate(&f, &bad, consts::rtype::A, &bm, now).await;
         eprintln!("dnssec-failed.org A -> {vb:?}");
         assert_eq!(vb, Verdict::Bogus);
 

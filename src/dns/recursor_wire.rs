@@ -109,11 +109,19 @@ fn build_query(qname: &Name, qtype: u16) -> (u16, Vec<u8>) {
         qdcount: 1,
         ancount: 0,
         nscount: 0,
-        arcount: 0,
+        arcount: 1, // the OPT pseudo-RR below
     };
     let mut enc = wire::Encoder::uncompressed();
     header.emit(&mut enc);
     wire::Question::new(qname.clone(), qtype).emit(&mut enc);
+    // EDNS(0) OPT with DO=1: ask authoritative servers to include RRSIGs (and DS
+    // in referrals) so the answer can be DNSSEC-validated, and advertise a larger
+    // UDP buffer; oversized replies still set TC and we retry over TCP.
+    enc.u8(0); // root owner name
+    enc.u16(consts::rtype::OPT);
+    enc.u16(1232); // UDP payload size
+    enc.u32(0x0000_8000); // extended-rcode/version 0, DO bit set
+    enc.u16(0); // rdlen
     (id, enc.into_vec())
 }
 
@@ -346,6 +354,88 @@ fn record_ip(r: &Record) -> Option<IpAddr> {
     }
 }
 
+/// Resolve `(qname, qtype)` iteratively (DO set) and return the final
+/// authoritative message — answer or negative — for DNSSEC validation. Follows
+/// referrals like `resolve_once` but stops at the first terminal response (it
+/// does not chase CNAMEs: the validator queries explicit types).
+pub async fn resolve_message(qname: &Name, qtype: u16) -> Option<wire::Message> {
+    let mut budget = MAX_QUERIES;
+    let mut ns_ips: Vec<IpAddr> = ROOT_HINTS_V4.iter().copied().map(IpAddr::V4).collect();
+    let mut zone = Name::root();
+
+    for _ in 0..MAX_DEPTH {
+        let msg = query_ns_set(&ns_ips, qname, qtype, &mut budget).await?;
+        let rcode = msg.header.rcode_low();
+
+        // Terminal: an answer for our name (qtype or CNAME), or NXDOMAIN.
+        let has_answer = msg.answers.iter().any(|r| {
+            (r.rtype == qtype || r.rtype == consts::rtype::CNAME) && r.name.eq_ignore_ascii_case(qname)
+        });
+        if has_answer || rcode == consts::rcode::NXDOMAIN {
+            return Some(msg);
+        }
+
+        // Referral down the tree?
+        let referral_zone = msg
+            .authority
+            .iter()
+            .filter(|r| r.rtype == consts::rtype::NS)
+            .map(|r| &r.name)
+            .find(|nm| qname.is_in_zone(nm) && nm.is_in_zone(&zone) && !nm.eq_ignore_ascii_case(&zone))
+            .cloned();
+        let Some(next_zone) = referral_zone else {
+            // No answer, no referral → NODATA (the message carries SOA/NSEC*).
+            return Some(msg);
+        };
+
+        let ns_names: Vec<Name> = msg
+            .authority
+            .iter()
+            .filter(|r| r.rtype == consts::rtype::NS && r.name.eq_ignore_ascii_case(&next_zone))
+            .filter_map(|r| match &r.rdata {
+                Rdata::Ns(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut next_ips: Vec<IpAddr> = msg
+            .additional
+            .iter()
+            .filter(|r| ns_names.iter().any(|ns| ns.eq_ignore_ascii_case(&r.name)))
+            .filter_map(record_ip)
+            .filter(|ip| is_public_ip(*ip))
+            .collect();
+        if next_ips.is_empty() {
+            for ns in &ns_names {
+                if budget == 0 {
+                    return None;
+                }
+                if let Some(ips) = resolve_ns_addr(ns, &mut budget).await {
+                    next_ips = ips.into_iter().filter(|ip| is_public_ip(*ip)).collect();
+                    if !next_ips.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        if next_ips.is_empty() {
+            return None;
+        }
+        ns_ips = next_ips;
+        zone = next_zone;
+    }
+    None
+}
+
+/// A [`Fetcher`](crate::dns::dnssec_chain::Fetcher) backed by this resolver's own
+/// iterative DO descent — the production source of records for validation.
+pub struct ResolverFetcher;
+
+impl crate::dns::dnssec_chain::Fetcher for ResolverFetcher {
+    async fn fetch(&self, name: &Name, qtype: u16) -> Option<wire::Message> {
+        resolve_message(name, qtype).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +487,34 @@ mod tests {
                 assert_eq!(rcode, consts::rcode::NXDOMAIN);
             }
             other => panic!("expected NXDOMAIN, got {other:?}"),
+        }
+    }
+
+    // End-to-end production path: records fetched by OUR OWN iterative DO resolver
+    // (ResolverFetcher / resolve_message), then DNSSEC-validated. Proves the real
+    // chain works without any third-party resolver.
+    //   cargo test -- --ignored live_validate_via_own_resolver
+    #[tokio::test]
+    #[ignore]
+    async fn live_validate_via_own_resolver() {
+        use crate::dns::dnssec_chain::{validate, Verdict};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let f = ResolverFetcher;
+
+        let cases: [(&str, Verdict); 3] = [
+            ("cloudflare.com.", Verdict::Secure),
+            ("dnssec-failed.org.", Verdict::Bogus),
+            ("google.com.", Verdict::Insecure),
+        ];
+        for (fqdn, want) in cases {
+            let name = Name::from_ascii(fqdn).unwrap();
+            let msg = resolve_message(&name, consts::rtype::A)
+                .await
+                .unwrap_or_else(|| panic!("{fqdn}: own resolver returned no message"));
+            let got = validate(&f, &name, consts::rtype::A, &msg, now).await;
+            eprintln!("OWN-RESOLVER {fqdn} -> {got:?}");
+            assert_eq!(got, want, "{fqdn}: wrong verdict");
         }
     }
 }

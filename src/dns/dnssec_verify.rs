@@ -345,6 +345,17 @@ pub fn validate_dnskey_rrset<'k>(
     None
 }
 
+/// The signer name (zone apex, RFC 4034 §3.1.7) carried by an RRSIG RDATA — used
+/// to determine which zone's keys must validate the RRset it covers.
+pub fn rrsig_signer(rdata: &[u8]) -> Option<Name> {
+    parse_rrsig(rdata).map(|s| s.signer)
+}
+
+/// The type covered by an RRSIG RDATA (RFC 4034 §3.1.1).
+pub fn rrsig_type_covered(rdata: &[u8]) -> Option<u16> {
+    (rdata.len() >= 2).then(|| u16::from_be_bytes([rdata[0], rdata[1]]))
+}
+
 /// Parse a DS RDATA (RFC 4034 §5.1): key tag | algorithm | digest type | digest.
 pub fn parse_ds(rdata: &[u8]) -> Option<Ds<'_>> {
     if rdata.len() < 5 {
