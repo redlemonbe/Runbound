@@ -2,12 +2,17 @@
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 // Local zone authority — in-memory, instant updates, O(1) lookup.
 
+#[cfg(any(feature = "recursor", test))]
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 
-use crate::dns::hasher::{hash_wire_qname, DnsHasherBuilder, IdentityHasherBuilder};
+use crate::dns::hasher::{hash_wire_qname, IdentityHasherBuilder};
+// DnsHasherBuilder only keys the hickory zone/record maps, which are gated below.
+#[cfg(any(feature = "recursor", test))]
+use crate::dns::hasher::DnsHasherBuilder;
 use crate::dns::simd;
 use smallvec::SmallVec;
+#[cfg(any(feature = "recursor", test))]
 use std::str::FromStr;
 
 /// #201: set once at startup from `local-zone-dnssec`. When true, local zones are **not**
@@ -16,6 +21,7 @@ use std::str::FromStr;
 pub static LOCAL_ZONE_DNSSEC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(any(feature = "recursor", test))]
 use hickory_proto::rr::{
     rdata::{self, CNAME},
     LowerName, Name, RData, Record, RecordType,
@@ -53,10 +59,16 @@ impl From<&str> for ZoneAction {
 ///          Clone happens only on API writes (rare), never on DNS reads (ArcSwap).
 #[derive(Debug, Default, Clone)]
 pub struct LocalZoneSet {
+    // Hickory-typed zone/record maps and static-name set. Kept only for the
+    // recursor handler and the differential oracle tests; the default serving
+    // path uses the wire-typed twins below. Absent from the default release.
+    #[cfg(any(feature = "recursor", test))]
     pub zones: HashMap<Name, ZoneAction, DnsHasherBuilder>,
+    #[cfg(any(feature = "recursor", test))]
     pub records: HashMap<Name, Vec<Record>, DnsHasherBuilder>,
     /// SEC-AGV-01: names that were statically configured at startup.
     /// DDNS DELETE operations on these names are rejected.
+    #[cfg(any(feature = "recursor", test))]
     pub static_names: HashSet<Name>,
     /// Fast-path wire-key A/AAAA index (#156 item 3).
     /// Exact-match only; parent-walk / wildcard / other types fall through
@@ -124,6 +136,7 @@ impl WireRecordIndex {
 /// Uses `simd::copy_lowercase_label` for the per-label lowercase step,
 /// the SAME function used in the hot path on the raw query wire bytes.
 /// One function = one normalisation = no silent divergence.
+#[cfg(any(feature = "recursor", test))]
 pub(crate) fn name_to_wire_qname(name: &Name) -> SmallVec<[u8; 64]> {
     let mut buf: SmallVec<[u8; 64]> = SmallVec::new();
     for label in name.iter() {
@@ -156,27 +169,34 @@ pub(crate) fn wire_name_key(name: &crate::dns::wire::Name) -> Box<[u8]> {
 
 impl LocalZoneSet {
     pub fn from_config(zones: &[LocalZone], data: &[LocalData]) -> Self {
-        let mut map = HashMap::with_capacity_and_hasher(zones.len(), DnsHasherBuilder::new());
-        for z in zones {
-            let name_str = if z.name.ends_with('.') {
-                z.name.clone()
-            } else {
-                format!("{}.", z.name)
-            };
-            if let Ok(n) = Name::from_str(&name_str) {
-                map.insert(n, ZoneAction::from(z.zone_type.as_str()));
+        // Hickory zone/record maps — consumed only by the recursor handler and the
+        // differential oracle tests; the default serving path is wire-native
+        // (records_wire / zones_wire, built below).
+        #[cfg(any(feature = "recursor", test))]
+        let (zones_map, record_map) = {
+            let mut map = HashMap::with_capacity_and_hasher(zones.len(), DnsHasherBuilder::new());
+            for z in zones {
+                let name_str = if z.name.ends_with('.') {
+                    z.name.clone()
+                } else {
+                    format!("{}.", z.name)
+                };
+                if let Ok(n) = Name::from_str(&name_str) {
+                    map.insert(n, ZoneAction::from(z.zone_type.as_str()));
+                }
             }
-        }
-        // Build record map: O(1) name lookup replaces O(n) Vec scan on every query.
-        // Also sets implicit static zone for each local-data name (Unbound behaviour).
-        let mut record_map: HashMap<Name, Vec<Record>, DnsHasherBuilder> = HashMap::with_hasher(DnsHasherBuilder::new());
-        for d in data {
-            if let Some(rec) = parse_local_data(&d.rr) {
-                let name = rec.name.clone();
-                map.entry(name.clone()).or_insert(ZoneAction::Static);
-                record_map.entry(name).or_default().push(rec);
+            // O(1) name lookup replaces O(n) Vec scan; implicit static zone per name.
+            let mut record_map: HashMap<Name, Vec<Record>, DnsHasherBuilder> =
+                HashMap::with_hasher(DnsHasherBuilder::new());
+            for d in data {
+                if let Some(rec) = parse_local_data(&d.rr) {
+                    let name = rec.name.clone();
+                    map.entry(name.clone()).or_insert(ZoneAction::Static);
+                    record_map.entry(name).or_default().push(rec);
+                }
             }
-        }
+            (map, record_map)
+        };
 
         // ── De-hickory: build the wire::Record store from the same lines ───────
         // parse_rr_line is the hickory-free parser, proven byte-identical to
@@ -253,6 +273,7 @@ impl LocalZoneSet {
         }
 
         // SEC-AGV-01: track all statically configured names so DDNS cannot delete them.
+        #[cfg(any(feature = "recursor", test))]
         let static_names: HashSet<Name> = zones.iter()
             .filter_map(|z| {
                 let n = if z.name.ends_with('.') { z.name.clone() } else { format!("{}.", z.name) };
@@ -262,8 +283,11 @@ impl LocalZoneSet {
             .collect();
 
         Self {
-            zones: map,
+            #[cfg(any(feature = "recursor", test))]
+            zones: zones_map,
+            #[cfg(any(feature = "recursor", test))]
             records: record_map,
+            #[cfg(any(feature = "recursor", test))]
             static_names,
             wire_records: wire_idx,
             records_wire,
@@ -315,6 +339,7 @@ impl LocalZoneSet {
         } else {
             format!("{}.", name)
         };
+        #[cfg(any(feature = "recursor", test))]
         if let Ok(n) = Name::from_str(&name_str) {
             self.zones.insert(n, action.clone());
         }
@@ -333,6 +358,7 @@ impl LocalZoneSet {
         } else {
             format!("{}.", name)
         };
+        #[cfg(any(feature = "recursor", test))]
         if let Ok(n) = Name::from_str(&name_str) {
             self.zones.remove(&n);
         }
@@ -346,6 +372,7 @@ impl LocalZoneSet {
     /// zone. Used by API / relay zone management so serve_wire (records_wire) and
     /// the legacy maps stay consistent.
     pub fn insert_record_str(&mut self, rr: &str) {
+        #[cfg(any(feature = "recursor", test))]
         if let Some(record) = parse_local_data(rr) {
             let name = record.name.clone();
             self.zones.entry(name.clone()).or_insert(ZoneAction::Static);
@@ -366,6 +393,7 @@ impl LocalZoneSet {
     /// allocation that callers previously had to perform before each lookup.
     /// `LowerName: Deref<Target=Name>`, so `&**query` gives a `&Name` for the
     /// HashMap without any heap allocation on the exact-match fast path.
+    #[cfg(any(feature = "recursor", test))]
     #[inline]
     pub fn find(&self, query: &LowerName) -> Option<ZoneAction> {
         // Fast path: exact match — LowerName: Borrow<Name>, zero allocation.
@@ -392,6 +420,7 @@ impl LocalZoneSet {
 
     /// Exact local-data records for a query. O(1) name lookup + O(m) type filter
     /// where m is the number of records for that name (typically 1–5).
+    #[cfg(any(feature = "recursor", test))]
     #[inline(always)]
     pub fn local_records(&self, query_name: &LowerName, rtype: RecordType) -> Vec<&Record> {
         self.records
@@ -403,6 +432,7 @@ impl LocalZoneSet {
     /// True if the name has at least one record of any type. O(1) HashMap lookup.
     /// Used to distinguish NODATA (name exists, wrong type → NOERROR empty)
     /// from NXDOMAIN (name itself does not exist) — RFC 1035 §3.7.
+    #[cfg(any(feature = "recursor", test))]
     #[inline(always)]
     pub fn name_has_records(&self, name: &LowerName) -> bool {
         self.records.contains_key(name.borrow() as &Name)
@@ -495,6 +525,7 @@ pub(crate) fn preload_into_cache(
 /// Parse a `local-data` RR string into a hickory Record.
 /// Supports: A, AAAA, CNAME, TXT, PTR, NS, MX, SRV, CAA, NAPTR, SSHFP, TLSA
 /// Format:  name [ttl] TYPE rdata...
+#[cfg(any(feature = "recursor", test))]
 pub fn parse_local_data(rr: &str) -> Option<Record> {
     let parts: Vec<&str> = rr.split_whitespace().collect();
     if parts.len() < 3 {

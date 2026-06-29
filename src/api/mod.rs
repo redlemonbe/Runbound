@@ -35,7 +35,7 @@ use crate::audit::{AuditEvent, AuditLogger};
 use crate::config::parser::{TlsConfig, UnboundConfig};
 use crate::dns::server::{SharedResolver, SharedResolversVec};
 use crate::dns::{
-    local::{parse_local_data, LocalZoneSet},
+    local::LocalZoneSet,
     BlacklistAction, ZoneAction,
 };
 use crate::feeds::{
@@ -46,7 +46,6 @@ use crate::stats::Stats;
 use crate::store::{self, BlacklistEntry, DnsEntry, DnsType};
 use crate::sync::{SyncJournal, SyncOp};
 use crate::upstreams::{self, SharedUpstreams};
-use hickory_proto::rr::{LowerName, Name, RecordType};
 
 /// Max TTL for API-created DNS entries (86400 s = 24 h).
 /// Prevents TTL-based cache persistence attacks and operator mistakes.
@@ -1398,9 +1397,12 @@ fn resync_xdp_cache_inner(
     new_zones: &LocalZoneSet,
 ) {
     let mut affected: std::collections::HashSet<Vec<u8>> =
-        std::collections::HashSet::with_capacity(old_zones.zones.len() + new_zones.zones.len());
-    for n in old_zones.zones.keys().chain(new_zones.zones.keys()) {
-        affected.insert(crate::dns::local::name_to_wire_qname(n).to_vec());
+        std::collections::HashSet::with_capacity(
+            old_zones.zones_wire.len() + new_zones.zones_wire.len(),
+        );
+    // zones_wire keys are already lowercased wire QNAMEs — no conversion needed.
+    for k in old_zones.zones_wire.keys().chain(new_zones.zones_wire.keys()) {
+        affected.insert(k.to_vec());
     }
     if !affected.is_empty() {
         cache.retain(|_k, e| !affected.contains(e.wire_qname.as_ref()));
@@ -1671,7 +1673,7 @@ async fn get_dns_handler(
 /// Returns the triple on success, or a (StatusCode, JSON error) ready to return.
 fn validate_dns_entry(
     req: &AddDnsRequest,
-) -> Result<(DnsEntry, String, hickory_proto::rr::Record), ApiError> {
+) -> Result<(DnsEntry, String), ApiError> {
     // VUL-05: Reject malformed or dangerous names before any parsing.
     if let Err(e) = validate_dns_name(&req.name) {
         return Err((
@@ -1786,22 +1788,20 @@ fn validate_dns_entry(
             ))
         }
     };
-    let record = match parse_local_data(&rr) {
-        Some(r) => r,
-        None => {
-            // FIX 6 (VUL-NEW-07): do not reflect the internal RR string in the HTTP response;
-            // log it server-side so operators can diagnose but clients see no filesystem/config detail.
-            warn!(rr = %rr, "RR parse failed for input");
-            return Err((
-                StatusCode::BAD_REQUEST,
-                JsonExtract(serde_json::json!({
-                    "error": "PARSE_FAILED",
-                    "details": "Record validation failed"
-                })),
-            ));
-        }
-    };
-    Ok((entry, rr, record))
+    // Validate the RR parses with our own wire parser (hickory-free).
+    // FIX 6 (VUL-NEW-07): do not reflect the internal RR string in the HTTP response;
+    // log it server-side so operators can diagnose but clients see no filesystem/config detail.
+    if crate::dns::wire::present::parse_rr_line(&rr).is_none() {
+        warn!(rr = %rr, "RR parse failed for input");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error": "PARSE_FAILED",
+                "details": "Record validation failed"
+            })),
+        ));
+    }
+    Ok((entry, rr))
 }
 
 /// Persist entry to disk and atomically inject into the live zone set.
@@ -1811,7 +1811,6 @@ fn validate_dns_entry(
 /// lost from the on-disk store.
 async fn persist_and_swap(
     entry: &DnsEntry,
-    record: hickory_proto::rr::Record,
     s: &AppState,
 ) -> Result<(), ApiError> {
     {
@@ -1840,13 +1839,7 @@ async fn persist_and_swap(
 
         let current = s.zones.load_full();
         let mut new_zones = (*current).clone();
-        let name = record.name.clone();
-        new_zones
-            .zones
-            .entry(name.clone())
-            .or_insert(ZoneAction::Static);
-        new_zones.records.entry(name).or_default().push(record);
-        // Wire twin so serve_wire (records_wire) serves API-added records.
+        // Insert into the wire store the serving path reads (records_wire / zones_wire).
         if let Some(rr) = entry.to_rr_string() {
             if let Some(wr) = crate::dns::wire::present::parse_rr_line(&rr) {
                 let key = crate::dns::local::wire_name_key(&wr.name);
@@ -1885,7 +1878,7 @@ async fn add_dns_handler(
     ApiJson(req): ApiJson<AddDnsRequest>,
 ) -> impl IntoResponse {
     let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
-    let (entry, rr, record) = match validate_dns_entry(&req) {
+    let (entry, rr) = match validate_dns_entry(&req) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1898,7 +1891,7 @@ async fn add_dns_handler(
             JsonExtract(serde_json::json!({"error":"FORBIDDEN","details":"name outside your zone scope"})),
         );
     }
-    if let Err(e) = persist_and_swap(&entry, record, &s).await {
+    if let Err(e) = persist_and_swap(&entry, &s).await {
         return e;
     }
     (
@@ -1958,46 +1951,25 @@ async fn delete_dns_handler(
 
     // Remove from live zone set — ArcSwap write
     if let Some(rr) = entry.to_rr_string() {
-        if let Some(record) = parse_local_data(&rr) {
+        if let Some(wr) = crate::dns::wire::present::parse_rr_line(&rr) {
             let current = s.zones.load_full();
             let mut new_zones = (*current).clone();
-            let name = record.name.clone();
-            if let Some(recs) = new_zones.records.get_mut(&name) {
-                // VUL-08: match on the full Record (name + type + rdata + TTL),
-                // not just the type. The old code removed ALL records of the
-                // same type for the given name — e.g. deleting one A record
-                // would silently wipe every A record for that name.
+            // VUL-08: match on the full record (name + type + rdata), not just the
+            // type — removing one A record must not wipe every A for that name.
+            let key = crate::dns::local::wire_name_key(&wr.name);
+            if let Some(wrecs) = new_zones.records_wire.get_mut(&key[..]) {
                 let mut removed = false;
-                recs.retain(|r| {
-                    if !removed && r == &record {
+                wrecs.retain(|r| {
+                    if !removed && r.rtype == wr.rtype && r.rdata == wr.rdata {
                         removed = true;
                         false
                     } else {
                         true
                     }
                 });
-                if recs.is_empty() {
-                    new_zones.records.remove(&name);
-                    new_zones.zones.remove(&name);
-                }
-            }
-            // Wire twin removal, same exact match (name + type + rdata).
-            if let Some(wr) = crate::dns::wire_bridge::from_hickory(&record) {
-                let key = crate::dns::local::wire_name_key(&wr.name);
-                if let Some(wrecs) = new_zones.records_wire.get_mut(&key[..]) {
-                    let mut removed = false;
-                    wrecs.retain(|r| {
-                        if !removed && r.rtype == wr.rtype && r.rdata == wr.rdata {
-                            removed = true;
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    if wrecs.is_empty() {
-                        new_zones.records_wire.remove(&key[..]);
-                        new_zones.zones_wire.remove(&key[..]);
-                    }
+                if wrecs.is_empty() {
+                    new_zones.records_wire.remove(&key[..]);
+                    new_zones.zones_wire.remove(&key[..]);
                 }
             }
             resync_xdp_cache(&s, &new_zones);
@@ -2062,13 +2034,14 @@ async fn dns_lookup_handler(
             .into_response();
     }
 
-    let qtype: RecordType = match p.qtype.to_uppercase().as_str() {
-        "A" => RecordType::A,
-        "AAAA" => RecordType::AAAA,
-        "MX" => RecordType::MX,
-        "TXT" => RecordType::TXT,
-        "CNAME" => RecordType::CNAME,
-        "PTR" => RecordType::PTR,
+    use crate::dns::wire::consts::rtype;
+    let qtype: u16 = match p.qtype.to_uppercase().as_str() {
+        "A" => rtype::A,
+        "AAAA" => rtype::AAAA,
+        "MX" => rtype::MX,
+        "TXT" => rtype::TXT,
+        "CNAME" => rtype::CNAME,
+        "PTR" => rtype::PTR,
         other => return (
             StatusCode::BAD_REQUEST,
             JsonExtract(serde_json::json!({
@@ -2084,7 +2057,7 @@ async fn dns_lookup_handler(
     } else {
         format!("{}.", p.name)
     };
-    let name = match fqdn_str.parse::<Name>() {
+    let name = match crate::dns::wire::Name::from_ascii(&fqdn_str) {
         Ok(n) => n,
         Err(_) => {
             return (
@@ -2096,12 +2069,12 @@ async fn dns_lookup_handler(
                 .into_response()
         }
     };
-    let lower = LowerName::from(&name);
+    let qkey = crate::dns::local::wire_name_key(&name);
 
     // Check local zones first
     {
         let zones_snap = s.zones.load();
-        match zones_snap.find(&lower) {
+        match zones_snap.find_wire(&qkey) {
             Some(crate::dns::ZoneAction::Refuse) | Some(crate::dns::ZoneAction::NxDomain) | Some(crate::dns::ZoneAction::BlockPage) => {
                 return (
                     StatusCode::OK,
@@ -2114,10 +2087,10 @@ async fn dns_lookup_handler(
                     .into_response();
             }
             Some(crate::dns::ZoneAction::Static) | Some(crate::dns::ZoneAction::Redirect) => {
-                let records = zones_snap.local_records(&lower, qtype);
+                let records = zones_snap.local_records_wire(&qkey, qtype);
                 let answers: Vec<serde_json::Value> = records
                     .iter()
-                    .map(|r| serde_json::json!({ "ttl": r.ttl, "data": r.data.to_string() }))
+                    .map(|r| serde_json::json!({ "ttl": r.ttl, "data": r.rdata.to_presentation() }))
                     .collect();
                 return (
                     StatusCode::OK,
@@ -2133,19 +2106,9 @@ async fn dns_lookup_handler(
         }
     }
 
-    // Resolve upstream via ForwardPool
-    use hickory_proto::op::{Message, MessageType, OpCode, Query as DnsQuery};
-    use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+    // Resolve upstream via ForwardPool — synthesise the query with our own encoder.
     let start = std::time::Instant::now();
-    let query_wire: Vec<u8> = {
-        let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
-        msg.metadata.recursion_desired = true;
-        msg.add_query(DnsQuery::query(name.clone(), qtype));
-        let mut wire = Vec::with_capacity(256);
-        let mut enc = BinEncoder::new(&mut wire);
-        msg.emit(&mut enc).unwrap_or_default();
-        wire
-    };
+    let query_wire = crate::dns::wire::message::encode_query(&name, qtype);
     let (fwd_result, _winner) = s.resolver.load().forward(&query_wire).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let from_cache = elapsed_ms * 1000 < crate::stats::CACHE_HIT_THRESHOLD_US;
@@ -2154,13 +2117,7 @@ async fn dns_lookup_handler(
         ResolveResult::Answer { records } => {
             let answers: Vec<serde_json::Value> = records
                 .iter()
-                .map(|r| {
-                    // de-hickory transitional: present via the bridge until the API moves to wire.
-                    let data = crate::dns::wire_bridge::to_hickory(r)
-                        .map(|h| h.data.to_string())
-                        .unwrap_or_default();
-                    serde_json::json!({ "ttl": r.ttl, "data": data })
-                })
+                .map(|r| serde_json::json!({ "ttl": r.ttl, "data": r.rdata.to_presentation() }))
                 .collect();
             (
                 StatusCode::OK,
@@ -2765,8 +2722,8 @@ fn apply_split_horizon_live(entries: &[crate::config::parser::SplitHorizonEntry]
     if let Some(cache) = crate::dns::cache_snapshot::XDP_CACHE_FOR_API.get() {
         let mut affected: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for (_subnets, zs) in &table {
-            for n in zs.zones.keys() {
-                affected.insert(crate::dns::local::name_to_wire_qname(n).to_vec());
+            for k in zs.zones_wire.keys() {
+                affected.insert(k.to_vec());
             }
         }
         if !affected.is_empty() {

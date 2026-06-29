@@ -27,6 +27,24 @@ pub struct Message {
     pub additional: Vec<Record>,
 }
 
+/// Encode a minimal recursive query (header + one question) to wire bytes.
+/// Used to synthesise outbound queries — prefetch warming and the REST resolve
+/// endpoint — without pulling in a third-party DNS library.
+pub fn encode_query(name: &super::name::Name, qtype: u16) -> Vec<u8> {
+    let header = Header {
+        id: 0,
+        flags: 0x0100, // RD set; QR=0, opcode=QUERY, rcode=0
+        qdcount: 1,
+        ancount: 0,
+        nscount: 0,
+        arcount: 0,
+    };
+    let mut enc = Encoder::uncompressed();
+    header.emit(&mut enc);
+    Question::new(name.clone(), qtype).emit(&mut enc);
+    enc.into_vec()
+}
+
 /// Initial capacity cap so a hostile header count cannot make us pre-allocate
 /// a huge vector before any bytes are validated.
 const PREALLOC_CAP: usize = 16;

@@ -12,9 +12,13 @@
 // UDP + TCP on the configured port (default 53).
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+// FromStr / bare OnceLock are only used by the recursor-gated identity-probe set.
+#[cfg(feature = "recursor")]
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "recursor")]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -28,6 +32,7 @@ use hickory_proto::op::Query as DnsQuery;
 #[cfg(feature = "recursor")]
 use hickory_proto::op::{Edns, Message, MessageType, Metadata, OpCode, ResponseCode};
 use crate::dns::tsig::TsigAlg;
+#[cfg(feature = "recursor")]
 use hickory_proto::rr::{LowerName, Name};
 #[cfg(feature = "recursor")]
 use hickory_proto::rr::{RData, Record, RecordType};
@@ -95,10 +100,10 @@ const RECURSION_TIMEOUT: Duration = Duration::from_secs(5);
 // Initialised once on first DNS query; compared directly as LowerName.
 // Avoids a String allocation per request for the CHAOS identity-probe check.
 // recursor-only: the wire serving path uses an inline literal-match identity probe.
-#[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+#[cfg(feature = "recursor")]
 static IDENTITY_PROBE_NAMES: OnceLock<[LowerName; 4]> = OnceLock::new();
 
-#[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+#[cfg(feature = "recursor")]
 fn identity_probe_names() -> &'static [LowerName; 4] {
     IDENTITY_PROBE_NAMES.get_or_init(|| {
         [
@@ -2299,7 +2304,7 @@ struct DdrInfo {
 
 impl DdrInfo {
     /// Build the SVCB RRset advertised at `_dns.resolver.arpa` (DoT / DoH / DoQ).
-    #[cfg_attr(not(feature = "recursor"), allow(dead_code))]
+    #[cfg(feature = "recursor")]
     fn svcb_records(&self) -> Vec<hickory_proto::rr::Record> {
         use hickory_proto::rr::rdata::svcb::{Alpn, SvcParamKey, SvcParamValue, Unknown, SVCB};
         use hickory_proto::rr::{Name, RData, Record};

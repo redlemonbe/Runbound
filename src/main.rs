@@ -1438,19 +1438,11 @@ async fn build_and_launch(
                 for name in hot {
                     let r = Arc::clone(&res);
                     tokio::spawn(async move {
-                        use hickory_proto::op::{Message, MessageType, OpCode};
-                        use hickory_proto::rr::{Name, RecordType};
-                        use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
-                        if let Ok(n) = name.parse::<Name>() {
-                            use hickory_proto::op::Query as DnsQuery;
-                            let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
-                            msg.metadata.recursion_desired = true;
-                            msg.add_query(DnsQuery::query(n, RecordType::A));
-                            let mut wire = Vec::with_capacity(256);
-                            let mut enc = BinEncoder::new(&mut wire);
-                            if msg.emit(&mut enc).is_ok() {
-                                let _ = r.load().forward(&wire).await;
-                            }
+                        // Synthesise the prefetch A query with our own wire encoder (no hickory).
+                        if let Ok(n) = dns::wire::Name::from_ascii(&name) {
+                            let wire =
+                                dns::wire::message::encode_query(&n, dns::wire::consts::rtype::A);
+                            let _ = r.load().forward(&wire).await;
                         }
                     });
                 }
@@ -2628,17 +2620,15 @@ pub fn build_zone_set(cfg: &UnboundConfig) -> LocalZoneSet {
     // For BlockPage zones: insert A record pointing to block page server IP
     if let Some(ref ip_str) = cfg.block_page_redirect_ip {
         if let Ok(bp_ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-            use hickory_proto::rr::{rdata, RData, Record};
-            let zone_keys: Vec<_> = zone_set.zones.iter()
+            // Insert the block-page A record for every BlockPage zone straight into
+            // the wire store the serving path reads (records_wire / zones_wire).
+            let bp_keys: Vec<Box<[u8]>> = zone_set.zones_wire.iter()
                 .filter(|(_, v)| **v == dns::ZoneAction::BlockPage)
                 .map(|(k, _)| k.clone())
                 .collect();
-            for name in zone_keys {
-                let rec = Record::from_rdata(name.clone(), 10, RData::A(rdata::A(bp_ip)));
-                zone_set.records.entry(name.clone()).or_default().push(rec);
-                // Wire twin (serve_wire BlockPage path reads records_wire).
-                if let Ok(wn) = dns::wire::Name::from_ascii(&name.to_string()) {
-                    let key = dns::local::wire_name_key(&wn);
+            for key in bp_keys {
+                // Reconstruct the wire Name from its stored (lowercased) wire QNAME.
+                if let Ok(wn) = dns::wire::Name::parse(&mut dns::wire::Decoder::new(&key)) {
                     zone_set.records_wire.entry(key).or_default().push(dns::wire::Record {
                         name: wn,
                         rtype: dns::wire::consts::rtype::A,

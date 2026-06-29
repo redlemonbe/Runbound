@@ -79,6 +79,48 @@ impl Rdata {
         }
     }
 
+    /// A human-readable presentation of this RDATA for REST/JSON diagnostics.
+    /// Not a canonical zone-file encoding — opaque (Unknown) types render as hex.
+    pub fn to_presentation(&self) -> String {
+        use std::fmt::Write as _;
+        match self {
+            Rdata::A(ip) => ip.to_string(),
+            Rdata::Aaaa(ip) => ip.to_string(),
+            Rdata::Ns(n) | Rdata::Cname(n) | Rdata::Ptr(n) => n.to_ascii(),
+            Rdata::Soa { mname, rname, serial, refresh, retry, expire, minimum } => format!(
+                "{} {} {} {} {} {} {}",
+                mname.to_ascii(), rname.to_ascii(), serial, refresh, retry, expire, minimum
+            ),
+            Rdata::Mx { preference, exchange } => format!("{} {}", preference, exchange.to_ascii()),
+            Rdata::Txt(strings) => {
+                let mut out = String::new();
+                for (i, s) in strings.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(&String::from_utf8_lossy(s));
+                }
+                out
+            }
+            Rdata::Srv { priority, weight, port, target } => {
+                format!("{} {} {} {}", priority, weight, port, target.to_ascii())
+            }
+            Rdata::Caa { flags, tag, value } => format!(
+                "{} {} \"{}\"",
+                flags,
+                String::from_utf8_lossy(tag),
+                String::from_utf8_lossy(value)
+            ),
+            Rdata::Unknown { data, .. } => {
+                let mut out = String::with_capacity(data.len() * 2);
+                for b in data {
+                    let _ = write!(out, "{:02x}", b);
+                }
+                out
+            }
+        }
+    }
+
     /// Parse RDATA of the given type and on-wire length. The decoder starts at
     /// the first RDATA octet. On success the decoder has advanced by exactly
     /// the on-wire RDATA size; a structured field that disagrees with

@@ -13,6 +13,9 @@
 // echoes a minimal OPT RR (DO=0, rdlen=0) for non-DNSSEC queries.  DO=1 →
 // fall back to the wire serving core (signed local zones are signed there).
 
+// Only the legacy hickory-typed build_answer_a_aaaa (below) needs this; the hot
+// path uses build_answer_a_aaaa_wire. Absent from the default release build.
+#[cfg(any(feature = "recursor", test))]
 use hickory_proto::rr::RData;
 use smallvec::SmallVec;
 
@@ -293,6 +296,7 @@ fn write_opt_rr(buf: &mut [u8], pos: usize, udp_payload: u16) -> usize {
 ///   - records is non-empty (caller checks and dispatches to build_nodata/build_nxdomain)
 ///   - wq.qtype is A (1) or AAAA (28) (caller pre-checks before calling)
 ///   - wq.qclass is IN (caller pre-checks)
+#[cfg(any(feature = "recursor", test))]
 #[allow(dead_code)]
 pub fn build_answer_a_aaaa(
     wq: &WireQuery<'_>,

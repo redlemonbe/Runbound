@@ -20,6 +20,9 @@ pub mod zone_signer;
 pub mod dnssec_sign;
 pub mod plain_server;
 pub mod wire;
+// hickory <-> wire converter — only the recursor handler and the differential
+// oracle tests still cross the boundary; gone from the default release build.
+#[cfg(any(feature = "recursor", test))]
 pub mod wire_bridge;
 pub mod wire_serve;
 pub mod xdp;
