@@ -26,6 +26,9 @@ use tracing::{debug, warn};
 const DOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DOT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// TCP fallback query (RFC 1035 §4.2.2) — only used to recover a full RRset after
+/// a truncated UDP answer, so it is off the common forward path.
+const TCP_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Max idle connections held per DoT upstream
 const POOL_CONNS: usize = 4;
 /// Discard pooled connections idle longer than this
@@ -255,6 +258,24 @@ impl UdpUpstream {
             match sock.recv(&mut buf).await {
                 Ok(n) => {
                     if response_matches(&buf[..n], qid, qquestion.as_ref()) {
+                        // RFC 1035 §4.2.1: a truncated (TC=1) UDP answer is
+                        // incomplete — the upstream capped at 512 and dropped the
+                        // RRset (large DNSKEY/TXT come back empty). Retry the same
+                        // query over TCP to pull the full answer. response_matches
+                        // already parsed the header, so buf[2] (flags hi byte) is
+                        // in bounds. Only oversized answers reach here → TCP cold.
+                        if buf[2] & 0x02 != 0 {
+                            if let Some(full) = tcp_query(self.addr, wire).await {
+                                // Re-apply SEC-O1: the TCP answer must match the
+                                // query ID + question before it is trusted.
+                                if response_matches(&full, qid, qquestion.as_ref()) {
+                                    return parse_response(&full);
+                                }
+                            }
+                            // TCP failed / mismatched → fall through to the
+                            // truncated UDP parse (a TC-flagged partial beats a
+                            // dropped query).
+                        }
                         return parse_response(&buf[..n]);
                     }
                     debug!(addr=%self.addr, "UDP forward: response did not match query (id/question) — ignored");
@@ -267,6 +288,35 @@ impl UdpUpstream {
             }
         }
     }
+}
+
+/// RFC 1035 §4.2.2: query an upstream over plain TCP (2-byte length prefix),
+/// used to recover a full RRset after a truncated UDP answer. Returns the raw
+/// response bytes, or `None` on any I/O failure (the caller then falls back to
+/// the truncated UDP answer rather than dropping the query). The caller still
+/// re-applies SEC-O1 ID/question matching to the returned bytes.
+async fn tcp_query(addr: SocketAddr, wire: &[u8]) -> Option<Vec<u8>> {
+    let len = u16::try_from(wire.len()).ok()?;
+    let mut tcp = timeout(TCP_QUERY_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let _ = tcp.set_nodelay(true);
+    let io = async {
+        tcp.write_all(&len.to_be_bytes()).await.ok()?;
+        tcp.write_all(wire).await.ok()?;
+        tcp.flush().await.ok()?;
+        let mut len_buf = [0u8; 2];
+        tcp.read_exact(&mut len_buf).await.ok()?;
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        if resp_len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; resp_len];
+        tcp.read_exact(&mut buf).await.ok()?;
+        Some(buf)
+    };
+    timeout(TCP_QUERY_TIMEOUT, io).await.ok()?
 }
 
 /// SEC-O1: a plain-UDP upstream response is only accepted when its transaction ID

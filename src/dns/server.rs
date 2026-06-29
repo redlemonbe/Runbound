@@ -1612,7 +1612,7 @@ fn build_tls_config(
 /// advertised UDP size clamped to `[512, 1232]`. When the full answer exceeds it,
 /// strip to header + question (keeping the OPT pseudo-RR for EDNS clients) and set
 /// TC so the client retries over TCP. No-op when the answer already fits.
-fn truncate_udp_response(resp: &mut Vec<u8>, query: &[u8]) {
+pub(crate) fn truncate_udp_response(resp: &mut Vec<u8>, query: &[u8]) {
     use crate::dns::wire::{consts::rtype, Message};
     let max = match Message::parse(query) {
         Ok(m) => match m.edns() {

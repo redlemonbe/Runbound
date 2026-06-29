@@ -149,7 +149,11 @@ pub async fn run(
         let upstream = Arc::clone(&upstream);
         tokio::spawn(async move {
             let resp = handle_datagram(&query, &zones.load(), &upstream).await;
-            if let Some(bytes) = resp {
+            if let Some(mut bytes) = resp {
+                // RFC 1035 §4.1.1: this is the UDP serving path — cap the response to
+                // the client's payload budget and set TC if it overflows (the XDP
+                // zero-syscall fast path is untouched; this generic async path is not it).
+                crate::dns::server::truncate_udp_response(&mut bytes, &query);
                 let _ = sock.send_to(&bytes, peer).await;
             }
         });

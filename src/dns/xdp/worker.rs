@@ -1660,6 +1660,24 @@ fn answer_from_cache(
             // Patch QID (bytes [0..2]) with the client's actual transaction ID.
             tx_dns[0] = qid[0];
             tx_dns[1] = qid[1];
+
+            // RFC 1035 §4.1.1 / RFC 6891: a cached payload larger than this
+            // client's UDP budget must be truncated with TC=1 so it retries over
+            // TCP. Gated on >512 (the guaranteed minimum budget) so the common
+            // small-response hit pays a single length comparison and nothing
+            // else — the SIMD/zero-alloc hot path is untouched. Only oversized
+            // answers (DNSKEY, large TXT) take the cold branch, reusing the wire
+            // serving core's OPT-preserving truncation so a cached oversized
+            // answer behaves identically to a freshly resolved one.
+            let mut out_len = wire.len();
+            if out_len > 512 {
+                let mut v = tx_dns[..out_len].to_vec();
+                crate::dns::server::truncate_udp_response(&mut v, query_bytes);
+                if v.len() != out_len {
+                    tx_dns[..v.len()].copy_from_slice(&v);
+                    out_len = v.len();
+                }
+            }
             // Per-hit observability via CONTENTION-FREE, ALLOCATION-FREE thread-local
             // accumulators (no shared atomic on the line-rate path, no heap per hit — the
             // v0.9.9 regression came from shared atomics, which these avoid). This makes
@@ -1677,7 +1695,7 @@ fn answer_from_cache(
             if let Some(ds) = domain_stats {
                 ds.inc_wire(&qname_lc);
             }
-            return Some(wire.len());
+            return Some(out_len);
         }
     }
     crate::dns::cache_snapshot::XDP_CACHE_SNAPSHOT_MISSES
@@ -1814,6 +1832,67 @@ mod cache_tests {
         let mut tx_dns = vec![0u8; 512];
         let result = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns, None, None);
         assert!(result.is_none(), "expired entry must not be served");
+    }
+
+    /// Regression: an oversized cached payload served to a non-EDNS client must
+    /// be truncated with TC=1 (RFC 1035 §4.1.1), not sent whole. Before the fix
+    /// the cache fast path copied the full payload verbatim → a >512-byte UDP
+    /// answer with no TC (the master's `org DNSKEY` cache-hit bug).
+    #[test]
+    fn cache_hit_oversized_sets_tc_for_non_edns() {
+        use crate::dns::wire::{consts, Header, Message, Name, Question, Rdata, Record};
+        use std::net::Ipv4Addr;
+        let qname = "big.example.com";
+        let wn = Name::from_ascii("big.example.com.").unwrap();
+        // 60 A records → comfortably past the 512-byte UDP limit, even compressed.
+        let answers: Vec<Record> = (0..60u16)
+            .map(|i| Record {
+                name: wn.clone(),
+                rtype: consts::rtype::A,
+                rclass: consts::class::IN,
+                ttl: 300,
+                rdata: Rdata::A(Ipv4Addr::new(10, (i >> 8) as u8, 0, i as u8)),
+            })
+            .collect();
+        let resp = Message {
+            header: Header { id: 0, flags: 0x8180, qdcount: 1, ancount: 0, nscount: 0, arcount: 0 },
+            questions: vec![Question { name: wn, qtype: consts::rtype::A, qclass: consts::class::IN }],
+            answers,
+            authority: vec![],
+            additional: vec![],
+        };
+        let payload = resp.encode();
+        assert!(payload.len() > 512, "payload must exceed 512 (got {})", payload.len());
+
+        let (key, wq) = make_cache_key(qname, consts::rtype::A);
+        let snap = make_snap_with_entry(key, wq, payload, Instant::now() + Duration::from_secs(300));
+        let acl = crate::dns::acl::Acl::from_config(&[]);
+        let mut tx_dns = vec![0u8; 4096];
+
+        let query = make_query(0x1234, qname, consts::rtype::A);
+        let len = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns, None, None)
+            .expect("cache hit expected");
+        assert!(len <= 512, "non-EDNS answer must fit 512 bytes (got {len})");
+        assert_eq!(tx_dns[2] & 0x02, 0x02, "TC flag must be set on truncation");
+        assert_eq!(tx_dns[0], 0x12, "QID preserved");
+        assert_eq!(tx_dns[1], 0x34, "QID preserved");
+    }
+
+    /// Counterpart: a small cached payload (≤512) is served whole, never TC'd.
+    #[test]
+    fn cache_hit_small_never_truncated() {
+        let (key, wq) = make_cache_key("example.com", 1);
+        let mut stored = make_wire_response(0);
+        stored.extend_from_slice(&[0u8; 8]);
+        let full_len = stored.len();
+        let snap = make_snap_with_entry(key, wq, stored, Instant::now() + Duration::from_secs(300));
+        let acl = crate::dns::acl::Acl::from_config(&[]);
+        let query = make_query(0x55AA, "example.com", 1);
+        let mut tx_dns = vec![0u8; 512];
+        let len = answer_from_cache(&query, &snap, &acl, None, &mut tx_dns, None, None)
+            .expect("cache hit expected");
+        assert_eq!(len, full_len, "small payload served whole");
+        assert_eq!(tx_dns[2] & 0x02, 0x00, "TC must not be set for a fitting answer");
     }
 
     #[test]
