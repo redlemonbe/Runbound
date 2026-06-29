@@ -14,6 +14,8 @@
 #[cfg(feature = "fuzz")]
 pub mod config {
     pub mod parser;
+    // parser calls writer::is_managed_directive during parsing.
+    pub mod writer;
 }
 
 // hsm is required by api — re-exported to allow api to compile via lib.
@@ -21,17 +23,40 @@ pub mod config {
 #[cfg(feature = "fuzz")]
 pub mod hsm;
 
+// config::parser (and config::writer) reference these crate-root modules via
+// the Config struct fields and directive handling. They form a self-contained
+// closure that does not touch main.rs-only items, so re-exposing them here lets
+// the parser compile in the library crate without dragging in the binary.
+#[cfg(feature = "fuzz")]
+pub mod webhooks;
+#[cfg(feature = "fuzz")]
+pub mod multiuser;
+#[cfg(feature = "fuzz")]
+pub mod upstreams;
+#[cfg(feature = "fuzz")]
+pub mod integrity;
+#[cfg(feature = "fuzz")]
+pub mod logbuffer;
+
+// Runbound's own zero-copy wire parser — the actual default inbound parse path
+// since v0.22 (hickory is only used on the optional `recursor` slow path). It is
+// self-contained: its only cross-module references live in the `oracle` submodule,
+// which is #[cfg(test)] and therefore excluded from the fuzz build.
+#[cfg(feature = "fuzz")]
+pub mod dns {
+    pub mod wire;
+}
+
 // ── Fuzz helpers ─────────────────────────────────────────────────────────────
 
-/// Parse raw DNS wire bytes using hickory-proto.
+/// Parse raw DNS wire bytes through Runbound's own zero-copy wire parser
+/// (`dns::wire::Message::parse`) — the default inbound parse path, so this fuzzes
+/// the code Runbound owns rather than a third-party dependency.
 /// Returns Some(()) on success, None on parse failure.
 /// Used by the fuzz_dns_query target.
-#[cfg(any(test, feature = "fuzz"))]
+#[cfg(feature = "fuzz")]
 pub fn parse_dns_bytes(data: &[u8]) -> Option<()> {
-    use hickory_proto::serialize::binary::BinDecodable;
-    hickory_proto::op::Message::from_bytes(data)
-        .ok()
-        .map(|_| ())
+    crate::dns::wire::Message::parse(data).ok().map(|_| ())
 }
 
 /// Parse a string as an Unbound-format config.
