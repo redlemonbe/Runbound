@@ -1516,6 +1516,38 @@ fn build_tls_config(
 /// #167: bind a blocking std UDP socket on the server port with SO_REUSEPORT so
 /// the XDP recursion-miss fallback can reply FROM the server port. We only ever
 /// send on it; SO_REUSEPORT lets it coexist with the XDP / kernel-loop port bindings.
+/// Cap a UDP DNS response to the client's maximum payload, setting TC (RFC 1035
+/// §4.1.1 / RFC 6891). The budget is 512 bytes without EDNS, else the client's
+/// advertised UDP size clamped to `[512, 1232]`. When the full answer exceeds it,
+/// strip to header + question (keeping the OPT pseudo-RR for EDNS clients) and set
+/// TC so the client retries over TCP. No-op when the answer already fits.
+fn truncate_udp_response(resp: &mut Vec<u8>, query: &[u8]) {
+    use crate::dns::wire::{consts::rtype, Message};
+    let max = match Message::parse(query) {
+        Ok(m) => match m.edns() {
+            Ok(Some(e)) => (e.udp_payload as usize).clamp(512, 1232),
+            _ => 512,
+        },
+        Err(_) => 512,
+    };
+    if resp.len() <= max {
+        return;
+    }
+    let Ok(mut m) = Message::parse(resp) else {
+        return;
+    };
+    m.header.set_tc(true);
+    m.answers.clear();
+    m.authority.clear();
+    m.additional.retain(|r| r.rtype == rtype::OPT);
+    let encoded = m.encode();
+    // header + question (+ OPT) is well under any 512 budget; guard regardless.
+    *resp = encoded;
+    if resp.len() > max {
+        resp.truncate(max);
+    }
+}
+
 fn bind_xdp_reply_sock(port: u16) -> anyhow::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -2749,8 +2781,12 @@ pub async fn run_dns_server(
                 let sock_c = std::sync::Arc::clone(&msg.socket);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let resp = handler_c.handle_request_wire(&msg.query, msg.peer).await;
+                    let mut resp = handler_c.handle_request_wire(&msg.query, msg.peer).await;
                     if !resp.is_empty() {
+                        // This is the UDP datapath — cap to the client's payload and set
+                        // TC if over budget (RFC 1035 §4.1.1). TCP replies (handled
+                        // elsewhere) are never truncated.
+                        truncate_udp_response(&mut resp, &msg.query);
                         let _ = sock_c.send_to(&resp, msg.peer);
                     }
                 });
