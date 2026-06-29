@@ -3376,7 +3376,14 @@ async fn reconnect_upstreams_handler(State(s): State<AppState>) -> impl IntoResp
 // ── GET /api/cache/stats ───────────────────────────────────────────────────
 
 async fn cache_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let hits = s.stats.cache_hits.load(Ordering::Relaxed);
+    // Canonical cache_hits = slow-path counter + Σ per-worker fast-path hits (same
+    // sum /api/stats reports). Reading s.stats.cache_hits alone misses every
+    // fast-path (XDP / kernel-fast-loop) hit, so the two endpoints would disagree.
+    let xh: u64 = crate::dns::cache_snapshot::XDP_WORKER_PKTS
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum();
+    let hits = s.stats.cache_hits.load(Ordering::Relaxed) + xh;
     let misses = s.stats.cache_misses.load(Ordering::Relaxed);
     let evictions = s.cache_evictions.load(Ordering::Relaxed);
     let entries = s.stats.cache_entries.load(Ordering::Relaxed);
