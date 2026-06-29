@@ -403,6 +403,68 @@ mod tests {
     use super::*;
     use smallvec::SmallVec;
 
+    // Hot-path micro-bench. Not a correctness test — measures ns/op so optimisation
+    // decisions are made on numbers, not guesses. Run:
+    //   cargo test --release bench_hotpath -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_hotpath() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let iters = 50_000_000u64;
+        let mut dst: SmallVec<[u8; 64]> = SmallVec::new();
+        macro_rules! bench {
+            ($name:expr, $body:expr) => {{
+                for _ in 0..1_000_000u64 {
+                    black_box($body);
+                }
+                let t = Instant::now();
+                for _ in 0..iters {
+                    black_box($body);
+                }
+                let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+                println!("  {:<30} {:>7.3} ns/op", $name, ns);
+            }};
+        }
+        // Realistic wire qnames (length-prefixed). q17 ≈ "www.example.com.",
+        // q32/q48 deeper names — the lengths copy_lowercase_label actually sees
+        // (it lowercases the WHOLE qname in one pass, not per-label).
+        let q17: &[u8] = b"\x03www\x07example\x03com\x00";
+        let q32: &[u8] = b"\x04mail\x06server\x07example\x02co\x02uk\x00aaaaa";
+        let q48: &[u8] = b"\x08services\x03api\x09us-east-1\x06aws-dns\x03net\x00aaaaaaaaaa";
+        let scalar_lower = |dst: &mut SmallVec<[u8; 64]>, src: &[u8]| {
+            for &b in src {
+                dst.push(if b.is_ascii_uppercase() { b | 0x20 } else { b });
+            }
+        };
+        println!("\n--- hot-path micro-bench (release) ---");
+        bench!("cpu::simd_level()", crate::cpu::simd_level());
+        bench!("find_zero 17B", find_zero(black_box(q17)));
+        bench!("find_zero 48B", find_zero(black_box(q48)));
+        bench!("bytes_eq 17B", bytes_eq(black_box(q17), black_box(q17)));
+        bench!("hash_wire_qname 17B", crate::dns::hasher::hash_wire_qname(black_box(q17)));
+        bench!("copy_lowercase SIMD 17B", {
+            dst.clear();
+            copy_lowercase_label(&mut dst, black_box(q17));
+        });
+        bench!("copy_lowercase SIMD 32B", {
+            dst.clear();
+            copy_lowercase_label(&mut dst, black_box(q32));
+        });
+        bench!("copy_lowercase SIMD 48B", {
+            dst.clear();
+            copy_lowercase_label(&mut dst, black_box(q48));
+        });
+        bench!("copy_lowercase SCALAR 17B", {
+            dst.clear();
+            scalar_lower(&mut dst, black_box(q17));
+        });
+        bench!("copy_lowercase SCALAR 32B", {
+            dst.clear();
+            scalar_lower(&mut dst, black_box(q32));
+        });
+    }
+
     fn lower(s: &[u8]) -> Vec<u8> {
         let mut v: SmallVec<[u8; 64]> = SmallVec::new();
         copy_lowercase_label(&mut v, s);

@@ -196,24 +196,28 @@ fn verify_signature(algorithm: u8, dnskey_pubkey: &[u8], msg: &[u8], sig: &[u8])
 /// owner is `*.` followed by the `labels` rightmost labels of the queried owner.
 /// `labels` greater than the owner's label count is malformed → `None` (reject).
 fn rrsig_owner_name(owner: &Name, labels: u8) -> Option<Name> {
-    let lab = owner.labels_lower();
+    let total = owner.label_count();
     let n = labels as usize;
-    if n > lab.len() {
+    if n > total {
         return None;
     }
-    if n == lab.len() {
+    if n == total {
         return Some(owner.clone());
     }
-    // Wildcard expansion: `*.<n rightmost labels>`.
-    let mut s = String::from("*");
-    for l in &lab[lab.len() - n..] {
-        s.push('.');
-        for &b in l {
-            s.push(b as char); // canonical labels are ASCII-lowercased
-        }
+    // Wildcard expansion: `*.<n rightmost labels>`. Build the owner from the WIRE
+    // bytes (not a presentation round-trip) so labels containing `.`/`\`/non-print
+    // octets reconstruct byte-exactly. Walk past the first (total - n) labels, then
+    // prepend a single `*` label to the surviving suffix (which keeps its NUL root).
+    let w = owner.wire();
+    let mut i = 0usize;
+    for _ in 0..(total - n) {
+        i += 1 + w[i] as usize;
     }
-    s.push('.');
-    Name::from_ascii(&s).ok()
+    let mut wire = Vec::with_capacity(2 + (w.len() - i));
+    wire.push(1); // label length
+    wire.push(b'*');
+    wire.extend_from_slice(&w[i..]);
+    Name::parse(&mut Decoder::new(&wire)).ok()
 }
 
 /// Verify one RRSIG (`rrsig_rdata`) over the RRset (`owner`/`rclass`/`rdatas`)

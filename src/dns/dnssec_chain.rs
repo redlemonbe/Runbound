@@ -249,6 +249,21 @@ fn zone_apex(msg: &wire::Message) -> Option<Name> {
         .next()
 }
 
+/// The signing zone taken from the RRSIG that actually covers qname's OWN answer
+/// RRset (owner == qname), in-bailiwick. Preferred over [`zone_apex`] for a positive
+/// answer so it validates under the zone that signed IT — not the first (possibly
+/// unrelated, merely-enclosing) RRSIG that happens to appear first in the message.
+fn answer_zone(msg: &wire::Message, qname: &Name) -> Option<Name> {
+    msg.answers
+        .iter()
+        .filter(|r| r.rtype == consts::rtype::RRSIG && r.name.eq_ignore_ascii_case(qname))
+        .filter_map(|r| match &r.rdata {
+            Rdata::Unknown { data, .. } => verify::rrsig_signer(data),
+            _ => None,
+        })
+        .find(|z| qname.is_in_zone(z))
+}
+
 /// The SOA owner (zone apex) in the authority section, if any.
 fn soa_owner(msg: &wire::Message) -> Option<Name> {
     msg.authority
@@ -323,7 +338,8 @@ pub async fn validate<F: Fetcher>(
     // a signed name (DNSSEC downgrade — the forged answer would then be served
     // without SERVFAIL). Bind the zone to qname: any signer / SOA owner that does
     // not enclose qname is ignored, and such data falls through to Bogus.
-    let Some(zone) = zone_apex(msg).filter(|z| qname.is_in_zone(z)) else {
+    let Some(zone) = answer_zone(msg, qname).or_else(|| zone_apex(msg).filter(|z| qname.is_in_zone(z)))
+    else {
         let z = soa_owner(msg)
             .filter(|z| qname.is_in_zone(z))
             .unwrap_or_else(|| qname.clone());
