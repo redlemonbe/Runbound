@@ -436,6 +436,35 @@ impl crate::dns::dnssec_chain::Fetcher for ResolverFetcher {
     }
 }
 
+/// A resolved-and-validated answer for the serving path.
+pub struct Validated {
+    /// Answer records (CNAME chain followed), without RRSIG/OPT.
+    pub records: Vec<Record>,
+    /// Response code (NOERROR / NXDOMAIN).
+    pub rcode: u16,
+    /// DNSSEC verdict — the caller serves SERVFAIL on `Bogus`.
+    pub verdict: crate::dns::dnssec_chain::Verdict,
+}
+
+/// Resolve `(qname, qtype)` from the root and DNSSEC-validate the reply. The
+/// serving records follow CNAMEs (via [`resolve`]); the verdict comes from the
+/// authoritative reply for `qname`. `None` only on a hard resolution failure.
+pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Validated> {
+    let msg = resolve_message(qname, qtype).await?;
+    let verdict = crate::dns::dnssec_chain::validate(&ResolverFetcher, qname, qtype, &msg, now).await;
+    let rcode = msg.header.rcode_low();
+    let records = match resolve(qname, qtype).await {
+        Outcome::Answer(recs) => recs,
+        _ => msg
+            .answers
+            .iter()
+            .filter(|r| r.rtype != consts::rtype::RRSIG && r.rtype != consts::rtype::OPT)
+            .cloned()
+            .collect(),
+    };
+    Some(Validated { records, rcode, verdict })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +544,15 @@ mod tests {
             let got = validate(&f, &name, consts::rtype::A, &msg, now).await;
             eprintln!("OWN-RESOLVER {fqdn} -> {got:?}");
             assert_eq!(got, want, "{fqdn}: wrong verdict");
+        }
+        // Additional signed zones — RSA-1024 (Verisign/IANA/ISC) and ECDSA.
+        for fqdn in ["iana.org.", "verisign.com.", "isc.org.", "nic.cz."] {
+            let name = Name::from_ascii(fqdn).unwrap();
+            if let Some(msg) = resolve_message(&name, consts::rtype::A).await {
+                let got = validate(&f, &name, consts::rtype::A, &msg, now).await;
+                eprintln!("OWN-RESOLVER {fqdn} -> {got:?}");
+                assert_eq!(got, Verdict::Secure, "{fqdn}: expected Secure");
+            }
         }
     }
 }

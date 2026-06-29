@@ -148,10 +148,14 @@ fn verify_signature(algorithm: u8, dnskey_pubkey: &[u8], msg: &[u8], sig: &[u8])
             let Some((n, e)) = rsa_components(dnskey_pubkey) else {
                 return false;
             };
+            // Accept 1024-bit RSA: many production DNSSEC zones (Verisign, IANA,
+            // ISC, …) still publish 1024-bit ZSKs/KSKs, and a validator that
+            // refused them would SERVFAIL those zones. The key length is the zone
+            // operator's choice; like unbound/bind we verify what they publish.
             let params = if algorithm == ALG_RSASHA256 {
-                &signature::RSA_PKCS1_2048_8192_SHA256
+                &signature::RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY
             } else {
-                &signature::RSA_PKCS1_2048_8192_SHA512
+                &signature::RSA_PKCS1_1024_8192_SHA512_FOR_LEGACY_USE_ONLY
             };
             signature::RsaPublicKeyComponents { n, e }
                 .verify(params, msg, sig)

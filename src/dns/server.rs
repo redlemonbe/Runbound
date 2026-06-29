@@ -1302,13 +1302,6 @@ impl RunboundHandler {
                 }
             }
         }
-        // Recursor mode keeps the hickory handler (the iterative resolver lives
-        // there, behind the `recursor` feature). Default builds never route out.
-        #[cfg(feature = "recursor")]
-        if self.resolution_mode.load(Ordering::Relaxed) == 1 {
-            return None;
-        }
-
         let client_ip = peer.ip();
 
         // ── ACL (wire-native) ───────────────────────────────────────────────
@@ -1467,6 +1460,51 @@ impl RunboundHandler {
             self.stats.record_latency_us(start.elapsed().as_micros() as u64);
             self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Local, start);
             return Some(resp);
+        }
+
+        // ── Full recursion (own validating resolver) ───────────────────────
+        // resolution: full-recursion → resolve iteratively from the root and
+        // DNSSEC-validate. A Bogus answer is never served (fail-closed → SERVFAIL).
+        if self.resolution_mode.load(Ordering::Relaxed) == 1 {
+            use crate::dns::dnssec_chain::Verdict;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            match crate::dns::recursor_wire::resolve_validated(&q.name, qtype, now).await {
+                Some(val) if val.verdict != Verdict::Bogus => {
+                    // AD only when the data is Secure and the client is DNSSEC-aware.
+                    let do_bit = msg.edns().ok().flatten().map(|e| e.dnssec_ok()).unwrap_or(false);
+                    let set_ad = val.verdict == Verdict::Secure && do_bit;
+                    if val.rcode == rcode::NXDOMAIN {
+                        self.stats.inc_nxdomain();
+                        self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Nxdomain, start);
+                        let mut resp = self.wire_error(&msg, rcode::NXDOMAIN);
+                        if set_ad && resp.len() > 3 {
+                            resp[3] |= 0x20; // authenticated denial (RFC 4035)
+                        }
+                        return Some(resp);
+                    }
+                    let mut records = val.records;
+                    for r in records.iter_mut() {
+                        r.ttl = r.ttl.max(self.cache_min_ttl).min(self.cache_max_ttl);
+                    }
+                    let mut resp = self.wire_answer(&msg, &records, rcode::NOERROR);
+                    if set_ad && resp.len() > 3 {
+                        resp[3] |= 0x20; // AD bit (RFC 4035)
+                    }
+                    self.maybe_cache_wire(&q, &resp, &records);
+                    self.stats.inc_forwarded();
+                    self.stats.record_forward(start.elapsed().as_micros() as u64);
+                    self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Forwarded, start);
+                    return Some(resp);
+                }
+                _ => {
+                    self.stats.inc_servfail();
+                    self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Servfail, start);
+                    return Some(self.wire_error(&msg, rcode::SERVFAIL));
+                }
+            }
         }
 
         // ── Forward upstream (own wire forward pool) ────────────────────────

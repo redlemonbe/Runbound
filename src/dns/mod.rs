@@ -16,19 +16,11 @@ pub mod ratelimit;
 pub mod server;
 #[cfg(feature = "recursor")]
 pub mod recursor;
-// In-house iterative resolver (Phase 1 of the recursor de-hickory). Built and
-// tested under the recursor feature; not yet dispatched to (Phase 2 = DNSSEC).
-#[cfg(any(feature = "recursor", test))]
+// In-house iterative recursive resolver + DNSSEC validation (hickory-free).
+// The default serving path uses these for `resolution: full-recursion`.
 pub mod recursor_wire;
-// In-house DNSSEC validation (Phase 2). Increment 1 = RRSIG verification,
-// increment 2 = DS/DNSKEY chain of trust.
-#[cfg(any(feature = "recursor", test))]
 pub mod dnssec_verify;
-// In-house DNSSEC denial of existence (Phase 2, increment 3): NSEC / NSEC3.
-#[cfg(any(feature = "recursor", test))]
 pub mod dnssec_denial;
-// In-house DNSSEC chain walk + verdict (Phase 2, increment 4): Secure/Insecure/Bogus.
-#[cfg(any(feature = "recursor", test))]
 pub mod dnssec_chain;
 pub mod zone_signer;
 pub mod dnssec_sign;
@@ -98,9 +90,12 @@ pub mod recursor {
         pub fn load_full(&self) -> Option<Arc<()>> { None }
     }
 
-    /// Always returns forward mode (0).
-    pub fn mode_atomic(_mode: ResolutionMode) -> Arc<AtomicU8> {
-        Arc::new(AtomicU8::new(0))
+    /// 1 for full-recursion, 0 for forward. The in-house validating resolver
+    /// (dns::recursor_wire + dns::dnssec_chain) serves full-recursion in the
+    /// default build, so this honours the configured mode even without the
+    /// (hickory) `recursor` feature.
+    pub fn mode_atomic(mode: ResolutionMode) -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(u8::from(mode == ResolutionMode::FullRecursion)))
     }
 
     /// Returns a no-op SharedRecursor handle.
