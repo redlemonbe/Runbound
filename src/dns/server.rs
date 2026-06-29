@@ -651,6 +651,17 @@ impl RunboundHandler {
             return Some(resp);
         }
 
+        // ── #8: per-subnet additive blacklist (SLOW PATH ONLY) ──────────────
+        // A domain blocked only for this client's subnet is, by design, not in the
+        // global filter, so it is never caught by the XDP/kernel fast path and lands
+        // here. REFUSED and never cached (so it can't leak to other subnets). The
+        // fast path is untouched.
+        if crate::subnet_policy::blocks(client_ip, &qname_lc) {
+            self.stats.inc_blocked();
+            self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Blocked, start);
+            return Some(self.wire_error(&msg, rcode::REFUSED));
+        }
+
         // ── Full recursion (own validating resolver) ───────────────────────
         // resolution: full-recursion → resolve iteratively from the root and
         // DNSSEC-validate. A Bogus answer is never served (fail-closed → SERVFAIL)

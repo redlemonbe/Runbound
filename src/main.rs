@@ -51,6 +51,7 @@ mod logbuffer;
 mod runtime;
 mod stats;
 mod store;
+mod subnet_policy;
 mod sync;
 mod upstreams;
 mod webui;
@@ -1232,6 +1233,9 @@ async fn build_and_launch(
     // icmp state hoisted here so NodeRelay (slave relay) can reference it
     let icmp_stats = IcmpStats::new();
     icmp_stats.load_blacklist();
+
+    // #8: load per-subnet filtering policies from disk into the live (slow-path) set.
+    subnet_policy::init();
 
     // SEC-C3: periodic cleanup of expired ICMP ban entries (24h TTL, runs hourly).
     {

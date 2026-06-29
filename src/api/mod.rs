@@ -707,6 +707,12 @@ pub fn router(state: AppState) -> Router {
         .route("/blacklist/:id", delete(delete_blacklist_handler))
         .route("/split-horizon", get(list_split_horizon).post(add_split_horizon))
         .route("/split-horizon/:name", delete(delete_split_horizon))
+        // #8: per-subnet/VLAN filtering policies.
+        .route("/policies", get(list_policies_handler).post(add_policy_handler))
+        .route(
+            "/policies/:name",
+            delete(delete_policy_handler).put(put_policy_handler),
+        )
         // Feeds
         .route("/feeds", get(get_feeds_handler).post(add_feed_handler))
         .route("/feeds/presets", get(feed_presets_handler))
@@ -2687,6 +2693,122 @@ async fn delete_split_horizon(
     apply_split_horizon_live(&s.split_horizon.lock().unwrap_or_else(|e| e.into_inner()));
     info!(name = %name, "split-horizon entry deleted via API (live)");
     (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","removed": before, "note":"applied live (no restart)"})))
+}
+
+// ── #8: per-subnet/VLAN filtering policies ──────────────────────────────────
+// Stored in subnet-policies.json (not runbound.conf) and applied LIVE on the slow
+// serving path only — the XDP fast path is never touched.
+
+/// GET /api/policies — list per-subnet policies with their blocked counts.
+async fn list_policies_handler(State(_s): State<AppState>) -> impl IntoResponse {
+    let counts: std::collections::HashMap<String, u64> =
+        crate::subnet_policy::blocked_counts().into_iter().collect();
+    let out: Vec<_> = crate::subnet_policy::load()
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "subnet": p.subnet,
+                "blacklist_extra": p.blacklist_extra,
+                "blocked": counts.get(&p.name).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    JsonExtract(serde_json::json!({ "policies": out }))
+}
+
+/// Add-or-replace (by name) a subnet policy; persist + apply live. Shared by POST/PUT.
+fn upsert_policy_resp(
+    slave_mode: bool,
+    pol: crate::subnet_policy::SubnetPolicy,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if slave_mode {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            JsonExtract(serde_json::json!({"error":"SLAVE_READONLY"})),
+        )
+            .into_response();
+    }
+    if pol.name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error":"INVALID","details":"name is required"})),
+        )
+            .into_response();
+    }
+    if crate::dns::acl::CidrBlock::parse(&pol.subnet).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error":"INVALID_SUBNET","details":"subnet must be a CIDR, e.g. 192.168.10.0/24"})),
+        )
+            .into_response();
+    }
+    let name = pol.name.clone();
+    let mut pols = crate::subnet_policy::load();
+    pols.retain(|p| p.name != name);
+    pols.push(pol);
+    if let Err(e) = crate::subnet_policy::save(&pols) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({"error":"PERSIST_FAILED","details": e.to_string()})),
+        )
+            .into_response();
+    }
+    crate::subnet_policy::apply(&pols);
+    info!(name = %name, "subnet policy added/updated via API (live)");
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({"status":"ok","name":name,"note":"applied live (no restart)"})),
+    )
+        .into_response()
+}
+
+/// POST /api/policies — create or replace a per-subnet policy.
+async fn add_policy_handler(
+    State(s): State<AppState>,
+    ApiJson(pol): ApiJson<crate::subnet_policy::SubnetPolicy>,
+) -> impl IntoResponse {
+    upsert_policy_resp(s.slave_mode, pol)
+}
+
+/// PUT /api/policies/:name — update a per-subnet policy (the path name wins).
+async fn put_policy_handler(
+    State(s): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    ApiJson(mut pol): ApiJson<crate::subnet_policy::SubnetPolicy>,
+) -> impl IntoResponse {
+    pol.name = name;
+    upsert_policy_resp(s.slave_mode, pol)
+}
+
+/// DELETE /api/policies/:name — remove a per-subnet policy by name.
+async fn delete_policy_handler(
+    State(s): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if s.slave_mode {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            JsonExtract(serde_json::json!({"error":"SLAVE_READONLY"})),
+        );
+    }
+    let mut pols = crate::subnet_policy::load();
+    let before = pols.len();
+    pols.retain(|p| p.name != name);
+    let removed = before - pols.len();
+    if let Err(e) = crate::subnet_policy::save(&pols) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonExtract(serde_json::json!({"error":"PERSIST_FAILED","details": e.to_string()})),
+        );
+    }
+    crate::subnet_policy::apply(&pols);
+    info!(name = %name, "subnet policy deleted via API (live)");
+    (
+        StatusCode::OK,
+        JsonExtract(serde_json::json!({"status":"ok","removed": removed, "note":"applied live (no restart)"})),
+    )
 }
 
 /// Persist the effective config (boot config + live runtime overrides: the DNSSEC
