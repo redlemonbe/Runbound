@@ -400,8 +400,10 @@ mod tests {
 
     /// Build an unsigned UPDATE message (header + a question/zone), encoded.
     fn unsigned_update() -> Vec<u8> {
-        let mut h = Header::default();
-        h.id = 0x1234;
+        let mut h = Header {
+            id: 0x1234,
+            ..Default::default()
+        };
         h.set_opcode(opcode::UPDATE);
         let mut m = Message {
             header: h,
@@ -534,8 +536,10 @@ mod tests {
         let v = verify_request(&req, &keys(), now, 300).expect("request verifies");
 
         // Build and sign a response.
-        let mut h = Header::default();
-        h.id = 0x1234;
+        let mut h = Header {
+            id: 0x1234,
+            ..Default::default()
+        };
         h.set_opcode(opcode::UPDATE);
         h.set_qr(true);
         let mut resp = Message { header: h, ..Default::default() };

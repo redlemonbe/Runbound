@@ -138,7 +138,7 @@ fn oracle_soa_authority() {
         RData::SOA(SOA::new(
             hname("ns1.example.com."),
             hname("hostmaster.example.com."),
-            2026_06_20,
+            20260620,
             7200,
             3600,
             1_209_600,
@@ -304,7 +304,7 @@ fn records_wire_matches_hickory_store() {
         for hr in hick_recs {
             let expect = from_hickory(hr).expect("bridge hickory->wire");
             assert!(
-                wire_recs.iter().any(|w| *w == expect),
+                wire_recs.contains(&expect),
                 "{name}: a hickory record has no byte-equal match in the wire store"
             );
         }

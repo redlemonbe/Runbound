@@ -339,7 +339,7 @@ mod tests {
         roundtrip(Rdata::Soa {
             mname: Name::from_ascii("ns.example.com.").unwrap(),
             rname: Name::from_ascii("hostmaster.example.com.").unwrap(),
-            serial: 2026_06_20,
+            serial: 20260620,
             refresh: 7200,
             retry: 3600,
             expire: 1_209_600,

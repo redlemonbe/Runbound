@@ -372,7 +372,7 @@ mod tests {
     fn matches_hickory_oracle() {
         use hickory_proto::dnssec::crypto::{signing_key_from_der, EcdsaSigningKey};
         use hickory_proto::dnssec::rdata::DNSKEY;
-        use hickory_proto::dnssec::{Algorithm, DigestType, SigningKey as HSigningKey};
+        use hickory_proto::dnssec::{Algorithm, DigestType};
         use hickory_proto::rr::Name as HName;
         use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -505,7 +505,7 @@ mod tests {
             iters,
             salt.to_vec(),
             next_hash.to_vec(),
-            [HRecordType::A, HRecordType::RRSIG].into_iter(),
+            [HRecordType::A, HRecordType::RRSIG],
         );
         let mut hbytes = Vec::new();
         hnsec3.emit(&mut BinEncoder::new(&mut hbytes)).unwrap();

@@ -177,8 +177,10 @@ mod tests {
 
     /// Build a TSIG-signed UPDATE adding/deleting `updates` (authority section).
     fn signed_update(updates: Vec<Record>, time: u64) -> Vec<u8> {
-        let mut h = Header::default();
-        h.id = 0x55aa;
+        let mut h = Header {
+            id: 0x55aa,
+            ..Default::default()
+        };
         h.set_opcode(opcode::UPDATE);
         let mut m = Message {
             header: h,
