@@ -214,7 +214,7 @@ pub fn start_kernel_fast_loop(
 
 /// Tight recv→dispatch→send loop for one socket/core.
 fn worker_loop(
-    _thread_idx: usize,
+    thread_idx: usize,
     _core_id: usize,
     sock: Arc<UdpSocket>,
     zones: Arc<ArcSwap<LocalZoneSet>>,
@@ -380,6 +380,15 @@ fn worker_loop(
                     tx_lens[tx_n] = resp_len;
                     tx_peers[tx_n] = Some(peer);
                     tx_n += 1;
+                    // Count this fast-path cache hit. `stats.cache_hits` is reported as
+                    // `ch_slow + Σ XDP_WORKER_PKTS`; the AF_XDP loop bumps that per-worker
+                    // counter (worker.rs), but the kernel-fast-loop datapath did not — so
+                    // cache_hits / cache_hit_rate read 0 here despite real hits. Same
+                    // contention-free per-worker slot, indexed by this thread.
+                    if thread_idx < crate::dns::cache_snapshot::XDP_WORKER_PKTS.len() {
+                        crate::dns::cache_snapshot::XDP_WORKER_PKTS[thread_idx]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     continue;
                 }
             }
