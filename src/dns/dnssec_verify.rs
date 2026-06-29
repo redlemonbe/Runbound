@@ -345,6 +345,37 @@ pub fn validate_dnskey_rrset<'k>(
     None
 }
 
+/// Parse a DS RDATA (RFC 4034 §5.1): key tag | algorithm | digest type | digest.
+pub fn parse_ds(rdata: &[u8]) -> Option<Ds<'_>> {
+    if rdata.len() < 5 {
+        return None;
+    }
+    Some(Ds {
+        key_tag: u16::from_be_bytes([rdata[0], rdata[1]]),
+        algorithm: rdata[2],
+        digest_type: rdata[3],
+        digest: &rdata[4..],
+    })
+}
+
+/// Verify an RRset under a set of already-trusted DNSKEYs: at least one RRSIG
+/// over the RRset must verify under at least one trusted key. Fail-closed.
+pub fn validate_rrset(
+    owner: &Name,
+    rclass: u16,
+    rtype: u16,
+    rdatas: &[&Rdata],
+    rrsigs: &[&[u8]],
+    trusted_keys: &[&[u8]],
+    now: u32,
+) -> bool {
+    rrsigs.iter().any(|sig| {
+        trusted_keys
+            .iter()
+            .any(|key| verify_rrsig(owner, rclass, rtype, rdatas, sig, key, now))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +586,152 @@ mod tests {
         let validated = validate_dnskey_rrset(&Name::root(), &kr, &sr, ROOT_ANCHORS, now);
         assert!(validated.is_some(), "root DNSKEY did NOT validate against the hardcoded anchor");
         eprintln!("ROOT DNSKEY validated against hardcoded anchor: {} trusted keys", validated.unwrap().len());
+    }
+
+    // Fetch (name, qtype) with DO=1 from a validating-aware resolver over TCP,
+    // returning the parsed message. Used only to feed real records to the chain
+    // validator under test — the production resolver fetches via its own descent.
+    async fn fetch_do(qname: &Name, qtype: u16) -> crate::dns::wire::Message {
+        use crate::dns::wire;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut idb = [0u8; 2];
+        let _ = getrandom::fill(&mut idb);
+        let mut enc = wire::Encoder::uncompressed();
+        // RD + CD: CD (checking disabled) makes the resolver hand back the raw
+        // records — including deliberately-bogus ones — so WE do the validation.
+        wire::Header { id: u16::from_be_bytes(idb), flags: 0x0110, qdcount: 1, ancount: 0, nscount: 0, arcount: 1 }
+            .emit(&mut enc);
+        wire::Question::new(qname.clone(), qtype).emit(&mut enc);
+        enc.u8(0);
+        enc.u16(consts::rtype::OPT);
+        enc.u16(1232);
+        enc.u32(0x0000_8000);
+        enc.u16(0);
+        let q = enc.into_vec();
+        let mut s = tokio::net::TcpStream::connect("8.8.8.8:53").await.unwrap();
+        s.write_all(&(q.len() as u16).to_be_bytes()).await.unwrap();
+        s.write_all(&q).await.unwrap();
+        let mut lb = [0u8; 2];
+        s.read_exact(&mut lb).await.unwrap();
+        let mut resp = vec![0u8; u16::from_be_bytes(lb) as usize];
+        s.read_exact(&mut resp).await.unwrap();
+        wire::Message::parse(&resp).expect("parse DO response")
+    }
+
+    // Owned RDATA of `rtype` in the answer, plus the RRSIG rdatas covering it.
+    fn records_and_sigs(msg: &crate::dns::wire::Message, rtype: u16) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let rdatas = msg.answers.iter().filter(|r| r.rtype == rtype)
+            .map(|r| { let mut e = crate::dns::wire::Encoder::uncompressed(); r.rdata.emit(&mut e); e.into_vec() })
+            .collect();
+        let sigs = msg.answers.iter()
+            .filter(|r| r.rtype == consts::rtype::RRSIG)
+            .filter_map(|r| match &r.rdata { Rdata::Unknown { data, .. } => Some(data.clone()), _ => None })
+            .filter(|d| d.len() >= 2 && u16::from_be_bytes([d[0], d[1]]) == rtype)
+            .collect();
+        (rdatas, sigs)
+    }
+
+    fn as_unknown(rdatas: &[Vec<u8>], rtype: u16) -> Vec<Rdata> {
+        rdatas.iter().map(|d| Rdata::Unknown { rtype, data: d.clone() }).collect()
+    }
+
+    // Live: validate the full chain of trust root -> com -> cloudflare.com and a
+    // signed A RRset, from the hardcoded anchor. Proves Secure end to end.
+    //   cargo test -- --ignored validate_chain_root_to_cloudflare
+    #[tokio::test]
+    #[ignore]
+    async fn validate_chain_root_to_cloudflare() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let root = Name::root();
+        let com = Name::from_ascii("com.").unwrap();
+        let cf = Name::from_ascii("cloudflare.com.").unwrap();
+
+        // 1. Root DNSKEY validated against the hardcoded anchor.
+        let m = fetch_do(&root, consts::rtype::DNSKEY).await;
+        let (rk, rs) = records_and_sigs(&m, consts::rtype::DNSKEY);
+        let rk_refs: Vec<&[u8]> = rk.iter().map(|v| v.as_slice()).collect();
+        let rs_refs: Vec<&[u8]> = rs.iter().map(|v| v.as_slice()).collect();
+        let root_keys = validate_dnskey_rrset(&root, &rk_refs, &rs_refs, ROOT_ANCHORS, now)
+            .expect("root DNSKEY vs anchor");
+
+        // helper closure: validate child DNSKEY given parent's trusted keys.
+        async fn descend(child: &Name, parent: &Name, parent_keys: &[&[u8]], now: u32) -> Vec<Vec<u8>> {
+            // DS of child lives in the parent zone, signed by the parent.
+            let dm = fetch_do(child, consts::rtype::DS).await;
+            let (ds_rd, ds_sig) = records_and_sigs(&dm, consts::rtype::DS);
+            let ds_un = as_unknown(&ds_rd, consts::rtype::DS);
+            let ds_refs: Vec<&Rdata> = ds_un.iter().collect();
+            let dssig_refs: Vec<&[u8]> = ds_sig.iter().map(|v| v.as_slice()).collect();
+            assert!(
+                validate_rrset(child, consts::class::IN, consts::rtype::DS, &ds_refs, &dssig_refs, parent_keys, now),
+                "DS of {} not signed by {}", child.to_ascii(), parent.to_ascii()
+            );
+            let ds_list: Vec<Ds> = ds_rd.iter().filter_map(|r| parse_ds(r)).collect();
+            // Child DNSKEY validated against the (now trusted) DS.
+            let km = fetch_do(child, consts::rtype::DNSKEY).await;
+            let (ck, cs) = records_and_sigs(&km, consts::rtype::DNSKEY);
+            let ck_refs: Vec<&[u8]> = ck.iter().map(|v| v.as_slice()).collect();
+            let cs_refs: Vec<&[u8]> = cs.iter().map(|v| v.as_slice()).collect();
+            validate_dnskey_rrset(child, &ck_refs, &cs_refs, &ds_list, now)
+                .unwrap_or_else(|| panic!("DNSKEY of {} vs DS", child.to_ascii()))
+                .iter().map(|s| s.to_vec()).collect()
+        }
+
+        let root_refs: Vec<&[u8]> = root_keys.to_vec();
+        let com_keys = descend(&com, &root, &root_refs, now).await;
+        let com_refs: Vec<&[u8]> = com_keys.iter().map(|v| v.as_slice()).collect();
+        let cf_keys = descend(&cf, &com, &com_refs, now).await;
+        let cf_refs: Vec<&[u8]> = cf_keys.iter().map(|v| v.as_slice()).collect();
+
+        // Final: a signed A RRset for cloudflare.com under its validated keys.
+        let am = fetch_do(&cf, consts::rtype::A).await;
+        let a_rdatas: Vec<&Rdata> = am.answers.iter().filter(|r| r.rtype == consts::rtype::A).map(|r| &r.rdata).collect();
+        let (_a, a_sigs) = records_and_sigs(&am, consts::rtype::A);
+        let asig_refs: Vec<&[u8]> = a_sigs.iter().map(|v| v.as_slice()).collect();
+        assert!(!a_rdatas.is_empty(), "no A records for cloudflare.com");
+        assert!(
+            validate_rrset(&cf, consts::class::IN, consts::rtype::A, &a_rdatas, &asig_refs, &cf_refs, now),
+            "cloudflare.com A RRset did not validate under its keys"
+        );
+        eprintln!("CHAIN root->com->cloudflare.com + A RRset: SECURE ({} cf keys)", cf_keys.len());
+    }
+
+    // Live fail-closed: dnssec-failed.org is deliberately misconfigured (its keys
+    // do not match the DS in .org / its RRSIGs are bad). The validator MUST refuse
+    // to call it Secure — anything else is the exact vulnerability we are avoiding.
+    //   cargo test -- --ignored bogus_zone_fails_closed
+    #[tokio::test]
+    #[ignore]
+    async fn bogus_zone_fails_closed() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let bad = Name::from_ascii("dnssec-failed.org.").unwrap();
+
+        // The bad zone's DS (in .org) and its DNSKEY.
+        let dm = fetch_do(&bad, consts::rtype::DS).await;
+        let (ds_rd, _ds_sig) = records_and_sigs(&dm, consts::rtype::DS);
+        let ds_list: Vec<Ds> = ds_rd.iter().filter_map(|r| parse_ds(r)).collect();
+        let km = fetch_do(&bad, consts::rtype::DNSKEY).await;
+        let (ck, cs) = records_and_sigs(&km, consts::rtype::DNSKEY);
+        let ck_refs: Vec<&[u8]> = ck.iter().map(|v| v.as_slice()).collect();
+        let cs_refs: Vec<&[u8]> = cs.iter().map(|v| v.as_slice()).collect();
+
+        // Whole positive chain to a validated A must NOT succeed.
+        let a_secure = match validate_dnskey_rrset(&bad, &ck_refs, &cs_refs, &ds_list, now) {
+            None => false, // DNSKEY does not chain to the DS — already Bogus.
+            Some(keys) => {
+                let am = fetch_do(&bad, consts::rtype::A).await;
+                let a_rdatas: Vec<&Rdata> =
+                    am.answers.iter().filter(|r| r.rtype == consts::rtype::A).map(|r| &r.rdata).collect();
+                let (_a, a_sigs) = records_and_sigs(&am, consts::rtype::A);
+                let asig: Vec<&[u8]> = a_sigs.iter().map(|v| v.as_slice()).collect();
+                let kr: Vec<&[u8]> = keys.to_vec();
+                validate_rrset(&bad, consts::class::IN, consts::rtype::A, &a_rdatas, &asig, &kr, now)
+            }
+        };
+        assert!(!a_secure, "BOGUS zone validated as SECURE — DNSSEC validation is broken");
+        eprintln!("BOGUS dnssec-failed.org correctly REJECTED (fail-closed)");
     }
 
     #[test]
