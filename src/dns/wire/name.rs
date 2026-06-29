@@ -105,6 +105,35 @@ impl Name {
         Some(Name { wire })
     }
 
+    /// The labels of this name, each ASCII-lowercased, in wire (top-down) order.
+    /// The root name yields an empty vec.
+    pub fn labels_lower(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while self.wire[i] != 0 {
+            let ll = self.wire[i] as usize;
+            out.push(self.wire[i + 1..i + 1 + ll].iter().map(|b| b.to_ascii_lowercase()).collect());
+            i += 1 + ll;
+        }
+        out
+    }
+
+    /// Canonical DNS name order (RFC 4034 §6.1): labels compared from the rightmost
+    /// (most significant), each as a lowercased left-justified octet string; a
+    /// shorter name (fewer labels) sorts before a longer one sharing its suffix.
+    pub fn canonical_cmp(&self, other: &Name) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let a = self.labels_lower();
+        let b = other.labels_lower();
+        for (la, lb) in a.iter().rev().zip(b.iter().rev()) {
+            match la.cmp(lb) {
+                Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        a.len().cmp(&b.len())
+    }
+
     /// True if `self` is `zone` or a subdomain of it (case-insensitive). Walks the
     /// label hierarchy, so the suffix match is always label-aligned.
     pub fn is_in_zone(&self, zone: &Name) -> bool {

@@ -136,7 +136,7 @@ impl WireRecordIndex {
 /// Uses `simd::copy_lowercase_label` for the per-label lowercase step,
 /// the SAME function used in the hot path on the raw query wire bytes.
 /// One function = one normalisation = no silent divergence.
-#[cfg(any(feature = "recursor", test))]
+#[cfg(test)]
 pub(crate) fn name_to_wire_qname(name: &Name) -> SmallVec<[u8; 64]> {
     let mut buf: SmallVec<[u8; 64]> = SmallVec::new();
     for label in name.iter() {

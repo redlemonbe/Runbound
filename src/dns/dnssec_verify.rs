@@ -303,8 +303,10 @@ fn dnskey_matches_ds(owner: &Name, dnskey_rdata: &[u8], ds: &Ds) -> bool {
     if crate::dns::dnssec_sign::key_tag(dnskey_rdata) != ds.key_tag {
         return false;
     }
+    // The DS digest is public data (published in the parent zone), so a plain
+    // comparison is fine — there is no secret whose timing could leak.
     match compute_ds_digest(owner, dnskey_rdata, ds.digest_type) {
-        Some(d) => ring::constant_time::verify_slices_are_equal(&d, ds.digest).is_ok(),
+        Some(d) => d.as_slice() == ds.digest,
         None => false,
     }
 }
@@ -355,7 +357,7 @@ mod tests {
     fn ecdsa_roundtrip_verifies() {
         let key = SigningKey::generate(false).unwrap();
         let owner = Name::from_ascii("host.example.com.").unwrap();
-        let rdatas = vec![
+        let rdatas = [
             Rdata::A(Ipv4Addr::new(192, 0, 2, 1)),
             Rdata::A(Ipv4Addr::new(192, 0, 2, 2)),
         ];
@@ -376,7 +378,7 @@ mod tests {
             &owner, consts::class::IN, consts::rtype::A, &refs, &rrsig_rdata, &dnskey, 2_000_000
         ));
         // Fail-closed: tampered RDATA.
-        let tampered = vec![Rdata::A(Ipv4Addr::new(192, 0, 2, 99)), Rdata::A(Ipv4Addr::new(192, 0, 2, 2))];
+        let tampered = [Rdata::A(Ipv4Addr::new(192, 0, 2, 99)), Rdata::A(Ipv4Addr::new(192, 0, 2, 2))];
         let trefs: Vec<&Rdata> = tampered.iter().collect();
         assert!(!verify_rrsig(
             &owner, consts::class::IN, consts::rtype::A, &trefs, &rrsig_rdata, &dnskey, 2_000_000
