@@ -675,7 +675,18 @@ impl RunboundHandler {
                 .map(|d| d.as_secs() as u32)
                 .unwrap_or(0);
             let cd_bit = msg.header.cd();
-            match crate::dns::recursor_wire::resolve_validated(&q.name, qtype, now).await {
+            // Bound one client query's total recursion wall-clock (it can fan out
+            // across the DNSSEC chain + up to MAX_CNAME hops). Past the deadline →
+            // SERVFAIL, releasing the inflight permit instead of holding it for an
+            // attacker-controlled duration (defence-in-depth with the per-exchange
+            // timeout, the inflight cap, and the front-door rate limiter).
+            let resolved = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                crate::dns::recursor_wire::resolve_validated(&q.name, qtype, now),
+            )
+            .await
+            .unwrap_or(None);
+            match resolved {
                 Some(val) if val.verdict != Verdict::Bogus || cd_bit => {
                     match val.verdict {
                         Verdict::Secure => self.stats.inc_dnssec_secure(),

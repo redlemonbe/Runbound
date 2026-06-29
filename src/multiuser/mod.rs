@@ -293,12 +293,17 @@ impl RequestUser {
     }
 
     pub fn from_account(u: &UserAccount) -> Self {
+        // A Role::Admin account IS admin everywhere — unify the two flags so the
+        // explicit `!caller.admin` gates (TLS/users/rotate-key/…) and the role-based
+        // `may_write` can never disagree (a `admin:false, role:Admin` account must not
+        // be able to write some admin endpoints but not others).
+        let admin = u.admin || matches!(u.role, Role::Admin);
         Self {
             id: u.id.clone(),
             username: u.username.clone(),
-            admin: u.admin,
+            admin,
             zone_prefixes: u.zone_prefixes.clone(),
-            role: if u.admin { Role::Admin } else { u.role },
+            role: if admin { Role::Admin } else { u.role },
         }
     }
 

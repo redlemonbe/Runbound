@@ -172,6 +172,12 @@ const MAX_BLACKLIST_ENTRIES: usize = 100_000;
 /// without this limit an authenticated client could trigger unbounded I/O.
 const MAX_FEEDS: usize = 100;
 
+/// #8: caps on per-subnet policies — bound the persisted file size and the
+/// per-query O(N) policy scan / domain set so an authenticated client cannot
+/// inflate them into a slow-path resource-exhaustion vector.
+const MAX_POLICIES: usize = 256;
+const MAX_POLICY_DOMAINS: usize = 4096;
+
 /// Priority: HSM > RUNBOUND_API_KEY env var > api-key in unbound.conf > auto-generate.
 /// Auto-generated keys are 256-bit CSPRNG (2× UUID v4, backed by getrandom).
 pub fn init_api_key(config_key: Option<String>) -> String {
@@ -2744,8 +2750,45 @@ fn upsert_policy_resp(
         )
             .into_response();
     }
+    // Sanitize the name (it is logged and persisted to JSON) and validate the domain
+    // list — same standard as the blacklist/split-horizon handlers (audit #8 F1).
+    if pol.name.len() > 64
+        || pol
+            .name
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error":"INVALID","details":"name must be ≤64 chars with no control characters, quotes or backslashes"})),
+        )
+            .into_response();
+    }
+    if pol.blacklist_extra.len() > MAX_POLICY_DOMAINS {
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error":"TOO_MANY_DOMAINS","details": format!("max {} domains per policy", MAX_POLICY_DOMAINS)})),
+        )
+            .into_response();
+    }
+    for d in pol.blacklist_extra.iter().filter(|d| !d.trim().is_empty()) {
+        if let Err(e) = validate_dns_name(d) {
+            return (
+                StatusCode::BAD_REQUEST,
+                JsonExtract(serde_json::json!({"error":"INVALID_DOMAIN","details": format!("'{}': {}", d, e)})),
+            )
+                .into_response();
+        }
+    }
     let name = pol.name.clone();
     let mut pols = crate::subnet_policy::load();
+    if !pols.iter().any(|p| p.name == name) && pols.len() >= MAX_POLICIES {
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({"error":"TOO_MANY_POLICIES","details": format!("max {} subnet policies", MAX_POLICIES)})),
+        )
+            .into_response();
+    }
     pols.retain(|p| p.name != name);
     pols.push(pol);
     if let Err(e) = crate::subnet_policy::save(&pols) {

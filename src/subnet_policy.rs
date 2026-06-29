@@ -17,8 +17,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// Fast no-policy gate: when no policy is configured (the default), the slow-path
+/// `blocks()` check returns on a single relaxed load, skipping the `ArcSwap` load
+/// (and its refcount bump) entirely — the feature costs nothing when unused.
+static HAS_POLICIES: AtomicBool = AtomicBool::new(false);
 
 /// A subnet policy as edited via the API and persisted to JSON.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -76,10 +81,18 @@ fn store_path() -> PathBuf {
     crate::runtime::base_dir().join("subnet-policies.json")
 }
 
-/// Persisted policies (empty if the file is absent or unreadable).
+/// Persisted policies (empty if the file is absent). A CORRUPT file is logged and
+/// treated as empty rather than crashing — but the warning makes the resulting
+/// fail-open (0 policies active) visible instead of silent.
 pub fn load() -> Vec<SubnetPolicy> {
     match std::fs::read(store_path()) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "subnet-policies.json is corrupt — ignoring it (0 subnet policies active)");
+                Vec::new()
+            }
+        },
         Err(_) => Vec::new(),
     }
 }
@@ -127,26 +140,32 @@ static LIVE: OnceLock<ArcSwap<CompiledPolicies>> = OnceLock::new();
 
 /// Initialise the live policies from the persisted file (call once at startup).
 pub fn init() {
-    let _ = LIVE.set(ArcSwap::from_pointee(compile_with(&load(), None)));
+    let compiled = compile_with(&load(), None);
+    HAS_POLICIES.store(!compiled.0.is_empty(), Ordering::Relaxed);
+    let _ = LIVE.set(ArcSwap::from_pointee(compiled));
 }
 
 /// Recompile and hot-swap the live policies after an API edit (carrying counters).
 pub fn apply(policies: &[SubnetPolicy]) {
+    let compiled = match LIVE.get() {
+        Some(live) => compile_with(policies, Some(&live.load())),
+        None => compile_with(policies, None),
+    };
+    HAS_POLICIES.store(!compiled.0.is_empty(), Ordering::Relaxed);
     match LIVE.get() {
-        Some(live) => {
-            let prev = live.load();
-            live.store(Arc::new(compile_with(policies, Some(&prev))));
-        }
+        Some(live) => live.store(Arc::new(compiled)),
         None => {
-            let _ = LIVE.set(ArcSwap::from_pointee(compile_with(policies, None)));
+            let _ = LIVE.set(ArcSwap::from_pointee(compiled));
         }
     }
 }
 
 /// Slow-path query check: is `qname_lc` extra-blacklisted for `ip` by some policy?
+/// Returns on a single relaxed load when no policy is configured (the default).
 #[inline]
 pub fn blocks(ip: IpAddr, qname_lc: &str) -> bool {
-    LIVE.get().is_some_and(|l| l.load().blocks(ip, qname_lc))
+    HAS_POLICIES.load(Ordering::Relaxed)
+        && LIVE.get().is_some_and(|l| l.load().blocks(ip, qname_lc))
 }
 
 /// Per-policy blocked counters (since the last edit) for the API / dashboard.

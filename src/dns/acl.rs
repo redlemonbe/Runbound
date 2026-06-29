@@ -50,6 +50,16 @@ impl CidrBlock {
             (s, len)
         };
         let prefix: IpAddr = ip_str.parse().ok()?;
+        // Reject an out-of-range prefix (v4 ≤ /32, v6 ≤ /128) so callers that use
+        // `parse(..).is_some()` as a validity gate (e.g. the policy API) actually
+        // reject nonsense like `192.168.0.0/99`.
+        let max = match prefix {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix_len > max {
+            return None;
+        }
         Some(CidrBlock { prefix, prefix_len })
     }
 
