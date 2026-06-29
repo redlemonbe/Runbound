@@ -550,12 +550,19 @@ fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
         rcode::NOERROR => {
             if msg.answers.is_empty() {
                 // NODATA — authoritative empty answer
-                ResolveResult::NegativeAnswer { rcode: rcode::NOERROR, neg_ttl: soa_min_ttl(&msg) }
+                // neg_ttl 0 = no usable SOA → consumer must not negative-cache (#210).
+                ResolveResult::NegativeAnswer {
+                    rcode: rcode::NOERROR,
+                    neg_ttl: soa_min_ttl(&msg).unwrap_or(0),
+                }
             } else {
                 ResolveResult::Answer { records: msg.answers }
             }
         }
-        rcode::NXDOMAIN => ResolveResult::NegativeAnswer { rcode: rcode::NXDOMAIN, neg_ttl: soa_min_ttl(&msg) },
+        rcode::NXDOMAIN => ResolveResult::NegativeAnswer {
+            rcode: rcode::NXDOMAIN,
+            neg_ttl: soa_min_ttl(&msg).unwrap_or(0),
+        },
         other => {
             debug!(rcode = other, "upstream returned error rcode");
             ResolveResult::Servfail
@@ -563,19 +570,20 @@ fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
     }
 }
 
-/// Extract the SOA minimum TTL from the authority section (RFC 2308 §5).
-fn soa_min_ttl(msg: &wire::Message) -> u32 {
-    msg.authority
-        .iter()
-        .find_map(|r| {
-            if let wire::Rdata::Soa { minimum, .. } = &r.rdata {
-                Some(*minimum)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(300)
-        .clamp(60, 900)
+/// Negative-cache TTL from the authority SOA (RFC 2308 §5): the LESSER of the SOA
+/// MINIMUM field and the SOA record's own TTL (the record TTL was previously
+/// ignored — #210). `None` when the authority carries no SOA: RFC 2308 negative
+/// caching is predicated on the SOA, so a no-SOA negative must not be pinned on an
+/// invented TTL — the consumer treats `None`/0 as "do not negative-cache". The
+/// configured-window clamp is the consumer's job, not done here.
+fn soa_min_ttl(msg: &wire::Message) -> Option<u32> {
+    msg.authority.iter().find_map(|r| {
+        if let wire::Rdata::Soa { minimum, .. } = &r.rdata {
+            Some((*minimum).min(r.ttl))
+        } else {
+            None
+        }
+    })
 }
 
 /// Build a keepalive SOA query for "." in DNS wire format.

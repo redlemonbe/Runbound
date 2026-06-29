@@ -679,13 +679,25 @@ impl RunboundHandler {
                     if val.rcode == rcode::NXDOMAIN {
                         self.stats.inc_nxdomain();
                         self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Nxdomain, start);
-                        let mut resp = self.wire_error(&msg, rcode::NXDOMAIN);
+                        // RFC 2308 §3: carry the zone SOA (+ DNSSEC denial for DO).
+                        let mut resp =
+                            self.wire_negative(&msg, rcode::NXDOMAIN, &val.authority, do_bit);
                         if set_ad && resp.len() > 3 {
                             resp[3] |= 0x20; // authenticated denial (RFC 4035)
                         }
                         return Some(resp);
                     }
                     let mut records = val.records;
+                    if records.is_empty() {
+                        // NODATA (NOERROR, empty answer) — also carry the SOA (RFC 2308 §3).
+                        let mut resp =
+                            self.wire_negative(&msg, rcode::NOERROR, &val.authority, do_bit);
+                        if set_ad && resp.len() > 3 {
+                            resp[3] |= 0x20;
+                        }
+                        self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Recursed, start);
+                        return Some(resp);
+                    }
                     for r in records.iter_mut() {
                         r.ttl = r.ttl.max(self.cache_min_ttl).min(self.cache_max_ttl);
                     }
@@ -848,6 +860,58 @@ impl RunboundHandler {
             questions: req.questions.clone(),
             answers: records.to_vec(),
             authority: Vec::new(),
+            additional,
+        };
+        m.encode()
+    }
+
+    /// Build a negative response (NXDOMAIN / NODATA) carrying the zone SOA in the
+    /// authority section (RFC 2308 §3) so downstream resolvers can negative-cache.
+    /// The SOA is always included; DNSSEC denial records (NSEC/NSEC3/RRSIG) only for
+    /// DO clients (RFC 4035). `authority` is the validated upstream authority section.
+    fn wire_negative(
+        &self,
+        req: &crate::dns::wire::Message,
+        rcode_low: u16,
+        authority: &[crate::dns::wire::Record],
+        do_bit: bool,
+    ) -> Vec<u8> {
+        use crate::dns::wire::{consts::rtype, Header, Message};
+        let mut h = Header {
+            id: req.header.id,
+            flags: 0,
+            qdcount: 0,
+            ancount: 0,
+            nscount: 0,
+            arcount: 0,
+        };
+        h.set_qr(true);
+        h.set_rd(req.header.rd());
+        h.set_ra(true);
+        h.set_rcode_low(rcode_low);
+        let auth: Vec<crate::dns::wire::Record> = authority
+            .iter()
+            .filter(|r| {
+                r.rtype == rtype::SOA
+                    || (do_bit
+                        && matches!(r.rtype, rtype::NSEC | rtype::NSEC3 | rtype::RRSIG))
+            })
+            .cloned()
+            .collect();
+        let mut additional = Vec::new();
+        if let Ok(Some(req_edns)) = req.edns() {
+            let mut e = crate::dns::wire::Edns {
+                udp_payload: req_edns.udp_payload.clamp(512, 1232),
+                ..Default::default()
+            };
+            e.set_dnssec_ok(req_edns.dnssec_ok());
+            additional.push(e.to_record());
+        }
+        let m = Message {
+            header: h,
+            questions: req.questions.clone(),
+            answers: Vec::new(),
+            authority: auth,
             additional,
         };
         m.encode()

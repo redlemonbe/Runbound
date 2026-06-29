@@ -457,6 +457,10 @@ impl crate::dns::dnssec_chain::Fetcher for ResolverFetcher {
 pub struct Validated {
     /// Answer records (CNAME chain followed), without RRSIG/OPT.
     pub records: Vec<Record>,
+    /// Authority section of the terminal reply (SOA + any NSEC/NSEC3 + RRSIGs,
+    /// OPT excluded) — carried so a negative answer can include the zone SOA
+    /// (RFC 2308 §3) and the DNSSEC denial proof. Empty for positive answers.
+    pub authority: Vec<Record>,
     /// Response code (NOERROR / NXDOMAIN).
     pub rcode: u16,
     /// DNSSEC verdict — the caller serves SERVFAIL on `Bogus`.
@@ -499,7 +503,12 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
             records.push(cn_rec);
             if cname_left == 0 {
                 // Refuse to serve a too-long / looping chain.
-                return Some(Validated { records, rcode, verdict: Verdict::Bogus });
+                return Some(Validated {
+                    records,
+                    authority: Vec::new(),
+                    rcode,
+                    verdict: Verdict::Bogus,
+                });
             }
             cname_left -= 1;
             target = next;
@@ -514,7 +523,15 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
                 .filter(|r| r.rtype == qtype && r.name.eq_ignore_ascii_case(&target))
                 .cloned(),
         );
-        return Some(Validated { records, rcode, verdict });
+        // Carry the authority (SOA + denial proof, OPT excluded) so a negative
+        // answer can echo the zone SOA per RFC 2308 §3.
+        let authority = msg
+            .authority
+            .iter()
+            .filter(|r| r.rtype != consts::rtype::OPT)
+            .cloned()
+            .collect();
+        return Some(Validated { records, authority, rcode, verdict });
     }
 }
 
