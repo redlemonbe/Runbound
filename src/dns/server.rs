@@ -705,7 +705,12 @@ impl RunboundHandler {
                     if set_ad && resp.len() > 3 {
                         resp[3] |= 0x20; // AD bit (RFC 4035)
                     }
-                    self.maybe_cache_wire(&q, &resp, &records);
+                    // Never cache a CD-served (Bogus) answer: it must not poison the
+                    // cache for non-CD clients, who would then get it as NOERROR without
+                    // the SERVFAIL that validation requires. Secure/Insecure are cacheable.
+                    if val.verdict != Verdict::Bogus {
+                        self.maybe_cache_wire(&q, &resp, &records);
+                    }
                     self.stats.inc_forwarded();
                     self.stats.record_forward(start.elapsed().as_micros() as u64);
                     // full-recursion: the answer came from our own iterative resolver,
