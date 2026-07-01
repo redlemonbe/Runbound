@@ -50,16 +50,9 @@ activates (not implemented, see §1). Certificate changes are **applied live**
 
 ## 3. Auto-discovery — DDR (RFC 9462)
 
-**Known limitation:** `ddr: yes` parses and Runbound stores the endpoint info
-(hostname + DoT/DoH/DoQ ports), but SVCB synthesis for `_dns.resolver.arpa` is
-**not yet wired into the wire serving path** (`serve_wire`, the only DNS
-serving path in the current binary) — the struct holding this info is
-currently dead code. A query for `SVCB _dns.resolver.arpa` gets whatever your
-normal resolution/local-zone rules produce, not a synthesized answer. Treat
-the config below as forward-looking; clients cannot yet auto-discover the
-encrypted endpoint this way. See the tracked gap (PAR-7) for status.
-
-Intended configuration once implemented:
+`ddr: yes` + a `tls-cert-hostname` makes Runbound answer `SVCB _dns.resolver.arpa`
+wire-natively (`src/dns/server.rs::DdrInfo::svcb_records`, RFC 9460 SVCB rdata via
+the in-house wire codec — no hickory), one record per transport:
 
 ```
 server:
@@ -67,21 +60,19 @@ server:
     tls-cert-hostname: "dns.example.com"
 ```
 
-The design is for Runbound to answer `SVCB _dns.resolver.arpa` with one record
-per transport, pointing at your hostname:
-
 ```
 _dns.resolver.arpa. 7200 IN SVCB 1 dns.example.com. alpn="dot" port=853
 _dns.resolver.arpa. 7200 IN SVCB 2 dns.example.com. alpn="h2"  port=443 dohpath="/dns-query{?dns}"
 _dns.resolver.arpa. 7200 IN SVCB 3 dns.example.com. alpn="doq" port=853
 ```
 
-A client reaching Runbound over plain DNS would then discover and verify the
-encrypted endpoint before upgrading. The advertised ports would follow
-`tls-port` / `https-port` / `quic-port` (defaults 853 / 443 / 853; the `quic-port`
-entry is forward-compat only — DoQ itself isn't implemented, see §1). Until DDR
-lands, distribute the DoT/DoH endpoint out-of-band (client provisioning, a
-static SVCB record on a separate authoritative zone, etc.).
+A client reaching Runbound over plain DNS discovers and verifies the encrypted
+endpoint before upgrading. The advertised ports follow `tls-port` / `https-port` /
+`quic-port` (defaults 853 / 443 / 853; the `quic-port` entry is forward-compat
+only — DoQ itself isn't implemented, see §1). This was briefly dead code during
+the de-hickory rewrite (the hickory-typed synthesiser was deleted without a
+wire-native replacement — see the tracked gap PAR-7) and was reimplemented in
+v0.23.11.
 
 ---
 

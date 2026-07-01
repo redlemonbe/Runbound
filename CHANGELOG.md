@@ -7,6 +7,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.23.11] - 2026-07-01
+
+### Added
+- **Wire-native CHAOS identity queries.** `id.server.` (RFC 4892) and the
+  BIND/Unbound-convention `version.bind.`/`version.server.`/`hostname.bind.`
+  CH TXT queries are now genuinely answerable, matching Unbound's
+  `hide-identity`/`hide-version`/`identity`/`version` directives exactly
+  (secure by default: `hide-identity`/`hide-version` both default to `yes`,
+  so out-of-the-box behavior is unchanged — REFUSED). Set either to `no` to
+  answer with a custom `identity:`/`version:` string, or the real system
+  hostname / build version if unset. `authors.bind.` has no RFC standing (a
+  BIND-only easter egg) and is not implemented — still REFUSED. This replaces
+  the hard NOTIMP/REFUSED-always behavior introduced when the hickory request
+  handler was removed (v0.22.0) and never revisited.
+- **DDR SVCB synthesis reimplemented, wire-native (#204).** `ddr: yes` +
+  `tls-cert-hostname` once again answers `SVCB _dns.resolver.arpa` (RFC 9462)
+  with DoT/DoH/DoQ records — this had been deleted as (believed) dead code
+  during the de-hickory handler removal (`537f442`) without a wire-native
+  replacement, unlike every other feature carried through that migration
+  (AXFR, TSIG, DDNS, DNSSEC signing each got their own port). Added a new
+  `Rdata::Svcb` variant to the in-house wire codec (RFC 9460; also parses
+  HTTPS records, which share the identical wire format), fully round-trip
+  tested.
+
+Both were found by the same adversarial re-audit that turned up the 0.23.9/
+0.23.10 issues, and confirmed via `git log`/`git show` on the exact commits
+that dropped them — not guessed. Verified live (standalone test instance,
+not production): custom identity/version strings returned correctly,
+`authors.bind.` still REFUSED, default (hidden) behavior unchanged, DDR SVCB
+answer decodes cleanly in `dig` with correct ALPN/port/dohpath params for all
+three transports. 444/444 tests pass (2 new: SVCB round-trip, SVCB-as-HTTPS
+decode), clippy clean.
+
 ## [0.23.10] - 2026-07-01
 
 ### Changed

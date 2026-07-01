@@ -52,6 +52,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "xdp-domain-routing" | "xdp-busy-poll" | "xdp-ring-size"
                 | "xdp-rx-ring-size" | "xdp-tx-ring-size" | "xdp-fill-ring-size" | "xdp-comp-ring-size"
                 | "prefetch" | "prefetch-threshold" | "cache-flush-cooldown"
+                | "hide-version" | "hide-identity" | "identity" | "version"
                 | "upstream-racing" | "resolv-fallback" | "serve-stale"
                 | "stale-answer-ttl" | "stale-max-age"
                 | "allow-update" | "block-https-record"
@@ -198,6 +199,10 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.cache_flush_cooldown != d.cache_flush_cooldown { o.push_str(&format!("    cache-flush-cooldown: {}\n", cfg.cache_flush_cooldown)); }
     if cfg.upstream_racing != d.upstream_racing { o.push_str(&format!("    upstream-racing: {}\n", b(cfg.upstream_racing))); }
     if cfg.resolv_fallback != d.resolv_fallback { o.push_str(&format!("    resolv-fallback: {}\n", b(cfg.resolv_fallback))); }
+    if cfg.hide_version != d.hide_version { o.push_str(&format!("    hide-version: {}\n", b(cfg.hide_version))); }
+    if cfg.hide_identity != d.hide_identity { o.push_str(&format!("    hide-identity: {}\n", b(cfg.hide_identity))); }
+    if let Some(v) = &cfg.identity { o.push_str(&format!("    identity: \"{}\"\n", escape_str(v))); }
+    if let Some(v) = &cfg.version { o.push_str(&format!("    version: \"{}\"\n", escape_str(v))); }
     if cfg.serve_stale != d.serve_stale { o.push_str(&format!("    serve-stale: {}\n", b(cfg.serve_stale))); }
     if cfg.stale_answer_ttl != d.stale_answer_ttl { o.push_str(&format!("    stale-answer-ttl: {}\n", cfg.stale_answer_ttl)); }
     if cfg.stale_max_age != d.stale_max_age { o.push_str(&format!("    stale-max-age: {}\n", cfg.stale_max_age)); }

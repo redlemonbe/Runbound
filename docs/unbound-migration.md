@@ -34,6 +34,8 @@ Directives with identical behavior to Unbound — no changes required.
 | `serve-expired` | Serve stale/expired cached answers when upstream is unreachable (Runbound alias: `serve-stale`) |
 | `serve-expired-ttl` | Max age of a stale record still eligible to be served (Runbound alias: `stale-max-age`, default: 86400s) |
 | `serve-expired-reply-ttl` | TTL returned to the client on a stale answer (Runbound alias: `stale-answer-ttl`, default: 30s) |
+| `hide-identity` / `hide-version` | Refuse `id.server.`/`hostname.bind.` and `version.bind.`/`version.server.` CH TXT queries. Default: `yes` (hidden) — matches Unbound's secure-by-default. Set to `no` to answer them (RFC 4892 for `id.server.`; the others are long-standing BIND/Unbound convention). `authors.bind.` has no RFC standing and always REFUSED. |
+| `identity` / `version` | Custom string returned for the identity/version CH TXT queries above when not hidden. Falls back to the system hostname / build version if unset. |
 
 #### `forward-zone:` block
 
@@ -74,7 +76,6 @@ Directives accepted without error but with no effect at runtime. Safe to leave i
 | `prefetch-key` | Key prefetching not separately configurable |
 | `use-syslog` | Runbound logs to stdout/journald via `tracing` |
 | `log-queries` / `log-replies` | Use `verbosity: 2` for per-query logging |
-| `hide-identity` / `hide-version` / `identity` / `version` | Runbound hard-rejects all CHAOS-class queries with NOTIMP and never constructs a CHAOS answer — it doesn't answer identity probes even minimally. `version.bind.` / `hostname.bind.` / `id.server.` / `authors.bind.` are also REFUSED regardless of query class |
 | `username` / `chroot` / `directory` | Process isolation handled by systemd (static `User=runbound`/`Group=runbound` created by `install.sh`, plus `PrivateTmp`) — no `DynamicUser` |
 | `auto-trust-anchor-file` / `val-log-level` | See `dnssec-validation` caveat above |
 | `harden-glue` / `harden-dnssec-stripped` | Security defaults equivalent to Unbound's hardened mode are always on |

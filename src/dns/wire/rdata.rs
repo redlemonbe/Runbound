@@ -54,6 +54,19 @@ pub enum Rdata {
         tag: Vec<u8>,
         value: Vec<u8>,
     },
+    /// SVCB (RFC 9460, type 64) — used for `_dns.resolver.arpa` DDR (RFC 9462)
+    /// answers. Also parses HTTPS (type 65), which shares the identical wire
+    /// format; `rtype()` reports SVCB unconditionally since nothing in this tree
+    /// currently needs to distinguish the two after decode (`Record.rtype`, not
+    /// `Rdata::rtype()`, drives re-encoding — see `record.rs`). `params` is an
+    /// ordered list of `(SvcParamKey, value)`; the value bytes are already in
+    /// their final wire encoding (e.g. an ALPN param's own length-prefixed
+    /// string list) — opaque here, same philosophy as CAA's tag/value split.
+    Svcb {
+        priority: u16,
+        target: Name,
+        params: Vec<(u16, Vec<u8>)>,
+    },
     /// Any type not modelled above: its numeric type and opaque RDATA.
     Unknown {
         rtype: u16,
@@ -75,6 +88,7 @@ impl Rdata {
             Rdata::Txt(_) => rtype::TXT,
             Rdata::Srv { .. } => rtype::SRV,
             Rdata::Caa { .. } => rtype::CAA,
+            Rdata::Svcb { .. } => rtype::SVCB,
             Rdata::Unknown { rtype, .. } => *rtype,
         }
     }
@@ -111,6 +125,16 @@ impl Rdata {
                 String::from_utf8_lossy(tag),
                 String::from_utf8_lossy(value)
             ),
+            Rdata::Svcb { priority, target, params } => {
+                let mut out = format!("{} {}", priority, target.to_ascii());
+                for (key, value) in params {
+                    let _ = write!(out, " key{}=0x", key);
+                    for b in value {
+                        let _ = write!(out, "{:02x}", b);
+                    }
+                }
+                out
+            }
             Rdata::Unknown { data, .. } => {
                 let mut out = String::with_capacity(data.len() * 2);
                 for b in data {
@@ -199,6 +223,21 @@ impl Rdata {
                 let value = d.slice(end - d.pos())?.to_vec();
                 Rdata::Caa { flags, tag, value }
             }
+            rtype::SVCB | rtype::HTTPS => {
+                let priority = d.u16()?;
+                let target = Name::parse(d)?;
+                let mut params = Vec::new();
+                while d.pos() < end {
+                    let key = d.u16()?;
+                    let vlen = d.u16()? as usize;
+                    if d.pos() + vlen > end {
+                        return Err(WireError::BadRdataLength);
+                    }
+                    let value = d.slice(vlen)?.to_vec();
+                    params.push((key, value));
+                }
+                Rdata::Svcb { priority, target, params }
+            }
             _ => {
                 let data = d.slice(rdlength as usize)?.to_vec();
                 Rdata::Unknown {
@@ -272,6 +311,16 @@ impl Rdata {
                 e.bytes(tag);
                 e.bytes(value);
             }
+            Rdata::Svcb { priority, target, params } => {
+                e.u16(*priority);
+                target.emit_raw(e);
+                for (key, value) in params {
+                    e.u16(*key);
+                    debug_assert!(value.len() <= u16::MAX as usize, "SvcParamValue exceeds 64 KiB");
+                    e.u16(value.len() as u16);
+                    e.bytes(value);
+                }
+            }
             Rdata::Unknown { data, .. } => e.bytes(data),
         }
     }
@@ -317,6 +366,15 @@ impl Rdata {
                 e.u8(tag.len() as u8);
                 e.bytes(tag);
                 e.bytes(value);
+            }
+            Rdata::Svcb { priority, target, params } => {
+                e.u16(*priority);
+                target.emit_canonical(e);
+                for (key, value) in params {
+                    e.u16(*key);
+                    e.u16(value.len() as u16);
+                    e.bytes(value);
+                }
             }
             Rdata::Unknown { data, .. } => e.bytes(data),
         }
@@ -397,6 +455,34 @@ mod tests {
             tag: b"issue".to_vec(),
             value: b"letsencrypt.org".to_vec(),
         });
+    }
+
+    #[test]
+    fn svcb() {
+        let target = Name::from_ascii("dns.example.com.").unwrap();
+        roundtrip(Rdata::Svcb {
+            priority: 1,
+            target: target.clone(),
+            params: vec![
+                (1, b"\x03dot".to_vec()),        // ALPN "dot" (length-prefixed string)
+                (3, 853u16.to_be_bytes().to_vec()), // port
+            ],
+        });
+        // Priority 0 ("AliasMode", RFC 9460 §2.2) carries no params.
+        roundtrip(Rdata::Svcb { priority: 0, target, params: vec![] });
+    }
+
+    #[test]
+    fn svcb_parses_as_https_too() {
+        // SVCB and HTTPS (RFC 9460) share an identical wire format.
+        let target = Name::from_ascii("example.com.").unwrap();
+        let rd = Rdata::Svcb { priority: 1, target, params: vec![] };
+        let mut e = Encoder::new();
+        rd.emit(&mut e);
+        let buf = e.into_vec();
+        let mut d = Decoder::new(&buf);
+        let got = Rdata::parse(&mut d, rtype::HTTPS, buf.len() as u16).unwrap();
+        assert_eq!(got, rd);
     }
 
     #[test]

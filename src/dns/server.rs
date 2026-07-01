@@ -149,10 +149,31 @@ pub struct RunboundHandler {
     /// #203: counter driving the RRL slip leak.
     rrl_counter: std::sync::atomic::AtomicU64,
     /// #204: DDR (RFC 9462) endpoint info, Some when `ddr: yes` + a TLS hostname is set.
-    /// DDR SVCB synthesis is not yet ported to the wire serving path — recursor-only
-    /// (the synthesiser returns hickory records). See audit finding.
-    #[allow(dead_code)]
+    /// Wire-native SVCB synthesis at `_dns.resolver.arpa` — see `DdrInfo::svcb_records`.
     ddr: Option<DdrInfo>,
+    /// CHAOS-class identity queries: refuse `version.bind.`/`version.server.` CH TXT
+    /// unless the operator opts in (`hide-version: no`). Default: true (hidden).
+    hide_version: bool,
+    /// CHAOS-class identity queries: refuse `id.server.`/`hostname.bind.` CH TXT
+    /// unless the operator opts in (`hide-identity: no`). Default: true (hidden).
+    hide_identity: bool,
+    /// String reported for `id.server.`/`hostname.bind.` when not hidden — the
+    /// `identity:` config value, or the system hostname if unset.
+    identity_string: String,
+    /// String reported for `version.bind.`/`version.server.` when not hidden — the
+    /// `version:` config value, or the build version (`CARGO_PKG_VERSION`) if unset.
+    version_string: String,
+}
+
+/// Best-effort system hostname for CHAOS identity answers (`identity:` unset).
+/// Linux-only, zero-dependency: reads the same source as `hostname(1)`. Falls back to
+/// a fixed placeholder — never fails the query path over a cosmetic string.
+fn system_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "runbound".to_string())
 }
 
 /// #10/#186: compiled split-horizon table — (CidrBlock list, per-subnet LocalZoneSet).
@@ -243,6 +264,10 @@ impl RunboundHandler {
         dns_cookies: bool,
         rrl_slip: u64,
         ddr: Option<DdrInfo>,
+        hide_version: bool,
+        hide_identity: bool,
+        identity_string: String,
+        version_string: String,
     ) -> Self {
         Self {
             zones,
@@ -291,6 +316,10 @@ impl RunboundHandler {
             },
             rrl_counter: std::sync::atomic::AtomicU64::new(0),
             ddr,
+            hide_version,
+            hide_identity,
+            identity_string,
+            version_string,
             // SEC-20: decode TSIG keys once at startup instead of per-request.
             tsig_keys: tsig_keys_raw.into_iter().filter_map(|(name, alg_str, secret_b64)| {
                 let Some(alg) = TsigAlg::parse(&alg_str) else {
@@ -605,20 +634,44 @@ impl RunboundHandler {
         }
 
         // ── Special query classes/types (RFC-mandated rejections), wire-native ──
-        // CHAOS class (version.bind/hostname.bind identity probes) → NOTIMP (RFC 5358).
+        let qname_pres = q.name.to_ascii();
+        let qname_lc = qname_pres.to_ascii_lowercase();
+        // CHAOS-class identity queries: `id.server.` (RFC 4892) and the BIND-convention
+        // `version.bind.`/`version.server.`/`hostname.bind.` — secure by default (refused
+        // unless the operator opts in via hide-version:no / hide-identity:no, matching
+        // Unbound/BIND semantics), answered wire-native with a single TXT record when
+        // enabled. `authors.bind.` has no RFC standing (a BIND-only easter egg) and is not
+        // implemented — falls through to REFUSED like any other unrecognized CH query.
+        if q.qclass == class::CH {
+            if qtype == rtype::TXT {
+                let txt: Option<&str> = match qname_lc.as_str() {
+                    "version.bind." | "version.server." if !self.hide_version => {
+                        Some(self.version_string.as_str())
+                    }
+                    "id.server." | "hostname.bind." if !self.hide_identity => {
+                        Some(self.identity_string.as_str())
+                    }
+                    _ => None,
+                };
+                if let Some(txt) = txt {
+                    self.stats.inc_local_hits();
+                    let record = crate::dns::wire::Record {
+                        name: q.name.clone(),
+                        rtype: rtype::TXT,
+                        rclass: class::CH,
+                        ttl: 0,
+                        rdata: crate::dns::wire::Rdata::Txt(vec![txt.as_bytes().to_vec()]),
+                    };
+                    return Some(self.wire_answer(&msg, &[record], rcode::NOERROR));
+                }
+            }
+            self.stats.inc_refused();
+            return Some(self.wire_error(&msg, rcode::REFUSED));
+        }
+        // Any other non-IN class (Hesiod, etc.) → NOTIMP (RFC 5358).
         if q.qclass != class::IN {
             self.stats.inc_refused();
             return Some(self.wire_error(&msg, rcode::NOTIMP));
-        }
-        // Identity-probe names regardless of class → REFUSED (defence in depth, SEC-03).
-        let qname_pres = q.name.to_ascii();
-        let qname_lc = qname_pres.to_ascii_lowercase();
-        if matches!(
-            qname_lc.as_str(),
-            "version.bind." | "hostname.bind." | "id.server." | "authors.bind."
-        ) {
-            self.stats.inc_refused();
-            return Some(self.wire_error(&msg, rcode::REFUSED));
         }
         // ANY → REFUSED (RFC 8482 amplification mitigation).
         if qtype == rtype::ANY {
@@ -627,6 +680,16 @@ impl RunboundHandler {
         // block-https-record: suppress HTTPS type-65 (QUIC/HTTP3 guard) → empty NOERROR.
         if self.block_https_record && qtype == rtype::HTTPS {
             return Some(self.wire_answer(&msg, &[], rcode::NOERROR));
+        }
+        // #204: DDR (RFC 9462) — answer _dns.resolver.arpa SVCB wire-native.
+        if qtype == rtype::SVCB && qname_lc == "_dns.resolver.arpa." {
+            if let Some(ddr) = &self.ddr {
+                let answer = ddr.svcb_records();
+                if !answer.is_empty() {
+                    self.stats.inc_local_hits();
+                    return Some(self.wire_answer(&msg, &answer, rcode::NOERROR));
+                }
+            }
         }
 
         // #5: per-domain counter (feeds GET /api/stats/top-domains). The XDP fast
@@ -1227,6 +1290,55 @@ struct DdrInfo {
     dot_port: u16,
     doh_port: u16,
     doq_port: u16,
+}
+
+impl DdrInfo {
+    /// Build the SVCB RRset advertised at `_dns.resolver.arpa` (RFC 9462 DDR),
+    /// wire-native (no hickory — see #204 / the de-hickory audit finding this
+    /// replaces). TTL 7200s (2h): long enough for clients to cache the upgrade.
+    fn svcb_records(&self) -> Vec<crate::dns::wire::Record> {
+        use crate::dns::wire::{consts::rtype, Name, Rdata, Record};
+        const TTL: u32 = 7200;
+        const KEY_ALPN: u16 = 1;
+        const KEY_PORT: u16 = 3;
+        const KEY_DOHPATH: u16 = 7; // RFC 9461
+        let Ok(owner) = Name::from_ascii("_dns.resolver.arpa.") else {
+            return Vec::new();
+        };
+        let Ok(target) = Name::from_ascii(&format!("{}.", self.hostname.trim_end_matches('.')))
+        else {
+            return Vec::new();
+        };
+        let alpn = |id: &str| {
+            let mut v = Vec::with_capacity(1 + id.len());
+            v.push(id.len() as u8);
+            v.extend_from_slice(id.as_bytes());
+            (KEY_ALPN, v)
+        };
+        let port = |p: u16| (KEY_PORT, p.to_be_bytes().to_vec());
+        let record = |priority: u16, params: Vec<(u16, Vec<u8>)>| Record {
+            name: owner.clone(),
+            rtype: rtype::SVCB,
+            rclass: crate::dns::wire::consts::class::IN,
+            ttl: TTL,
+            rdata: Rdata::Svcb { priority, target: target.clone(), params },
+        };
+        vec![
+            // DoT (RFC 7858) — priority 1
+            record(1, vec![alpn("dot"), port(self.dot_port)]),
+            // DoH (RFC 8484) — priority 2, with dohpath (SvcParamKey 7, RFC 9461)
+            record(
+                2,
+                vec![
+                    alpn("h2"),
+                    port(self.doh_port),
+                    (KEY_DOHPATH, b"/dns-query{?dns}".to_vec()),
+                ],
+            ),
+            // DoQ (RFC 9250) — priority 3
+            record(3, vec![alpn("doq"), port(self.doq_port)]),
+        ]
+    }
 }
 
 /// RFC 7873 server cookie: HMAC-SHA256(secret, client_cookie || client_ip)[..8].
@@ -2566,6 +2678,10 @@ pub async fn run_dns_server(
         } else {
             None
         },
+        cfg.hide_version,
+        cfg.hide_identity,
+        cfg.identity.clone().unwrap_or_else(system_hostname),
+        cfg.version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
     );
     // Step 3b: wrap handler in Arc for sharing between the TLS supervisor and the fallback reader.
     let handler_arc = std::sync::Arc::new(handler);

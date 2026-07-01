@@ -301,6 +301,23 @@ pub struct UnboundConfig {
     /// recovers.  Default: true.
     pub resolv_fallback: bool,
 
+    // ── CHAOS-class identity queries (RFC 4892 id.server. + BIND-convention
+    // version.bind./hostname.bind., wire-native, secure-by-default) ─────────────
+    /// Hide the server version from `version.bind.`/`version.server.` CH TXT queries.
+    /// Default: true (refuse). Set to `no` to answer with `version` (or the real
+    /// build version if unset).
+    pub hide_version: bool,
+    /// Hide the server identity from `id.server.`/`hostname.bind.` CH TXT queries.
+    /// Default: true (refuse). Set to `no` to answer with `identity` (or the real
+    /// system hostname if unset).
+    pub hide_identity: bool,
+    /// Custom string reported for `id.server.`/`hostname.bind.` when `hide-identity: no`.
+    /// Falls back to the system hostname if unset.
+    pub identity: Option<String>,
+    /// Custom string reported for `version.bind.`/`version.server.` when
+    /// `hide-version: no`. Falls back to the build version (`CARGO_PKG_VERSION`) if unset.
+    pub version: Option<String>,
+
     // ── Serve-stale RFC 8767 (#108) ──────────────────────────────────────────────
     /// Return stale (expired) cached data when all upstreams return SERVFAIL.
     /// Default: true. Set to `no` to disable.
@@ -512,6 +529,10 @@ impl UnboundConfig {
             prefetch_threshold: 5,
             cache_flush_cooldown: 60,
             resolv_fallback: true,
+            hide_version: true,
+            hide_identity: true,
+            identity: None,
+            version: None,
             rate_limit_prefix_v4: 24,
             rate_limit_prefix_v6: 48,
             abuse_tarpit_delay_ms: 2000,
@@ -1137,6 +1158,10 @@ fn parse_server_directive(
         "ui-tls-san" => {
             cfg.ui_tls_san.push(val.trim_matches('"').to_string());
         }
+        "hide-version" => cfg.hide_version = val.trim_matches('"') != "no",
+        "hide-identity" => cfg.hide_identity = val.trim_matches('"') != "no",
+        "identity" => cfg.identity = Some(val.trim_matches('"').to_string()),
+        "version" => cfg.version = Some(val.trim_matches('"').to_string()),
         // Accepted but unused — common Unbound tuning directives
         "num-threads"
         | "msg-cache-size"
@@ -1153,10 +1178,6 @@ fn parse_server_directive(
         | "use-syslog"
         | "log-queries"
         | "log-replies"
-        | "hide-identity"
-        | "hide-version"
-        | "identity"
-        | "version"
         | "username"
         | "chroot"
         | "directory"
