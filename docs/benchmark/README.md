@@ -30,7 +30,7 @@ process so they are comparable and reproducible.
      before any measurement is recorded.
   2. **Ramp phase** — progressively increase offered load to find the **exact
      saturation point** (the QPS beyond which loss or latency degrades).
-- **Dataset:** `docs/benchmark/corpus/top-10000-domains.txt` — 10 000 real, varied DNS
+- **Dataset:** `docs/benchmark/corpus/top-100000-resolving.txt` — 100 000 real, varied DNS
   names, read in **random** order (not round-robin, to avoid an unrealistic cache
   pattern).
 
