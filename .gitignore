@@ -34,7 +34,11 @@ RAPPORT_TEST_COMPLET.txt
 /tmp/dnsperf-*.out
 /tmp/runbound-*.conf
 /tmp/queries-*.txt
-runbound-v*
+# Loose local binaries/build artifacts dropped at repo root only — anchored so this
+# never shadows docs/benchmark/RUNBOUND-vX.Y.Z-*.md report files (collides on
+# case-insensitive filesystems: macOS/Windows treat "runbound-v*" and "RUNBOUND-v*"
+# as the same pattern).
+/runbound-v*
 
 # Claude Code context — contains local infra credentials, never commit
 CLAUDE.md
