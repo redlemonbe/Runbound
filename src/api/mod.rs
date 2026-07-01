@@ -1455,8 +1455,9 @@ fn resync_xdp_cache(s: &AppState, new_zones: &LocalZoneSet) {
 /// Pure core of `resync_xdp_cache`, decoupled from the global cache handle and
 /// `AppState` so it can be unit-tested. Evicts every changed name (old union new
 /// zone keys, which also covers deletions) by wire-qname (all qtypes), then
-/// re-preloads the current local-data.
-fn resync_xdp_cache_inner(
+/// re-preloads the current local-data. `pub(crate)`: also called directly from
+/// the SIGHUP handler in `main.rs`, which has no `AppState`.
+pub(crate) fn resync_xdp_cache_inner(
     cache: &crate::dns::cache_snapshot::MutableCacheMap,
     old_zones: &LocalZoneSet,
     new_zones: &LocalZoneSet,

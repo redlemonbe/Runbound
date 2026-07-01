@@ -7,7 +7,8 @@
 //   2. Rate limiting (per source IP token bucket)
 //   3. Check local zones (local-data, blacklist, feeds) in memory → instant
 //   4. Otherwise → forward upstream via the in-house wire forward pool
-//      (src/dns/forward.rs); full recursion is behind the optional `recursor` feature.
+//      (src/dns/forward.rs); full recursion (`resolution: full-recursion`, in-house,
+//      always compiled in) is an opt-in runtime toggle, not a Cargo feature.
 //
 // UDP + TCP on the configured port (default 53).
 
@@ -315,24 +316,9 @@ impl RunboundHandler {
 }
 
 impl RunboundHandler {
-    /// De-hickory fast path: resolve a query entirely on the own wire codec when
-    /// it needs none of the hickory-typed special handling. Returns
-    /// `Some(response_bytes)` when fully handled, or `None` for the routed-out
-    /// cases (with the `recursor` feature, the recursor handler takes them;
-    /// default builds drop on `None`).
-    ///
-    /// Routed to the fallback (before any side-effectful gate, so gates run once):
-    /// non-QUERY opcodes (UPDATE), AXFR/IXFR/ANY, non-IN class (CHAOS), HTTPS-block,
-    /// DNS cookies, split-horizon, signed local zones, recursor mode, alert tracker,
-    /// RRL-with-slip, and any ACL result other than Allow. The dominant forward and
-    /// plain local-zone paths are served here with zero hickory.
-    ///
-    /// Observability note: the per-query web-UI log buffer is hickory-name typed and
-    /// is not written on this fast path; stats counters are. Full parity returns when
-    /// the handler's logging is wire-native.
     /// Wire-native query log — feeds the webui Logs panel / `GET /api/logs`.
     /// Latency stats are recorded inline by `serve_wire`; this only emits the
-    /// structured log entry (mirrors the recursor `record_query`, no hickory types).
+    /// structured log entry.
     fn log_query_wire(&self, client: IpAddr, name: &str, qtype: u16, action: LogAction, start: Instant) {
         let is_notable = matches!(
             action,
@@ -2121,7 +2107,9 @@ async fn spawn_tls_service(
             Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
         }
 
-        // DNS-over-QUIC: not supported in this build (requires --features doq).
+        // DNS-over-QUIC: not implemented. No QUIC dependency exists in this crate at
+        // all (not gated by any Cargo feature — there isn't one). `doq-port`/
+        // `quic-port` still parse for forward-compat but no listener is ever bound.
         let _ = doq_port; // suppress unused warning
     }
 

@@ -217,6 +217,12 @@ server:
     rate-limit:    200
     cache-max-ttl: 3600
 
+    # Least privilege by default (PENT-3): the shipped systemd unit only grants
+    # CAP_NET_BIND_SERVICE. XDP needs CAP_NET_RAW/CAP_NET_ADMIN/CAP_BPF/CAP_PERFMON
+    # too -- set xdp: yes AND uncomment the wider AmbientCapabilities line in
+    # runbound.service before enabling it.
+    xdp: no
+
     private-address: 10.0.0.0/8
     private-address: 172.16.0.0/12
     private-address: 192.168.0.0/16

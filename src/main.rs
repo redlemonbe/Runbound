@@ -994,6 +994,13 @@ async fn build_and_launch(
                 match config::load(&cfg_path_hup) {
                     Ok(new_cfg) => {
                         let new_zones = build_zone_set(&new_cfg);
+                        // Evict/re-preload the XDP cache BEFORE swapping zones_hup, same
+                        // ordering as the API reload path — otherwise a stale forwarded
+                        // answer cached before a blacklist/feed/local-zone change keeps
+                        // shadowing it from the XDP fast path until TTL expiry.
+                        if let Some(cache) = dns::cache_snapshot::XDP_CACHE_FOR_API.get() {
+                            api::resync_xdp_cache_inner(cache, &zones_hup.load_full(), &new_zones);
+                        }
                         zones_hup.store(Arc::new(new_zones));
                         info!(
                             local_zones = new_cfg.local_zones.len(),

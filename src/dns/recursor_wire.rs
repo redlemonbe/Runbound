@@ -576,7 +576,7 @@ mod tests {
     }
 
     // Live test (needs outbound UDP/53 to the internet). Run with:
-    //   cargo test --features recursor -- --ignored recursor_wire
+    //   cargo test -- --ignored recursor_wire
     #[tokio::test]
     #[ignore]
     async fn live_resolve_a() {

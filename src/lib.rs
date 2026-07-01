@@ -38,10 +38,11 @@ pub mod integrity;
 #[cfg(feature = "fuzz")]
 pub mod logbuffer;
 
-// Runbound's own zero-copy wire parser — the actual default inbound parse path
-// since v0.22 (hickory is only used on the optional `recursor` slow path). It is
-// self-contained: its only cross-module references live in the `oracle` submodule,
-// which is #[cfg(test)] and therefore excluded from the fuzz build.
+// Runbound's own zero-copy wire parser — the only inbound parse path since v0.23
+// (hickory is a [dev-dependencies]-only oracle for differential tests, never a
+// runtime dependency). It is self-contained: its only cross-module references
+// live in the `oracle` submodule, which is #[cfg(test)] and therefore excluded
+// from the fuzz build.
 #[cfg(feature = "fuzz")]
 pub mod dns {
     pub mod wire;

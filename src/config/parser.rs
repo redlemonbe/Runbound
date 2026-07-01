@@ -6,7 +6,8 @@ use tracing::warn;
 /// Resolution backend for queries not answered locally / from cache.
 /// `Forward` (default) = send to the configured upstreams (`forward-zone`) — current behaviour.
 /// `FullRecursion` = iterative resolution from the root servers (sovereign, no third-party
-/// forwarder), backed by the in-tree stable recursor (hickory-resolver `recursor` feature); opt-in.
+/// forwarder), backed by the in-house recursor (`dns::recursor_wire`, always compiled in,
+/// no Cargo feature gates it); opt-in via this runtime config toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResolutionMode {
     #[default]

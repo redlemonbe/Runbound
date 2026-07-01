@@ -536,7 +536,7 @@ mod tests {
     // Live: fetch the root DNSKEY RRset (DO=1) from a root server and verify the
     // KSK self-signature — a real RSA/SHA-256 (alg 8) signature over real data,
     // i.e. the actual DNSSEC trust anchor. Run with:
-    //   cargo test --features recursor -- --ignored verify_root_ksk_rsa
+    //   cargo test -- --ignored verify_root_ksk_rsa
     #[tokio::test]
     #[ignore]
     async fn verify_root_ksk_rsa() {
