@@ -7,6 +7,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.23.12] - 2026-07-01
+
+### Fixed
+- **CHAOS TXT answer could ship corrupted wire output for a long `identity:`/
+  `version:` config value.** 0.23.11 built the TXT character-string with
+  `debug_assert!(s.len() <= 255)` — an assert that compiles out of a release
+  build, so an operator-configured string over 255 bytes would silently wrap
+  the length byte (`300 as u8` → `44`) rather than fail, producing a
+  malformed response. Found immediately after 0.23.11 shipped, while
+  re-examining test coverage in response to a direct question about what
+  "tested" actually meant — the two live-validation passes both used short
+  (15-20 byte) test strings, so this never triggered. Fixed by splitting into
+  as many ≤255-byte character-strings as needed (RFC 1035 §3.3.14 allows a
+  TXT record to carry more than one), same as the existing `Rdata::Txt`
+  multi-string support already used elsewhere. Added a live test with a
+  600-byte identity string proving the fix (was previously untested at any
+  length beyond the two short strings used for 0.23.11).
+
 ## [0.23.11] - 2026-07-01
 
 ### Added

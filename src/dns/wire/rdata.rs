@@ -458,6 +458,33 @@ mod tests {
     }
 
     #[test]
+    fn txt_chunked_over_255_bytes_roundtrips() {
+        // Regression test for the 0.23.11 CHAOS TXT bug: a single character-string
+        // is capped at 255 octets (RFC 1035 §3.3.14). The fix splits any longer
+        // string into chunks(255) before building Rdata::Txt — mirror that here
+        // with a 600-byte string (as used by src/dns/server.rs for CHAOS answers)
+        // and prove every chunk is ≤255 bytes and the concatenation round-trips
+        // byte-for-byte through emit/parse.
+        let long: Vec<u8> = (0..600u32).map(|i| (i % 26) as u8 + b'a').collect();
+        let strings: Vec<Vec<u8>> = long.chunks(255).map(<[u8]>::to_vec).collect();
+        assert_eq!(strings.len(), 3); // 255 + 255 + 90
+        assert!(strings.iter().all(|s| s.len() <= 255));
+
+        let rd = Rdata::Txt(strings.clone());
+        let mut e = Encoder::new();
+        rd.emit(&mut e);
+        let buf = e.into_vec();
+        let mut d = Decoder::new(&buf);
+        let got = Rdata::parse(&mut d, rtype::TXT, buf.len() as u16).unwrap();
+        assert_eq!(got, rd);
+        if let Rdata::Txt(got_strings) = got {
+            assert_eq!(got_strings.concat(), long);
+        } else {
+            panic!("expected Rdata::Txt");
+        }
+    }
+
+    #[test]
     fn svcb() {
         let target = Name::from_ascii("dns.example.com.").unwrap();
         roundtrip(Rdata::Svcb {

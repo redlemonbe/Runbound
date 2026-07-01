@@ -660,7 +660,14 @@ impl RunboundHandler {
                         rtype: rtype::TXT,
                         rclass: class::CH,
                         ttl: 0,
-                        rdata: crate::dns::wire::Rdata::Txt(vec![txt.as_bytes().to_vec()]),
+                        // A TXT character-string is capped at 255 octets (RFC 1035 §3.3.14);
+                        // an operator-configured identity/version string can exceed that, so
+                        // split into as many character-strings as needed rather than silently
+                        // truncating (or wrapping the length byte — `debug_assert` alone would
+                        // compile out of a release build and ship a corrupt wire response).
+                        rdata: crate::dns::wire::Rdata::Txt(
+                            txt.as_bytes().chunks(255).map(<[u8]>::to_vec).collect(),
+                        ),
                     };
                     return Some(self.wire_answer(&msg, &[record], rcode::NOERROR));
                 }
