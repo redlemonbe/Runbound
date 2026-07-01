@@ -1,6 +1,6 @@
 # 09 — Design decisions and rationale
 
-> **Status: current (v0.22.4)** — condensed decision table.
+> **Status: current (v0.23.8)** — condensed decision table.
 
 | Decision | Why | Trade-off |
 |----------|-----|-----------|

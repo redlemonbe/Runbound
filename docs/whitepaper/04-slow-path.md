@@ -1,10 +1,12 @@
 # 04 — The slow path (wire-native `serve_wire`)
 
-> **Status: current (v0.22.4).** As of v0.22 the default build is **hickory-free**: the slow path
-> is served entirely by the in-house wire codec (`serve_wire`, `src/dns/server.rs`); the
-> hickory-dns request handler is removed from the default binary and only re-introduced behind the
-> optional `recursor` feature (the sovereign iterative resolver). The pipeline below is unchanged
-> in behaviour — only its implementation moved from hickory to the wire codec.
+> **Status: current (v0.23.8).** As of v0.23 hickory is fully removed from the runtime:
+> the slow path is served entirely by the in-house wire codec (`serve_wire`,
+> `src/dns/server.rs`), and recursion + DNSSEC validation are in-house too
+> (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`), always on by default — there is
+> no `recursor` Cargo feature anymore. `hickory-proto` remains only as a
+> `[dev-dependencies]` entry for the differential oracle tests. The pipeline below is
+> unchanged in behaviour — only its implementation moved from hickory to the wire codec.
 
 In `xdp: no` mode the receive side is the **kernel fast loop** (§4.0): it serves cache hits through
 the same wire responder the AF_XDP fast path uses, and genuine misses (forward, CNAME/MX, TSIG,

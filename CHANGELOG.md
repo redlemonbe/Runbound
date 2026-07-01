@@ -7,6 +7,114 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.23.8] - 2026-07-01
+
+### Added
+- **Hickory fully removed from the runtime.** Recursion (`src/dns/recursor_wire.rs`)
+  and DNSSEC validation (RRSIG verification, chain-of-trust, NSEC/NSEC3 denial,
+  Secure/Insecure/Bogus verdicts) are now entirely in-house, always on by default —
+  there is no `recursor` Cargo feature anymore. `hickory-proto` remains only as a
+  `[dev-dependencies]` entry, used exclusively by the differential oracle tests that
+  prove the in-house wire codec byte-identical to it (`cargo tree -e normal` is
+  hickory-free). This removes the last untrusted-input message-parsing dependency
+  from the entire network-facing surface.
+- **#8: per-subnet/VLAN filtering policies.** `POST /api/policies` blocks extra
+  domains (and their subdomains) for clients in one subnet/VLAN only, additive to the
+  global blacklist/feeds filter — never less permissive, only ever more. Applied
+  live, no restart; the fast path is untouched. Merged into the WebUI **Subnets** tab
+  alongside split-horizon. See [api.md](docs/api.md#subnet-policies-8).
+
+### Fixed
+- **RFC 4035 §3.2.2**: honour the client's CD (Checking Disabled) bit — a Bogus
+  answer is now served unvalidated (no AD) instead of always SERVFAIL.
+- **RFC 1035 §4.1.1**: oversized UDP responses now correctly set TC on every serving
+  path — the cache-hit fast path, the forward-mode path (retries over TCP on a
+  truncated upstream UDP answer instead of silently dropping the RRset), and the
+  opt-in plain-server — previously only the async slow path truncated correctly.
+- **RFC 2308 §3/§5**: negative answers (NXDOMAIN/NODATA) now carry the zone SOA in
+  the authority section, and the negative TTL is `min(SOA MINIMUM, SOA record TTL)`
+  instead of MINIMUM alone (#210 items 2–3).
+- **DNSSEC — reverse-DNS (`in-addr.arpa`) lookups wrongly went Bogus/SERVFAIL.**
+  Reverse zones routinely skip delegation levels (RFC 2317-style — e.g. Cloudflare's
+  `1.1.1.0/24` is delegated straight from `1.in-addr.arpa.`, with no separate cut at
+  `1.1.in-addr.arpa.`). The chain-of-trust walker assumed every label boundary was a
+  real, separately-delegated zone and stopped at the first one that wasn't, before
+  ever reaching the real, DS-checkable cut. Fixed by confirming a genuine NS
+  delegation exists before treating an empty DS answer as a verdict.
+- **DNSSEC — resolver amplification (HIGH).** Full-recursion mode had no wall-clock
+  bound on a single client query's fan-out across the DNSSEC chain + CNAME hops,
+  holding an inflight permit for an attacker-controlled duration. Now wrapped in a
+  10 s timeout → SERVFAIL past the deadline, releasing the permit.
+- **DNSSEC — zone-binding (CRITICAL).** A forged RRSIG/SOA pointing at an unrelated,
+  proven-insecure zone could downgrade a signed name to Insecure and serve forged
+  data without SERVFAIL. The validated zone is now bound to the queried name.
+  Related: every CNAME hop is now validated under its own zone (no
+  validate-one/serve-another), and the SOA in a negative answer is RRSIG-validated
+  and bailiwick-checked before being served with AD=1.
+- **DNSSEC — wildcard replay.** The canonical wildcard owner is reconstructed from
+  the wire bytes (RFC 4035 §5.3.2), and a wildcard-signed answer now requires a
+  validated no-exact-match NSEC/NSEC3 proof before being served Secure — defeats
+  replaying a wildcard signature onto an existing name.
+- **DNSSEC — NSEC3 CPU-exhaustion DoS.** Iteration count is capped per RFC 9276;
+  previously a 65535-iteration NSEC3 chain could be amplified across the ancestor
+  chain.
+- **DNSSEC — SSRF guard bypass.** IPv4-mapped IPv6 / NAT64 addresses are now
+  re-checked against the embedded IPv4 in the public-IP guard.
+- **A CD-served Bogus answer no longer poisons the cache** for subsequent non-CD
+  clients.
+- **`POST /api/cache/flush` didn't clear the XDP fast-path cache** — it rebuilt only
+  the async resolver's own cache, leaving every previously-resolved name served stale
+  from the untouched fast-path snapshot (confirmed live: `cache_entries` stayed
+  unchanged after a reported-successful flush). Now evicts both.
+- **A blacklist/feed block was counted as a `local_hits` hit instead of
+  `blocked`/`nxdomain`** in `/api/stats` and `/api/metrics` — fixed on both the async
+  slow path and the synchronous XDP-adjacent fast path (which had no stats reference
+  at all before this fix, so this whole category was silently uncounted there).
+- Cache-hit counters (`cache_hits`, per-worker XDP counters) weren't incremented on
+  the kernel-fast-loop datapath; `/api/cache/stats` didn't match `/api/stats`.
+- **WebUI Users tab was completely broken**: it called a non-existent `apiFetch`
+  function (`ReferenceError` on every load, rendering the raw error instead of the
+  user list) and, once that was fixed, misread `GET /api/users`'s `{"users": [...]}`
+  response shape as a bare array. Full create/list/rotate-key/delete cycle now works,
+  verified via real browser clicks.
+- **`GET /api/help`** (the machine-readable endpoint list) was stale by 33 of 82
+  routes (multi-user, alerts, protection/banned, TLS management, split-horizon,
+  resolution toggle, DNSSEC DS, events SSE, audit, webhooks, backup export/import,
+  #8 policies) and had one wrong description (rotate-key reads the JSON body, not an
+  env var).
+- **`runbound_nic_rx_ring` (OpenMetrics)** stuck at 0 on drivers that reject the
+  ring-resize ioctl (e.g. virtio-net), even though the current ring size was known —
+  the successful GET's value was discarded whenever the follow-up SET failed.
+- `/api/resolution`'s `recursor_active` now reflects the actual resolution mode
+  (was always a fixed value).
+- #8: policy name/domain input validation (length, control characters, DNS name
+  syntax) matching the existing blacklist/split-horizon handlers; `MAX_POLICIES`
+  (256) and `MAX_POLICY_DOMAINS` (4096) caps; a corrupt `subnet-policies.json` now
+  logs a warning instead of silently resetting to empty.
+
+### Security
+- **Dropped `CAP_BPF`/`CAP_PERFMON`** from the process once the one-time XDP
+  load/attach completes. The kernel only checks these capabilities at BPF map/program
+  *creation* — every runtime map operation that follows (ban, blacklist reload) uses
+  an fd the process already holds and needs no capability re-check — so holding them
+  for the process's full lifetime was unneeded attack surface: an RCE (or any child
+  process it spawns) could otherwise load an arbitrary eBPF program. Setup-time only,
+  zero hot-path cost.
+- **Fixed a cross-tenant IDOR**: `GET /api/dns` and `GET /api/blacklist` returned
+  every tenant's entries to any authenticated non-admin user instead of filtering by
+  ownership (the single-entry `GET /api/dns/:id` already enforced this correctly —
+  only the list endpoints leaked).
+- **Fixed stored XSS** via `zone_prefixes` (rendered unescaped in the Users tab) and
+  **reflected XSS** via the block-page's `Host` header.
+- **Authorization consistency**: an `admin: false, role: Admin` account was
+  admin for role-based write checks but not for explicit `!caller.admin` gates —
+  now derived consistently in one place.
+- Tightened file permissions (`users.json`, `webui-auth.conf` → `0600`) and closed a
+  path-traversal defence-in-depth gap in DNSSEC key storage (a zone name could carry
+  a `/` and escape `<config_dir>/dnssec/`).
+- A DNS name is never emitted with a constant transaction ID if the OS CSPRNG
+  (`getrandom`) fails.
+
 ## [0.22.4] - 2026-06-23
 
 ### Fixed

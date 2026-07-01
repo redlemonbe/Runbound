@@ -1,17 +1,19 @@
 # Security Architecture
 
 This document covers the security model, defensive layers, and all audit findings
-fixed across Runbound releases through v0.22.4 (see docs/security-audit/SECURITY-AUDIT.md for the per-cycle history, and docs/security-audit/CYCLE-O-dehickory-2026-06-22.md plus docs/security-audit/pentest-aggressive-2026-06-22.md for the v0.22 de-hickory cycle and aggressive pentest).
+fixed across Runbound releases through v0.23.8 (see docs/security-audit/SECURITY-AUDIT.md for the per-cycle history, and docs/security-audit/CYCLE-O-dehickory-2026-06-22.md plus docs/security-audit/pentest-aggressive-2026-06-22.md for the v0.22 de-hickory cycle and aggressive pentest).
 
-> **v0.22 attack-surface note.** The default build is now **hickory-free on the
-> network-facing serving path**: DNS is served by the in-house wire codec
-> (`src/dns/wire/`) via `serve_wire` in `src/dns/server.rs`. The hickory-dns request
-> handler (`hickory-server`) is no longer in the default binary — it, and the
-> sovereign full-recursion resolver (`hickory-resolver`), live behind the optional
-> `recursor` Cargo feature. `hickory-proto` remains a default dependency (it backs
-> part of the in-memory data model and the XDP response builders), but **no hickory
-> request handler runs on the default path**, removing a large untrusted-input
-> message-parsing dependency from the default network-facing surface.
+> **v0.23 update — hickory fully removed from the runtime.** DNS is served
+> end-to-end by the in-house wire codec (`src/dns/wire/`) via `serve_wire` in
+> `src/dns/server.rs`; recursion (`src/dns/recursor_wire.rs`) and DNSSEC
+> validation (`src/dns/dnssec_*.rs`) are in-house too, always on by default —
+> there is no `recursor` Cargo feature anymore, and no hickory dependency of any
+> kind in the default runtime build. `hickory-proto` remains **only** as a
+> `[dev-dependencies]` entry, used exclusively by the differential oracle tests
+> that prove the in-house wire codec byte-identical to it
+> (`cargo tree -e normal` is hickory-free). This removes the last
+> untrusted-input message-parsing dependency from the entire network-facing
+> surface, not just the serving path.
 
 ---
 

@@ -1,6 +1,10 @@
 # 08 — Performance
 
-> **Status: current as of v0.22.4 (benchmark figures from 2026-06-15)** — governed by `docs/benchmark/README.md`
+> **Status: current as of v0.23.8 (benchmark figures from 2026-06-15 — unchanged: the
+> v0.22.4→v0.23.8 changes are slow-path/serving-core fixes, a single gated length
+> check on the cache-hit path (only taken past 512 bytes), and setup-time-only
+> hardening — none touch the zero-syscall SIMD hot path or add cost to the common
+> case)** — governed by `docs/benchmark/README.md`
 > (the methodology) and the per-run reports under `docs/benchmark/`. The suite was re-run on
 > a new rig (Threadripper PRO 5995WX receiver; dual Xeon E5-2690 v2 generator; direct 10 GbE
 > DACs Intel X710/i40e + X510/ixgbe; dnsmark v2.3.0; warm cache; NIC `tx_packets` truth); the

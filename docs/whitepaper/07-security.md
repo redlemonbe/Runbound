@@ -1,6 +1,6 @@
 # 07 — Security
 
-> **Status: current (v0.22.4)** — condensed, with code anchors; open items are listed
+> **Status: current (v0.23.8)** — condensed, with code anchors; open items are listed
 > at the end. Cross-references `SECURITY.md`, `THREAT_MODEL.md`,
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 

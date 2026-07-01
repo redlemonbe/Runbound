@@ -28,7 +28,7 @@ At the end you'll see your API key and the service URL:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Version:  runbound 0.22.4
+ Version:  runbound 0.23.8
  API key:  a1b2c3d4...   ← save this
  Config:   /etc/runbound/runbound.conf
  Logs:     journalctl -u runbound -f
@@ -73,6 +73,17 @@ sudo cp /etc/unbound/unbound.conf /etc/runbound/runbound.conf
 
 ---
 
+## New in v0.23.0
+
+**Per-subnet / per-VLAN filtering policies (#8)** — `POST /api/policies` blocks extra domains
+(and their subdomains) for clients in one subnet/VLAN only, additive to the global
+blacklist/feeds filter. Applied live, no restart. Merged into the WebUI **Subnets** tab
+alongside split-horizon. See [api.md](api.md#subnet-policies-8).
+
+**Hickory fully removed from the runtime** — recursion and DNSSEC validation are now
+entirely in-house (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`), always on by
+default; `hickory-proto` remains only as a dev-dependency for differential oracle tests.
+
 ## New in v0.20.0
 
 Three opt-in capabilities (default-off, toggleable live via the API/WebUI):
@@ -101,7 +112,7 @@ dig @127.0.0.1 google.com
 # Verify the API is reachable:
 curl -s http://localhost:8080/api/system \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
-# → {"version":"0.22.4","uptime_secs":3,...}
+# → {"version":"0.23.8","uptime_secs":3,...}
 ```
 
 ---
