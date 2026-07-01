@@ -3297,6 +3297,19 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
         Ok(_warmed) => {
             s.stats.reset_cache();
             s.cache_evictions.store(0, Ordering::Relaxed);
+            // rebuild_and_swap only rebuilds the async resolver's own cache (the
+            // slow serve_wire path). On an XDP-active host almost every cache hit
+            // is served by the fast path's independent snapshot (worker.rs
+            // answer_from_cache, refreshed from XDP_CACHE_FOR_API by publish_loop)
+            // — without this, "flush" reported success while every previously
+            // resolved name kept answering from the untouched fast-path cache.
+            // Evict-all + bump the generation counter is the same pattern already
+            // used by resync_xdp_cache_inner/apply_split_horizon_live; publish_loop
+            // picks it up within one 10ms tick.
+            if let Some(cache) = crate::dns::cache_snapshot::XDP_CACHE_FOR_API.get() {
+                cache.clear();
+                crate::dns::cache_snapshot::CACHE_WRITE_GEN.fetch_add(1, Ordering::Relaxed);
+            }
             info!(flushed = before, "DNS cache flushed via API");
             s.audit.send(AuditEvent::ConfigReload);
             // Fire config-reloaded webhook (#11)
