@@ -420,8 +420,9 @@ const FLAGS_REFUSED: u16 = 0x8585;
 /// Build an NXDOMAIN response directly into `out`.
 ///
 /// Wire: Header(12, RCODE=3, ancount=0) + echo Question.
-/// No SOA in authority (RFC-minimal; negative caching not supported in fast path —
-/// acceptable, follow-up #156). dig reports `status: NXDOMAIN` correctly.
+/// No SOA in authority (RFC-minimal; no negative-answer cache exists on the fast
+/// path, or anywhere else in the codebase — see #210). dig reports `status:
+/// NXDOMAIN` correctly regardless.
 ///
 /// Returns `Some(len)` on success, `None` if `out` is too small.
 /// Build an A/AAAA answer from pre-serialised `WireRdata` entries (from `WireRecordIndex`).

@@ -43,8 +43,10 @@ pub enum ResolveResult {
     /// NOERROR with one or more answer records
     Answer { records: Vec<wire::Record> },
     /// Authoritative negative: NXDOMAIN or NOERROR+empty ANSWER (NODATA).
-    /// `neg_ttl` drives the recursor's negative cache; the wire slow path does not
-    /// negative-cache yet (the XDP fast path has its own), so it is unread by default.
+    /// `neg_ttl` is RFC 2308 §5 min(SOA MINIMUM, SOA record TTL), or 0 if no SOA
+    /// was present (do-not-cache sentinel). No negative-answer cache exists yet
+    /// anywhere in the codebase (neither this slow path nor the XDP fast path —
+    /// see #210), so `neg_ttl` is computed but currently unread.
     NegativeAnswer {
         rcode: u16,
         #[allow(dead_code)]
