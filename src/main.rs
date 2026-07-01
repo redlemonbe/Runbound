@@ -35,6 +35,7 @@ mod anycast;
 mod blockpage;
 mod api;
 mod audit;
+mod caps_drop;
 mod config;
 mod cpu;
 mod dns;
@@ -429,6 +430,17 @@ async fn async_main(
             );
         }
     }
+
+    // Pentest hardening: CAP_BPF/CAP_PERFMON were only needed for the XDP
+    // load/attach + one-time BPF map init above (blacklist/CPUMAP/XSKMAP/ICMP
+    // config, all done by this point). Every later BPF map operation (ban,
+    // blacklist reload, domain-routing toggle) updates a map through an fd
+    // this process already holds and does not need the capability again — see
+    // caps_drop.rs. Unconditional and feature-independent: a no-op when the
+    // capabilities were never granted (xdp: no, or the `xdp` feature is not
+    // compiled in). Runs once, at boot, before the server starts answering
+    // queries — not on any query/packet path.
+    caps_drop::drop_bpf_load_time_capabilities();
     // ── #158: extract GovernorGuard BEFORE handle is moved into poll task ──────
     // XdpHandle is moved into a detached tokio::spawn below — its Drop is never
     // reached on SIGTERM (OS kills the process before unwind).  We extract the

@@ -126,6 +126,11 @@ socket2 = { version = "0.6", features = ["all"] }
 # Low-level OS syscalls used by AF_XDP implementation
 libc = "0.2"
 
+# Linux capability drop (pentest hardening, #caps_drop): relinquish CAP_BPF /
+# CAP_PERFMON once the one-time XDP load/attach is done, so an RCE can no
+# longer use them to load an arbitrary eBPF program. Pure-Rust, libc-only dep.
+caps = "0.5"
+
 # Lock-free atomic Arc swap — read path for LocalZoneSet with zero contention
 arc-swap = "1"
 
