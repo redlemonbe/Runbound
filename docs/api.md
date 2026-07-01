@@ -188,7 +188,6 @@ overhead (~1 µs RTT).
 - IPv6 queries for blocked domains fall through to the wire-native slow path (still blocked).
 - The map is updated atomically after every `POST /api/blacklist` and `DELETE /api/blacklist/:id`.
 - `GET /api/blacklist` includes `xdp_active: true` when the BPF map is loaded.
-- These hits are counted under `local_hits` in `GET /api/stats`, not `blocked` — see the note under **Counter semantics** below.
 
 ---
 
@@ -339,13 +338,12 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stat
 
 | Field | What it counts |
 |---|---|
-| `blocked` | Queries REFUSED by a **subnet policy** (`POST /api/policies`, #8) only. See note below — blacklist/feed REFUSE hits are **not** in this field. |
-| `nxdomain` | Queries answered **NXDOMAIN by the upstream/recursor** (genuine non-existence). Blacklist/feed `action: nxdomain` hits are **not** in this field — see note below. |
-| `refused` | Queries REFUSED for a protocol/policy reason: ACL deny, rate limiting, malformed TSIG, identity-probe names, `ANY` queries (RFC 8482), etc. Not related to the blacklist. |
+| `blocked` | Queries answered with **REFUSED** — blacklist / feeds / local-zone with `action: refuse`, or a subnet policy (#8) |
+| `nxdomain` | Queries answered with **NXDOMAIN** — blacklist / feeds with `action: nxdomain`, or upstream NXDOMAIN |
 | `forwarded` | Queries sent to an upstream resolver (network round-trip) |
-| `local_hits` | Queries answered from local zone data **or matched by the blacklist/feeds** — see note below |
+| `local_hits` | Queries answered from local zone data (config + `POST /dns`) without upstream |
 | `servfail` | Upstream returned SERVFAIL or DNSSEC validation failed |
-| `blocked_percent` | `blocked / total × 100` (f64, one decimal place) — see note: this reflects only #8 subnet-policy blocks, not the global blacklist |
+| `blocked_percent` | `blocked / total × 100` — REFUSED blocking rate (f64, one decimal place) |
 | `qps_1m` / `qps_5m` | Average queries/second over the last 1 and 5 minutes |
 | `qps_peak` | All-time highest queries in any single second |
 | `latency_p50/95/99_ms` | Latency percentiles from a fixed 10-bucket histogram (zero-alloc) |
@@ -355,19 +353,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stat
 | `dnssec.bogus` | Queries where DNSSEC validation failed — potential tampering or misconfiguration |
 | `dnssec.insecure` | Queries for zones with no DNSSEC signatures (unsigned delegations) |
 
-> **Blacklist/feed hits are counted under `local_hits`, not `blocked`/`nxdomain`.** Both
-> the global blacklist (`POST /api/blacklist`) and feed subscriptions answer through the
-> same local-zone serving path as `POST /api/dns` entries (`action: refuse` and
-> `action: nxdomain` alike), which increments `local_hits` regardless of the resulting
-> RCODE. Verified live: 3 REFUSE-action hits and 2 NXDOMAIN-action hits on a blacklisted
-> test domain moved `local_hits` by exactly that count and left `blocked`/`nxdomain`
-> unchanged. `blocked` is currently **only** incremented by the #8 per-subnet-policy
-> REFUSE path (`crate::subnet_policy::blocks`); there is no dedicated counter that
-> isolates "REFUSED because of the blacklist" from "REFUSED/NXDOMAIN because of a
-> `POST /api/dns` static entry" — both fall under `local_hits`. To see actual
-> blacklist/feed block volume, use `GET /api/logs?action=local` combined with the
-> per-feed `blocked_count` (`GET /api/feeds`) and the per-policy `blocked` counter
-> (`GET /api/policies`), rather than the `blocked`/`blocked_percent` stats fields.
+**Total blocked = `blocked` + `nxdomain`.** The split exists because `refuse` and `nxdomain` are distinct DNS responses. Use `blocked_percent` or sum both fields for an aggregate blocking rate.
 
 **DNSSEC counters** are always present in the response but are meaningful only when `dnssec-validation: yes` is configured.
 
@@ -494,9 +480,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 |---|---|
 | `forwarded` | Network round-trip to upstream (cache miss) |
 | `cached` | Served from the in-process DNS cache (< 2 ms) |
-| `local` | Answered from local zone data (config, `POST /dns`) **or a blacklist/feed match** (refuse or nxdomain action) |
-| `blocked` | REFUSED by a **subnet policy** only (`POST /api/policies`, #8) — not the global blacklist, see `local` above |
-| `nxdomain` | NXDOMAIN from the upstream/recursor (not a blacklist/feed nxdomain-action match, see `local` above) |
+| `local` | Answered from local zone data (config or `POST /dns`) |
+| `blocked` | Domain blocked by blacklist, feeds, or a subnet policy (#8) |
+| `nxdomain` | NXDOMAIN from upstream or local zone |
 | `refused` | REFUSED (ACL, rate limit, CHAOS class, etc.) |
 | `servfail` | SERVFAIL (resolver error or private-address block) |
 

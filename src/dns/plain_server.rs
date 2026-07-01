@@ -54,7 +54,7 @@ pub async fn handle_datagram(
     zones: &LocalZoneSet,
     upstream: &Upstream,
 ) -> Option<Vec<u8>> {
-    if let Some(local) = serve_datagram(query, zones) {
+    if let Some((local, _action)) = serve_datagram(query, zones) {
         return Some(local);
     }
     // Not locally authoritative — relay to the configured upstream.

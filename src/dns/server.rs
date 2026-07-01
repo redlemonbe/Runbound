@@ -388,6 +388,31 @@ impl RunboundHandler {
         )
     }
 
+    /// Attribute the right counter + query-log action for a local-zone match.
+    /// A blocked query stays blocked, not a "local hit": `Refuse`/`NxDomain`/
+    /// `BlockPage` come from the blacklist, feeds, or a local-zone `action:
+    /// refuse`/`action: nxdomain` entry. Only `Static`/`Redirect` is a genuine
+    /// local-zone answer (config `local-data` or `POST /api/dns`). Shared by
+    /// both `serve_datagram` call sites (split-horizon and global zones) so
+    /// the classification can't drift between them.
+    fn account_zone_action(&self, action: &crate::dns::local::ZoneAction) -> LogAction {
+        use crate::dns::local::ZoneAction;
+        match action {
+            ZoneAction::Refuse | ZoneAction::BlockPage => {
+                self.stats.inc_blocked();
+                LogAction::Blocked
+            }
+            ZoneAction::NxDomain => {
+                self.stats.inc_nxdomain();
+                LogAction::Nxdomain
+            }
+            ZoneAction::Static | ZoneAction::Redirect => {
+                self.stats.inc_local_hits();
+                LogAction::Local
+            }
+        }
+    }
+
     pub async fn serve_wire(&self, query: &[u8], peer: std::net::SocketAddr) -> Option<Vec<u8>> {
         use crate::dns::wire::consts::{class, opcode, rcode, rtype};
         use crate::dns::wire::Message as WMessage;
@@ -633,10 +658,10 @@ impl RunboundHandler {
                 .map(|(_, z)| std::sync::Arc::clone(z))
         };
         if let Some(sh_zones) = sh_match {
-            if let Some(resp) = crate::dns::wire_serve::serve_datagram(query, &sh_zones) {
-                self.stats.inc_local_hits();
+            if let Some((resp, action)) = crate::dns::wire_serve::serve_datagram(query, &sh_zones) {
+                let log_action = self.account_zone_action(&action);
                 self.stats.record_latency_us(start.elapsed().as_micros() as u64);
-                self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Local, start);
+                self.log_query_wire(client_ip, &qname_pres, qtype, log_action, start);
                 return Some(resp);
             }
             // No match in the split-horizon zone → fall through to global zones.
@@ -644,10 +669,10 @@ impl RunboundHandler {
 
         // ── Local zones (own wire serving core) ─────────────────────────────
         let zones = self.zones.load();
-        if let Some(resp) = crate::dns::wire_serve::serve_datagram(query, &zones) {
-            self.stats.inc_local_hits();
+        if let Some((resp, action)) = crate::dns::wire_serve::serve_datagram(query, &zones) {
+            let log_action = self.account_zone_action(&action);
             self.stats.record_latency_us(start.elapsed().as_micros() as u64);
-            self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Local, start);
+            self.log_query_wire(client_ip, &qname_pres, qtype, log_action, start);
             return Some(resp);
         }
 

@@ -1335,7 +1335,7 @@ fn process_packet(
                 }
                 // Try the wire serving core for local zones (records / CNAME /
                 // BlockPage / NODATA / NXDOMAIN). Non-local returns false → forward.
-                if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
+                if answer_dns(dns_in, zones, acl, src_ip, dns_scratch, stats) {
                     let len = dns_scratch.len();
                     if dns_off + len > tx.len() {
                         return None;
@@ -1359,7 +1359,7 @@ fn process_packet(
         }
     } else {
         // No cache — fall through to the wire serving core (xdp-cache-snapshot: no).
-        if answer_dns(dns_in, zones, acl, src_ip, dns_scratch) {
+        if answer_dns(dns_in, zones, acl, src_ip, dns_scratch, stats) {
             let len = dns_scratch.len();
             if dns_off + len > tx.len() { return None; }
             tx[dns_off..dns_off + len].copy_from_slice(dns_scratch);
@@ -2059,6 +2059,7 @@ fn answer_dns(
     acl: &Acl,
     src_ip: Option<IpAddr>,
     out: &mut Vec<u8>,
+    stats: &Arc<crate::stats::Stats>,
 ) -> bool {
     let query = match crate::dns::wire::Message::parse(query_bytes) {
         Ok(m) => m,
@@ -2104,9 +2105,23 @@ fn answer_dns(
     // Hickory-free local-zone serving: Refuse / NxDomain / BlockPage / Static,
     // exact records, CNAME chains, NODATA vs NXDOMAIN, EDNS echo.
     match crate::dns::wire_serve::answer_local(&query, zones) {
-        Some(resp) => {
+        Some((resp, action)) => {
             out.clear();
             out.extend_from_slice(&resp.encode());
+            // A blocked query stays blocked, not a "local hit": Refuse/NxDomain/
+            // BlockPage come from the blacklist, feeds, or a local-zone `action:
+            // refuse`/`action: nxdomain` entry — attribute them to blocked/nxdomain,
+            // matching the async slow path (server.rs). Only Static/Redirect are a
+            // genuine local-zone answer.
+            match action {
+                crate::dns::local::ZoneAction::Refuse | crate::dns::local::ZoneAction::BlockPage => {
+                    stats.inc_blocked();
+                }
+                crate::dns::local::ZoneAction::NxDomain => stats.inc_nxdomain(),
+                crate::dns::local::ZoneAction::Static | crate::dns::local::ZoneAction::Redirect => {
+                    stats.inc_local_hits();
+                }
+            }
             true
         }
         None => false, // not authoritative — forward upstream
@@ -2491,7 +2506,8 @@ mod tests_edns_160 {
         let (zones, acl) = (make_zones(), make_acl());
         let q = build_query("a.bench.test.", RecordType::A, Some(1232));
         let mut out = Vec::new();
-        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out));
+        let stats = std::sync::Arc::new(crate::stats::Stats::new());
+        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out, &stats));
         let payload = parse_opt_payload(&out);
         assert_eq!(payload, Some(1232), "OPT must be echoed with client payload");
     }
@@ -2501,9 +2517,44 @@ mod tests_edns_160 {
         let (zones, acl) = (make_zones(), make_acl());
         let q = build_query("a.bench.test.", RecordType::A, None);
         let mut out = Vec::new();
-        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out));
+        let stats = std::sync::Arc::new(crate::stats::Stats::new());
+        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out, &stats));
         let payload = parse_opt_payload(&out);
         assert_eq!(payload, None, "no OPT expected for non-EDNS query");
+    }
+
+    /// Regression: a blacklist/feed Refuse-zone match on the answer_dns() fast
+    /// path (the XDP-adjacent kernel_loop path, not the async serve_wire slow
+    /// path) must increment `blocked`, not `local_hits` — a blocked query is
+    /// a block, not a local-zone hit. Before the fix answer_dns() had no Stats
+    /// reference at all, so this whole category was silently uncounted.
+    #[test]
+    fn refuse_zone_counts_as_blocked_not_local_hit() {
+        let zones_cfg = vec![LocalZone {
+            name: "blocked.test.".to_string(),
+            zone_type: "refuse".to_string(),
+        }];
+        let zones = LocalZoneSet::from_config(&zones_cfg, &[]);
+        let acl = make_acl();
+        let q = build_query("blocked.test.", RecordType::A, None);
+        let mut out = Vec::new();
+        let stats = std::sync::Arc::new(crate::stats::Stats::new());
+        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out, &stats));
+        assert_eq!(stats.blocked.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(stats.local_hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// Counterpart: a genuine local-zone Static match must still count as a
+    /// local hit, not a block.
+    #[test]
+    fn static_zone_counts_as_local_hit_not_blocked() {
+        let (zones, acl) = (make_zones(), make_acl());
+        let q = build_query("a.bench.test.", RecordType::A, None);
+        let mut out = Vec::new();
+        let stats = std::sync::Arc::new(crate::stats::Stats::new());
+        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out, &stats));
+        assert_eq!(stats.local_hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(stats.blocked.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2511,7 +2562,8 @@ mod tests_edns_160 {
         let (zones, acl) = (make_zones(), make_acl());
         let q = build_query("a.bench.test.", RecordType::A, Some(4096)); // oversized
         let mut out = Vec::new();
-        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out));
+        let stats = std::sync::Arc::new(crate::stats::Stats::new());
+        assert!(super::answer_dns(&q, &zones, &acl, None, &mut out, &stats));
         let payload = parse_opt_payload(&out);
         assert_eq!(payload, Some(1232), "payload must be capped to 1232");
     }

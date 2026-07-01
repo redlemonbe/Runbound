@@ -35,13 +35,18 @@ fn lower_key(wire_name: &[u8]) -> SmallVec<[u8; 64]> {
 }
 
 /// Build the authoritative local answer for `query`, or `None` if the queried
-/// name is not locally authoritative (caller should forward upstream).
-pub fn answer_local(query: &Message, zones: &LocalZoneSet) -> Option<Message> {
+/// name is not locally authoritative (caller should forward upstream). Also
+/// returns the `ZoneAction` that matched, so the caller can attribute the
+/// right stats counter (a blacklist/feed `Refuse`/`NxDomain`/`BlockPage` match
+/// is a *block*, not a local-zone hit — `Static`/`Redirect` are the only
+/// genuine local-zone hits).
+pub fn answer_local(query: &Message, zones: &LocalZoneSet) -> Option<(Message, ZoneAction)> {
     let question = query.first_question()?.clone();
     let qtype = question.qtype;
     let key = lower_key(question.name.wire());
 
     let action = zones.find_wire(&key)?; // None ⇒ not authoritative ⇒ forward
+    let action_result = action.clone();
 
     let mut resp = Message {
         header: query.header,
@@ -117,17 +122,17 @@ pub fn answer_local(query: &Message, zones: &LocalZoneSet) -> Option<Message> {
         resp.additional.push(server.to_record());
     }
 
-    Some(resp)
+    Some((resp, action_result))
 }
 
 /// Datagram-level local serving: parse a query, serve it locally, and return
-/// the response bytes — or `None` if the datagram is malformed or the name is
-/// not locally authoritative (the caller forwards). This is the per-packet seam
-/// the future own UDP/TCP listener calls.
-pub fn serve_datagram(query: &[u8], zones: &LocalZoneSet) -> Option<Vec<u8>> {
+/// the response bytes plus the matched `ZoneAction` — or `None` if the
+/// datagram is malformed or the name is not locally authoritative (the caller
+/// forwards). This is the per-packet seam the future own UDP/TCP listener calls.
+pub fn serve_datagram(query: &[u8], zones: &LocalZoneSet) -> Option<(Vec<u8>, ZoneAction)> {
     let msg = Message::parse(query).ok()?;
-    let resp = answer_local(&msg, zones)?;
-    Some(resp.encode())
+    let (resp, action) = answer_local(&msg, zones)?;
+    Some((resp.encode(), action))
 }
 
 /// CNAME chain following (RFC 1034 §3.6.2), wire-typed twin of
@@ -324,63 +329,69 @@ mod tests {
     #[test]
     fn positive_answer() {
         let z = zoneset();
-        let r = answer_local(&query("host.local.", consts::rtype::A, false), &z).unwrap();
+        let (r, action) = answer_local(&query("host.local.", consts::rtype::A, false), &z).unwrap();
         assert!(r.header.qr() && r.header.aa());
         assert_eq!(r.header.rcode_low(), rcode::NOERROR);
         assert_eq!(r.answers.len(), 2);
         assert_eq!(r.header.id, 0x4242);
         assert!(r.header.rd(), "RD echoed");
+        assert_eq!(action, ZoneAction::Static, "a genuine record match is a local hit, not a block");
         assert_wellformed(&r);
     }
 
     #[test]
     fn nodata_when_type_absent() {
         let z = zoneset();
-        let r = answer_local(&query("host.local.", consts::rtype::MX, false), &z).unwrap();
+        let (r, action) = answer_local(&query("host.local.", consts::rtype::MX, false), &z).unwrap();
         assert_eq!(r.header.rcode_low(), rcode::NOERROR);
         assert!(r.header.aa());
         assert!(r.answers.is_empty());
+        assert_eq!(action, ZoneAction::Static, "NODATA on a Static zone is still a local hit, not a block");
         assert_wellformed(&r);
     }
 
     #[test]
     fn nxdomain_when_name_absent() {
         let z = zoneset();
-        let r = answer_local(&query("absent.local.", consts::rtype::A, false), &z).unwrap();
+        let (r, action) = answer_local(&query("absent.local.", consts::rtype::A, false), &z).unwrap();
         assert_eq!(r.header.rcode_low(), rcode::NXDOMAIN);
         assert!(r.header.aa());
+        assert_eq!(action, ZoneAction::Static, "NXDOMAIN on a Static zone (name doesn't exist) is a local hit, not a block");
         assert_wellformed(&r);
     }
 
     #[test]
     fn refuse_zone() {
         let z = zoneset();
-        let r = answer_local(&query("x.refuse.test.", consts::rtype::A, false), &z).unwrap();
+        let (r, action) = answer_local(&query("x.refuse.test.", consts::rtype::A, false), &z).unwrap();
         assert_eq!(r.header.rcode_low(), rcode::REFUSED);
         // v0.22.1: blocked/local responses must advertise recursion-available (RA),
         // consistent with the forward + XDP paths.
         assert!(r.header.ra(), "REFUSED block must set RA");
+        assert_eq!(action, ZoneAction::Refuse, "a blacklist/feed Refuse match must be reported as a block, not a local hit");
         assert_wellformed(&r);
     }
 
     #[test]
     fn nxdomain_zone() {
         let z = zoneset();
-        let r = answer_local(&query("anything.gone.test.", consts::rtype::A, false), &z).unwrap();
+        let (r, action) = answer_local(&query("anything.gone.test.", consts::rtype::A, false), &z).unwrap();
         assert_eq!(r.header.rcode_low(), rcode::NXDOMAIN);
         assert!(r.header.ra(), "NXDOMAIN block must set RA");
+        assert_eq!(action, ZoneAction::NxDomain, "a blacklist/feed NxDomain match must be reported as a block, not a local hit");
         assert_wellformed(&r);
     }
 
     #[test]
     fn cname_chain_resolved() {
         let z = zoneset();
-        let r = answer_local(&query("alias.local.", consts::rtype::A, false), &z).unwrap();
+        let (r, action) = answer_local(&query("alias.local.", consts::rtype::A, false), &z).unwrap();
         assert_eq!(r.header.rcode_low(), rcode::NOERROR);
         assert!(r.header.aa());
         // CNAME + the two A records of the target
         assert_eq!(r.answers.len(), 3);
         assert_eq!(r.answers[0].rtype, consts::rtype::CNAME);
+        assert_eq!(action, ZoneAction::Static, "a CNAME chain on a Static zone is a local hit, not a block");
         assert_wellformed(&r);
     }
 
@@ -393,7 +404,7 @@ mod tests {
     #[test]
     fn edns_echoed() {
         let z = zoneset();
-        let r = answer_local(&query("host.local.", consts::rtype::A, true), &z).unwrap();
+        let (r, _action) = answer_local(&query("host.local.", consts::rtype::A, true), &z).unwrap();
         assert!(r.edns().unwrap().is_some());
         assert_wellformed(&r);
     }
@@ -417,7 +428,7 @@ mod tests {
 
         let mut buf = [0u8; 1232];
         let (n, from) = server.recv_from(&mut buf).unwrap();
-        let resp = serve_datagram(&buf[..n], &z).expect("name is locally authoritative");
+        let (resp, _action) = serve_datagram(&buf[..n], &z).expect("name is locally authoritative");
         server.send_to(&resp, from).unwrap();
 
         let (n2, _) = client.recv_from(&mut buf).unwrap();
