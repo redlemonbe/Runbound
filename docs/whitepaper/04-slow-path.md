@@ -20,8 +20,10 @@ pipeline:
    `src/dns/server.rs`).
 3. **Local zones** (local-data, blacklist, feeds), AXFR/IXFR, TSIG-authenticated DDNS, and
    DNSSEC-signed serving (in-house ECDSA P-256 signer) → answered wire-native.
-4. Otherwise → **forward** over the own wire forward pool (plain UDP / DoT), or, with the `recursor`
-   feature, the sovereign iterative resolver.
+4. Otherwise → **forward** over the own wire forward pool (plain UDP / DoT), or, when
+   `resolution: full-recursion` is set in `unbound.conf` (a runtime config toggle, not a
+   build flag — always compiled in), the sovereign in-house iterative resolver
+   (`src/dns/recursor_wire.rs`).
 
 ## 4.0 The kernel fast loop — the real `xdp: no` hot path
 
@@ -36,19 +38,19 @@ pipeline:
   16.8M softnet drops/s). On a few-flow benchmark generator this is what lets every serving
   core stay busy; on real traffic (thousands of source ports) the default hash already would.
 - **Batched receive with `recvmmsg`** (`MSG_WAITFORONE`): one syscall drains up to 64
-  datagrams (`BATCH = 64`, `src/dns/kernel_loop.rs:233`; raised from 32 in v0.17.0)
+  datagrams (`BATCH = 64`, `src/dns/kernel_loop.rs:236`; raised from 32 in v0.17.0)
   instead of one syscall per datagram. Per-packet `recv_from` cannot keep the
   socket buffer empty under burst — the overflow shows up as `UdpRcvbufErrors`, not a NIC
   drop. `MSG_WAITFORONE` returns as soon as ≥1 datagram is ready, so a lone query (e.g.
   `dig`) is still answered immediately — no batching latency for single queries.
 - **Batched transmit with `sendmmsg`** (v0.17.0): answered responses from one `recvmmsg`
   batch are collected and flushed with a **single** `sendmmsg`
-  (`src/dns/kernel_loop.rs:235`) — one syscall per batch on the TX side too, with the
+  (`src/dns/kernel_loop.rs:444`) — one syscall per batch on the TX side too, with the
   iovec/header arrays allocated once, not per batch.
 - **32 MiB socket buffers**: each kloop socket requests `SO_RCVBUF = 32 MiB`
-  (`RCVBUF_SIZE`, `src/dns/kernel_loop.rs:64`) so NAPI bursts are absorbed instead of
+  (`RCVBUF_SIZE`, `src/dns/kernel_loop.rs:65`) so NAPI bursts are absorbed instead of
   dropped as `UdpRcvbufErrors`; startup auto-raises `net.core.rmem_max`/`wmem_max` to
-  match (best-effort, root — `src/dns/server.rs:2603`) and warns if the kernel clamps
+  match (best-effort, root — `src/dns/server.rs:2735`) and warns if the kernel clamps
   the buffer.
 - **The shared per-source gate.** Every datagram passes the *same* gate the XDP path uses,
   driven by the *same* objects: `rl_should_drop()` (the memoized per-source rate-limit) and
@@ -59,7 +61,7 @@ pipeline:
 - **Then the shared SIMD/ASM responder** — `answer_dns_wire` (local-data / wire) and
   `answer_from_cache` (cache snapshot, §05). Only `WireResult::Fallback` (cache miss,
   CNAME/MX/DNSSEC DO=1, ANY) is handed to the slow-path handler `serve_wire`
-  (`src/dns/server.rs:1195`) via a bounded channel.
+  (`src/dns/server.rs:416`) via a bounded channel.
 
 The net effect: in `xdp: no` the cache-hit path is the same hand-written wire builder as
 XDP, on a kernel UDP socket; the wire-native `serve_wire` handler only sees the genuine
@@ -69,7 +71,7 @@ misses.
 
 A spawn-per-request handler with no backpressure (as the old hickory `ServerFuture` was)
 exhausts RAM under a flood. The wire-native handler bounds concurrency with a semaphore of
-`MAX_INFLIGHT_REQUESTS = 4096` (`src/dns/server.rs:71`). A **non-blocking** `try_acquire`
+`MAX_INFLIGHT_REQUESTS = 4096` (`src/dns/server.rs:48`). A **non-blocking** `try_acquire`
 returns `REFUSED` instantly without allocating, so the bound holds even at line rate. This
 is a deliberate availability trade-off: shed load rather than OOM.
 
@@ -81,11 +83,11 @@ not a hickory resolver:
 - **Upstream racing** (`upstream-racing: yes`): the forward pool queries all upstreams in
   parallel and the first **definitive** result (positive or authoritative negative) ends
   the race; a `Servfail` is not definitive (`Forward::is_definitive`,
-  `src/dns/forward.rs:56`; race at `src/dns/forward.rs:345`).
+  `src/dns/forward.rs:61`; racing logic in `ForwardPool::forward`, `src/dns/forward.rs:387`).
 - **txid + question validation** (SEC-O1): a plain-UDP upstream response is accepted only
   when its transaction ID and its question (name case-insensitive + type + class) match the
-  query (`src/dns/forward.rs:272`) — a cache-poisoning defence the de-hickory forwarder
-  added.
+  query (`response_matches`, `src/dns/forward.rs`) — a cache-poisoning defence the de-hickory
+  forwarder added.
 - **Hard lookup timeout** (#83): forward lookups are wrapped in a hard timeout so a stuck
   upstream cannot pin a task/Tokio worker indefinitely (a measured-and-fixed deadlock root
   cause).
@@ -93,15 +95,18 @@ not a hickory resolver:
 - **TSIG** is wire-native on `ring` HMAC (RFC 8945), `src/dns/tsig.rs` — no longer
   `hickory_proto`'s TSIG; the key-name lookup is constant-time (§07).
 
-The optional `recursor` Cargo feature adds the sovereign full-recursion path
-(`src/dns/recursor.rs`, still on `hickory-resolver`); it is not part of the default build.
+Sovereign full-recursion is a **runtime config toggle**, not a Cargo feature — set
+`resolution: full-recursion` under `server:` in `unbound.conf` to switch the cache-miss
+backend from forward to the in-house iterative resolver (`src/dns/recursor_wire.rs`); the
+default is `resolution: forward`. Both code paths ship in every build; there is no
+`recursor` build flag and no `hickory-resolver` dependency.
 
 ## 4.3 Upstream health monitoring
 
 `src/upstreams.rs` probes upstreams every 30 s (2 s timeout):
 
 - **UDP upstreams**: a 28-byte DNS probe for `. IN A` carrying an EDNS0 OPT RR with the
-  **DO bit set** (`DNS_PROBE_PACKET`, `src/upstreams.rs:39`). The reply confirms liveness
+  **DO bit set** (`DNS_PROBE_PACKET`, `src/upstreams.rs:41`). The reply confirms liveness
   and the **AD bit** reveals whether the upstream does DNSSEC validation.
 - **DoT upstreams**: a TCP+TLS connect+handshake (no DNS query needed).
 - **Backoff** on failure: 30 → 60 → 120 → 300 s cap, so a dead upstream does not spam
@@ -120,7 +125,7 @@ the racing forwarders carried no cache, so `xdp: no` forwarded *every* query (ca
 ## 4.5 NIC auto-tune at startup (v0.17.0, `xdp: no` only)
 
 When a slow-path interface is **explicitly named** in the config, startup reads the live
-topology and tunes the NIC for kernel-UDP throughput (`src/dns/server.rs:2590-2675`):
+topology and tunes the NIC for kernel-UDP throughput (`src/dns/server.rs:2663-2830`):
 
 - **RX queue count = the NIC's NUMA-node logical-CPU count**, capped at 32
   (`SLOWPATH_QUEUE_CAP`) and at the serving-core count. The kernel-UDP path is bounded by
@@ -165,14 +170,14 @@ These features had lived only in the now-default-disabled hickory handler; v0.22
 them in `serve_wire` so the default (wire) path keeps them:
 
 - **Query logging** — wire-native, feeds the WebUI Logs panel and `GET /api/logs`
-  (`src/dns/server.rs:1137`).
+  (`log_query_wire`, `src/dns/server.rs:336`).
 - **serve-stale** (#108, RFC 8767) — a wire-native stale cache (`stale_cache_wire`,
-  `src/dns/server.rs:186`) keyed by `(name, type)`, serving an expired answer on a transient
-  upstream SERVFAIL (the legacy hickory-typed `stale_cache` survives only on the `recursor`
-  path).
+  `src/dns/server.rs:126`) keyed by `(name, type)`, serving an expired answer on a transient
+  upstream SERVFAIL. This is the only stale-cache implementation — there is no separate
+  hickory-typed variant.
 - **resolv.conf emergency fallback** (#94) — when all configured upstreams are down the
   forward path falls back to `/etc/resolv.conf` and recovers automatically
-  (`src/dns/server.rs:948`, recovery probe at `:3644`).
+  (`src/dns/server.rs:793`, recovery probe at `:2459`).
 - **Per-upstream racing-win metric** (#33, in `GET /api/system`) and **top-domains
   slow-path counting** (#5) are likewise restored on the wire path.
 

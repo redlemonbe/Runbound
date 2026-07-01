@@ -23,8 +23,21 @@ the wider set — an **explicit, commented opt-in** in the unit file.
 | `CAP_NET_BIND_SERVICE` | always (bind :53) | Cannot bind to port 53 — server fails to start |
 | `CAP_NET_RAW` | XDP only | XDP disabled silently — server runs normally on SO_REUSEPORT fallback |
 | `CAP_NET_ADMIN` | XDP + firewall-manage | XDP / firewall-manage disabled silently |
-| `CAP_BPF` | XDP only | XDP disabled silently |
-| `CAP_PERFMON` | XDP only | eBPF load may fail — XDP disabled silently |
+| `CAP_BPF` | XDP only, load-time only | XDP disabled silently |
+| `CAP_PERFMON` | XDP only, load-time only | eBPF load may fail — XDP disabled silently |
+
+**`CAP_BPF`/`CAP_PERFMON` are dropped right after XDP setup completes.** These two
+are only required for the one-time `BPF_MAP_CREATE`/`BPF_PROG_LOAD` sequence at
+startup — every runtime BPF operation afterwards (ICMP ban/unban, blacklist reload,
+XSKMAP registration) goes through an fd the process already holds, which the kernel
+does not re-check against capabilities. Runbound drops both from
+Effective/Permitted/Inheritable/Ambient immediately after XDP load/attach, before the
+server starts answering queries (`src/caps_drop.rs`) — so even if the process is
+later remote-code-executed, CAP_BPF/CAP_PERFMON are no longer available to it or any
+child process for the rest of its lifetime. Look for
+`CAP_BPF/CAP_PERFMON dropped post-XDP-setup` in the logs to confirm. This is a
+best-effort defence-in-depth step (never fatal if the drop fails) and does not
+replace granting the capabilities correctly at startup — see the table above.
 
 **Default (no XDP, no firewall-manage) — what the shipped unit uses:**
 

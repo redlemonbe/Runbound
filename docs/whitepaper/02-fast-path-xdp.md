@@ -23,16 +23,22 @@ before the kernel network stack. Its logic, in order:
    echo in place with `XDP_TX` (see §3.7). Otherwise `XDP_PASS`.
 3. **Must be UDP, dest port 53.** Anything else (TCP for DoT/DoH/AXFR, other ports)
    `XDP_PASS` — so the kernel stack still serves TCP/TLS DNS normally.
-4. **Blacklist (IPv4).** Extract the QNAME key, look it up in the `dns_blacklist` hash
+4. **DDoS abuse-engine kernel ban (IPv4).** Gated on a `bans_active` array-map flag (one
+   lookup when idle, no measurable fast-path cost): if set, look the source IP up in the
+   `icmp_banned` LRU hash and `XDP_DROP` on a hit. Bans are populated by the userspace
+   abuse engine — escalation to `tarpit`/`block` only happens for **verified** sources
+   (TCP/DoT/DoH/DoQ or UDP carrying a valid DNS cookie), so a spoofed UDP source can never
+   get a victim banned. (`ebpf/dns_xdp.c:503`)
+5. **Blacklist (IPv4).** Extract the QNAME key, look it up in the `dns_blacklist` hash
    map; on a hit, forge NXDOMAIN in place and `XDP_TX` (~µs round-trip, never wakes user
-   space). (`ebpf/dns_xdp.c:440`)
-5. **Optional domain-affinity routing.** If `domain_routing_cfg.enabled`, hash the QNAME
+   space). (`ebpf/dns_xdp.c:525`)
+6. **Optional domain-affinity routing.** If `domain_routing_cfg.enabled`, hash the QNAME
    (FNV-1a, §3.6) and `bpf_redirect_map` to a specific CPU via `CPUMAP`, so repeated
-   queries for one name always hit the same core's warm cache. (`ebpf/dns_xdp.c:469`)
-6. **Default.** `bpf_redirect_map(&XSKS, rx_queue_index, XDP_PASS)` — hand the frame to
+   queries for one name always hit the same core's warm cache. (`ebpf/dns_xdp.c:544`)
+7. **Default.** `bpf_redirect_map(&XSKS, rx_queue_index, XDP_PASS)` — hand the frame to
    the AF_XDP socket bound to this NIC queue. If no socket is registered for the queue
    (e.g. during startup), the `XDP_PASS` fallback sends it to the normal kernel socket.
-   (`ebpf/dns_xdp.c:498`)
+   (`ebpf/dns_xdp.c:586`)
 
 The key design property: **everything the fast path does not explicitly claim is passed
 to the kernel.** TCP, DoT/DoH/DoQ, non-DNS traffic, IPv6 blacklist hits, IP-with-options

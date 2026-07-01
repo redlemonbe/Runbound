@@ -285,8 +285,8 @@ jobs:
         run: |
           ./target/release/runbound /tmp/runbound-ci.conf &
           sleep 2
-          curl -sf http://localhost:8080/health \
-            -H "Authorization: Bearer $HSM_PIN" | jq .hsm
+          curl -sf http://localhost:8080/api/config \
+            -H "Authorization: Bearer $RUNBOUND_API_KEY" | jq .hsm.active
           # → true
 ```
 
@@ -360,8 +360,8 @@ the session is closed. The HSM does not need to remain connected after startup.
 
 ```bash
 # Verify HSM is active
-curl -s http://localhost:8080/health -H "Authorization: Bearer $KEY" \
-  | jq .hsm
+curl -s http://localhost:8080/api/config -H "Authorization: Bearer $KEY" \
+  | jq .hsm.active
 # true
 ```
 
@@ -403,8 +403,8 @@ sed -i 's/hsm-api-key-label:.*/hsm-api-key-label: runbound-api-key-v2/' \
 systemctl restart runbound
 
 # 4. Verify the new key is active
-curl -s http://localhost:8080/health \
-    -H "Authorization: Bearer $NEW_API_KEY" | jq .hsm
+curl -s http://localhost:8080/api/config \
+    -H "Authorization: Bearer $NEW_API_KEY" | jq .hsm.active
 # true
 
 # 5. Delete the old key object once the new one is confirmed working
@@ -431,8 +431,8 @@ sed -i 's/hsm-api-key-label:.*/hsm-api-key-label: runbound-api-key-v2/' \
 systemctl restart runbound
 
 # 3. Verify
-curl -s http://localhost:8080/health \
-    -H "Authorization: Bearer $NEW_API_KEY" | jq .hsm
+curl -s http://localhost:8080/api/config \
+    -H "Authorization: Bearer $NEW_API_KEY" | jq .hsm.active
 # true
 
 # 4. Delete the old object
@@ -560,7 +560,7 @@ curl -s http://127.0.0.1:12345/connector/status
 
 3. **Key rotation** — follow the step-by-step procedure in the
    [Key rotation](#key-rotation) section above. Import under a new label, update
-   config, restart, verify `/health`, then delete the old object.
+   config, restart, verify `/api/config`, then delete the old object.
 
 4. **Audit log** — HSMs maintain an internal hardware audit log of all key access
    operations. On YubiHSM 2, retrieve it with `yubihsm-shell > list log-entries`.

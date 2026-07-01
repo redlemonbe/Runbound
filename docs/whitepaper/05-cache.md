@@ -7,28 +7,31 @@ async task.
 ## 5.1 Double-buffer: DashMap writer, ArcSwap reader
 
 - **Writer**: a `DashMap` (concurrent, lock-free inserts) holds the mutable cache
-  (`src/dns/cache_snapshot.rs:6`).
+  (`MutableCacheMap`, `src/dns/cache_snapshot.rs:109`).
 - **Reader**: an `ArcSwap<HashMap>` holds an immutable **snapshot**. XDP workers call
   `load_full()` once per received batch and look up from the frozen copy with zero locking.
-- A background **publish loop** clones the mutable map every **10 ms**, evicts expired
-  entries, and atomically swaps the snapshot in (`src/dns/cache_snapshot.rs:9`).
+- A background **publish loop** (`publish_loop`, `src/dns/cache_snapshot.rs:364`) clones the
+  mutable map every **10 ms**, evicts expired entries, and atomically swaps the snapshot in.
 
 ### Skipping the clone when nothing changed (PERF-1 / #135)
 
 Cloning the whole map every 10 ms is wasteful when no inserts happened. A monotonic
-`CACHE_WRITE_GEN` counter is bumped on every insert; the publish loop compares it to its
-last-seen value and **skips the O(n) clone** when unchanged (`src/dns/cache_snapshot.rs:91`).
+`CACHE_WRITE_GEN` counter (`src/dns/cache_snapshot.rs:120`) is bumped on every insert; the
+publish loop compares it to its last-seen value and **skips the O(n) clone** when unchanged
+(`src/dns/cache_snapshot.rs:374`). A forced eviction pass still runs every 256 ticks
+(~2.5 s) to drop TTL-expired entries even when nothing new was inserted.
 
 ## 5.2 Keys: CRC32c → u64 + IdentityHasher
 
 The snapshot is `HashMap<u64, CacheEntry, IdentityHasherBuilder>`
-(`src/dns/cache_snapshot.rs:81`). The key is the wire-QNAME pre-hashed to u64 with the same
-CRC32c SSE4.2 routine as `answer_dns_wire` — **one ASM lookup path for both local zones and
-cache**. `IdentityHasher` then avoids re-hashing an already-good 64-bit key (§3.2).
+(`CacheSnapshot`, `src/dns/cache_snapshot.rs:82`). The key is the wire-QNAME pre-hashed to
+u64 with the same CRC32c SSE4.2 routine as `answer_dns_wire` — **one ASM lookup path for
+both local zones and cache**. `IdentityHasher` then avoids re-hashing an already-good
+64-bit key (§3.2).
 
 Because CRC32c is a 32→64-bit hash, a collision is astronomically rare but possible, so
-`CacheEntry` carries `wire_qname` bytes and the lookup confirms them with the SIMD
-`bytes_eq` after the hash hit (`src/dns/cache_snapshot.rs:63`, `QuestionKey::eq` at `:47`).
+`CacheEntry` carries `wire_qname` bytes (`src/dns/cache_snapshot.rs:66`) and the lookup
+confirms them with the SIMD `bytes_eq` after the hash hit (`QuestionKey::eq` at `:48-53`).
 This is correctness insurance, not paranoia: a silent collision would serve the wrong
 record.
 
@@ -36,23 +39,23 @@ record.
 
 `CacheEntry.wire_payload` is a `bytes::Bytes` (an `Arc<[u8]>` internally) holding the full
 response datagram with the query ID zeroed; the worker patches bytes [0..2] with the real
-QID before sending (`src/dns/cache_snapshot.rs:57`). Cloning an entry during the snapshot
+QID before sending (`src/dns/cache_snapshot.rs:59-60`). Cloning an entry during the snapshot
 publish is therefore O(1) — just an Arc refcount bump.
 
 ## 5.4 Eviction and sizing
 
 On insert when full, Runbound evicts the **first expired** entry; if none is expired it
 **skips the insert** (backpressure) rather than evicting a live entry
-(`src/dns/cache_snapshot.rs:116`). Cache sizing respects cgroup v2 `memory.max` so a
-container does not OOM.
+(`cache_insert`, `src/dns/cache_snapshot.rs:171`). Cache sizing respects cgroup v2
+`memory.max` so a container does not OOM.
 
 ## 5.5 Accounting
 
-`XDP_CACHE_SNAPSHOT_HITS/MISSES/ENTRIES` are atomic counters read by `/api/system` and the
-Prometheus handler. With `xdp: yes`, a per-worker miss counter `XDP_WORKER_MISS[64]`
-mirrors the existing per-worker `XDP_WORKER_PKTS[64]` (served = hits); the hit *rate* is
-computed in Rust off the hot path, so the hot path only does a `fetch_add` on the
-miss/fallback branch (`src/dns/cache_snapshot.rs:106`).
+`XDP_CACHE_SNAPSHOT_HITS/MISSES/ENTRIES` (`src/dns/cache_snapshot.rs:113-116`) are atomic
+counters read by `/api/system` and the Prometheus handler. With `xdp: yes`, a per-worker
+miss counter `XDP_WORKER_MISS[64]` (`:143`) mirrors the existing per-worker
+`XDP_WORKER_PKTS[64]` (`:133`, served = hits); the hit *rate* is computed in Rust off the
+hot path, so the hot path only does a `fetch_add` on the miss/fallback branch.
 
 ## 5.6 Persistence (#29)
 

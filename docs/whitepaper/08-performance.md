@@ -57,7 +57,7 @@ any figure not yet re-measured.
 - The naïve hickory slow path measured **1.78× Unbound's instructions/query** — the reason
   the fast paths exist (§1.2).
 
-## X710 10 GbE — earlier detail (v0.16.11, superseded by the v0.20.0 table above)
+## X710 10 GbE — earlier detail (v0.16.11, superseded by the v0.23.8 table above)
 
 Measured on the documented rig (receiver: 5995WX + Intel X710-DA2; generator: dual Xeon
 E5-2690 v2 + X710, direct DACs; dnsmark 2.2.1, XDP zero-copy both sides, NIC-counter

@@ -21,10 +21,11 @@
   `xdp: no` too.) A separate per-source ICMP rate limit + flood detector bans source IPs at
   the XDP layer via `ebpf/dns_xdp.c`. Permanent ("blacklisted") bans are persisted to a
   `0600` file and reloaded at startup (capped on both write and read).
-- **DNSSEC `AD`.** With `dnssec-validation: yes` on the default (forward) path, the
-  forwarder tracks `Secure`/`Insecure` by the presence of an `RRSIG` in the upstream answer
-  (`src/dns/server.rs:999`); the wire serving path never sets `AD` on its own authoritative
-  answers (`wire_serve` clears it, `src/dns/wire_serve.rs:56`). With `resolution:
+- **DNSSEC `AD`.** On the default (forward) path, `wire_answer` never sets `AD`
+  (`src/dns/server.rs`, flags built from scratch with no `set_ad` call) — Runbound does not
+  itself validate DNSSEC or track `Secure`/`Insecure` for forwarded answers; `dnssec-validation`
+  only affects the sovereign resolver below. The wire serving path never sets `AD` on its own
+  authoritative answers either (`wire_serve` clears it, `src/dns/wire_serve.rs:66`). With `resolution:
   full-recursion` (a runtime config toggle, not a Cargo feature), the sovereign in-house
   resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) attaches a per-record `Proof`
   and sets `AD` only when every answer + authority record is cryptographically `Secure`,
@@ -84,8 +85,12 @@
 - **v0.22 "de-hickory" hardening (Cycle O + aggressive pentest — `docs/security-audit/`).**
   - **Reduced attack surface.** The `hickory-server` request handler is removed from the
     default binary; the default serving path no longer carries that large message-parsing
-    dependency on the network-facing path. (`hickory-proto` remains for the data model + XDP
-    builders; the hickory recursor is only present under the optional `recursor` feature.)
+    dependency on the network-facing path. The de-hickory migration is now **complete**:
+    `hickory-proto` is a `[dev-dependencies]`-only entry used solely by differential oracle
+    tests — it is not a runtime dependency at all, in any configuration. Full recursion
+    (`src/dns/recursor_wire.rs`) and DNSSEC validation/signing are entirely in-house and
+    always compiled in, toggled at runtime via `resolution: full-recursion` — there is no
+    `recursor` Cargo feature.
   - **AXFR allow-list & split-horizon on the real client IP (PENT-1/PENT-2).** TCP/DoT/DoH
     are proxied through an internal loopback relay; the relay now carries the **real client
     IP via a PROXY v2 header** read **before** the TLS handshake for DoT/DoH

@@ -31,6 +31,9 @@ Directives with identical behavior to Unbound — no changes required.
 | `cache-max-ttl` | TTL cap for cached records (seconds) |
 | `rate-limit` | Per-IP query rate limit in q/s |
 | `dnssec-validation` | Enable DNSSEC (see caveats below) |
+| `serve-expired` | Serve stale/expired cached answers when upstream is unreachable (Runbound alias: `serve-stale`) |
+| `serve-expired-ttl` | Max age of a stale record still eligible to be served (Runbound alias: `stale-max-age`, default: 86400s) |
+| `serve-expired-reply-ttl` | TTL returned to the client on a stale answer (Runbound alias: `stale-answer-ttl`, default: 30s) |
 
 #### `forward-zone:` block
 
@@ -101,6 +104,8 @@ Directives accepted by Runbound but not understood by Unbound. Unbound will warn
 |---|---|
 | `api-key` | REST API Bearer token (prefer `RUNBOUND_API_KEY` env var) |
 | `api-port` | REST API port (default: 8080) |
+| `resolution` | Resolution mode: `forward` (default, trusts upstream) or `full-recursion` (in-house sovereign resolver, `src/dns/recursor_wire.rs`, with full RRSIG-chain DNSSEC validation) |
+| `local-zone-dnssec` | Enable DNSSEC authoritative signing for local zones (default: no) |
 | `rate-limit-prefix-v4` | IPv4 prefix for subnet bucketing (default: /24) |
 | `rate-limit-prefix-v6` | IPv6 prefix for subnet bucketing (default: /48) |
 | `cache-min-entries` | Minimum cache entries after memory pressure halvings (default: 2048) |

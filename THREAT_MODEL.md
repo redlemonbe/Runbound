@@ -28,10 +28,10 @@
 | Remote answer poisoning / DNS rebinding | ✅ | Forward path validates the upstream response transaction-ID + question before accepting it (`src/dns/forward.rs`); `private-address` stripping; optional DNSSEC validation |
 | Remote attacker on the sync channel | ✅ | HMAC-SHA256 + anti-replay + TLS (TOFU pinning) |
 | Unauthorized administrative access | ✅ | API bearer auth + RBAC roles; WebUI argon2id + sessions/CSRF; API localhost-only; WebUI binds `127.0.0.1` by default (`ui-bind`) — network exposure requires explicit `ui-bind: 0.0.0.0` |
-| Malicious co-located local process | ⚠️ partial | API is localhost-only, but the bearer token is readable by a same-uid process — Unix-socket/mTLS is on the roadmap |
+| Malicious co-located local process | ⚠️ partial | API is localhost-only; the bearer token is readable by a same-uid process, but an owner-only Unix-domain socket (mode 0600, `api-socket`) is available as a hardened alternative — localhost mTLS is on the roadmap |
 | Local **root** attacker | ❌ out of scope | A root attacker owns the host (standard assumption) |
 | Volumetric DDoS **upstream of the NIC** | ❌ out of scope | Needs network/ISP-level mitigation; Runbound protects from the NIC inward |
-| Supply-chain (crate compromise) | ⚠️ partial | `cargo-deny`/`cargo-audit` in CI; CycloneDX SBOM, reproducible-build doc and minisign-signed releases shipped (v0.15.0) |
+| Supply-chain (crate compromise) | ⚠️ partial | `cargo-deny`/`cargo-audit` configured (`deny.toml`/`audit.toml`, `make deny`/`make audit`) but not yet wired into the GitHub Actions CI workflow; CycloneDX SBOM, reproducible-build doc and minisign-signed releases shipped (v0.15.0) |
 
 ## Out of scope (today)
 

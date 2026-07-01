@@ -289,7 +289,7 @@ curl http://localhost:8080/health
 ```json
 {
   "status":              "ok",
-  "version":             "0.9.41",
+  "version":             "0.23.8",
   "uptime_secs":         3600,
   "xdp_active":          true,
   "upstreams_healthy":   4,
@@ -865,7 +865,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 
 ```json
 {
-  "version": "0.9.41",
+  "version": "0.23.8",
   "uptime_secs": 3600,
   "xdp_active": true,
   "xdp_mode": "drv",
@@ -1135,7 +1135,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/sync
       "status": "connected",
       "last_seen_secs": 4,
       "zones_synced": 12,
-      "version": "0.6.2"
+      "version": "0.23.8"
     }
   ],
   "total": 1
@@ -1169,7 +1169,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/node
       "status":           "connected",
       "last_seen_secs":   5,
       "zones_synced":     42,
-      "version":          "0.6.20"
+      "version":          "0.23.8"
     }
   ],
   "total": 1

@@ -143,7 +143,7 @@ throughput ~40×). It remains available in SKB/copy mode for cache locality.
 | Item | Details |
 |---|---|
 | Kernel | Linux 5.10+ (6.x recommended) |
-| Capabilities | `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF` |
+| Capabilities | `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF`, `CAP_PERFMON` (load-time only, dropped after XDP setup — see [hardening.md](hardening.md)) |
 | Address family | `AF_XDP` in `RestrictAddressFamilies` |
 | Locked memory | `LimitMEMLOCK=infinity` |
 | NIC (optimal) | Intel ixgbe / i40e / ice / igc (native zero-copy) |
@@ -222,13 +222,16 @@ In both cases `bpftool prog list` and `ip link show` will show no XDP program af
 If not using `install.sh`, add to `/etc/systemd/system/runbound.service`:
 
 ```ini
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
 MemoryDenyWriteExecute=false
 ProtectKernelModules=false
 LimitMEMLOCK=infinity
 ```
+
+`CAP_BPF`/`CAP_PERFMON` are only needed at XDP load/attach time — Runbound drops both
+right after setup completes (see [hardening.md](hardening.md#capabilities)).
 
 Then: `systemctl daemon-reload && systemctl restart runbound`
 
@@ -409,7 +412,11 @@ ethtool -S enp4s0 | grep rx_no_buffer_count  # → 0 under load
 ```bash
 curl -s -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/system \
   | python3 -c "import sys,json; s=json.load(sys.stdin); \
-    print(f'ring {s[\"nic_rx_ring\"]}/{s[\"nic_rx_ring_max\"]}  dropped {s[\"nic_rx_dropped\"]}')"
+    print(f'ring {s[\"nic_rx_ring\"]}/{s[\"nic_rx_ring_max\"]}')"
+
+# Dropped-packet counter (hardware FIFO overflow, summed across all XDP ifaces)
+# is exposed as a Prometheus metric, not a /api/system field:
+curl -s http://localhost:8080/metrics | grep runbound_nic_rx_dropped_total
 ```
 
 Config override — force a specific ring size:
@@ -589,14 +596,12 @@ On Xeon v2 + X520, XDP can saturate at ~16 cores while still showing
 significant CPU headroom. This is a **NIC/PCIe-bus ceiling**, not a software
 limit. The indicator is `rx_missed_errors` rising while CPU stays below 60%.
 
-Runbound exposes these counters in `/api/system`:
-```json
-{
-  "nic_rx_missed": 5700000,
-  "nic_rx_no_dma": 0,
-  "nic_rx_dropped": 5700000
-}
-```
+Runbound reads these counters from the interface's sysfs stats internally
+(`read_nic_rx_missed`, `read_nic_rx_no_dma` in `src/dns/xdp/socket.rs`) — they are
+not currently exposed as `/api/system` JSON fields or Prometheus metrics, only as
+the periodic WARN log line below (only `nic_rx_ring`/`nic_rx_ring_max` and the
+Prometheus `runbound_nic_rx_dropped_total` counter are API-visible; see the
+[NIC ring buffer auto-sizing](#nic-ring-buffer-auto-sizing) section above).
 
 A WARN is logged every 60 seconds when `rx_missed_errors > 0`:
 ```

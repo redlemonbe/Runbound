@@ -69,7 +69,9 @@ Do **not** open a public issue for security problems. Reports are handled on a
 - **Bot/scanner defense:** honeypot trap routes with configurable banning.
 - **Supply chain:** release binaries are signed with **minisign** and ship a
   **CycloneDX SBOM** plus `SHA256SUMS`; reproducible-build and signature-verification
-  steps are in [docs/BUILD.md](docs/BUILD.md). `cargo audit` / `cargo deny` run in CI.
+  steps are in [docs/BUILD.md](docs/BUILD.md). `cargo audit` / `cargo deny` are configured
+  (`deny.toml`/`audit.toml`) and available via `make audit` / `make deny`, but are not yet
+  wired into the GitHub Actions CI workflow.
 
 ## Known limitations
 

@@ -47,8 +47,16 @@ cert, built-in ACME (`ui-tls: acme`) is also available.
 
 ## 3. Auto-discovery — DDR (RFC 9462)
 
-So clients upgrade from plain DNS to your encrypted endpoint **without manual
-configuration**, publish Discovery of Designated Resolvers records:
+**Known limitation:** `ddr: yes` parses and Runbound stores the endpoint info
+(hostname + DoT/DoH/DoQ ports), but SVCB synthesis for `_dns.resolver.arpa` is
+**not yet wired into the wire serving path** (`serve_wire`, the only DNS
+serving path in the current binary) — the struct holding this info is
+currently dead code. A query for `SVCB _dns.resolver.arpa` gets whatever your
+normal resolution/local-zone rules produce, not a synthesized answer. Treat
+the config below as forward-looking; clients cannot yet auto-discover the
+encrypted endpoint this way. See the tracked gap (PAR-7) for status.
+
+Intended configuration once implemented:
 
 ```
 server:
@@ -56,8 +64,8 @@ server:
     tls-cert-hostname: "dns.example.com"
 ```
 
-Runbound then answers `SVCB _dns.resolver.arpa` with one record per transport,
-pointing at your hostname:
+The design is for Runbound to answer `SVCB _dns.resolver.arpa` with one record
+per transport, pointing at your hostname:
 
 ```
 _dns.resolver.arpa. 7200 IN SVCB 1 dns.example.com. alpn="dot" port=853
@@ -65,9 +73,11 @@ _dns.resolver.arpa. 7200 IN SVCB 2 dns.example.com. alpn="h2"  port=443 dohpath=
 _dns.resolver.arpa. 7200 IN SVCB 3 dns.example.com. alpn="doq" port=853
 ```
 
-A client that reaches Runbound over plain DNS discovers and verifies the
-encrypted endpoint, then upgrades. The advertised ports follow `tls-port` /
-`https-port` / `quic-port` (defaults 853 / 443 / 853).
+A client reaching Runbound over plain DNS would then discover and verify the
+encrypted endpoint before upgrading. The advertised ports would follow
+`tls-port` / `https-port` / `quic-port` (defaults 853 / 443 / 853). Until this
+lands, distribute the DoT/DoH/DoQ endpoint out-of-band (client provisioning,
+a static SVCB record on a separate authoritative zone, etc.).
 
 ---
 

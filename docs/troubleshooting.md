@@ -4,47 +4,43 @@ Common operational issues and their resolutions.
 
 ---
 
-## Cache shrinks to zero on low-memory systems
+## Memory pressure under low-memory systems (cache no longer shrinks to zero)
 
-**Symptom:** Logs show repeated `memory pressure — cache halved` messages every 30 s,
-the cache eventually reaches 0, and all queries go upstream.
+**Historical symptom (v0.5.0 and earlier, hickory-based resolver cache):** Logs showed
+repeated `memory pressure — cache halved` messages every 30 s, and on RAM-constrained
+hosts the cache could eventually be halved down to 0, sending all queries upstream.
+This was fixed in v0.5.1 with a floor (`cache-min-entries`), a 5-minute cooldown, and
+no-effect detection.
 
-```
-WARN memory pressure — cache halved  used_pct=73.2%  cache_from=65536  cache_to=32768
-WARN memory pressure — cache halved  used_pct=72.8%  cache_from=32768  cache_to=16384
-WARN memory pressure — cache halved  used_pct=72.6%  cache_from=16384  cache_to=8192
-...
-```
+**Current behaviour (current de-hickory architecture, v0.23.x):** The DNS cache now lives in
+`ForwardPool` and is sized **once at startup** — a ceiling derived from available RAM
+(cgroup-aware: `memory.max` inside a container, `/proc/meminfo` `MemAvailable`
+otherwise), clamped to [8192, 64M] entries. It fills as queries arrive; it is never
+forcibly shrunk at runtime, so the "cache halved to 0" failure mode described above
+cannot recur. The `cache-min-entries` config directive still parses and round-trips
+for backward compatibility with existing config files, but no longer has any runtime
+effect (there is nothing left to floor).
 
-**Cause:** Runbound monitors system-wide RAM pressure via `/proc/meminfo`. On systems
-with less than 4 GB RAM where other processes consume significant memory, the 70 %
-pressure threshold may be permanently exceeded. Cache eviction frees Rust allocations,
-but jemalloc retains freed memory in its pool — system RSS does not decrease enough to
-clear the threshold, so halvings continue indefinitely.
+The 30 s memory-pressure monitor (`memory_guard_loop`) still runs, with the same 70 %
+/ 80 % watermarks, but its actions changed:
 
-**Fix (v0.5.0 and earlier):** Add to `unbound.conf`:
-
-```
-server:
-    cache-min-entries: 2048
-```
-
-**Fix (v0.5.1+):** The cache floor, cooldown, and no-effect detection are enforced
-automatically. The default `cache-min-entries: 2048` prevents the cache from being
-destroyed. If halvings have no measurable effect, Runbound logs a single `WARN` and
-stops halving:
+| Used memory | Action |
+|---|---|
+| < 60 % | No action (stable). |
+| 60–80 % | Logged at `debug` only — no cache resize. |
+| ≥ 80 % | `ForwardPool` is rebuilt with the same target size (refreshes upstream/DoT connections), cache stats counters are reset, and the rate limiter's bucket table is cleared to free memory: |
 
 ```
-WARN cache halving has no effect on memory pressure (pct before=73.0% after=72.6%) —
-     cache floor reached, consider increasing MemoryMax in the service file or reducing other workloads
+WARN memory pressure high: pool rebuilt, rate limiter cleared  used_pct=82.1%  freed_buckets=4096
 ```
 
-**Root cause resolution:** If the warning persists, the system is genuinely memory-
-constrained. Options:
-- Increase `MemoryMax` in the systemd service file (e.g. `MemoryMax=512M`)
-- Reduce the workload of other processes sharing the host
-- Lower `cache-min-entries` to `1024` or `512` to free more cache memory
-- Add swap space as a last resort
+**If you are still low on memory:**
+- Increase `MemoryMax` in the systemd service file (e.g. `MemoryMax=512M`) so the
+  cgroup gives Runbound more headroom to size its startup cache ceiling from.
+- Set an explicit `cache-size:` in `runbound.conf` to cap the cache regardless of
+  available RAM.
+- Reduce the workload of other processes sharing the host.
+- Add swap space as a last resort.
 
 ---
 

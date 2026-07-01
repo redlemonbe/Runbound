@@ -612,12 +612,13 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 | Feature | Default | Effect |
 |---------|---------|--------|
 | `xdp` | ✅ enabled (`default`) | Compile eBPF program and AF_XDP code (`dep:aya`) |
-| `hsm` | ❌ disabled | PKCS#11 hardware key support |
+| `fuzz` | ❌ disabled | Expose internal parsing functions for cargo-fuzz targets — never enabled in release |
+| `xdp-debug-counters` | ❌ disabled | Per-interface TX/RX instrumentation counters for debugging XDP — never enabled in benchmarks |
 
-There is no `recursor` Cargo feature. Full-recursion (`src/dns/recursor_wire.rs`) and
-DNSSEC validation (`src/dns/dnssec_*.rs`) are entirely in-house, always compiled in, and
-always available in the default build — full-recursion is a **runtime config toggle**
-(`resolution: full-recursion`), not a compile-time flag.
+There is no `recursor` and no `hsm` Cargo feature. Full-recursion (`src/dns/recursor_wire.rs`),
+DNSSEC validation (`src/dns/dnssec_*.rs`), and HSM/PKCS#11 support (`src/hsm.rs`) are entirely
+in-house, always compiled into the binary, and toggled purely via **runtime config**
+(`resolution: full-recursion`, `hsm-pkcs11-lib`) — never a compile-time flag.
 
 > **de-hickory (v0.23):** DNS is served end-to-end by the in-house wire codec on every
 > path. `hickory-proto` remains **only** as a `[dev-dependencies]` entry, used

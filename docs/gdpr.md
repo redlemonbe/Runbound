@@ -16,7 +16,8 @@ and procedures for handling data subject requests.
 | Source IP of DNS queries | In-memory ring buffer (`/logs`) | Until restart or rotation | `log-retention`, `log-client-ip` |
 | Queried domain names | In-memory ring buffer (`/logs`) | Until restart or rotation | `log-retention` |
 | Source IP of API calls | Audit log | Until manual rotation | `audit-log-path` |
-| API key (hashed) | Memory only | Duration of the process | — |
+| Master API key (plain text) | Memory only | Duration of the process | — |
+| Per-user API keys (plain text, multi-user mode) | `users.json` on disk (file must be `0600`) | Until the user account is deleted | `DELETE /api/users/:id` |
 
 Runbound **does not persist** DNS data to disk by default.
 The `logfile:` directive is disabled by default.

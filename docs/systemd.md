@@ -171,7 +171,7 @@ journalctl -u runbound -n 20 | grep "Hot-reload complete"
 | `SIGHUP` | Hot-reload zones and config (same as `POST /api/reload`). In-flight queries finish on the old snapshot. |
 | `SIGTERM` | Graceful shutdown — XDP detached, connections drained, process exits cleanly. |
 | `SIGUSR1` | Dump live stats to the log: total queries, forwarded, blocked, 1-minute QPS, cache hit rate, uptime. |
-| `SIGUSR2` | Ignored (reserved for future use). |
+| `SIGUSR2` | Persist the XDP cache to disk (`xdp_cache.rkyv`, rkyv-serialized, atomic write via temp file + rename). Reloaded automatically on next startup. No-op (logged at debug) if the XDP cache is not active. |
 
 ```bash
 # Reload zones
@@ -180,6 +180,10 @@ systemctl reload runbound          # sends SIGHUP
 # Dump live stats to journal
 kill -USR1 $(systemctl show -p MainPID --value runbound)
 journalctl -u runbound -n 5        # look for the stats line
+
+# Persist the XDP cache to disk before a planned restart
+kill -USR2 $(systemctl show -p MainPID --value runbound)
+journalctl -u runbound -n 5        # look for "XDP cache saved"
 ```
 
 ---

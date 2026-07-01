@@ -74,7 +74,8 @@ build outright, so even the fallback path no longer pays the `ServerFuture` per-
 ## 1.3 The shared wire answer routine
 
 Both fast tiers call the same function, `answer_dns_wire` (exposed as
-`answer_dns_wire_pub` for the kernel loop, `src/dns/kernel_loop.rs:202`). It:
+`answer_dns_wire_pub` in `src/dns/xdp/worker.rs`, called from the kernel loop at
+`src/dns/kernel_loop.rs:356`). It:
 
 1. parses the query with `parse_query` (no allocation, SIMD `find_zero`),
 2. looks the name up in a `WireRecordIndex` keyed by CRC32c `hash_wire_qname`,

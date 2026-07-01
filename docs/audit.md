@@ -181,6 +181,7 @@ this is beyond the current `src/hsm.rs` scope. See [`docs/hsm.md`](hsm.md) for d
 | Advisory | Crate | Reason ignored |
 |---|---|---|
 | RUSTSEC-2025-0134 | `rustls-pemfile` | Maintenance notice only, no CVE. `rustls-pemfile 2.x` is a thin wrapper around `rustls-pki-types`. Migration planned at next rustls update cycle. |
+| RUSTSEC-2024-0436 | `paste` | Compile-time proc-macro crate (identifier concatenation) with no runtime code and no security impact. Transitive via `cryptoki 0.6`, no upstream fix available yet. |
 
 New advisories that cannot be ignored must block the release until the affected crate
 is updated or the advisory is explicitly acknowledged in `deny.toml` with a dated justification.

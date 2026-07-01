@@ -68,6 +68,9 @@ restart (split-horizon, whose resolver table is built at boot).
 - **Backup/restore**: `GET/POST /api/backup` export/import — base64 JSON of the managed
   state files + `runbound.conf`; import is path-whitelisted and written atomically.
 - **Split-horizon**: per-client-network answer sets, CRUD via API + web UI.
+- **Per-subnet/VLAN policies (#8)**: `/api/policies` adds domain blocks scoped to one
+  subnet, additive to the global blacklist/feeds filter (never less permissive), applied
+  live with no restart. Merged into the WebUI **Subnets** tab alongside split-horizon.
 - **Embedded web UI**: static HTML gzipped at build (`include_bytes!` of
   `OUT_DIR/index.html.gz`), served by the binary — no nginx since v0.9.0. Since **v0.22** the
   admin panel **binds `127.0.0.1` by default** (`ui-bind` default changed from `0.0.0.0`,
