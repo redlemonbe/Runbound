@@ -1,33 +1,39 @@
 # 08 — Performance
 
-> **Status: current as of v0.23.8 (benchmark figures from 2026-06-15 — unchanged: the
-> v0.22.4→v0.23.8 changes are slow-path/serving-core fixes, a single gated length
-> check on the cache-hit path (only taken past 512 bytes), and setup-time-only
-> hardening — none touch the zero-syscall SIMD hot path or add cost to the common
-> case)** — governed by `docs/benchmark/README.md`
-> (the methodology) and the per-run reports under `docs/benchmark/`. The suite was re-run on
-> a new rig (Threadripper PRO 5995WX receiver; dual Xeon E5-2690 v2 generator; direct 10 GbE
-> DACs Intel X710/i40e + X510/ixgbe; dnsmark v2.3.0; warm cache; NIC `tx_packets` truth); the
-> dual-link runs and the latency were refreshed at **v0.20.0** (DNS datapath byte-identical to
-> v0.18.1). Headline measured results (per-run reports in `docs/benchmark/`, indexed in
-> `docs/benchmark/INDEX.md`):
+> **Status: re-measured on v0.23.8 (2026-07-01)**, using the official, minisig-signed
+> GitHub release binaries for both Runbound and the generator (dnsmark v2.6.0) — no
+> locally-compiled artifacts. This confirms no regression from the de-hickory rewrite
+> (recursion + DNSSEC validation moved fully in-house): the fast path's hot loop was not
+> touched, and single-link X710 throughput rose from the prior ~10.12 Mqps baseline to
+> ~12.56 Mqps at lower CPU. Governed by `docs/benchmark/README.md` (the methodology) and
+> the per-run reports under `docs/benchmark/`, indexed in `docs/benchmark/INDEX.md`. This
+> round also directly measured and quantified dnsmark's own under-reporting at
+> saturation (12–34% below the receiver's NIC hardware counters, depending on
+> configuration) — all figures below are the NIC-hardware-verified numbers, not
+> dnsmark's self-reported ones. **Caveat: 2 MiB huge pages were unavailable for this
+> round** (host memory fragmentation, unrelated to the resolver or to any user VM) —
+> Runbound's own logging documents this as a lower-throughput fallback path, so every
+> number below is a floor, not the fully-tuned ceiling (see the report's §5).
 >
-> | v0.20.0 | served (NIC) | receiver CPU | limited by |
+> | v0.23.8 (2026-07-01) | served (NIC) | receiver CPU | limited by |
 > |---|---|---|---|
-> | `xdp: yes` **dual-link** X510+X710 | **~20.3 Mqps** | ~24 % (steady) | the two 10 G links (server not saturated) |
-> | `xdp: yes` single link X710 | ~10.14 Mqps | ~10.5 % (steady) | 10 G link response direction |
-> | `xdp: yes` dual-link X710 (1 gen card) | ~13.5 Mqps | ~12 % | generator's single X710 card |
-> | `xdp: no` kernel slow path X710 | ~3.71 Mqps | ~19 % | kernel-UDP RX + generator |
+> | `xdp: yes` **dual-link** X710+X520 | **~19.9 Mqps** | not isolated | generator-side imbalance (dnsmark #15-P2), not Runbound — see report §5 |
+> | `xdp: yes` single link X710 | ~12.56 Mqps | ~9.3 % | 10 G link response direction |
+> | `xdp: yes` single link X520 | ~11.88 Mqps | not isolated | ixgbe RX path (non-zero `rx_missed_errors`) |
 >
-> **Latency** (fast-path wire RTT, capped sub-saturation; AF_XDP can't be tcpdump-anchored):
-> i40e **p50 0.073 / p95 0.203 / p99 0.245 ms**, ixgbe p50 0.188 / p99 0.256 ms. Slow path
-> (closed-loop, kernel-UDP): p50 0.066 / p95 0.207 / p99 0.371 ms. The closed-loop `--xdp`
-> *completion %* under-counts (generator-side accounting, HW-proven: server emits ~all
-> responses; the matched-sample RTT is the valid figure) — see the per-run reports.
+> **Latency** (dnsmark `--ramp`, per-step): X710 at 6.4 Mqps sustained (pre-knee) p50
+> 0.212 / p95 0.271 / p99 0.291 ms; at the ~12.77 Mqps knee p50 0.876 / p99 0.962 ms — still
+> sub-millisecond at saturation. X520 at 6.4 Mqps sustained p50 0.138 / p99 0.254 ms; at the
+> ~12.79 Mqps knee p50 0.942 / p99 1.052 ms.
 >
-> In no run did Runbound reach its own CPU ceiling (≤24 %). Same-rig kernel-UDP references:
-> unbound 1.22.0 ~2.09 M, BIND 9.20.23 ~1.84 M. The older v0.16.11 (X710) and v0.17.0
-> sections below are superseded by the v0.18.1 reports but kept for the datapath history.
+> In no run did Runbound show CPU saturation or non-zero error rate. Historical
+> reference (v0.18.1/v0.19.3, 2026-06-13/15, superseded by the round above but kept for
+> the datapath history): dual-link X510+X710 ~20.3 Mqps at ~24% CPU (that run used two
+> *separate* generator cards, avoiding this round's generator-imbalance limitation — the
+> two dual-link figures are not directly comparable, see `docs/benchmark/RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md` §5); single-link X710 ~10.12 Mqps; kernel slow path
+> X710 ~3.71 Mqps. Same-rig kernel-UDP references: unbound 1.22.0 ~2.09 M, BIND 9.20.23
+> ~1.84 M. The older v0.16.11 (X710) and v0.17.0 sections below are superseded but kept
+> for the datapath history.
 
 This chapter holds **only measured numbers produced under the documented methodology**.
 Until a run is completed under that methodology at the current version, this chapter states

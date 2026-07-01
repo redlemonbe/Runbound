@@ -10,6 +10,32 @@ generator's self-reported rate. Full context behind every number in its report.
 > this current round; pre-v0.18.1 results (X520, X710 v0.16.x, EPYC/bnxt) were measured on a
 > different binary and are superseded — recoverable from git history if ever needed.
 
+## Re-run on v0.23.8 (2026-07-01) — same rig, official release binaries, NIC-counter ground truth
+
+Re-validated after the de-hickory rewrite (recursion + DNSSEC now fully in-house). Both
+Runbound (v0.23.8) and the generator (dnsmark v2.6.0) were the **official, minisig-signed
+GitHub release binaries** — no local compilation. This round also **directly measured and
+quantified** the gap between dnsmark's own self-reported throughput and the receiver's NIC
+hardware counters (the latter is what this table has always used): dnsmark under-reported
+by 12–34% at saturation across all three configurations below — see the report for the
+side-by-side numbers. **Caveat affecting every row below:** 2 MiB huge pages were unavailable
+this session (host memory fragmentation, unrelated to any user VM); Runbound's own logging
+confirms this is a lower-throughput fallback path, so these figures are a **floor, not the
+tuned ceiling** — a post-reboot re-run is needed for that.
+
+| Max served | Latency (p50) | Receiver CPU | Configuration | Link / NIC | Report |
+|-----------:|--------------:|-------------:|---------------|-----------|--------|
+| **~19.9 M qps** | 0.591 ms (at knee) | not isolated (aggregate run) | **Runbound v0.23.8** `xdp: yes` **dual-link**, one generator process on both NICs — **generator-imbalanced** (dnsmark issue #15-P2: X710 share starved to 8.55M of its own 12.56M solo ceiling) | X710 + X520 | [report](RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md) |
+| **~12.56 M qps** | 0.212 ms (sustained) / 0.876 ms (at knee) | **~9.3 %** | **Runbound v0.23.8** `xdp: yes` (AF_XDP fast path), no huge pages this run | X710 (i40e) | [report](RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md) |
+| **~11.88 M qps** | 0.138 ms (sustained) / 0.942 ms (at knee) | not isolated | **Runbound v0.23.8** `xdp: yes` (AF_XDP fast path), no huge pages this run | X520 (ixgbe) | [report](RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md) |
+
+**No regression vs the v0.18.1/v0.19.3 baseline below** — single-link X710 rose from ~10.12 M
+to ~12.56 M served at lower CPU (~24% → ~9.3%), consistent with no fast-path code having
+moved during the de-hickory rewrite. The dual-link figure (~19.9 M) is **not directly
+comparable** to the v0.19.3 dual-link row (~20.3 M): that earlier run used two separate
+generator cards to avoid the exact imbalance this session's single-process, single-card-pair
+setup hit — see the report's §5 for the full explanation.
+
 ## New bench rig (2026-06-13) — X710 + X510 direct links, **non-XDP generator**
 
 A fresh rig to re-run the whole suite: the same hosts (5995WX receiver / dual Xeon E5-2690 v2
@@ -76,6 +102,8 @@ round-trip. Every run follows [README.md](README.md) (warmup + ramp) and [TEMPLA
 - [TEMPLATE.md](TEMPLATE.md) — the report template every run follows.
 - [runbound-receiver-bench.conf](runbound-receiver-bench.conf) — the receiver config for the
   Runbound runs (`xdp:no`, real forward-zone, no local-data, `rate-limit: 0`).
+- **Re-run on v0.23.8 (2026-07-01) — official release binaries, NIC-counter ground truth**
+  - [Runbound v0.23.8 `xdp: yes` — X710 (i40e) + X520 (ixgbe) single-link + dual-link (all three in one report)](RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md)
 - **New bench rig (2026-06-13) — X710 + X510 direct links**
   - [Runbound v0.19.3 `xdp: yes` **dual-link X510+X710** (20.3 M, link-bound; per-link p99 ≤0.26 ms)](RUNBOUND-v0.19.3-threadripper-5995wx-x510x710-dual-xdp-2026-06-15.md)
   - [Runbound v0.19.3 `xdp: yes` **dual-link X710** (13.50 M, generator-bound; p50/p95/p99 0.100/0.247/0.251 ms)](RUNBOUND-v0.19.3-threadripper-5995wx-x710-dual-xdp-2026-06-15.md)
