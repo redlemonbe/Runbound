@@ -121,6 +121,37 @@ pub async fn trusted_keys_for<F: Fetcher>(
         let (ds_rd, ds_sig) = split(&ds_msg.answers, consts::rtype::DS);
 
         if ds_rd.is_empty() {
+            // `delegation_path` synthesizes every label boundary between the root
+            // and `zone`, not just the ones that are REAL delegations — reverse
+            // (in-addr.arpa) trees routinely skip levels (RFC 2317-style: e.g.
+            // 1.1.in-addr.arpa. has no NS of its own; the real next cut is
+            // 1.1.1.in-addr.arpa., delegated straight from 1.in-addr.arpa. by
+            // APNIC/ARIN to Cloudflare — confirmed live via `dig +trace -x 1.1.1.1`).
+            // A DS query at exactly a delegation point is answered authoritatively
+            // by the PARENT either way (RFC 4035 §3.1.4.1), so an empty DS answer
+            // looks IDENTICAL whether `child` is a real (if unsigned) cut or just a
+            // synthetic non-existent label — the response shape alone (SOA owner,
+            // lack of a referral) cannot tell them apart. What DOES distinguish them
+            // uniformly, whether `fetcher` walks iteratively or delegates to an
+            // upstream full resolver: a genuinely delegated name has its OWN NS
+            // RRset resolvable in the answer section (confirmed live: `dig
+            // google.com NS` → ANSWER 4; `dig 1.1.in-addr.arpa NS` → ANSWER 0, only
+            // a NODATA SOA; `dig 1.1.1.in-addr.arpa NS` → ANSWER 2). Only treat an
+            // empty DS as an insecure-delegation candidate when `child` clears that
+            // bar; otherwise it's not a real cut, so skip it and keep validating
+            // deeper against the SAME (already-trusted) parent keys.
+            let is_real_cut = fetcher
+                .fetch(&child, consts::rtype::NS)
+                .await
+                .is_some_and(|ns_msg| {
+                    ns_msg
+                        .answers
+                        .iter()
+                        .any(|r| r.rtype == consts::rtype::NS && r.name.eq_ignore_ascii_case(&child))
+                });
+            if !is_real_cut {
+                continue;
+            }
             // No DS: must be a PROVEN insecure delegation (NSEC/NSEC3 in authority,
             // validated under the parent's keys). Otherwise Bogus.
             return if denial_secure(&ds_msg, &child, &key_refs, now) {
@@ -570,5 +601,24 @@ mod tests {
         let (chain, _) = trusted_keys_for(&f, &un, now).await;
         eprintln!("google.com chain -> {chain:?}");
         assert_eq!(chain, Verdict::Insecure);
+
+        // Regression: reverse-DNS trees routinely skip delegation levels (RFC
+        // 2317-style — confirmed live via `dig +trace -x 1.1.1.1`: the real chain
+        // is in-addr.arpa. -> 1.in-addr.arpa. (APNIC/ARIN) -> 1.1.1.in-addr.arpa.
+        // (Cloudflare), with NO separate delegation at 1.1.in-addr.arpa. — that
+        // label has no NS of its own). Before the fix, `delegation_path`'s
+        // synthesized (non-cut) boundary at 1.1.in-addr.arpa. had an empty DS
+        // answer misread as "insecure delegation ends here", short-circuiting the
+        // walk into Bogus/SERVFAIL before it ever reached the real cut. The real
+        // cut (1.1.1.in-addr.arpa., confirmed live: `dig 1.1.1.in-addr.arpa DS` →
+        // NODATA + valid NSEC) is itself genuinely unsigned — Quad9 and
+        // Cloudflare's own resolver both answer this exact query without the AD
+        // bit too — so the correct verdict is Insecure, not Bogus: the fix must
+        // reach and correctly validate the REAL cut, not fabricate security that
+        // was never there.
+        let ptr = Name::from_ascii("1.1.1.1.in-addr.arpa.").unwrap();
+        let (ptr_chain, _) = trusted_keys_for(&f, &ptr, now).await;
+        eprintln!("1.1.1.1.in-addr.arpa. chain -> {ptr_chain:?}");
+        assert_eq!(ptr_chain, Verdict::Insecure);
     }
 }
