@@ -1606,15 +1606,33 @@ async fn resolution_put_handler(
 
 // ── DNS CRUD ───────────────────────────────────────────────────────────────
 
-async fn list_dns_handler(State(_s): State<AppState>) -> impl IntoResponse {
+async fn list_dns_handler(
+    State(_s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> impl IntoResponse {
+    // BOLA fix: get_dns_handler enforces may_manage_name on a single entry, but
+    // this list handler returned the whole store — a non-admin `read` user could
+    // enumerate every other tenant's records. Filter to the caller's manageable
+    // zones (admin_context → admin=true → sees all, unchanged for the master key).
+    let caller = caller_ext
+        .map(|e| e.0)
+        .unwrap_or_else(crate::multiuser::RequestUser::admin_context);
     match store::load() {
-        Ok(st) => (
-            StatusCode::OK,
-            JsonExtract(serde_json::json!({
-                "entries": st.entries,
-                "total": st.entries.len()
-            })),
-        ),
+        Ok(st) => {
+            let entries: Vec<_> = st
+                .entries
+                .into_iter()
+                .filter(|e| caller.may_manage_name(&e.name))
+                .collect();
+            let total = entries.len();
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "entries": entries,
+                    "total": total
+                })),
+            )
+        }
         Err(e) => {
             warn!(err = %e, "store load failed");
             (
@@ -2156,15 +2174,34 @@ async fn dns_lookup_handler(
 
 // ── Blacklist ──────────────────────────────────────────────────────────────
 
-async fn list_blacklist_handler(State(_s): State<AppState>) -> impl IntoResponse {
+async fn list_blacklist_handler(
+    State(_s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
+) -> impl IntoResponse {
+    // BOLA fix: only return blacklist entries the caller owns (admin sees all).
+    // Previously the full store leaked to any authenticated `read` user.
+    let caller = caller_ext
+        .map(|e| e.0)
+        .unwrap_or_else(crate::multiuser::RequestUser::admin_context);
     match store::load_blacklist() {
-        Ok(bl) => (
-            StatusCode::OK,
-            JsonExtract(serde_json::json!({
-                "blacklist": bl.entries,
-                "total": bl.entries.len()
-            })),
-        ),
+        Ok(bl) => {
+            let entries: Vec<_> = bl
+                .entries
+                .into_iter()
+                .filter(|e| {
+                    caller.admin
+                        || e.owner_user_id.as_deref() == Some(caller.id.as_str())
+                })
+                .collect();
+            let total = entries.len();
+            (
+                StatusCode::OK,
+                JsonExtract(serde_json::json!({
+                    "blacklist": entries,
+                    "total": total
+                })),
+            )
+        }
         Err(e) => {
             warn!(err = %e, "blacklist load failed");
             (
@@ -4307,6 +4344,19 @@ async fn create_user_handler(
     };
     if body.username.trim().is_empty() || body.username.len() > 64 {
         return (StatusCode::BAD_REQUEST, JsonExtract(serde_json::json!({"error":"INVALID_USERNAME"}))).into_response();
+    }
+    // Stored-XSS defence-in-depth: username + zone_prefixes are rendered in the
+    // admin WebUI. The UI escapes them, but reject HTML-significant bytes here
+    // too — they are never valid in a username or a DNS zone name.
+    let has_html = |s: &str| s.bytes().any(|b| matches!(b, b'<' | b'>' | b'"' | b'\'' | b'&'));
+    if has_html(&body.username) || body.zone_prefixes.iter().any(|p| has_html(p)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            JsonExtract(serde_json::json!({
+                "error":"INVALID_INPUT",
+                "details":"username/zone_prefixes must not contain < > \" ' &"
+            })),
+        ).into_response();
     }
     match reg.create_user(body.username, body.zone_prefixes, body.admin, body.role) {
         Ok(u) => {

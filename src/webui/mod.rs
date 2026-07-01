@@ -655,7 +655,20 @@ async fn change_password(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "hash error").into_response(),
     };
     let body = serde_json::json!({ "username": payload.username, "hash": hash }).to_string();
-    if let Err(e) = std::fs::write(&state.auth_path, &body) {
+    // Credential file → 0600 (holds the admin username + argon2 hash). Plain
+    // fs::write inherits umask (0644); create it 0600 explicitly.
+    let write_res = {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&state.auth_path)
+            .and_then(|mut f| f.write_all(body.as_bytes()))
+    };
+    if let Err(e) = write_res {
         warn!(err=%e, "failed to write webui-auth.conf");
         return (StatusCode::INTERNAL_SERVER_ERROR, "write failed").into_response();
     }

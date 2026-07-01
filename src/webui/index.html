@@ -2323,7 +2323,7 @@ async function loadUsers() {
     if (!Array.isArray(d) || !d.length) { el.innerHTML = '<span class="text-xs text-gray-600 italic">No users yet.</span>'; return; }
     el.innerHTML = d.map(u => {
       const adminBadge = u.admin ? '<span class="px-1.5 py-0.5 rounded bg-cyan-900 text-cyan-300 text-xs">admin</span>' : '';
-      const prefixes = (u.zone_prefixes||[]).join(', ') || '<span class="text-gray-700 italic">all zones</span>';
+      const prefixes = (u.zone_prefixes||[]).map(esc).join(', ') || '<span class="text-gray-700 italic">all zones</span>';
       return '<div class="card flex items-center gap-3 flex-wrap text-xs">' +
         '<span class="font-mono text-gray-300 w-32 truncate">' + esc(u.username) + '</span>' +
         '<span class="text-gray-600 font-mono text-xs w-24 truncate" title="' + esc(u.id) + '">' + u.id.slice(0,8) + '…</span>' +

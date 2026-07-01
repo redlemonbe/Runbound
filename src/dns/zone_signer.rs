@@ -94,11 +94,36 @@ fn now_secs() -> u64 {
 // ── Key file management (unchanged on-disk format: PKCS#8 DER, mode 0600) ──────────────────────
 
 /// Directory holding a zone's keys: `<config_dir>/dnssec/<zone>/`.
+///
+/// Defence-in-depth: the zone name reaches this filesystem sink, and
+/// `Name::from_ascii`/`to_ascii` round-trip a literal `/` (path separator) or an
+/// absolute component (e.g. a zone parsed from a crafted `runbound.conf` or a
+/// relay `import_key` payload). A non-LDH label falls back to a collision-free
+/// SHA-256 of the presentation name, so the result can never escape
+/// `<config_dir>/dnssec/`. Deterministic per zone, so keys are found again on
+/// reload. Normal LDH zones keep their readable directory name.
 fn zone_key_dir(config_dir: &Path, zone: &Name) -> PathBuf {
-    let label = zone.to_ascii();
-    let label = label.trim_end_matches('.');
+    let ascii = zone.to_ascii();
+    let label = ascii.trim_end_matches('.');
     let label = if label.is_empty() { "root" } else { label };
-    config_dir.join("dnssec").join(label)
+    let safe = label.len() <= 255
+        && !label.starts_with('.')
+        && !label.contains("..")
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_');
+    if safe {
+        config_dir.join("dnssec").join(label)
+    } else {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(ascii.as_bytes());
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        config_dir.join("dnssec").join(hex)
+    }
 }
 
 /// Load the zone's KSK + ZSK, generating and persisting them (mode 0600) on first use.

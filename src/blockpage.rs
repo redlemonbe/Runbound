@@ -66,7 +66,19 @@ pub async fn start(cfg: Arc<BlockPageConfig>) {
                         .and_then(|l| l.splitn(2, ':').nth(1))
                         .map(|s| s.trim().to_string())
                         .unwrap_or_default();
-                    let domain = host.split(':').next().unwrap_or(&host).to_string();
+                    // XSS guard: `domain` comes from the attacker-controlled Host
+                    // header and is interpolated into HTML and an inline JS string
+                    // in build_page. A real DNS hostname is LDH-only, so strip
+                    // everything else — this neutralises both the HTML and the JS
+                    // injection contexts at the source.
+                    let domain: String = host
+                        .split(':')
+                        .next()
+                        .unwrap_or(&host)
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+                        .take(253)
+                        .collect();
                     let body = build_page(&cfg, &domain);
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",

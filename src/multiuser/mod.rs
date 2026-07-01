@@ -172,8 +172,22 @@ impl UserRegistry {
         let data = serde_json::to_vec_pretty(store)
             .map_err(|e| format!("serialize users: {e}"))?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &data)
-            .map_err(|e| format!("write users tmp: {e}"))?;
+        // users.json holds per-user API keys → 0600 (the code comment already
+        // required it). Plain fs::write inherits umask (0644 world-readable);
+        // create the temp file with mode 0600 so the rename lands 0600.
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| format!("open users tmp: {e}"))?;
+            f.write_all(&data)
+                .map_err(|e| format!("write users tmp: {e}"))?;
+        }
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| format!("rename users store: {e}"))?;
         Ok(())
