@@ -149,8 +149,9 @@ data-encoding = "2.11.0"
 
 [dev-dependencies]
 # Differential oracle tests prove our wire codec / DNSSEC / TSIG byte-identical to
-# hickory. hickory-proto is no longer a default runtime dep (see recursor feature),
-# but the oracle tests still need it — pull it in for tests only.
+# hickory. hickory-proto is not a runtime dependency at all (no `recursor` feature
+# exists — recursion + DNSSEC are in-house and always on), but the oracle tests
+# still need it — pull it in for tests only.
 hickory-proto    = { version = "0.26", features = ["dnssec-ring"] }
 
 

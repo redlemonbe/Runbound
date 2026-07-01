@@ -12,8 +12,8 @@ Only the **latest released version** receives security fixes — there is no LTS
 
 | Version | Supported |
 |---------|-----------|
-| 0.22.x  | ✅ |
-| < 0.22  | ❌ |
+| 0.23.x  | ✅ |
+| < 0.23  | ❌ |
 
 ## Reporting a vulnerability
 
@@ -50,11 +50,12 @@ Do **not** open a public issue for security problems. Reports are handled on a
 - **DNS rebinding:** `private-address` CIDRs are stripped from upstream answers.
 - **Cache poisoning:** the forward path validates the upstream response transaction-ID and
   question before accepting it.
-- **Reduced attack surface (v0.22):** the default build is **hickory-free on the
-  network-facing serving path** — DNS is served by the in-house wire codec (`serve_wire`).
-  The hickory-dns request handler and the sovereign full-recursion resolver live behind the
-  optional `recursor` Cargo feature (`hickory-proto` remains, backing the data model and XDP
-  builders).
+- **Reduced attack surface (v0.23):** the default build is **fully hickory-free at
+  runtime** — DNS is served by the in-house wire codec (`serve_wire`), and recursion +
+  DNSSEC validation (RRSIG verification, DS/DNSKEY chain-of-trust, NSEC/NSEC3 denial)
+  are entirely in-house (`dns::recursor_wire`, `dns::dnssec_*`), on by default. There
+  is no `recursor` Cargo feature. `hickory-proto` remains only as a dev-dependency for
+  differential oracle tests (`cargo tree -e normal` is hickory-free).
 - **Access control:** `access-control` ACLs; the REST API binds to localhost only
   (the WebUI server proxies `/api/*` internally). The WebUI itself binds `127.0.0.1` by
   default (`ui-bind`); network exposure requires an explicit `ui-bind: 0.0.0.0`. For
