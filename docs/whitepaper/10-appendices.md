@@ -9,10 +9,12 @@ See `docs/configuration.md`. Notable directives: `xdp`, `api-port`, `api-key`,
 the WebUI on the network), `log-format` (#175, json/text), `upstream-racing`, `serve-stale`,
 DoT upstreams, split-horizon, firewall.
 
-> **Build note (v0.22 de-hickory).** The default build is hickory-free on the request path
-> (`default = ["xdp"]`, `Cargo.toml:170`). Sovereign full recursion is the optional
-> `recursor` Cargo feature (`Cargo.toml:180`, pulls `hickory-resolver` + `hickory-server`);
-> build it with `--features recursor`.
+> **Build note.** Sovereign full recursion (`src/dns/recursor_wire.rs`) and DNSSEC
+> validation (`src/dns/dnssec_*.rs`) are in-house, always on by default — there is no
+> `recursor` Cargo feature anymore. Full-recursion is a runtime config toggle
+> (`resolution: full-recursion` vs the default `forward`), not a compile-time flag.
+> `hickory-proto` remains only as a `[dev-dependencies]` entry for the differential
+> oracle tests — `cargo tree -e normal` is hickory-free.
 
 ## B. API reference
 See `docs/api.md`. Endpoint groups: zones, blacklist/feeds, upstreams, `/system`, stats,

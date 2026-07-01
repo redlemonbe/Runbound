@@ -24,13 +24,14 @@
 - **DNSSEC `AD`.** With `dnssec-validation: yes` on the default (forward) path, the
   forwarder tracks `Secure`/`Insecure` by the presence of an `RRSIG` in the upstream answer
   (`src/dns/server.rs:999`); the wire serving path never sets `AD` on its own authoritative
-  answers (`wire_serve` clears it, `src/dns/wire_serve.rs:56`). With the optional `recursor`
-  feature, the sovereign resolver attaches a per-record `Proof` and sets `AD` only when every
-  answer + authority record is cryptographically `Secure`, `Bogus` is SERVFAIL'd, and
-  insecure/unsigned answers leave `AD` clear (`src/dns/server.rs:644`). Outbound DNSSEC
-  **signing** of local zones is wire-native — an in-house ECDSA P-256 signer on `ring`
-  (RFC 6605/4034/5155/9276), validated byte-identical to hickory by differential oracles and
-  `delv`.
+  answers (`wire_serve` clears it, `src/dns/wire_serve.rs:56`). With `resolution:
+  full-recursion` (a runtime config toggle, not a Cargo feature), the sovereign in-house
+  resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) attaches a per-record `Proof`
+  and sets `AD` only when every answer + authority record is cryptographically `Secure`,
+  `Bogus` is SERVFAIL'd, and insecure/unsigned answers leave `AD` clear
+  (`src/dns/server.rs:644`). Outbound DNSSEC **signing** of local zones is wire-native — an
+  in-house ECDSA P-256 signer on `ring` (RFC 6605/4034/5155/9276), validated byte-identical
+  to a hickory-proto oracle in dev-only differential tests and against `delv`.
 - **API auth is constant-time.** The bearer token is compared with `subtle::ConstantTimeEq`
   (no early-exit timing side-channel). The unauthenticated surface is a single `/health`
   liveness route (no version or secrets).

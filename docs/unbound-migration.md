@@ -48,7 +48,7 @@ Directives that work but with noted differences from Unbound's behavior.
 
 | Directive | Caveat |
 |---|---|
-| `dnssec-validation` | In the **default build** (forwarding resolver), Runbound trusts the upstream AD bit rather than performing full RRSIG chain validation. Full RRSIG-chain validation is performed under sovereign full recursion (`resolution: full-recursion`), which is built from the optional `recursor` Cargo feature — not part of the default release binary. |
+| `dnssec-validation` | In the **default `forward` resolution mode**, Runbound trusts the upstream AD bit rather than performing full RRSIG chain validation. Full RRSIG-chain validation is performed under sovereign full recursion (`resolution: full-recursion`), an in-house resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) always compiled in and always available — it's a runtime config toggle, not a Cargo feature or special build. |
 | `rate-limit` | Runbound uses a per-IP token bucket compatible with Unbound's semantics. Runbound extends this with per-subnet bucketing via `rate-limit-prefix-v4` / `rate-limit-prefix-v6` (Runbound-specific directives). |
 | `tls-cert-bundle` | Accepted as an alias for `tls-service-pem`. Unbound uses `tls-cert-bundle` for the CA bundle, not the server certificate — if you use both, set `tls-service-pem` explicitly. |
 

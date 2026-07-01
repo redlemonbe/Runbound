@@ -385,8 +385,9 @@ The stream is a standard SSE event stream (`Content-Type: text/event-stream`). E
 Most-queried domain names since process start, sorted by query count descending.
 Tracks up to 10,000 distinct domains. Counter is cumulative (not windowed).
 
-> **v0.22:** slow-path domain counting is done on the default wire serving path, so
-> top-domains is populated independently of the optional hickory recursor.
+> **v0.22:** slow-path domain counting is done on the in-house wire serving path
+> (`serve_wire`), so top-domains is populated on every path (forward, full-recursion,
+> local, etc.) — there is no separate hickory-backed handler.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -417,9 +418,9 @@ Once the cap is reached, new domains are silently ignored until the process rest
 
 Recent DNS query log, newest first. Entries are kept in a fixed-size ring buffer pre-allocated at startup (zero allocation per query). The buffer size is controlled by `log-retention` in `runbound.conf` (default: **1,000**, compile-time max: 10,000). Set to `0` to disable the buffer entirely.
 
-> **v0.22:** query logging is populated by the default wire serving path (`serve_wire`).
-> It is no longer tied to the (now optional) hickory recursor handler — every served
-> query is logged regardless of build features.
+> **v0.22:** query logging is populated by the in-house wire serving path (`serve_wire`).
+> There is no hickory-dns request handler anywhere in the runtime — every served
+> query is logged on every path (forward, full-recursion, local, AXFR, DDNS, TSIG, etc.).
 
 ```bash
 # Last 100 queries (default)

@@ -88,8 +88,8 @@ check of the RUSTSEC advisory database and the upstream changelog before merging
 | `rustls` / `rustls-webpki` | `src/main.rs`, `src/sync.rs` | TLS stack — CVE here breaks DoT/DoH/DoQ security |
 | `tokio` | everywhere | Async runtime — attack surface for all network I/O |
 | in-house wire codec (`src/dns/wire/`) | `src/dns/server.rs` → `serve_wire`, `src/dns/forward.rs` | DNS parsing — the default network-facing path processes untrusted input here (no hickory request handler in the default build) |
-| `hickory-proto` | `src/dns/`, XDP builders | Default dep — backs part of the data model and XDP response builders (no request handler) |
-| `hickory-server` / `hickory-resolver` | `recursor` feature only | Optional sovereign full-recursion path — **not** in the default build |
+| `hickory-proto` | tests only | `[dev-dependencies]` only, used solely by the differential oracle tests — no hickory dependency of any kind in the default runtime build |
+| in-house recursor + DNSSEC (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) | `src/dns/` | Sovereign full-recursion resolver and DNSSEC validation, entirely in-house — always compiled in and on by default; no `recursor` Cargo feature exists. Full-recursion is a runtime config toggle (`resolution: full-recursion` vs. default `forward`), not a build-time flag |
 | `axum` / `hyper` | `src/api/mod.rs` | HTTP server — injection, path traversal, request smuggling |
 | `serde_json` | `src/store.rs`, `src/api/mod.rs` | JSON deserialisation — parses external (API) input |
 | `ring` | transitive via `rustls` | Cryptographic backend — AEAD, HMAC, ECDSA |

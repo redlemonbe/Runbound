@@ -33,15 +33,15 @@ NIC hardware
 The XDP path handles the hot path (local zones + cache hits) at kernel-bypass speed.  
 The Tokio path handles everything else (cache misses, forwarding, management API).
 
-> **v0.22 — de-hickory.** The default build serves DNS **entirely on Runbound's own DNS
-> wire codec** (`src/dns/wire/`, the `serve_wire` path in `src/dns/server.rs`). The
-> hickory-dns request handler (`hickory-server`) is **removed from the default binary** —
-> `cargo tree -i hickory-server` is empty by default. The sovereign **full-recursion**
-> resolver (which still uses `hickory-resolver`) lives behind an optional **`recursor`
-> Cargo feature** and is the *only* place hickory still handles requests. `hickory-proto`
-> remains a default dependency: it backs part of the in-memory data model, the XDP
-> response builders, and a differential test oracle — but **no hickory request handler
-> runs on the default serving path**. The XDP fast path is unchanged.
+> **v0.23 — hickory fully removed from the runtime.** DNS is served **entirely on
+> Runbound's own DNS wire codec** (`src/dns/wire/`, the `serve_wire` path in
+> `src/dns/server.rs`) on every path, including full-recursion. The sovereign
+> **full-recursion** resolver (`src/dns/recursor_wire.rs`) and DNSSEC validation
+> (`src/dns/dnssec_*.rs`) are entirely in-house, always compiled in, and always
+> available in the default build — there is no `recursor` Cargo feature anymore.
+> `hickory-proto` remains **only** as a `[dev-dependencies]` entry, used exclusively
+> by the differential oracle tests (`cargo tree -e normal` is hickory-free). The XDP
+> fast path is unchanged.
 
 ---
 
@@ -344,8 +344,8 @@ in `forward` mode are forwarded by the in-house forwarder (`src/dns/forward.rs`,
 replaces `hickory-resolver`'s resolver on this path). The forwarder validates the upstream
 response's transaction ID and question (name/type/class) before accepting it — a
 cache-poisoning defence added by the de-hickory rewrite (`forward.rs::response_matches`).
-The sovereign full-recursion resolver (the only component still using `hickory-resolver`)
-is an optional `recursor`-feature path; see [§5 Full-recursion](#full-recursion-recursor-feature).
+The sovereign full-recursion resolver is entirely in-house and always compiled in;
+see [§5 Full-recursion](#full-recursion).
 
 - **Local zones:** `ArcSwap<LocalZoneSet>` — reads are lock-free, writes clone + swap
 - **Blacklist / feeds:** `ArcSwap<BlacklistSet>` — same pattern
@@ -481,22 +481,22 @@ apply to LocalZoneSet → ArcSwap swap → persist to dns_entries.json (async)
 RCODE=NOERROR
 ```
 
-### Full-recursion (`recursor` feature)
+### Full-recursion
 
-The sovereign full-recursion resolver (`src/dns/recursor.rs`) is the **only** component
-that still uses `hickory-resolver`, so it is gated behind the optional **`recursor` Cargo
-feature** (`default` = forwarder, hickory-free). With the feature compiled in and
-`resolution: full-recursion` set, cache misses are resolved **iteratively from the root**
-(QNAME minimisation, 0x20 case-randomisation, serve-stale, anti-SSRF guards on glue/NS/CNAME
-addresses, and DNSSEC validation when `dnssec-validation: yes`). When full-recursion is
-*requested* on a default build (feature absent) the recursor is a no-op and Runbound
-silently stays in `forward` mode (`dns::recursor` stub in `src/dns/mod.rs`). The mode is
-toggled live via `PUT /api/resolution` (master propagates to slaves over the relay);
-`src/dns/recursor.rs::rebuild_shared` hot-swaps the `ArcSwap<Option<…>>` handle.
+The sovereign full-recursion resolver (`src/dns/recursor_wire.rs`) is entirely in-house,
+always compiled in, and always available in the default build — there is no Cargo
+feature gating it. Full-recursion is a **runtime config toggle**
+(`resolution: full-recursion` vs the default `forward`), not a compile-time feature: no
+special build or rebuild is needed. When enabled, cache misses are resolved
+**iteratively from the root** (QNAME minimisation, 0x20 case-randomisation, serve-stale,
+anti-SSRF guards on glue/NS/CNAME addresses, and DNSSEC validation when
+`dnssec-validation: yes`). The mode is toggled live via `PUT /api/resolution` (master
+propagates to slaves over the relay); `src/dns/recursor_wire.rs::rebuild_shared`
+hot-swaps the `ArcSwap<Option<…>>` handle.
 
-When the `recursor` feature is enabled, `handle_request_wire` falls back to the hickory
-request handler (`handle_request`) only for the full-recursion query path; every other
-query — including a malformed one — is handled by `serve_wire`.
+Every query path — forward, full-recursion, local, AXFR, DDNS, TSIG — is served by
+`serve_wire` on Runbound's own wire codec; there is no hickory-dns request handler
+anywhere in the runtime.
 
 ---
 
@@ -576,10 +576,11 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 | eBPF XDP program in Rust (aya-bpf) | — | Rewrite `ebpf/dns_xdp.c` in Rust using `aya-bpf` crate. Eliminates clang build dependency. |
 
 > **DNSSEC full validation (#34) — delivered.** Chain-of-trust validation from the root
-> (NSEC/NSEC3, DS/DNSKEY) ships in the sovereign full-recursion resolver behind the
-> `recursor` feature (`src/dns/recursor.rs`), enforced when `dnssec-validation: yes`.
-> Separately, **authoritative DNSSEC signing** for local zones (in-house ECDSA P-256 on
-> `ring`, RFC 6605/4034/5155/9276) is served wire-native on the default path.
+> (NSEC/NSEC3, DS/DNSKEY) ships in the sovereign full-recursion resolver
+> (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`), always on by default in the
+> default build — enforced when `dnssec-validation: yes`. Separately, **authoritative
+> DNSSEC signing** for local zones (in-house ECDSA P-256 on `ring`, RFC 6605/4034/5155/9276)
+> is served wire-native on the default path.
 
 ---
 
@@ -611,23 +612,28 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 | Feature | Default | Effect |
 |---------|---------|--------|
 | `xdp` | ✅ enabled (`default`) | Compile eBPF program and AF_XDP code (`dep:aya`) |
-| `recursor` | ❌ disabled | Sovereign full-recursion resolver (`resolution: full-recursion`). Pulls in `hickory-resolver` + `hickory-server` — **the only path that runs a hickory request handler.** The default build is hickory-handler-free. |
 | `hsm` | ❌ disabled | PKCS#11 hardware key support |
 
-> **de-hickory (v0.22):** `cargo tree -i hickory-server` is empty for the default build.
-> `hickory-proto` is still a default dependency (in-memory data model + XDP response
-> builders + a differential test oracle), but no hickory request handler is on the default
-> serving path. Build the recursor with `--features recursor`.
+There is no `recursor` Cargo feature. Full-recursion (`src/dns/recursor_wire.rs`) and
+DNSSEC validation (`src/dns/dnssec_*.rs`) are entirely in-house, always compiled in, and
+always available in the default build — full-recursion is a **runtime config toggle**
+(`resolution: full-recursion`), not a compile-time flag.
+
+> **de-hickory (v0.23):** DNS is served end-to-end by the in-house wire codec on every
+> path. `hickory-proto` remains **only** as a `[dev-dependencies]` entry, used
+> exclusively by the differential oracle tests — it is not a runtime dependency at all.
+> `cargo tree -e normal` is hickory-free.
 
 ```bash
-# Default release build — hickory-handler-free, wire-native serving path
+# Default release build — hickory-free runtime, wire-native serving path,
+# full-recursion + DNSSEC validation always compiled in
 cargo build --release --target x86_64-unknown-linux-gnu
 cargo build --release --target x86_64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-gnu
 cargo build --release --target aarch64-unknown-linux-musl
 
-# Enable the sovereign full-recursion resolver (adds hickory-resolver/-server)
-cargo build --release --features recursor
+# Enable full-recursion at runtime — no special build needed
+# (set in config: resolution: full-recursion)
 
 # Disable XDP (containers, cloud VMs without CAP_BPF)
 cargo build --release --no-default-features

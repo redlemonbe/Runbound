@@ -45,11 +45,14 @@
 - The XDP fast path answers only **cache hits and local-zone data** in userspace;
   every other query falls through (`XDP_PASS`) to the wire-native `serve_wire` slow
   path, which applies the **same** blacklist/policy. TCP queries and kernel-reassembled
-  fragments are therefore filtered on the slow path — **not** bypassed. (v0.22: the
-  default build is hickory-free on the serving path; the hickory-server request handler
-  was removed and the slow path is now the in-house wire codec. `hickory-proto` still
-  backs part of the data model; the optional `recursor` feature is the only place a
-  hickory handler still runs.)
+  fragments are therefore filtered on the slow path — **not** bypassed. The serving path
+  is entirely hickory-free: there is no hickory-dns request handler anywhere, and the
+  slow path is the in-house wire codec (`serve_wire`) on every path (forward,
+  full-recursion, local, AXFR, DDNS, TSIG). Full-recursion (`src/dns/recursor_wire.rs`)
+  and DNSSEC validation (`src/dns/dnssec_*.rs`) are in-house too, always on by default —
+  there is no `recursor` Cargo feature anymore, and no hickory dependency of any kind in
+  the default runtime build. `hickory-proto` remains only as a `[dev-dependencies]` entry
+  for the differential oracle tests.
 - TCP/DoT/DoH are proxied through an internal loopback relay. v0.22 carries the **real
   client IP** to the handler via a PROXY v2 header (read before the TLS handshake for
   DoT/DoH), so `axfr-allow` and split-horizon (#10) evaluate the true source rather than

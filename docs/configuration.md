@@ -326,9 +326,10 @@ dnssec-validation: yes   # local re-validation (recursive mode only)
 
 Mirrors Unbound's `dnssec-validation` directive. When set to `yes`, the sovereign
 recursor performs local DNSSEC re-validation of every response. This requires
-`resolution: full-recursion` on a binary built with the `recursor` feature (see
-[Resolution mode](#resolution-mode--forward-vs-full-recursion-202)); in the default
-forwarder build Runbound trusts the upstream AD bit.
+`resolution: full-recursion` (see
+[Resolution mode](#resolution-mode--forward-vs-full-recursion-202)) — a runtime config
+toggle, not a special build; in the default `forward` mode Runbound trusts the upstream
+AD bit instead.
 
 **Warning:** Only enable in full recursive deployments where upstream resolvers return
 complete RRSIG/DNSKEY chains. In forwarder mode (the typical setup with Cloudflare or
@@ -870,16 +871,18 @@ server:
 `full-recursion` makes Runbound a **sovereign recursive resolver**: it resolves iteratively
 from the root servers itself, so no third-party resolver ever sees your queries.
 
-> **Build requirement (v0.22):** since the de-hickory rewrite the default binary serves
-> DNS entirely on Runbound's own wire codec and contains **no DNS request handler from
-> hickory**. The sovereign recursor is the one component that still uses
-> `hickory-resolver`, so it ships behind an optional **`recursor` Cargo feature**
-> (`cargo build --features recursor`). On a default build, `resolution: full-recursion`
-> is parsed but the recursor is a no-op and Runbound silently stays in `forward` mode.
-> Everything else (forward & local-zone resolution, split-horizon, AXFR/IXFR, TSIG, DDNS,
-> DNSSEC signing) is served wire-native with no hickory handler.
+> **No special build required:** the default binary serves DNS entirely on Runbound's own
+> wire codec (`serve_wire`) and contains no hickory-dns request handler of any kind. The
+> sovereign recursor (`src/dns/recursor_wire.rs`) and DNSSEC validation
+> (`src/dns/dnssec_*.rs`) are entirely in-house, always compiled in, and always available
+> in the default build — there is no `recursor` Cargo feature to enable. `full-recursion`
+> is a plain runtime config toggle: setting `resolution: full-recursion` activates it
+> immediately, no rebuild needed. Forward & local-zone resolution, split-horizon,
+> AXFR/IXFR, TSIG, DDNS, and DNSSEC signing are all served wire-native the same way.
+> `hickory-proto` remains only as a `[dev-dependencies]` entry used by the differential
+> oracle tests (`cargo tree -e normal` is hickory-free).
 
-When full-recursion is active (on a `recursor`-enabled build):
+When full-recursion is active:
 - **DNSSEC is validated and enforced** when `dnssec-validation: yes` — a Bogus answer is
   refused with SERVFAIL, the AD bit is set only for fully-Secure answers, and DNSSEC records
   are stripped for non-DO clients (RFC 4035 §3.2.1).
