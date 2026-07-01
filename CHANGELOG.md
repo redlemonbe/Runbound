@@ -7,6 +7,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.23.13] - 2026-07-01
+
+### Fixed
+- **Kernel UDP fast loop (`xdp: no` path) only bound the first configured
+  `interface:` line — any additional interfaces got a TCP listener but no UDP
+  listener at all (UDP is the overwhelming majority of DNS traffic), so a
+  node could not serve both its normal unicast address and an anycast VIP at
+  the same time in UDP. Found while validating the `anycast:` feature
+  end-to-end on isolated lab infrastructure (two throwaway LXCs — a real
+  eBGP peer via FRR and a Runbound anycast node — never touching production
+  or the operator's own network). Fixed by starting one kernel fast-loop
+  worker pool per configured `interface:` instead of only `interfaces[0]`.
+  The primary interface keeps its full NUMA/NIC-tuned core budget (no
+  behaviour or performance change for the common single-interface case);
+  additional interfaces get a small (2-core) dedicated budget rather than
+  stealing from the primary NIC's serving cores, since they are expected to
+  be low-volume (e.g. a VIP that isn't yet globally routed).
+- Verified live on the lab node: UDP `dig` against both the anycast VIP and
+  the node's normal address succeeded simultaneously after the fix (both
+  failed to answer on one address before it, exactly as the pre-existing
+  code comment warned). Full BGP lifecycle also validated on the same lab:
+  session establishment, route announced while healthy, hard `SIGKILL` →
+  cgroup reaps the exabgp child → route withdrawn immediately, automatic
+  restart → route re-announced — no manual intervention.
+
 ## [0.23.12] - 2026-07-01
 
 ### Fixed

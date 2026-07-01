@@ -2960,28 +2960,44 @@ pub async fn run_dns_server(
                 snapshot
             });
 
-        // Start one kernel UDP thread per fast core.
-        // MULTI-INTERFACE NOTE: currently binds to interfaces[0] only.
-        // If multiple interfaces are configured, the additional interfaces have no
-        // kernel fast loop — they have no UDP listener at all (future follow-up).
-        let kernel_loop_bind = format!("{}:{}", kernel_loop_iface, cfg.port);
-        let _kloop_handle = crate::dns::kernel_loop::start_kernel_fast_loop(
-            &kernel_loop_bind,
-            &fast_cores,
-            Arc::clone(&zones_for_kloop),
-            Arc::clone(&acl_for_kloop),
-            Arc::clone(&rl_for_kloop),
-            Arc::clone(&icmp_for_kloop),
-            fallback_tx.clone(),
-            kloop_cache_snapshot,
-            Some(Arc::clone(&stats_for_kloop)),
-            Some(Arc::clone(&domain_stats_for_kloop)),
-        )?;
-        info!(
-            threads = fast_cores.len(),
-            addr = %kernel_loop_bind,
-            "kernel UDP fast loop started (wire handler serves TCP + fallback only)"
-        );
+        // Start one kernel UDP thread per fast core, per configured interface.
+        // The primary interface (interfaces[0]) keeps the full NUMA/NIC-tuned core
+        // budget computed above — zero behaviour change for the common single-interface
+        // deployment. Additional interfaces (e.g. an anycast VIP on a dummy/lo device)
+        // get a small dedicated budget instead of stealing from the primary NIC's
+        // serving cores: they are expected to be low-volume, and the auto-tuning above
+        // (ethtool queues/IRQs) only applies to the real physical NIC anyway.
+        const SECONDARY_IFACE_CORES: usize = 2;
+        let mut kloop_handles: Vec<crate::dns::kernel_loop::KernelLoopHandle> =
+            Vec::with_capacity(interfaces.len());
+        for (idx, iface) in interfaces.iter().enumerate() {
+            let bind_cores: &[usize] = if idx == 0 {
+                &fast_cores
+            } else {
+                let n = fast_cores.len().min(SECONDARY_IFACE_CORES).max(1);
+                &fast_cores[fast_cores.len() - n..]
+            };
+            let kernel_loop_bind = format!("{iface}:{}", cfg.port);
+            let handle = crate::dns::kernel_loop::start_kernel_fast_loop(
+                &kernel_loop_bind,
+                bind_cores,
+                Arc::clone(&zones_for_kloop),
+                Arc::clone(&acl_for_kloop),
+                Arc::clone(&rl_for_kloop),
+                Arc::clone(&icmp_for_kloop),
+                fallback_tx.clone(),
+                kloop_cache_snapshot.clone(),
+                Some(Arc::clone(&stats_for_kloop)),
+                Some(Arc::clone(&domain_stats_for_kloop)),
+            )?;
+            info!(
+                threads = bind_cores.len(),
+                addr = %kernel_loop_bind,
+                "kernel UDP fast loop started (wire handler serves TCP + fallback only)"
+            );
+            kloop_handles.push(handle);
+        }
+        std::mem::forget(kloop_handles); // keep the fast-loop threads alive for the process lifetime
     } // end kernel fast loop guard — kernel UDP threads only (#fix: reader is now unconditional)
 
 
