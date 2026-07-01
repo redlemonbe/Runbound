@@ -28,7 +28,7 @@ Each chapter is a standalone Markdown file. Line references point at real source
 | 01 | [Architecture](01-architecture.md) | The dual-path model (XDP fast path / kernel slow path), the wire-native `serve_wire` handler (de-hickory), process model, packet life-cycle, the shared wire answer routine |
 | 02 | [The XDP fast path](02-fast-path-xdp.md) | eBPF program, AF_XDP zero-copy, XSKMAP/CPUMAP routing, 802.1Q tagged fabrics, per-view split-horizon snapshots, the zero-alloc wire response builder (positive + negative answers) |
 | 03 | [SIMD & hand-written assembly](03-simd-and-asm.md) | CRC32c domain hashing, AVX2/SSE2 label lowercasing & comparison, the eBPF FNV-vs-CRC verifier story |
-| 04 | [The slow path](04-slow-path.md) | the `xdp:no` kernel fast loop (SO_REUSEPORT per core, by-CPU cBPF + RPS, batched recvmmsg/sendmmsg, shared rate-limit/ban gate, shared wire responder); startup NIC auto-tune (NUMA-local queues/IRQs, RPS, coalescing); the wire-native `serve_wire` handler (forward, DoT/DoH, AXFR/IXFR, TSIG, DDNS, DNSSEC signing, serve-stale); the in-house sovereign full-recursion resolver, always on by default (a runtime config toggle, not a Cargo feature) |
+| 04 | [The slow path](04-slow-path.md) | the `xdp:no` kernel fast loop (SO_REUSEPORT per core, by-CPU cBPF + RPS, batched recvmmsg/sendmmsg, shared rate-limit/ban gate, shared wire responder); startup NIC auto-tune (NUMA-local queues/IRQs, RPS, coalescing); the wire-native `serve_wire` handler (forward, DoT/DoH, AXFR/IXFR, TSIG, DDNS, DNSSEC signing, serve-stale); the in-house sovereign full-recursion resolver, always compiled in but off by runtime default (a config toggle, not a Cargo feature) |
 | 05 | [Caching](05-cache.md) | Cache sizing under cgroup v2, stale serving, negative cache |
 | 06 | [Control plane](06-control-plane.md) | REST API (axum), config-writer (atomic full-regen), web UI, HMAC relay, SSE, split-horizon, Unix socket |
 | 07 | [Security](07-security.md) | rate-limit + bans on both datapaths (one shared gate), DNSSEC AD, constant-time auth, least-privilege systemd, HMAC relay, reproducible build + signatures, SBOM, audit discipline |
@@ -48,13 +48,17 @@ on the hot path). Everything the fast path cannot answer — forwarding/recursio
 DNSSEC, anything non-trivial — falls through to the kernel slow path. In `xdp: no` that slow path is itself a tight
 kernel-UDP loop that serves cache hits through the *same* hand-written wire responder
 (behind the same per-source rate-limit/ban gate), routing only genuine misses to the
-in-house wire-native handler (`serve_wire`, `src/dns/wire/`). As of **v0.22 ("de-hickory")**
+in-house wire-native handler (`serve_wire`, `src/dns/server.rs`, which calls into the wire
+codec library at `src/dns/wire/`). As of **v0.22 ("de-hickory")**
 the default build is hickory-free on the request path: forwarding, local zones, AXFR/IXFR,
 TSIG, DDNS and DNSSEC signing are all served wire-native; there is no `hickory-server`
 request handler anywhere in the runtime, and the sovereign full-recursion resolver
-(`src/dns/recursor_wire.rs`) and DNSSEC validation (`src/dns/dnssec_*.rs`) are in-house
-too, always on by default — there is no `recursor` Cargo feature anymore, and no hickory
-dependency of any kind in the default runtime build. `hickory-proto` remains only as a
+(`src/dns/recursor_wire.rs`) and DNSSEC validation (`src/dns/dnssec_*.rs`) are entirely
+in-house and always compiled in (no Cargo feature gates them) — but OFF by runtime
+default: `resolution: forward` and `dnssec-validation: no` are the defaults; full-recursion
+and DNSSEC validation are opt-in via config (`resolution: full-recursion`,
+`dnssec-validation: yes`), not a build flag. There is no `recursor` Cargo feature anymore,
+and no hickory dependency of any kind in the default runtime build. `hickory-proto` remains only as a
 `[dev-dependencies]` entry for the differential oracle tests. All paths
 share a single normalisation and hashing contract so that a name resolves identically
 whichever path serves it. The control plane (REST API, web UI, relay) is isolated on a

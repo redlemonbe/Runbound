@@ -133,12 +133,7 @@ Blocked domain example:
 | Field | Required | Default | Notes |
 |-------|----------|---------|-------|
 | `name` | Yes | — | Domain name (trailing dot optional) |
-| `type` | No | `"A"` | Record type: `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `PTR`, `NS`, `SOA` |
-| `value` | Yes | — | Record value (IP for A/AAAA, hostname for CNAME/MX/NS, text for TXT) |
-| `ttl` | No | 3600 | TTL in seconds (0–2147483647, capped at 86400) |
-| `priority` | No | — | Required for `MX` and `SRV` records (0–65535). Default: 10 if omitted |
-| `weight` | No | — | `SRV` only: load-balancing weight |
-| `port` | No | — | `SRV` only: target port |
+| `type` | No | `"A"` | Record type: `A`, `AAAA`, `MX`, `TXT`, `CNAME`, `PTR`. Returns `400 INVALID_TYPE` for anything else (`NS`/`SOA` are **not** supported by this endpoint). |
 
 ---
 
@@ -289,11 +284,13 @@ curl http://localhost:8080/health
 ```json
 {
   "status":              "ok",
-  "version":             "0.23.8",
+  "node":                "a1b2c3d4-e5f6-...",
   "uptime_secs":         3600,
   "xdp_active":          true,
   "upstreams_healthy":   4,
-  "cache_entries":       48231
+  "upstreams_total":     4,
+  "cache_entries":       48231,
+  "reason":              null
 }
 ```
 
@@ -539,12 +536,19 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/conf
   "rate_limit": 200,
   "cache_max_ttl": 86400,
   "dnssec_validation": false,
+  "resolution_mode": "forward",
   "log_retention": 1000,
   "log_client_ip": true,
   "api_port": null,
   "logfile": null,
-  "prefetch": false,
-  "prefetch_threshold": 5
+  "hsm": {
+    "active": false,
+    "pkcs11_lib": null,
+    "slot": 0,
+    "pin": null,
+    "api_key_label": null,
+    "store_key_label": null
+  }
 }
 ```
 
@@ -701,7 +705,7 @@ scrape_configs:
     authorization:
       type: Bearer
       credentials: <your-api-key>
-    metrics_path: /metrics
+    metrics_path: /api/metrics
 ```
 
 ---
@@ -880,7 +884,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
   "upstreams_total": 3,
   "nic_rx_ring": 4096,
   "nic_rx_ring_max": 4096,
-  "nic_rx_dropped": 0,
+  "xsk_rx_dropped": 0,
+  "xsk_rx_fill_ring_empty": 0,
+  "xsk_rx_ring_full": 0,
   "upstream_racing": true,
   "upstream_racing_wins": { "1.1.1.1@853": 8123, "9.9.9.9@853": 5012 },
   "anycast": { "configured": true, "address": "198.51.100.53/32", "announced": true, "peer": "192.168.1.1", "local_as": 65001 }
@@ -896,7 +902,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 | `upstreams_total` | u32 | Total registered upstreams (config + API) |
 | `nic_rx_ring` | u32 | Current RX ring depth applied to the NIC (descriptors). `0` when XDP is disabled or the driver does not support ethtool ring queries. |
 | `nic_rx_ring_max` | u32 | Maximum RX ring depth supported by the driver. Equal to `nic_rx_ring` when auto-sizing succeeded. |
-| `nic_rx_dropped` | u64 | Hardware-level RX drops read from `/sys/class/net/<iface>/statistics/rx_dropped`. A non-zero value under load indicates the NIC FIFO is overflowing before XDP sees the packets. |
+| `xsk_rx_dropped` | u64 | AF_XDP socket RX drops (kernel `XDP_STATISTICS` getsockopt), summed across XDP sockets. Valid under zero-copy, unlike the old ethtool/sysfs `rx_dropped` counters which are blind to `XDP_REDIRECT`→XSK traffic. |
+| `xsk_rx_fill_ring_empty` | u64 | Count of times the AF_XDP fill ring was empty when the kernel needed a buffer — an early warning that RX buffers aren't being recycled fast enough. |
+| `xsk_rx_ring_full` | u64 | Count of times the AF_XDP RX ring was full and packets were dropped before the userspace worker could drain it. |
 | `upstream_racing` | bool | `true` when `upstream-racing: yes` is set. |
 | `upstream_racing_wins` | object | Per-upstream racing-win counters (#33), `{ "<ip>": count }`. The number of times each upstream returned the first valid answer for a raced query. Empty `{}` until the first raced win. Populated on the default wire serving path (v0.22). |
 | `anycast` | object | Anycast announcer state (see [anycast.md](../docs/anycast.md)). `{ configured, address, peer, local_as, announced }` when an `anycast:` block is set; `{ "configured": false }` otherwise. `announced` is `true` while the exabgp child is up (route advertised). The WebUI **System** tab renders this per node (master + each slave via the relay). |
@@ -1058,7 +1066,10 @@ curl -X PATCH http://localhost:8080/api/upstreams/550e8400-... \
 
 #### `GET /api/upstreams/presets`
 
-Nine built-in presets: Cloudflare (UDP + DoT), Google, Quad9 (UDP + DoT), OpenDNS, AdGuard DNS.
+14 built-in presets: Cloudflare, Cloudflare alt, Cloudflare DoT, Cloudflare DoT alt, Google,
+Google alt, Google DoT, Google DoT alt, Quad9, Quad9 alt, Quad9 DoT, Quad9 DoT alt, OpenDNS,
+OpenDNS alt. (AdGuard DNS is **not** an upstream preset — it only exists as a feed/blocklist
+preset under `GET /api/feeds/presets`.)
 Each preset carries a bare IP `addr` and a separate `port` field (no `@port` suffix).
 
 ```bash
@@ -1142,7 +1153,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/sync
 }
 ```
 
-`status`: `"connected"` (< 30 s), `"stale"` (< 120 s), `"disconnected"` (> 120 s).
+`status`: `"connected"` (last seen < 30 s ago), `"disconnected"` (otherwise). There is no
+intermediate `"stale"` state for this field — that 3-tier scheme (`ok`/`warn`/`error`) only
+applies to `GET /api/events` (see below).
 
 ---
 
@@ -1182,7 +1195,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/node
 | `addr` | Source IP of the last registration request. |
 | `relay_host` | `ip:port` of the slave's relay server. Used by the master for config push and relay forwarding. Absent if the slave has no `sync-port` configured. |
 | `cert_fingerprint` | SHA-256 fingerprint of the slave's relay TLS certificate. |
-| `status` | `"connected"` (< 30 s), `"stale"` (< 120 s), `"disconnected"` (> 120 s) since last registration. |
+| `status` | `"connected"` (< 30 s since last registration), `"disconnected"` (otherwise). No `"stale"` state for this field — see the note under `GET /api/sync/slaves`. |
 
 ---
 
@@ -1314,7 +1327,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/icmp
 ```
 
 ```json
-{"burst":8,"enable":true,"rate_limit":20}
+{"burst":8,"enable":true,"rate_limit":20,"ban_threshold":100}
 ```
 
 ---
@@ -1327,8 +1340,8 @@ Live-update the ICMP responder config. Changes are applied to the BPF map within
 ```bash
 curl -X PUT -H "Authorization: Bearer $RUNBOUND_API_KEY" \
      -H "Content-Type: application/json" \
-     -H "Content-Length: 41" \
-     -d '{"enable":true,"rate_limit":20,"burst":8}' \
+     -H "Content-Length: 61" \
+     -d '{"enable":true,"rate_limit":20,"burst":8,"ban_threshold":100}' \
      http://localhost:8080/api/icmp/config
 ```
 
@@ -1339,11 +1352,12 @@ curl -X PUT -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 | `enable` | bool | Enable/disable the ICMP echo responder |
 | `rate_limit` | integer | Max echo requests per second per source IP |
 | `burst` | integer | Initial burst tokens granted to new source IPs |
+| `ban_threshold` | integer | Echo requests from a single source before the flood detector bans it (default: 100) |
 
 Returns the updated config:
 
 ```json
-{"burst":8,"enable":true,"rate_limit":20}
+{"burst":8,"enable":true,"rate_limit":20,"ban_threshold":100}
 ```
 
 ---

@@ -1,13 +1,20 @@
 # 05 — Caching
 
 File: `src/dns/cache_snapshot.rs`. The cache is built for one reader profile — XDP worker
-OS threads that must never take a lock on the hot path — and one writer — the DNS server's
-async task.
+OS threads that must never take a lock on the hot path — but there are **multiple writers**:
+the DNS server's own async resolution path, and the REST API handlers whenever zones,
+blacklist entries, or feeds are edited. `resync_xdp_cache`/`resync_xdp_cache_inner`
+(`src/api/mod.rs`) is called from at least eight distinct handler call sites (zone reload,
+blacklist add/delete, feed add/update/delete) and mutates the same `MutableCacheMap` directly
+(`cache.retain(...)` to evict changed names, then `preload_into_cache` to re-insert local-data)
+— see CHANGELOG #186 ("across all seven write paths").
 
 ## 5.1 Double-buffer: DashMap writer, ArcSwap reader
 
-- **Writer**: a `DashMap` (concurrent, lock-free inserts) holds the mutable cache
-  (`MutableCacheMap`, `src/dns/cache_snapshot.rs:109`).
+- **Writer**: a `DashMap` (sharded, per-shard `RwLock` — not lock-free, but contention is
+  low since writes are rare: cache inserts on resolution misses, or API handlers on
+  zone/blacklist/feed edits) holds the mutable cache (`MutableCacheMap`,
+  `src/dns/cache_snapshot.rs:109`).
 - **Reader**: an `ArcSwap<HashMap>` holds an immutable **snapshot**. XDP workers call
   `load_full()` once per received batch and look up from the frozen copy with zero locking.
 - A background **publish loop** (`publish_loop`, `src/dns/cache_snapshot.rs:364`) clones the

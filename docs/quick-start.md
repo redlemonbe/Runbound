@@ -81,8 +81,11 @@ blacklist/feeds filter. Applied live, no restart. Merged into the WebUI **Subnet
 alongside split-horizon. See [api.md](api.md#subnet-policies-8).
 
 **Hickory fully removed from the runtime** — recursion and DNSSEC validation are now
-entirely in-house (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`), always on by
-default; `hickory-proto` remains only as a dev-dependency for differential oracle tests.
+entirely in-house (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) and always compiled
+in (no Cargo feature gates them) — but OFF by runtime default: `resolution: forward` and
+`dnssec-validation: no` are the defaults; full-recursion and DNSSEC validation are opt-in
+via config (`resolution: full-recursion`, `dnssec-validation: yes`), not a build flag.
+`hickory-proto` remains only as a dev-dependency for differential oracle tests.
 
 ## New in v0.20.0
 
@@ -97,14 +100,14 @@ iteratively from the root instead of forwarding, so no upstream ever sees your q
 enforced, anti-SSRF, QNAME-minimisation). Toggle live: `PUT /api/resolution {"mode":"full-recursion"}`.
 
 **Serve encrypted DNS (DoT / DoH / DoQ)** — enable from the WebUI *Settings -> Encrypted DNS*
-panel (generate a self-signed cert or import your own), or `POST /api/tls/self-signed`; restart
-to bind the listeners.
+panel (generate a self-signed cert or import your own), or `POST /api/tls/self-signed`; applies
+live — no restart needed to bind the listeners.
 
 ## 3. Run
 
 ```bash
 # Foreground (test first):
-sudo RUNBOUND_API_KEY="your-key" runbound --config /etc/runbound/runbound.conf
+sudo RUNBOUND_API_KEY="your-key" runbound /etc/runbound/runbound.conf
 
 # Verify DNS is working:
 dig @127.0.0.1 google.com

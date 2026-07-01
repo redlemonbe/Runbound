@@ -6,7 +6,7 @@ service file and explains what breaks silently if it is missing or misconfigured
 **Quick check:** run this after every install or update:
 
 ```bash
-runbound --check-config /etc/runbound/unbound.conf
+runbound --check-config /etc/runbound/runbound.conf
 ```
 
 ---
@@ -134,27 +134,26 @@ can remain enabled.
 Check the following lines appear in logs after every install or update:
 
 ```bash
-journalctl -u runbound | grep -E "XDP|affinity|cache|socket|rate"
+journalctl -u runbound | grep -E "XDP|CPU placement|cache|rate"
 ```
 
 Expected output:
 
 ```
-INFO runbound: CPU affinity enabled — physical cores (HT excluded) cores=N
+INFO runbound: CPU placement: automatic (OS scheduler + XDP NUMA-local pin) cores=N
 INFO runbound::dns::server: cache size auto-sized from MemAvailable cache_size=N
-INFO runbound::dns::server: DNS UDP listening (SO_REUSEPORT) addr=0.0.0.0:53 sockets=N
-INFO runbound: XDP kernel-bypass fast path active iface=ethX
-INFO runbound::dns::server: rate limiting disabled   ← or: rate limiting enabled limit=N
+INFO runbound::dns::xdp::worker: XDP fast path active (core block assigned) iface=ethX mode=... core_base=N queue_count=N cores=[...]
+INFO runbound::dns::server: rate limiting disabled (rate-limit: 0)   ← or: DNS rate limiter configured rps=N burst=N
 ```
 
-**If `XDP kernel-bypass fast path active` is absent**, check the following in order:
+**If `XDP fast path active` is absent**, check the following in order:
 
-1. `runbound --check-config /etc/runbound/unbound.conf` — will identify the exact missing parameter
+1. `runbound --check-config /etc/runbound/runbound.conf` — will identify the exact missing parameter
 2. Capabilities: `cat /proc/$(pgrep runbound)/status | grep CapEff`
 3. `AF_XDP` in `RestrictAddressFamilies`
 4. `LimitMEMLOCK=infinity` in the service file
 5. `MemoryDenyWriteExecute=false` and `ProtectKernelModules=false`
-6. `xdp: no` not set in `unbound.conf` and `--no-xdp` not passed on the command line
+6. `xdp: no` not set in `runbound.conf` and `--no-xdp` not passed on the command line
 
 **Virtual interfaces (Proxmox vmbr, ipvlan, veth):** attaching Runbound to a Proxmox
 bridge interface (`vmbr0`) or an ipvlan will not silently break DNS — Runbound detects
@@ -164,7 +163,7 @@ is disabled gracefully and DNS continues on the `SO_REUSEPORT` path. No capabili
 changes or config edits are required. See [xdp.md](xdp.md) for details.
 
 **To deliberately disable XDP** (containers, restricted VMs, troubleshooting) without touching
-systemd capabilities, add to `unbound.conf`:
+systemd capabilities, add to `runbound.conf`:
 
 ```
 server:
@@ -179,49 +178,63 @@ Or pass `--no-xdp` on the command line. The server logs
 
 ## Complete hardened service file (with XDP)
 
+This is the **actual shipped `runbound.service`** (repo root), with the XDP capability
+lines uncommented. The default install ships the narrower `CAP_NET_BIND_SERVICE`-only
+set shown in the Capabilities section above — swap the two `AmbientCapabilities`/
+`CapabilityBoundingSet` lines below for that default (they're present as a commented
+alternative in the shipped file).
+
 ```ini
 [Unit]
 Description=Runbound DNS Server
-After=network.target
-Wants=network.target
+Documentation=https://github.com/redlemonbe/Runbound
+After=network-online.target
+Wants=network-online.target
+ConditionFileNotEmpty=/etc/runbound/runbound.conf
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/runbound /etc/runbound/unbound.conf
-Restart=on-failure
-RestartSec=5
-
 User=runbound
 Group=runbound
+EnvironmentFile=-/etc/runbound/env
+# Huge pages for the XDP/AF_XDP UMEM: reserved once at boot (needs root via
+# ExecStartPre=+), consumed unprivileged by the runbound user. 0 = disabled.
+Environment=RUNBOUND_HUGEPAGES_2M=0
+ExecStartPre=+/bin/sh -c '[ "${RUNBOUND_HUGEPAGES_2M:-0}" = 0 ] || echo "${RUNBOUND_HUGEPAGES_2M}" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true'
+ExecStart=/usr/local/sbin/runbound /etc/runbound/runbound.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
 
 # Capabilities — port 53 + XDP kernel-bypass.
-# NOTE: this is the XDP profile. For the default xdp:no deployment, drop everything
-# except CAP_NET_BIND_SERVICE (see the Capabilities section above).
+# NOTE: this is the XDP profile. For the default xdp:no deployment, use the narrower
+# CAP_NET_BIND_SERVICE-only set (see the Capabilities section above).
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+
 NoNewPrivileges=yes
-
-# XDP requires AF_XDP + unlocked memory + eBPF JIT
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
-LimitMEMLOCK=infinity
-MemoryDenyWriteExecute=false
-ProtectKernelModules=false
-
-# General hardening (compatible with XDP)
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
-ProtectKernelLogs=yes
-ProtectClock=yes
-ProtectControlGroups=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
+
+# XDP requires AF_XDP + unlocked memory + eBPF JIT
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
+MemoryDenyWriteExecute=false
+ReadWritePaths=/etc/runbound /var/lib/runbound
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+The shipped unit deliberately does **not** set `ProtectKernelModules`,
+`ProtectKernelLogs`, `ProtectClock`, `ProtectControlGroups`, `RestrictRealtime`,
+`RestrictSUIDSGID`, or `LockPersonality`. `ProtectKernelModules=false` would be needed
+if you add it, since `true` blocks eBPF program loading (see the eBPF / kernel
+hardening section above); the others are optional extensions you can layer on
+top — verify each doesn't break XDP before enabling it in production.
 
 ---
 

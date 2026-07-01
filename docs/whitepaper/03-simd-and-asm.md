@@ -47,14 +47,14 @@ The chosen backend is logged at startup, so an operator can see which path is li
 
 ### The intrinsic version (reference)
 
-`crc32c_sse42` (`src/dns/hasher.rs:39`) uses `align_to::<u64>()` to split the byte slice
+`crc32c_sse42` (`src/dns/hasher.rs:40`) uses `align_to::<u64>()` to split the byte slice
 into an unaligned prefix, a `u64`-aligned middle processed with `_mm_crc32_u64`, and a
 trailing suffix. Correct, but `align_to` has overhead that dominates for the **short**
 inputs DNS names actually are (8–64 bytes).
 
 ### The `asm!` version (hot path)
 
-`crc32c_sse42_asm` (`src/dns/hasher.rs:69`) drops `align_to` entirely and issues the
+`crc32c_sse42_asm` (`src/dns/hasher.rs:70`) drops `align_to` entirely and issues the
 `crc32` instruction directly over **unaligned** reads, in three stages — 8 bytes, then
 4, then the byte tail:
 
@@ -85,7 +85,7 @@ short names the sequential dependency chain — not throughput — is the limite
 ### 32-bit → 64-bit spread
 
 CRC32c yields 32 bits. Used directly as a hash-table key the high 32 bits would be zero
-and the low bits would cluster. `finish()` (`src/dns/hasher.rs:183`) spreads it to 64
+and the low bits would cluster. `finish()` (`src/dns/hasher.rs:184`) spreads it to 64
 bits with a Fibonacci multiply:
 
 ```rust
@@ -97,7 +97,7 @@ c ^ c.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 
 `WireRecordIndex` keys are already high-entropy 64-bit values from `hash_wire_qname`.
 Feeding them through `HashMap`'s default hasher would waste cycles re-mixing an
-already-good key. `IdentityHasherBuilder` (`src/dns/hasher.rs:533`) passes a `u64`
+already-good key. `IdentityHasherBuilder` (`src/dns/hasher.rs:534`) passes a `u64`
 straight through (`write_u64` stores, `finish` returns it). The safety note is explicit:
 this is only valid because the keys have uniform 64-bit entropy.
 
@@ -137,38 +137,38 @@ penalty that mixing legacy SSE encodings with AVX would incur. A scalar loop han
 final < 16 bytes.
 
 Correctness is pinned by `sse2_explicit_all_lengths` and `avx2_explicit_all_lengths`,
-which check every length 0..=80 against a scalar reference (`src/dns/simd.rs:448`, `:461`).
+which check every length 0..=80 against a scalar reference (`src/dns/simd.rs:511`, `:524`).
 
 ---
 
 ## 3.4 Byte equality — early-exit SIMD compare
 
-`bytes_eq` (`src/dns/simd.rs:192`) returns `false` immediately on length mismatch, then
+`bytes_eq` (`src/dns/simd.rs:193`) returns `false` immediately on length mismatch, then
 compares 32 bytes/iter (AVX2) or 16 (SSE2). Each iteration does `pcmpeqb` + `pmovmskb`
 and checks the mask against all-ones; a single differing byte makes the mask `!= 0xFFFF`
-and the function returns early (`src/dns/simd.rs:233`). This is the collision-rejection
+and the function returns early (`src/dns/simd.rs:234`). This is the collision-rejection
 step after a hash hit — it must be correct for every offset, which
-`bytes_eq_mismatch_at_each_position` verifies (`src/dns/simd.rs:509`).
+`bytes_eq_mismatch_at_each_position` verifies (`src/dns/simd.rs:572`).
 
 ---
 
 ## 3.5 QNAME terminator scan — `find_zero`
 
-`find_zero` (`src/dns/simd.rs:317`) locates the `\0` that terminates a wire QNAME, capped
+`find_zero` (`src/dns/simd.rs:318`) locates the `\0` that terminates a wire QNAME, capped
 at 255 bytes. SSE2 path: `pcmpeqb` against a zero vector + `pmovmskb`, and the position is
-`mask.trailing_zeros()` within the first matching 16-byte block (`src/dns/simd.rs:348`).
+`mask.trailing_zeros()` within the first matching 16-byte block (`src/dns/simd.rs:349`).
 This is how `parse_query` finds the end of the name in one pass before lowercasing
-(`src/dns/xdp/wire_builder.rs:115`).
+(`src/dns/wire_builder.rs:117`).
 
 ---
 
 ## 3.6 The eBPF hash: why FNV-1a, not CRC32c
 
-File: `ebpf/dns_xdp.c`, `dns_qname_hash` (`ebpf/dns_xdp.c:215`).
+File: `ebpf/dns_xdp.c`, `dns_qname_hash` (`ebpf/dns_xdp.c:225`).
 
 In **user space** Runbound hashes with CRC32c. In **the kernel** it uses FNV-1a. This is
 not an oversight — it is forced by the BPF verifier, and the reasoning is documented in
-the source (`ebpf/dns_xdp.c:195`):
+the source (`ebpf/dns_xdp.c:205`):
 
 > CRC32C's 8-iteration inner loop (`#pragma unroll 8`) causes exponential scalar-state
 > explosion in the BPF verifier and is rejected. FNV-1a's single multiply per byte bounds
@@ -183,7 +183,7 @@ verifier processes them in linear sequence. FNV-1a (XOR + multiply per byte) yie
 verifier states; CRC32c's bit loop would be O(2^N).
 
 The kernel hash is only used for **optional** per-domain CPUMAP affinity routing
-(`ebpf/dns_xdp.c:481`); the default path is RSS via XSKMAP and uses no hash at all.
+(`ebpf/dns_xdp.c:577`); the default path is RSS via XSKMAP and uses no hash at all.
 
 ---
 
@@ -191,13 +191,13 @@ The kernel hash is only used for **optional** per-domain CPUMAP affinity routing
 
 The eBPF program can answer two things without ever touching user space:
 
-- **ICMP echo reply** (`ebpf/dns_xdp.c:381`): swap MACs, swap IP src/dst (the IP checksum
+- **ICMP echo reply** (`ebpf/dns_xdp.c:372`): swap MACs, swap IP src/dst (the IP checksum
   is unchanged because swapping preserves the one's-complement sum), set type 8→0, and fix
   the ICMP checksum **incrementally** — `csum16_add(checksum, htons(ICMP_ECHO << 8))`
-  rather than recomputing it (`ebpf/dns_xdp.c:397`). Then `XDP_TX` bounces the frame back
+  rather than recomputing it (`ebpf/dns_xdp.c:463`). Then `XDP_TX` bounces the frame back
   out the same NIC. Rate-limited per source IP via an LRU hash map with a 1-second sliding
   window and burst tokens.
-- **Blacklist NXDOMAIN** (`forge_nxdomain_ipv4`, `ebpf/dns_xdp.c:250`): on a blacklist hit,
+- **Blacklist NXDOMAIN** (`forge_nxdomain_ipv4`, `ebpf/dns_xdp.c:260`): on a blacklist hit,
   forge the response in place (swap MACs/IPs/ports, clear UDP checksum — legal for IPv4 per
   RFC 768, set DNS flags to `QR=1 RA=1 RCODE=3` while preserving the RD bit) and `XDP_TX`.
   Round-trip is on the order of a microsecond and never wakes a user-space thread.
@@ -211,11 +211,11 @@ preserved or incrementally patched rather than recomputed.
 
 | Kernel | Where | Technique | Reference impl tested against |
 |--------|-------|-----------|-------------------------------|
-| Domain hash (user) | `hasher.rs:69` | CRC32c raw `asm!`, 8/4/1-byte stages | intrinsic `crc32c_sse42` (`:330`) |
-| Domain hash (kernel) | `dns_xdp.c:215` | FNV-1a, `#pragma unroll 64` | verifier-bounded by construction |
+| Domain hash (user) | `hasher.rs:70` | CRC32c raw `asm!`, 8/4/1-byte stages | intrinsic `crc32c_sse42` (`:330`) |
+| Domain hash (kernel) | `dns_xdp.c:225` | FNV-1a, `#pragma unroll 64` | verifier-bounded by construction |
 | Lowercase | `simd.rs:22` | AVX2/SSE2, XOR-0x80 signed-compare trick | scalar, all lengths 0..=80 |
-| Byte equality | `simd.rs:192` | AVX2/SSE2 `pcmpeqb`+`pmovmskb`, early exit | scalar, mismatch at each pos |
-| Zero scan | `simd.rs:317` | SSE2 `pcmpeqb` + `trailing_zeros` | scalar `position` |
+| Byte equality | `simd.rs:193` | AVX2/SSE2 `pcmpeqb`+`pmovmskb`, early exit | scalar, mismatch at each pos |
+| Zero scan | `simd.rs:318` | SSE2 `pcmpeqb` + `trailing_zeros` | scalar `position` |
 
 > **Measurement note.** This chapter explains *what the code does and why*. It does **not**
 > assign a qps figure to any single kernel — per-kernel microbenchmarks are not part of

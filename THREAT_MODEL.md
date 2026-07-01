@@ -49,10 +49,13 @@
   is entirely hickory-free: there is no hickory-dns request handler anywhere, and the
   slow path is the in-house wire codec (`serve_wire`) on every path (forward,
   full-recursion, local, AXFR, DDNS, TSIG). Full-recursion (`src/dns/recursor_wire.rs`)
-  and DNSSEC validation (`src/dns/dnssec_*.rs`) are in-house too, always on by default —
-  there is no `recursor` Cargo feature anymore, and no hickory dependency of any kind in
-  the default runtime build. `hickory-proto` remains only as a `[dev-dependencies]` entry
-  for the differential oracle tests.
+  and DNSSEC validation (`src/dns/dnssec_*.rs`) are entirely in-house and always compiled
+  in (no Cargo feature gates them — there is no `recursor` Cargo feature anymore, and no
+  hickory dependency of any kind in the default runtime build) — but **off by runtime
+  default**: `resolution: forward` and `dnssec-validation: no` are the defaults;
+  full-recursion and DNSSEC validation are opt-in via config (`resolution: full-recursion`,
+  `dnssec-validation: yes`), not a build flag. `hickory-proto` remains only as a
+  `[dev-dependencies]` entry for the differential oracle tests.
 - TCP/DoT/DoH are proxied through an internal loopback relay. v0.22 carries the **real
   client IP** to the handler via a PROXY v2 header (read before the TLS handshake for
   DoT/DoH), so `axfr-allow` and split-horizon (#10) evaluate the true source rather than

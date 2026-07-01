@@ -2,9 +2,13 @@
 
 > **Status: current (v0.23.8).** As of v0.23 hickory is fully removed from the runtime:
 > the slow path is served entirely by the in-house wire codec (`serve_wire`,
-> `src/dns/server.rs`), and recursion + DNSSEC validation are in-house too
-> (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`), always on by default — there is
-> no `recursor` Cargo feature anymore. `hickory-proto` remains only as a
+> `src/dns/server.rs`), and recursion + DNSSEC validation are entirely in-house too
+> (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) and always compiled in — there is
+> no `recursor` Cargo feature anymore. They are, however, **off by runtime default**:
+> `resolution: forward` and `dnssec-validation: no` are the defaults
+> (`UnboundConfig::defaults()`, `src/config/parser.rs`); full-recursion and DNSSEC
+> validation are opt-in via config (`resolution: full-recursion`,
+> `dnssec-validation: yes`), not a build flag. `hickory-proto` remains only as a
 > `[dev-dependencies]` entry for the differential oracle tests. The pipeline below is
 > unchanged in behaviour — only its implementation moved from hickory to the wire codec.
 
@@ -155,10 +159,11 @@ On i40e/X710 the kernel slow path is **tuning-sensitive**, three measured figure
 **~3.71 M qps served at ~19 % CPU** under the benchmark methodology (NIC tuned, 63
 `SO_REUSEPORT` workers, kernel-UDP generator — the canonical `…-x710-noxdp` report, ~2×
 BIND/unbound); **~1.5 M** (best ~1.59 M) **out of the box, not retuned** — i40e NAPI-bound
-([#190](https://github.com/redlemonbe/Runbound/issues/190)/[#165](https://github.com/redlemonbe/Runbound/issues/165));
+([#190](https://github.com/redlemonbe/Runbound/issues/190));
 and the historical **~7.3 M** which was **ixgbe/X520** (a different datapath, **not
 reproducible on i40e**). The lever between the first two is node-local queues/IRQs; real
-slow-path scaling on i40e is tracked in #165.
+slow-path scaling on i40e is tracked in #190 (#165 is an unrelated closed issue about the
+XDP fast-path cache lookup, not kernel slow-path NIC tuning).
 The AF_XDP fast path is byte-for-byte unchanged throughout. The auto-tune adapts to the
 card (which NUMA node it sits on) and the CPU (node size); NIC families with hardware flow
 steering (e.g. mlx5 aRFS) may prefer a different strategy — a driver-aware path is future

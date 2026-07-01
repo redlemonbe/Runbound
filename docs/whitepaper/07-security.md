@@ -4,12 +4,17 @@
 > at the end. Cross-references `SECURITY.md`, `THREAT_MODEL.md`,
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 
-- **Transport crypto.** `rustls` 0.23 (TLS 1.2 + 1.3) for DoT/DoH/DoQ and the relay.
+- **Transport crypto.** `rustls` 0.23 (TLS 1.2 + 1.3) for DoT/DoH and the relay. DoQ
+  (DNS-over-QUIC) is **not implemented** — `doq-port`/`quic-port` parse for
+  forward-compat but no listener is ever bound; there is no QUIC dependency in this
+  crate at all (`src/dns/server.rs`, no `quinn` dependency, no `doq` Cargo feature).
 - **Relay authentication.** HMAC-SHA256 over method + path + timestamp **+ body**
-  (SEC-I14, v0.17.1), anti-replay ±30 s, constant-time dual-accept for rolling upgrades
-  (`src/sync.rs:118`); TOFU cert pinning. Registration rejects loopback/link-local/ULA
-  and (by default) RFC 1918 relay hosts — `sync-allow-private-relay` opts LAN
-  deployments in (§6.3).
+  (SEC-I14, v0.17.1), anti-replay ±30 s (`replay_check_and_record`, `src/sync.rs:118`),
+  constant-time compare (`hmac_verify_with_ts`, `src/sync.rs:145`); TOFU cert pinning.
+  The pre-v0.17.1 header-only (body-not-covered) fallback was removed in v0.18.1
+  (SEC-J5) — only the body-covering signature is accepted now. Registration rejects
+  loopback/link-local/ULA and (by default) RFC 1918 relay hosts —
+  `sync-allow-private-relay` opts LAN deployments in (§6.3).
 - **API.** Localhost-only bind; bearer token (env var preferred over config); optional
   PKCS#11 HSM storage for the API key and relay HMAC key; optional Unix socket (0600).
 - **Rate limit + bans on *both* datapaths (one mechanism).** Per-source-IP token-bucket
@@ -28,10 +33,12 @@
   authoritative answers either (`wire_serve` clears it, `src/dns/wire_serve.rs:66`). With `resolution:
   full-recursion` (a runtime config toggle, not a Cargo feature), the sovereign in-house
   resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) attaches a per-record `Proof`
-  and sets `AD` only when every answer + authority record is cryptographically `Secure`,
-  `Bogus` is SERVFAIL'd, and insecure/unsigned answers leave `AD` clear
-  (`src/dns/server.rs:644`). Outbound DNSSEC **signing** of local zones is wire-native — an
-  in-house ECDSA P-256 signer on `ring` (RFC 6605/4034/5155/9276), validated byte-identical
+  and sets `AD` only when the answer is cryptographically `Secure` **and** the query's
+  own `DO` bit is set (`set_ad = val.verdict == Verdict::Secure && do_bit`,
+  `src/dns/server.rs:711`) — `Bogus` is SERVFAIL'd (unless the client set `CD`), and
+  insecure/unsigned or DO-less answers leave `AD` clear. Outbound DNSSEC **signing** of
+  local zones is wire-native — an in-house ECDSA P-256 signer on `ring` (RFC
+  6605/4034/5155/9276), validated byte-identical
   to a hickory-proto oracle in dev-only differential tests and against `delv`.
 - **API auth is constant-time.** The bearer token is compared with `subtle::ConstantTimeEq`
   (no early-exit timing side-channel). The unauthenticated surface is a single `/health`
@@ -63,9 +70,9 @@
 - **Least privilege (PENT-3).** The service runs as a dedicated non-root user
   (`User=runbound`) with `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`. As
   of **v0.22** the default capability set is reduced to **`CAP_NET_BIND_SERVICE` only**
-  (`AmbientCapabilities` + `CapabilityBoundingSet` in `runbound.service:23` / `install.sh:284`)
-  — enough to bind `:53` on the default `xdp: no` path. The XDP fast path and the
-  firewall-manage feature additionally need `NET_RAW`/`NET_ADMIN`/`BPF`/`PERFMON`; these are
+  (`AmbientCapabilities` + `CapabilityBoundingSet` in `runbound.service:32-33` /
+  `install.sh:297-298`) — enough to bind `:53` on the default `xdp: no` path. The XDP fast
+  path and the firewall-manage feature additionally need `NET_RAW`/`NET_ADMIN`/`BPF`/`PERFMON`; these are
   now an explicit, commented opt-in in the unit file rather than granted by default.
 - **Cycle I remediations (v0.17.1).** The Cycle I two-AI adversarial audit
   (Claude Opus 4.8 × Gemini 2.5 Pro; full report `docs/security-audit/SECURITY-AUDIT.md`)
@@ -89,16 +96,20 @@
     `hickory-proto` is a `[dev-dependencies]`-only entry used solely by differential oracle
     tests — it is not a runtime dependency at all, in any configuration. Full recursion
     (`src/dns/recursor_wire.rs`) and DNSSEC validation/signing are entirely in-house and
-    always compiled in, toggled at runtime via `resolution: full-recursion` — there is no
-    `recursor` Cargo feature.
+    always compiled in (no Cargo feature gates them — there is no `recursor` or `dnssec`
+    feature) — but **off by runtime default**: `UnboundConfig::defaults()` sets
+    `resolution_mode: ResolutionMode::Forward` and `dnssec_validation: false`
+    (`src/config/parser.rs`). Full recursion + DNSSEC validation are opt-in via config
+    (`resolution: full-recursion`, `dnssec-validation: yes`), not a build flag.
   - **AXFR allow-list & split-horizon on the real client IP (PENT-1/PENT-2).** TCP/DoT/DoH
     are proxied through an internal loopback relay; the relay now carries the **real client
     IP via a PROXY v2 header** read **before** the TLS handshake for DoT/DoH
-    (`src/dns/server.rs:3043` builds it, `:3072` parses it). `axfr-allow` and split-horizon
-    therefore evaluate the true source instead of `127.0.0.1` — closing a real ACL bypass.
+    (`src/dns/server.rs:1873` builds it — `proxy_v2_header` —, `:1903` parses it —
+    `read_proxy_v2`). `axfr-allow` and split-horizon therefore evaluate the true source
+    instead of `127.0.0.1` — closing a real ACL bypass.
   - **Least privilege default `CAP_NET_BIND_SERVICE`** (PENT-3, above).
   - **WebUI binds `127.0.0.1` by default** (PENT, `ui-bind` default changed from `0.0.0.0`,
-    `src/config/parser.rs:522`).
+    `src/config/parser.rs:530`).
   - Config-parser fixes: a `server:` directive written after an `axfr:`/`io-uring:`
     sub-block is now parsed (was silently dropped); a `tsig-key` name with a trailing dot is
     normalized to match the verifier (used to fail every signed UPDATE with `UnknownKey`).
@@ -113,11 +124,11 @@
 
 On top of the per-source token-bucket rate limit, an **abuse engine** (per-client
 query-rate rules: `log` / `tarpit` / `block` / `notify`) escalates only **verified
-sources** — connection transports (TCP/DoT/DoH/DoQ) or UDP carrying a valid DNS Cookie
-(RFC 7873). An unverified UDP source is **never** tarpitted or banned: spoofing a
-victim's IP must not let an attacker get the victim banned, nor make Runbound reflect
-responses toward a spoofed victim. Unverified UDP floods are handled by the rate limiter
-+ `BADCOOKIE`.
+sources** — connection transports (TCP/DoT/DoH; DoQ is not implemented, see above) or
+UDP carrying a valid DNS Cookie (RFC 7873). An unverified UDP source is **never**
+tarpitted or banned: spoofing a victim's IP must not let an attacker get the victim
+banned, nor make Runbound reflect responses toward a spoofed victim. Unverified UDP
+floods are handled by the rate limiter + `BADCOOKIE`.
 
 - **Tarpit** holds a verified abuser's request a bounded delay (then REFUSED); on
   connection transports the relay holds the connection itself, wasting the attacker's

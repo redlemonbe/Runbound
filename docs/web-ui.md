@@ -63,7 +63,8 @@ The CA certificate is also downloadable from the Settings tab inside the UI afte
 Open `https://<server-ip>:8091` and enter your credentials.
 
 Default username is `admin`. The password is set during install or changed via
-Settings → Change Password. Sessions expire after 8 hours (30-minute idle timeout).
+Account → Change Password. Sessions have a flat 8-hour expiry from login — there is
+no idle-based auto-logout (activity does not extend or reset the session timer).
 
 If the WebUI is still on the default `admin`/`admin` credentials, the dashboard
 shows a one-time prompt on connect to change them (it disappears once changed).
@@ -82,12 +83,12 @@ Passwords are hashed with **argon2id** (m=19456, t=2, p=1).
 | **Feeds** | Add / delete blocklist feed URLs (hosts or adblock format); preset list; entry count; error text on refresh failure |
 | **Upstreams** | Add / delete resolvers; 14 built-in presets (Cloudflare, Google, Quad9, OpenDNS — plain + DoT variants); health dots, DNSSEC badge, latency sparkline, DoT SNI config; **↺ Reconnect DoT** button |
 | **Subnets** | **Split-Horizon**: per-subnet answer sets (add / delete, applied on next restart). **Subnet Policies** (#8): per-subnet/VLAN filtering — extra blacklist domains scoped to a subnet, additive to the global blacklist, **applied live, no restart** |
-| **Logs** | Query ring buffer with 3-second auto-refresh; **admin & config audit** (who did what — actor, action, result); **WebUI auth activity**; a **functional search** filtering all three. |
+| **Logs** | Query ring buffer with 3-second auto-refresh; **admin & config audit** (who did what — actor, action, result); **WebUI auth activity**; a **functional search** filtering the query log and the admin/config audit (the WebUI auth activity list is not filtered by this search). |
 | **Protection** | ICMP XDP flood protection (enable/disable per node; rate / burst / ban-threshold; per-node stats cards); **Banned source IPs** table (IP, source, age) with per-row **Blacklist** (make permanent) and **Unban** buttons; DDoS alerts log. Bans are enforced on both the XDP fast path and the kernel slow path. |
 | **System** | Runtime info (version, XDP mode, memory, CPU); slave list with sync status and version; full backup download / restore; cache flush button |
 | **Settings** | DNSSEC validation toggle; **Resolution mode** (forward to full-recursion, #202); **Encrypted DNS** panel: enable DoT/DoH/DoQ with a self-signed **or** imported certificate — **applied live, no restart** (cert CN/expiry/fingerprint shown); CA certificate download |
 | **Users** | Multi-user administration: create / list / delete users, per-user API key rotation. Disabled by default — enable by creating `users.json` in the data directory and restarting. |
-| **Account** | Per-user settings: change password, session info (idle / duration, logout now), recent auth event log |
+| **Account** | Per-user settings: change password, session info (fixed 8-hour session duration, no idle timeout enforced; logout now), recent auth event log |
 | **About** | Version badge, uptime, feature list, GitHub links, credits; plus a custom organisation / blurb / support-link card when white-label branding is enabled |
 
 The header bar shows: connection dot (blink green = connected, red = error), live
@@ -124,8 +125,8 @@ weighs ten times one serving 5 (never a flat average of the nodes).
 - All browser ↔ Runbound traffic is HTTPS (TLS 1.2+, rustls, auto-generated cert).
 - Sessions use HTTP-only cookies with CSRF tokens on all mutating requests.
 - The API port (8080) remains localhost-only — the UI server proxies `/api/*` internally.
-- Auto-logout after 30 minutes idle; hard session limit 8 hours.
-- All login attempts are logged (Settings → Recent Auth Events).
+- Flat 8-hour session limit; there is no idle-based auto-logout.
+- All login attempts are logged (Account → Recent Auth Events).
 
 ---
 
@@ -187,7 +188,9 @@ The consolidated security audit (all cycles) is available without internet acces
 https://<host>:<ui-port>/webui/security-audit
 ```
 
-This page is served directly by Runbound from the embedded binary (no CDN). A link is also available in the **About** tab → Links card.
+This page is served directly by Runbound from the embedded binary (no CDN). Note: the
+**About** tab → Links card currently links to the GitHub copy of the audit doc (requires
+internet access), not to this local `/webui/security-audit` route.
 
 ---
 

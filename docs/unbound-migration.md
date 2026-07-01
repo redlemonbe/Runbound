@@ -51,7 +51,7 @@ Directives that work but with noted differences from Unbound's behavior.
 
 | Directive | Caveat |
 |---|---|
-| `dnssec-validation` | In the **default `forward` resolution mode**, Runbound trusts the upstream AD bit rather than performing full RRSIG chain validation. Full RRSIG-chain validation is performed under sovereign full recursion (`resolution: full-recursion`), an in-house resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) always compiled in and always available — it's a runtime config toggle, not a Cargo feature or special build. |
+| `dnssec-validation` | In the **default `forward` resolution mode**, Runbound does no DNSSEC validation at all — responses are built with the AD bit never set (not "trusted" or passed through from upstream). Full RRSIG-chain validation is performed under sovereign full recursion (`resolution: full-recursion`), an in-house resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) entirely in-house and always compiled in (no Cargo feature gates it) — but OFF by runtime default: `resolution: forward` and `dnssec-validation: no` are the defaults; full recursion + DNSSEC validation are opt-in via config (`resolution: full-recursion`, `dnssec-validation: yes`), not a build flag. |
 | `rate-limit` | Runbound uses a per-IP token bucket compatible with Unbound's semantics. Runbound extends this with per-subnet bucketing via `rate-limit-prefix-v4` / `rate-limit-prefix-v6` (Runbound-specific directives). |
 | `tls-cert-bundle` | Accepted as an alias for `tls-service-pem`. Unbound uses `tls-cert-bundle` for the CA bundle, not the server certificate — if you use both, set `tls-service-pem` explicitly. |
 
@@ -74,25 +74,17 @@ Directives accepted without error but with no effect at runtime. Safe to leave i
 | `prefetch-key` | Key prefetching not separately configurable |
 | `use-syslog` | Runbound logs to stdout/journald via `tracing` |
 | `log-queries` / `log-replies` | Use `verbosity: 2` for per-query logging |
-| `hide-identity` / `hide-version` / `identity` / `version` | Runbound returns minimal CHAOS responses |
-| `username` / `chroot` / `directory` | Process isolation handled by systemd (`DynamicUser`, `PrivateTmp`) |
+| `hide-identity` / `hide-version` / `identity` / `version` | Runbound hard-rejects all CHAOS-class queries with NOTIMP and never constructs a CHAOS answer — it doesn't answer identity probes even minimally. `version.bind.` / `hostname.bind.` / `id.server.` / `authors.bind.` are also REFUSED regardless of query class |
+| `username` / `chroot` / `directory` | Process isolation handled by systemd (static `User=runbound`/`Group=runbound` created by `install.sh`, plus `PrivateTmp`) — no `DynamicUser` |
 | `auto-trust-anchor-file` / `val-log-level` | See `dnssec-validation` caveat above |
 | `harden-glue` / `harden-dnssec-stripped` | Security defaults equivalent to Unbound's hardened mode are always on |
 | `unwanted-reply-threshold` / `private-domain` | Not currently implemented |
-| `pidfile` | Parsed but not written — systemd uses `Type=notify`, no PID file needed |
-
----
-
-### Not yet supported
-
-Directives that generate an `unknown directive` warning and are ignored. Remove these from your config before migrating to avoid confusion.
-
-| Directive | Status |
-|---|---|
-| `module-config` | Unbound modules are not supported — Runbound is not module-extensible |
-| `python-script` | No Python scripting support |
-| `dnstap` | Not planned |
-| `forward-first` | `forward-zone` flag — unimplemented, logged as unknown directive |
+| `cpu-affinity` | Deprecated and ignored — CPU placement is now automatic (#163). Unlike the other entries in this table, this one **does** log a deprecation warning |
+| `pidfile` | Parsed but not written — the systemd unit is `Type=simple` and tracks the process directly; there's no `sd_notify`/`NOTIFY_SOCKET` integration, so no PID file is needed |
+| `module-config` | Unbound modules are not supported — Runbound is not module-extensible. Not a recognized directive, so it's captured into `raw_passthrough` and re-emitted unchanged on config regen — no warning is logged |
+| `python-script` | No Python scripting support. Same silent passthrough as `module-config` |
+| `dnstap` | Not planned. Same silent passthrough as `module-config` |
+| `forward-first` | `forward-zone` flag — unimplemented. Same silent passthrough as `module-config` |
 
 ---
 
@@ -135,7 +127,6 @@ Directives accepted by Runbound but not understood by Unbound. Unbound will warn
 | `hsm-pin` | PKCS#11 PIN — prefer `HSM_PIN` environment variable (chmod 640) |
 | `hsm-api-key-label` | Label of the `CKO_SECRET_KEY` object used as the REST API Bearer token |
 | `hsm-store-key-label` | Label of the `CKO_SECRET_KEY` object used as the JSON store HMAC key |
-| `cpu-affinity` | Pin Tokio worker threads to physical cores (default: yes) |
 | `xdp` | Enable AF/XDP kernel-bypass fast path (default: yes) |
 | `xdp-interface` | Explicit XDP network interface (default: auto-detect) |
 | `xdp-cpu-governor` | Set `performance` governor on XDP cores (default: no) |
@@ -170,10 +161,11 @@ sudo mv runbound-x86_64-linux-musl /usr/local/sbin/runbound
 ### 2. Test against your existing config
 
 ```bash
-# Run on a non-standard port first to avoid disruption
-sudo RUNBOUND_API_KEY="test" runbound \
-  --config /etc/unbound/unbound.conf \
-  --port 5353
+# Run on a non-standard port first to avoid disruption. The config path is a
+# bare positional argument (there is no --config flag), and there is no --port
+# flag either — the listen port comes only from the config file's port:
+# directive. Set "port: 5353" in /etc/unbound/unbound.conf before starting.
+sudo RUNBOUND_API_KEY="test" runbound /etc/unbound/unbound.conf
 
 # Verify resolution
 dig @127.0.0.1 -p 5353 google.com
@@ -211,4 +203,6 @@ with `SO_REUSEPORT`. Setting `num-threads` in your config is harmless — it's s
 ignored.
 
 **Module config:** If your Unbound config loads modules (`python`, `dynlib`, etc.),
-strip those lines before migrating. Runbound will warn about unknown directives.
+strip those lines before migrating — Runbound doesn't support them. Unrecognized
+directives are captured verbatim and re-emitted unchanged on config regen, with no
+warning logged, so a stale module line won't be flagged for you.

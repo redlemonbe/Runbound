@@ -18,9 +18,17 @@ hardware.
 | FIPS 140-2 / 140-3 compliance path | ❌ | ✅ (device-dependent) |
 
 In Runbound's PKCS#11 integration, keys are **extracted** from the HSM at startup
-into `Zeroizing<T>` buffers (memory is scrubbed on process exit). The HSM session
-is closed immediately after extraction — the HSM is not required to be reachable
-during normal operation.
+into `Zeroizing<T>` buffers, which zero their contents when dropped. The HSM
+session is closed immediately after extraction — the HSM is not required to be
+reachable during normal operation.
+
+**Known gap:** the buffers live in module-level `static OnceLock<Zeroizing<T>>`
+cells (`src/hsm.rs`). Rust never runs static destructors on normal process exit,
+and Runbound's shutdown paths call `std::process::exit()` directly (including
+the SIGTERM/SIGINT handler in `src/main.rs`, after the CPU governor is restored)
+— so the `Zeroizing` drop glue does not run and the key bytes are **not**
+guaranteed to be scrubbed from memory before exit. There is currently no
+explicit exit/signal hook that zeroizes these buffers.
 
 To prevent key extraction entirely (never leave the HSM), use a PKCS#11 token that
 refuses `CKA_EXTRACTABLE=true` and perform all cryptographic operations inside the
@@ -264,8 +272,9 @@ jobs:
               --extractable
           rm -f /tmp/store.key
 
-          # Expose the PIN to subsequent steps
+          # Expose the PIN and the generated API key to subsequent steps
           echo "HSM_PIN=1234" >> $GITHUB_ENV
+          echo "RUNBOUND_API_KEY=$API_KEY" >> $GITHUB_ENV
 
       - name: Write Runbound test config
         run: |
@@ -319,7 +328,7 @@ cat > /etc/runbound/env <<'EOF'
 HSM_PIN=1234
 EOF
 chmod 640 /etc/runbound/env
-chown root:runbound /etc/runbound/env
+chown runbound:runbound /etc/runbound/env
 ```
 
 In the systemd unit, load the env file:

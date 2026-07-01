@@ -532,49 +532,43 @@ This bound is hard even at line rate.
 
 ```
 # Not configurable — polls /proc/meminfo every 30 s.
-# Threshold: purge when system RAM usage ≥ 80 %
-# Target:    log status at 50 % after purge
+# Watermarks: 70 % (moderate) and 80 % (high)
 ```
 
-A background task reads `/proc/meminfo` every 30 seconds. If system memory usage
-reaches **80 %**, two caches are flushed atomically:
+A background task (`memory_guard_loop`) reads `/proc/meminfo` every 30 seconds and
+computes `used = 1 - MemAvailable/MemTotal` against two watermarks:
 
-| Cache | Action | Recovery |
-|---|---|---|
-| Rate-limiter DashMap | All token buckets cleared | Rebuilds naturally on next query per IP |
-| Forwarder / resolver cache | Resolver rebuilt, ArcSwap pointer swapped | In-flight queries keep old resolver; new queries use fresh empty cache |
+| Used memory | Action |
+|---|---|
+| < 70 % | No action (stable). |
+| 70–80 % | Logged at `debug` only — nothing is resized (see below). |
+| ≥ 80 % | `ForwardPool` is rebuilt (refreshes upstream/DoT connections), cache stats counters are reset, and the rate limiter's DashMap of token buckets is cleared to free memory. |
 
-After purging, usage and whether the 50 % target was reached are logged at `WARN` level.
-On non-Linux systems or containers without `/proc/meminfo`, the guard silently skips
-its check and DNS service continues normally.
+There is no general query-answer cache to "halve" in this architecture — `ForwardPool`
+only pools upstream connections, it does not cache answers. On non-Linux systems or
+containers without `/proc/meminfo`, the guard silently skips its check and DNS service
+continues normally.
 
-**Log output example:**
+**Log output example (≥ 80 % watermark):**
 
 ```
-WARN Memory pressure — purging DNS caches  used_pct=82.3%  avail_mb=312  total_mb=1753
-WARN DNS resolver cache flushed and rate limiter cleared  freed_buckets=8241
-WARN Memory after purge  used_pct=44.1%  status="below 50% target"
+WARN memory pressure high: pool rebuilt, rate limiter cleared  used_pct=82.1%  freed_buckets=4096
 ```
 
-**`cache-min-entries`** — floor for memory-pressure halvings (v0.5.1+):
+**`cache-min-entries`** — accepted for backward compatibility only:
 
 ```
 server:
-    cache-min-entries: 2048
+    cache-min-entries: 2048   # default: 2048
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `cache-min-entries` | integer | `2048` | Minimum number of entries the cache will be reduced to during memory pressure events. The cache halving mechanism will not go below this value. |
+| `cache-min-entries` | integer | `2048` | Still parses and round-trips in the config file, but has **no runtime effect** — the cache-halving mechanism it used to floor was removed along with the old hickory-based resolver cache. The value is read into config and otherwise discarded. |
 
-The halving loop also enforces a 5-minute cooldown between halvings and will disable
-further halvings if they produce no measurable reduction in system memory pressure,
-logging a clear `WARN` that points to the root cause.
-
-Recommended values:
-- `1024` — systems with < 4 GB RAM or high memory contention
-- `2048` — default, suitable for most deployments
-- `4096` — systems with ≥ 4 GB RAM where cache hit rate matters
+See [docs/troubleshooting.md](troubleshooting.md#memory-pressure-under-low-memory-systems-cache-no-longer-shrinks-to-zero)
+for how cache sizing actually works today (the serve-stale fallback store,
+`stale_cache_wire`, sized once at startup from available RAM).
 
 ### XDP kernel-bypass fast path
 
@@ -653,19 +647,26 @@ INFO XDP auto-selected interface: ens18 (use xdp-interface: to override)
 
 ```
 server:
-    xdp-hugepages: 512    # default: 0 (disabled)
+    xdp-hugepages: yes    # default: yes
 ```
 
-Number of 2 MiB hugepages to pre-allocate for AF_XDP UMEM. Hugepages reduce TLB
-pressure on the hot packet path. Requires `vm.nr_hugepages` to be set in the kernel
-before Runbound starts:
+Boolean — whether to back the AF_XDP UMEM with 2 MiB huge pages instead of standard
+4 KiB pages. Hugepages reduce TLB pressure on the hot packet path. Provisioning is
+**fully automatic**: at startup Runbound tries to allocate 2 MiB huge pages, and if
+none are available it auto-reserves enough pages via
+`/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages` (root only) and retries —
+no manual `vm.nr_hugepages` setup is required. If 2 MiB pages still cannot be
+obtained, it falls back to 1 GiB huge pages, then finally to standard 4 KiB pages
+with a loud `WARN` (expect `rx_no_dma` drops and lower throughput under flood in
+that last case).
 
-```bash
-echo 512 | sudo tee /proc/sys/vm/nr_hugepages
+Set `xdp-hugepages: no` to force standard 4 KiB pages (e.g. to silence a persistent
+hugepage-registration-failed warning on a host that cannot provide huge pages).
+
 ```
-
-A value of 0 disables hugepage allocation (default). At 100 k QPS, 512 pages
-(1 GiB) is a comfortable working set.
+INFO UMEM: huge pages active (2 MiB, auto-reserved by runbound)
+WARN UMEM: no 2 MiB huge pages available — falling back to standard 4 KiB pages ...
+```
 
 ### XDP NIC ring size
 
@@ -693,7 +694,10 @@ default is used. A `WARN` is emitted in the log.
 [WARN]  xdp: ring resize failed on ens18 — Operation not permitted
 ```
 
-Monitor via `GET /api/system`: `nic_rx_ring`, `nic_rx_ring_max`, `nic_rx_dropped`.
+Monitor via `GET /api/system`: `nic_rx_ring`, `nic_rx_ring_max`. The AF_XDP-socket-level
+drop counter, `xsk_rx_dropped`, is also exposed there; the NIC hardware FIFO overflow
+counter (`runbound_nic_rx_dropped_total`) is only available via `GET /api/metrics`
+(OpenMetrics).
 
 ### XDP IRQ affinity
 
@@ -750,11 +754,19 @@ Accepted values: `performance`, `powersave`, `ondemand`. Requires root and
 
 ```
 server:
-    cpu-affinity: no    # default: yes
+    cpu-affinity: no    # deprecated — no runtime effect (#163)
 ```
 
-Disables pinning tokio worker threads and DNS socket workers to physical CPU cores.
-Set to `no` in containers or environments without `CAP_SYS_NICE`.
+**Deprecated and ignored.** CPU placement is now fully automatic (Tokio's work-stealing
+scheduler outperformed manual pinning in benchmarking — see [xdp.md](xdp.md)). Setting
+`cpu-affinity` to any value in `unbound.conf` does nothing except emit a startup warning:
+
+```
+WARN cpu-affinity is deprecated and ignored — CPU placement is now automatic (#163)
+```
+
+There is no config field behind this directive anymore; it is accepted purely so
+existing config files still parse without error.
 
 ### Cache TTL cap
 
@@ -888,7 +900,12 @@ When full-recursion is active:
   are stripped for non-DO clients (RFC 4035 §3.2.1).
 - **Anti-SSRF:** the recursor refuses to query loopback / RFC 1918 / CGNAT / link-local
   (incl. `169.254` cloud-metadata) / ULA addresses — on glue, CNAME chains and NS addresses.
-- QNAME minimisation, 0x20 case-randomisation and serve-stale (RFC 8767) are on.
+
+> **Not implemented:** `src/dns/recursor_wire.rs` sends the full QNAME in one query per
+> hop (no QNAME minimisation, RFC 7816) and does not randomise the case of the query
+> name (no 0x20 encoding). Transaction IDs are randomised per query. Serve-stale
+> (RFC 8767) is a `forward`-mode / `ForwardPool` feature (`src/dns/server.rs`) and is not
+> wired into the recursor.
 
 Toggle live without a restart via [`PUT /api/resolution`](api.md); the master propagates the
 mode to slaves over the relay. Opt-in (experimental); `forward` stays the default.

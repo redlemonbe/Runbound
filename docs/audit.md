@@ -38,10 +38,19 @@ make audit-full  # runs all three above + cargo outdated
 
 | Check | Trigger |
 |---|---|
-| `make audit` | Every release + every week in CI |
-| `make deny` | Every dependency addition or `Cargo.lock` change |
-| `make sbom` | Every git tag (attach `sbom.cdx.json` as a release asset) |
-| `cargo outdated` | Monthly + before any minor or major release |
+| `make audit` | Every release, run manually (not currently CI-scheduled — see below) |
+| `make deny` | Every dependency addition or `Cargo.lock` change, run manually |
+| `make sbom` | Every git tag (CI runs `cargo cyclonedx` in `release.yml`, attaches `sbom.cdx.json` as a release asset) |
+| `cargo outdated` | Monthly + before any minor or major release, run manually |
+
+None of `make audit`/`make deny`/`cargo outdated` are wired into a scheduled or
+per-push CI workflow today. The only cron-scheduled workflow in `.github/workflows/`
+is `fuzz.yml` (`cron: '0 2 * * 1'`, weekly), and it only runs `cargo fuzz` targets
+(`fuzz_dns_query`, `fuzz_config`, `fuzz_api_json`, `fuzz_dns_name`) — it does not run
+`cargo audit` or `cargo deny`. `.github/workflows/ci.yml` runs on push/PR and only does
+a SECURITY.md/Cargo.toml version-drift check, `cargo build --release`, `cargo clippy`,
+and `cargo test` — no audit, no deny. The cadence above is a recommendation for the
+maintainer to run locally, not an enforced schedule.
 
 ---
 
@@ -49,6 +58,16 @@ make audit-full  # runs all three above + cargo outdated
 
 **`Cargo.lock` is committed.** Every build resolves to the exact same crate versions.
 Dependency updates are a conscious, audited step — not a side-effect of a stale lockfile.
+
+> **Known drift:** as of the current `HEAD`, `Cargo.lock`'s own `runbound` package entry
+> is still pinned at `0.23.8` while `Cargo.toml` reads `0.23.9` (the lockfile was
+> regenerated in commit `9e074d8` to purge stale `hickory-resolver`/`hickory-server`
+> entries, but that happened one commit before the `0.23.9` version bump and `cargo
+> update`/`cargo check` wasn't re-run after). Run `cargo update -p runbound --precise
+> 0.23.9` (or any build/check, which also rewrites the local package entry) and commit
+> the result before the next release. `hickory-resolver`/`hickory-server` are confirmed
+> absent from the lockfile; only `hickory-proto` remains, and only as a transitive
+> dev-dependency (see `Cargo.toml`'s `[dev-dependencies]`).
 
 **Rust toolchain pinning.** Pin the compiler in `rust-toolchain.toml` to prevent silent
 breakage when a new toolchain ships between CI runs:
@@ -89,7 +108,7 @@ check of the RUSTSEC advisory database and the upstream changelog before merging
 | `tokio` | everywhere | Async runtime — attack surface for all network I/O |
 | in-house wire codec (`src/dns/wire/`) | `src/dns/server.rs` → `serve_wire`, `src/dns/forward.rs` | DNS parsing — the default network-facing path processes untrusted input here (no hickory request handler in the default build) |
 | `hickory-proto` | tests only | `[dev-dependencies]` only, used solely by the differential oracle tests — no hickory dependency of any kind in the default runtime build |
-| in-house recursor + DNSSEC (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) | `src/dns/` | Sovereign full-recursion resolver and DNSSEC validation, entirely in-house — always compiled in and on by default; no `recursor` Cargo feature exists. Full-recursion is a runtime config toggle (`resolution: full-recursion` vs. default `forward`), not a build-time flag |
+| in-house recursor + DNSSEC (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) | `src/dns/` | Sovereign full-recursion resolver and DNSSEC validation, entirely in-house and always compiled in (no Cargo feature gates them) — but **off by runtime default**: `resolution: forward` and `dnssec-validation: no` are the defaults (`UnboundConfig::defaults()`); full-recursion and DNSSEC validation are opt-in via config (`resolution: full-recursion`, `dnssec-validation: yes`), not a build flag |
 | `axum` / `hyper` | `src/api/mod.rs` | HTTP server — injection, path traversal, request smuggling |
 | `serde_json` | `src/store.rs`, `src/api/mod.rs` | JSON deserialisation — parses external (API) input |
 | `ring` | transitive via `rustls` | Cryptographic backend — AEAD, HMAC, ECDSA |
@@ -100,7 +119,7 @@ check of the RUSTSEC advisory database and the upstream changelog before merging
 
 ## Release procedure
 
-The following gates must all pass with zero errors before tagging a release:
+Run the following manually before tagging a release:
 
 ```bash
 # 1. Zero known CVEs or unsound/unmaintained advisories
@@ -118,8 +137,14 @@ git tag -s v0.X.Y -m "release v0.X.Y"
 git push origin v0.X.Y
 ```
 
-Steps 1 and 2 are blocking — a failed gate prevents the release.
-Step 3 is mandatory for enterprise and government customers.
+Steps 1 and 2 are **not currently enforced by CI** — `.github/workflows/release.yml` only
+builds the release binaries and generates the SBOM (`cargo cyclonedx`); neither it nor
+`.github/workflows/ci.yml` runs `cargo audit` or `cargo deny`. `make audit`/`make deny` are
+local, manual checks the releaser is expected to run themselves; a failure does not
+currently block `git push --tags` or the release workflow. Wiring them into CI as a
+blocking gate is a TODO, not a shipped control.
+Step 3 (SBOM) is mandatory for enterprise and government customers, and is the one part
+of this list CI actually performs (`release.yml` runs `cargo cyclonedx` on every tag).
 Step 4 ensures every release can be traced to a verified committer identity.
 
 ---

@@ -20,8 +20,14 @@ ConditionFileNotEmpty=/etc/runbound/runbound.conf
 Type=simple
 User=runbound
 Group=runbound
-EnvironmentFile=/etc/runbound/env
-ExecStart=/usr/local/sbin/runbound /etc/runbound/unbound.conf
+EnvironmentFile=-/etc/runbound/env
+# Huge pages for the XDP/AF_XDP UMEM (perf): reserving the 2 MiB pool needs root, but
+# consuming it (mmap MAP_HUGETLB) needs no privilege — so it's reserved once at boot here
+# and the unprivileged runbound user mmaps it. 0 = disabled (default, for xdp: no installs);
+# set to cover ceil(UMEM_bytes/2MiB) per worker (e.g. 512 ≈ 1 GiB) when running xdp: yes.
+Environment=RUNBOUND_HUGEPAGES_2M=0
+ExecStartPre=+/bin/sh -c '[ "${RUNBOUND_HUGEPAGES_2M:-0}" = 0 ] || echo "${RUNBOUND_HUGEPAGES_2M}" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true'
+ExecStart=/usr/local/sbin/runbound /etc/runbound/runbound.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
@@ -37,32 +43,23 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 # CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 
-# AF_XDP socket family
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
-
-# Hardening
 NoNewPrivileges=yes
 PrivateTmp=yes
-PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
-ProtectKernelModules=no        # eBPF JIT requires kernel module access
-ProtectControlGroups=yes
-ReadWritePaths=/etc/runbound /var/log/runbound
-MemoryDenyWriteExecute=no      # required for eBPF JIT compilation
-LimitNOFILE=131072             # 32× SO_REUSEPORT sockets + XDP sockets + DoT connections
-LimitNPROC=4096                # cap on XDP worker threads (max 64) + tokio pool
+# AF_XDP socket family
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
+MemoryDenyWriteExecute=false   # required for eBPF JIT compilation
+ReadWritePaths=/etc/runbound /var/lib/runbound
+LimitNOFILE=65536              # SO_REUSEPORT sockets + XDP sockets + DoT connections
 LimitMEMLOCK=infinity          # required for AF_XDP UMEM mmap
-MemoryMax=2G                   # cgroup v2 memory cap — prevents runaway growth; adjust to your RAM
-
-# Optional: pre-allocate hugepages before Runbound starts (recommended in production)
-# Uncomment and adjust the count to match xdp-hugepages in runbound.conf
-# ExecStartPre=/usr/sbin/sysctl -w vm.nr_hugepages=512
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+This matches the `runbound.service` file shipped in the repo root exactly — use that file directly rather than retyping it by hand.
 
 ---
 
@@ -121,7 +118,7 @@ systemctl reload runbound
 # Via REST API — same effect as SIGHUP
 curl -X POST http://localhost:8080/api/reload \
   -H "Authorization: Bearer $RUNBOUND_API_KEY"
-# → {"status":"ok","cfg_path":"/etc/runbound/runbound.conf","local_zones":5,"local_data":12}
+# → {"status":"ok","cfg_path":"/etc/runbound/runbound.conf","local_zones":5,"local_data":12,"alert_rules":3}
 ```
 
 ### What gets reloaded
@@ -169,7 +166,7 @@ journalctl -u runbound -n 20 | grep "Hot-reload complete"
 | Signal | Effect |
 |--------|--------|
 | `SIGHUP` | Hot-reload zones and config (same as `POST /api/reload`). In-flight queries finish on the old snapshot. |
-| `SIGTERM` | Graceful shutdown — XDP detached, connections drained, process exits cleanly. |
+| `SIGTERM` | Graceful shutdown — CPU governor restored, connections drained, process exits (`exit(0)`). Does **not** detach XDP: the OS kills the process before Rust's unwind path runs, so `XdpHandle::Drop` (which calls `detach()`) is never reached. If XDP was force-enabled outside normal operation (e.g. `xdp: yes` left attached from a prior test), it stays attached across a `SIGTERM` stop — detach it manually with `ip link set <iface> xdp off` before switching back to `xdp: no`, or the interface will keep dropping/redirecting packets per the old program. |
 | `SIGUSR1` | Dump live stats to the log: total queries, forwarded, blocked, 1-minute QPS, cache hit rate, uptime. |
 | `SIGUSR2` | Persist the XDP cache to disk (`xdp_cache.rkyv`, rkyv-serialized, atomic write via temp file + rename). Reloaded automatically on next startup. No-op (logged at debug) if the XDP cache is not active. |
 

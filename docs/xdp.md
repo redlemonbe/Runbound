@@ -178,9 +178,9 @@ All requirements are configured automatically by `install.sh`.
 ## Startup log
 
 ```
-INFO runbound::dns::xdp::loader: XDP program attached iface=eth0 link_id=...
+INFO runbound::dns::xdp::loader: XDP program attached iface=eth0 mode=Drv hash=fnv1a
 INFO runbound::dns::xdp::worker: Starting XDP workers iface=eth0 queues=N
-INFO runbound: XDP kernel-bypass fast path active iface=eth0
+INFO runbound::dns::xdp::worker: XDP fast path active (core block assigned) iface=eth0 mode=Drv core_base=0 queue_count=N cores=[...]
 ```
 
 **virtio-net MTU warning** — emitted when `MTU > 3506` (virtio-net single-buffer limit).
@@ -311,11 +311,13 @@ Full details, reference architecture, and troubleshooting: [docs/proxmox.md](pro
 
 By default, the kernel distributes NIC interrupts across any available core. If queue N's IRQ fires on a different core than the XDP worker handling queue N, the packet data arrives in the wrong L1/L2 cache — guaranteed cache miss on every RX.
 
-Runbound automates IRQ pinning at startup with `xdp-irq-affinity: auto`:
+Runbound automates IRQ pinning at startup with `xdp-irq-affinity: yes`. This is a plain
+boolean directive — only the exact string `yes` enables it, any other value (including
+`auto`) is treated as off:
 
 ```
 server:
-    xdp-irq-affinity: auto    # default: off
+    xdp-irq-affinity: yes    # default: no
 ```
 
 When enabled, after spawning XDP workers Runbound reads `/proc/interrupts` to locate the IRQ numbers for the active NIC, then writes the matching core mask to `/proc/irq/<N>/smp_affinity_list` — queue N's IRQ → core N's XDP worker.
@@ -450,7 +452,7 @@ leaves the queue count untouched and continues.
 | Hardware | Mode | Estimated peak |
 |---|---|---|
 | VM virtio (Proxmox/KVM) | copy mode | ~500k–1M QPS (theoretical) |
-| Bare metal Intel 10GbE | native zero-copy | **~10.14 M QPS** (X710 single-link, link-bound, ~10.5 % CPU) · **~20.3 M** dual-link (X510+X710), ~24 % CPU — see [benchmark/INDEX.md](benchmark/INDEX.md) |
+| Bare metal Intel 10GbE | native zero-copy | **~12.56 M QPS** (X710 single-link, ~9.3 % CPU) · **~11.88 M** (X520 single-link) · **~19.9 M** dual-link aggregate (X710+X520, generator-imbalanced — CPU not isolated on this run) — see the current [v0.23.8 re-run in benchmark/INDEX.md](benchmark/INDEX.md#re-run-on-v0238-2026-07-01--same-rig-official-release-binaries-nic-counter-ground-truth) |
 
 Wire speed on 10GbE = ~14.88M 64-byte packets/second (physical limit, not yet validated end-to-end).
 
@@ -481,11 +483,10 @@ No system calls, no kernel IP stack, no userspace context switches.
 ### Configuration
 
 ```
-icmp {
+icmp:
     enable:           yes
     rate-limit:       20     # pings/s per source IP
     rate-limit-burst: 8      # initial burst tokens for new IPs
-}
 ```
 
 ### BPF maps
@@ -579,16 +580,19 @@ If RPS was previously enabled:
 for f in /sys/class/net/<iface>/queues/rx-*/rps_cpus; do echo 0 > $f; done
 ```
 
-### cpu-affinity default changed to 'no' (#163)
+### cpu-affinity is deprecated and ignored (#163)
 
 Measured on Xeon E5-2690 v2 + X520 (kernel path, 5-run medians):
-- `cpu-affinity: yes` (old default): **630k qps**
-- `cpu-affinity: no` (new default):  **874k qps** (+39%)
-- `taskset 0-19` (physical):         **713k qps**
+- pinned affinity (old behaviour): **630k qps**
+- floating scheduler (OS-managed): **874k qps** (+39%)
+- `taskset 0-19` (physical):       **713k qps**
 
-The floating scheduler (OS-managed) outperforms naive thread pinning on this
-architecture because Tokio's work-stealing adapts to load imbalance dynamically.
-The new default is `cpu-affinity: no`.
+The floating scheduler outperforms naive thread pinning on this architecture because
+Tokio's work-stealing adapts to load imbalance dynamically. As a result `cpu-affinity`
+is no longer a live tunable at all: CPU placement is fully automatic, and setting this
+directive to any value in `unbound.conf` does nothing except emit a deprecation warning
+(`cpu-affinity is deprecated and ignored — CPU placement is now automatic (#163)`) — there
+is no config field behind it anymore.
 
 ### #164 — NIC/bus-bound detection (rx_missed_errors)
 

@@ -12,22 +12,35 @@ hosts the cache could eventually be halved down to 0, sending all queries upstre
 This was fixed in v0.5.1 with a floor (`cache-min-entries`), a 5-minute cooldown, and
 no-effect detection.
 
-**Current behaviour (current de-hickory architecture, v0.23.x):** The DNS cache now lives in
-`ForwardPool` and is sized **once at startup** — a ceiling derived from available RAM
+**Current behaviour (current de-hickory architecture, v0.23.x):** There is no general
+query-answer cache anywhere in this architecture (outside the XDP fast-path snapshot).
+`ForwardPool` (`src/dns/forward.rs`) only pools upstream DoT/UDP connections and races
+them — it does not cache answers. The structure that `cache-min-entries` / `cache-size`
+/ RAM-based auto-sizing actually govern is `stale_cache_wire`, the **serve-stale
+fallback store** (`src/dns/server.rs`): a `DashMap` of the last-known-good answer per
+`(name, qtype)`, used only to answer queries when all upstreams are unreachable
+(RFC 8767). It is sized **once at startup** — a ceiling derived from available RAM
 (cgroup-aware: `memory.max` inside a container, `/proc/meminfo` `MemAvailable`
 otherwise), clamped to [8192, 64M] entries. It fills as queries arrive; it is never
 forcibly shrunk at runtime, so the "cache halved to 0" failure mode described above
-cannot recur. The `cache-min-entries` config directive still parses and round-trips
-for backward compatibility with existing config files, but no longer has any runtime
-effect (there is nothing left to floor).
+cannot recur.
 
-The 30 s memory-pressure monitor (`memory_guard_loop`) still runs, with the same 70 %
-/ 80 % watermarks, but its actions changed:
+**This entire section only matters if serve-stale is enabled** (`serve-stale: yes`,
+which is the default — check your `runbound.conf` if unsure). `stale_cache_wire` is
+only allocated when serve-stale is on; with `serve-stale: no`, none of the
+sizing/watermark logic below touches anything real — every query goes straight
+upstream, uncached, on every request. The `cache-min-entries`
+config directive still parses and round-trips for backward compatibility with existing
+config files, but no longer has any runtime effect (there is nothing left to floor —
+the halving logic it used to feed was removed along with the hickory resolver cache).
+
+The 30 s memory-pressure monitor (`memory_guard_loop`) still runs, with 70 % / 80 %
+watermarks (`MEM_MOD_WATERMARK` / `MEM_HIGH_WATERMARK`), but its actions changed:
 
 | Used memory | Action |
 |---|---|
-| < 60 % | No action (stable). |
-| 60–80 % | Logged at `debug` only — no cache resize. |
+| < 70 % | No action (stable). |
+| 70–80 % | Logged at `debug` only — no cache resize. |
 | ≥ 80 % | `ForwardPool` is rebuilt with the same target size (refreshes upstream/DoT connections), cache stats counters are reset, and the rate limiter's bucket table is cleared to free memory: |
 
 ```
@@ -35,10 +48,12 @@ WARN memory pressure high: pool rebuilt, rate limiter cleared  used_pct=82.1%  f
 ```
 
 **If you are still low on memory:**
-- Increase `MemoryMax` in the systemd service file (e.g. `MemoryMax=512M`) so the
-  cgroup gives Runbound more headroom to size its startup cache ceiling from.
-- Set an explicit `cache-size:` in `runbound.conf` to cap the cache regardless of
-  available RAM.
+- Add a `MemoryMax=` directive to the systemd service file (e.g. `MemoryMax=512M` under
+  `[Service]` in `runbound.service`) — the shipped unit does not set one by default, so
+  the cgroup is otherwise unbounded and Runbound sizes its startup ceiling from all
+  available host RAM.
+- Set an explicit `cache-size:` in `runbound.conf` to cap the serve-stale store
+  regardless of available RAM (only relevant if `serve-stale: yes`).
 - Reduce the workload of other processes sharing the host.
 - Add swap space as a last resort.
 

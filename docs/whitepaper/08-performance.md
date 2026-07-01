@@ -84,11 +84,11 @@ truth):
     RX ring 4096), 63 `SO_REUSEPORT` workers, a kernel-UDP generator (~4.6 M offered), p99
     0.371 ms — ~2× BIND/unbound on the same rig. **This is the slow-path number.**
   - **~1.5 M qps** (best ~1.59 M) — **out of the box, NOT retuned** (no named NIC), i40e
-    NAPI-bound ([#190](https://github.com/redlemonbe/Runbound/issues/190)/[#165](https://github.com/redlemonbe/Runbound/issues/165)).
+    NAPI-bound ([#190](https://github.com/redlemonbe/Runbound/issues/190)).
   - **~7.3 M** — historical **ixgbe/X520** (a different datapath, see the table below), **not
     reproducible on i40e**.
   A mis-tuned setup (e.g. NIC RX queues spread cross-NUMA away from the card's node) collapses
-  below even the out-of-box figure — the lever is node-local queues/IRQs (#165). The AF_XDP fast path is unaffected by any
+  below even the out-of-box figure — the lever is node-local queues/IRQs (#190). The AF_XDP fast path is unaffected by any
   of this (re-verified at the 10 G link ceiling — **~10.1–11.2 M qps** single link,
   run-to-run; the v0.18.1 per-run report records **~10.12 M** sustained served).
 
@@ -127,18 +127,21 @@ reports archived — in git history pre-`6ff6ae4`; the current round is in [benc
 ## Independent cross-validation (dnsperf)
 
 The same `xdp: no` receiver was measured by an independent third-party tool — `dnsperf
-2.14.0` (DNS-OARC) — to confirm the figures are not a generator artifact. NIC-confirmed:
-served = received with **zero drops**, 99.85 % NOERROR, ~0.09–0.12 ms latency, at **3.4 %
-receiver CPU**. dnsperf plateaus at **~238 k QPS** regardless of added clients/threads — a
-closed-loop, kernel-UDP, single-process generator is bounded there, exercising only ~3–4 %
-of the AF_XDP-measured ceiling while the receiver is far from saturation. The tools agree on
-correctness, latency and NIC-truth; dnsperf is generator-bound, as expected — which is why
-an open-loop AF_XDP generator is needed to reach the receiver's actual saturation point.
-Full report in the dnsmark repository (`docs/cross-validation-dnsperf.md`).
+2.14.0` (DNS-OARC) — to confirm the figures are not a generator artifact. Closed-loop,
+NIC-confirmed (`RUNBOUND-v0.18.1-…-x710-noxdp`, the canonical `xdp: no` report, §4): dnsperf
+sustains **~1.99 M avg / 2.05 M peak QPS** (receiver NIC `tx_packets`), **99.52 % completed /
+0.48 % lost**, **99.68 % NOERROR**, at the same run's **19.1 % receiver CPU** (dnsmark
+open-loop peak on this config/rig) — 2.5–3.4× the reference resolvers (BIND, unbound) in the
+same closed-loop test, and consistent with the `xdp: no` ramp figures above. dnsperf is a
+closed-loop, single-process generator, so it does not itself reach the AF_XDP-measured
+ceiling; it corroborates correctness and NIC-truth rather than pushing the receiver to
+saturation — which is why an open-loop AF_XDP generator is needed to reach the receiver's
+actual saturation point. Full report:
+`docs/benchmark/RUNBOUND-v0.18.1-threadripper-5995wx-x710-noxdp-2026-06-13.md`.
 
 ## Bottleneck analysis & scaling headroom
 
-At the 2026-06-13 ceiling — **~20.28 M qps served, dual-link (X510 + X710)** — the limit is
+At the 2026-06-15 ceiling — **~20.3 M qps served (steady 20.0–20.34 M), dual-link (X510 + X710)** — the limit is
 **the aggregate link line rate, not Runbound and not the CPU.** Each 10 GbE link carries
 ~10.1 M small-DNS responses/s (its *response-direction* line rate); both links run at line
 rate at once, with **~0 NIC drops** and the receiver (a single AMD Threadripper PRO 5995WX,
@@ -164,9 +167,9 @@ rate as long as CPU, PCIe and memory keep pace:
 > **These are projections, not measurements.** They assume: (a) an **AF_XDP zero-copy** NIC —
 > Mellanox `mlx5` or Intel `ice` / `i40e`, **not** Broadcom `bnxt` (no zero-copy in any kernel
 > → copy-mode only); (b) PCIe and memory bandwidth that keep pace with the link; (c) NIC RSS
-> queues pinned to physical cores (the [#165](https://github.com/redlemonbe/Runbound/issues/165)
+> queues pinned to physical cores (the [#190](https://github.com/redlemonbe/Runbound/issues/190)
 > lever). They have **not** been run on the target hardware. The measured, reproducible fact is
-> the one above: **20.28 M served at ~24 % CPU, link-bound** — the server was never the wall.
+> the one above: **~20.3 M served at ~24 % CPU, link-bound** — the server was never the wall.
 
 ## To expand
 - A v0.17.x run under the documented methodology (the v0.16.11 dual-link report's open

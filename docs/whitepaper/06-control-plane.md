@@ -1,7 +1,10 @@
 # 06 — Control plane
 
-The control plane runs on a **separate 2-thread Tokio runtime** so DNS load and management
-cannot starve each other (§1.4). Files: `src/api/`, `src/config/writer.rs`, `src/sync.rs`,
+The control plane runs on its own Tokio runtimes, separate from the DNS runtime, so DNS
+load and management cannot starve each other (§1.4): the REST API gets a dedicated
+**2-thread runtime** (`api_rt`, `worker_threads(2)`), while the embedded web UI gets a
+**separate 1-thread runtime** (`ui_rt`, `worker_threads(1)`) — both set up in
+`src/main.rs`. Files: `src/api/`, `src/config/writer.rs`, `src/sync.rs`,
 `src/api/relay.rs`, `src/webui/`.
 
 ## 6.1 REST API (axum 0.7)
@@ -25,8 +28,11 @@ because axum 0.7 `serve()` is TCP-only (chapter 02 of the API; see also the sock
 - Round-trip tests (examples, passthrough preservation, kitchen-sink, upstreams) guard
   against silent corruption.
 
-Some changes apply live (DNSSEC toggle, upstreams via forward-zone rebuild); others need a
-restart (split-horizon, whose resolver table is built at boot).
+Most changes apply live: DNSSEC toggle, upstreams via forward-zone rebuild, and
+split-horizon — `add_split_horizon`/`delete_split_horizon` (`src/api/mod.rs`) call
+`apply_split_horizon_live()`, which hot-swaps an `ArcSwap<SplitHorizonTable>`
+(`src/dns/server.rs`) with **zero restart** (the API response literally returns
+`"note":"applied live (no restart)"`).
 
 ## 6.3 Master↔slave relay (HMAC-SHA256) — and an honest security note
 
@@ -37,7 +43,7 @@ restart (split-horizon, whose resolver table is built at boot).
   (SEC-I14, v0.17.1 — before that the body was not covered), carried in the
   `x-runbound-ts` + `x-runbound-sig` headers (`src/api/relay.rs:136`), anti-replay
   window ±30 s. Verification is constant-time (no secret-dependent short-circuit —
-  `hmac_verify_with_ts`, `src/sync.rs:118`). As of **v0.18.1 (SEC-J5) only the
+  `hmac_verify_with_ts`, `src/sync.rs:145`). As of **v0.18.1 (SEC-J5) only the
   body-covering signature is accepted** — the pre-v0.17.1 legacy header-only fallback
   (which left the body unauthenticated) was removed once the fleet was ≥ v0.17.1. Deploy
   note: the relay requires **both** master and slave at ≥ v0.17.1.
@@ -64,9 +70,18 @@ restart (split-horizon, whose resolver table is built at boot).
 
 ## 6.4 SSE, backup/restore, split-horizon, web UI
 
-- **SSE**: `GET /api/events`, `node_status` events `{node_id, addr, status, ts}`.
-- **Backup/restore**: `GET/POST /api/backup` export/import — base64 JSON of the managed
-  state files + `runbound.conf`; import is path-whitelisted and written atomically.
+- **SSE**: `GET /api/events`, `node_status` events `{node_id, addr, status, reason, ts}`
+  (`NodeStatusEvent`, `src/sync.rs`).
+- **Backup/restore** — two separate mechanisms:
+  - `POST /api/backup` / `GET /api/backup`: create/list on-disk snapshot directories
+    (`backup_<ts>[_label]/`) holding plain copies of `runbound.conf` + the data files
+    (`dns_entries.json`, `blacklist.json`, `feeds.json`, `upstreams.json`); restored via
+    `POST /api/backup/restore` (no base64 involved).
+  - `GET /api/backup/export` / `POST /api/backup/import`: full backup as a single
+    downloadable **base64-encoded JSON document** (`runbound-backup-v1`) covering
+    `runbound.conf` plus secret/state files (API key, sync cert/key, WebUI auth); import
+    is name-whitelisted (rejects path separators/`..`) and written atomically — apply
+    requires a restart.
 - **Split-horizon**: per-client-network answer sets, CRUD via API + web UI.
 - **Per-subnet/VLAN policies (#8)**: `/api/policies` adds domain blocks scoped to one
   subnet, additive to the global blacklist/feeds filter (never less permissive), applied
@@ -74,5 +89,5 @@ restart (split-horizon, whose resolver table is built at boot).
 - **Embedded web UI**: static HTML gzipped at build (`include_bytes!` of
   `OUT_DIR/index.html.gz`), served by the binary — no nginx since v0.9.0. Since **v0.22** the
   admin panel **binds `127.0.0.1` by default** (`ui-bind` default changed from `0.0.0.0`,
-  `src/config/parser.rs:522`); exposing it on the network now requires an explicit
+  `src/config/parser.rs:530`); exposing it on the network now requires an explicit
   `ui-bind: 0.0.0.0`.

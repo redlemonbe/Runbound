@@ -1,7 +1,9 @@
 # Deploying Runbound as a public encrypted resolver (#204)
 
-Runbound already serves **DoT (853)**, **DoH (443)** and **DoQ (853/udp)** and
-forwards upstream over DoT. This guide turns that into a real public,
+Runbound already serves **DoT (853)** and **DoH (443)**, and forwards upstream
+over DoT. **DoQ (RFC 9250) is not yet implemented** — the TLS config is
+prepared internally but no QUIC socket is ever bound (no `quinn`/QUIC listener
+in the codebase). This guide turns the working transports into a real public,
 encrypted, auto-discoverable resolver ("like 1.1.1.1") — the *deployment and
 discovery* story, not new transports.
 
@@ -19,7 +21,7 @@ It builds on three features documented elsewhere:
 | 53 | UDP + TCP | Plain DNS (legacy clients) |
 | 853 | TCP | DoT (RFC 7858) |
 | 443 | TCP | DoH (RFC 8484) — path `/dns-query` |
-| 853 | UDP | DoQ (RFC 9250, QUIC) |
+| 853 | UDP | DoQ (RFC 9250, QUIC) — **not yet implemented, do not open** |
 
 Open these inbound. If you terminate behind an L4 load balancer or anycast
 relay, enable `proxy-protocol: yes` so per-client rate-limiting, ACL and logging
@@ -39,9 +41,10 @@ server:
     tls-cert-hostname: "dns.example.com"
 ```
 
-DoT/DoH/DoQ auto-activate once `tls-service-pem`/`-key` are set. Certificate
-changes are **applied live** — no restart (see [tls.md](tls.md)). For the WebUI
-cert, built-in ACME (`ui-tls: acme`) is also available.
+DoT/DoH auto-activate once `tls-service-pem`/`-key` are set — DoQ never
+activates (not implemented, see §1). Certificate changes are **applied live**
+— no restart (see [tls.md](tls.md)). For the WebUI cert, built-in ACME
+(`ui-tls: acme`) is also available.
 
 ---
 
@@ -75,9 +78,10 @@ _dns.resolver.arpa. 7200 IN SVCB 3 dns.example.com. alpn="doq" port=853
 
 A client reaching Runbound over plain DNS would then discover and verify the
 encrypted endpoint before upgrading. The advertised ports would follow
-`tls-port` / `https-port` / `quic-port` (defaults 853 / 443 / 853). Until this
-lands, distribute the DoT/DoH/DoQ endpoint out-of-band (client provisioning,
-a static SVCB record on a separate authoritative zone, etc.).
+`tls-port` / `https-port` / `quic-port` (defaults 853 / 443 / 853; the `quic-port`
+entry is forward-compat only — DoQ itself isn't implemented, see §1). Until DDR
+lands, distribute the DoT/DoH endpoint out-of-band (client provisioning, a
+static SVCB record on a separate authoritative zone, etc.).
 
 ---
 
@@ -107,9 +111,11 @@ server:
     # ANY is already refused (RFC 8482)
 ```
 
-DoT/DoH/DoQ are connection-oriented (TCP/QUIC handshake) and are **not** a
+DoT/DoH are connection-oriented (TCP handshake) and are **not** a
 spoofed-amplification vector; the cookies + RRL layer protects the plain UDP
-`:53` surface.
+`:53` surface. (DoQ would be QUIC/UDP-based once implemented — see §1 — and
+would need its own amplification analysis; it isn't a factor today since it
+doesn't exist yet.)
 
 ---
 

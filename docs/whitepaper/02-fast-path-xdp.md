@@ -5,13 +5,13 @@ The path has four parts: the eBPF program decides what to do with the frame; AF_
 sockets carry chosen frames into user space with zero copy; worker threads parse and
 answer; and anything not answerable falls through to the slow path.
 
-Files: `ebpf/dns_xdp.c`, `src/dns/xdp/{loader,socket,umem,worker,wire_builder}.rs`.
+Files: `ebpf/dns_xdp.c`, `src/dns/xdp/{loader,socket,umem,worker}.rs`, `src/dns/wire_builder.rs`.
 
 ---
 
 ## 2.1 The eBPF decision tree
 
-`dns_xdp` (`ebpf/dns_xdp.c:289`) runs on every frame the NIC delivers to the XDP hook,
+`dns_xdp` (`ebpf/dns_xdp.c:299`) runs on every frame the NIC delivers to the XDP hook,
 before the kernel network stack. Its logic, in order:
 
 1. **Parse Ethernet.** If the frame carries one 802.1Q VLAN tag (`ETH_P_8021Q`), skip
@@ -150,9 +150,9 @@ The explicit enum exists because an earlier `Some(0)` sentinel was a footgun (#1
 
 Each configured split-horizon view is compiled into a **per-view wire snapshot**
 (`crate::dns::cache_snapshot::ViewSnapshots`). The worker loads the view set once per RX
-batch with a lock-free `ArcSwap` read (`src/dns/xdp/worker.rs:942`) and, per query,
+batch with a lock-free `ArcSwap` read (`src/dns/xdp/worker.rs:985`) and, per query,
 matches the client source IP to its view **before** consulting the global cache
-(`src/dns/xdp/worker.rs:1264`) — so a per-source override always wins on the fast path and
+(`src/dns/xdp/worker.rs:1310-1320`) — so a per-source override always wins on the fast path and
 answers cannot leak across views. View edits through the API hot-swap the snapshots live
 (no restart), reusing the same wire serialisation as the global local-data preload.
 Coverage is A/AAAA — the same as the global preload; other record types in a view fall
@@ -169,34 +169,35 @@ re-inserts one tag on the reply (`src/dns/xdp/worker.rs:93`).
 
 ## 2.5 The zero-allocation response builder
 
-File: `src/dns/xdp/wire_builder.rs`. This replaces hickory's
-`Message::from_bytes` + `BinEncoder::emit` for the common case (A/AAAA from local zones).
+File: `src/dns/wire_builder.rs` — shared by both the AF_XDP fast path and the kernel-UDP
+fallback path (there is no separate `src/dns/xdp/wire_builder.rs`; a duplicate under
+`src/dns/xdp/` existed early in development but was dead/orphaned code, never compiled,
+and has since been removed). This replaces hickory's `Message::from_bytes` +
+`BinEncoder::emit` for the common case (A/AAAA from local zones).
 
-- **Parse** (`parse_query`, `src/dns/xdp/wire_builder.rs:91`): validates a single-question
+- **Parse** (`parse_query`, `src/dns/wire_builder.rs:91`): validates a single-question
   query, finds the QNAME terminator with `simd::find_zero`, reads qtype/qclass, and parses
   any EDNS OPT RR. No heap allocation — the `qname_wire` is a slice into the original
   buffer (zero copy).
-- **EDNS / DNSSEC** (`EdnsInfo`, `src/dns/xdp/wire_builder.rs:55`): if the OPT RR has the
+- **EDNS / DNSSEC** (`EdnsInfo`, `src/dns/wire_builder.rs:55`): if the OPT RR has the
   DO bit set, the query wants DNSSEC → the wire builder returns `Fallback` so the slow-path
   handler (`serve_wire`, which does the DNSSEC signing/serving) handles it. The wire fast
   path never fakes DNSSEC.
 - **Build**: writes the answer directly into the output (TX UMEM) slice. The response uses
-  a DNS **name-compression pointer** (`0xC0 0x0C`, `src/dns/xdp/wire_builder.rs:37`) to
+  a DNS **name-compression pointer** (`0xC0 0x0C`, `src/dns/wire_builder.rs:37`) to
   point the answer's owner name back at the question at offset 12 — so the name is not
   repeated, saving bytes and a copy. Flags are set to `QR=1 AA=1 RD RA RCODE=0`
-  (authoritative NOERROR, `src/dns/xdp/wire_builder.rs:34`).
+  (authoritative NOERROR, `src/dns/wire_builder.rs:34`).
 
-Positive answers are wire-built for A (1) and AAAA (28). Negative and error responses are
-also wire-built: `build_nxdomain` / `build_nodata` / `build_refused`
-(`src/dns/xdp/wire_builder.rs:388-520`) write RFC-minimal responses (no SOA in authority)
-directly into the TX frame. Since #166 (v0.10.5), `NXDOMAIN` and `NODATA` results are
-**cached as wire answers** on the fast path (RFC 2308), keyed by name + type, with a TTL
-derived from the SOA `MINIMUM` field clamped to [60, 900] s; `SERVFAIL` is deliberately
-never cached (transient condition). On a Tranco top-10 000 corpus this change removed a
-17 % steady-state miss rate dominated by repeated `NODATA`/`AAAA` lookups (CHANGELOG
-v0.10.5). Note: the summary comment at the top of `wire_builder.rs` still says
-"NXDOMAIN, NODATA, REFUSED: next deliveries" — that comment is stale; the builders below
-it are the code that runs.
+Positive answers are wire-built for A (1) and AAAA (28). Negative and error responses also
+have wire builders: `build_nxdomain` / `build_nodata` / `build_refused`
+(`src/dns/wire_builder.rs:388-520`) write RFC-minimal responses (no SOA in authority)
+directly into the TX frame. Of these, only `build_refused` is currently wired into the
+fast-path hot loop (`answer_dns_wire` in `worker.rs`); `build_nodata` is
+`#[allow(dead_code)]`, reserved for a future wildcard-aware fast path, and `build_nxdomain`
+is exercised only by unit tests. **No negative-answer cache exists on the fast path, or
+anywhere else in the codebase** (see #210) — `NXDOMAIN`/`NODATA` responses are built fresh
+each time, not cached as wire answers.
 
 ---
 

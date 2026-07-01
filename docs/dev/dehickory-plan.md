@@ -30,11 +30,16 @@ flag; that approach was dropped in favor of always-on compilation + runtime
 toggle, matching how `hsm-pkcs11-lib` gates HSM/PKCS#11 support.) So:
 
 - The **default build** is hickory-free: own codec (`dns::wire`) + own
-  listeners + own forward client. DNSSEC in forward mode is delegated to the
-  validating upstream over the authenticated DoT channel by default, and
-  Runbound also does full DNSSEC validation in-house (`dns::dnssec_verify`,
-  `dns::dnssec_chain`, `dns::dnssec_denial`) when full-recursion is enabled;
-  locally-signed zones are covered by the in-house signer (`dns::dnssec_sign`).
+  listeners + own forward client. In forward mode, Runbound does no DNSSEC
+  validation of its own and never asserts the AD bit: the client's original
+  query (with whatever DO/CD it set) is relayed upstream over the
+  authenticated DoT channel as-is, but `ResolveResult::Answer` only carries
+  the answer records — not the upstream's header — so there is no upstream
+  AD bit to trust or propagate; `wire_answer` always builds the reply with
+  `flags: 0` and AD unset. Runbound does full DNSSEC validation in-house
+  (`dns::dnssec_verify`, `dns::dnssec_chain`, `dns::dnssec_denial`), including
+  asserting AD itself, only when full-recursion is enabled; locally-signed
+  zones are covered by the in-house signer (`dns::dnssec_sign`).
 - **Full-recursion + local DNSSEC validation** are in-house
   (`dns::recursor_wire` + `dns::dnssec_*`), not `hickory-resolver`. **We did
   not hand-roll a DNSSEC validator or a recursive resolver casually, and we did
@@ -139,17 +144,25 @@ what actually landed.
   parsed and stored in config but not served. This is a real gap, tracked
   separately from the de-hickory migration (see phase 6 below).
 - **Phase 4 — own forward client. DONE.** Upstream forwarding runs over
-  UDP/TCP/DoT (rustls); DNSSEC in forward mode sets DO/CD and trusts upstream
-  AD over the authenticated DoT channel. `hickory-resolver` is gone from the
-  forward path. Racing + cache retargeted onto the new client.
+  UDP/TCP/DoT (rustls), relaying the client's original query wire-for-wire;
+  forward mode does no DNSSEC validation and never asserts AD at all — the
+  upstream's header (and any AD bit it set) isn't even carried back by
+  `ResolveResult::Answer`, so there is nothing to "trust," it's simply never
+  validated or asserted. `hickory-resolver` is gone from the forward path.
+  Racing + cache retargeted onto the new client.
 - **Phase 5 — full-recursion + DNSSEC validation, always compiled in. DONE
   (with a design change from the original plan).** Rather than gating
   full-recursion behind a `--features recursor` Cargo feature as originally
   planned, it shipped as `dns::recursor_wire` + `dns::dnssec_verify` /
-  `dnssec_chain` / `dnssec_denial` — **always compiled into the default
-  binary**, toggled at runtime via `resolution: full-recursion` in config
-  (default is `forward`). This mirrors how HSM/PKCS#11 support (`src/hsm.rs`)
-  is gated by the runtime directive `hsm-pkcs11-lib` rather than a build flag.
+  `dnssec_chain` / `dnssec_denial` — entirely in-house and **always compiled
+  into the default binary** (no Cargo feature gates them), but **off by
+  runtime default**: `UnboundConfig::defaults()` sets `resolution_mode:
+  Forward` and `dnssec_validation: false`, i.e. `resolution: forward` and
+  `dnssec-validation: no` are the defaults. Full-recursion and DNSSEC
+  validation are opt-in via config (`resolution: full-recursion`,
+  `dnssec-validation: yes`), not a build flag. This mirrors how HSM/PKCS#11
+  support (`src/hsm.rs`) is gated by the runtime directive `hsm-pkcs11-lib`
+  rather than a build flag.
   Net result matches the phase's goal: the default build compiles with
   **zero** hickory in `cargo tree -e normal`; `hickory-proto` is a
   `[dev-dependencies]`-only differential oracle.
@@ -166,5 +179,5 @@ what actually landed.
   compression pointers, pointer-chase cap, header-count vs body.
 - A/B X710 NIC-truth bench on every data-path phase: no regression, byte-identical
   answers where the path was byte-identical before.
-- Two-AI audit on the security-sensitive phases (parser, forward DNSSEC delegation).
+- Two-AI audit on the security-sensitive phases (parser, in-house DNSSEC validation).
 - Crypto via `ring`/`aws-lc-rs`. No DIY validator in the default path.

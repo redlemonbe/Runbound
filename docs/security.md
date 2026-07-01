@@ -6,9 +6,13 @@ fixed across Runbound releases through v0.23.8 (see docs/security-audit/SECURITY
 > **v0.23 update — hickory fully removed from the runtime.** DNS is served
 > end-to-end by the in-house wire codec (`src/dns/wire/`) via `serve_wire` in
 > `src/dns/server.rs`; recursion (`src/dns/recursor_wire.rs`) and DNSSEC
-> validation (`src/dns/dnssec_*.rs`) are in-house too, always on by default —
-> there is no `recursor` Cargo feature anymore, and no hickory dependency of any
-> kind in the default runtime build. `hickory-proto` remains **only** as a
+> validation (`src/dns/dnssec_*.rs`) are entirely in-house and always compiled
+> in — there is no `recursor` Cargo feature anymore, and no hickory dependency
+> of any kind in the default runtime build. They are, however, **off by
+> runtime default**: `resolution: forward` and `dnssec-validation: no` are the
+> defaults (`UnboundConfig::defaults()`); full-recursion and DNSSEC validation
+> are opt-in via config (`resolution: full-recursion`, `dnssec-validation: yes`),
+> not a build flag. `hickory-proto` remains **only** as a
 > `[dev-dependencies]` entry, used exclusively by the differential oracle tests
 > that prove the in-house wire codec byte-identical to it
 > (`cargo tree -e normal` is hickory-free). This removes the last

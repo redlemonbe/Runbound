@@ -44,7 +44,7 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 ### Performance — XDP fast path
 | Feature | Notes |
 |---|---|
-| AF_XDP kernel-bypass | zero-syscall hot path; ~13.5 M qps dual-link X710 (NIC-truth, server ~10 % CPU) |
+| AF_XDP kernel-bypass | zero-syscall hot path; ~12.56 M qps single-link X710, ~19.9 M qps dual-link (NIC-truth, ~9.3 % CPU) — see [Performance](#performance) |
 | SIMD / ASM wire responder | shared by the fast and slow paths |
 | Multi-NIC + IRQ/CPU auto-pinning | governor control, ring auto-sizing |
 | XDP ICMP echo responder | rate-limited, with auto-ban |

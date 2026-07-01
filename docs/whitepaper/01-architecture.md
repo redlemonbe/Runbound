@@ -28,24 +28,31 @@ tiers, fastest first:
                          │ Tier 3 — wire-native handler `serve_wire`    │
                          │   forward, TCP, DoT/DoH/DoQ, DNSSEC signing,  │
                          │   TSIG, AXFR/IXFR, DDNS, CNAME/MX, EDNS DO=1   │
-                         │   (full-recursion: in-house, always on,       │
-                         │    toggled by the `resolution` config, not     │
-                         │    a Cargo feature)                            │
+                         │   (full-recursion: in-house, always compiled  │
+                         │    in, off by default — opt-in via the        │
+                         │    `resolution` config, not a Cargo feature)   │
                          └───────────────────────────────────────────────┘
 ```
 
-Tier 1 and Tier 2 are mutually exclusive at runtime (chosen by the `xdp` config
-directive). Both share the **same** zero-allocation wire answer routine. Tier 3 is always
-present. As of **v0.22 ("de-hickory")** Tier 3 is the in-house wire handler `serve_wire`
-(`src/dns/server.rs:1195`, codec in `src/dns/wire/`): the `hickory-server` request handler
-is gone from the default binary. There is no hickory-dns request handler anywhere in the
-runtime anymore — every path (forward, full-recursion, local, AXFR, DDNS, TSIG, …) is served
-by `serve_wire`. The sovereign full-recursion resolver (`src/dns/recursor_wire.rs`) and
-DNSSEC validation (`src/dns/dnssec_*.rs`) are entirely in-house and always compiled in —
-full-recursion is a runtime config toggle (`resolution: full-recursion` vs. the default
-`forward`), not a Cargo feature; no such `recursor` feature exists. `hickory-proto` is a
-`[dev-dependencies]` entry only, used solely by the differential-oracle tests — it is not a
-runtime dependency and does not back the in-memory data model or the XDP response builders.
+Tier 1 and Tier 2 are mutually exclusive at runtime for the physical NIC (chosen by the
+`xdp` config directive) — with one exception: in XDP mode, loopback (`127.0.0.1`) traffic
+is served by an always-started, one-core kernel UDP fast loop (`src/dns/kernel_loop.rs`,
+issue #167b) running *alongside* the XDP workers, because XDP only owns the physical NIC
+and local resolution still needs a kernel path. So for loopback traffic specifically, Tier
+1 and Tier 2 run concurrently. Both share the **same** zero-allocation wire answer routine.
+Tier 3 is always present. As of **v0.22 ("de-hickory")** Tier 3 is the in-house wire handler
+`serve_wire` (`src/dns/server.rs:402`, codec in `src/dns/wire/`): the `hickory-server`
+request handler is gone from the default binary. There is no hickory-dns request handler
+anywhere in the runtime anymore — every path (forward, full-recursion, local, AXFR, DDNS,
+TSIG, …) is served by `serve_wire`. The sovereign full-recursion resolver
+(`src/dns/recursor_wire.rs`) and DNSSEC validation (`src/dns/dnssec_*.rs`) are entirely
+in-house and always compiled in (no Cargo feature gates them) — but OFF by runtime
+default: `resolution: forward` and `dnssec-validation: no` are the defaults; full-recursion
+and DNSSEC validation are opt-in via config (`resolution: full-recursion`,
+`dnssec-validation: yes`), not a build flag; no such `recursor` feature exists.
+`hickory-proto` is a `[dev-dependencies]` entry only, used solely by the
+differential-oracle tests — it is not a runtime dependency and does not back the
+in-memory data model or the XDP response builders.
 
 ## 1.2 Why this shape — the measurement that drove it
 
@@ -80,7 +87,8 @@ Both fast tiers call the same function, `answer_dns_wire` (exposed as
 1. parses the query with `parse_query` (no allocation, SIMD `find_zero`),
 2. looks the name up in a `WireRecordIndex` keyed by CRC32c `hash_wire_qname`,
 3. builds the A/AAAA answer directly into the output buffer with a name-compression
-   pointer to the question (`src/dns/xdp/wire_builder.rs`).
+   pointer to the question (`src/dns/wire_builder.rs`, shared with the kernel-UDP
+   fallback path — there is no separate copy under `src/dns/xdp/`).
 
 If the query is anything the wire path does not handle (EDNS DO=1 / DNSSEC, CNAME, MX,
 TSIG, AXFR, TCP, or a cache/zone miss requiring recursion), the routine returns
@@ -93,9 +101,9 @@ fast-path lookups would silently miss, so the test is the guard against a silent
 
 - **DNS data plane.** Tier 1 uses dedicated OS worker threads pinned to physical,
   NUMA-local cores, one per AF_XDP queue. Tier 2 uses one blocking OS thread per
-  NUMA-local core, each owning a `SO_REUSEPORT` UDP socket (`src/dns/kernel_loop.rs:117`).
+  NUMA-local core, each owning a `SO_REUSEPORT` UDP socket (`src/dns/kernel_loop.rs:133-134`).
   Buffers are stack-allocated (`[u8; 4096]`), never heap, on the hot path
-  (`src/dns/kernel_loop.rs:177`). `SO_RCVBUF`/`SO_SNDBUF` are set to 8 MiB and the code
+  (`src/dns/kernel_loop.rs:177`). `SO_RCVBUF`/`SO_SNDBUF` are set to 32 MiB and the code
   warns if the kernel clamps them (`net.core.rmem_max` too low).
 - **Control plane.** The REST API runs on a **separate, dedicated 2-thread Tokio runtime**
   (`src/main.rs`, the `runbound-api` runtime). The rationale, documented inline: under DoT
@@ -115,7 +123,7 @@ fast-path lookups would silently miss, so the test is the guard against a silent
 | Kernel UDP fast loop | `src/dns/kernel_loop.rs` | `SO_REUSEPORT` per-core fast loop (xdp: no) |
 | Slow path (wire-native) | `src/dns/server.rs` (`serve_wire`), `src/dns/wire_serve.rs` | forward, DoT/DoH, AXFR/IXFR, TSIG, DDNS, DNSSEC signing |
 | Wire DNS codec | `src/dns/wire/` | in-house message/name/rdata encode+decode (de-hickory) |
-| Full recursion | `src/dns/recursor_wire.rs` | sovereign full recursion, in-house, always on (runtime config toggle, not a Cargo feature) |
+| Full recursion | `src/dns/recursor_wire.rs` | sovereign full recursion, in-house, always compiled in but off by default (runtime config toggle, not a Cargo feature) |
 | SIMD/ASM kernels | `src/dns/simd.rs`, `src/dns/hasher.rs` | lowercasing, comparison, hashing |
 | Local zones | `src/dns/local.rs` | `LocalZoneSet`, `WireRecordIndex` |
 | REST API | `src/api/` | axum CRUD, relay, SSE, backup, split-horizon |

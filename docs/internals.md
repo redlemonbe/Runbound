@@ -37,8 +37,12 @@ The Tokio path handles everything else (cache misses, forwarding, management API
 > Runbound's own DNS wire codec** (`src/dns/wire/`, the `serve_wire` path in
 > `src/dns/server.rs`) on every path, including full-recursion. The sovereign
 > **full-recursion** resolver (`src/dns/recursor_wire.rs`) and DNSSEC validation
-> (`src/dns/dnssec_*.rs`) are entirely in-house, always compiled in, and always
-> available in the default build — there is no `recursor` Cargo feature anymore.
+> (`src/dns/dnssec_*.rs`) are entirely in-house and always compiled in (no Cargo
+> feature gates them) — there is no `recursor` Cargo feature anymore. Both are
+> **off by runtime default**, though: `resolution: forward` and
+> `dnssec-validation: no` are the config defaults (`UnboundConfig::defaults()`,
+> `src/config/parser.rs`); full-recursion and DNSSEC validation are opt-in via
+> `resolution: full-recursion` / `dnssec-validation: yes`, not a build flag.
 > `hickory-proto` remains **only** as a `[dev-dependencies]` entry, used exclusively
 > by the differential oracle tests (`cargo tree -e normal` is hickory-free). The XDP
 > fast path is unchanged.
@@ -165,7 +169,8 @@ swap src/dst MAC + IP, set type=ECHO_REPLY, recompute checksum
 XDP_TX (transmit directly from driver, zero kernel involvement)
 ```
 
-Rate limit and ban thresholds are configurable via `POST /api/icmp`. Values are written
+Rate limit and ban thresholds are configurable via `PUT /api/icmp/config` (there is a
+separate `GET /api/icmp/stats` for counters; no bare `/api/icmp` route exists). Values are written
 to BPF maps via `aya` map handles — no XDP detach/reattach needed.
 
 ---
@@ -318,23 +323,31 @@ if desc.len > FRAME_SIZE || end.map(|e| e > umem.area_len).unwrap_or(true) {
 
 32 `SO_REUSEPORT` UDP sockets, one per physical core. The kernel distributes incoming packets across sockets by 4-tuple hash. Each Tokio worker owns one socket — no cross-thread contention on the receive path.
 
-**SO_BUSY_POLL (v0.9.17):** when XDP is unavailable (containers, cloud VMs), Runbound
-applies `SO_BUSY_POLL` to each socket:
+**SO_BUSY_POLL (v0.9.17):** the AF_XDP socket setup (`src/dns/xdp/socket.rs`) applies
+NAPI busy-poll hints unconditionally, best-effort:
 
 ```rust
-setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &50u32)  // 50 µs kernel spin-poll
+setsockopt(fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &1u32)
+setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL,        &20u32)  // 20 µs kernel spin-poll budget
+setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &64u32)  // max packets/cycle
 ```
 
-The kernel spins on the driver RX queue for up to 50 µs before sleeping, eliminating
-the scheduler wakeup for high-QPS bursts. Configurable via config:
+The kernel spins on the driver RX queue for up to 20 µs before sleeping, eliminating
+the scheduler wakeup for high-QPS bursts (silently ignored on pre-5.11 kernels). This
+value is hardcoded, not config-tunable. Separately, there is a boolean
+`udp-busy-poll: yes/no` config directive (default: `no`) that is parsed and persisted
+but currently has no effect on the Tokio UDP listener — no `setsockopt` call in the
+slow path is gated on it yet:
 
 ```
 server:
-    busy-poll-us: 50    # default: 50 (0 = disabled)
+    udp-busy-poll: no    # default: no — parsed but not yet wired to the slow-path socket
 ```
 
-Effect: −20–60 µs p50 latency on the slow path at the cost of one pinned CPU. Disabled
-automatically when XDP is active (XDP workers spin-poll AF_XDP rings natively).
+Effect (theoretical): reduced wakeup latency for the AF_XDP socket under high-QPS
+bursts, at the cost of extra CPU spin time on the XDP worker core. This is separate
+from — and not to be confused with — busy-polling on the Tokio UDP slow-path sockets,
+which is not currently implemented.
 
 ### Resolver
 
@@ -369,66 +382,82 @@ sizing the DNS cache:
                                          /sys/fs/cgroup/<path>/memory.current
 ```
 
-Cache size formula:
+Cache size formula (`cache_size_from_meminfo()`, `src/dns/server.rs`):
 
 ```
-available = memory.max - memory.current
-cache_size = min(available × 0.60, 1 GiB)
+available = memory.max - memory.current                    (KiB)
+entries   = available_kb × 1024 / 4 / 512                   (~25% of available memory,
+                                                               in 512-byte cache entries)
+cache_entries = clamp(entries, 8192, 64 × 1024 × 1024)      (8K floor ≈ 4 MiB,
+                                                               64M ceiling ≈ 32 GiB)
 ```
 
 If `memory.max` is `max` (unlimited), falls back to `MemAvailable` from `/proc/meminfo`.
-The `MemoryMax=2G` directive in the systemd unit sets the cgroup limit. With a fresh
-start (~80 MiB RSS), Runbound allocates ~(2048−80)×0.60 ≈ 1.18 GiB → rounded to 1 GiB.
+There is no fixed 1 GiB cap — the ceiling is 64M entries (~32 GiB). An explicit
+`cache-size:` directive in config overrides the auto-sized value entirely.
 
 Logged at startup: `INFO runbound::dns::server: cache size auto-sized from MemAvailable cache_size=N`
 
 ### Serve-stale (RFC 8767, v0.9.3)
 
 When all upstreams are unreachable, Runbound answers from expired cache entries rather
-than returning SERVFAIL (`src/dns/serve_stale.rs`):
+than returning SERVFAIL (logic inline in `src/dns/server.rs`, gated by `serve_stale` /
+`stale_answer_ttl` / `stale_max_age` on the config struct in `src/config/parser.rs`):
 
 ```
 upstream timeout / all upstreams unreachable
     ↓
-cache lookup (expired entries included)
-    found  →  answer with TTL clamped to serve-stale-ttl + EDE code 3 (Stale Answer)
+cache lookup (expired entries included, within stale-max-age)
+    found  →  answer with TTL clamped to stale-answer-ttl + EDE code 3 (Stale Answer)
     missing →  SERVFAIL
 ```
 
 ```
 server:
-    serve-stale: yes              # default: no
-    serve-stale-ttl: 30           # TTL reported for stale answers (seconds)
-    serve-stale-max-age: 86400    # refuse entries expired longer than this
+    serve-stale: yes              # default: yes
+    stale-answer-ttl: 30          # alias: serve-expired-reply-ttl — TTL reported for stale answers (seconds)
+    stale-max-age: 86400          # alias: serve-expired-ttl — refuse entries expired longer than this
 ```
 
 Stale entries are replaced by fresh upstream responses as soon as connectivity recovers.
 
 ### Per-client alert thresholds (v0.9.12)
 
-`src/alerts.rs` implements configurable per-client-IP alert rules. Each rule watches
-one metric (query rate, NXDOMAIN rate, or blocked-query rate) and fires an action (log,
-webhook, or auto-block):
+`src/alerts.rs` implements configurable per-client-IP alert rules via `AlertTracker`.
+The config schema (`AlertRule`, `src/config/parser.rs`) currently accepts `nxdomain-rate`
+and `blocked-rate` as `metric` values, but only `client-qps` is actually evaluated —
+`AlertTracker::record()` skips any rule whose `metric != "client-qps"`, so
+`nxdomain-rate`/`blocked-rate` rules are parsed and stored but silently inert:
 
 ```
-IncomingQuery { src_ip, qtype, blocked, nxdomain }
+AlertTracker::record(&self, ip: IpAddr, verified: bool) -> AbuseVerdict
     ↓
-AlertSet::check(&src_ip, &event)
-    → TokenBucket per (rule_id, src_ip) in DashMap
-    → threshold exceeded? → log / POST webhook / add to blacklist
+already blocked? → Block
+no rules, or source unverified (anti-spoof gate)? → Serve
+    ↓
+for each rule where metric == "client-qps":
+    per-ip sliding window count (DashMap<IpAddr, ClientBucket>)
+    → count == threshold + 1 ? → trigger() once per window
+        → action: log (warn-log only) | block (ban + push to XDP ban map) |
+                  tarpit (delay, no XDP push) | notify(notify_url) (webhook only)
+    ↓
+Block | Tarpit | Serve
 ```
 
 ```
 alert:
-    name:    "flood detector"
-    metric:  qps          # qps | nxdomain-rate | blocked-rate
-    limit:   500
-    window:  10           # seconds
-    action:  log          # log | webhook | block
-    webhook: "http://..."
+    name:       "flood detector"
+    metric:     client-qps   # only client-qps is evaluated; nxdomain-rate/blocked-rate parsed but inert
+    threshold:  500
+    window-s:   10           # seconds
+    action:     log          # log | block | tarpit | notify
+    notify-url: "http://..."
+    block-duration-s: 300    # 0 = permanent until restart (action: block/tarpit only)
 ```
 
-Multiple `alert:` blocks supported. Managed via `GET/POST/DELETE /api/alerts`.
+Multiple `alert:` blocks supported. Managed via `GET /api/alerts` (and alias
+`GET /api/alerts/rules`), `PUT /api/alerts/rules` (replace rule set), and
+`PUT`/`DELETE /api/alerts/blocked/:ip` (manual block/unblock).
 
 ### Zone transfer — AXFR / IXFR (v0.9.13; wire-native since v0.22)
 
@@ -438,13 +467,16 @@ Runbound's own wire codec (no hickory handler). `serve_wire` dispatches AXFR/IXF
 the generic query path; IXFR is answered as a full AXFR.
 
 **AXFR (TCP only):** SOA serial checked, `axfr-allow` ACL enforced against the **real
-client IP** (carried to the handler over the loopback relay via a PROXY v2 header), records
-streamed in batches of 64 to avoid holding the zone lock across the full transfer. TSIG
-(RFC 8945, `ring` HMAC — SHA-1/256/384/512, `src/dns/tsig.rs`) supported.
+client IP** (carried to the handler over the loopback relay via a PROXY v2 header).
+`axfr_response()` builds the entire transfer (`SOA … records … SOA`, RFC 5936 §2.2) as a
+**single in-memory message** — there is no batching or streaming across multiple
+messages (the same limitation the prior hickory path had; local zones are expected to
+fit comfortably within one message). TSIG (RFC 8945, `ring` HMAC — SHA-1/256/384/512,
+`src/dns/tsig.rs`) supported.
 
-**IXFR (incremental):** Runbound keeps a per-zone journal (ring buffer, last 10 changes).
-If the client's SOA serial is within the journal window → incremental diff; otherwise
-falls back to full AXFR.
+**IXFR:** there is no incremental journal — `axfr_response()`'s own doc comment states
+"IXFR is served as a full AXFR (matching the prior behaviour)". Every IXFR request gets
+the full zone, regardless of the client's SOA serial.
 
 ```
 zone "home." {
@@ -577,10 +609,12 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 
 > **DNSSEC full validation (#34) — delivered.** Chain-of-trust validation from the root
 > (NSEC/NSEC3, DS/DNSKEY) ships in the sovereign full-recursion resolver
-> (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`), always on by default in the
-> default build — enforced when `dnssec-validation: yes`. Separately, **authoritative
-> DNSSEC signing** for local zones (in-house ECDSA P-256 on `ring`, RFC 6605/4034/5155/9276)
-> is served wire-native on the default path.
+> (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`), entirely in-house and always
+> compiled into the default build (no Cargo feature gates it) — but **off by runtime
+> default**: `dnssec-validation: no` is the config default, enforced only when
+> `dnssec-validation: yes` is set. Separately, **authoritative DNSSEC signing** for
+> local zones (in-house ECDSA P-256 on `ring`, RFC 6605/4034/5155/9276) is served
+> wire-native on the default path.
 
 ---
 
@@ -594,7 +628,7 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 | `ArcSwap<CacheSnapshot>` | `src/dns/cache_snapshot.rs` | XDP-readable cache — generation-skipping publish |
 | `DashMap<QuestionKey, CacheEntry>` | `src/dns/cache_snapshot.rs` | Mutable cache — lock-free inserts |
 | `DashMap<IpAddr, TokenBucket>` | `src/dns/xdp/worker.rs` | Per-IP rate limiter |
-| `DashMap<(RuleId, IpAddr), TokenBucket>` | `src/alerts.rs` | Per-client alert thresholds |
+| `DashMap<IpAddr, ClientBucket>` | `src/alerts.rs` | Per-client alert thresholds (`AlertTracker`) |
 | `XSKMAP` (BPF map) | `ebpf/dns_xdp.c` | XDP → AF_XDP socket redirect, max 64 entries |
 | `CPUMAP` (BPF map) | `ebpf/dns_xdp.c` | XDP → CPU redirect (QNAME-aware) |
 | `icmp_cfg` (BPF array) | `ebpf/dns_xdp.c` | ICMP responder enable/disable flag |
@@ -617,8 +651,11 @@ Practical ceiling: 10 GbE wire speed = **14.88 M 64-byte packets/second**.
 
 There is no `recursor` and no `hsm` Cargo feature. Full-recursion (`src/dns/recursor_wire.rs`),
 DNSSEC validation (`src/dns/dnssec_*.rs`), and HSM/PKCS#11 support (`src/hsm.rs`) are entirely
-in-house, always compiled into the binary, and toggled purely via **runtime config**
-(`resolution: full-recursion`, `hsm-pkcs11-lib`) — never a compile-time flag.
+in-house, always compiled into the binary (no Cargo feature gates them), and toggled purely
+via **runtime config** (`resolution: full-recursion`, `dnssec-validation: yes`,
+`hsm-pkcs11-lib`) — never a compile-time flag. Both full-recursion and DNSSEC validation
+are **off by default at runtime** (`resolution: forward`, `dnssec-validation: no`); HSM is
+unset/disabled by default too.
 
 > **de-hickory (v0.23):** DNS is served end-to-end by the in-house wire codec on every
 > path. `hickory-proto` remains **only** as a `[dev-dependencies]` entry, used
