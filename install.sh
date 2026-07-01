@@ -217,11 +217,14 @@ server:
     rate-limit:    200
     cache-max-ttl: 3600
 
-    # Least privilege by default (PENT-3): the shipped systemd unit only grants
-    # CAP_NET_BIND_SERVICE. XDP needs CAP_NET_RAW/CAP_NET_ADMIN/CAP_BPF/CAP_PERFMON
-    # too -- set xdp: yes AND uncomment the wider AmbientCapabilities line in
-    # runbound.service before enabling it.
-    xdp: no
+    # XDP fast path (kernel-bypass, AF_XDP) is on out of the box -- the shipped
+    # runbound.service grants the capabilities it needs by default (CAP_NET_RAW/
+    # CAP_NET_ADMIN/CAP_BPF/CAP_PERFMON), and CAP_BPF/CAP_PERFMON are dropped again
+    # right after XDP attaches at startup. If your NIC/driver can't do AF_XDP
+    # (e.g. virtio-net), Runbound falls back to the kernel path on its own -- no
+    # action needed. Set to "no" (and switch runbound.service to its minimal
+    # capability set) only if you want to rule out XDP entirely.
+    xdp: yes
 
     private-address: 10.0.0.0/8
     private-address: 172.16.0.0/12
@@ -282,8 +285,9 @@ EnvironmentFile=-${CONFIG_DIR}/env
 # Huge pages for the XDP/AF_XDP UMEM (PERF): reserving the 2 MiB pool needs root, but
 # consuming it (mmap MAP_HUGETLB) needs none — so reserve once at boot here and let the
 # unprivileged ${RUN_USER} user mmap them. ExecStartPre=+ runs with full privileges
-# outside the service sandbox. 0 = disabled (default, xdp: no); set to cover
-# ceil(UMEM_bytes/2MiB) per worker (e.g. 512 ≈ 1 GiB) when running xdp: yes.
+# outside the service sandbox. 0 = disabled (no reservation attempted; falls back to
+# regular 4 KiB pages, non-fatal); set to cover ceil(UMEM_bytes/2MiB) per worker (e.g.
+# 512 ≈ 1 GiB) for the full AF_XDP zero-copy benefit.
 Environment=RUNBOUND_HUGEPAGES_2M=0
 ExecStartPre=+/bin/sh -c '[ "\${RUNBOUND_HUGEPAGES_2M:-0}" = 0 ] || echo "\${RUNBOUND_HUGEPAGES_2M}" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true'
 ExecStart=${BINARY_DST} ${CONFIG_DIR}/runbound.conf
@@ -291,13 +295,19 @@ ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# PENT-3: least privilege. xdp:no (default) only needs CAP_NET_BIND_SERVICE for :53.
-# XDP (xdp:yes) and firewall-manage additionally need NET_RAW/NET_ADMIN/BPF/PERFMON —
-# uncomment the wider set below if you enable them.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-# AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
-# CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+# PENT-3 (revised): xdp:yes is the shipped default (out-of-the-box, best performance),
+# so the wider capability set is granted by default too. This doesn't enlarge the
+# lasting blast radius: CAP_BPF/CAP_PERFMON are only checked by the kernel at
+# BPF_MAP_CREATE/BPF_PROG_LOAD, and Runbound drops both right after XDP load/attach
+# completes (src/caps_drop.rs), before serving a single query. A NIC/driver that can't
+# do AF_XDP (e.g. virtio-net) falls back to the kernel path on its own — no need to
+# pre-emptively narrow capabilities for that case. Switch to the minimal set below only
+# if you've set xdp:no and firewall-manage:no in runbound.conf.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+# Minimal set for xdp:no / firewall-manage:no deployments:
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 NoNewPrivileges=yes
 PrivateTmp=yes

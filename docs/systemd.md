@@ -23,8 +23,9 @@ Group=runbound
 EnvironmentFile=-/etc/runbound/env
 # Huge pages for the XDP/AF_XDP UMEM (perf): reserving the 2 MiB pool needs root, but
 # consuming it (mmap MAP_HUGETLB) needs no privilege — so it's reserved once at boot here
-# and the unprivileged runbound user mmaps it. 0 = disabled (default, for xdp: no installs);
-# set to cover ceil(UMEM_bytes/2MiB) per worker (e.g. 512 ≈ 1 GiB) when running xdp: yes.
+# and the unprivileged runbound user mmaps it. 0 = disabled (no reservation attempted;
+# falls back to regular 4 KiB pages, non-fatal); set to cover ceil(UMEM_bytes/2MiB) per
+# worker (e.g. 512 ≈ 1 GiB) for the full AF_XDP zero-copy benefit.
 Environment=RUNBOUND_HUGEPAGES_2M=0
 ExecStartPre=+/bin/sh -c '[ "${RUNBOUND_HUGEPAGES_2M:-0}" = 0 ] || echo "${RUNBOUND_HUGEPAGES_2M}" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || true'
 ExecStart=/usr/local/sbin/runbound /etc/runbound/runbound.conf
@@ -32,16 +33,18 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# Capabilities — least privilege. The default (xdp: no) path only needs
-# CAP_NET_BIND_SERVICE to bind :53. The XDP fast path (xdp: yes) additionally
-# needs CAP_NET_RAW (AF_XDP socket), CAP_NET_ADMIN (attach the XDP program),
-# CAP_BPF + CAP_PERFMON (load eBPF) — and the firewall-manage feature needs
-# CAP_NET_ADMIN. If you enable any of those, switch to the wider set below.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-# XDP (xdp: yes) / firewall-manage — uncomment instead of the two lines above:
-# AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
-# CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+# Capabilities — xdp: yes is the shipped default (out-of-the-box, best performance), so
+# the wider set is granted by default: CAP_NET_RAW (AF_XDP socket), CAP_NET_ADMIN (attach
+# the XDP program / firewall-manage), CAP_BPF + CAP_PERFMON (load eBPF) — on top of
+# CAP_NET_BIND_SERVICE (bind :53, always needed). CAP_BPF/CAP_PERFMON are dropped again
+# right after XDP load/attach completes (src/caps_drop.rs), so this doesn't enlarge the
+# lasting privileged surface. Switch to the minimal set below only if you've set
+# xdp: no and firewall-manage: no in runbound.conf.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+# Minimal set for xdp: no / firewall-manage: no deployments:
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 NoNewPrivileges=yes
 PrivateTmp=yes

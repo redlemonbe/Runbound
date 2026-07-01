@@ -24,16 +24,23 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# PENT-3: least privilege. The default (xdp: no) path only needs CAP_NET_BIND_SERVICE
-# to bind :53. The XDP fast path (xdp: yes) additionally needs CAP_NET_RAW (AF_XDP),
-# CAP_NET_ADMIN (attach the XDP program), CAP_BPF + CAP_PERFMON (load eBPF) — and the
-# firewall-manage feature needs CAP_NET_ADMIN. If you enable any of those, switch to the
-# wider set below. Keeping these off shrinks the blast radius of any process compromise.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-# XDP (xdp: yes) / firewall-manage — uncomment instead of the two lines above:
-# AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
-# CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+# PENT-3 (revised, v0.23.10): xdp: yes is the shipped default (out-of-the-box, best
+# performance) so the wider capability set is granted by default too — CAP_NET_RAW
+# (AF_XDP), CAP_NET_ADMIN (attach the XDP program / firewall-manage), CAP_BPF +
+# CAP_PERFMON (load eBPF). This does not enlarge the *lasting* blast radius: CAP_BPF and
+# CAP_PERFMON are only checked by the kernel at BPF_MAP_CREATE/BPF_PROG_LOAD, and
+# src/caps_drop.rs drops both from Effective/Permitted/Inheritable/Ambient right after
+# XDP load/attach completes, before the server answers a single query — a compromise
+# after startup gets neither. If a NIC/driver can't do XDP (virtio-net, missing kernel
+# support), Runbound already falls back to the kernel path gracefully on its own; you
+# don't need to pre-emptively narrow capabilities for that case. Switch to the minimal
+# set below only if you've explicitly set xdp: no and firewall-manage: no in config.
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+# Minimal set for xdp: no / firewall-manage: no deployments — uncomment instead of the
+# two lines above:
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 NoNewPrivileges=yes
 PrivateTmp=yes

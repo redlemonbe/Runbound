@@ -210,16 +210,23 @@ WARN runbound: XDP disabled: <reason> — server running normally on SO_REUSEPOR
 
 The XDP program is attached via `BPF_LINK_CREATE` (fd-backed link). It is detached in two cases:
 
-- **Graceful shutdown** (SIGTERM / `systemctl stop`) — Runbound's `Drop` implementation explicitly
-  calls `Xdp::detach()` before the process exits. This prevents a race window during hot-restarts.
+- **SIGTERM / `systemctl stop`** — does **not** currently detach XDP: the `XdpHandle` is moved
+  into a detached `tokio::spawn` task, so its `Drop` (which calls `detach()`) is never reached —
+  the OS kills the process before that unwind path runs. The program stays attached to the NIC
+  across a graceful stop; detach it manually with `ip link set <iface> xdp off` before switching
+  back to `xdp: no`, or it keeps dropping/redirecting packets per the old program.
 - **Crash / SIGKILL** — the kernel closes the link file descriptor on process exit, which
   automatically removes the XDP attachment. DNS traffic resumes on the kernel UDP stack immediately.
 
-In both cases `bpftool prog list` and `ip link show` will show no XDP program after exit.
+`bpftool prog list` / `ip link show` will show no XDP program after a crash, but **will** still
+show one after a graceful `systemctl stop` on an `xdp: yes` node — check manually if you switch
+that node to `xdp: no` afterwards.
 
 ## Manual service file configuration
 
-If not using `install.sh`, add to `/etc/systemd/system/runbound.service`:
+`install.sh` already writes this by default (it's not an opt-in — see
+[hardening.md](hardening.md#capabilities)). If configuring
+`/etc/systemd/system/runbound.service` by hand instead, add:
 
 ```ini
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON

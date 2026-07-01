@@ -7,6 +7,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.23.10] - 2026-07-01
+
+### Changed
+- **Reverted part of 0.23.9's fix: `xdp: yes` is the shipped default again, with
+  capabilities to match.** 0.23.9 made `install.sh` write `xdp: no` explicitly to
+  match the shipped systemd unit's minimal `CAP_NET_BIND_SERVICE`-only capability
+  set — but that made a fresh install *less* out-of-the-box, not more: Runbound
+  already falls back to the kernel path gracefully on its own when XDP can't
+  attach (unsupported NIC/driver, missing capabilities), so there was never a
+  need to disable it pre-emptively. The actual fix is the other direction:
+  `install.sh` now writes `xdp: yes` again, and both `runbound.service` and
+  `install.sh`'s generated unit grant the wider capability set
+  (`CAP_NET_RAW`/`CAP_NET_ADMIN`/`CAP_BPF`/`CAP_PERFMON`) by default. This
+  doesn't enlarge the *lasting* privileged surface: `CAP_BPF`/`CAP_PERFMON` are
+  only checked by the kernel at `BPF_MAP_CREATE`/`BPF_PROG_LOAD` and are dropped
+  again right after XDP load/attach completes (`src/caps_drop.rs`, from
+  0.23.8), before the server answers a single query. The minimal
+  `CAP_NET_BIND_SERVICE`-only set remains available as a commented alternative
+  for deployments that explicitly set `xdp: no` and `firewall-manage: no`.
+  THREAT_MODEL.md, docs/hardening.md, docs/systemd.md, docs/xdp.md, and
+  docs/whitepaper/07-security.md updated to match. Also fixed two instances of
+  a stale claim that SIGTERM detaches XDP (it doesn't — `XdpHandle::Drop` is
+  never reached, the OS kills the process before Rust's unwind runs).
+
 ## [0.23.9] - 2026-07-01
 
 ### Fixed

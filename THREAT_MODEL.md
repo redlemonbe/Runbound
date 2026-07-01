@@ -16,9 +16,14 @@
 1. **Untrusted DNS clients** → UDP/TCP `:53` and DoT / DoH / DoQ.
 2. **Untrusted network** → master↔slave sync relay (HMAC + TLS).
 3. **Local host** → REST API (localhost-only) + WebUI (TLS).
-4. **Kernel** → the eBPF/XDP program, loaded by the non-root service. The XDP fast path is an
-   opt-in: only when `xdp: yes` is enabled does the service hold `CAP_NET_RAW`/`CAP_NET_ADMIN`/
-   `CAP_BPF`/`CAP_PERFMON`. The default (`xdp: no`) service holds only `CAP_NET_BIND_SERVICE`.
+4. **Kernel** → the eBPF/XDP program, loaded by the non-root service. `xdp: yes` is the shipped
+   default, so the service holds `CAP_NET_RAW`/`CAP_NET_ADMIN`/`CAP_BPF`/`CAP_PERFMON` by
+   default too — but `CAP_BPF`/`CAP_PERFMON` are only checked by the kernel at
+   `BPF_MAP_CREATE`/`BPF_PROG_LOAD` and are dropped again (`src/caps_drop.rs`) right after XDP
+   load/attach completes, before the server answers a single query, so the lasting privileged
+   surface is the same either way. Deployments that explicitly set `xdp: no` (and
+   `firewall-manage: no`) can switch `runbound.service` to the minimal `CAP_NET_BIND_SERVICE`-only
+   capability set (commented in the shipped unit) for a smaller startup-time window too.
 
 ## Attackers modeled
 

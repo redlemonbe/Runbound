@@ -13,10 +13,16 @@ runbound --check-config /etc/runbound/runbound.conf
 
 ## Capabilities
 
-**Least-privilege default (v0.22, PENT-3):** the shipped `runbound.service` and
-`install.sh` grant **only `CAP_NET_BIND_SERVICE`**. The default `xdp: no` path needs
-nothing else. The XDP fast path (`xdp: yes`) and the firewall-manage feature each need
-the wider set — an **explicit, commented opt-in** in the unit file.
+**Out of the box (v0.23.10, PENT-3 revised):** `xdp: yes` is the shipped default, so the
+shipped `runbound.service` and `install.sh` grant the wider capability set by default —
+`CAP_NET_RAW`/`CAP_NET_ADMIN`/`CAP_BPF`/`CAP_PERFMON` in addition to
+`CAP_NET_BIND_SERVICE`. This doesn't enlarge the *lasting* blast radius: `CAP_BPF`/
+`CAP_PERFMON` are only checked by the kernel at load time (see below) and are dropped
+again right after XDP attaches, before the server answers a single query. A NIC/driver
+that can't do AF_XDP (virtio-net, missing kernel support) falls back to the kernel path
+on its own — no capability tuning needed for that case. The minimal
+`CAP_NET_BIND_SERVICE`-only set is available as a **commented alternative** in the unit
+file for deployments that explicitly set `xdp: no` and `firewall-manage: no`.
 
 | Parameter | When needed | Effect if missing |
 |---|---|---|
@@ -39,20 +45,20 @@ child process for the rest of its lifetime. Look for
 best-effort defence-in-depth step (never fatal if the drop fails) and does not
 replace granting the capabilities correctly at startup — see the table above.
 
-**Default (no XDP, no firewall-manage) — what the shipped unit uses:**
-
-```ini
-[Service]
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-```
-
-**XDP fast path / firewall-manage — uncomment the wider set instead:**
+**Default (XDP + firewall-manage) — what the shipped unit uses:**
 
 ```ini
 [Service]
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+```
+
+**No XDP, no firewall-manage — switch to the minimal set instead:**
+
+```ini
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ```
 
 To grant the XDP capabilities to the binary directly (without running as root):
@@ -178,11 +184,11 @@ Or pass `--no-xdp` on the command line. The server logs
 
 ## Complete hardened service file (with XDP)
 
-This is the **actual shipped `runbound.service`** (repo root), with the XDP capability
-lines uncommented. The default install ships the narrower `CAP_NET_BIND_SERVICE`-only
-set shown in the Capabilities section above — swap the two `AmbientCapabilities`/
-`CapabilityBoundingSet` lines below for that default (they're present as a commented
-alternative in the shipped file).
+This is the **actual shipped `runbound.service`** (repo root), exactly as installed —
+the XDP capability lines are the default, not an opt-in. The narrower
+`CAP_NET_BIND_SERVICE`-only set (for `xdp: no` / `firewall-manage: no` deployments) is
+present as a commented alternative in the shipped file — swap the two
+`AmbientCapabilities`/`CapabilityBoundingSet` lines below for that if you want it.
 
 ```ini
 [Unit]
@@ -206,9 +212,9 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# Capabilities — port 53 + XDP kernel-bypass.
-# NOTE: this is the XDP profile. For the default xdp:no deployment, use the narrower
-# CAP_NET_BIND_SERVICE-only set (see the Capabilities section above).
+# Capabilities — port 53 + XDP kernel-bypass (the shipped default).
+# NOTE: for an xdp:no / firewall-manage:no deployment, use the narrower
+# CAP_NET_BIND_SERVICE-only set instead (see the Capabilities section above).
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON
 
