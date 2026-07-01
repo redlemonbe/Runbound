@@ -2307,21 +2307,20 @@ async function loadAuthEvents() {
 async function loadUsers() {
   const el = document.getElementById('users-list');
   el.innerHTML = '<span class="text-xs text-gray-700 italic">Loading…</span>';
+  const notice = document.getElementById('users-disabled-notice');
+  const createSection = document.getElementById('users-create-section');
   try {
-    const r = await apiFetch('/api/users');
-    const d = await r.json();
-    const notice = document.getElementById('users-disabled-notice');
-    const createSection = document.getElementById('users-create-section');
-    if (d.error === 'MULTI_USER_DISABLED') {
-      notice.classList.remove('hidden');
-      createSection.classList.add('hidden');
-      el.innerHTML = '';
-      return;
-    }
+    // #182 fix: this tab called a non-existent `apiFetch` (ReferenceError on every
+    // load) — every other tab already uses the real `api(method, path, body)`
+    // helper (fetch-style but throws Error(message) on a non-2xx response and
+    // returns the already-parsed JSON body). GET /api/users responds
+    // {"users": [...]} (unlike POST, which returns the created user flat) —
+    // unwrap it, rather than assuming the top-level value is itself the array.
+    const users = (await api('GET', '/users')).users;
     notice.classList.add('hidden');
     createSection.classList.remove('hidden');
-    if (!Array.isArray(d) || !d.length) { el.innerHTML = '<span class="text-xs text-gray-600 italic">No users yet.</span>'; return; }
-    el.innerHTML = d.map(u => {
+    if (!Array.isArray(users) || !users.length) { el.innerHTML = '<span class="text-xs text-gray-600 italic">No users yet.</span>'; return; }
+    el.innerHTML = users.map(u => {
       const adminBadge = u.admin ? '<span class="px-1.5 py-0.5 rounded bg-cyan-900 text-cyan-300 text-xs">admin</span>' : '';
       const prefixes = (u.zone_prefixes||[]).map(esc).join(', ') || '<span class="text-gray-700 italic">all zones</span>';
       return '<div class="card flex items-center gap-3 flex-wrap text-xs">' +
@@ -2333,7 +2332,18 @@ async function loadUsers() {
         '<button onclick="userDelete(\'' + u.id + '\',\'' + esc(u.username) + '\')" class="text-xs text-red-500 hover:text-red-400 px-2 py-1 rounded hover:bg-red-900/20">Delete</button>' +
         '</div>';
     }).join('');
-  } catch(e) { el.innerHTML = '<span class="text-xs text-red-500">' + esc(e.message) + '</span>'; }
+  } catch(e) {
+    // GET /api/users returns 403 MULTI_USER_DISABLED (not 200) when multi-user
+    // mode is off — api() throws for any non-2xx, so this is a thrown error here,
+    // not a body field on a successful response.
+    if (e.message === 'MULTI_USER_DISABLED') {
+      notice.classList.remove('hidden');
+      createSection.classList.add('hidden');
+      el.innerHTML = '';
+      return;
+    }
+    el.innerHTML = '<span class="text-xs text-red-500">' + esc(e.message) + '</span>';
+  }
 }
 
 async function userCreate() {
@@ -2343,9 +2353,7 @@ async function userCreate() {
   if (!username) { toast('Username required', true); return; }
   const zone_prefixes = prefixesRaw ? prefixesRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
   try {
-    const r = await apiFetch('/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({username, zone_prefixes, admin}) });
-    const d = await r.json();
-    if (!r.ok) { toast('Error: ' + (d.error||r.status), true); return; }
+    const d = await api('POST', '/users', {username, zone_prefixes, admin});
     document.getElementById('u-username').value = '';
     document.getElementById('u-prefixes').value = '';
     document.getElementById('u-admin').checked = false;
@@ -2357,8 +2365,7 @@ async function userCreate() {
 async function userDelete(id, name) {
   if (!(await showConfirmModal('Delete user ' + name + '?'))) return;
   try {
-    const r = await apiFetch('/api/users/' + id, { method: 'DELETE' });
-    if (!r.ok) { const d = await r.json(); toast('Error: ' + (d.error||r.status), true); return; }
+    await api('DELETE', '/users/' + id);
     loadUsers();
   } catch(e) { toast(e.message, true); }
 }
@@ -2366,9 +2373,7 @@ async function userDelete(id, name) {
 async function userRotateKey(id) {
   if (!(await showConfirmModal('Rotate API key? The old key will stop working immediately.'))) return;
   try {
-    const r = await apiFetch('/api/users/' + id + '/rotate-key', { method: 'POST' });
-    const d = await r.json();
-    if (!r.ok) { toast('Error: ' + (d.error||r.status), true); return; }
+    const d = await api('POST', '/users/' + id + '/rotate-key');
     showApiKey(d.api_key);
   } catch(e) { toast(e.message, true); }
 }
