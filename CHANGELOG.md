@@ -7,13 +7,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+## [0.23.9] - 2026-07-01
+
+### Fixed
+- **SIGHUP reload didn't resync the XDP fast-path cache.** Every API-triggered
+  reload (`POST /api/reload`, blacklist/feed/DNS-entry writes) called
+  `resync_xdp_cache()` to evict names affected by the change before swapping the
+  zone set; `systemctl reload` (SIGHUP) only reloaded zones from config and never
+  touched the cache. On an `xdp: yes` node this could leave a stale forwarded
+  answer shadowing a freshly-added blacklist/feed block until TTL expiry after a
+  reload — a real staleness/security gap, not just a doc inaccuracy. Fixed by
+  calling the same evict/re-preload logic from the SIGHUP handler.
+- **`install.sh` never actually wrote `xdp: no`**, despite its own comments
+  assuming it's the default ("PENT-3: least privilege... xdp:no (default) only
+  needs CAP_NET_BIND_SERVICE"). The code's real compiled-in default is
+  `xdp: true`; a stock install ran with XDP enabled but a systemd unit granting
+  only `CAP_NET_BIND_SERVICE`, silently falling back to the kernel path on every
+  load attempt (non-fatal, confirmed) instead of the clean `xdp: no` state
+  everything else assumed. `install.sh` now writes `xdp: no` explicitly.
+- Regenerated `Cargo.lock` — was frozen at `runbound 0.22.4`, still listing
+  `hickory-resolver`/`hickory-server` as direct dependencies three releases
+  after the de-hickory rewrite removed them from `Cargo.toml`.
+- Deleted `src/dns/xdp/wire_builder.rs` — dead code, superseded by
+  `src/dns/wire_builder.rs` months ago, never compiled, still importing
+  hickory types.
+- Corrected several stale source comments (`config/parser.rs`, `lib.rs`,
+  `dns/server.rs` ×3, `dns/recursor_wire.rs`, `dns/dnssec_verify.rs`)
+  referencing a `recursor`/`doq` Cargo feature that no longer exists (or never
+  did, for `doq`).
+
+Found by an adversarial documentation re-audit that cross-checked doc claims
+against source and turned up real code issues along the way, not just wording.
+
 ## [0.23.8] - 2026-07-01
 
 ### Added
 - **Hickory fully removed from the runtime.** Recursion (`src/dns/recursor_wire.rs`)
   and DNSSEC validation (RRSIG verification, chain-of-trust, NSEC/NSEC3 denial,
-  Secure/Insecure/Bogus verdicts) are now entirely in-house, always on by default —
-  there is no `recursor` Cargo feature anymore. `hickory-proto` remains only as a
+  Secure/Insecure/Bogus verdicts) are now entirely in-house — there is no
+  `recursor` Cargo feature anymore, though full-recursion (`resolution:
+  full-recursion`) and `dnssec-validation: yes` both remain opt-in at the
+  runtime-config level, off by default. `hickory-proto` remains only as a
   `[dev-dependencies]` entry, used exclusively by the differential oracle tests that
   prove the in-house wire codec byte-identical to it (`cargo tree -e normal` is
   hickory-free). This removes the last untrusted-input message-parsing dependency
