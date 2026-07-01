@@ -935,6 +935,17 @@ fn maximize_nic_ring_inner(iface: &str, target: Option<u32>) -> std::io::Result<
     let tx_cur = ring.tx_pending;
     let tx_max = ring.tx_max_pending;
 
+    // Publish the CURRENT ring size now, right after a successful GET, and
+    // treat it as the fallback result of this whole call. The driver may
+    // reject the SET below (e.g. virtio-net returns EINVAL for
+    // ETHTOOL_SRINGPARAM) — that must not leave the gauge or the caller's
+    // return value at zero, which is documented/read as "XDP disabled /
+    // driver doesn't support ethtool ring queries". Neither is true here:
+    // the ring size is known (this exact GET ioctl is what `ethtool -g`
+    // itself uses) even when we can't raise it.
+    XDP_NIC_RX_RING.store(rx_cur, Ordering::Relaxed);
+    XDP_NIC_RX_RING_MAX.store(rx_max, Ordering::Relaxed);
+
     let rx_set = target.map_or(rx_max, |n| n.min(rx_max).max(1));
     let tx_set = target.map_or(tx_max, |n| n.min(tx_max).max(1));
 
@@ -955,7 +966,19 @@ fn maximize_nic_ring_inner(iface: &str, target: Option<u32>) -> std::io::Result<
         )
     } < 0
     {
-        return Err(std::io::Error::last_os_error());
+        // Resize rejected by the driver (e.g. virtio-net: EINVAL). This is
+        // informational, not fatal: the GET above already gave us the true
+        // current/max ring size, published above and returned here — the
+        // caller (maximize_nic_ring) must NOT fall back to its (0, 0)
+        // "unavailable" sentinel, which would contradict what we just read.
+        // Only the raise-to-target optimisation didn't happen.
+        let e = std::io::Error::last_os_error();
+        tracing::warn!(
+            iface, err = %e,
+            "[XDP] NIC {iface} ring resize rejected by driver (current RX {rx_cur}, \
+             max {rx_max}) — continuing at the current ring size"
+        );
+        return Ok((rx_cur, rx_max));
     }
 
     tracing::info!(
