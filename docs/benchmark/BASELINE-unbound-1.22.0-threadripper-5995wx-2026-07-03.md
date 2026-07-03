@@ -84,4 +84,6 @@ for Q in 200 1000 2000 4000; do dnsperf -s <ip> -d /root/queries-A.txt -l 15 -c 
 **Notes.** Cache warmed hot before measuring (rule 2), flow control off (rule 3), RSS
 spread (rule 4), `:53` sole-owner verified (rule 5). Flood is an overload probe; unbound
 happens not to degrade (99.9 % NOERROR) so its NIC-rx doubles as the open-loop service
-rate.
+rate. **CPU** is `pidstat` on the server PID = userspace CPU only; softirq/kernel cost is
+off-PID and not counted, so it under-states whole-system CPU (consistent across servers,
+valid for relative efficiency). See README "CPU accounting".

@@ -57,6 +57,10 @@ does — see notes).
 - **Latency method.** Kernel path: tcpdump at the receiver → tshark `dns.time` (pure
   server service time, rule 7). Fast path: dnsmark `--wire-latency` (server+link) — XDP
   bypasses the receiver stack so tcpdump sees nothing there.
+- **CPU column** is `pidstat` on the server PID = **userspace CPU of the server process
+  only**; softirq/kernel cost (NIC IRQ, `ksoftirqd`) is not attributed to the PID, so it
+  under-states whole-system cost. Consistent across servers → good for relative
+  efficiency, not the total system CPU. (See README "CPU accounting".)
 
 ## Superseded — first-pass BIND (2026-07-03, dnsmark v2.7.5, latency v2.7.7)
 

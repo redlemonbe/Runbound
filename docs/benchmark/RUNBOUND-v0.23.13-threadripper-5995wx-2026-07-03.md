@@ -119,6 +119,13 @@ dnsmark -s <ip> [-s <ip2>] -d /root/queries-A.txt [--xdp] -Q 0 --max-outstanding
 dnsmark -s <ip> -d /root/queries-A.txt --wire-latency -Q 5000 -l 6
 ```
 
+**CPU accounting.** The CPU columns are `pidstat` on the server PID = the server
+process's **userspace** CPU only; softirq/kernel cost (NIC IRQ, `ksoftirqd`, ring
+fill/drain) is not attributed to the PID and is not counted. The figures are consistent
+across all runs (measured the same way) and valid for relative efficiency, but they
+under-state whole-system CPU — especially on the XDP path, where the driver/DMA softirq
+cost is real but off-PID. See README "CPU accounting".
+
 **Notes.** XDP residual detached (`ip link set … xdp off`) before switching to kernel
 runs — otherwise a stale XDP prog drops UDP:53. In XDP the receiver-side tcpdump sees no
 packets (XDP bypasses the kernel stack), so fast-path latency is the generator-side
