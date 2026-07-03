@@ -804,15 +804,33 @@ impl RunboundHandler {
                     for r in records.iter_mut() {
                         r.ttl = r.ttl.max(self.cache_min_ttl).min(self.cache_max_ttl);
                     }
-                    let mut resp = self.wire_answer(&msg, &records, rcode::NOERROR);
-                    if set_ad && resp.len() > 3 {
-                        resp[3] |= 0x20; // AD bit (RFC 4035)
-                    }
+                    // Base answer WITHOUT RRSIGs — this is the cached form and what
+                    // DO=0 clients receive (the fast path serves this cached datagram).
                     // Never cache a CD-served (Bogus) answer: it must not poison the
                     // cache for non-CD clients, who would then get it as NOERROR without
                     // the SERVFAIL that validation requires. Secure/Insecure are cacheable.
+                    let resp_base = self.wire_answer(&msg, &records, rcode::NOERROR);
                     if val.verdict != Verdict::Bogus {
-                        self.maybe_cache_wire(&q, &resp, &records);
+                        self.maybe_cache_wire(&q, &resp_base, &records);
+                    }
+                    // RFC 4035 §3.2.1: a DO=1 client MUST get the covering RRSIGs in the
+                    // ANSWER section. Reattach them (TTL-clamped like the RRset they cover)
+                    // only for DO clients; DO=0 clients keep the RRSIG-free base answer.
+                    // Oversized UDP replies are truncated downstream (truncate_udp_response),
+                    // so the client retries over TCP — no special handling needed here.
+                    let mut resp = if do_bit && !val.answer_rrsigs.is_empty() {
+                        let mut with_sigs = records;
+                        let mut sigs = val.answer_rrsigs;
+                        for r in sigs.iter_mut() {
+                            r.ttl = r.ttl.max(self.cache_min_ttl).min(self.cache_max_ttl);
+                        }
+                        with_sigs.extend(sigs);
+                        self.wire_answer(&msg, &with_sigs, rcode::NOERROR)
+                    } else {
+                        resp_base
+                    };
+                    if set_ad && resp.len() > 3 {
+                        resp[3] |= 0x20; // AD bit (RFC 4035)
                     }
                     self.stats.inc_forwarded();
                     self.stats.record_forward(start.elapsed().as_micros() as u64);
