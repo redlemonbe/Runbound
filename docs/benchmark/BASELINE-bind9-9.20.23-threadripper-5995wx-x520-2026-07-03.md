@@ -12,7 +12,9 @@
 **The baseline figure is a closed-loop knee of ~1.12 M qps** — BIND 9.20.23 as a
 forward+cache resolver, warmed on the 100 000-name corpus, on a single 10 GbE X520
 (82599ES, ixgbe) link, p50 under the SLO. This is the one throughput number in this
-report.
+report, and two independent generators agree on it: dnsmark's DSD reports Within-SLO
+1.09 M / knee ~1.12 M, and a dnsperf load sweep brackets the same knee (984 k clean at
+0.69 ms; latency crosses 1 ms by 1.20 M).
 
 An open-loop firehose was also run **as an overload/stress probe, not a measurement**:
 it is a deliberate DoS that livelocks BIND (50.00 % SERVFAIL at 1.20 M reply-packets/s
@@ -56,7 +58,10 @@ generator — only the link changes, per README rule 6).
 |--------|-------|--------|
 | **Closed-loop knee (ramp, Within-SLO)** | **~1.12 M qps** (Within-SLO 1.09 M) | dnsmark `--ramp` DSD (NIC-verified) |
 | Idle latency floor (p50) | 0.051 ms | dnsmark ramp |
-| dnsperf closed-loop (q=200/client, 20 clients) | 289 k qps @ avg 0.480 ms | dnsperf |
+| dnsperf load sweep — q=1000/client | 984 k qps @ 0.688 ms, 99.70 % NOERROR (clean) | dnsperf |
+| dnsperf load sweep — q=2000/client | 1.197 M qps @ 1.290 ms, 96.09 % NOERROR (latency breaks 1 ms) | dnsperf |
+| dnsperf load sweep — q=4000/client | 1.396 M qps @ 2.356 ms, 98.74 % NOERROR (over-driven) | dnsperf |
+| dnsperf gentle (q=200/client) | 289 k qps @ avg 0.480 ms | dnsperf |
 
 **Not a measurement — open-loop firehose (overload/DoS probe + tool cross-check):**
 
@@ -75,12 +80,23 @@ generator — only the link changes, per README rule 6).
 
 ## 5. Interpretation
 
-- **The baseline is the ramp knee (~1.12 M qps). The flood is not a measurement.** The
-  open-loop firehose is a deliberate DoS; at the ceiling BIND is doubly constrained (NIC
-  drops upstream, 50 % SERVFAIL downstream), so only ~0.60 M/s are real answers — a
-  saturation artefact, not a capacity. The closed-loop knee (~1.12 M qps, p50 under SLO)
-  is where BIND answers correctly; that is the BIND-on-X520 baseline, and the only
-  throughput number here.
+- **The baseline is the ramp knee (~1.12 M qps), independently corroborated.** A dnsperf
+  load sweep brackets the same knee from the other side: 984 k qps is still clean
+  (0.688 ms, 99.70 % NOERROR); by q=2000 the average latency crosses 1 ms (1.290 ms) and
+  SERVFAIL rises to 3.84 %. So the SLO knee sits at ~1.0–1.1 M qps by dnsperf — the same
+  window dnsmark's DSD reports (Within-SLO 1.09 M, knee ~1.12 M). Two independent
+  generators agree; **~1.12 M qps is the BIND-on-X520 baseline.**
+- **The flood *under*-measures on this NIC — concrete proof it is not a capacity number.**
+  Regulated closed-loop dnsperf drove BIND to serve **1.396 M qps** (q=4000, 98.74 %
+  NOERROR), with receiver NIC rx = tx second-by-second and zero `rx_no_dma` growth. The
+  open-loop firehose, offering 5.02 M, made BIND serve only **1.204 M** — *lower* than the
+  regulated rate — because the firehose overran the 82599's RX ring and the card dropped
+  ~2.7 M/s before BIND. On an ingress-bound NIC the flood is not merely "not the
+  sustained number", it reads ~14 % *below* the real closed-loop capacity. This is the
+  clearest single proof of why the firehose is a stress probe, not a measurement.
+- **The flood is not a measurement.** At its ceiling BIND is doubly constrained (NIC
+  drops upstream, 50 % SERVFAIL downstream), ~0.60 M/s real answers — a saturation
+  artefact.
 - **The tool cross-check holds.** dnsmark reported 1.204 M replies/s under the DoS; the
   receiver's 82599 `tx_packets` counted 1.202 M/s — 0.2 %. That validates dnsmark's
   NIC-rx instrumentation, nothing about BIND's capacity.
@@ -119,8 +135,12 @@ pidstat -u -r -h -p $(pidof named) 1 <secs> > <pidstat.log> &
 dnsmark -s 10.51.10.1 -d /root/queries-A.txt --ramp --max-outstanding 100
 # Run 2 — open-loop firehose (raw wire ceiling)
 dnsmark -s 10.51.10.1 -d /root/queries-A.txt -Q 0 --max-outstanding 0 -l 30
-# Run 3 — dnsperf closed-loop cross-tool
+# Run 3 — dnsperf closed-loop cross-tool (gentle)
 dnsperf -s 10.51.10.1 -d /root/queries-A.txt -l 30 -c 20 -T 20 -q 200 -t 3
+# Run 3b — dnsperf load sweep to bracket the knee independently (re-warm first)
+for Q in 1000 2000 4000; do
+  dnsperf -s 10.51.10.1 -d /root/queries-A.txt -l 20 -c 20 -T 20 -q $Q -t 3
+done
 
 # Truth read (receiver) — note rx_no_dma_resources is the ixgbe drop counter
 ethtool -S enp66s0f1 | grep -E 'rx_packets|tx_packets|rx_missed_errors|rx_no_dma_resources'

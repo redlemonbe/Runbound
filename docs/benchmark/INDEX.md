@@ -17,16 +17,22 @@ NIC-rx instrumentation is exact at high pps.
 **Reference resolvers — BIND 9.20.23** (dnsmark 2.7.5 + dnsperf 2.14.0 generators,
 corpus warmed 100 k):
 
-| **Capacity — closed-loop knee (SLO)** | Under overload firehose (not a measure) | Tool cross-check | Link / NIC | Report |
-|--------------------------------------:|-----------------------------------------|:----------------:|-----------|--------|
-| **~1.40 M qps** (99.90 % NOERROR, p50 0.133 ms) | 18 % SERVFAIL livelock; NIC ingested 4.96 M/s, 0 drops | dnsmark 1.589 M vs NIC tx 1.611 M = **1.4 %** | X710 (i40e) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-07-03.md) |
-| **~1.12 M qps** (Within-SLO 1.09 M) | 50 % SERVFAIL livelock; 82599 dropped ~2.7 M/s at `rx_no_dma` before BIND | dnsmark 1.204 M vs NIC tx 1.202 M = **0.2 %** | X520 / 82599ES (ixgbe) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-07-03.md) |
+| **Capacity — closed-loop knee (SLO)** | Cross-tool corroboration (dnsperf) | Tool cross-check (dnsmark vs NIC) | Link / NIC | Report |
+|--------------------------------------:|------------------------------------|:---------------------------------:|-----------|--------|
+| **~1.40 M qps** (99.90 % NOERROR, p50 0.133 ms) | dnsperf 1.466 M @ 6.5 % SERVFAIL = onset (knee ~1.4 M) | 1.589 M vs NIC tx 1.611 M = **1.4 %** | X710 (i40e) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-07-03.md) |
+| **~1.12 M qps** (Within-SLO 1.09 M) | dnsperf sweep: 984 k clean, >1 ms by 1.20 M → knee ~1.0–1.1 M | 1.204 M vs NIC tx 1.202 M = **0.2 %** | X520 / 82599ES (ixgbe) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-07-03.md) |
 
-Back-to-back, same host/binary/generator, only the link changed (rule 6): the i40e
-ingests 4.96 M/s with zero drops → BIND knee ~1.40 M; the 82599 hits its RX-DMA wall at
-~2.69 M/s ingested (~2.7 M/s dropped before the resolver) → BIND knee ~1.12 M. The
-difference is the NIC, not BIND (CPU ≤17.5 of 128 cores on both). Runbound runs under
-this methodology follow.
+Both knees are placed by two independent generators (dnsmark DSD + dnsperf sweep), not a
+single tool. Back-to-back, same host/binary/generator, only the link changed (rule 6):
+the i40e ingests 4.96 M/s with zero drops → BIND knee ~1.40 M; the 82599 hits its RX-DMA
+wall under firehose but, regulated, serves to ~1.4 M — its SLO knee is ~1.12 M. The
+difference is the NIC, not BIND (CPU ≤17.5 of 128 cores on both).
+
+**Note on the firehose.** The open-loop flood is a stress/DoS probe, never a capacity
+number — on the ingress-bound 82599 it actually reads *below* the regulated closed-loop
+rate (served 1.204 M under firehose vs 1.396 M under regulated dnsperf q=4000), because
+it overruns the NIC's RX ring. Capacity is always the closed-loop SLO knee. Runbound
+runs under this methodology follow.
 
 ## Measured speeds at a glance (archived — pre-revision, see [OLD/](OLD/))
 

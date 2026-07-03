@@ -108,10 +108,12 @@ Ramp step ladder (offered → served, p50 / p95 / p99, ms):
 - **Server was not link-bound.** Offered egress reached 5.42 M qps (14 % of the 10 G
   wire at 86 B replies); the link had headroom. The limit was BIND's own processing
   (17.5 cores busy, SERVFAIL onset), not the NIC or the link.
-- **Cross-tool consistency.** dnsperf at a gentle closed-loop rate (q=200) held 496 k qps
-  at 0.195 ms avg with 99.90 % NOERROR — same rcode profile as the ramp's low steps,
-  consistent latency floor. Pushed to q=2000 it reached 1.466 M qps but SERVFAIL rose to
-  6.54 %, the same overload signature the flood shows in the extreme.
+- **Cross-tool consistency corroborates the knee.** dnsperf at a gentle closed-loop rate
+  (q=200) held 496 k qps at 0.195 ms avg with 99.90 % NOERROR — same rcode profile as the
+  ramp's low steps. Pushed to q=2000 it reached 1.466 M qps but SERVFAIL rose to 6.54 % at
+  0.914 ms: that is the onset of degradation, so BIND's real knee on X710 sits right at
+  the dnsmark DSD figure (~1.40 M, clean) with 1.466 M already over the edge. Two
+  independent generators place the knee in the same ~1.4 M window.
 - **Latency wire-truth.** p50/p95/p99 here come from the two generators' closed-loop RTT
   (dnsmark ramp + dnsperf), which agree. A `tcpdump` wire capture was not taken this
   run, so for the exact on-wire latency distribution: **I cannot confirm this** beyond
