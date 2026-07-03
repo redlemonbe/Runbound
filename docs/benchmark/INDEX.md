@@ -31,9 +31,16 @@ does — see notes).
 | ~1.49 M | 98.42 % (1.5 % SERVFAIL) | 1.0 % | 24.0 µs (tcpdump) | 17.6 % | BIND 9.20.23 | X710 (i40e) |
 | ~1.26 M | **66.74 %** (33 % SERVFAIL — livelock) | 0.9 % | 29.8 µs (tcpdump) | 21.7 % | BIND 9.20.23 | X520 (ixgbe) |
 
-**Reports:** [Runbound v0.23.13 (all 5 runs)](RUNBOUND-v0.23.13-threadripper-5995wx-2026-07-03.md) ·
-[unbound 1.22.0](BASELINE-unbound-1.22.0-threadripper-5995wx-2026-07-03.md) ·
-[BIND 9.20.23](BASELINE-bind9-9.20.23-threadripper-5995wx-2026-07-03.md)
+**Reports (one per run, per [TEMPLATE.md](TEMPLATE.md)):**
+Runbound v0.23.13 `xdp:yes` [X710](RUNBOUND-v0.23.13-threadripper-5995wx-x710-xdp-2026-07-03.md) ·
+[X520](RUNBOUND-v0.23.13-threadripper-5995wx-x520-xdp-2026-07-03.md) ·
+[dual](RUNBOUND-v0.23.13-threadripper-5995wx-dual-xdp-2026-07-03.md) — `xdp:no`
+[X710](RUNBOUND-v0.23.13-threadripper-5995wx-x710-noxdp-2026-07-03.md) ·
+[X520](RUNBOUND-v0.23.13-threadripper-5995wx-x520-noxdp-2026-07-03.md) ·
+unbound [X710](BASELINE-unbound-1.22.0-threadripper-5995wx-x710-2026-07-03.md) ·
+[X520](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-07-03.md) ·
+BIND [X710](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-07-03.md) ·
+[X520](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-07-03.md)
 
 **What the numbers say.**
 
@@ -63,12 +70,6 @@ does — see notes).
   Efficiency (served per point of host CPU) is the story: Runbound `xdp:yes` ~0.97 M/%
   (X710) is ~6× its own kernel path, ~10× unbound, ~11× BIND. (See README "CPU
   accounting".)
-
-## Superseded — first-pass BIND (2026-07-03, dnsmark v2.7.5, latency v2.7.7)
-
-The initial BIND-only pass (per-link reports) was folded into the consolidated BIND
-report above when the full suite was re-run on v2.7.7. Its throughput figures
-(v2.7.5 datapath) match the v2.7.7 re-run within flood variance.
 
 ## Measured speeds at a glance (archived — pre-revision, see [OLD/](OLD/))
 
@@ -173,9 +174,10 @@ round-trip. Every run follows [README.md](README.md) (warmup + ramp) and [TEMPLA
 - [runbound-receiver-bench.conf](runbound-receiver-bench.conf) — the receiver config for the
   Runbound runs (`xdp:no`, real forward-zone, no local-data, `rate-limit: 0`).
 - **Full suite (2026-07-03, dnsmark v2.7.7) — current**
-  - [Runbound v0.23.13 — `xdp:no`, `xdp:yes`, dual-link (X710 + X520, all five runs)](RUNBOUND-v0.23.13-threadripper-5995wx-2026-07-03.md)
-  - [unbound 1.22.0 — X710 + X520](BASELINE-unbound-1.22.0-threadripper-5995wx-2026-07-03.md)
-  - [BIND 9.20.23 — X710 + X520](BASELINE-bind9-9.20.23-threadripper-5995wx-2026-07-03.md)
+  - Runbound v0.23.13 `xdp:yes` — [X710](RUNBOUND-v0.23.13-threadripper-5995wx-x710-xdp-2026-07-03.md) · [X520](RUNBOUND-v0.23.13-threadripper-5995wx-x520-xdp-2026-07-03.md) · [dual-link](RUNBOUND-v0.23.13-threadripper-5995wx-dual-xdp-2026-07-03.md)
+  - Runbound v0.23.13 `xdp:no` — [X710](RUNBOUND-v0.23.13-threadripper-5995wx-x710-noxdp-2026-07-03.md) · [X520](RUNBOUND-v0.23.13-threadripper-5995wx-x520-noxdp-2026-07-03.md)
+  - unbound 1.22.0 — [X710](BASELINE-unbound-1.22.0-threadripper-5995wx-x710-2026-07-03.md) · [X520](BASELINE-unbound-1.22.0-threadripper-5995wx-x520-2026-07-03.md)
+  - BIND 9.20.23 — [X710](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-07-03.md) · [X520](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-07-03.md)
 - **Re-run on v0.23.8 (2026-07-01) — official release binaries, NIC-counter ground truth**
   - [Runbound v0.23.8 `xdp: yes` — X710 (i40e) + X520 (ixgbe) single-link + dual-link (all three in one report)](OLD/RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md)
 - **New bench rig (2026-06-13) — X710 + X510 direct links**
