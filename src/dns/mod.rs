@@ -23,6 +23,7 @@ pub mod dnssec_chain;
 pub mod zone_signer;
 pub mod dnssec_sign;
 pub mod plain_server;
+pub mod doq;
 pub mod wire;
 // hickory <-> wire converter — only the recursor handler and the differential
 // oracle tests still cross the boundary; gone from the default release build.

@@ -2107,7 +2107,7 @@ async fn spawn_tls_service(
             return handles;
         }
     };
-    let _doq_config = match build_tls_config(certs, key, b"doq", true, None) {
+    let doq_config = match build_tls_config(certs, key, b"doq", true, None) {
         Ok(c) => c,
         Err(e) => {
             warn!(err=%e, "DoQ TLS config failed — encrypted DNS not started");
@@ -2226,10 +2226,24 @@ async fn spawn_tls_service(
             Err(e) => warn!(addr=%doh_addr, err=%e, "DoH bind failed — skipping"),
         }
 
-        // DNS-over-QUIC: not implemented. No QUIC dependency exists in this crate at
-        // all (not gated by any Cargo feature — there isn't one). `doq-port`/
-        // `quic-port` still parse for forward-compat but no listener is ever bound.
-        let _ = doq_port; // suppress unused warning
+        // DNS-over-QUIC (RFC 9250) — own quinn-based listener (src/dns/doq.rs),
+        // reusing the doq TLS config (TLS 1.3, ALPN "doq") and the shared request
+        // path. Unlike DoT/DoH there is no loopback relay: quinn exposes the real
+        // client address directly (conn.remote_address()).
+        let doq_addr = format!("{}:{}", iface, doq_port);
+        match doq_addr.parse::<SocketAddr>() {
+            Ok(sa) => {
+                let h_doq = std::sync::Arc::clone(&handler_dot_sup);
+                match crate::dns::doq::spawn_doq(sa, std::sync::Arc::clone(&doq_config), h_doq) {
+                    Ok(handle) => {
+                        info!(addr=%doq_addr, "DoQ (DNS-over-QUIC) listening — RFC 9250");
+                        handles.push(handle);
+                    }
+                    Err(e) => warn!(addr=%doq_addr, err=%e, "DoQ bind failed — skipping"),
+                }
+            }
+            Err(e) => warn!(addr=%doq_addr, err=%e, "DoQ addr parse failed — skipping"),
+        }
     }
 
     // All DoT/DoH listeners are already spawned as tasks in handles above.

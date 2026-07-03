@@ -5,9 +5,10 @@
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 
 - **Transport crypto.** `rustls` 0.23 (TLS 1.2 + 1.3) for DoT/DoH and the relay. DoQ
-  (DNS-over-QUIC) is **not implemented** — `doq-port`/`quic-port` parse for
-  forward-compat but no listener is ever bound; there is no QUIC dependency in this
-  crate at all (`src/dns/server.rs`, no `quinn` dependency, no `doq` Cargo feature).
+  (DNS-over-QUIC, RFC 9250) runs on `quinn` (QUIC transport) over the same `rustls`
+  TLS 1.3 stack and the same request path as DoT/DoH; the listener is bound at startup
+  (`src/dns/doq.rs`, wired in `src/dns/server.rs`). `quinn` is a direct dependency,
+  independent of hickory, with minimal features (ring crypto, no platform-verifier).
 - **Relay authentication.** HMAC-SHA256 over method + path + timestamp **+ body**
   (SEC-I14, v0.17.1), anti-replay ±30 s (`replay_check_and_record`, `src/sync.rs:118`),
   constant-time compare (`hmac_verify_with_ts`, `src/sync.rs:145`); TOFU cert pinning.
@@ -127,7 +128,8 @@
 
 On top of the per-source token-bucket rate limit, an **abuse engine** (per-client
 query-rate rules: `log` / `tarpit` / `block` / `notify`) escalates only **verified
-sources** — connection transports (TCP/DoT/DoH; DoQ is not implemented, see above) or
+sources** — connection transports (TCP/DoT/DoH; DoQ is connection-verified at the QUIC
+layer but its abuse-engine integration is not yet wired) or
 UDP carrying a valid DNS Cookie (RFC 7873). An unverified UDP source is **never**
 tarpitted or banned: spoofing a victim's IP must not let an attacker get the victim
 banned, nor make Runbound reflect responses toward a spoofed victim. Unverified UDP
