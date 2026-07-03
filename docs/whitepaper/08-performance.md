@@ -1,39 +1,36 @@
 # 08 — Performance
 
-> **Status: re-measured on v0.23.8 (2026-07-01)**, using the official, minisig-signed
-> GitHub release binaries for both Runbound and the generator (dnsmark v2.6.0) — no
-> locally-compiled artifacts. This confirms no regression from the de-hickory rewrite
-> (recursion + DNSSEC validation moved fully in-house): the fast path's hot loop was not
-> touched, and single-link X710 throughput rose from the prior ~10.12 Mqps baseline to
-> ~12.56 Mqps at lower CPU. Governed by `docs/benchmark/README.md` (the methodology) and
-> the per-run reports under `docs/benchmark/`, indexed in `docs/benchmark/INDEX.md`. This
-> round also directly measured and quantified dnsmark's own under-reporting at
-> saturation (12–34% below the receiver's NIC hardware counters, depending on
-> configuration) — all figures below are the NIC-hardware-verified numbers, not
-> dnsmark's self-reported ones. **Caveat: 2 MiB huge pages were unavailable for this
-> round** (host memory fragmentation, unrelated to the resolver or to any user VM) —
-> Runbound's own logging documents this as a lower-throughput fallback path, so every
-> number below is a floor, not the fully-tuned ceiling (see the report's §5).
+> **Status: re-measured on v0.23.13 (2026-07-03)** under the revised methodology
+> (dnsmark v2.7.7 + dnsperf 2.14.0, 100k-name real corpus). This confirms no regression
+> from the de-hickory rewrite (recursion + DNSSEC validation moved fully in-house): the
+> fast path's hot loop was not touched. Governed by `docs/benchmark/README.md` (the
+> methodology) and the per-run reports under `docs/benchmark/`, indexed in
+> `docs/benchmark/INDEX.md`. Every throughput figure below is **cross-checked against the
+> receiver NIC hardware counters** (`tx_packets`, agreement 0.1–1.0 %), not dnsmark's
+> self-reported round-trip. The served rate is the open-loop flood NIC-rx (the service
+> ceiling): for the fast path it is line-bound; for the kernel path it is the open-loop
+> rate (Runbound/unbound do not livelock; BIND does).
 >
-> | v0.23.8 (2026-07-01) | served (NIC) | receiver CPU | limited by |
+> | v0.23.13 (2026-07-03) | served (NIC) | host CPU (128 c) | limited by |
 > |---|---|---|---|
-> | `xdp: yes` **dual-link** X710+X520 | **~19.9 Mqps** | not isolated | generator-side imbalance (dnsmark #15-P2), not Runbound — see report §5 |
-> | `xdp: yes` single link X710 | ~12.56 Mqps | ~9.3 % | 10 G link response direction |
-> | `xdp: yes` single link X520 | ~11.88 Mqps | not isolated | ixgbe RX path (non-zero `rx_missed_errors`) |
+> | `xdp: yes` **dual-link** X710+X520 | **~20.3 Mqps** (ramp) / 19.4 M (flood) | ~24.4 % | 99 % of the aggregate 20 G link — server not saturated |
+> | `xdp: yes` single link X710 | ~9.85 Mqps | ~10.1 % | 10 G link (103 B responses → line-bound) |
+> | `xdp: yes` single link X520 | ~9.81 Mqps | ~8.2 % | 10 G link response direction (line-bound) |
+> | `xdp: no` kernel slow path X710 | ~2.86 Mqps | ~17.7 % | kernel-UDP RX path (no livelock, 99.96 % NOERROR) |
+> | `xdp: no` kernel slow path X520 | ~2.18 Mqps | ~17.1 % | kernel-UDP RX path |
 >
-> **Latency** (dnsmark `--ramp`, per-step): X710 at 6.4 Mqps sustained (pre-knee) p50
-> 0.212 / p95 0.271 / p99 0.291 ms; at the ~12.77 Mqps knee p50 0.876 / p99 0.962 ms — still
-> sub-millisecond at saturation. X520 at 6.4 Mqps sustained p50 0.138 / p99 0.254 ms; at the
-> ~12.79 Mqps knee p50 0.942 / p99 1.052 ms.
+> **Latency**: fast-path wire latency (dnsmark `--wire-latency`, server+link) p50 **31 µs**
+> (X710) / **34 µs** (X520); dual-link p50 **30 µs**. Kernel slow-path cache-hit latency
+> (tcpdump → tshark `dns.time`, pure server service time) p50 **24.6 µs** (X710) /
+> **25.2 µs** (X520). The host-CPU column is whole-machine `mpstat` utilisation across all
+> 128 cores during the flood (softirq/NIC cost included, VM `%guest`/`%steal` excluded).
 >
-> In no run did Runbound show CPU saturation or non-zero error rate. Historical
-> reference (v0.18.1/v0.19.3, 2026-06-13/15, superseded by the round above but kept for
-> the datapath history): dual-link X510+X710 ~20.3 Mqps at ~24% CPU (that run used two
-> *separate* generator cards, avoiding this round's generator-imbalance limitation — the
-> two dual-link figures are not directly comparable, see `docs/benchmark/OLD/RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md` §5); single-link X710 ~10.12 Mqps; kernel slow path
-> X710 ~3.71 Mqps. Same-rig kernel-UDP references: unbound 1.22.0 ~2.09 M, BIND 9.20.23
-> ~1.84 M. The older v0.16.11 (X710) and v0.17.0 sections below are superseded but kept
-> for the datapath history.
+> On the single 10 G link the wall is the *response* direction: 103-byte replies cap a
+> single link at ~9.85 M/s, so a bigger single-link figure is not reproducible with this
+> corpus. In no run did Runbound reach its own CPU ceiling. Same-rig kernel-UDP references:
+> unbound 1.22.0 ~1.91 M (X710) / ~1.46 M (X520); BIND 9.20.23 ~1.49 M (X710) and it
+> **livelocks** into 33 % SERVFAIL under the X520 flood. The older v0.16.11 (X710) and
+> v0.17.0 sections below are superseded but kept for the datapath history.
 
 This chapter holds **only measured numbers produced under the documented methodology**.
 Until a run is completed under that methodology at the current version, this chapter states
@@ -57,7 +54,7 @@ any figure not yet re-measured.
 - The naïve hickory slow path measured **1.78× Unbound's instructions/query** — the reason
   the fast paths exist (§1.2).
 
-## X710 10 GbE — earlier detail (v0.16.11, superseded by the v0.23.8 table above)
+## X710 10 GbE — earlier detail (v0.16.11 / v0.18.1, superseded by the v0.23.13 table above)
 
 Measured on the documented rig (receiver: 5995WX + Intel X710-DA2; generator: dual Xeon
 E5-2690 v2 + X710, direct DACs; dnsmark 2.2.1, XDP zero-copy both sides, NIC-counter
@@ -82,7 +79,9 @@ truth):
   - **~3.71 M qps served at ~19 % CPU** — the canonical benchmark
     (`RUNBOUND-v0.18.1-…-x710-noxdp`): NIC tuned (RSS `udp4 sdfn`, node-local queues/IRQs,
     RX ring 4096), 63 `SO_REUSEPORT` workers, a kernel-UDP generator (~4.6 M offered), p99
-    0.371 ms — ~2× BIND/unbound on the same rig. **This is the slow-path number.**
+    0.371 ms — ~2× BIND/unbound on the same rig. (This was the v0.18.1 slow-path figure; the
+    current v0.23.13 campaign measures ~2.86 M X710 / ~2.18 M X520 under the revised
+    100k-corpus methodology — see the table at the top of this chapter.)
   - **~1.5 M qps** (best ~1.59 M) — **out of the box, NOT retuned** (no named NIC), i40e
     NAPI-bound ([#190](https://github.com/redlemonbe/Runbound/issues/190)).
   - **~7.3 M** — historical **ixgbe/X520** (a different datapath, see the table below), **not
@@ -141,13 +140,14 @@ actual saturation point. Full report:
 
 ## Bottleneck analysis & scaling headroom
 
-At the 2026-06-15 ceiling — **~20.3 M qps served (steady 20.0–20.34 M), dual-link (X510 + X710)** — the limit is
-**the aggregate link line rate, not Runbound and not the CPU.** Each 10 GbE link carries
-~10.1 M small-DNS responses/s (its *response-direction* line rate); both links run at line
-rate at once, with **~0 NIC drops** and the receiver (a single AMD Threadripper PRO 5995WX,
-a PCIe-3.0 / 2013-class Xeon-v2 generator on the other end) at **~24 % CPU**. Single link:
-~10.12 M served at **~11 % CPU**. In no run did Runbound reach its own CPU ceiling — ~76 % of
-the machine was idle at the maximum.
+At the current campaign's dual-link ceiling — **~20.3 M qps served (ramp) / 19.4 M (flood),
+dual-link (X710 + X520)** — the limit is **99 % of the aggregate 20 G link line rate, not
+Runbound and not the CPU.** Each 10 GbE link carries ~9.85 M small-DNS responses/s (its
+*response-direction* line rate, 103-byte replies); both links run at line rate at once, with
+the receiver (a single AMD Threadripper PRO 5995WX, a 2013-class Xeon-v2 generator on the
+other end) at **~24.4 % host CPU** of 128 cores. Single link: ~9.85 M served (X710) at
+**~10.1 % host CPU** / ~9.81 M (X520) at **~8.2 %**. In no run did Runbound reach its own CPU
+ceiling — the machine was overwhelmingly idle at the maximum.
 
 So the wall is **bandwidth**, hit in this order as each is removed: link line rate → NIC
 RX / PCIe path → CPU / memory. On this rig the **links saturated first** — PCIe 3.0 (X710)

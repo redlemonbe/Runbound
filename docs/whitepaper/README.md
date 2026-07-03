@@ -10,7 +10,7 @@ Runbound does but *how* and *why* — down to the hand-written assembly on the h
 and the eBPF verifier constraints that shaped the in-kernel code.
 
 > **Status & honesty.** This document describes the code as it exists in the repository
-> at **v0.23.8** (last full sync pass: 2026-07-01). Where a claim is not backed by a
+> at **v0.23.13** (last full sync pass: 2026-07-03). Where a claim is not backed by a
 > measurement or by the code, it is marked **"I cannot confirm this."** No marketing
 > language is used: the words *production-ready, blazing, world-first, military-grade,
 > rock-solid, unbreakable, guaranteed* are banned, in line with the project's

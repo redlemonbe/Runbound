@@ -59,7 +59,7 @@ split-horizon — `add_split_horizon`/`delete_split_horizon` (`src/api/mod.rs`) 
 - **Sync** is a delta journal (`SyncJournal`, capacity 1000) over TOFU TLS, with SHA-256
   content hashing (`src/sync.rs`).
 - **Auto-registration**: the slave registers itself to the master on startup
-  (`POST /nodes/register`, HMAC-signed, `src/sync.rs:923`). The master validates the
+  (`POST /nodes/register`, HMAC-signed, `src/sync.rs:989`). The master validates the
   advertised `relay_host` against SSRF: loopback, unspecified, link-local, IPv6 ULA and
   — unless `sync-allow-private-relay: yes` is set on the master — **RFC 1918 private
   ranges are rejected with 400** (`src/sync.rs:1047`). LAN deployments (a slave at a
@@ -89,5 +89,5 @@ split-horizon — `add_split_horizon`/`delete_split_horizon` (`src/api/mod.rs`) 
 - **Embedded web UI**: static HTML gzipped at build (`include_bytes!` of
   `OUT_DIR/index.html.gz`), served by the binary — no nginx since v0.9.0. Since **v0.22** the
   admin panel **binds `127.0.0.1` by default** (`ui-bind` default changed from `0.0.0.0`,
-  `src/config/parser.rs:530`); exposing it on the network now requires an explicit
+  `src/config/parser.rs:551`); exposing it on the network now requires an explicit
   `ui-bind: 0.0.0.0`.
