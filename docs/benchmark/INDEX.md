@@ -1,11 +1,32 @@
 # Runbound — Benchmark index
 
-> **Archive note (2026-07-03).** All runs below predate the current methodology revision
-> (dnsmark-vs-NIC cross-check table + ramp/DSD rules in [README.md](README.md)) and have
-> been moved to [OLD/](OLD/). They remain valid measurements under the methodology of
-> their time. Reports from the next campaign will land at the top level of this directory.
+> **Archive note (2026-07-03).** All runs in the "at a glance" table below predate the
+> current methodology revision (dnsmark-vs-NIC cross-check table + ramp/DSD rules in
+> [README.md](README.md)) and have been moved to [OLD/](OLD/). They remain valid
+> measurements under the methodology of their time. New-methodology runs are listed
+> directly under the heading immediately below.
 
-## Measured speeds at a glance
+## Current campaign (revised methodology, 2026-07-03)
+
+Runs under the [README.md](README.md) revision: every throughput figure is
+cross-checked against receiver NIC hardware counters, ramps use DSD, and both the
+closed-loop SLO knee and the raw open-loop wire ceiling are reported separately.
+
+**Reference resolvers — BIND 9.20.23** (dnsmark 2.7.5 + dnsperf 2.14.0 generators,
+corpus warmed 100 k):
+
+| Sustained knee (SLO) | Raw wire ceiling | NIC cross-check | Notes | Link / NIC | Report |
+|---------------------:|-----------------:|:---------------:|-------|-----------|--------|
+| **~1.40 M qps** (99.90 % NOERROR, p50 0.133 ms) | 1.589 M pkts/s (18 % SERVFAIL — livelock) | dnsmark 1.589 M vs NIC tx 1.611 M = **1.4 %** | BIND processing-bound; NIC ingested 4.96 M/s, 0 drops | X710 (i40e) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-07-03.md) |
+| **~1.12 M qps** (Within-SLO 1.09 M) | 1.204 M pkts/s (50 % SERVFAIL — livelock) | dnsmark 1.204 M vs NIC tx 1.202 M = **0.2 %** | **NIC-bound**: 82599 dropped ~2.7 M/s at `rx_no_dma` before BIND | X520 / 82599ES (ixgbe) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-07-03.md) |
+
+Back-to-back, same host/binary/generator, only the link changed (rule 6): the i40e
+ingests 4.96 M/s with zero drops → BIND knee ~1.40 M; the 82599 hits its RX-DMA wall at
+~2.69 M/s ingested (~2.7 M/s dropped before the resolver) → BIND knee ~1.12 M. The
+difference is the NIC, not BIND (CPU ≤17.5 of 128 cores on both). Runbound runs under
+this methodology follow.
+
+## Measured speeds at a glance (archived — pre-revision, see [OLD/](OLD/))
 
 Maximum **served** throughput per run — receiver NIC hardware counters, never the
 generator's self-reported rate. Full context behind every number in its report.
