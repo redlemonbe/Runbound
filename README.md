@@ -44,7 +44,7 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 ### Performance — XDP fast path
 | Feature | Notes |
 |---|---|
-| AF_XDP kernel-bypass | zero-syscall hot path; ~12.56 M qps single-link X710, ~19.9 M qps dual-link (NIC-truth, ~9.3 % CPU) — see [Performance](#performance) |
+| AF_XDP kernel-bypass | zero-syscall hot path; ~9.85 M qps single-link X710 (line-bound), ~20.3 M qps dual-link (NIC-truth, ~10 % host CPU) — see [Performance](#performance) |
 | SIMD / ASM wire responder | shared by the fast and slow paths |
 | Multi-NIC + IRQ/CPU auto-pinning | governor control, ring auto-sizing |
 | XDP ICMP echo responder | rate-limited, with auto-ban |
@@ -58,7 +58,7 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 | Block-list feed subscriptions | managed via the API |
 | Real-time stats | Prometheus `/metrics` (queries, cache, XDP, DDoS/abuse, listener saturation, upstreams) + SSE stream |
 | Master/slave replication | REST relay (HMAC + TLS-pinned) **and** AXFR/IXFR (RFC 5936) *¹ |
-| Anycast deployment | built-in BGP announcer, health-driven route withdrawal |
+| Anycast deployment | BGP route announcement via a supervised `exabgp` process, health-driven route withdrawal |
 | Multi-user API | per-user zone isolation |
 | Webhook notifications | Slack / Discord / ntfy |
 | Hot backup / restore | via the API |
@@ -200,30 +200,30 @@ curl -s -X POST http://localhost:8080/api/feeds \
 Benchmarked under a documented, reproducible methodology — **the truth is the receiver
 NIC hardware counters** (`tx_packets`), warm cache, governor pinned, flow-control off,
 never the generator's self-report. Full per-run reports: [docs/benchmark/](docs/benchmark/).
-Rig re-run on the official v0.23.8 release binary (2026-07-01): AMD Threadripper PRO 5995WX
-receiver, dual Xeon E5-2690 v2 generator (dnsmark v2.6.0), direct 10 GbE DACs (Intel
-X710/i40e + X520/ixgbe). No huge pages this session (host memory fragmentation) — these
-figures are a **floor, not the tuned ceiling**.
+Current campaign (2026-07-03, v0.23.13 binary, dnsmark v2.7.7 + dnsperf 2.14.0): AMD
+Threadripper PRO 5995WX receiver, dual Xeon E5-2690 v2 generator, direct 10 GbE DACs (Intel
+X710/i40e + X520/ixgbe), 100k-name real corpus. Every throughput figure is cross-checked
+against the receiver NIC `tx_packets` (agreement 0.1–1.0 %).
 
-| Runbound v0.23.8 | Served (receiver NIC) | Receiver CPU | Limited by |
+| Runbound v0.23.13 | Served (receiver NIC) | Host CPU (128 c) | Limited by |
 |---|---|---|---|
-| `xdp: yes` — **dual-link** (X710 + X520) | **~19.9 M qps** | not isolated (aggregate run) | generator-imbalanced across the two links — **server not saturated** |
-| `xdp: yes` — single link (X710) | ~12.56 M qps | ~9.3 % (steady) | 10 G link (response direction) |
-| `xdp: no` — kernel slow path (X710) | ~3.71 M qps | ~19 % | kernel-UDP RX + generator |
+| `xdp: yes` — **dual-link** (X710 + X520) | **~20.3 M qps** (ramp) / 19.4 M (flood) | ~24.4 % | 99 % of the aggregate 20 G link — **server not saturated** |
+| `xdp: yes` — single link (X710) | ~9.85 M qps | ~10.1 % | 10 G link (103 B responses → line-bound) |
+| `xdp: yes` — single link (X520) | ~9.81 M qps | ~8.2 % | 10 G link (response direction) |
+| `xdp: no` — kernel slow path (X710) | ~2.86 M qps | ~17.7 % | kernel-UDP RX path |
+| `xdp: no` — kernel slow path (X520) | ~2.18 M qps | ~17.1 % | kernel-UDP RX path |
 
 These figures are **cache-hit / hot-path throughput** (answers served from cache or local
-zones over the XDP fast path), not recursion under cache miss — a different workload. In no run
-did Runbound reach its own CPU ceiling; the limit is always the link, the NIC RX path,
-or the generator. Same-rig kernel-UDP reference resolvers, same cache-hit workload: **unbound
-1.22.0 ~2.09 M**, **BIND 9.20.23 ~1.84 M** — both excellent and both bounded by the kernel
-socket path here, not their own code (see the [diplomacy of the comparison](docs/benchmark/INDEX.md)).
-Runbound's slow path is ~2× and its fast path ~5–6× on the same rig, at lower CPU and lower
-latency: fast-path wire **p50 0.212 / p95 0.271 / p99 0.291 ms** at 6.4 M sustained (X710,
-pre-saturation-knee) vs unbound p50 ~0.227 ms / BIND ~0.320 ms. Re-validated after the
-de-hickory rewrite (recursion + DNSSEC now fully in-house) with no regression vs the
-v0.18.1/v0.19.3 baseline. Full context, with every counter and caveat, including the
-superseded v0.19.3 dual-link run (~20.3 M, X510+X710, not directly comparable — see the
-report's §5):
+zones), not recursion under cache miss — a different workload. In no run did Runbound reach
+its own CPU ceiling; the fast path is bounded by the 10 G link (103-byte responses cap a
+single link at ~9.85 M/s), the slow path by the kernel-UDP RX path — never by Runbound's own
+code. Same-rig kernel-UDP reference resolvers, same cache-hit workload: **unbound 1.22.0
+~1.91 M** (X710), **BIND 9.20.23 ~1.49 M** (X710, and it livelocks into SERVFAIL under the
+X520 flood). Runbound's slow path is ~1.5× unbound / ~1.9× BIND and, unlike BIND, does not
+livelock; its fast path is ~5× on the same rig, at lower host CPU. Fast-path wire latency
+p50 **31 µs** (X710) / **34 µs** (X520); kernel slow-path cache-hit latency (tcpdump) p50
+**24.6 µs** (X710). Re-validated after the de-hickory rewrite (recursion + DNSSEC now fully
+in-house) with no regression. Full context, with every counter and caveat:
 [docs/benchmark/INDEX.md](docs/benchmark/INDEX.md).
 
 The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC

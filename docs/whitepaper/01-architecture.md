@@ -41,7 +41,7 @@ issue #167b) running *alongside* the XDP workers, because XDP only owns the phys
 and local resolution still needs a kernel path. So for loopback traffic specifically, Tier
 1 and Tier 2 run concurrently. Both share the **same** zero-allocation wire answer routine.
 Tier 3 is always present. As of **v0.22 ("de-hickory")** Tier 3 is the in-house wire handler
-`serve_wire` (`src/dns/server.rs:402`, codec in `src/dns/wire/`): the `hickory-server`
+`serve_wire` (`src/dns/server.rs:431`, codec in `src/dns/wire/`): the `hickory-server`
 request handler is gone from the default binary. There is no hickory-dns request handler
 anywhere in the runtime anymore — every path (forward, full-recursion, local, AXFR, DDNS,
 TSIG, …) is served by `serve_wire`. The sovereign full-recursion resolver
@@ -102,9 +102,11 @@ fast-path lookups would silently miss, so the test is the guard against a silent
 - **DNS data plane.** Tier 1 uses dedicated OS worker threads pinned to physical,
   NUMA-local cores, one per AF_XDP queue. Tier 2 uses one blocking OS thread per
   NUMA-local core, each owning a `SO_REUSEPORT` UDP socket (`src/dns/kernel_loop.rs:133-134`).
-  Buffers are stack-allocated (`[u8; 4096]`), never heap, on the hot path
-  (`src/dns/kernel_loop.rs:177`). `SO_RCVBUF`/`SO_SNDBUF` are set to 32 MiB and the code
-  warns if the kernel clamps them (`net.core.rmem_max` too low).
+  The per-worker RX/TX scratch buffers are `Vec<[u8; DNS_BUF_SIZE]>` (heap), allocated
+  **once** before the hot loop and reused every batch — so there is **zero allocation per
+  packet** on the hot path (`src/dns/kernel_loop.rs:237` and `:242`; `DNS_BUF_SIZE = 4096`).
+  `SO_RCVBUF`/`SO_SNDBUF` are set to 32 MiB and the code warns if the kernel clamps them
+  (`net.core.rmem_max` too low).
 - **Control plane.** The REST API runs on a **separate, dedicated 2-thread Tokio runtime**
   (`src/main.rs`, the `runbound-api` runtime). The rationale, documented inline: under DoT
   rebuild storms the DNS runtime can be flooded with hundreds of tasks/second, which would

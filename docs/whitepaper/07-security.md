@@ -1,6 +1,6 @@
 # 07 — Security
 
-> **Status: current (v0.23.8)** — condensed, with code anchors; open items are listed
+> **Status: current (v0.23.13, last full sync pass: 2026-07-03)** — condensed, with code anchors; open items are listed
 > at the end. Cross-references `SECURITY.md`, `THREAT_MODEL.md`,
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 
@@ -35,7 +35,7 @@
   resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) attaches a per-record `Proof`
   and sets `AD` only when the answer is cryptographically `Secure` **and** the query's
   own `DO` bit is set (`set_ad = val.verdict == Verdict::Secure && do_bit`,
-  `src/dns/server.rs:711`) — `Bogus` is SERVFAIL'd (unless the client set `CD`), and
+  `src/dns/server.rs:781`) — `Bogus` is SERVFAIL'd (unless the client set `CD`), and
   insecure/unsigned or DO-less answers leave `AD` clear. Outbound DNSSEC **signing** of
   local zones is wire-native — an in-house ECDSA P-256 signer on `ring` (RFC
   6605/4034/5155/9276), validated byte-identical
@@ -48,11 +48,11 @@
   so a signed UPDATE's key selection is not a timing oracle.
 - **Forward path validates the upstream response.** A plain-UDP upstream answer is accepted
   only when its transaction ID **and** its question (name case-insensitive + type + class)
-  match the query (SEC-O1, `src/dns/forward.rs:272`) — a cache-poisoning defence the
+  match the query (SEC-O1, `src/dns/forward.rs:326`) — a cache-poisoning defence the
   de-hickory forwarder added.
 - **Firewall integration.** `src/firewall/` manages backend rules automatically.
 - **Availability under flood.** A hard inflight cap (`MAX_INFLIGHT_REQUESTS = 4096`,
-  non-blocking semaphore → instant `REFUSED`, `src/dns/server.rs:71`) bounds memory even at
+  non-blocking semaphore → instant `REFUSED`, `src/dns/server.rs:49`) bounds memory even at
   line rate — a spawn-per-request handler with no backpressure (as the old hickory
   `ServerFuture` was) would OOM under a flood. Per-source-IP token-bucket rate limiting
   (default 200 qps) sits in front.
@@ -107,12 +107,12 @@
   - **AXFR allow-list & split-horizon on the real client IP (PENT-1/PENT-2).** TCP/DoT/DoH
     are proxied through an internal loopback relay; the relay now carries the **real client
     IP via a PROXY v2 header** read **before** the TLS handshake for DoT/DoH
-    (`src/dns/server.rs:1873` builds it — `proxy_v2_header` —, `:1903` parses it —
+    (`src/dns/server.rs:1992` builds it — `proxy_v2_header` —, `:2022` parses it —
     `read_proxy_v2`). `axfr-allow` and split-horizon therefore evaluate the true source
     instead of `127.0.0.1` — closing a real ACL bypass.
   - **Least privilege default `CAP_NET_BIND_SERVICE`** (PENT-3, above).
   - **WebUI binds `127.0.0.1` by default** (PENT, `ui-bind` default changed from `0.0.0.0`,
-    `src/config/parser.rs:530`).
+    `src/config/parser.rs:551`).
   - Config-parser fixes: a `server:` directive written after an `axfr:`/`io-uring:`
     sub-block is now parsed (was silently dropped); a `tsig-key` name with a trailing dot is
     normalized to match the verifier (used to fail every signed UPDATE with `UnknownKey`).

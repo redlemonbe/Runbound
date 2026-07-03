@@ -1,6 +1,6 @@
 # 04 — The slow path (wire-native `serve_wire`)
 
-> **Status: current (v0.23.8).** As of v0.23 hickory is fully removed from the runtime:
+> **Status: current (v0.23.13, last full sync pass: 2026-07-03).** As of v0.23 hickory is fully removed from the runtime:
 > the slow path is served entirely by the in-house wire codec (`serve_wire`,
 > `src/dns/server.rs`), and recursion + DNSSEC validation are entirely in-house too
 > (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) and always compiled in — there is
@@ -54,7 +54,7 @@ pipeline:
 - **32 MiB socket buffers**: each kloop socket requests `SO_RCVBUF = 32 MiB`
   (`RCVBUF_SIZE`, `src/dns/kernel_loop.rs:65`) so NAPI bursts are absorbed instead of
   dropped as `UdpRcvbufErrors`; startup auto-raises `net.core.rmem_max`/`wmem_max` to
-  match (best-effort, root — `src/dns/server.rs:2735`) and warns if the kernel clamps
+  match (best-effort, root — `src/dns/server.rs:2846`) and warns if the kernel clamps
   the buffer.
 - **The shared per-source gate.** Every datagram passes the *same* gate the XDP path uses,
   driven by the *same* objects: `rl_should_drop()` (the memoized per-source rate-limit) and
@@ -65,7 +65,7 @@ pipeline:
 - **Then the shared SIMD/ASM responder** — `answer_dns_wire` (local-data / wire) and
   `answer_from_cache` (cache snapshot, §05). Only `WireResult::Fallback` (cache miss,
   CNAME/MX/DNSSEC DO=1, ANY) is handed to the slow-path handler `serve_wire`
-  (`src/dns/server.rs:416`) via a bounded channel.
+  (`src/dns/server.rs:431`) via a bounded channel.
 
 The net effect: in `xdp: no` the cache-hit path is the same hand-written wire builder as
 XDP, on a kernel UDP socket; the wire-native `serve_wire` handler only sees the genuine
@@ -75,7 +75,7 @@ misses.
 
 A spawn-per-request handler with no backpressure (as the old hickory `ServerFuture` was)
 exhausts RAM under a flood. The wire-native handler bounds concurrency with a semaphore of
-`MAX_INFLIGHT_REQUESTS = 4096` (`src/dns/server.rs:48`). A **non-blocking** `try_acquire`
+`MAX_INFLIGHT_REQUESTS = 4096` (`src/dns/server.rs:49`). A **non-blocking** `try_acquire`
 returns `REFUSED` instantly without allocating, so the bound holds even at line rate. This
 is a deliberate availability trade-off: shed load rather than OOM.
 
@@ -175,14 +175,14 @@ These features had lived only in the now-default-disabled hickory handler; v0.22
 them in `serve_wire` so the default (wire) path keeps them:
 
 - **Query logging** — wire-native, feeds the WebUI Logs panel and `GET /api/logs`
-  (`log_query_wire`, `src/dns/server.rs:336`).
+  (`log_query_wire`, `src/dns/server.rs:351`).
 - **serve-stale** (#108, RFC 8767) — a wire-native stale cache (`stale_cache_wire`,
   `src/dns/server.rs:126`) keyed by `(name, type)`, serving an expired answer on a transient
   upstream SERVFAIL. This is the only stale-cache implementation — there is no separate
   hickory-typed variant.
 - **resolv.conf emergency fallback** (#94) — when all configured upstreams are down the
   forward path falls back to `/etc/resolv.conf` and recovers automatically
-  (`src/dns/server.rs:793`, recovery probe at `:2459`).
+  (`src/dns/server.rs:849`, recovery probe at `:2566`).
 - **Per-upstream racing-win metric** (#33, in `GET /api/system`) and **top-domains
   slow-path counting** (#5) are likewise restored on the wire path.
 

@@ -15,7 +15,7 @@ Files: `ebpf/dns_xdp.c`, `src/dns/xdp/{loader,socket,umem,worker}.rs`, `src/dns/
 before the kernel network stack. Its logic, in order:
 
 1. **Parse Ethernet.** If the frame carries one 802.1Q VLAN tag (`ETH_P_8021Q`), skip
-   exactly one tag to reach the inner ethertype (#188, `ebpf/dns_xdp.c:302` — on a tagged
+   exactly one tag to reach the inner ethertype (#188, `ebpf/dns_xdp.c:312` — on a tagged
    fabric with `rx-vlan-offload` off the tag stays inside the frame). If the result is
    not IPv4/IPv6, `XDP_PASS` (hand to kernel). Untagged traffic pays one extra ethertype
    compare per frame and is otherwise byte-for-byte unchanged.
@@ -47,7 +47,7 @@ packets — all fall through untouched. The fast path is purely additive.
 ### Why a runtime flag for routing, not a constant
 
 Domain routing is gated by a `BPF_MAP_TYPE_ARRAY` entry, not a `volatile const`
-(`ebpf/dns_xdp.c:173`). A `.rodata` constant is frozen at eBPF load time. The Array map
+(`ebpf/dns_xdp.c:199`). A `.rodata` constant is frozen at eBPF load time. The Array map
 lets user space flip routing **after** the AF_XDP zero-copy bind has succeeded — because
 whether zero-copy actually engaged is only known post-bind, and the routing choice depends
 on it. This preserves the zero-copy fast path (issue #155).
@@ -163,7 +163,7 @@ through to the slow path. When no split-horizon is configured the per-packet cos
 
 The in-place reply preserves the 802.1Q tag that arrived in the frame. For NICs that
 strip the RX tag in hardware and refuse to disable it (e.g. bnxt), `RUNBOUND_XDP_VLAN=<vid>`
-re-inserts one tag on the reply (`src/dns/xdp/worker.rs:93`).
+re-inserts one tag on the reply (`src/dns/xdp/worker.rs:97`).
 
 ---
 
@@ -184,10 +184,10 @@ and has since been removed). This replaces hickory's `Message::from_bytes` +
   handler (`serve_wire`, which does the DNSSEC signing/serving) handles it. The wire fast
   path never fakes DNSSEC.
 - **Build**: writes the answer directly into the output (TX UMEM) slice. The response uses
-  a DNS **name-compression pointer** (`0xC0 0x0C`, `src/dns/wire_builder.rs:37`) to
+  a DNS **name-compression pointer** (`0xC0 0x0C`, `src/dns/wire_builder.rs:36`) to
   point the answer's owner name back at the question at offset 12 — so the name is not
   repeated, saving bytes and a copy. Flags are set to `QR=1 AA=1 RD RA RCODE=0`
-  (authoritative NOERROR, `src/dns/wire_builder.rs:34`).
+  (authoritative NOERROR, `src/dns/wire_builder.rs:32`).
 
 Positive answers are wire-built for A (1) and AAAA (28). Negative and error responses also
 have wire builders: `build_nxdomain` / `build_nodata` / `build_refused`
