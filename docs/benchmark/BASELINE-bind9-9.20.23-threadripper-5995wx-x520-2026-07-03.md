@@ -14,7 +14,8 @@ forward+cache resolver, warmed on the 100 000-name corpus, on a single 10 GbE X5
 (82599ES, ixgbe) link, p50 under the SLO. This is the one throughput number in this
 report, and two independent generators agree on it: dnsmark's DSD reports Within-SLO
 1.09 M / knee ~1.12 M, and a dnsperf load sweep brackets the same knee (984 k clean at
-0.69 ms; latency crosses 1 ms by 1.20 M).
+0.69 ms; latency crosses 1 ms by 1.20 M). Cache-hit service latency at the wire was p50
+37 µs / p95 139 µs / p99 247 µs.
 
 An open-loop firehose was also run **as an overload/stress probe, not a measurement**:
 it is a deliberate DoS that livelocks BIND (50.00 % SERVFAIL at 1.20 M reply-packets/s
@@ -62,6 +63,8 @@ generator — only the link changes, per README rule 6).
 | dnsperf load sweep — q=2000/client | 1.197 M qps @ 1.290 ms, 96.09 % NOERROR (latency breaks 1 ms) | dnsperf |
 | dnsperf load sweep — q=4000/client | 1.396 M qps @ 2.356 ms, 98.74 % NOERROR (over-driven) | dnsperf |
 | dnsperf gentle (q=200/client) | 289 k qps @ avg 0.480 ms | dnsperf |
+| **Wire latency, cache-hit service** (p50 / p95 / p99) | **37 / 139 / 247 µs** | tcpdump at receiver NIC → tshark `dns.time` (n=178 074, 99.5 % hits) |
+| Wire latency incl. cache-miss tail (p99.9) | 59.4 ms | tshark (miss = upstream forward, not BIND) |
 
 **Not a measurement — open-loop firehose (overload/DoS probe + tool cross-check):**
 
@@ -114,10 +117,14 @@ generator — only the link changes, per README rule 6).
   rx = tx identical second-by-second at the NIC — proof of zero server-side loss in the
   gated loop; the ceiling losses are entirely the open-loop firehose overrunning the
   ixgbe ring.
-- **Latency wire-truth.** As with the X710 run, p50/p95/p99 come from the two
-  generators' closed-loop RTT, which agree. No `tcpdump` wire capture was taken, so for
-  the exact on-wire latency distribution: **I cannot confirm this** beyond the
-  mutually-consistent generator figures.
+- **Latency wire-truth (tcpdump-anchored, per rule 7).** A receiver-NIC capture decoded
+  with tshark `dns.time` gives cache-hit **p50 37 µs / p95 139 µs / p99 247 µs** over
+  178 074 hits (99.5 %). Back-to-back with the X710 run (same host/binary/day, only the
+  NIC changed): the ixgbe adds ~15 µs at p50 and ~150 µs at p99 over the i40e (22 / 94 µs)
+  — the heavier ixgbe datapath shows up in latency just as it does in ingest. The tail
+  (p99.9 59 ms) is the cache-miss forward fraction, internet RTT, not BIND. dnsmark's
+  `--wire-latency` mode was intended for this but hung on this rig (see the X710 report's
+  appendix); tcpdump is the methodology's designated reference.
 
 ## 6. Appendix — exact commands & configuration
 
@@ -144,6 +151,13 @@ done
 
 # Truth read (receiver) — note rx_no_dma_resources is the ixgbe drop counter
 ethtool -S enp66s0f1 | grep -E 'rx_packets|tx_packets|rx_missed_errors|rx_no_dma_resources'
+
+# Wire latency — tcpdump at receiver NIC, tshark dns.time (re-warm cache first)
+tcpdump -i enp66s0f1 -s 128 --time-stamp-precision=nano -w lat.pcap -c 400000 'udp port 53' &
+dnsperf -s 10.51.10.1 -d /root/queries-A.txt -l 6 -c 20 -T 20 -q 200 -t 3
+tshark -r lat.pcap -Y 'dns.flags.response==1 && dns.time' -T fields -e dns.time \
+  | sort -n | awk '{a[NR]=$1} END{print a[int(NR*.5)],a[int(NR*.95)],a[int(NR*.99)]}'
+# dnsmark --wire-latency hung on this rig — see the X710 report appendix.
 ```
 
 **Notes.** Same host / binary / generator / methodology as the X710 run of 2026-07-03 —

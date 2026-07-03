@@ -8,7 +8,8 @@
 **The baseline figure is a closed-loop knee of ~1.40 M qps** — BIND 9.20.23 as a
 forward+cache resolver, warmed on the 100 000-name corpus, on a single 10 GbE X710
 (i40e) link, with p50 latency under the 1.04 ms SLO and 99.90 % NOERROR. This is the
-one throughput number in this report.
+one throughput number in this report. Cache-hit service latency at the wire (tcpdump at
+the receiver NIC) was p50 22 µs / p95 67 µs / p99 94 µs.
 
 An open-loop firehose was also run, **but as an overload/stress probe, not a
 measurement**: it is a deliberate DoS (5.42 M qps offered at a resolver that peaks far
@@ -63,6 +64,8 @@ it is a DoS that livelocks the resolver, per the project's benchmarking practice
 | Ramp NOERROR rate | 99.90 % | dnsmark rcode breakdown |
 | dnsperf closed-loop (q=200/client, 20 clients) | 496 k qps @ avg 0.195 ms | dnsperf |
 | dnsperf pushed (q=2000, 40 clients) | 1.466 M qps @ 0.914 ms, **6.54 % SERVFAIL** | dnsperf |
+| **Wire latency, cache-hit service** (p50 / p95 / p99) | **22 / 67 / 94 µs** | tcpdump at receiver NIC → tshark `dns.time` (n=175 820, 98.3 % hits) |
+| Wire latency incl. cache-miss tail (p99 / p99.9) | 21.1 ms / 193 ms | tshark (miss = upstream forward, not BIND) |
 
 **Not a measurement — open-loop firehose (overload/DoS probe + tool cross-check):**
 
@@ -114,10 +117,15 @@ Ramp step ladder (offered → served, p50 / p95 / p99, ms):
   0.914 ms: that is the onset of degradation, so BIND's real knee on X710 sits right at
   the dnsmark DSD figure (~1.40 M, clean) with 1.466 M already over the edge. Two
   independent generators place the knee in the same ~1.4 M window.
-- **Latency wire-truth.** p50/p95/p99 here come from the two generators' closed-loop RTT
-  (dnsmark ramp + dnsperf), which agree. A `tcpdump` wire capture was not taken this
-  run, so for the exact on-wire latency distribution: **I cannot confirm this** beyond
-  the generator-measured closed-loop figures, which are mutually consistent.
+- **Latency wire-truth (tcpdump-anchored, per rule 7).** A packet capture at the receiver
+  NIC, decoded with tshark `dns.time` (the query→response delta on the wire = pure server
+  service time, no generator overhead), gives cache-hit **p50 22 µs / p95 67 µs / p99
+  94 µs** over 175 820 hits (98.3 %). The p50 corroborates dnsmark's idle floor (0.038 ms
+  ≈ 38 µs, generator-side, slightly higher as expected). The full-distribution tail
+  (p99 21 ms, p99.9 193 ms) is the small cache-miss fraction forwarded to the real
+  upstreams — internet RTT, not BIND — exactly the workload-tail effect rule 7 anticipates.
+  dnsmark's own `--wire-latency` mode (SO_TIMESTAMPING) was intended for this but hung on
+  this rig (see appendix); tcpdump is the methodology's designated reference anyway.
 
 ## 6. Appendix — exact commands & configuration
 
@@ -147,7 +155,21 @@ dnsperf -s 10.71.10.1 -d /root/queries-A.txt -l 30 -c 20 -T 20 -q 200 -t 3
 
 # Truth read (receiver), over the measured window
 ethtool -S enp33s0f0np0 | grep -E 'rx_packets|tx_packets|rx_dropped'
+
+# Wire latency — tcpdump at the receiver NIC, tshark dns.time (query→response on wire)
+#   (re-warm the cache immediately before, then capture during a moderate dnsperf)
+tcpdump -i enp33s0f0np0 -s 128 --time-stamp-precision=nano -w lat.pcap -c 400000 'udp port 53' &
+dnsperf -s 10.71.10.1 -d /root/queries-A.txt -l 6 -c 20 -T 20 -q 200 -t 3
+tshark -r lat.pcap -Y 'dns.flags.response==1 && dns.time' -T fields -e dns.time \
+  | sort -n | awk '{a[NR]=$1} END{print a[int(NR*.5)],a[int(NR*.95)],a[int(NR*.99)]}'
 ```
+
+**dnsmark `--wire-latency` note.** This mode (kernel SO_TIMESTAMPING) is the intended
+tool for this figure, but on this rig it hung — a trivial `--wire-latency -Q 500 -l 1`
+(2000 samples, ~4 s expected) did not terminate within 20 s (exit 124), producing no
+percentiles, although the generator NIC reports full HW+SW timestamping capability
+(`ethtool -T`). tcpdump + tshark `dns.time` is the README's designated latency reference,
+so it was used instead. The dnsmark hang is a separate tool bug to fix.
 
 **Notes.** BIND cache warmed hot before measuring (rule 2). Flow control off (rule 3),
 RSS spread (rule 4), `:53` sole-owner verified (rule 5). i40e does not expose

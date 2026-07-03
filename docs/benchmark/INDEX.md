@@ -22,6 +22,11 @@ corpus warmed 100 k):
 | **~1.40 M qps** (99.90 % NOERROR, p50 0.133 ms) | dnsperf 1.466 M @ 6.5 % SERVFAIL = onset (knee ~1.4 M) | 1.589 M vs NIC tx 1.611 M = **1.4 %** | X710 (i40e) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-07-03.md) |
 | **~1.12 M qps** (Within-SLO 1.09 M) | dnsperf sweep: 984 k clean, >1 ms by 1.20 M → knee ~1.0–1.1 M | 1.204 M vs NIC tx 1.202 M = **0.2 %** | X520 / 82599ES (ixgbe) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-07-03.md) |
 
+Wire service latency (cache-hit, tcpdump at receiver NIC → tshark `dns.time`): X710 p50
+**22 µs** / p95 67 µs / p99 94 µs; X520 p50 **37 µs** / p95 139 µs / p99 247 µs — the
+heavier ixgbe datapath shows in latency as it does in ingest. (dnsmark's `--wire-latency`
+mode hung on this rig; tcpdump is the README's designated reference.)
+
 Both knees are placed by two independent generators (dnsmark DSD + dnsperf sweep), not a
 single tool. Back-to-back, same host/binary/generator, only the link changed (rule 6):
 the i40e ingests 4.96 M/s with zero drops → BIND knee ~1.40 M; the 82599 hits its RX-DMA
