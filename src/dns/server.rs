@@ -53,11 +53,11 @@ const ABUSE_TARPIT_DELAY_MS_DEFAULT: u64 = 2000;
 /// (hold delay ms, max concurrent held) — set once from config at startup.
 static ABUSE_TARPIT_CFG: std::sync::OnceLock<(u64, usize)> = std::sync::OnceLock::new();
 static TARPIT_SEMA: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
-fn tarpit_sema() -> &'static Semaphore {
+pub(crate) fn tarpit_sema() -> &'static Semaphore {
     let max = ABUSE_TARPIT_CFG.get().map(|c| c.1).unwrap_or(ABUSE_TARPIT_MAX_DEFAULT);
     TARPIT_SEMA.get_or_init(|| Semaphore::new(max))
 }
-fn tarpit_delay() -> Duration {
+pub(crate) fn tarpit_delay() -> Duration {
     Duration::from_millis(ABUSE_TARPIT_CFG.get().map(|c| c.0).unwrap_or(ABUSE_TARPIT_DELAY_MS_DEFAULT))
 }
 
@@ -1796,7 +1796,7 @@ fn normalize_tcp_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-struct TcpConnTracker {
+pub(crate) struct TcpConnTracker {
     counts: DashMap<IpAddr, Arc<AtomicU16>, ahash::RandomState>,
     last_warn: DashMap<IpAddr, Instant, ahash::RandomState>,
 }
@@ -1812,7 +1812,7 @@ impl TcpConnTracker {
     /// Attempt to claim a connection slot for `ip`.
     /// Returns `true` if allowed, `false` if the per-IP cap is exceeded.
     /// Loopback addresses (127.x and ::1) are always allowed (health checks).
-    fn try_acquire(&self, ip: IpAddr) -> bool {
+    pub(crate) fn try_acquire(&self, ip: IpAddr) -> bool {
         if matches!(ip, IpAddr::V4(a) if a.is_loopback())
             || matches!(ip, IpAddr::V6(a) if a.is_loopback())
         {
@@ -1847,7 +1847,7 @@ impl TcpConnTracker {
         }
     }
 
-    fn release(&self, ip: IpAddr) {
+    pub(crate) fn release(&self, ip: IpAddr) {
         // SCOPE the get() Ref so its DashMap shard read-lock is dropped BEFORE the
         // remove_if() below takes the SAME shard write-lock. Holding the read guard
         // across remove_if self-deadlocks DashMap: the worker thread hangs holding the
@@ -2229,12 +2229,21 @@ async fn spawn_tls_service(
         // DNS-over-QUIC (RFC 9250) — own quinn-based listener (src/dns/doq.rs),
         // reusing the doq TLS config (TLS 1.3, ALPN "doq") and the shared request
         // path. Unlike DoT/DoH there is no loopback relay: quinn exposes the real
-        // client address directly (conn.remote_address()).
+        // client address directly (conn.remote_address()). The ACL, per-IP connection
+        // cap and abuse engine are applied on the QUIC connection, parity with
+        // run_tcp_with_limit (the per-query ACL + abuse verdict still run in serve_wire).
         let doq_addr = format!("{}:{}", iface, doq_port);
         match doq_addr.parse::<SocketAddr>() {
             Ok(sa) => {
                 let h_doq = std::sync::Arc::clone(&handler_dot_sup);
-                match crate::dns::doq::spawn_doq(sa, std::sync::Arc::clone(&doq_config), h_doq) {
+                match crate::dns::doq::spawn_doq(
+                    sa,
+                    std::sync::Arc::clone(&doq_config),
+                    h_doq,
+                    std::sync::Arc::clone(acl),
+                    std::sync::Arc::clone(tcp_tracker),
+                    alert.clone(),
+                ) {
                     Ok(handle) => {
                         info!(addr=%doq_addr, "DoQ (DNS-over-QUIC) listening — RFC 9250");
                         handles.push(handle);

@@ -7972,8 +7972,12 @@ async fn banned_list_handler(State(s): State<AppState>) -> impl IntoResponse {
 }
 
 // POST /api/protection/banned/:ip/blacklist — promote a ban to a permanent one
-// ("blacklist"): it no longer auto-expires, is dropped on both datapaths, and is
-// propagated to slaves like any other ban.
+// ("blacklist"): it no longer auto-expires and is propagated to slaves. The ban is
+// applied to BOTH ban systems so it is enforced on every path: `icmp_stats`
+// (XDP + kernel-UDP fast path) AND `alert_tracker` (the `serve_wire` slow path, which
+// is what DoT/DoH/DoQ go through — they check `alert.is_blocked`, not `icmp_stats`).
+// Before this, only icmp_stats was set, so a blacklisted IP could still reach the
+// resolver over the encrypted transports (DoT/DoH/DoQ) and the slow path.
 async fn blacklist_ip_handler(
     State(state): State<AppState>,
     axum::extract::Path(ip_str): axum::extract::Path<String>,
@@ -7981,6 +7985,7 @@ async fn blacklist_ip_handler(
     match ip_str.parse::<std::net::IpAddr>() {
         Ok(ip) => {
             state.icmp_stats.ban_permanent(ip);
+            state.alert_tracker.block_manual(ip, "manual-blacklist".to_string());
             if let std::net::IpAddr::V4(ipv4) = ip {
                 let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
             }

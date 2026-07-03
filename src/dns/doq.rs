@@ -20,7 +20,9 @@ use std::time::Duration;
 use quinn::{Endpoint, ServerConfig};
 use tracing::debug;
 
-use crate::dns::server::RunboundHandler;
+use crate::alerts::{AbuseVerdict, AlertTracker};
+use crate::dns::acl::{Acl, AclAction};
+use crate::dns::server::{tarpit_delay, tarpit_sema, RunboundHandler, TcpConnTracker};
 
 /// Largest DNS message we accept/emit on a stream (the 2-byte length prefix caps
 /// it at 65535). Bounds the per-stream read buffer.
@@ -35,10 +37,20 @@ const MAX_BIDI_STREAMS: u32 = 128;
 /// `tls` must be the TLS 1.3-only, ALPN-`doq` config from `build_tls_config`.
 /// Returns the task handle; a bind/config error is returned to the caller so the
 /// other encrypted-DNS listeners can still start (parity with DoT/DoH).
+///
+/// `acl`, `tracker` and `alert` give DoQ the same connection-level protections DoT/DoH
+/// get via `run_tcp_with_limit`: the source-IP ACL, the per-IP connection cap, and the
+/// abuse engine (ban check + connection-verified escalation credit). The per-query ACL
+/// and abuse verdict still run inside `serve_wire`; these apply earlier, on the QUIC
+/// connection itself.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_doq(
     addr: SocketAddr,
     tls: Arc<rustls::ServerConfig>,
     handler: Arc<RunboundHandler>,
+    acl: Arc<Acl>,
+    tracker: Arc<TcpConnTracker>,
+    alert: Option<Arc<AlertTracker>>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|e| anyhow::anyhow!("DoQ rustls->quic config: {e}"))?;
@@ -61,8 +73,11 @@ pub fn spawn_doq(
     Ok(tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let handler = Arc::clone(&handler);
+            let acl = Arc::clone(&acl);
+            let tracker = Arc::clone(&tracker);
+            let alert = alert.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_connection(incoming, handler).await {
+                if let Err(e) = serve_connection(incoming, handler, acl, tracker, alert).await {
                     debug!(err = %e, "DoQ connection ended");
                 }
             });
@@ -70,14 +85,73 @@ pub fn spawn_doq(
     }))
 }
 
+/// Releases the per-IP connection slot when the connection ends, however it ends.
+struct ConnSlot {
+    tracker: Arc<TcpConnTracker>,
+    ip: std::net::IpAddr,
+}
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.tracker.release(self.ip);
+    }
+}
+
+/// QUIC application error code sent when we refuse a connection (ACL/ban/cap).
+const DOQ_REFUSED: u32 = 0x02; // DOQ_INTERNAL_ERROR-ish; the client just sees a close.
+
 /// Complete the QUIC handshake, then serve one query per bidirectional stream
 /// until the peer closes the connection.
 async fn serve_connection(
     incoming: quinn::Incoming,
     handler: Arc<RunboundHandler>,
+    acl: Arc<Acl>,
+    tracker: Arc<TcpConnTracker>,
+    alert: Option<Arc<AlertTracker>>,
 ) -> anyhow::Result<()> {
     let conn = incoming.await?;
     let peer = conn.remote_address();
+    let ip = peer.ip();
+
+    // Connection-level protections, parity with run_tcp_with_limit (DoT/DoH). Loopback
+    // is exempt (health checks / local relay), matching the tracker and abuse engine.
+    if !ip.is_loopback() {
+        // 1) Source-IP ACL: Deny and Refuse both drop the connection (no stream served).
+        if !matches!(acl.check(ip), AclAction::Allow) {
+            conn.close(DOQ_REFUSED.into(), b"acl");
+            return Ok(());
+        }
+        // 2) Abuse engine on the REAL client IP. QUIC completed a handshake, so the source
+        //    is connection-verified (verified = true), exactly like DoT/DoH. Block drops;
+        //    Tarpit holds a bounded delay (shared tarpit semaphore) then drops.
+        if let Some(at) = &alert {
+            match at.record(ip, true) {
+                AbuseVerdict::Block => {
+                    conn.close(DOQ_REFUSED.into(), b"blocked");
+                    return Ok(());
+                }
+                AbuseVerdict::Tarpit => {
+                    if let Ok(_permit) = tarpit_sema().try_acquire() {
+                        tokio::time::sleep(tarpit_delay()).await;
+                    }
+                    conn.close(DOQ_REFUSED.into(), b"tarpit");
+                    return Ok(());
+                }
+                AbuseVerdict::Serve => {}
+            }
+        }
+        // 3) Per-IP connection cap (shared with TCP/DoT/DoH). Released on any exit.
+        if !tracker.try_acquire(ip) {
+            conn.close(DOQ_REFUSED.into(), b"conn-cap");
+            return Ok(());
+        }
+    }
+    // Hold the slot for the connection's lifetime (no-op for loopback: try_acquire
+    // returned true without incrementing, and release() is a cheap miss).
+    let _slot = ConnSlot {
+        tracker: Arc::clone(&tracker),
+        ip,
+    };
+
     loop {
         let (send, recv) = match conn.accept_bi().await {
             Ok(pair) => pair,
