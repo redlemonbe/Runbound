@@ -3883,21 +3883,39 @@ async fn audit_tail_handler(
     // audit::init resolution, otherwise /audit/tail cannot find the log (QA Cycle I).
     let log_path = s.cfg.audit_log_path.as_ref().map(std::path::PathBuf::from)
         .unwrap_or_else(|| s.base_dir.join("audit.log"));
+    // No audit log on disk means audit logging is simply not enabled — a normal state,
+    // not an error. Report a well-formed empty tail (200) instead of a 404 that would
+    // leak the resolved path and raw OS errno to the client.
+    if !log_path.exists() {
+        return (
+            StatusCode::OK,
+            JsonExtract(serde_json::json!({
+                "lines": [],
+                "count": 0,
+                "enabled": false,
+            })),
+        );
+    }
     match crate::audit::tail_audit_log(&log_path, n) {
         Ok(lines) => (
             StatusCode::OK,
             JsonExtract(serde_json::json!({
                 "lines": lines,
                 "count": lines.len(),
+                "enabled": true,
             })),
         ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            JsonExtract(serde_json::json!({
-                "error": "AUDIT_LOG_UNAVAILABLE",
-                "details": e,
-            })),
-        ),
+        // The file exists but could not be read (permissions, I/O, corruption). Log the
+        // detail server-side; return a generic 500 without echoing the raw OS error.
+        Err(e) => {
+            warn!(path = %log_path.display(), err = %e, "audit tail read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": "AUDIT_LOG_READ_FAILED",
+                })),
+            )
+        }
     }
 }
 
@@ -4035,7 +4053,7 @@ fn render_prometheus_metrics(
         .iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).sum();
     out.push_str(&fmt_counter(
         "runbound_xdp_cache_hits_total",
-        "DNS responses served from the XDP fast-path cache (per-worker)",
+        "DNS responses served from the fast-path cache — AF_XDP workers and the kernel recvmmsg fast-loop (non-zero even when xdp:no)",
         xdp_worker_hits,
     ));
     out.push_str(&fmt_counter(
