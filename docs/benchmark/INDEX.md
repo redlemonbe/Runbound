@@ -8,17 +8,19 @@
 
 ## Current campaign (revised methodology, 2026-07-03)
 
-Runs under the [README.md](README.md) revision: every throughput figure is
-cross-checked against receiver NIC hardware counters, ramps use DSD, and both the
-closed-loop SLO knee and the raw open-loop wire ceiling are reported separately.
+Runs under the [README.md](README.md) revision. The **throughput figure is the
+closed-loop SLO knee** (ramp DSD), cross-checked against receiver NIC counters. The
+open-loop firehose is **not** used as a capacity number — it is a DoS that livelocks the
+resolver; it appears here only as an overload observation and as a check that dnsmark's
+NIC-rx instrumentation is exact at high pps.
 
 **Reference resolvers — BIND 9.20.23** (dnsmark 2.7.5 + dnsperf 2.14.0 generators,
 corpus warmed 100 k):
 
-| Sustained knee (SLO) | Raw wire ceiling | NIC cross-check | Notes | Link / NIC | Report |
-|---------------------:|-----------------:|:---------------:|-------|-----------|--------|
-| **~1.40 M qps** (99.90 % NOERROR, p50 0.133 ms) | 1.589 M pkts/s (18 % SERVFAIL — livelock) | dnsmark 1.589 M vs NIC tx 1.611 M = **1.4 %** | BIND processing-bound; NIC ingested 4.96 M/s, 0 drops | X710 (i40e) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-07-03.md) |
-| **~1.12 M qps** (Within-SLO 1.09 M) | 1.204 M pkts/s (50 % SERVFAIL — livelock) | dnsmark 1.204 M vs NIC tx 1.202 M = **0.2 %** | **NIC-bound**: 82599 dropped ~2.7 M/s at `rx_no_dma` before BIND | X520 / 82599ES (ixgbe) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-07-03.md) |
+| **Capacity — closed-loop knee (SLO)** | Under overload firehose (not a measure) | Tool cross-check | Link / NIC | Report |
+|--------------------------------------:|-----------------------------------------|:----------------:|-----------|--------|
+| **~1.40 M qps** (99.90 % NOERROR, p50 0.133 ms) | 18 % SERVFAIL livelock; NIC ingested 4.96 M/s, 0 drops | dnsmark 1.589 M vs NIC tx 1.611 M = **1.4 %** | X710 (i40e) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x710-2026-07-03.md) |
+| **~1.12 M qps** (Within-SLO 1.09 M) | 50 % SERVFAIL livelock; 82599 dropped ~2.7 M/s at `rx_no_dma` before BIND | dnsmark 1.204 M vs NIC tx 1.202 M = **0.2 %** | X520 / 82599ES (ixgbe) | [report](BASELINE-bind9-9.20.23-threadripper-5995wx-x520-2026-07-03.md) |
 
 Back-to-back, same host/binary/generator, only the link changed (rule 6): the i40e
 ingests 4.96 M/s with zero drops → BIND knee ~1.40 M; the 82599 hits its RX-DMA wall at

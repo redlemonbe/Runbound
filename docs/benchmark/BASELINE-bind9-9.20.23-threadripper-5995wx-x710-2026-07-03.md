@@ -5,24 +5,29 @@
 
 ## 1. Executive Summary
 
-BIND 9.20.23 as a forward+cache resolver, warmed on the 100 000-name corpus, sustained
-a **closed-loop knee of ~1.40 M qps** on a single 10 GbE X710 (i40e) link with p50
-latency staying under the 1.04 ms SLO and 99.90 % NOERROR. Pushed past that knee with
-an open-loop firehose it emitted a **raw reply ceiling of ~1.59 M packets/s** on the
-wire, but degraded: 18.03 % of those replies were SERVFAIL (BIND livelock under
-overload), so the useful (NOERROR) reply rate at the ceiling was ~1.30 M/s. The
-authoritative figure — dnsmark's `Server throughput (NIC rx)` = 1.589 M — was confirmed
-against the receiver NIC's own `tx_packets` counter (1.611 M/s), a 1.4 % agreement.
-Receiver CPU at the flood was ~17.5 of 128 cores (1751 %); RSS ~293 MiB.
+**The baseline figure is a closed-loop knee of ~1.40 M qps** — BIND 9.20.23 as a
+forward+cache resolver, warmed on the 100 000-name corpus, on a single 10 GbE X710
+(i40e) link, with p50 latency under the 1.04 ms SLO and 99.90 % NOERROR. This is the
+one throughput number in this report.
+
+An open-loop firehose was also run, **but as an overload/stress probe, not a
+measurement**: it is a deliberate DoS (5.42 M qps offered at a resolver that peaks far
+lower) that drives BIND into livelock — at 1.59 M reply-packets/s on the wire, 18.03 %
+were SERVFAIL, so it characterises behaviour under saturation, not capacity. Its one
+methodological use here: at 1.6 M pps it let us confirm dnsmark's NIC-rx instrumentation
+is exact — dnsmark's `Server throughput (NIC rx)` 1.589 M vs the receiver's own
+`tx_packets` 1.611 M, 1.4 % apart. That validates the **tool**, not a BIND capacity.
+Receiver CPU during the flood was ~17.5 of 128 cores (1751 %); RSS ~293 MiB.
 
 ## 2. Objective
 
 Re-establish the BIND baseline on the current rig under the revised methodology
 (dnsmark-vs-NIC cross-check + ramp/DSD), replacing the archived
-`OLD/BASELINE-bind9-...-x710-2026-06-13.md` run. Two questions: (a) what closed-loop
-rate does BIND sustain within an SLO, and (b) what is its raw reply ceiling on the wire
-— each cross-checked against receiver NIC hardware counters, not the generator's
-self-report.
+`OLD/BASELINE-bind9-...-x710-2026-06-13.md` run. The measurement question is (a) what
+closed-loop rate does BIND sustain within an SLO — that is the baseline. Separately, an
+open-loop firehose is used only (b) as an overload probe and to validate dnsmark's
+NIC-rx instrumentation at high pps. The firehose is **not** used as a capacity number:
+it is a DoS that livelocks the resolver, per the project's benchmarking practice.
 
 ## 3. Methodology & Architecture
 
@@ -49,20 +54,26 @@ self-report.
 
 ## 4. Raw Results
 
+**The measurement — closed-loop capacity:**
+
 | Metric | Value | Source |
 |--------|-------|--------|
 | **Closed-loop knee (ramp, Within-SLO)** | **~1.40 M qps** | dnsmark `--ramp` DSD (NIC-verified) |
 | Idle latency floor (p50) | 0.038 ms | dnsmark ramp |
 | Ramp NOERROR rate | 99.90 % | dnsmark rcode breakdown |
-| **Raw reply ceiling (flood, Server throughput NIC rx)** | **1.589 M pkts/s** | dnsmark open-loop |
-| — confirmed by receiver NIC `tx_packets` | 1.611 M/s | `nic-sample.sh` (Δtx over window) |
-| — agreement | **1.4 %** | cross-check (README rule 1) |
-| Received at server NIC (rx) during flood | 4.96 M/s | receiver NIC `rx_packets` |
-| SERVFAIL fraction at the flood ceiling | 18.03 % | dnsmark rcode breakdown |
-| Useful (NOERROR) reply rate at ceiling | ~1.30 M/s | 1.589 M × 81.9 % |
-| Offered load (generator egress) at flood | 5.42 M qps | dnsmark egress (line rate 14 %) |
 | dnsperf closed-loop (q=200/client, 20 clients) | 496 k qps @ avg 0.195 ms | dnsperf |
 | dnsperf pushed (q=2000, 40 clients) | 1.466 M qps @ 0.914 ms, **6.54 % SERVFAIL** | dnsperf |
+
+**Not a measurement — open-loop firehose (overload/DoS probe + tool cross-check):**
+
+| Metric | Value | Source |
+|--------|-------|--------|
+| Server throughput NIC rx (replies on wire under DoS) | 1.589 M pkts/s | dnsmark open-loop |
+| — confirmed by receiver NIC `tx_packets` (validates the tool) | 1.611 M/s, **1.4 %** | `nic-sample.sh` (Δtx) |
+| SERVFAIL fraction under the firehose | 18.03 % (livelock) | dnsmark rcode breakdown |
+| Useful (NOERROR) reply rate under DoS | ~1.30 M/s | 1.589 M × 81.9 % |
+| Received at server NIC (rx) during flood | 4.96 M/s | receiver NIC `rx_packets` |
+| Offered load (generator egress) at flood | 5.42 M qps | dnsmark egress (line rate 14 %) |
 | Receiver CPU (`named`) at flood | 1751 % (~17.5 / 128 cores) | pidstat |
 | Receiver RSS (`named`) at flood | ~293 MiB | pidstat |
 | NIC `rx_dropped` / `rx_missed` (i40e, flood) | 0 / not exposed by i40e | `ethtool -S` |
@@ -79,20 +90,21 @@ Ramp step ladder (offered → served, p50 / p95 / p99, ms):
 
 ## 5. Interpretation
 
-- **The two independent counters agree, so the ceiling number is trustworthy.** dnsmark
-  reported 1.589 M replies/s on the wire; the receiver's own X710 `tx_packets` counted
-  1.611 M/s over the same window — 1.4 % apart, within the README's ≤2 % band. This is
-  the core of the revised methodology: the throughput figure is not the generator's
-  self-report, it is corroborated at the NIC.
-- **The honest sustained number is the ramp knee, not the flood ceiling.** At the
-  open-loop ceiling BIND is in livelock: it puts 1.589 M packets/s on the wire but
-  18.03 % are SERVFAIL, so only ~1.30 M/s are real answers. The closed-loop ramp knee
-  (~1.40 M qps at 99.90 % NOERROR, p50 0.133 ms) is where BIND actually serves correct
-  answers within an SLO. Report **~1.40 M qps** as the BIND-on-X710 baseline; the
-  1.59 M is a raw, degraded wire ceiling and is labelled as such.
-- **This ramp is generator-recv bound, per methodology.** The kernel-UDP `--ramp` is a
-  gated closed loop; its knee is the SLO knee, not proof of BIND's absolute maximum. The
-  flood establishes the wire ceiling separately. Both are reported, neither is conflated.
+- **The baseline is the ramp knee (~1.40 M qps). The flood is not a measurement.** The
+  open-loop firehose is a deliberate DoS: 5.42 M qps offered at a resolver that peaks far
+  lower drives BIND into livelock (18.03 % SERVFAIL), so its 1.589 M packets/s on the
+  wire describes *behaviour under saturation*, not throughput. The closed-loop ramp knee
+  (~1.40 M qps at 99.90 % NOERROR, p50 0.133 ms) is where BIND serves correct answers
+  within an SLO — that, and only that, is the BIND-on-X710 baseline. This matches the
+  project's practice of never using the firehose as a capacity number.
+- **The flood's only legitimate use here was to validate the tool.** At 1.6 M pps,
+  dnsmark's `Server throughput (NIC rx)` (1.589 M) matched the receiver's own X710
+  `tx_packets` (1.611 M/s) to 1.4 %. That proves dnsmark's NIC-rx instrumentation is
+  exact even at high pps — a statement about the *generator*, not about BIND's capacity.
+- **The ramp is generator-recv bound, by design.** The kernel-UDP `--ramp` is a gated
+  closed loop (`--max-outstanding 32`); its knee is the honest SLO knee, latency-anchored
+  and dnsperf-comparable. It is the only figure in this report that answers "how much can
+  BIND serve".
 - **Server was not link-bound.** Offered egress reached 5.42 M qps (14 % of the 10 G
   wire at 86 B replies); the link had headroom. The limit was BIND's own processing
   (17.5 cores busy, SERVFAIL onset), not the NIC or the link.

@@ -9,16 +9,19 @@
 
 ## 1. Executive Summary
 
-BIND 9.20.23 as a forward+cache resolver, warmed on the 100 000-name corpus, sustained
-a **closed-loop knee of ~1.12 M qps** on a single 10 GbE X520 (82599ES, ixgbe) link with
-p50 under the SLO. Pushed past that with an open-loop firehose it emitted a **raw reply
-ceiling of ~1.20 M packets/s** on the wire, but 50.00 % of those replies were SERVFAIL
-(BIND livelock), so the useful (NOERROR) reply rate at the ceiling was only ~0.60 M/s.
-The authoritative figure — dnsmark's `Server throughput (NIC rx)` = 1.204 M — matched
-the receiver NIC's own `tx_packets` counter (1.202 M/s) to 0.2 %. Unlike the X710, the
-82599 dropped ~2.7 M pkts/s **at the NIC** (`rx_no_dma_resources`) before BIND ever saw
-them: the ixgbe ingest wall, not BIND, capped this link. Receiver CPU at the flood was
-~16.4 of 128 cores (1639 %); RSS ~577 MiB.
+**The baseline figure is a closed-loop knee of ~1.12 M qps** — BIND 9.20.23 as a
+forward+cache resolver, warmed on the 100 000-name corpus, on a single 10 GbE X520
+(82599ES, ixgbe) link, p50 under the SLO. This is the one throughput number in this
+report.
+
+An open-loop firehose was also run **as an overload/stress probe, not a measurement**:
+it is a deliberate DoS that livelocks BIND (50.00 % SERVFAIL at 1.20 M reply-packets/s
+on the wire). Its methodological use: at that rate dnsmark's `Server throughput (NIC
+rx)` (1.204 M) matched the receiver's own `tx_packets` (1.202 M/s) to 0.2 % — validating
+the tool, not a BIND capacity. The stress probe also exposed the headline hardware fact:
+unlike the X710, the 82599 dropped ~2.7 M pkts/s **at the NIC** (`rx_no_dma_resources`)
+before BIND ever saw them — the ixgbe ingest wall, not BIND, is what caps this link.
+Receiver CPU during the flood was ~16.4 of 128 cores (1639 %); RSS ~577 MiB.
 
 ## 2. Objective
 
@@ -47,38 +50,47 @@ generator — only the link changes, per README rule 6).
 
 ## 4. Raw Results
 
+**The measurement — closed-loop capacity:**
+
 | Metric | Value | Source |
 |--------|-------|--------|
 | **Closed-loop knee (ramp, Within-SLO)** | **~1.12 M qps** (Within-SLO 1.09 M) | dnsmark `--ramp` DSD (NIC-verified) |
 | Idle latency floor (p50) | 0.051 ms | dnsmark ramp |
-| **Raw reply ceiling (flood, Server throughput NIC rx)** | **1.204 M pkts/s** | dnsmark open-loop |
-| — confirmed by receiver NIC `tx_packets` | 1.202 M/s | `nic-sample.sh` (Δtx over window) |
-| — agreement | **0.2 %** | cross-check (README rule 1) |
-| Received at server NIC (rx) during flood | 2.69 M/s | receiver NIC `rx_packets` |
-| **Dropped at NIC before BIND** (`rx_no_dma_resources`) | ~2.7 M/s (Δ 82 M over 30 s) | `ethtool -S` |
-| SERVFAIL fraction at the flood ceiling | 50.00 % | dnsmark rcode breakdown |
-| Useful (NOERROR) reply rate at ceiling | ~0.60 M/s | 1.204 M × 49.93 % |
-| Offered load (generator egress) at flood | 5.02 M qps | dnsmark egress (line rate 11 %) |
 | dnsperf closed-loop (q=200/client, 20 clients) | 289 k qps @ avg 0.480 ms | dnsperf |
+
+**Not a measurement — open-loop firehose (overload/DoS probe + tool cross-check):**
+
+| Metric | Value | Source |
+|--------|-------|--------|
+| Server throughput NIC rx (replies on wire under DoS) | 1.204 M pkts/s | dnsmark open-loop |
+| — confirmed by receiver NIC `tx_packets` (validates the tool) | 1.202 M/s, **0.2 %** | `nic-sample.sh` (Δtx) |
+| **Dropped at NIC before BIND** (`rx_no_dma_resources`) | ~2.7 M/s (Δ 82 M over 30 s) | `ethtool -S` |
+| Received at server NIC (rx) during flood | 2.69 M/s | receiver NIC `rx_packets` |
+| SERVFAIL fraction under the firehose | 50.00 % (livelock) | dnsmark rcode breakdown |
+| Useful (NOERROR) reply rate under DoS | ~0.60 M/s | 1.204 M × 49.93 % |
+| Offered load (generator egress) at flood | 5.02 M qps | dnsmark egress (line rate 11 %) |
 | Receiver CPU (`named`) at flood | 1639 % (~16.4 / 128 cores) | pidstat |
 | Receiver RSS (`named`) at flood | ~577 MiB | pidstat |
 | NIC `rx_dropped` | 0 (drops are `rx_no_dma_resources`, not `rx_dropped`) | `ethtool -S` |
 
 ## 5. Interpretation
 
-- **The counters agree to 0.2 %.** dnsmark reported 1.204 M replies/s; the receiver's
-  82599 `tx_packets` counted 1.202 M/s over the same window. The wire ceiling figure is
-  trustworthy.
+- **The baseline is the ramp knee (~1.12 M qps). The flood is not a measurement.** The
+  open-loop firehose is a deliberate DoS; at the ceiling BIND is doubly constrained (NIC
+  drops upstream, 50 % SERVFAIL downstream), so only ~0.60 M/s are real answers — a
+  saturation artefact, not a capacity. The closed-loop knee (~1.12 M qps, p50 under SLO)
+  is where BIND answers correctly; that is the BIND-on-X520 baseline, and the only
+  throughput number here.
+- **The tool cross-check holds.** dnsmark reported 1.204 M replies/s under the DoS; the
+  receiver's 82599 `tx_packets` counted 1.202 M/s — 0.2 %. That validates dnsmark's
+  NIC-rx instrumentation, nothing about BIND's capacity.
 - **This link is NIC-bound, and that is the headline difference vs the X710.** During the
   flood the 82599 received only 2.69 M/s while `rx_no_dma_resources` climbed ~2.7 M/s —
   the ixgbe ran out of RX DMA descriptors and dropped roughly half the offered packets
   **before BIND**. The i40e on the same host, same day, ingested 4.96 M/s with zero
   drops. Same binary, only the NIC changed (rule 6): the X520 delivers less to the
-  resolver, so BIND serves less. The bottleneck here is the card, not BIND.
-- **The honest sustained number is the ramp knee (~1.12 M qps).** At the open-loop
-  ceiling BIND is doubly constrained — NIC drops upstream and 50 % SERVFAIL downstream —
-  so only ~0.60 M/s are real answers there. The closed-loop knee is where BIND answers
-  correctly within the SLO; report **~1.12 M qps** as the BIND-on-X520 baseline.
+  resolver, so BIND's knee is lower (~1.12 M vs ~1.40 M). The bottleneck here is the
+  card, not BIND.
 - **CPU headroom confirms it is not compute-bound.** BIND used ~16.4 of 128 cores at the
   flood; it had ample CPU. It was starved of input by the NIC and shedding load as
   SERVFAIL, not saturating the processor.
