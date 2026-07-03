@@ -120,12 +120,16 @@ Ramp step ladder (offered → served, p50 / p95 / p99, ms):
 - **Latency wire-truth (tcpdump-anchored, per rule 7).** A packet capture at the receiver
   NIC, decoded with tshark `dns.time` (the query→response delta on the wire = pure server
   service time, no generator overhead), gives cache-hit **p50 22 µs / p95 67 µs / p99
-  94 µs** over 175 820 hits (98.3 %). The p50 corroborates dnsmark's idle floor (0.038 ms
-  ≈ 38 µs, generator-side, slightly higher as expected). The full-distribution tail
+  94 µs** over 175 820 hits (98.3 %). The full-distribution tail
   (p99 21 ms, p99.9 193 ms) is the small cache-miss fraction forwarded to the real
   upstreams — internet RTT, not BIND — exactly the workload-tail effect rule 7 anticipates.
-  dnsmark's own `--wire-latency` mode (SO_TIMESTAMPING) was intended for this but hung on
-  this rig (see appendix); tcpdump is the methodology's designated reference anyway.
+- **A second independent method agrees.** dnsmark's `--wire-latency` mode (kernel
+  SO_TIMESTAMPING at the generator, fixed in v2.7.7 — it hung on v2.7.5, see appendix)
+  reports p50 **29 µs** over 28 982 samples. That is the *server + link* RTT — it includes
+  the DAC round-trip the receiver-side tcpdump does not — so it sits ~7 µs above the
+  tcpdump server-only p50 (22 µs), the expected gap, and corroborates dnsmark's own ramp
+  idle floor (~38 µs). Two independent timestamping paths place BIND's cache-hit service
+  latency in the 22–29 µs range.
 
 ## 6. Appendix — exact commands & configuration
 
@@ -162,14 +166,20 @@ tcpdump -i enp33s0f0np0 -s 128 --time-stamp-precision=nano -w lat.pcap -c 400000
 dnsperf -s 10.71.10.1 -d /root/queries-A.txt -l 6 -c 20 -T 20 -q 200 -t 3
 tshark -r lat.pcap -Y 'dns.flags.response==1 && dns.time' -T fields -e dns.time \
   | sort -n | awk '{a[NR]=$1} END{print a[int(NR*.5)],a[int(NR*.95)],a[int(NR*.99)]}'
+
+# dnsmark --wire-latency, generator-side SO_TIMESTAMPING cross-check (v2.7.7+)
+dnsmark -s 10.71.10.1 -d /root/queries-A.txt --wire-latency -Q 5000 -l 6
 ```
 
-**dnsmark `--wire-latency` note.** This mode (kernel SO_TIMESTAMPING) is the intended
-tool for this figure, but on this rig it hung — a trivial `--wire-latency -Q 500 -l 1`
-(2000 samples, ~4 s expected) did not terminate within 20 s (exit 124), producing no
-percentiles, although the generator NIC reports full HW+SW timestamping capability
-(`ethtool -T`). tcpdump + tshark `dns.time` is the README's designated latency reference,
-so it was used instead. The dnsmark hang is a separate tool bug to fix.
+**dnsmark `--wire-latency` note.** This mode (kernel SO_TIMESTAMPING at the generator)
+**hung on v2.7.5** — a trivial `--wire-latency -Q 500 -l 1` did not terminate within 20 s
+(exit 124, no percentiles) despite full HW+SW `ethtool -T` capability (issue #18). **Fixed
+in v2.7.7**: three bounded waits (TX stamp via `POLLERR` ≤5 ms, per-sample reply cap, a
+whole-probe wall-clock deadline). Re-run here on v2.7.7 it completes and reports p50 29 µs
+(28 982 samples), corroborating the tcpdump server-only p50 (22 µs) plus the DAC link
+round-trip. Both methods are kept: tcpdump is the README's designated reference (pure
+server time at the receiver), `--wire-latency` is the generator-side cross-check
+(server + link).
 
 **Notes.** BIND cache warmed hot before measuring (rule 2). Flow control off (rule 3),
 RSS spread (rule 4), `:53` sole-owner verified (rule 5). i40e does not expose

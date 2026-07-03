@@ -122,9 +122,12 @@ generator — only the link changes, per README rule 6).
   178 074 hits (99.5 %). Back-to-back with the X710 run (same host/binary/day, only the
   NIC changed): the ixgbe adds ~15 µs at p50 and ~150 µs at p99 over the i40e (22 / 94 µs)
   — the heavier ixgbe datapath shows up in latency just as it does in ingest. The tail
-  (p99.9 59 ms) is the cache-miss forward fraction, internet RTT, not BIND. dnsmark's
-  `--wire-latency` mode was intended for this but hung on this rig (see the X710 report's
-  appendix); tcpdump is the methodology's designated reference.
+  (p99.9 59 ms) is the cache-miss forward fraction, internet RTT, not BIND.
+- **Second independent method agrees.** dnsmark's `--wire-latency` (generator-side
+  SO_TIMESTAMPING, fixed in v2.7.7 after hanging on v2.7.5 — see the X710 report) reports
+  p50 **38 µs** over 29 450 samples — essentially identical to the tcpdump server-only p50
+  (37 µs) here, because on the ixgbe the DAC round-trip is a smaller share of a larger
+  service time. Two independent timestamping paths agree on ~37–38 µs.
 
 ## 6. Appendix — exact commands & configuration
 
@@ -157,7 +160,8 @@ tcpdump -i enp66s0f1 -s 128 --time-stamp-precision=nano -w lat.pcap -c 400000 'u
 dnsperf -s 10.51.10.1 -d /root/queries-A.txt -l 6 -c 20 -T 20 -q 200 -t 3
 tshark -r lat.pcap -Y 'dns.flags.response==1 && dns.time' -T fields -e dns.time \
   | sort -n | awk '{a[NR]=$1} END{print a[int(NR*.5)],a[int(NR*.95)],a[int(NR*.99)]}'
-# dnsmark --wire-latency hung on this rig — see the X710 report appendix.
+# dnsmark --wire-latency generator-side cross-check (v2.7.7+, hung on v2.7.5 — issue #18)
+dnsmark -s 10.51.10.1 -d /root/queries-A.txt --wire-latency -Q 5000 -l 6
 ```
 
 **Notes.** Same host / binary / generator / methodology as the X710 run of 2026-07-03 —

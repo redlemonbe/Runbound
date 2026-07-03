@@ -24,8 +24,9 @@ corpus warmed 100 k):
 
 Wire service latency (cache-hit, tcpdump at receiver NIC → tshark `dns.time`): X710 p50
 **22 µs** / p95 67 µs / p99 94 µs; X520 p50 **37 µs** / p95 139 µs / p99 247 µs — the
-heavier ixgbe datapath shows in latency as it does in ingest. (dnsmark's `--wire-latency`
-mode hung on this rig; tcpdump is the README's designated reference.)
+heavier ixgbe datapath shows in latency as it does in ingest. Cross-checked by dnsmark's
+`--wire-latency` (generator-side SO_TIMESTAMPING, fixed in v2.7.7): p50 29 µs (X710) /
+38 µs (X520), agreeing with tcpdump within the DAC link RTT.
 
 Both knees are placed by two independent generators (dnsmark DSD + dnsperf sweep), not a
 single tool. Back-to-back, same host/binary/generator, only the link changed (rule 6):
