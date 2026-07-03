@@ -1,6 +1,6 @@
 # Runbound Benchmark — Runbound v0.19.3 `xdp: yes` dual-link X510 + X710 — Threadripper PRO 5995WX — 2026-06-15
 
-> Follows [README.md](README.md). Measured data only. Where a value is missing or
+> Follows [README.md](../README.md). Measured data only. Where a value is missing or
 > uncertain, write exactly **"I cannot confirm this."** Truth is the receiver NIC hardware
 > counters, summed across both links. **`xdp: yes` (AF_XDP fast path)** with a single dnsmark
 > multi-NIC AF_XDP generator (`-s` repeated). Companion to the dual-X710 report. Re-run of

@@ -30,7 +30,7 @@
 > reference (v0.18.1/v0.19.3, 2026-06-13/15, superseded by the round above but kept for
 > the datapath history): dual-link X510+X710 ~20.3 Mqps at ~24% CPU (that run used two
 > *separate* generator cards, avoiding this round's generator-imbalance limitation — the
-> two dual-link figures are not directly comparable, see `docs/benchmark/RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md` §5); single-link X710 ~10.12 Mqps; kernel slow path
+> two dual-link figures are not directly comparable, see `docs/benchmark/OLD/RUNBOUND-v0.23.8-threadripper-5995wx-2026-07-01.md` §5); single-link X710 ~10.12 Mqps; kernel slow path
 > X710 ~3.71 Mqps. Same-rig kernel-UDP references: unbound 1.22.0 ~2.09 M, BIND 9.20.23
 > ~1.84 M. The older v0.16.11 (X710) and v0.17.0 sections below are superseded but kept
 > for the datapath history.
@@ -137,7 +137,7 @@ closed-loop, single-process generator, so it does not itself reach the AF_XDP-me
 ceiling; it corroborates correctness and NIC-truth rather than pushing the receiver to
 saturation — which is why an open-loop AF_XDP generator is needed to reach the receiver's
 actual saturation point. Full report:
-`docs/benchmark/RUNBOUND-v0.18.1-threadripper-5995wx-x710-noxdp-2026-06-13.md`.
+`docs/benchmark/OLD/RUNBOUND-v0.18.1-threadripper-5995wx-x710-noxdp-2026-06-13.md`.
 
 ## Bottleneck analysis & scaling headroom
 

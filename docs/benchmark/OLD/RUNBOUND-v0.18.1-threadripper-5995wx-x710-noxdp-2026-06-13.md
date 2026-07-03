@@ -1,6 +1,6 @@
 # Runbound Benchmark — Runbound v0.18.1 `xdp: no` — Threadripper PRO 5995WX / X710 (i40e) — 2026-06-13
 
-> Follows [README.md](README.md). Measured data only. Where a value is missing or
+> Follows [README.md](../README.md). Measured data only. Where a value is missing or
 > uncertain, write exactly **"I cannot confirm this."** Truth is the receiver NIC hardware
 > counters, not the generator's round-trip. **`xdp: no` (kernel slow path)** and a **non-XDP
 > (kernel UDP) generator** this round — the like-for-like kernel-path comparison against the

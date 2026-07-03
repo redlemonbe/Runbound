@@ -1,6 +1,6 @@
 # Runbound Benchmark — Runbound v0.18.1 `xdp: yes` — Threadripper PRO 5995WX / X510 (ixgbe) — 2026-06-13
 
-> Follows [README.md](README.md). Measured data only. Where a value is missing or
+> Follows [README.md](../README.md). Measured data only. Where a value is missing or
 > uncertain, write exactly **"I cannot confirm this."** Truth is the receiver NIC hardware
 > counters, not the generator's round-trip. **`xdp: yes` (AF_XDP fast path)** with an **AF_XDP
 > (`--xdp`) dnsmark generator**. Companion to the Runbound X710 `xdp: yes` report (same binary,

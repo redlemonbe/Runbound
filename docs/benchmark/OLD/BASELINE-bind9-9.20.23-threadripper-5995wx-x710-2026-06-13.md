@@ -1,6 +1,6 @@
 # Runbound Benchmark — Baseline BIND 9.20.23 — Threadripper PRO 5995WX / X710 (i40e) — 2026-06-13
 
-> Follows [README.md](README.md). Measured data only. Where a value is missing or
+> Follows [README.md](../README.md). Measured data only. Where a value is missing or
 > uncertain, write exactly **"I cannot confirm this."** Truth is the receiver NIC hardware
 > counters, not the generator's round-trip. **Generator is non-XDP (kernel UDP)** this
 > round — see §3; this is the deliberate baseline for the upcoming non-XDP Runbound runs on

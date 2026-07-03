@@ -1,6 +1,6 @@
 # Runbound Benchmark — v0.23.8 — threadripper-5995wx — 2026-07-01
 
-> Follows [README.md](README.md). Measured data only. Where a value is missing or
+> Follows [README.md](../README.md). Measured data only. Where a value is missing or
 > uncertain, this reports **"I cannot confirm this."**
 
 ## 1. Executive Summary
