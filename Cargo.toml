@@ -38,6 +38,10 @@ rustls              = { version = "0.23", features = ["tls12"] }
 rustls-pemfile      = "2"
 rustls-native-certs = "0.8"
 webpki-roots        = "0.26"
+# DNS-over-QUIC (RFC 9250) — own listener (src/dns/doq.rs). quinn is independent
+# of hickory; it reuses our rustls config + the ring provider. Minimal features:
+# no platform-verifier (server-side only), ring crypto to match the rest of the stack.
+quinn               = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 
 # DNSSEC signing crypto (own signer, de-hickory) — ECDSA P-256 fixed sig + SHA-1/256.
 ring                = "0.17"

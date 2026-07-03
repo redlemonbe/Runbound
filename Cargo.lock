@@ -2139,6 +2139,7 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "libc",
+ "quinn",
  "rcgen 0.13.2",
  "regex",
  "reqwest",
