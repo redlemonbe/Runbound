@@ -1632,6 +1632,19 @@ fn answer_from_cache(
         return None;
     }
 
+    // DNSSEC (DO=1) requests must fall through to the slow path, which reattaches
+    // the covering RRSIGs (RFC 4035 §3.2.1). The cache holds the RRSIG-free base
+    // answer, so serving it here would silently drop the signatures a DO client
+    // asked for. arcount==0 (no OPT) short-circuits with zero scan cost, and a
+    // DO=0 EDNS client still gets the cached answer.
+    let arcount = u16::from_be_bytes([query_bytes[10], query_bytes[11]]);
+    if arcount > 0
+        && crate::dns::wire_builder::parse_opt_rr(query_bytes, pos + 4, arcount)
+            .is_some_and(|e| e.do_bit)
+    {
+        return None;
+    }
+
     // CRC32c hash (SSE4.2 + Fibonacci spread) mixed with qtype — same as answer_dns_wire.
     // Mix qtype into the upper 16 bits so A and AAAA for the same name have distinct keys.
     let raw_key = crate::dns::hasher::hash_wire_qname(&qname_lc);
