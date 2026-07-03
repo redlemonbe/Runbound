@@ -11,8 +11,8 @@ open-loop **~1.91 M qps (X710) / ~1.46 M (X520) at 99.9 % NOERROR** — it does 
 livelock under the firehose. dnsperf closed-loop peaks around ~1.36 M (X710) / ~1.18 M
 (X520). Cache-hit service latency at the wire is the lowest of the three kernel
 resolvers: **p50 12.8 µs (X710) / 17.5 µs (X520)**. Every throughput figure is
-cross-checked against the receiver NIC `tx_packets` (0.4 % agreement). Receiver CPU
-~15–16 of 128 cores; RSS ~0.2–0.5 GiB.
+cross-checked against the receiver NIC `tx_packets` (0.4 % agreement). Receiver host CPU
+~19–20 % of 128 cores; RSS ~0.2–0.5 GiB.
 
 ## 2. Objective
 
@@ -47,7 +47,7 @@ corpus; only the resolver and NIC change (rule 6).
 | Ramp DSD knee (closed-loop, gen-bound) | 498 k | 605 k | dnsmark `--ramp` |
 | **Wire latency cache-hit** p50/p95/p99 | **12.8 / 25.1 / 38.8 µs** | **17.5 / 58.4 / 100.9 µs** | tcpdump→tshark `dns.time` |
 | wire-latency (server+link) p50 | 28 µs | 35 µs | dnsmark `--wire-latency` |
-| Receiver CPU (flood) | 15.7 cores (1566 %) | 15.4 cores (1538 %) | pidstat |
+| Receiver host CPU (flood) | 19.1 % of 128 c | 20.4 % of 128 c | mpstat (idle ~1 %) |
 | Receiver RSS | 214 MiB | 521 MiB | pidstat |
 
 ## 5. Interpretation
@@ -84,6 +84,8 @@ for Q in 200 1000 2000 4000; do dnsperf -s <ip> -d /root/queries-A.txt -l 15 -c 
 **Notes.** Cache warmed hot before measuring (rule 2), flow control off (rule 3), RSS
 spread (rule 4), `:53` sole-owner verified (rule 5). Flood is an overload probe; unbound
 happens not to degrade (99.9 % NOERROR) so its NIC-rx doubles as the open-loop service
-rate. **CPU** is `pidstat` on the server PID = userspace CPU only; softirq/kernel cost is
-off-PID and not counted, so it under-states whole-system CPU (consistent across servers,
-valid for relative efficiency). See README "CPU accounting".
+rate. **Host CPU** is whole-machine `mpstat` utilisation (`usr+nice+sys+irq+soft`) over
+128 cores during the flood, including softirq/NIC cost, VM `%guest` excluded (idle
+~1 %). unbound's ~19–20 % for ~1.9/1.46 M served ≈ 0.10 M qps per 1 % host CPU — below
+Runbound's kernel path (~0.16 M/%) and far below its fast path (~0.97 M/%). See README
+"CPU accounting".

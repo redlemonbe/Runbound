@@ -64,13 +64,15 @@ These exist because earlier numbers were wrong for these exact reasons:
 If any rule above could not be satisfied for a given run, say so in the report and
 write **"I cannot confirm this"** for the affected metric.
 
-**CPU accounting.** The receiver-CPU column is `pidstat -u` on the server process PID
-(cores = %CPU ÷ 100, over the loaded window). It measures the **server process's
-userspace CPU only** — kernel work in softirq context (NIC IRQs, `ksoftirqd`, ring
-fill/drain) is **not** attributed to the PID, so the figure **under-states total system
-cost**. It is consistent across servers (all measured the same way), so it is valid for
-*relative* efficiency, but it is not the whole-system CPU. This applies to every row of
-every report.
+**CPU accounting.** The receiver-CPU figure is the **whole-machine host utilisation**
+during the flood window, from `mpstat` on the receiver: `%usr + %nice + %sys + %irq +
+%soft`, averaged over all 128 cores. This includes the softirq/kernel cost (NIC IRQs,
+`ksoftirqd`, ring fill/drain) — i.e. the *total* host cost of serving, not just the
+resolver process. `%guest`/`%steal` (this host also runs unrelated VMs) are **excluded**
+so the figure reflects the DNS bench, not co-tenant load. Report it as a percentage of
+the machine (e.g. "10 % of 128 cores"), with the idle baseline for context. Do **not**
+report a per-process core count — it misses the softirq cost and is not what this column
+means.
 
 ---
 

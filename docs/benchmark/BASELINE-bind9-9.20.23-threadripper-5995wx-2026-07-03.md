@@ -16,7 +16,7 @@ firehose**: it served ~1.49 M pkts/s on X710 but at 98.4 % NOERROR (1.5 % SERVFA
 rate is therefore ~1.47 M (X710) / ~0.84 M (X520). dnsperf closed-loop peaks ~1.35–1.44 M
 but with rising SERVFAIL. Cache-hit service latency at the wire: p50 24 µs (X710) /
 30 µs (X520). Every throughput figure is cross-checked against the receiver NIC
-`tx_packets` (0.9–1.0 %). Receiver CPU ~16–18 of 128 cores.
+`tx_packets` (0.9–1.0 %). Receiver host CPU ~18–22 % of 128 cores.
 
 ## 2. Objective
 
@@ -51,7 +51,7 @@ corpus; only the resolver and NIC change, rule 6). This supersedes the archived
 | Ramp DSD knee (closed-loop, gen-bound) | 295 k | 268 k | dnsmark `--ramp` |
 | **Wire latency cache-hit** p50/p95/p99 | **24.0 / 57.5 / 105.6 µs** | **29.8 / 92.2 / 199.5 µs** | tcpdump→tshark `dns.time` |
 | wire-latency (server+link) p50 | 35 µs | 44 µs | dnsmark `--wire-latency` |
-| Receiver CPU (flood) | 18.2 cores (1822 %) | 16.1 cores (1609 %) | pidstat |
+| Receiver host CPU (flood) | 17.6 % of 128 c | 21.7 % of 128 c | mpstat (idle ~1 %) |
 | Receiver RSS | 323 MiB | 564 MiB | pidstat |
 
 ## 5. Interpretation
@@ -64,7 +64,7 @@ corpus; only the resolver and NIC change, rule 6). This supersedes the archived
   number it produces is degraded.
 - **Slowest of the three, on both throughput and (X520) latency.** Useful service rate,
   single link X710: Runbound `xdp:no` 2.86 M > unbound 1.91 M > **BIND 1.47 M**. BIND uses
-  the most CPU (18.2 cores) for the least correct output.
+  the most host CPU (17.6–21.7 %, ≈0.085 M served per 1 % CPU) for the least correct output.
 - **Counters agree** (0.9–1.0 %), so the NIC-rx figures are trustworthy; the weakness is
   BIND's, not a measurement artefact.
 - **The ramp knee (295 k / 268 k) is generator-recv bound**, well below the open-loop
@@ -88,7 +88,7 @@ for Q in 200 1000 2000 4000; do dnsperf -s <ip> -d /root/queries-A.txt -l 15 -c 
 **Notes.** Cache warmed hot before measuring (rule 2), flow control off (rule 3), RSS
 spread (rule 4), `:53` sole-owner verified (rule 5). The flood SERVFAIL fraction varies
 run-to-run with upstream/cache state (X710 read 1.5 % here vs 18 % in an earlier
-v2.7.5 probe) — the point is that BIND *does* livelock, not the exact fraction. **CPU**
-is `pidstat` on the server PID = userspace CPU only; softirq/kernel cost is off-PID and
-not counted, so it under-states whole-system CPU (consistent across servers, valid for
-relative efficiency). See README "CPU accounting".
+v2.7.5 probe) — the point is that BIND *does* livelock, not the exact fraction. **Host
+CPU** is whole-machine `mpstat` utilisation (`usr+nice+sys+irq+soft`) over 128 cores
+during the flood, including softirq/NIC cost, VM `%guest` excluded (idle ~1 %). See
+README "CPU accounting".

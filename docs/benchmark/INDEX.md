@@ -19,17 +19,17 @@ does — see notes).
 
 **Throughput — served rate at the receiver NIC (single 10 GbE link unless noted):**
 
-| Served (NIC rx) | NOERROR | NIC cross-check | Cache-hit latency p50 | CPU (of 128) | Config | Link |
-|----------------:|--------:|:---------------:|----------------------:|-------------:|--------|------|
-| **~20.3 M** (ramp) / 19.4 M (flood) | 99.99 % | 0.4 % | 30 µs (wire-lat) | ~21.9 c | **Runbound v0.23.13 `xdp:yes` dual-link** — 99 % of 20 G | X710+X520 |
-| **~9.85 M** (line-rate) | 99.99 % | 0.3 % | 31 µs (wire-lat) | ~6.0 c | **Runbound `xdp:yes`** (AF_XDP) — wire-bound | X710 (i40e) |
-| **~9.81 M** (line-rate) | 99.99 % | 0.4 % | 34 µs (wire-lat) | ~6.0 c | **Runbound `xdp:yes`** (AF_XDP) — wire-bound | X520 (ixgbe) |
-| **~2.86 M** | 99.96 % | 0.6 % | 24.6 µs (tcpdump) | ~13.7 c | **Runbound `xdp:no`** (kernel slow path) | X710 (i40e) |
-| **~2.18 M** | 99.95 % | 0.1 % | 25.2 µs (tcpdump) | ~11.1 c | **Runbound `xdp:no`** (kernel slow path) | X520 (ixgbe) |
-| ~1.91 M | 99.88 % | 0.4 % | **12.8 µs** (tcpdump) | ~15.7 c | unbound 1.22.0 | X710 (i40e) |
-| ~1.46 M | 99.89 % | 0.4 % | 17.5 µs (tcpdump) | ~15.4 c | unbound 1.22.0 | X520 (ixgbe) |
-| ~1.49 M | 98.42 % (1.5 % SERVFAIL) | 1.0 % | 24.0 µs (tcpdump) | ~18.2 c | BIND 9.20.23 | X710 (i40e) |
-| ~1.26 M | **66.74 %** (33 % SERVFAIL — livelock) | 0.9 % | 29.8 µs (tcpdump) | ~16.1 c | BIND 9.20.23 | X520 (ixgbe) |
+| Served (NIC rx) | NOERROR | NIC cross-check | Cache-hit latency p50 | Host CPU (128 c) | Config | Link |
+|----------------:|--------:|:---------------:|----------------------:|-----------------:|--------|------|
+| **~20.3 M** (ramp) / 19.4 M (flood) | 99.99 % | 0.4 % | 30 µs (wire-lat) | 24.4 % | **Runbound v0.23.13 `xdp:yes` dual-link** — 99 % of 20 G | X710+X520 |
+| **~9.85 M** (line-rate) | 99.99 % | 0.3 % | 31 µs (wire-lat) | **10.1 %** | **Runbound `xdp:yes`** (AF_XDP) — wire-bound | X710 (i40e) |
+| **~9.81 M** (line-rate) | 99.99 % | 0.4 % | 34 µs (wire-lat) | **8.2 %** | **Runbound `xdp:yes`** (AF_XDP) — wire-bound | X520 (ixgbe) |
+| **~2.86 M** | 99.96 % | 0.6 % | 24.6 µs (tcpdump) | 17.7 % | **Runbound `xdp:no`** (kernel slow path) | X710 (i40e) |
+| **~2.18 M** | 99.95 % | 0.1 % | 25.2 µs (tcpdump) | 17.1 % | **Runbound `xdp:no`** (kernel slow path) | X520 (ixgbe) |
+| ~1.91 M | 99.88 % | 0.4 % | **12.8 µs** (tcpdump) | 19.1 % | unbound 1.22.0 | X710 (i40e) |
+| ~1.46 M | 99.89 % | 0.4 % | 17.5 µs (tcpdump) | 20.4 % | unbound 1.22.0 | X520 (ixgbe) |
+| ~1.49 M | 98.42 % (1.5 % SERVFAIL) | 1.0 % | 24.0 µs (tcpdump) | 17.6 % | BIND 9.20.23 | X710 (i40e) |
+| ~1.26 M | **66.74 %** (33 % SERVFAIL — livelock) | 0.9 % | 29.8 µs (tcpdump) | 21.7 % | BIND 9.20.23 | X520 (ixgbe) |
 
 **Reports:** [Runbound v0.23.13 (all 5 runs)](RUNBOUND-v0.23.13-threadripper-5995wx-2026-07-03.md) ·
 [unbound 1.22.0](BASELINE-unbound-1.22.0-threadripper-5995wx-2026-07-03.md) ·
@@ -38,7 +38,7 @@ does — see notes).
 **What the numbers say.**
 
 - **Runbound's AF_XDP fast path tops the table and never reaches its own ceiling.** ~9.85 M
-  qps per 10 G link at 99.99 % NOERROR on ~6 cores — the wire (103 B replies → ~9.85 M/s)
+  qps per 10 G link at 99.99 % NOERROR on ~8–10 % host CPU — the wire (103 B replies → ~9.85 M/s)
   is the wall, not Runbound. Dual-link doubles to ~19.4 M (99 % of 20 G). The fast-path
   saturation point was not reached on this rig: **I cannot confirm** it.
 - **Runbound wins even without XDP.** Its kernel slow path serves ~2.86 M (X710) / 2.18 M
@@ -57,10 +57,12 @@ does — see notes).
 - **Latency method.** Kernel path: tcpdump at the receiver → tshark `dns.time` (pure
   server service time, rule 7). Fast path: dnsmark `--wire-latency` (server+link) — XDP
   bypasses the receiver stack so tcpdump sees nothing there.
-- **CPU column** is `pidstat` on the server PID = **userspace CPU of the server process
-  only**; softirq/kernel cost (NIC IRQ, `ksoftirqd`) is not attributed to the PID, so it
-  under-states whole-system cost. Consistent across servers → good for relative
-  efficiency, not the total system CPU. (See README "CPU accounting".)
+- **Host CPU column** is whole-machine `mpstat` host utilisation (`usr+nice+sys+irq+soft`)
+  over all 128 cores during the flood, **including** softirq/NIC cost, with VM
+  `%guest`/`%steal` excluded (this host runs unrelated VMs). Idle baseline ~1 %.
+  Efficiency (served per point of host CPU) is the story: Runbound `xdp:yes` ~0.97 M/%
+  (X710) is ~6× its own kernel path, ~10× unbound, ~11× BIND. (See README "CPU
+  accounting".)
 
 ## Superseded — first-pass BIND (2026-07-03, dnsmark v2.7.5, latency v2.7.7)
 

@@ -9,9 +9,9 @@
 ## 1. Executive Summary
 
 On a single 10 GbE link Runbound's **AF_XDP fast path serves ~9.85 M qps at 99.99 %
-NOERROR — line-rate — using ~6 of 128 cores**; the link, not Runbound, is the wall.
-**Dual-link (X710+X520) reaches ~20.3 M qps** (ramp) / 19.4 M (flood), 99 % of the
-combined 20 Gb/s wire, at ~22 cores. Runbound's **kernel slow path (`xdp:no`) serves
+NOERROR — line-rate — at ~8–10 % host CPU (of 128 cores)**; the link, not Runbound, is
+the wall. **Dual-link (X710+X520) reaches ~20.3 M qps** (ramp) / 19.4 M (flood), 99 % of
+the combined 20 Gb/s wire, at ~24 % host CPU. Runbound's **kernel slow path (`xdp:no`) serves
 ~2.86 M qps (X710) / 2.18 M (X520) at 99.9+ % NOERROR without livelock** — already ~1.5×
 unbound and ~1.9× BIND on the same rig (see the BIND and unbound baselines of the same
 day). Every throughput figure is cross-checked against the receiver NIC hardware
@@ -50,24 +50,24 @@ unbound baselines of the same day so the numbers are directly comparable.
 
 **Fast path (`xdp:yes`, AF_XDP) — the throughput number is the ramp/flood NIC-verified rate:**
 
-| Link | Ramp knee (NIC-verified) | Flood served (NIC rx) | dnsmark vs recv NIC tx | NOERROR | Line rate | CPU / RSS | Wire latency p50/p95/p99 |
-|------|-------------------------:|----------------------:|:----------------------:|--------:|----------:|-----------|--------------------------|
-| X710 (i40e) | 9.85 M qps | 9.848 M | 9.848 vs 9.882 M = **0.3 %** | 99.99 % | **100 % of 10 G** | ~6.0 cores / 8.77 GiB | 31 / 183 / 233 µs |
-| X520 (ixgbe) | 9.91 M qps | 9.810 M | 9.810 vs 9.849 M = **0.4 %** | 99.99 % | **100 % of 10 G** | ~6.0 cores / 8.71 GiB | 34 / 36 / 38 µs |
-| **Dual-link** | **20.33 M qps** | 19.415 M | 19.415 vs 19.480 M = **0.4 %** | 99.99 % | **99 % of 20 G** | ~21.9 cores / 8.66 GiB | 30 / 183 / 233 µs |
+| Link | Ramp knee (NIC-verified) | Flood served (NIC rx) | dnsmark vs recv NIC tx | NOERROR | Line rate | Host CPU / RSS | Wire latency p50/p95/p99 |
+|------|-------------------------:|----------------------:|:----------------------:|--------:|----------:|----------------|--------------------------|
+| X710 (i40e) | 9.85 M qps | 9.848 M | 9.848 vs 9.882 M = **0.3 %** | 99.99 % | **100 % of 10 G** | **10.1 %** of 128 c / 8.77 GiB | 31 / 183 / 233 µs |
+| X520 (ixgbe) | 9.91 M qps | 9.810 M | 9.810 vs 9.849 M = **0.4 %** | 99.99 % | **100 % of 10 G** | **8.2 %** / 8.71 GiB | 34 / 36 / 38 µs |
+| **Dual-link** | **20.33 M qps** | 19.415 M | 19.415 vs 19.480 M = **0.4 %** | 99.99 % | **99 % of 20 G** | 24.4 % / 8.66 GiB | 30 / 183 / 233 µs |
 
 Both single links are **wire-bound** (10 G saturated at 103 B replies → ~9.85 M/s
-ceiling); Runbound is far from its own limit (~6 cores). The dual-link aggregate (X710
-9.886 M + X520 9.594 M = 19.48 M received tx) is 99 % of the 20 G wire — again the links,
-not Runbound (~22 cores), are the wall.
+ceiling); Runbound is far from its own limit (~8–10 % host CPU). The dual-link aggregate
+(X710 9.886 M + X520 9.594 M = 19.48 M received tx) is 99 % of the 20 G wire — again the
+links, not Runbound (~24 % host CPU), are the wall.
 
 **Slow path (`xdp:no`, kernel) — flood NIC-rx is the open-loop service rate; ramp DSD is
 generator-recv bound (see §5):**
 
-| Link | Flood served (NIC rx) | NOERROR | dnsmark vs recv NIC tx | dnsperf sweep max | CPU / RSS | tcpdump p50/p95/p99 | wire-lat p50 |
-|------|----------------------:|--------:|:----------------------:|------------------:|-----------|---------------------|-------------:|
-| X710 (i40e) | **2.865 M** | 99.96 % | 2.865 vs 2.883 M = **0.6 %** | 878 k @ p50<1 ms | ~13.7 cores / 541 MiB | 24.6 / 105 / 284 µs | 28 µs |
-| X520 (ixgbe) | **2.184 M** | 99.95 % | 2.184 vs 2.187 M = **0.1 %** | 880 k | ~11.1 cores / 527 MiB | 25.2 / 77 / 132 µs | 36 µs |
+| Link | Flood served (NIC rx) | NOERROR | dnsmark vs recv NIC tx | dnsperf sweep max | Host CPU / RSS | tcpdump p50/p95/p99 | wire-lat p50 |
+|------|----------------------:|--------:|:----------------------:|------------------:|----------------|---------------------|-------------:|
+| X710 (i40e) | **2.865 M** | 99.96 % | 2.865 vs 2.883 M = **0.6 %** | 878 k @ p50<1 ms | 17.7 % of 128 c / 541 MiB | 24.6 / 105 / 284 µs | 28 µs |
+| X520 (ixgbe) | **2.184 M** | 99.95 % | 2.184 vs 2.187 M = **0.1 %** | 880 k | 17.1 % / 527 MiB | 25.2 / 77 / 132 µs | 36 µs |
 
 Kernel-path ramp DSD knees (closed-loop, generator-recv bound, **not** the server
 ceiling): X710 320 k, X520 379 k. See §5.
@@ -75,10 +75,10 @@ ceiling): X710 320 k, X520 379 k. See §5.
 ## 5. Interpretation
 
 - **The fast path is link-bound, not server-bound.** At ~9.85 M qps per 10 G link
-  Runbound uses ~6 of 128 cores at 99.99 % NOERROR; the 10 G wire (103 B replies) is the
-  ceiling. To measure Runbound's own XDP ceiling would need >10 G of egress. On this rig,
-  **I cannot confirm** the fast-path saturation point — it was never reached. The
-  dual-link run doubling to ~19.4 M (99 % of 20 G) at ~22 cores is consistent with the
+  Runbound uses ~8–10 % of the host's 128 cores at 99.99 % NOERROR; the 10 G wire (103 B
+  replies) is the ceiling. To measure Runbound's own XDP ceiling would need >10 G of
+  egress. On this rig, **I cannot confirm** the fast-path saturation point — it was never
+  reached. The dual-link run doubling to ~19.4 M (99 % of 20 G) at ~24 % host CPU is consistent with the
   fast path scaling linearly with offered wire.
 - **The slow path does not livelock — this is the sharp contrast with BIND.** Under the
   open-loop firehose Runbound `xdp:no` serves 2.865 M (X710) / 2.184 M (X520) replies/s at
@@ -119,12 +119,15 @@ dnsmark -s <ip> [-s <ip2>] -d /root/queries-A.txt [--xdp] -Q 0 --max-outstanding
 dnsmark -s <ip> -d /root/queries-A.txt --wire-latency -Q 5000 -l 6
 ```
 
-**CPU accounting.** The CPU columns are `pidstat` on the server PID = the server
-process's **userspace** CPU only; softirq/kernel cost (NIC IRQ, `ksoftirqd`, ring
-fill/drain) is not attributed to the PID and is not counted. The figures are consistent
-across all runs (measured the same way) and valid for relative efficiency, but they
-under-state whole-system CPU — especially on the XDP path, where the driver/DMA softirq
-cost is real but off-PID. See README "CPU accounting".
+**CPU accounting.** The Host-CPU column is whole-machine `mpstat` utilisation
+(`usr+nice+sys+irq+soft`) over all 128 cores during the flood — it **includes** the
+softirq/NIC cost, so it is the total host cost of serving. VM `%guest`/`%steal` (this box
+runs unrelated VMs) are excluded; idle baseline ~1 %. Efficiency (served per point of
+host CPU) is the real story: **`xdp:yes` X710 ≈ 0.97 M qps per 1 % host CPU** (9.85 M @
+10.1 %) vs `xdp:no` ≈ 0.16 M/% (2.86 M @ 17.7 %) — the fast path is ~6× more
+CPU-efficient than Runbound's own kernel path, and ~10–11× more than unbound / BIND on
+the same rig. See README "CPU accounting". (An earlier draft mis-stated this as a
+per-process core count from `pidstat`, which omits the softirq cost; corrected here.)
 
 **Notes.** XDP residual detached (`ip link set … xdp off`) before switching to kernel
 runs — otherwise a stale XDP prog drops UDP:53. In XDP the receiver-side tcpdump sees no
