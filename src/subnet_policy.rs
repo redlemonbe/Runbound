@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 //
-// Per-subnet / per-VLAN filtering policies (#8) — SLOW PATH ONLY.
+// Per-subnet / per-VLAN filtering policies (#8).
 //
-// Each policy adds extra-blacklisted domains for one source CIDR. This NEVER touches
-// the XDP/kernel fast path: an extra-blacklisted domain is by definition NOT in the
-// global blacklist, so it misses the fast-path block and reaches `serve_wire`, where
-// this check runs; the REFUSED response is not cached, so it can't leak to other
-// subnets. Per-subnet feed-override (un-blocking a globally-blocked domain) and
-// per-subnet rate-limit are intentionally NOT implemented here — they would require
-// changing the fast path, which is kept untouched for speed.
+// Each policy adds extra-blacklisted domains for one source CIDR (additive to the
+// global filter). The slow path checks `blocks()` in `serve_wire`; the resulting
+// REFUSED is never cached, so it can't leak to other subnets.
+//
+// The fast-path cache ALSO consults this (via `has_policies()` + `blocks()` in
+// `answer_from_cache`): an extra-blacklisted domain that also resolves normally can
+// be positively cached, and a cache hit would otherwise be served without the
+// per-subnet check — bypassing the policy for cached names. When a policy blocks a
+// cached (src_ip, qname), the fast path falls back to `serve_wire`, which applies
+// the block. `has_policies()` gates this on a single relaxed load, so the check is
+// free when no policy is configured (the default). Per-subnet feed-override
+// (un-blocking a globally-blocked domain) and per-subnet rate-limit are still NOT
+// implemented — they would need deeper fast-path changes.
 
 use crate::dns::acl::CidrBlock;
 use arc_swap::ArcSwap;
@@ -166,6 +172,14 @@ pub fn apply(policies: &[SubnetPolicy]) {
 pub fn blocks(ip: IpAddr, qname_lc: &str) -> bool {
     HAS_POLICIES.load(Ordering::Relaxed)
         && LIVE.get().is_some_and(|l| l.load().blocks(ip, qname_lc))
+}
+
+/// Fast-path gate: `true` iff at least one policy is configured. Single relaxed
+/// load, so the fast path can skip the (allocating) wire→presentation qname
+/// conversion entirely when no policy exists (the default).
+#[inline]
+pub fn has_policies() -> bool {
+    HAS_POLICIES.load(Ordering::Relaxed)
 }
 
 /// Per-policy blocked counters (since the last edit) for the API / dashboard.
