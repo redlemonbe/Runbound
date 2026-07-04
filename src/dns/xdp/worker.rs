@@ -1524,8 +1524,6 @@ pub(crate) fn answer_dns_wire_pub(
     answer_dns_wire(query_bytes, out, zones, acl, src_ip)
 }
 
-/// Public (crate-visible) wrapper for `answer_from_cache` — used by `kernel_loop.rs`.
-#[inline(always)]
 /// Convert a wire-format, already-lowercased QNAME into its dotted presentation
 /// string for the subnet-policy check. Labels are ASCII; returns None on a malformed
 /// length. No trailing dot — matches the policy's `trim_end_matches('.')` normalisation.
@@ -1556,6 +1554,8 @@ fn wire_qname_to_presentation(wire: &[u8]) -> Option<String> {
     }
 }
 
+/// Public (crate-visible) wrapper for `answer_from_cache` — used by `kernel_loop.rs`.
+#[inline(always)]
 pub(crate) fn answer_from_cache_pub(
     query_bytes: &[u8],
     cache_snap: &crate::dns::cache_snapshot::CacheSnapshot,
