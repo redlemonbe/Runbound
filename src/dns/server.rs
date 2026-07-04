@@ -1948,8 +1948,12 @@ async fn run_tcp_with_limit(
         // to the loopback wire listener makes the DNS handler see 127.0.0.1, so without
         // this check TCP/DoT/DoH would bypass allow/deny/refuse rules. Deny and Refuse both
         // drop the connection here (no DNS message parsed yet); loopback follows the same
-        // ACL as the UDP path.
-        if !matches!(acl.check(src_ip), AclAction::Allow) {
+        // ACL as the UDP path. Matches on `raw_ip`, NOT the /48-normalised `src_ip`: ACL
+        // rules are CIDRs and must see the real address — normalising first would defeat any
+        // IPv6 rule finer than /48 (fail-open on a fine deny, fail-closed on a fine allow).
+        // Parity with the abuse check below and the DoQ listener; `src_ip` is only the
+        // per-/48 connection-cap key.
+        if !matches!(acl.check(raw_ip), AclAction::Allow) {
             continue;
         }
         // #ddos: the handler sees the loopback relay address for connection transports,
