@@ -457,6 +457,12 @@ impl crate::dns::dnssec_chain::Fetcher for ResolverFetcher {
 pub struct Validated {
     /// Answer records (CNAME chain followed), without RRSIG/OPT.
     pub records: Vec<Record>,
+    /// RRSIGs covering the served answer RRset(s) and every CNAME in the chain,
+    /// in ANSWER-section order. Served only to DO=1 clients (RFC 4035 §3.2.1);
+    /// empty for Insecure/unsigned answers. Kept separate from `records` so the
+    /// RRSIG-free wire answer stays cacheable and servable to DO=0 clients (the
+    /// fast path), while DO=1 clients get the signatures reattached.
+    pub answer_rrsigs: Vec<Record>,
     /// VALIDATED authority for a negative answer (RFC 2308 §3): the RRSIG-checked,
     /// in-bailiwick SOA plus the DNSSEC denial proof (NSEC/NSEC3 + RRSIGs). Empty for
     /// a positive answer. A forged/unsigned SOA is never carried here.
@@ -467,6 +473,24 @@ pub struct Validated {
     pub verdict: crate::dns::dnssec_chain::Verdict,
 }
 
+/// Push, into `out`, the RRSIG records from `answers` whose owner is `owner` and
+/// whose type-covered field is `covered`. RFC 4034 §3.1: the covered type is the
+/// first two RDATA octets; RRSIG rdata is carried opaquely as `Rdata::Unknown`
+/// (RFC 3597). These are exactly the signatures a DO=1 client needs to validate
+/// the RRset we serve for `owner`.
+fn collect_covering_rrsigs(answers: &[Record], owner: &Name, covered: u16, out: &mut Vec<Record>) {
+    for r in answers {
+        if r.rtype != consts::rtype::RRSIG || !r.name.eq_ignore_ascii_case(owner) {
+            continue;
+        }
+        if let Rdata::Unknown { data, .. } = &r.rdata {
+            if data.len() >= 2 && u16::from_be_bytes([data[0], data[1]]) == covered {
+                out.push(r.clone());
+            }
+        }
+    }
+}
+
 /// Resolve `(qname, qtype)` from the root and DNSSEC-validate the reply. The
 /// serving records follow CNAMEs (via [`resolve`]); the verdict comes from the
 /// authoritative reply for `qname`. `None` only on a hard resolution failure.
@@ -475,6 +499,9 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
     let mut target = qname.clone();
     let mut cname_left = MAX_CNAME;
     let mut records: Vec<Record> = Vec::new();
+    // RRSIGs covering the served RRsets, collected in ANSWER order alongside
+    // `records`, to reattach for DO=1 clients (RFC 4035 §3.2.1).
+    let mut rrsigs: Vec<Record> = Vec::new();
     let mut verdict = Verdict::Secure; // worst-of across every served hop
 
     loop {
@@ -504,10 +531,13 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
 
         if let Some((cn_rec, next)) = cname {
             records.push(cn_rec);
+            // Signature(s) over this CNAME (owner = current target) — DO=1 clients.
+            collect_covering_rrsigs(&msg.answers, &target, consts::rtype::CNAME, &mut rrsigs);
             if cname_left == 0 {
                 // Refuse to serve a too-long / looping chain.
                 return Some(Validated {
                     records,
+                    answer_rrsigs: Vec::new(),
                     authority: Vec::new(),
                     rcode,
                     verdict: Verdict::Bogus,
@@ -526,9 +556,11 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
                 .filter(|r| r.rtype == qtype && r.name.eq_ignore_ascii_case(&target))
                 .cloned(),
         );
+        // Signature(s) over the terminal RRset — reattached for DO=1 clients (RFC 4035 §3.2.1).
+        collect_covering_rrsigs(&msg.answers, &target, qtype, &mut rrsigs);
         // Serve only the VALIDATED authority from this terminal hop (RFC 2308 §3 SOA,
         // RRSIG-checked & in-bailiwick) — empty for a positive answer.
-        return Some(Validated { records, authority: hop_authority, rcode, verdict });
+        return Some(Validated { records, answer_rrsigs: rrsigs, authority: hop_authority, rcode, verdict });
     }
 }
 

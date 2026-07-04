@@ -1526,6 +1526,36 @@ pub(crate) fn answer_dns_wire_pub(
 
 /// Public (crate-visible) wrapper for `answer_from_cache` — used by `kernel_loop.rs`.
 #[inline(always)]
+/// Convert a wire-format, already-lowercased QNAME into its dotted presentation
+/// string for the subnet-policy check. Labels are ASCII; returns None on a malformed
+/// length. No trailing dot — matches the policy's `trim_end_matches('.')` normalisation.
+/// Only called when a subnet policy exists (gated by `has_policies()`).
+fn wire_qname_to_presentation(wire: &[u8]) -> Option<String> {
+    let mut out = String::with_capacity(wire.len());
+    let mut i = 0;
+    while i < wire.len() {
+        let len = wire[i] as usize;
+        if len == 0 {
+            break;
+        }
+        if len > 63 || i + 1 + len > wire.len() {
+            return None;
+        }
+        if !out.is_empty() {
+            out.push('.');
+        }
+        for &b in &wire[i + 1..i + 1 + len] {
+            out.push(b as char);
+        }
+        i += 1 + len;
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 pub(crate) fn answer_from_cache_pub(
     query_bytes: &[u8],
     cache_snap: &crate::dns::cache_snapshot::CacheSnapshot,
@@ -1630,6 +1660,35 @@ fn answer_from_cache(
     const QTYPE_ANY: u16 = 255;
     if qtype == QTYPE_ANY {
         return None;
+    }
+
+    // DNSSEC (DO=1) requests must fall through to the slow path, which reattaches
+    // the covering RRSIGs (RFC 4035 §3.2.1). The cache holds the RRSIG-free base
+    // answer, so serving it here would silently drop the signatures a DO client
+    // asked for. arcount==0 (no OPT) short-circuits with zero scan cost, and a
+    // DO=0 EDNS client still gets the cached answer.
+    let arcount = u16::from_be_bytes([query_bytes[10], query_bytes[11]]);
+    if arcount > 0
+        && crate::dns::wire_builder::parse_opt_rr(query_bytes, pos + 4, arcount)
+            .is_some_and(|e| e.do_bit)
+    {
+        return None;
+    }
+
+    // #8 subnet policies on the fast path: an extra-blacklisted domain that ALSO
+    // resolves normally can be positively cached, and this hit would otherwise be
+    // served without the per-subnet check (which lives in serve_wire) — bypassing the
+    // policy for cached names. has_policies() is a single relaxed load (zero cost, and
+    // skips the allocating wire→presentation conversion, when no policy is configured).
+    // When a policy blocks (src_ip, qname), fall back to serve_wire for the REFUSED.
+    if let Some(ip) = src_ip {
+        if crate::subnet_policy::has_policies() {
+            if let Some(name) = wire_qname_to_presentation(&qname_lc) {
+                if crate::subnet_policy::blocks(ip, &name) {
+                    return None;
+                }
+            }
+        }
     }
 
     // CRC32c hash (SSE4.2 + Fibonacci spread) mixed with qtype — same as answer_dns_wire.

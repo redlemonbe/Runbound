@@ -3883,21 +3883,39 @@ async fn audit_tail_handler(
     // audit::init resolution, otherwise /audit/tail cannot find the log (QA Cycle I).
     let log_path = s.cfg.audit_log_path.as_ref().map(std::path::PathBuf::from)
         .unwrap_or_else(|| s.base_dir.join("audit.log"));
+    // No audit log on disk means audit logging is simply not enabled — a normal state,
+    // not an error. Report a well-formed empty tail (200) instead of a 404 that would
+    // leak the resolved path and raw OS errno to the client.
+    if !log_path.exists() {
+        return (
+            StatusCode::OK,
+            JsonExtract(serde_json::json!({
+                "lines": [],
+                "count": 0,
+                "enabled": false,
+            })),
+        );
+    }
     match crate::audit::tail_audit_log(&log_path, n) {
         Ok(lines) => (
             StatusCode::OK,
             JsonExtract(serde_json::json!({
                 "lines": lines,
                 "count": lines.len(),
+                "enabled": true,
             })),
         ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            JsonExtract(serde_json::json!({
-                "error": "AUDIT_LOG_UNAVAILABLE",
-                "details": e,
-            })),
-        ),
+        // The file exists but could not be read (permissions, I/O, corruption). Log the
+        // detail server-side; return a generic 500 without echoing the raw OS error.
+        Err(e) => {
+            warn!(path = %log_path.display(), err = %e, "audit tail read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonExtract(serde_json::json!({
+                    "error": "AUDIT_LOG_READ_FAILED",
+                })),
+            )
+        }
     }
 }
 
@@ -4035,7 +4053,7 @@ fn render_prometheus_metrics(
         .iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).sum();
     out.push_str(&fmt_counter(
         "runbound_xdp_cache_hits_total",
-        "DNS responses served from the XDP fast-path cache (per-worker)",
+        "DNS responses served from the fast-path cache — AF_XDP workers and the kernel recvmmsg fast-loop (non-zero even when xdp:no)",
         xdp_worker_hits,
     ));
     out.push_str(&fmt_counter(
@@ -7972,8 +7990,12 @@ async fn banned_list_handler(State(s): State<AppState>) -> impl IntoResponse {
 }
 
 // POST /api/protection/banned/:ip/blacklist — promote a ban to a permanent one
-// ("blacklist"): it no longer auto-expires, is dropped on both datapaths, and is
-// propagated to slaves like any other ban.
+// ("blacklist"): it no longer auto-expires and is propagated to slaves. The ban is
+// applied to BOTH ban systems so it is enforced on every path: `icmp_stats`
+// (XDP + kernel-UDP fast path) AND `alert_tracker` (the `serve_wire` slow path, which
+// is what DoT/DoH/DoQ go through — they check `alert.is_blocked`, not `icmp_stats`).
+// Before this, only icmp_stats was set, so a blacklisted IP could still reach the
+// resolver over the encrypted transports (DoT/DoH/DoQ) and the slow path.
 async fn blacklist_ip_handler(
     State(state): State<AppState>,
     axum::extract::Path(ip_str): axum::extract::Path<String>,
@@ -7981,6 +8003,7 @@ async fn blacklist_ip_handler(
     match ip_str.parse::<std::net::IpAddr>() {
         Ok(ip) => {
             state.icmp_stats.ban_permanent(ip);
+            state.alert_tracker.block_manual(ip, "manual-blacklist".to_string());
             if let std::net::IpAddr::V4(ipv4) = ip {
                 let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
             }

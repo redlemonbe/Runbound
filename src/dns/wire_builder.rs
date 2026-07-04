@@ -149,7 +149,7 @@ pub fn parse_query(buf: &[u8]) -> Option<WireQuery<'_>> {
 /// All buffer accesses are bounds-checked. A truncated or malformed
 /// additional section yields None without panicking (#156 security review).
 #[inline]
-fn parse_opt_rr(buf: &[u8], mut pos: usize, arcount: u16) -> Option<EdnsInfo> {
+pub(crate) fn parse_opt_rr(buf: &[u8], mut pos: usize, arcount: u16) -> Option<EdnsInfo> {
     if arcount == 0 {
         return None;
     }
