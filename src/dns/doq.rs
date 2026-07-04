@@ -31,6 +31,11 @@ const MAX_DNS_MSG: usize = 65535;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Concurrent in-flight query streams per connection (anti-amplification / DoS bound).
 const MAX_BIDI_STREAMS: u32 = 128;
+/// Wall-clock cap on a single stream's read+resolve+write, independent of activity.
+/// Parity with the DoT/DoH `TLS_SESSION_TIMEOUT` in `run_tcp_with_limit`: `IDLE_TIMEOUT`
+/// alone is reset by any packet, so a peer trickling keepalives could hold a stream
+/// (and its slot) open indefinitely. This bounds each stream's total lifetime.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bind a DNS-over-QUIC listener on `addr` (UDP) and spawn its accept loop.
 ///
@@ -111,6 +116,11 @@ async fn serve_connection(
     let conn = incoming.await?;
     let peer = conn.remote_address();
     let ip = peer.ip();
+    // The per-IP connection cap keys on the /48-normalised IP (parity with the TCP/DoT/DoH
+    // path via normalize_tcp_ip): otherwise an IPv6 client rotating source addresses inside
+    // its /64 gets a fresh quota per /128 and defeats the cap. ACL and abuse still use the
+    // raw `ip` (CIDR match / real-source ban). Loopback is decided on the raw `ip` below.
+    let cap_ip = crate::dns::server::normalize_tcp_ip(ip);
 
     // Connection-level protections, parity with run_tcp_with_limit (DoT/DoH). Loopback
     // is exempt (health checks / local relay), matching the tracker and abuse engine.
@@ -139,17 +149,18 @@ async fn serve_connection(
                 AbuseVerdict::Serve => {}
             }
         }
-        // 3) Per-IP connection cap (shared with TCP/DoT/DoH). Released on any exit.
-        if !tracker.try_acquire(ip) {
+        // 3) Per-IP connection cap (shared with TCP/DoT/DoH), keyed on the /48. Released on any exit.
+        if !tracker.try_acquire(cap_ip) {
             conn.close(DOQ_REFUSED.into(), b"conn-cap");
             return Ok(());
         }
     }
     // Hold the slot for the connection's lifetime (no-op for loopback: try_acquire
-    // returned true without incrementing, and release() is a cheap miss).
+    // returned true without incrementing, and release() is a cheap miss). Keyed on the
+    // same /48-normalised IP as try_acquire so the release matches the acquire.
     let _slot = ConnSlot {
         tracker: Arc::clone(&tracker),
-        ip,
+        ip: cap_ip,
     };
 
     loop {
@@ -164,7 +175,15 @@ async fn serve_connection(
         };
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
-            serve_stream(send, recv, peer, handler).await;
+            // Wall-clock bound on the whole stream (parity with the DoT/DoH
+            // TLS_SESSION_TIMEOUT): drop a stream that trickles bytes or stalls in
+            // read_to_end instead of holding its slot open indefinitely. On timeout the
+            // send/recv halves drop and quinn resets the stream.
+            let _ = tokio::time::timeout(
+                STREAM_TIMEOUT,
+                serve_stream(send, recv, peer, handler),
+            )
+            .await;
         });
     }
 }

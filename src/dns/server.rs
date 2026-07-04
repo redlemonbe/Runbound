@@ -1803,7 +1803,7 @@ fn bind_xdp_reply_sock(port: u16) -> anyhow::Result<std::net::UdpSocket> {
 const TCP_CONN_PER_IP_MAX: u16 = 20;
 
 /// Truncate IPv6 to /48 for TCP connection tracking (consistent with rate limiter).
-fn normalize_tcp_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn normalize_tcp_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => {
