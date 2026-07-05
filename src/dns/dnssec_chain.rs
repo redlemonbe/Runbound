@@ -74,6 +74,25 @@ fn dnskey_ttl(section: &[wire::Record]) -> u32 {
         .unwrap_or(3600)
 }
 
+/// The earliest RRSIG signature-expiration across `sigs` (RFC 4034 §3.1.5: an
+/// absolute unix timestamp at RRSIG rdata offset 8..12), or `None` if none parse.
+fn min_rrsig_expiration(sigs: &[Vec<u8>]) -> Option<u32> {
+    sigs.iter()
+        .filter_map(|d| d.get(8..12).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+        .min()
+}
+
+/// Lifetime to cache a validated DNSKEY set under: the RRset TTL, further bounded
+/// by how long its signatures stay valid — so a revoked/rolled key is never reused
+/// past the point its RRSIG expired, not merely until the RRset TTL lapses (#230
+/// audit F-1). `sigs` are the RRSIG rdatas covering the DNSKEY RRset.
+fn dnskey_cache_ttl(rrset_ttl: u32, sigs: &[Vec<u8>], now: u32) -> u32 {
+    match min_rrsig_expiration(sigs) {
+        Some(exp) => rrset_ttl.min(exp.saturating_sub(now)),
+        None => rrset_ttl,
+    }
+}
+
 fn as_unknown(rdatas: &[Vec<u8>], rtype: u16) -> Vec<Rdata> {
     rdatas
         .iter()
@@ -134,7 +153,8 @@ pub async fn trusted_keys_for<F: Fetcher>(
             return (Verdict::Bogus, vec![]);
         };
         let owned: Vec<Vec<u8>> = root_keys.iter().map(|s| s.to_vec()).collect();
-        infra_cache::dnskey_learn(&Name::root(), &owned, dnskey_ttl(&root_msg.answers));
+        let ttl = dnskey_cache_ttl(dnskey_ttl(&root_msg.answers), &rs, now);
+        infra_cache::dnskey_learn(&Name::root(), &owned, ttl);
         owned
     };
 
@@ -228,8 +248,10 @@ pub async fn trusted_keys_for<F: Fetcher>(
             return (Verdict::Bogus, vec![]);
         };
         keys = child_keys.iter().map(|s| s.to_vec()).collect();
-        // #230: cache this now-validated cut (Secure) so later chains reuse it.
-        infra_cache::dnskey_learn(&child, &keys, dnskey_ttl(&km.answers));
+        // #230: cache this now-validated cut (Secure) so later chains reuse it,
+        // bounded by the DNSKEY RRSIG validity (audit F-1).
+        let ttl = dnskey_cache_ttl(dnskey_ttl(&km.answers), &cs, now);
+        infra_cache::dnskey_learn(&child, &keys, ttl);
         current = child;
     }
     (Verdict::Secure, keys)
@@ -580,6 +602,23 @@ mod tests {
         let labels: Vec<String> = p.iter().map(|n| n.to_ascii()).collect();
         assert_eq!(labels, vec!["com.".to_string(), "cloudflare.com.".to_string()]);
         assert!(delegation_path(&Name::root()).is_empty());
+    }
+
+    #[test]
+    fn dnskey_cache_ttl_bounded_by_rrsig_expiration() {
+        // RRSIG rdata layout: type_covered(2) algo(1) labels(1) orig_ttl(4)
+        // sig_expiration(4) ... — put the expiration (=1000) at offset 8..12.
+        let mut sig = vec![0u8; 18];
+        sig[8..12].copy_from_slice(&1000u32.to_be_bytes());
+        let one = std::slice::from_ref(&sig);
+        // RRset TTL 5000 but the signature expires at t=1000 → from now=600, cap 400.
+        assert_eq!(dnskey_cache_ttl(5000, one, 600), 400);
+        // RRset TTL 100 is shorter than the remaining signature validity → TTL wins.
+        assert_eq!(dnskey_cache_ttl(100, one, 600), 100);
+        // No signatures supplied → fall back to the RRset TTL.
+        assert_eq!(dnskey_cache_ttl(300, &[], 600), 300);
+        // Signature already expired → 0 (the cache's TTL_FLOOR clamps the min age).
+        assert_eq!(dnskey_cache_ttl(5000, one, 2000), 0);
     }
 
     // A DO-over-TCP fetcher against a public resolver, CD=1 (raw records).

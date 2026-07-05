@@ -104,18 +104,24 @@ impl<V: Clone> Bounded<V> {
         self.map.remove(key);
     }
 
-    /// Evict one entry: an expired one if any, else the least-recently-used.
+    /// Evict one entry, sampling at most `EVICT_SAMPLE` entries (Redis-style): drop
+    /// the first expired one seen, else the least-recently-used within the sample.
+    /// O(1) per insert regardless of capacity — a full O(n) scan under the global
+    /// lock on every insert once the cache is full would let a flood of distinct
+    /// zones/subdomains serialise every learner behind an O(cap) scan (#230 audit).
     fn evict_one(&mut self, now: u32) {
-        if let Some(k) = self
-            .map
-            .iter()
-            .find(|(_, e)| e.expiry <= now)
-            .map(|(k, _)| k.clone())
-        {
-            self.map.remove(&k);
-            return;
+        const EVICT_SAMPLE: usize = 16;
+        let mut lru: Option<(u64, String)> = None;
+        for (k, e) in self.map.iter().take(EVICT_SAMPLE) {
+            if e.expiry <= now {
+                lru = Some((0, k.clone())); // an expired entry wins outright
+                break;
+            }
+            if lru.as_ref().is_none_or(|(u, _)| e.used < *u) {
+                lru = Some((e.used, k.clone()));
+            }
         }
-        if let Some(k) = self.map.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k.clone()) {
+        if let Some((_, k)) = lru {
             self.map.remove(&k);
         }
     }
