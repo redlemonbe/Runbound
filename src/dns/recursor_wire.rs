@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
 //
-// In-house iterative recursive resolver (Phase 1 — no DNSSEC validation yet).
+// In-house iterative recursive resolver with DNSSEC validation.
 //
 // Resolves a query from the IANA root servers without any third-party DNS
 // library: it sends raw wire queries (built/parsed by `dns::wire`), follows
@@ -14,12 +14,13 @@
 //   - a global query budget and a delegation/CNAME depth cap (anti-DoS);
 //   - referrals must move *down* the tree (never sideways/up → no loops).
 //
-// DNSSEC validation is Phase 2 and lives elsewhere; this module deliberately
-// does NOT set the AD bit and must not be wired as the validating recursor.
+// DNSSEC: `resolve_validated` is the validating entry point, dispatched from
+// `server.rs` under `resolution: full-recursion` + `dnssec-validation: yes`;
+// it validates the chain and yields the AD verdict. The raw `resolve` /
+// `resolve_message` entry points are non-validating and used by tests/oracles.
 
-// Phase 1: the resolver is built and tested but not yet dispatched to (that
-// happens in Phase 2, once DNSSEC validation is in place), so its public API is
-// not reachable from the binary yet.
+// Some entry points (raw `resolve`, helpers) are only reached from tests in the
+// default build, so keep the module-level dead-code allowance.
 #![allow(dead_code)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

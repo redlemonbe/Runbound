@@ -3,8 +3,8 @@
 // Runbound — Immutable audit log
 //
 // Events are written to an append-only file (O_APPEND | O_CREAT | O_WRONLY).
-// Each line is a JSON object with a monotonic sequence number and an HMAC-SHA256
-// chain: mac = HMAC-SHA256(key, seq || ts || event || fields).
+// Each line is a JSON object with a monotonic sequence number and a per-entry
+// HMAC-SHA256 (not a running chain): mac = HMAC-SHA256(key, seq || ts || event || fields).
 //
 // A dedicated tokio task drains an unbounded channel — callers never block.
 // The monotonic seq is persisted in `base_dir/audit-seq.dat` so it survives restarts.
@@ -245,7 +245,7 @@ async fn writer_task(
             .as_secs();
 
         let event_name = event.event_name();
-        // Attribute the actor inside `fields` so it is covered by the HMAC chain.
+        // Attribute the actor inside `fields` so it is covered by the per-entry HMAC.
         let mut fields = event.fields();
         if let Some(o) = fields.as_object_mut() {
             o.insert("actor".to_string(), serde_json::json!(actor));

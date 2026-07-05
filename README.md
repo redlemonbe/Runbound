@@ -8,7 +8,7 @@
 
 > ⚠️ **Status: Experimental** — Runbound is under active development and has not yet undergone external human security audit. Not yet recommended for production deployments handling sensitive traffic.
 
-Most existing `unbound.conf` files work as-is. Non-standard or exotic directives are ignored gracefully — see [Unbound compatibility](docs/unbound-migration.md). Runbound adds a live REST API, AF_XDP kernel-bypass, and a browser dashboard on top.
+Most existing `unbound.conf` files parse without error — non-standard directives are ignored gracefully, and unsupported tuning knobs are preserved but inert (not applied) — see [Unbound compatibility](docs/unbound-migration.md). Runbound adds a live REST API, AF_XDP kernel-bypass, and a browser dashboard on top.
 
 > **Prior art.** DNS-over-XDP is not new — [Knot DNS](https://www.knot-dns.cz/) has had an authoritative XDP mode since 3.0 (2020), and the Knot project ships `kxdpgun`, an XDP DNS load generator. Runbound's contribution is the *combination*: a **drop-in Unbound-compatible resolver** with the XDP fast path on the cache/serve hot path, a **live REST API** (change config with no restart), and a **single static musl binary** — not XDP on its own.
 
@@ -57,26 +57,26 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 | Forwarding resolver | DoT-capable upstreams, query racing, per-upstream health probes |
 | Sovereign recursion | iterative from the root, opt-in (#202) — no third-party resolver sees your queries; DNSSEC-validated, anti-SSRF |
 | Split-horizon DNS | per-subnet answers |
-| serve-stale (RFC 8767) | answer from expired cache while refreshing in the background |
+| serve-stale (RFC 8767) | answer from expired cache on upstream SERVFAIL |
 
 ### Security & DNSSEC
 | Feature | Notes |
 |---|---|
-| DNSSEC validation | enforced under full-recursion — Bogus → SERVFAIL, AD bit |
+| DNSSEC validation | under full-recursion with `dnssec-validation: yes` — Bogus → SERVFAIL, AD bit |
 | Authoritative DNSSEC signing | online & zero-touch — per-zone KSK+ZSK (ECDSAP256), NSEC3 authenticated denial of existence, DS surfaced via API (#201) |
 | Encrypted DNS server | DoT (853) / DoH (443/RFC 8484 GET+POST) / DoQ (853) — self-signed leaf signed by a downloadable local CA (import once), or import your own; live, no restart |
 | Automatic TLS | built-in ACME / Let’s Encrypt |
 | DDoS abuse engine | per-client rate-limit + **tarpit** + bans, escalation gated to **verified sources** (connection-based transports TCP/DoT/DoH/DoQ, or UDP carrying a valid DNS cookie — anti-spoof); bans dropped at the XDP/kernel layer; enforced on both datapaths |
 | RBAC | read / dns / operator / admin API roles |
 | Privacy by default | client-IP redaction, configurable retention (GDPR) |
-| Tamper-evident audit log | HMAC-chained, SIEM-ready JSON; **actor-attributed** (every admin/user action), searchable in the WebUI |
+| Tamper-evident audit log | per-entry HMAC-SHA256, SIEM-ready JSON; **actor-attributed** (every admin/user action), searchable in the WebUI |
 
 ### Performance — XDP fast path
 | Feature | Notes |
 |---|---|
-| AF_XDP kernel-bypass | zero-syscall hot path; ~9.85 M qps single-link X710 (line-bound), ~19.4 M qps dual-link sustained flood (NIC-truth, ~24 % host CPU; 20.3 M peak under ramp) — see [Performance](#performance) |
+| AF_XDP kernel-bypass | near-zero-syscall hot path; ~9.85 M qps single-link X710 (line-bound), ~19.4 M qps dual-link sustained flood (NIC-truth, ~24 % host CPU; 20.3 M peak under ramp) — see [Performance](#performance) |
 | SIMD / ASM wire responder | shared by the fast and slow paths |
-| Multi-NIC + IRQ/CPU auto-pinning | governor control, ring auto-sizing |
+| Multi-NIC + IRQ/CPU auto-pinning | governor control, NIC-queue auto-sizing |
 | XDP ICMP echo responder | rate-limited, with auto-ban |
 | Static binary | musl, no runtime dependencies |
 
@@ -255,18 +255,18 @@ p50 **31 µs** (X710) / **34 µs** (X520); kernel slow-path cache-hit latency (t
 **24.6 µs** (X710). These two latencies are **not directly comparable** — the fast-path figure is generator-side (server + link RTT, via `dnsmark --wire-latency`), the slow-path figure is server-only (via `tcpdump dns.time`). Recursion and DNSSEC are fully in-house. Full context, with every counter and caveat:
 [docs/benchmark/INDEX.md](docs/benchmark/INDEX.md).
 
-The fast path is **self-configuring**: AF_XDP ring sizes are derived from the NIC
-hardware, huge pages are self-provisioned, and NIC queues scale to the CPU
-automatically (kept at the driver default on bus-bound Xeon v2 + X520). It is **designed for
+The fast path is **self-configuring**: huge pages are self-provisioned and NIC
+queues scale to the CPU automatically (AF_XDP ring sizes use a fixed default;
+queues kept at the driver default on bus-bound Xeon v2 + X520). It is **designed for
 linear scaling** — `SO_REUSEPORT`, lock-free config hot-swap (`ArcSwap`), per-core affinity, and
 SSE4.2 `CRC32c` + SIMD on the lookup path — though core scaling beyond the 2×10G link ceiling is
 not yet demonstrated (every run so far is link-bound at ≤24 % CPU).
 
 ## AF/XDP Fast Path
 
-An eBPF XDP program attaches to the NIC at startup. UDP/53 packets for local zones and cache hits are answered in user space at driver level — zero syscalls on the hot path. All other queries pass through to the normal resolver via `XDP_PASS`.
+An eBPF XDP program attaches to the NIC at startup. UDP/53 packets for local zones and cache hits are answered in user space at driver level — near-zero syscalls on the hot path (a `sendto` wakeup only when the TX ring drains under sustained load). All other queries pass through to the normal resolver via `XDP_PASS`.
 
-Negative answers (`NODATA` / `NXDOMAIN`) are cached on the fast path too (RFC 2308). AF_XDP ring sizes, huge pages, and NIC queue counts are **configured automatically** at startup — see [docs/xdp.md](docs/xdp.md).
+Local-zone negative answers (`NODATA` / `NXDOMAIN`) are served on the fast path; a recursive negative cache (RFC 2308) is not yet implemented (#166). Huge pages and NIC queue counts are **configured automatically** at startup — see [docs/xdp.md](docs/xdp.md).
 
 ```bash
 # Verify XDP is active
