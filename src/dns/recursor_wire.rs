@@ -30,6 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
+use crate::dns::infra_cache;
 use crate::dns::wire::{self, consts, Name, Rdata, Record};
 
 /// IANA root servers (IPv4) — the recursion bootstrap ("hints").
@@ -48,6 +49,51 @@ const ROOT_HINTS_V4: [Ipv4Addr; 13] = [
     Ipv4Addr::new(199, 7, 83, 42),
     Ipv4Addr::new(202, 12, 27, 33),
 ];
+
+/// The root hint IPs as a fresh `Vec` — the descent bootstrap when nothing
+/// closer is cached (#230).
+fn root_hints() -> Vec<IpAddr> {
+    ROOT_HINTS_V4.iter().copied().map(IpAddr::V4).collect()
+}
+
+/// Where to begin the descent for `(qname, qtype)` using the #230 zone-cut cache,
+/// or `None` to start from the root.
+///
+/// A DS record is authoritative in the PARENT zone, not in the zone it names, so a
+/// DS query must never jump to `qname`'s own cached cut — that would ask the child
+/// for its own DS (answered NODATA there) and wrongly fail the chain to Bogus.
+/// For DS we therefore anchor the lookup at the parent; every other type is served
+/// by the zone itself, so we anchor at `qname`.
+fn cached_start(qname: &Name, qtype: u16) -> Option<(Name, Vec<IpAddr>)> {
+    let anchor = if qtype == consts::rtype::DS {
+        qname.parent()?
+    } else {
+        qname.clone()
+    };
+    infra_cache::zone_cut_start(&anchor)
+}
+
+/// TTL to cache a learned zone cut under (#230): the min TTL of the referral's NS
+/// RRset (owner == the delegated `zone`) and of any glue A/AAAA for those NS
+/// names. Falls back to a conservative default if the referral carried no TTL.
+fn cut_ttl(msg: &wire::Message, zone: &Name, ns_names: &[Name]) -> u32 {
+    let mut ttl = u32::MAX;
+    for r in &msg.authority {
+        if r.rtype == consts::rtype::NS && r.name.eq_ignore_ascii_case(zone) {
+            ttl = ttl.min(r.ttl);
+        }
+    }
+    for r in &msg.additional {
+        if record_ip(r).is_some() && ns_names.iter().any(|n| n.eq_ignore_ascii_case(&r.name)) {
+            ttl = ttl.min(r.ttl);
+        }
+    }
+    if ttl == u32::MAX {
+        3600
+    } else {
+        ttl
+    }
+}
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Total upstream queries allowed for one user query (anti-DoS budget).
@@ -235,14 +281,27 @@ enum StepOutcome {
 /// referrals until an answer / negative / failure. Does not follow CNAMEs
 /// across the tree — that is the caller's loop.
 async fn resolve_once(qname: &Name, qtype: u16, budget: &mut u32) -> StepOutcome {
-    // Current nameserver IP set; start at the root hints.
-    let mut ns_ips: Vec<IpAddr> = ROOT_HINTS_V4.iter().copied().map(IpAddr::V4).collect();
-    let mut zone = Name::root();
+    // #230: start at the deepest cached enclosing zone cut instead of always the
+    // root. A stale/dead cached cut (its first query fails) is forgotten and we
+    // restart from the root, so the cache can only speed resolution up, never
+    // break it. Every answer is still DNSSEC-validated by the caller.
+    let (mut zone, mut ns_ips, mut from_cache) = match cached_start(qname, qtype) {
+        Some((z, ips)) => (z, ips, true),
+        None => (Name::root(), root_hints(), false),
+    };
 
     for _depth in 0..MAX_DEPTH {
         let Some(msg) = query_ns_set(&ns_ips, qname, qtype, budget).await else {
+            if from_cache {
+                infra_cache::zone_cut_forget(&zone);
+                zone = Name::root();
+                ns_ips = root_hints();
+                from_cache = false;
+                continue;
+            }
             return StepOutcome::Failure;
         };
+        from_cache = false;
         let rcode = msg.header.rcode_low();
 
         // CNAME for our exact name (even when the type differs) → hand back to caller.
@@ -321,6 +380,8 @@ async fn resolve_once(qname: &Name, qtype: u16, budget: &mut u32) -> StepOutcome
         if next_ips.is_empty() {
             return StepOutcome::Failure;
         }
+        // #230: remember this cut so the next miss under it skips the root walk.
+        infra_cache::zone_cut_learn(&next_zone, &next_ips, cut_ttl(&msg, &next_zone, &ns_names));
         ns_ips = next_ips;
         zone = next_zone;
     }
@@ -378,11 +439,27 @@ fn record_ip(r: &Record) -> Option<IpAddr> {
 /// does not chase CNAMEs: the validator queries explicit types).
 pub async fn resolve_message(qname: &Name, qtype: u16) -> Option<wire::Message> {
     let mut budget = MAX_QUERIES;
-    let mut ns_ips: Vec<IpAddr> = ROOT_HINTS_V4.iter().copied().map(IpAddr::V4).collect();
-    let mut zone = Name::root();
+    // #230: start from the deepest cached cut, with a root fallback if it is stale.
+    let (mut zone, mut ns_ips, mut from_cache) = match cached_start(qname, qtype) {
+        Some((z, ips)) => (z, ips, true),
+        None => (Name::root(), root_hints(), false),
+    };
 
     for _ in 0..MAX_DEPTH {
-        let msg = query_ns_set(&ns_ips, qname, qtype, &mut budget).await?;
+        let msg = match query_ns_set(&ns_ips, qname, qtype, &mut budget).await {
+            Some(m) => m,
+            None => {
+                if from_cache {
+                    infra_cache::zone_cut_forget(&zone);
+                    zone = Name::root();
+                    ns_ips = root_hints();
+                    from_cache = false;
+                    continue;
+                }
+                return None;
+            }
+        };
+        from_cache = false;
         let rcode = msg.header.rcode_low();
 
         // Terminal: an answer for our name (qtype or CNAME), or NXDOMAIN.
@@ -438,6 +515,8 @@ pub async fn resolve_message(qname: &Name, qtype: u16) -> Option<wire::Message> 
         if next_ips.is_empty() {
             return None;
         }
+        // #230: remember this cut so the next miss under it skips the root walk.
+        infra_cache::zone_cut_learn(&next_zone, &next_ips, cut_ttl(&msg, &next_zone, &ns_names));
         ns_ips = next_ips;
         zone = next_zone;
     }
@@ -679,5 +758,34 @@ mod tests {
                 assert_eq!(got, Verdict::Secure, "{fqdn}: expected Secure");
             }
         }
+    }
+
+    // #230 regression: the infrastructure cache must make repeated misses under
+    // the same parent materially faster. The FIRST miss walks from the root and
+    // builds the whole DNSSEC chain; the next misses must reuse the cached zone
+    // cut + validated DNSKEY chain and collapse to roughly one authoritative RTT.
+    // Needs outbound UDP+TCP/53. Run alone for a clean cold/warm split:
+    //   cargo test --release -- --ignored --nocapture cache_speeds_up_repeated_misses
+    #[tokio::test]
+    #[ignore]
+    async fn cache_speeds_up_repeated_misses() {
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let mut ms = [0u128; 3];
+        for (i, slot) in ms.iter_mut().enumerate() {
+            // Distinct random NXDOMAIN under the same signed parent (clubic.com).
+            let name = Name::from_ascii(&format!("zz-{i}-rb230probe.clubic.com.")).unwrap();
+            let t = Instant::now();
+            let _ = resolve_validated(&name, consts::rtype::A, now).await;
+            *slot = t.elapsed().as_millis();
+            eprintln!("miss {i} (validated) -> {} ms", *slot);
+        }
+        let warm = ms[1].min(ms[2]);
+        assert!(
+            warm * 2 <= ms[0].max(1),
+            "warm misses ({warm} ms) must be at least 2x faster than the cold one ({} ms) — \
+             the infrastructure cache is not being reused",
+            ms[0]
+        );
     }
 }

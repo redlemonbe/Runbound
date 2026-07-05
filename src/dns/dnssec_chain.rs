@@ -63,6 +63,17 @@ fn split(section: &[wire::Record], rtype: u16) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     (rdatas, sigs)
 }
 
+/// Min TTL of the DNSKEY records in `section` (the RRset's cache lifetime), with
+/// a conservative floor if none are present — the lifetime for the #230 cache.
+fn dnskey_ttl(section: &[wire::Record]) -> u32 {
+    section
+        .iter()
+        .filter(|r| r.rtype == consts::rtype::DNSKEY)
+        .map(|r| r.ttl)
+        .min()
+        .unwrap_or(3600)
+}
+
 fn as_unknown(rdatas: &[Vec<u8>], rtype: u16) -> Vec<Rdata> {
     rdatas
         .iter()
@@ -93,24 +104,50 @@ pub async fn trusted_keys_for<F: Fetcher>(
     zone: &Name,
     now: u32,
 ) -> (Verdict, Vec<Vec<u8>>) {
-    // 1. Root DNSKEY against the hardcoded anchor.
-    let Some(root_msg) = fetcher.fetch(&Name::root(), consts::rtype::DNSKEY).await else {
-        return (Verdict::Bogus, vec![]);
-    };
-    let (rk, rs) = split(&root_msg.answers, consts::rtype::DNSKEY);
-    let rk_refs: Vec<&[u8]> = rk.iter().map(|v| v.as_slice()).collect();
-    let rs_refs: Vec<&[u8]> = rs.iter().map(|v| v.as_slice()).collect();
-    let Some(root_keys) =
-        verify::validate_dnskey_rrset(&Name::root(), &rk_refs, &rs_refs, verify::ROOT_ANCHORS, now)
-    else {
-        return (Verdict::Bogus, vec![]);
-    };
+    use crate::dns::infra_cache;
+
+    // #230: a fully-validated key set for the exact target zone → done, no fetch.
+    // Only Secure zones are ever cached, so a hit is always Secure.
+    if let Some(keys) = infra_cache::dnskey_get(zone) {
+        return (Verdict::Secure, keys);
+    }
+
+    // 1. Root DNSKEY: reuse the cached validated set if fresh, else fetch it,
+    //    validate against the hardcoded anchor, and cache it (~once / 48 h).
     let mut current = Name::root();
-    let mut keys: Vec<Vec<u8>> = root_keys.iter().map(|s| s.to_vec()).collect();
+    let mut keys: Vec<Vec<u8>> = if let Some(rk) = infra_cache::dnskey_get(&Name::root()) {
+        rk
+    } else {
+        let Some(root_msg) = fetcher.fetch(&Name::root(), consts::rtype::DNSKEY).await else {
+            return (Verdict::Bogus, vec![]);
+        };
+        let (rk, rs) = split(&root_msg.answers, consts::rtype::DNSKEY);
+        let rk_refs: Vec<&[u8]> = rk.iter().map(|v| v.as_slice()).collect();
+        let rs_refs: Vec<&[u8]> = rs.iter().map(|v| v.as_slice()).collect();
+        let Some(root_keys) = verify::validate_dnskey_rrset(
+            &Name::root(),
+            &rk_refs,
+            &rs_refs,
+            verify::ROOT_ANCHORS,
+            now,
+        ) else {
+            return (Verdict::Bogus, vec![]);
+        };
+        let owned: Vec<Vec<u8>> = root_keys.iter().map(|s| s.to_vec()).collect();
+        infra_cache::dnskey_learn(&Name::root(), &owned, dnskey_ttl(&root_msg.answers));
+        owned
+    };
 
     // 2. Descend each zone cut, validating DS (in the parent) then the child DNSKEY.
     for child in delegation_path(zone) {
         if child.eq_ignore_ascii_case(&current) {
+            continue;
+        }
+        // #230: a cut we already validated (and cached) → adopt its keys directly,
+        // skipping the DS + DNSKEY fetch for it.
+        if let Some(ck) = infra_cache::dnskey_get(&child) {
+            keys = ck;
+            current = child;
             continue;
         }
         let key_refs: Vec<&[u8]> = keys.iter().map(|v| v.as_slice()).collect();
@@ -191,6 +228,8 @@ pub async fn trusted_keys_for<F: Fetcher>(
             return (Verdict::Bogus, vec![]);
         };
         keys = child_keys.iter().map(|s| s.to_vec()).collect();
+        // #230: cache this now-validated cut (Secure) so later chains reuse it.
+        infra_cache::dnskey_learn(&child, &keys, dnskey_ttl(&km.answers));
         current = child;
     }
     (Verdict::Secure, keys)

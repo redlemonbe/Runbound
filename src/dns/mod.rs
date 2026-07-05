@@ -16,6 +16,7 @@ pub mod ratelimit;
 pub mod server;
 // In-house iterative recursive resolver + DNSSEC validation (hickory-free).
 // The default serving path uses these for `resolution: full-recursion`.
+pub mod infra_cache;
 pub mod recursor_wire;
 pub mod dnssec_verify;
 pub mod dnssec_denial;
