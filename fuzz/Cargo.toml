@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
+[package]
+name = "runbound-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "fuzz_dns_query"
+path = "fuzz_targets/fuzz_dns_query.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_config"
+path = "fuzz_targets/fuzz_config.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_api_json"
+path = "fuzz_targets/fuzz_api_json.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_dns_name"
+path = "fuzz_targets/fuzz_dns_name.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+runbound = { path = "..", features = ["fuzz"] }
+hickory-proto = "0.26"
+serde_json = "1"
+
+[profile.release]
+debug = 1
+opt-level = 3

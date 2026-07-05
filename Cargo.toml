@@ -1,0 +1,188 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
+[package]
+name = "runbound"
+version = "0.9.0"
+edition = "2021"
+authors = ["redlemonbe <https://github.com/redlemonbe>"]
+license = "AGPL-3.0-or-later"
+description = "High-performance DNS server with XDP kernel-bypass, REST API, and web dashboard"
+readme = "README.md"
+repository = "https://github.com/redlemonbe/Runbound"
+homepage = "https://github.com/redlemonbe/Runbound"
+keywords = ["dns", "unbound", "resolver", "dnssec", "acme"]
+categories = ["network-programming", "command-line-utilities"]
+exclude = [
+    "runbound-*",
+    "*.sha256",
+    "sbom.cdx.json",
+    "runbound.cdx.json",
+    "runbound.json",
+    "fuzz/",
+    "docs/",
+]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "io-uring"] }
+
+# DNS engine — DoT / DoH / DoQ / DNSSEC
+# 0.26.1 fixes RUSTSEC-2026-0119 (O(n²) compression), RUSTSEC-2026-0037 (quinn DoS),
+# RUSTSEC-2025-0009 (ring AES panic), RUSTSEC-2026-0104/0098/0099 (rustls-webpki).
+# hickory is not used at runtime: recursion + DNSSEC validation are
+# in-house (dns::recursor_wire + dns::dnssec_*). hickory-proto remains only as a
+# dev-dependency for the differential oracle tests (see [dev-dependencies]).
+
+# TLS — rustls 0.23 (TLS 1.3 default, rustls-webpki CVEs fixed)
+rustls              = { version = "0.23", features = ["tls12"] }
+rustls-pemfile      = "2"
+rustls-native-certs = "0.8"
+webpki-roots        = "0.26"
+# DNS-over-QUIC (RFC 9250) — own listener (src/dns/doq.rs). quinn is independent
+# of hickory; it reuses our rustls config + the ring provider. Minimal features:
+# no platform-verifier (server-side only), ring crypto to match the rest of the stack.
+quinn               = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+
+# DNSSEC signing crypto (own signer) — ECDSA P-256 fixed sig + SHA-1/256.
+ring                = "0.17"
+
+# REST API
+axum       = { version = "0.7", features = ["json"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower      = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+
+# Serialization
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+serde_with  = "3"
+
+# Error handling
+thiserror = "2"
+anyhow    = "1"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender   = "0.2"
+
+# Utils
+uuid            = { version = "1", features = ["v4", "serde"] }
+argon2 = { version = "0.5", features = ["std"] }
+base64   = "0.22"
+sha2            = "0.10"
+hmac            = "0.12"
+getrandom       = "0.3"
+hex             = "0.4"
+subtle          = "2"
+tempfile        = "3"
+regex           = "1"
+humantime       = "2"
+humantime-serde = "1"
+
+# HTTP client (feeds fetch + ACME HTTP-01 bridge)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# ACME (Let's Encrypt) — ring backend only; HTTP done via reqwest bridge
+instant-acme = { version = "0.8", default-features = false, features = ["ring"] }
+
+# HSM (Hardware Security Module) key storage via PKCS#11
+# cryptoki provides the Rust binding; the actual PKCS#11 .so is loaded
+# dynamically at runtime (dlopen) — no compile-time dependency on the HSM.
+cryptoki = "0.6"
+
+# Secure memory zeroing — used for HSM-loaded key material (Zeroizing<T>)
+zeroize = "1"
+
+# Zero-copy byte buffers — used in ACME HttpClient bridge and XDP cache (#64)
+bytes = "1"
+
+# Stack-allocated small vectors — used in XDP wire-format cache keys (#64)
+smallvec = { version = "1", features = ["union"] }
+
+# HTTP types shared across hyper / axum / instant-acme
+http = "1"
+
+# Stream utilities — SSE streaming for /stats/stream endpoint
+futures-util = "0.3"
+
+# Zero-copy cache persistence (#29)
+rkyv = { version = "0.8", features = ["bytecheck", "smallvec-1"] }
+
+# Async trait (required by RequestHandler impl)
+async-trait = "0.1"
+
+# Jemalloc (Linux only)
+tikv-jemallocator = "0.6"
+
+# Concurrent HashMap — replaces Mutex<HashMap> in rate limiter (lock-free reads)
+dashmap = "6"
+
+# Fast non-cryptographic hasher — RandomState seeded by OS CSPRNG at startup,
+# HashDoS resistant. Used for rate-limiter DashMaps (IpAddr keys).
+# Zone-lookup HashMaps keep SipHash: DNS name keys come from untrusted network.
+ahash = "0.8"
+
+# Raw socket control — SO_REUSEPORT per-CPU UDP socket binding
+socket2 = { version = "0.6", features = ["all"] }
+
+# Low-level OS syscalls used by AF_XDP implementation
+libc = "0.2"
+
+# Linux capability drop (pentest hardening, #caps_drop): relinquish CAP_BPF /
+# CAP_PERFMON once the one-time XDP load/attach is done, so an RCE can no
+# longer use them to load an arbitrary eBPF program. Pure-Rust, libc-only dep.
+caps = "0.5"
+
+# Lock-free atomic Arc swap — read path for LocalZoneSet with zero contention
+arc-swap = "1"
+
+# Self-signed TLS certificate generation (--gen-cert)
+rcgen = { version = "0.13", features = ["x509-parser"] }
+x509-parser = "0.16"
+
+# Slave/master sync: HTTPS server (TLS termination) + HTTPS client (cert pinning)
+tokio-rustls   = "0.26"
+hyper          = { version = "1", features = ["http1", "http2"] }
+hyper-util     = { version = "0.1", features = ["tokio", "server-auto"] }
+http-body-util = "0.1"
+url = "2.5.8"
+time = { version = "0.3.49", default-features = false }
+data-encoding = "2.11.0"
+
+[dev-dependencies]
+# Differential oracle tests prove our wire codec / DNSSEC / TSIG byte-identical to
+# hickory. hickory-proto is not a runtime dependency at all (no `recursor` feature
+# exists — recursion + DNSSEC are in-house and always on), but the oracle tests
+# still need it — pull it in for tests only.
+hickory-proto    = { version = "0.26", features = ["dnssec-ring"] }
+
+
+[build-dependencies]
+flate2 = "1"
+
+[features]
+# Kernel-bypass DNS fast path via AF_XDP / eBPF.
+# Requires: clang + libbpf-dev at build time (apt install clang libbpf-dev).
+# No runtime C libraries needed — aya is pure Rust.
+# Enabled by default; opt out with --no-default-features.
+default = ["xdp"]
+xdp = ["dep:aya"]
+# Expose internal parsing functions for cargo-fuzz targets.
+# Never enabled in the normal release binary.
+fuzz = []
+# Per-interface TX/RX instrumentation counters for debugging XDP multi-interface issues.
+# Adds 6 AtomicU64 per interface + a logger thread — NEVER enable in production benchmarks.
+# Disabled by default (zero cost when off).
+xdp-debug-counters = []
+
+[dependencies.aya]
+version  = "0.13"
+optional = true
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = true

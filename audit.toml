@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
+# cargo-audit configuration
+# All known CVEs resolved by the hickory-proto 0.26 / rustls 0.23 upgrades; no active ignores.
+
+[advisories]

@@ -1,0 +1,16 @@
+#!/bin/bash
+# Linker wrapper for aarch64-unknown-linux-gnu cross-compilation.
+#
+# When the HOST target is x86_64-unknown-linux-gnu, rustc injects a
+# -B /path/to/x86_64-unknown-linux-gnu/ search-path arg that confuses
+# aarch64-linux-gnu-gcc (it finds host libraries instead of target libraries).
+# This wrapper strips the offending args before delegating to the cross-linker.
+filtered=()
+for arg in "$@"; do
+    case "$arg" in
+        -B*/x86_64-unknown-linux-gnu/*) continue ;;
+        -fuse-ld=lld)                   continue ;;
+    esac
+    filtered+=("$arg")
+done
+exec aarch64-linux-gnu-gcc "${filtered[@]}"

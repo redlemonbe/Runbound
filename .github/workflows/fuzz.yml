@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: Fuzz
+on:
+  schedule:
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+# tokio is built with the `io-uring` feature, which requires `--cfg tokio_unstable`.
+# The normal build gets this from .cargo/config.toml, but cargo-fuzz replaces RUSTFLAGS
+# with its own sanitizer flags, so we must re-supply the cfg here (cargo-fuzz appends).
+env:
+  RUSTFLAGS: --cfg tokio_unstable
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang libbpf-dev mold
+
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - run: cargo fuzz run fuzz_dns_query -- -max_total_time=300
+      - run: cargo fuzz run fuzz_config -- -max_total_time=300
+      - run: cargo fuzz run fuzz_api_json -- -max_total_time=300
+      - run: cargo fuzz run fuzz_dns_name -- -max_total_time=300

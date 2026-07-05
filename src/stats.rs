@@ -1,0 +1,666 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
+// Query statistics — shared between DNS hot path and REST API.
+//
+// All counters are AtomicU64: DNS increments and API reads never contend.
+// Latency histogram uses fixed buckets — zero allocation per query.
+// QPS ring buffer: 300 one-second slots (5-minute window), updated by a
+// dedicated background task that reads the total counter each second.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+use serde_json::Value as JsonValue;
+
+/// Flush a thread's qtype accumulator into the shared counters every N calls.
+const QTYPE_FLUSH: u64 = 512;
+
+thread_local! {
+    // Per-thread qtype accumulator for the XDP cache-hit hot path: contention-free (no
+    // shared atomic on the line-rate path), flushed into the shared `qtype_counts` every
+    // QTYPE_FLUSH calls. Mirrors the domain_stats thread-local pattern.
+    static TL_QTYPE: std::cell::RefCell<[u64; 256]> = const { std::cell::RefCell::new([0u64; 256]) };
+    static TL_QTYPE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Shared, lock-free snapshot cache.
+/// Updated every second by `qps_update_loop`; API handlers read it
+/// instead of calling `snapshot()` on every request (avoids ~360 atomic
+/// loads per API call under monitoring load).
+pub type SharedSnapshot = Arc<ArcSwap<StatsSnapshot>>;
+
+pub fn new_snapshot_cache(stats: &Stats) -> SharedSnapshot {
+    Arc::new(ArcSwap::from_pointee(stats.snapshot()))
+}
+
+// ── Latency histogram ──────────────────────────────────────────────────────
+//
+// 12 upper-bound thresholds in microseconds define 13 buckets:
+//   [0]  ≤ 0.1 ms   [1]  ≤ 0.5 ms   [2]  ≤ 1 ms    [3]  ≤ 2 ms
+//   [4]  ≤ 5 ms     [5]  ≤ 10 ms    [6]  ≤ 50 ms   [7]  ≤ 100 ms
+//   [8]  ≤ 250 ms   [9]  ≤ 500 ms  [10]  ≤ 1 s     [11]  ≤ 3 s
+//   [12] > 3 s     (overflow — reported as lower bound, not a fake midpoint)
+pub const HIST_BOUNDS_US: [u64; 12] = [
+    100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 3_000_000,
+];
+pub const HIST_BUCKETS: usize = 13;
+
+// ── QPS ring buffer ────────────────────────────────────────────────────────
+// 300 slots × 1 second each = 5-minute sliding window.
+pub const QPS_RING_SIZE: usize = 300;
+
+// Per-minute latency ring: 1440 slots x 1 min = 24 h, for windowed min/avg/max.
+pub const LAT_RING_MINUTES: usize = 1440;
+
+// ── Forward resolver cache size ────────────────────────────────────────────
+// Nominal upstream-cache capacity; used to cap the cache_entries approximation.
+const UPSTREAM_CACHE_SIZE: u64 = 8_192;
+
+// ── Cache hit threshold ────────────────────────────────────────────────────
+// Forward lookups completing in < 2 ms are almost certainly served from
+// the in-process upstream cache (real upstream RTT is typically 5–200 ms).
+pub const CACHE_HIT_THRESHOLD_US: u64 = 2_000;
+
+// ── Cache-line padding (#70) ───────────────────────────────────────────────
+// Wraps a value so it occupies its own 64-byte cache line.
+// Used for fields that are written by different CPU cores (qps_head / qps_peak
+// written by qps_update_loop vs. the per-query counters written by DNS handlers)
+// to prevent false sharing — a read-for-ownership on one core invalidating the
+// cache line of another core that modified an unrelated field in the same line.
+#[repr(align(64))]
+pub struct CachePadded<T>(pub T);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+pub struct Stats {
+    // Core query counters
+    pub total: AtomicU64,
+    pub blocked: AtomicU64,
+    pub forwarded: AtomicU64,
+    pub nxdomain: AtomicU64,
+    pub refused: AtomicU64,
+    pub stale_served: AtomicU64,
+    pub servfail: AtomicU64,
+    pub started_at: Instant,
+
+    // Latency histogram — fixed 10 buckets, zero alloc per query
+    pub lat_hist: Vec<AtomicU64>,
+    // Exact min/avg/max latency (#webui: percentiles are upstream/path-dependent
+    // and meaningless here — show min/average/max instead).
+    pub lat_min_us: AtomicU64,
+    pub lat_max_us: AtomicU64,
+    pub lat_sum_us: AtomicU64,
+    pub lat_count: AtomicU64,
+    // Per-minute latency ring (24h) -- windowed min/avg/max for the web UI selector.
+    pub lat_ring_min: Vec<AtomicU64>,
+    pub lat_ring_max: Vec<AtomicU64>,
+    pub lat_ring_sum: Vec<AtomicU64>,
+    pub lat_ring_cnt: Vec<AtomicU64>,
+    pub lat_ring_head: CachePadded<AtomicU64>,
+
+    // QPS ring buffer — 300 one-second slots
+    pub qps_ring: Vec<AtomicU64>,
+    // #70: each field lives on its own 64-byte cache line — qps_update_loop writes
+    // these from a background task while DNS handlers write total/blocked/… on other
+    // cores.  Without padding both would share a line causing false-sharing evictions.
+    pub qps_head: CachePadded<AtomicU64>, // next write slot index
+    pub qps_peak: CachePadded<AtomicU64>, // all-time peak (queries in any one second)
+
+    // Cache / local resolution metrics
+    // cache_hits: forwarded lookups < CACHE_HIT_THRESHOLD_US (likely in-process cache)
+    // cache_misses: forwarded lookups ≥ threshold (network round-trip)
+    // cache_entries: approximate count of distinct cached domains (0..UPSTREAM_CACHE_SIZE)
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
+    pub cache_entries: AtomicU64,
+    // local_hits: queries answered from local zone data (config + API dns_entries)
+    pub local_hits: AtomicU64,
+
+    // DNSSEC counters — only incremented when dnssec-validation is enabled.
+    // secure:   resolved with valid DNSSEC signature chain (RRSIG present)
+    // bogus:    DNSSEC validation failed (ProtoErrorKind::RrsigsNotPresent)
+    // insecure: resolved OK but unsigned (no RRSIG — delegation proven unsigned by parent)
+    pub dnssec_secure: AtomicU64,
+    pub dnssec_bogus: AtomicU64,
+    pub dnssec_insecure: AtomicU64,
+    /// #34: upstream DNSSEC stripping events detected.
+
+    // DoT reconnect metrics (#77 fix) — updated by keepalive, level-2 reconnect, and API endpoint.
+    pub dot_reconnects_total: AtomicU64,
+    /// ISO-8601 timestamp of the last successful resolver rebuild; None until first rebuild.
+    pub last_reconnect_at: std::sync::Mutex<Option<String>>,
+    /// Per-DNS-record-type query counters. Index = type code 0–255.
+    pub qtype_counts: Vec<AtomicU64>,
+    /// Accumulates queries with record type > 255 (e.g. CAA=257).
+    pub qtype_high: AtomicU64,
+}
+
+impl Stats {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            total: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
+            forwarded: AtomicU64::new(0),
+            nxdomain: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+            stale_served: AtomicU64::new(0),
+            servfail: AtomicU64::new(0),
+            started_at: Instant::now(),
+            lat_hist: (0..HIST_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+            lat_min_us: AtomicU64::new(u64::MAX),
+            lat_max_us: AtomicU64::new(0),
+            lat_sum_us: AtomicU64::new(0),
+            lat_count: AtomicU64::new(0),
+            lat_ring_min: (0..LAT_RING_MINUTES).map(|_| AtomicU64::new(u64::MAX)).collect(),
+            lat_ring_max: (0..LAT_RING_MINUTES).map(|_| AtomicU64::new(0)).collect(),
+            lat_ring_sum: (0..LAT_RING_MINUTES).map(|_| AtomicU64::new(0)).collect(),
+            lat_ring_cnt: (0..LAT_RING_MINUTES).map(|_| AtomicU64::new(0)).collect(),
+            lat_ring_head: CachePadded(AtomicU64::new(0)),
+            qps_ring: (0..QPS_RING_SIZE).map(|_| AtomicU64::new(0)).collect(),
+            qps_head: CachePadded(AtomicU64::new(0)),
+            qps_peak: CachePadded(AtomicU64::new(0)),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            cache_entries: AtomicU64::new(0),
+            local_hits: AtomicU64::new(0),
+            dnssec_secure: AtomicU64::new(0),
+            dnssec_bogus: AtomicU64::new(0),
+            dnssec_insecure: AtomicU64::new(0),
+            dot_reconnects_total: AtomicU64::new(0),
+            last_reconnect_at: std::sync::Mutex::new(None),
+            qtype_counts: (0..256).map(|_| AtomicU64::new(0)).collect(),
+            qtype_high: AtomicU64::new(0),
+        })
+    }
+
+    /// Record a DoT resolver rebuild: increment counter and update timestamp.
+    pub fn record_dot_reconnect(&self) {
+        self.dot_reconnects_total.fetch_add(1, Ordering::Relaxed);
+        let ts = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            crate::logbuffer::format_ts(secs)
+        };
+        if let Ok(mut g) = self.last_reconnect_at.lock() {
+            *g = Some(ts);
+        }
+    }
+
+    /// Increment the per-query-type counter for the given DNS type code.
+    #[inline]
+    pub fn inc_qtype_raw(&self, type_code: u16) {
+        if (type_code as usize) < self.qtype_counts.len() {
+            self.qtype_counts[type_code as usize].fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.qtype_high.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Contention-free qtype increment for the XDP cache-hit hot path. Accumulates in a
+    /// thread-local array (no shared atomic on the line-rate path), flushing into the
+    /// shared `qtype_counts` every QTYPE_FLUSH calls — same bounded-tail approximation as
+    /// `domain_stats`. `build_qtype_stats` then reads the shared counters unchanged.
+    #[inline]
+    pub fn inc_qtype_tl(&self, type_code: u16) {
+        if (type_code as usize) < 256 {
+            TL_QTYPE.with(|q| q.borrow_mut()[type_code as usize] += 1);
+        } else {
+            self.qtype_high.fetch_add(1, Ordering::Relaxed);
+        }
+        let calls = TL_QTYPE_CALLS.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
+        if calls % QTYPE_FLUSH == 0 {
+            self.flush_qtype_tl();
+        }
+    }
+
+    /// Drain this thread's qtype accumulator into the shared counters.
+    pub fn flush_qtype_tl(&self) {
+        TL_QTYPE.with(|q| {
+            let mut arr = q.borrow_mut();
+            for (i, v) in arr.iter_mut().enumerate() {
+                if *v > 0 {
+                    self.qtype_counts[i].fetch_add(*v, Ordering::Relaxed);
+                    *v = 0;
+                }
+            }
+        });
+    }
+
+    #[inline]
+    pub fn inc_total(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+    // recursor-only stat: the wire path serves blocklist hits via the local-zone
+    // path (counted as local hits); a dedicated "blocked" category is not split out.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn inc_blocked(&self) {
+        self.blocked.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_forwarded(&self) {
+        self.forwarded.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_nxdomain(&self) {
+        self.nxdomain.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_stale_served(&self) { self.stale_served.fetch_add(1, Ordering::Relaxed); }
+    pub fn inc_refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_servfail(&self) {
+        self.servfail.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_local_hits(&self) {
+        self.local_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_dnssec_secure(&self) {
+        self.dnssec_secure.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_dnssec_bogus(&self) {
+        self.dnssec_bogus.fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn inc_dnssec_insecure(&self) {
+        self.dnssec_insecure.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record query latency — zero allocation, single atomic increment.
+    /// Finds the histogram bucket via binary search on the 9 thresholds.
+    #[inline]
+    pub fn record_latency_us(&self, us: u64) {
+        // partition_point returns the first index i where HIST_BOUNDS_US[i] >= us,
+        // i.e. the first bucket whose upper bound is ≥ the measured latency.
+        let bucket = HIST_BOUNDS_US.partition_point(|&b| us > b);
+        self.lat_hist[bucket].fetch_add(1, Ordering::Relaxed);
+        self.lat_min_us.fetch_min(us, Ordering::Relaxed);
+        self.lat_max_us.fetch_max(us, Ordering::Relaxed);
+        self.lat_sum_us.fetch_add(us, Ordering::Relaxed);
+        self.lat_count.fetch_add(1, Ordering::Relaxed);
+        // #webui: also feed the current minute slot of the 24h latency ring.
+        let h = (self.lat_ring_head.load(Ordering::Relaxed) as usize) % LAT_RING_MINUTES;
+        self.lat_ring_min[h].fetch_min(us, Ordering::Relaxed);
+        self.lat_ring_max[h].fetch_max(us, Ordering::Relaxed);
+        self.lat_ring_sum[h].fetch_add(us, Ordering::Relaxed);
+        self.lat_ring_cnt[h].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Windowed (min, avg, max) latency in ms over the last `minutes` minute-slots,
+    /// plus the sample count. `None` when the window has no samples.
+    pub fn latency_window(&self, minutes: usize) -> Option<(f64, f64, f64, u64)> {
+        let head = self.lat_ring_head.load(Ordering::Relaxed) as usize;
+        let n = minutes.min(LAT_RING_MINUTES);
+        let (mut min_us, mut max_us, mut sum_us, mut cnt) = (u64::MAX, 0u64, 0u64, 0u64);
+        for i in 0..n {
+            let slot = (head + LAT_RING_MINUTES - i) % LAT_RING_MINUTES;
+            let c = self.lat_ring_cnt[slot].load(Ordering::Relaxed);
+            if c == 0 { continue; }
+            cnt += c;
+            sum_us += self.lat_ring_sum[slot].load(Ordering::Relaxed);
+            min_us = min_us.min(self.lat_ring_min[slot].load(Ordering::Relaxed));
+            max_us = max_us.max(self.lat_ring_max[slot].load(Ordering::Relaxed));
+        }
+        if cnt == 0 { return None; }
+        Some((min_us as f64 / 1000.0, sum_us as f64 / cnt as f64 / 1000.0, max_us as f64 / 1000.0, cnt))
+    }
+
+    /// Record a completed forwarded lookup and update cache metrics.
+    /// elapsed_us < 2 ms → cache hit (served from the in-process DNS cache).
+    /// elapsed_us ≥ 2 ms → cache miss (round-trip to upstream resolver).
+    #[inline]
+    pub fn record_forward(&self, elapsed_us: u64) {
+        if elapsed_us < CACHE_HIT_THRESHOLD_US {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            // Approximate cache fill: increment up to the upstream cache size.
+            // Saturates at UPSTREAM_CACHE_SIZE (matching the cache's eviction behaviour).
+            self.cache_entries
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    if n < UPSTREAM_CACHE_SIZE {
+                        Some(n + 1)
+                    } else {
+                        None
+                    }
+                })
+                .ok();
+        }
+    }
+
+    /// Reset cache counters after a resolver cache flush (called by memory_guard_loop).
+    pub fn reset_cache(&self) {
+        self.cache_hits.store(0, Ordering::Relaxed);
+        self.cache_misses.store(0, Ordering::Relaxed);
+        self.cache_entries.store(0, Ordering::Relaxed);
+    }
+
+    /// Compute a percentile (0–100) from the current latency histogram.
+    /// Returns the result in milliseconds.
+    pub fn percentile_ms(&self, pct: f64) -> f64 {
+        let counts: [u64; HIST_BUCKETS] =
+            std::array::from_fn(|i| self.lat_hist[i].load(Ordering::Relaxed));
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return 0.0;
+        }
+        let target = ((total as f64 * pct / 100.0) as u64).max(1);
+        let mut cum = 0u64;
+        for (i, &c) in counts.iter().enumerate() {
+            cum += c;
+            if cum >= target {
+                // Midpoint of bucket in µs → convert to ms.
+                // Overflow bucket (no upper bound): report lower bound to avoid
+                // returning a fake midpoint artifact.
+                let mid_us: u64 = if i == 0 {
+                    50 // midpoint of [0, 100µs]
+                } else {
+                    let lo = HIST_BOUNDS_US[i - 1];
+                    match HIST_BOUNDS_US.get(i) {
+                        Some(&hi) => (lo + hi) / 2,
+                        None => lo,
+                    }
+                };
+                return (mid_us as f64 / 1000.0 * 10.0).round() / 10.0;
+            }
+        }
+        1000.0
+    }
+
+    /// Compute QPS statistics from the ring buffer.
+    /// Returns (qps_1m, qps_5m, qps_peak).
+    pub fn qps_stats(&self) -> (f64, f64, u64) {
+        let head = self.qps_head.load(Ordering::Relaxed) as usize;
+        let mut sum_1m: u64 = 0;
+        let mut sum_5m: u64 = 0;
+        for i in 0..QPS_RING_SIZE {
+            // Walk backwards from the last written slot
+            let slot = (head + QPS_RING_SIZE - 1 - i) % QPS_RING_SIZE;
+            let v = self.qps_ring[slot].load(Ordering::Relaxed);
+            if i < 60 {
+                sum_1m += v;
+            }
+            sum_5m += v;
+        }
+        let qps_peak = self.qps_peak.load(Ordering::Relaxed);
+        (
+            (sum_1m as f64 / 60.0 * 10.0).round() / 10.0,
+            (sum_5m as f64 / 300.0 * 10.0).round() / 10.0,
+            qps_peak,
+        )
+    }
+
+    pub fn snapshot(&self) -> StatsSnapshot {
+        let blocked = self.blocked.load(Ordering::Relaxed);
+        let nxdomain = self.nxdomain.load(Ordering::Relaxed);
+        let ch_slow = self.cache_hits.load(Ordering::Relaxed);
+        let cm_slow = self.cache_misses.load(Ordering::Relaxed);
+        // Cache hits/misses are SUMMED across BOTH datapaths — never switched:
+        //  - slow path (incl. XDP recursion-miss fallbacks, which go through serve_wire):
+        //    ch_slow / cm_slow via record_forward.
+        //  - XDP fast-path cache HITS: counted per-worker (XDP_WORKER_PKTS, contention-free);
+        //    they never touch the slow path, so they are added here. XDP MISSES fall back to
+        //    serve_wire and are already in cm_slow — adding XDP_WORKER_MISS would double-count.
+        let xh: u64 = crate::dns::cache_snapshot::XDP_WORKER_PKTS.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let cache_hits = ch_slow + xh;
+        let cache_misses = cm_slow;
+        let cache_hit_rate = if cache_hits + cache_misses > 0 {
+            (cache_hits as f64 / (cache_hits + cache_misses) as f64 * 1000.0).round() / 10.0
+        } else {
+            0.0
+        };
+        // total: self.total counts slow-path + XDP recursion-miss fallbacks; XDP fast-path
+        // hits are NOT counted on the line-rate hot path, so add them here (the exact same
+        // sum qps_update_loop already uses, so QPS and total stay consistent).
+        let total = self.total.load(Ordering::Relaxed) + xh;
+        let (qps_1m, qps_5m, qps_peak) = self.qps_stats();
+        let qtype_stats = Self::build_qtype_stats(&self.qtype_counts, self.qtype_high.load(Ordering::Relaxed));
+        StatsSnapshot {
+            total,
+            blocked,
+            forwarded: self.forwarded.load(Ordering::Relaxed),
+            nxdomain,
+            refused: self.refused.load(Ordering::Relaxed),
+            stale_served: self.stale_served.load(Ordering::Relaxed),
+            servfail: self.servfail.load(Ordering::Relaxed),
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            qps_1m,
+            qps_5m,
+            qps_peak,
+            latency_p50_ms: self.percentile_ms(50.0),
+            latency_p95_ms: self.percentile_ms(95.0),
+            latency_p99_ms: self.percentile_ms(99.0),
+            latency_min_ms: { let c = self.lat_count.load(Ordering::Relaxed); if c > 0 { self.lat_min_us.load(Ordering::Relaxed) as f64 / 1000.0 } else { 0.0 } },
+            latency_avg_ms: { let c = self.lat_count.load(Ordering::Relaxed); if c > 0 { self.lat_sum_us.load(Ordering::Relaxed) as f64 / c as f64 / 1000.0 } else { 0.0 } },
+            latency_max_ms: { let c = self.lat_count.load(Ordering::Relaxed); if c > 0 { self.lat_max_us.load(Ordering::Relaxed) as f64 / 1000.0 } else { 0.0 } },
+            cache_hit_rate,
+            cache_hits,
+            cache_misses,
+            xdp_cache_hits: xh,
+            cache_entries: self.cache_entries.load(Ordering::Relaxed),
+            local_hits: self.local_hits.load(Ordering::Relaxed),
+            dnssec_secure: self.dnssec_secure.load(Ordering::Relaxed),
+            dnssec_bogus: self.dnssec_bogus.load(Ordering::Relaxed),
+            dnssec_insecure: self.dnssec_insecure.load(Ordering::Relaxed),
+            latency_windows: [("1m", 1usize), ("5m", 5), ("1h", 60), ("12h", 720), ("24h", 1440)].iter()
+                .map(|&(l, m)| { let (mn, av, mx, c) = self.latency_window(m).unwrap_or((0.0, 0.0, 0.0, 0)); (l.to_string(), mn, av, mx, c) })
+                .collect(),
+            qtype_stats,
+        }
+    }
+
+    fn build_qtype_stats(counts: &[AtomicU64], high: u64) -> Vec<(String, u64)> {
+        const NAMED: &[(usize, &str)] = &[
+            (1, "A"), (2, "NS"), (5, "CNAME"), (6, "SOA"), (12, "PTR"),
+            (15, "MX"), (16, "TXT"), (28, "AAAA"), (33, "SRV"), (43, "DS"),
+            (46, "RRSIG"), (47, "NSEC"), (48, "DNSKEY"), (52, "TLSA"), (255, "ANY"),
+        ];
+        let known: std::collections::HashSet<usize> = NAMED.iter().map(|&(i, _)| i).collect();
+        let mut result: Vec<(String, u64)> = NAMED.iter().filter_map(|&(idx, name)| {
+            let n = counts.get(idx).map(|c| c.load(Ordering::Relaxed)).unwrap_or(0);
+            if n > 0 { Some((name.to_owned(), n)) } else { None }
+        }).collect();
+        let other: u64 = counts.iter().enumerate()
+            .filter(|(i, _)| !known.contains(i))
+            .map(|(_, c)| c.load(Ordering::Relaxed))
+            .sum::<u64>()
+            .saturating_add(high);
+        if other > 0 { result.push(("OTHER".to_owned(), other)); }
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result
+    }
+}
+
+pub struct StatsSnapshot {
+    pub total: u64,
+    pub blocked: u64,
+    pub forwarded: u64,
+    pub nxdomain: u64,
+    pub refused: u64,
+    pub stale_served: u64,
+    pub servfail: u64,
+    pub uptime_secs: u64,
+    pub qps_1m: f64,
+    pub qps_5m: f64,
+    pub qps_peak: u64,
+    pub latency_p50_ms: f64,
+    pub latency_p95_ms: f64,
+    pub latency_p99_ms: f64,
+    pub latency_min_ms: f64,
+    pub latency_avg_ms: f64,
+    pub latency_max_ms: f64,
+    pub cache_hit_rate: f64,
+    /// Raw cache-hit count, summed across slow path + XDP fast-path workers.
+    pub cache_hits: u64,
+    /// Raw cache-miss count (slow path incl. XDP recursion-miss fallbacks).
+    pub cache_misses: u64,
+    /// XDP fast-path cache hits alone (per-worker), for the "XDP fast path" UI/metric.
+    pub xdp_cache_hits: u64,
+    pub cache_entries: u64,
+    pub local_hits: u64,
+    pub dnssec_secure: u64,
+    pub dnssec_bogus: u64,
+    pub dnssec_insecure: u64,
+    /// Per-record-type query distribution, sorted descending by count.
+    pub qtype_stats: Vec<(String, u64)>,
+    /// Per-UI-window latency: (label, min_ms, avg_ms, max_ms, count) for 1m..24h.
+    pub latency_windows: Vec<(String, f64, f64, f64, u64)>,
+}
+
+pub fn snapshot_to_json(snap: &StatsSnapshot) -> JsonValue {
+    let pct_blocked = if snap.total > 0 {
+        (snap.blocked as f64 / snap.total as f64 * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+    serde_json::json!({
+        "total":            snap.total,
+        "total_queries":    snap.total,
+        "blocked":          snap.blocked,
+        "forwarded":        snap.forwarded,
+        "nxdomain":         snap.nxdomain,
+        "stale_served":      snap.stale_served,
+        "refused":          snap.refused,
+        "servfail":         snap.servfail,
+        "local_hits":       snap.local_hits,
+        "blocked_percent":  pct_blocked,
+        "uptime_secs":      snap.uptime_secs,
+        "qps_1m":           snap.qps_1m,
+        "qps_5m":           snap.qps_5m,
+        "qps_peak":         snap.qps_peak,
+        "latency_p50_ms":   snap.latency_p50_ms,
+        "latency_p95_ms":   snap.latency_p95_ms,
+        "latency_p99_ms":   snap.latency_p99_ms,
+        "latency_min_ms":   snap.latency_min_ms,
+        "latency_avg_ms":   snap.latency_avg_ms,
+        "latency_max_ms":   snap.latency_max_ms,
+        "cache_hit_rate":   snap.cache_hit_rate,
+        "cache_hits":       snap.cache_hits,
+        "cache_misses":     snap.cache_misses,
+        "xdp_cache_hits":   snap.xdp_cache_hits,
+        "cache_entries":    snap.cache_entries,
+        "dnssec": {
+            "secure":   snap.dnssec_secure,
+            "bogus":    snap.dnssec_bogus,
+            "insecure": snap.dnssec_insecure,
+        },
+        "latency_windows": snap.latency_windows.iter().fold(serde_json::Map::new(), |mut m, (l, mn, av, mx, c)| { m.insert(l.clone(), serde_json::json!({"min_ms": mn, "avg_ms": av, "max_ms": mx, "count": c})); m }),
+        "qtype_stats": snap.qtype_stats.iter()
+            .map(|(k, v)| serde_json::json!({"type": k, "count": v}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_sums_cache_counters() {
+        let s = Stats::new();
+        // record_forward: <2ms → cache hit, ≥2ms → cache miss.
+        s.record_forward(100);
+        s.record_forward(100);
+        s.record_forward(100);
+        s.record_forward(5000);
+        let snap = s.snapshot();
+        // No XDP workers run in a unit test → XDP_WORKER_PKTS sum (xh) is 0, so the
+        // canonical cache_hits equals the slow-path hits. This guards the SUM semantics
+        // (cache_hits = slow + xh) against a regression back to the XDP-only switch.
+        assert_eq!(snap.cache_hits, 3, "cache_hits must include slow-path hits");
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.cache_hit_rate, 75.0, "rate = hits/(hits+misses)");
+        assert_eq!(snap.xdp_cache_hits, 0, "no XDP traffic in unit test");
+    }
+
+    #[test]
+    fn qtype_tl_flushes_into_shared_counters() {
+        let s = Stats::new();
+        // Drain any thread-local residue from a previous test on this thread first.
+        s.flush_qtype_tl();
+        let base = s.qtype_counts[1].load(Ordering::Relaxed);
+        for _ in 0..10 {
+            s.inc_qtype_tl(1); // A records; <512 so they stay in the TL accumulator
+        }
+        s.flush_qtype_tl();
+        assert_eq!(
+            s.qtype_counts[1].load(Ordering::Relaxed) - base,
+            10,
+            "thread-local qtype accumulator must flush exactly into the shared counter"
+        );
+    }
+}
+
+// ── QPS + snapshot background task ────────────────────────────────────────
+//
+// Runs every second:
+//   1. Updates the QPS ring buffer and all-time peak.
+//   2. Atomically swaps the SharedSnapshot so API handlers read pre-computed
+//      values (avoids ~360 atomic loads per API call under monitoring load).
+pub async fn qps_update_loop(stats: Arc<Stats>, snapshot_cache: SharedSnapshot) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prev_total: u64 = 0;
+    let mut sec_in_min: u64 = 0;
+
+    loop {
+        interval.tick().await;
+        // #webui: rotate the per-minute latency ring once a minute (reset the slot
+        // we advance into, then publish the new head).
+        sec_in_min += 1;
+        if sec_in_min >= 60 {
+            sec_in_min = 0;
+            let next = ((stats.lat_ring_head.load(Ordering::Relaxed) as usize) + 1) % LAT_RING_MINUTES;
+            stats.lat_ring_min[next].store(u64::MAX, Ordering::Relaxed);
+            stats.lat_ring_max[next].store(0, Ordering::Relaxed);
+            stats.lat_ring_sum[next].store(0, Ordering::Relaxed);
+            stats.lat_ring_cnt[next].store(0, Ordering::Relaxed);
+            stats.lat_ring_head.store(next as u64, Ordering::Relaxed);
+        }
+        // #perf: XDP-served packets are counted per-worker (XDP_WORKER_PKTS,
+        // contention-free) instead of on the line-rate cache hot path. Sum them with
+        // the slow-path total so QPS stays accurate without any contended atomic.
+        let total = stats.total.load(Ordering::Relaxed)
+            + crate::dns::cache_snapshot::XDP_WORKER_PKTS.iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .sum::<u64>();
+        let qps = total.saturating_sub(prev_total);
+        prev_total = total;
+
+        // Write to ring slot and advance head atomically.
+        let slot = (stats.qps_head.fetch_add(1, Ordering::Relaxed) as usize) % QPS_RING_SIZE;
+        stats.qps_ring[slot].store(qps, Ordering::Relaxed);
+
+        // Update peak (lock-free max).
+        stats.qps_peak.fetch_max(qps, Ordering::Relaxed);
+
+        // Refresh the shared snapshot cache used by API handlers.
+        snapshot_cache.store(Arc::new(stats.snapshot()));
+    }
+}

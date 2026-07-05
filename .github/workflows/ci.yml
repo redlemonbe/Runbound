@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Doc version drift guard (SECURITY.md vs Cargo.toml)
+        run: |
+          CARGO_MM=$(grep -m1 '^version = ' Cargo.toml | grep -oE '[0-9]+\.[0-9]+')
+          SEC_MM=$(grep -oE '[0-9]+\.[0-9]+\.x' SECURITY.md | head -1 | sed 's/\.x//')
+          echo "Cargo.toml minor: $CARGO_MM | SECURITY.md supported: ${SEC_MM}.x"
+          if [ "$CARGO_MM" != "$SEC_MM" ]; then
+            echo "::error file=SECURITY.md::Supported version ${SEC_MM}.x does not match Cargo.toml ($CARGO_MM.x). Update the SECURITY.md supported-versions table."
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang libbpf-dev mold musl-tools
+
+      - name: Install Rust toolchain (stable + clippy)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ci-
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test

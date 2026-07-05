@@ -1,0 +1,212 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
+#
+# Release workflow — triggered by pushing a vX.Y.Z tag.
+#
+# Build order: install deps → build 4 targets → package → create release →
+# upload assets.
+#
+# IMPORTANT: the release is created as *published* (no --draft) BEFORE assets
+# are uploaded.  GitHub only generates stable browser_download_url for assets
+# that land on an already-published release.  Creating as draft and then
+# editing to published corrupts the CDN URLs and causes 404 for anonymous
+# downloads (e.g. install.sh users).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Self-hosted 32-core builder (worker-dr). Only this tag-triggered workflow uses
+    # it; CI/fuzz stay on GitHub-hosted runners so fork PRs never reach the runner.
+    if: ${{ !contains(github.server_url, 'github.com') }}
+    runs-on: [self-hosted, rb-builder]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Build dependencies ────────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libbpf-dev \
+            mold \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            linux-libc-dev-arm64-cross \
+            musl-tools
+
+      # ── Linker wrapper ───────────────────────────────────────────────────
+      # Strips -B*/x86_64-unknown-linux-gnu/* args that rustc injects for the
+      # HOST target and that confuse aarch64-linux-gnu-gcc when cross-compiling.
+      # Referenced by .cargo/config.toml [target.aarch64-unknown-linux-gnu].
+      - name: Install aarch64-gnu linker wrapper
+        run: sudo install -m 755 scripts/aarch64-gnu-linker-wrapper /usr/local/bin/
+
+      # ── Rust toolchain ───────────────────────────────────────────────────
+      - name: Install Rust toolchain
+        run: |
+          # Idempotent: the self-hosted runner already has rustup; rustup-init
+          # refuses to run over an existing install, so only bootstrap if absent.
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          "$HOME/.cargo/bin/rustup" target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+
+      # ── Cargo cache ──────────────────────────────────────────────────────
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # ── Builds (all 4 targets in parallel on the 32-core self-hosted runner) ──
+      # Each target gets its own CARGO_TARGET_DIR so the concurrent cargo
+      # invocations never contend on a shared target/ lock. Wall-clock ≈ one
+      # target's build instead of the sum of four.
+      - name: Build all targets in parallel
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
+          RING_HOST_CC: gcc
+        run: |
+          set -u
+          targets="x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl"
+          declare -A pid
+          for t in $targets; do
+            CARGO_TARGET_DIR="target-$t" cargo build --release --target "$t" > "build-$t.log" 2>&1 &
+            pid[$t]=$!
+          done
+          rc=0
+          for t in $targets; do
+            if wait "${pid[$t]}"; then
+              echo "::notice::build OK $t"
+            else
+              echo "::error::build FAILED $t"; tail -n 30 "build-$t.log"; rc=1
+            fi
+          done
+          exit $rc
+
+      # ── SBOM (CycloneDX) ──
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json
+          mv runbound.cdx.json sbom.cdx.json
+
+      # ── Package ──────────────────────────────────────────────────────────
+      - name: Package binaries
+        run: |
+          cp target-x86_64-unknown-linux-gnu/x86_64-unknown-linux-gnu/release/runbound    runbound-x86_64-linux-gnu
+          cp target-x86_64-unknown-linux-musl/x86_64-unknown-linux-musl/release/runbound  runbound-x86_64-linux-musl
+          cp target-aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/release/runbound  runbound-aarch64-linux-gnu
+          cp target-aarch64-unknown-linux-musl/aarch64-unknown-linux-musl/release/runbound runbound-aarch64-linux-musl
+          sha256sum \
+            runbound-x86_64-linux-gnu \
+            runbound-x86_64-linux-musl \
+            runbound-aarch64-linux-gnu \
+            runbound-aarch64-linux-musl \
+            sbom.cdx.json \
+            > SHA256SUMS
+
+      # ── Sign artifacts (minisign, optional) ──────────────────────────────
+      # Set the MINISIGN_SECRET repo secret to enable signing. Without it the step
+      # is a no-op (SHA256SUMS still ships). Public key + verification: docs/BUILD.md.
+      - name: Sign release artifacts (minisign)
+        env:
+          MINISIGN_SECRET: ${{ secrets.MINISIGN_SECRET }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [ -z "${MINISIGN_SECRET}" ]; then
+            echo "MINISIGN_SECRET not set — skipping signatures (SHA256SUMS still published)."
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          # Trailing newline: minisign secret key files are 2 lines (comment + key).
+          printf '%s\n' "${MINISIGN_SECRET}" > "${RUNNER_TEMP}/minisign.key"
+          # Key may be passphrase-protected (recommended) or passwordless (-W).
+          sign_one() {
+            if [ -n "${MINISIGN_PASSWORD}" ]; then
+              printf '%s\n' "${MINISIGN_PASSWORD}" | minisign -S -s "${RUNNER_TEMP}/minisign.key" -m "$1"
+            else
+              minisign -S -s "${RUNNER_TEMP}/minisign.key" -m "$1" </dev/null
+            fi
+          }
+          for f in runbound-x86_64-linux-gnu runbound-x86_64-linux-musl \
+                   runbound-aarch64-linux-gnu runbound-aarch64-linux-musl \
+                   SHA256SUMS sbom.cdx.json; do
+            [ -f "$f" ] && sign_one "$f"
+          done
+          rm -f "${RUNNER_TEMP}/minisign.key"
+
+      # ── Changelog fragment ───────────────────────────────────────────────
+      - name: Extract changelog fragment
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk "/^\#\# \[${VERSION}\]/{p=1;next} p && /^\#\# \[/{p=0} p" \
+            CHANGELOG.md | sed '/^---$/d' > CHANGELOG_FRAGMENT.md
+          # Fallback if version not yet in CHANGELOG
+          [ -s CHANGELOG_FRAGMENT.md ] || echo "Release ${GITHUB_REF_NAME}" \
+            > CHANGELOG_FRAGMENT.md
+
+      # ── Publish release then upload assets ───────────────────────────────
+      # Two-step: create published release first, then upload.
+      # If the release already exists (e.g. created manually), edit it instead.
+      # --clobber on upload overwrites existing assets with the same name.
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_HOST: github.com
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG_FRAGMENT.md
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG_FRAGMENT.md
+          fi
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_HOST: github.com
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            --clobber \
+            runbound-x86_64-linux-gnu \
+            runbound-x86_64-linux-musl \
+            runbound-aarch64-linux-gnu \
+            runbound-aarch64-linux-musl \
+            SHA256SUMS \
+            sbom.cdx.json
+
+      - name: Upload signatures (if any)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_HOST: github.com
+        run: |
+          shopt -s nullglob
+          sigs=(*.minisig)
+          if [ ${#sigs[@]} -gt 0 ]; then
+            gh release upload "${GITHUB_REF_NAME}" --clobber "${sigs[@]}"
+          else
+            echo "no signatures to upload"
+          fi
