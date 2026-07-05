@@ -132,6 +132,18 @@ struct {
     __type(value, __u8);  // 1 = banned
 } icmp_banned SEC(".maps");
 
+// #228: IPv6 twin of icmp_banned — banned IPv6 sources dropped at the XDP fast
+// path (not just the userspace slow path). Keyed on the full 16-byte address so
+// the DNS hot path can shed an IPv6 flood at kernel-bypass speed like it does
+// for IPv4. Written/evicted by userspace alongside icmp_banned; gated by the
+// same bans_active flag so an idle server pays no per-packet v6 lookup either.
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct in6_addr);  // source IPv6 in network byte order
+    __type(value, __u8);           // 1 = banned
+} icmp_banned_v6 SEC(".maps");
+
 // #ddos: gate for the DNS-path ban lookup. bans_active[0] = 1 when >= 1 IP is
 // banned; the DNS hot path skips the per-packet icmp_banned lookup when it is 0,
 // so an idle server pays only a single array lookup per DNS packet.
@@ -360,6 +372,17 @@ int dns_xdp(struct xdp_md *ctx)
                 return XDP_PASS;
             if (u->dest != bpf_htons(53))
                 return XDP_PASS;
+            {
+                // #228: drop banned IPs' tagged IPv6 DNS at the kernel (gated).
+                __u32 ba_key = 0;
+                __u32 *ba = bpf_map_lookup_elem(&bans_active, &ba_key);
+                if (ba && *ba) {
+                    struct in6_addr src6 = ip6->saddr;
+                    __u8 *ban = bpf_map_lookup_elem(&icmp_banned_v6, &src6);
+                    if (ban && *ban)
+                        return XDP_DROP;
+                }
+            }
             return bpf_redirect_map(&XSKS, ctx->rx_queue_index, XDP_PASS);
         }
         return XDP_PASS;
@@ -500,10 +523,10 @@ int dns_xdp(struct xdp_md *ctx)
     if (udp->dest != bpf_htons(53))
         return XDP_PASS;
 
-    // ── #ddos: drop DNS from banned IPs at the kernel ────────────────────────────
+    // ── #ddos: drop DNS from banned IPv4 sources at the kernel ───────────────────
     // Gated on bans_active[0]: when no IP is banned the hot path pays one array
-    // lookup and skips the per-IP icmp_banned lookup. IPv4 only (the ban map is v4);
-    // IPv6 bans stay enforced in userspace via the slow path.
+    // lookup and skips the per-IP icmp_banned lookup. The IPv6 twin is the block
+    // right after this one (#228) — both datapaths now shed a flood at XDP speed.
     if (eth_proto == ETH_P_IP) {
         __u32 ba_key = 0;
         __u32 *ba = bpf_map_lookup_elem(&bans_active, &ba_key);
@@ -513,6 +536,29 @@ int dns_xdp(struct xdp_md *ctx)
                 return XDP_PASS;
             __be32 src_ip = bn_ip->saddr;
             __u8 *ban = bpf_map_lookup_elem(&icmp_banned, &src_ip);
+            if (ban && *ban) {
+                __u32 bk = 2; // STAT_BANNED_DROP
+                __u64 *bv = bpf_map_lookup_elem(&icmp_stats, &bk);
+                if (bv) (*bv)++;
+                return XDP_DROP;
+            }
+        }
+    }
+
+    // ── #228: drop DNS from banned IPv6 sources at the kernel ────────────────────
+    // Twin of the IPv4 block above; keeps the "bans enforced on both datapaths"
+    // guarantee symmetric across v4/v6. Same bans_active gate → zero per-packet
+    // cost when nothing is banned. IPv6 header is fixed 40 bytes (re-derived from
+    // eth, as the earlier ip6 binding is out of scope here).
+    if (eth_proto == ETH_P_IPV6) {
+        __u32 ba_key = 0;
+        __u32 *ba = bpf_map_lookup_elem(&bans_active, &ba_key);
+        if (ba && *ba) {
+            struct ipv6hdr *bn6 = (void *)(eth + 1);
+            if ((void *)(bn6 + 1) > data_end)
+                return XDP_PASS;
+            struct in6_addr src6 = bn6->saddr;
+            __u8 *ban = bpf_map_lookup_elem(&icmp_banned_v6, &src6);
             if (ban && *ban) {
                 __u32 bk = 2; // STAT_BANNED_DROP
                 __u64 *bv = bpf_map_lookup_elem(&icmp_stats, &bk);

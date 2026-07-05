@@ -379,6 +379,28 @@ impl XdpHandle {
         hash.remove(&ip_be32).map_err(|e| e.to_string())
     }
 
+    /// #228: insert a banned IPv6 source (16-byte address, network byte order —
+    /// `Ipv6Addr::octets()`) into the BPF `icmp_banned_v6` map. The v6 twin of
+    /// `icmp_ban_ip`, so IPv6 bans drop at the XDP fast path, not just the slow path.
+    pub fn icmp_ban_ip_v6(&mut self, ip_be: [u8; 16]) -> Result<(), String> {
+        let map = self
+            .bpf
+            .map_mut("icmp_banned_v6")
+            .ok_or_else(|| "icmp_banned_v6 map not found".to_string())?;
+        let mut hash = HashMap::<_, [u8; 16], u8>::try_from(map).map_err(|e| e.to_string())?;
+        hash.insert(ip_be, 1u8, 0).map_err(|e| e.to_string())
+    }
+
+    /// #228: remove a banned IPv6 source from the BPF `icmp_banned_v6` map (unban).
+    pub fn icmp_unban_ip_v6(&mut self, ip_be: [u8; 16]) -> Result<(), String> {
+        let map = self
+            .bpf
+            .map_mut("icmp_banned_v6")
+            .ok_or_else(|| "icmp_banned_v6 map not found".to_string())?;
+        let mut hash = HashMap::<_, [u8; 16], u8>::try_from(map).map_err(|e| e.to_string())?;
+        hash.remove(&ip_be).map_err(|e| e.to_string())
+    }
+
     /// Initialise CPUMAP entries for `nb_workers` physical CPUs.
     ///
     /// Each entry is initialised with `queue_size=192` packets (enough headroom

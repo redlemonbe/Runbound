@@ -491,6 +491,9 @@ async fn async_main(
         let mut xdp_handles_all = _xdp_handles; // entire Vec moved into closure
         // Local set of IPs currently banned in BPF — used to detect delta changes.
         let mut bpf_banned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // #228: v6 twin of `bpf_banned` (16-byte address, network byte order).
+        let mut bpf_banned_v6: std::collections::HashSet<[u8; 16]> =
+            std::collections::HashSet::new();
         // #ddos: mirror of the BPF bans_active gate (set only on empty<->non-empty).
         let mut bans_gate = false;
         let mut blacklist_reload_rx = blacklist_reload_rx;
@@ -529,12 +532,25 @@ async fn async_main(
                                 let _ = h.icmp_unban_ip(be32);
                             }
                         }
+                        IcmpBanCmd::BanV6(ip6) => {
+                            let key = ip6.octets();
+                            if bpf_banned_v6.insert(key) {
+                                let _ = h.icmp_ban_ip_v6(key);
+                            }
+                        }
+                        IcmpBanCmd::UnbanV6(ip6) => {
+                            let key = ip6.octets();
+                            if bpf_banned_v6.remove(&key) {
+                                let _ = h.icmp_unban_ip_v6(key);
+                            }
+                        }
                     }
                 }
 
                 // #ddos: keep the BPF DNS-path ban gate in sync with the ban set, so
                 // the hot path skips the per-IP lookup whenever no IP is banned.
-                let want_gate = !bpf_banned.is_empty();
+                // #228: the gate covers both the v4 and v6 ban maps.
+                let want_gate = !bpf_banned.is_empty() || !bpf_banned_v6.is_empty();
                 if want_gate != bans_gate {
                     let _ = h.set_bans_active(want_gate);
                     bans_gate = want_gate;
@@ -2029,8 +2045,13 @@ async fn build_and_launch(
                 interval.tick().await;
                 let expired = eviction_tracker.evict_expired();
                 for ip in expired {
-                    if let std::net::IpAddr::V4(ipv4) = ip {
-                        let _ = eviction_ban_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+                    match ip {
+                        std::net::IpAddr::V4(ipv4) => {
+                            let _ = eviction_ban_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+                        }
+                        std::net::IpAddr::V6(ipv6) => {
+                            let _ = eviction_ban_tx.send(crate::icmp::IcmpBanCmd::UnbanV6(ipv6));
+                        }
                     }
                     if let Some(journal) = &eviction_journal {
                         journal.push(crate::sync::SyncOp::DeleteGlobalBan { ip: ip.to_string() });

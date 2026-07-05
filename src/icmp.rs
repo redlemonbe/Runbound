@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ICMP echo responder — config types, stats, BPF map accessors, flood ban (#89).
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -45,9 +45,15 @@ pub struct BanEntry {
 }
 
 /// Command sent to the XDP poll task to apply/remove a kernel-level ban.
+///
+/// #228: v6 variants added so IPv6 bans reach the XDP fast path too (the poll
+/// task pushes them into the `icmp_banned_v6` BPF map). The v4 variants are
+/// unchanged — the proven IPv4 path is left byte-for-byte identical.
 pub enum IcmpBanCmd {
     Ban(Ipv4Addr),
     Unban(Ipv4Addr),
+    BanV6(Ipv6Addr),
+    UnbanV6(Ipv6Addr),
 }
 
 /// Rust-side counters + ban tracking + channels for propagation.
@@ -134,8 +140,13 @@ impl IcmpStats {
         });
         self.banned_present.store(!self.banned.is_empty(), std::sync::atomic::Ordering::Relaxed);
         for ip in to_unban {
-            if let IpAddr::V4(ipv4) = ip {
-                let _ = self.ban_cmd_tx.send(IcmpBanCmd::Unban(ipv4));
+            match ip {
+                IpAddr::V4(ipv4) => {
+                    let _ = self.ban_cmd_tx.send(IcmpBanCmd::Unban(ipv4));
+                }
+                IpAddr::V6(ipv6) => {
+                    let _ = self.ban_cmd_tx.send(IcmpBanCmd::UnbanV6(ipv6));
+                }
             }
         }
     }
@@ -179,8 +190,13 @@ impl IcmpStats {
         for ip_s in ips.into_iter().take(100_000) {
             if let Ok(ip) = ip_s.parse::<IpAddr>() {
                 self.banned.insert(ip, BanEntry { ts: Instant::now(), src: BanSource::Manual, permanent: true });
-                if let IpAddr::V4(v4) = ip {
-                    let _ = self.ban_cmd_tx.send(IcmpBanCmd::Ban(v4));
+                match ip {
+                    IpAddr::V4(v4) => {
+                        let _ = self.ban_cmd_tx.send(IcmpBanCmd::Ban(v4));
+                    }
+                    IpAddr::V6(v6) => {
+                        let _ = self.ban_cmd_tx.send(IcmpBanCmd::BanV6(v6));
+                    }
                 }
                 n += 1;
             }

@@ -8004,8 +8004,13 @@ async fn blacklist_ip_handler(
         Ok(ip) => {
             state.icmp_stats.ban_permanent(ip);
             state.alert_tracker.block_manual(ip, "manual-blacklist".to_string());
-            if let std::net::IpAddr::V4(ipv4) = ip {
-                let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+            match ip {
+                std::net::IpAddr::V4(ipv4) => {
+                    let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+                }
+                std::net::IpAddr::V6(ipv6) => {
+                    let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::BanV6(ipv6));
+                }
             }
             if let (Some(ref j), Some(ref k)) = (&state.sync_journal, &state.sync_key) {
                 crate::api::relay::push_to_slaves(
@@ -8027,8 +8032,13 @@ async fn put_blocked_ip(
         Ok(ip) => {
             state.alert_tracker.block_manual(ip, "manual".to_string());
             state.icmp_stats.ban(ip, crate::icmp::BanSource::Manual);
-            if let std::net::IpAddr::V4(ipv4) = ip {
-                let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+            match ip {
+                std::net::IpAddr::V4(ipv4) => {
+                    let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+                }
+                std::net::IpAddr::V6(ipv6) => {
+                    let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::BanV6(ipv6));
+                }
             }
             if let (Some(ref j), Some(ref k)) = (&state.sync_journal, &state.sync_key) {
                 crate::api::relay::push_to_slaves(
@@ -8051,8 +8061,13 @@ async fn delete_blocked_ip(
         Ok(ip) => {
             let removed = state.alert_tracker.unblock(ip);
             state.icmp_stats.unban(ip);
-            if let std::net::IpAddr::V4(ipv4) = ip {
-                let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+            match ip {
+                std::net::IpAddr::V4(ipv4) => {
+                    let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+                }
+                std::net::IpAddr::V6(ipv6) => {
+                    let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::UnbanV6(ipv6));
+                }
             }
             if let (Some(ref j), Some(ref k)) = (&state.sync_journal, &state.sync_key) {
                 crate::api::relay::push_to_slaves(

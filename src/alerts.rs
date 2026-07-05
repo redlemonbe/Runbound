@@ -391,13 +391,16 @@ impl AlertTracker {
     }
 
     /// #ddos: push a block/unblock to the XDP ban map (line-rate XDP_DROP) when an
-    /// XDP ban channel is wired. IPv4 only (the BPF map is v4); IPv6 blocks stay
-    /// enforced in userspace via is_blocked().
+    /// XDP ban channel is wired. #228: both IPv4 and IPv6 are now pushed to the
+    /// kernel (separate v4/v6 BPF maps), so a verified block is enforced at XDP
+    /// speed on either datapath.
     fn xdp_push(&self, ip: IpAddr, ban: bool) {
         if let Some(tx) = self.ban_tx.get() {
-            if let IpAddr::V4(v4) = ip {
-                let _ = tx.send(if ban { IcmpBanCmd::Ban(v4) } else { IcmpBanCmd::Unban(v4) });
-            }
+            let cmd = match ip {
+                IpAddr::V4(v4) => if ban { IcmpBanCmd::Ban(v4) } else { IcmpBanCmd::Unban(v4) },
+                IpAddr::V6(v6) => if ban { IcmpBanCmd::BanV6(v6) } else { IcmpBanCmd::UnbanV6(v6) },
+            };
+            let _ = tx.send(cmd);
         }
     }
 
@@ -409,9 +412,8 @@ impl AlertTracker {
             return;
         }
         for e in self.blocked.iter() {
-            if let IpAddr::V4(v4) = *e.key() {
-                self.xdp_push(IpAddr::V4(v4), true);
-            }
+            // #228: re-sync both v4 and v6 restored blocks into the BPF maps.
+            self.xdp_push(*e.key(), true);
         }
     }
 
