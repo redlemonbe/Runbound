@@ -344,9 +344,14 @@ pub fn load_xdp_cache(
         } else {
             continue; // corrupt entry — skip
         };
+        // A corrupt/crafted persisted entry can carry an absurd expiry; a checked add
+        // avoids an Instant-overflow panic at startup — skip such an entry instead.
+        let Some(expires_at) = instant_now.checked_add(remaining) else {
+            continue; // corrupt entry — skip
+        };
         let entry = CacheEntry {
             wire_payload: Bytes::from(pe.wire_payload),
-            expires_at: instant_now + remaining,
+            expires_at,
             wire_qname: Bytes::new(), // anti-collision disabled for persisted entries
         };
         cache_insert(cache, key, entry, max_entries);
