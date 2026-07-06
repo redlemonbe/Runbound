@@ -13,12 +13,11 @@
 // the owner|type|class|origTTL|rdlen|RDATA records, each RDATA canonicalised
 // (RFC 4034 §6.2) and the set sorted by canonical RDATA (§6.3).
 //
-// NOT YET wired in: the chain of trust (DS↔DNSKEY from the root anchor) and the
-// NSEC/NSEC3 denial proofs are later increments; this primitive alone does not
-// make an answer "Secure".
-
-// Verified and tested, but not yet dispatched to (the validating
-// recursor is wired only once the full chain + denial proofs land).
+// This primitive verifies a single RRSIG over one RRset; on its own it does not make
+// an answer "Secure". The full chain of trust (DS↔DNSKEY from the IANA root anchor) and
+// the NSEC/NSEC3 denial proofs are composed in `dnssec_chain.rs`, which dispatches to
+// these helpers and is reached from the validating recursor
+// (`recursor_wire::resolve_validated`) whenever `resolution: full-recursion` is active.
 #![allow(dead_code)]
 
 use ring::signature;

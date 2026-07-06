@@ -1306,11 +1306,9 @@ impl RunboundHandler {
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(min_ttl as u64),
             wire_qname: bytes::Bytes::copy_from_slice(&qname_lc),
         };
-        let cache_ref = Arc::clone(cache);
-        let max_ent = self.cache_max_entries;
-        tokio::spawn(async move {
-            super::cache_snapshot::cache_insert(&cache_ref, key, entry, max_ent);
-        });
+        // Slow-path (miss) insert only: a synchronous, non-blocking DashMap op — run it
+        // inline rather than paying a tokio::spawn + Arc::clone per cached answer.
+        super::cache_snapshot::cache_insert(cache, key, entry, self.cache_max_entries);
     }
 
     /// #166 / RFC 2308: cache a negative answer (NXDOMAIN / NODATA) so the fast path
@@ -1341,11 +1339,9 @@ impl RunboundHandler {
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl as u64),
             wire_qname: bytes::Bytes::copy_from_slice(&qname_lc),
         };
-        let cache_ref = Arc::clone(cache);
-        let max_ent = self.cache_max_entries;
-        tokio::spawn(async move {
-            super::cache_snapshot::cache_insert(&cache_ref, key, entry, max_ent);
-        });
+        // Slow-path (miss) insert only: a synchronous, non-blocking DashMap op — run it
+        // inline rather than paying a tokio::spawn + Arc::clone per cached answer.
+        super::cache_snapshot::cache_insert(cache, key, entry, self.cache_max_entries);
     }
 }
 
@@ -2788,7 +2784,9 @@ pub async fn run_dns_server(
 
         cfg.tsig_keys.clone(),
         Some(Arc::clone(&alert_tracker)),
-        cfg.axfr_allow.clone(),
+        // #knob: axfr-enable gates transfers — an empty allow-list makes serve_wire
+        // refuse every AXFR/IXFR (its guard is `axfr_allow.is_empty()`).
+        if cfg.axfr_enabled { cfg.axfr_allow.clone() } else { Vec::new() },
         {
             // #10/#186: compile split-horizon and publish a live-swappable handle
             // so API edits apply without a restart.
@@ -3161,6 +3159,10 @@ pub async fn run_dns_server(
         let mut kloop_handles: Vec<crate::dns::kernel_loop::KernelLoopHandle> =
             Vec::with_capacity(interfaces.len());
         for (idx, iface) in interfaces.iter().enumerate() {
+            // #knob: do-udp disables the UDP datapath (the kernel fast loop).
+            if !cfg.do_udp {
+                continue;
+            }
             let bind_cores: &[usize] = if idx == 0 {
                 &fast_cores
             } else {
@@ -3246,6 +3248,10 @@ pub async fn run_dns_server(
     const TCP_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
     for (idx, iface) in interfaces.iter().enumerate() {
+        // #knob: do-tcp disables the TCP datapath (listener + relay).
+        if !cfg.do_tcp {
+            continue;
+        }
         let udp_addr = crate::dns::kernel_loop::iface_socket_str(iface, port);
         let tcp_addr = crate::dns::kernel_loop::iface_socket_str(iface, port);
 

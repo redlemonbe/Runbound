@@ -857,10 +857,27 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
     } else {
         tracing_subscriber::EnvFilter::new(verbosity_to_filter(unbound_cfg.verbosity))
     };
-    if unbound_cfg.log_format == "json" {
-        tracing_subscriber::fmt().json().with_env_filter(log_filter).init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(log_filter).init();
+    // #knob: logfile — if set, write logs to that file (create its dir first) instead
+    // of stdout. A non-rotating appender; falls back to stdout if the path is unusable.
+    let json = unbound_cfg.log_format == "json";
+    let file_writer = unbound_cfg.logfile.as_deref().and_then(|p| {
+        let path = std::path::Path::new(p);
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+        let _ = std::fs::create_dir_all(dir);
+        let name = path.file_name()?;
+        Some(tracing_appender::rolling::never(dir, name))
+    });
+    match (file_writer, json) {
+        (Some(w), true) => tracing_subscriber::fmt().json().with_env_filter(log_filter).with_writer(w).init(),
+        (Some(w), false) => tracing_subscriber::fmt().with_env_filter(log_filter).with_writer(w).init(),
+        (None, true) => tracing_subscriber::fmt().json().with_env_filter(log_filter).init(),
+        (None, false) => tracing_subscriber::fmt().with_env_filter(log_filter).init(),
+    }
+    // #knob: pidfile — write our PID so classic init/monitoring can find us (best-effort).
+    if let Some(pidfile) = unbound_cfg.pidfile.as_deref() {
+        if let Err(e) = std::fs::write(pidfile, format!("{}\n", std::process::id())) {
+            tracing::warn!(pidfile, err = %e, "could not write pidfile");
+        }
     }
 
     runtime::BASE_DIR
