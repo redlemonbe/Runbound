@@ -149,7 +149,7 @@ fi
 [ "$_download_ok" -eq 1 ] || fail "Download failed: $DIRECT_URL"
 
 # ── Integrity: SHA256 (enforced when tools present) + minisign authenticity ───
-MINISIGN_PUBKEY="RWT4uccC0fq9zgcaMtMsdH90azvmKpsNI1xlZrzlBuGH7xx1nDftTFJr"
+MINISIGN_PUBKEY="RWR8qoSBp5QDO/+vJox3/sHX1RIp4y1ifIVWb5nSKD//Po+exCOWPZ0B"
 BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
 TMP_SUMS="$(mktemp)"; TMP_SIG="$(mktemp)"
 _fetch() {  # $1 url  $2 dest
