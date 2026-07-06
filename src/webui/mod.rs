@@ -540,13 +540,14 @@ async fn handle_login(
             use subtle::ConstantTimeEq;
             bool::from(creds.username.as_bytes().ct_eq(form.rb_user.as_bytes()))
         };
-        if !user_ok { false }
-        else {
-            match PasswordHash::new(&creds.hash) {
-                Ok(h) => Argon2::default().verify_password(form.rb_pass.as_bytes(), &h).is_ok(),
-                Err(_) => false,
-            }
-        }
+        // M1: always run the (expensive) argon2 verify regardless of whether the
+        // username matched, so response time does not leak username validity.
+        // `user_ok` gates the final result.
+        let pass_ok = match PasswordHash::new(&creds.hash) {
+            Ok(h) => Argon2::default().verify_password(form.rb_pass.as_bytes(), &h).is_ok(),
+            Err(_) => false,
+        };
+        user_ok && pass_ok
     };
     if !ok {
         tracing::warn!(user = %form.rb_user, ip = %client_ip, "WebUI login FAILED — invalid credentials");

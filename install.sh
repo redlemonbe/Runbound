@@ -315,7 +315,10 @@ ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_XDP
-MemoryDenyWriteExecute=false
+# M3: verified compatible (tested under systemd MemoryDenyWriteExecute=yes) — Runbound
+# maps no writable+executable memory: AF_XDP UMEM is read/write only, eBPF loads via the
+# bpf() syscall (no userspace JIT), and the crypto is pure-Rust.
+MemoryDenyWriteExecute=true
 ReadWritePaths=${CONFIG_DIR} ${DATA_DIR}
 LimitNOFILE=65536
 LimitMEMLOCK=infinity

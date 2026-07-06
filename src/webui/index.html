@@ -1325,7 +1325,7 @@ function renderDnsFlat(records) {
   const el = document.getElementById('dns-list');
   if (!records.length) { el.innerHTML = empty('No DNS records.'); return; }
   el.innerHTML = `<div class="dns-row-hdr"><span>Name</span><span>Type</span><span>Value</span><span>TTL</span><span></span></div>` +
-    records.map(e => `<div class="dns-row"><span class="text-cyan-300 truncate">${esc(e.name)}</span><span class="text-gray-600">${esc(e.type??e.qtype)}</span><span class="text-gray-300 truncate">${esc(e.value??e.rdata)}</span><span class="text-gray-700 text-right">${e.ttl}s</span><button class="del" onclick="dnsDelete('${e.id}')">✕</button></div>`).join('');
+    records.map(e => `<div class="dns-row"><span class="text-cyan-300 truncate">${esc(e.name)}</span><span class="text-gray-600">${esc(e.type??e.qtype)}</span><span class="text-gray-300 truncate">${esc(e.value??e.rdata)}</span><span class="text-gray-700 text-right">${e.ttl}s</span><button class="del" onclick="dnsDelete('${esc(e.id)}')">✕</button></div>`).join('');
 }
 
 function renderDnsZones(records) {
@@ -1344,7 +1344,7 @@ function renderDnsZones(records) {
     const isOpen = openZones.has(zone);
     const rows = recs.map(e => {
       const rel = relativeName(e.name, zone);
-      return `<div class="dns-row"><span class="text-cyan-300 truncate font-mono" title="${esc(e.name)}">${esc(rel)}</span><span class="text-gray-500">${esc(e.type??e.qtype)}</span><span class="text-gray-300 truncate">${esc(e.value??e.rdata)}</span><span class="text-gray-700 text-right">${e.ttl}s</span><button class="del" onclick="dnsDelete('${e.id}')">✕</button></div>`;
+      return `<div class="dns-row"><span class="text-cyan-300 truncate font-mono" title="${esc(e.name)}">${esc(rel)}</span><span class="text-gray-500">${esc(e.type??e.qtype)}</span><span class="text-gray-300 truncate">${esc(e.value??e.rdata)}</span><span class="text-gray-700 text-right">${e.ttl}s</span><button class="del" onclick="dnsDelete('${esc(e.id)}')">✕</button></div>`;
     }).join('');
     const addRow = `<div class="flex gap-2 p-2 bg-gray-950/60 border-t border-gray-800/50 flex-wrap items-center">
       <input id="zadd-name-${CSS.escape(zone)}" type="text" placeholder="name" class="input w-28" />
@@ -1422,7 +1422,7 @@ async function loadBlacklist() {
     const d=await api('GET','/blacklist'),entries=d.blacklist??d.entries??[];
     document.getElementById('bl-count').textContent=entries.length.toLocaleString()+' entries';
     document.getElementById('bl-list').innerHTML=entries.length===0?empty('No blocked domains.'):
-      entries.map(e=>`<div class="row py-1"><span class="text-red-400 flex-1">${esc(e.domain)}</span><span class="text-gray-700 w-20 text-right text-xs">${e.action}</span><button class="del ml-3" onclick="blDelete('${e.id}')">✕</button></div>`).join('');
+      entries.map(e=>`<div class="row py-1"><span class="text-red-400 flex-1">${esc(e.domain)}</span><span class="text-gray-700 w-20 text-right text-xs">${e.action}</span><button class="del ml-3" onclick="blDelete('${esc(e.id)}')">✕</button></div>`).join('');
   } catch(e){toast('Blacklist: '+e.message,true);}
 }
 async function blAdd(){const domain=document.getElementById('bl-domain').value.trim(),action=document.getElementById('bl-action').value;if(!domain)return toast('Domain required',true);try{await api('POST','/blacklist',{domain,action});toast('Blocked');loadBlacklist();document.getElementById('bl-domain').value='';}catch(e){toast('Add failed: '+e.message,true);}}

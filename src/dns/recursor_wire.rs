@@ -159,7 +159,7 @@ fn build_query(qname: &Name, qtype: u16) -> (u16, Vec<u8>) {
 /// return the parsed response, validated against `id` and the question.
 async fn query_server(addr: SocketAddr, qname: &Name, qtype: u16) -> Option<wire::Message> {
     let (id, q) = build_query(qname, qtype);
-    let resp = timeout(QUERY_TIMEOUT, udp_exchange(addr, &q)).await.ok()??;
+    let resp = timeout(QUERY_TIMEOUT, udp_exchange(addr, &q, id, qname, qtype)).await.ok()??;
     let msg = wire::Message::parse(&resp).ok()?;
     if msg.header.id != id || !question_matches(&msg, qname, qtype) {
         return None;
@@ -183,15 +183,30 @@ fn question_matches(msg: &wire::Message, qname: &Name, qtype: u16) -> bool {
     }
 }
 
-async fn udp_exchange(addr: SocketAddr, q: &[u8]) -> Option<Vec<u8>> {
+async fn udp_exchange(
+    addr: SocketAddr,
+    q: &[u8],
+    id: u16,
+    qname: &Name,
+    qtype: u16,
+) -> Option<Vec<u8>> {
     let bind = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
     let sock = UdpSocket::bind(bind).await.ok()?;
     sock.connect(addr).await.ok()?;
     sock.send(q).await.ok()?;
     let mut buf = vec![0u8; 4096];
-    let n = sock.recv(&mut buf).await.ok()?;
-    buf.truncate(n);
-    Some(buf)
+    // M2: read until a datagram matching our transaction id + question arrives.
+    // The socket is connect()ed so only the queried server's datagrams reach us;
+    // a single spoofed/stray non-matching datagram no longer aborts resolution —
+    // we keep waiting for the real answer, bounded by the caller's QUERY_TIMEOUT.
+    loop {
+        let n = sock.recv(&mut buf).await.ok()?;
+        if let Ok(msg) = wire::Message::parse(&buf[..n]) {
+            if msg.header.id == id && question_matches(&msg, qname, qtype) {
+                return Some(buf[..n].to_vec());
+            }
+        }
+    }
 }
 
 async fn tcp_exchange(addr: SocketAddr, q: &[u8]) -> Option<Vec<u8>> {

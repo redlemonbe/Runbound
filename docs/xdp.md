@@ -127,6 +127,14 @@ local-data**, CNAME/MX/TXT, EDNS (OPT), ACL Deny, ANY, malformed — transparent
 unchanged outside the A/AAAA answer case. See [benchmark/](benchmark/) for the current
 benchmark methodology.
 
+> **Blacklist matching is case-sensitive on the fast path.** The XDP fast-block (#153)
+> extracts the raw QNAME bytes, so a case-varied query (e.g. `AdS.ExAmPlE.CoM`, DNS 0x20)
+> does not match a blacklist entry at the XDP layer and is not served the forged NXDOMAIN
+> there — it falls through (`XDP_PASS`) to the slow path, where the blacklist re-matches
+> case-insensitively and blocks it. No bypass (the domain is still blocked); only the
+> ~1 microsecond fast-path block is skipped for that query shape. The cache / domain-routing
+> hash, by contrast, is case-normalised.
+
 ## domain-routing (CPUMAP) and zero-copy (#155)
 
 `xdp-domain-routing` (CPUMAP per-domain CPU affinity) is **mutually exclusive

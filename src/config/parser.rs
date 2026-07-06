@@ -1102,8 +1102,14 @@ fn parse_server_directive(
         "do-udp" => cfg.do_udp = val == "yes",
         "do-tcp" => cfg.do_tcp = val == "yes",
         // TLS — DoT / DoH / DoQ (Runbound extensions, ignored by real Unbound)
-        "tls-service-pem" | "tls-cert-bundle" => {
+        "tls-service-pem" => {
             cfg.tls.cert_path = Some(val.trim_matches('"').to_string())
+        }
+        // M5: in Unbound `tls-cert-bundle` is the CA bundle used to verify
+        // *outbound* TLS, NOT the DoT/DoH server certificate. Don't silently load
+        // it as the server cert (that would break a valid Unbound config).
+        "tls-cert-bundle" => {
+            warn!("tls-cert-bundle is Unbound's outbound CA bundle, not the DoT/DoH server certificate — ignored; use tls-service-pem for the server cert");
         }
         "tls-service-key" => cfg.tls.key_path = Some(val.trim_matches('"').to_string()),
         "tls-port" => cfg.tls.dot_port = val.parse().ok(),
