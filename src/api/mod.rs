@@ -5037,7 +5037,7 @@ mod tests {
         // Initialise API key (OnceLock — safe to call multiple times with same value)
         init_api_key(Some(TEST_KEY.to_string()));
         // Initialise BASE_DIR for store/feeds path resolution (OnceLock — idempotent).
-        let _ = crate::runtime::BASE_DIR.set(std::path::PathBuf::from("/tmp/runbound-test"));
+        let _ = crate::runtime::BASE_DIR.set({ let d = std::env::temp_dir().join(format!("runbound-test-{}", std::process::id())); let _ = std::fs::create_dir_all(&d); d });
 
         let cfg_arc = Arc::new(cfg);
         let zones = Arc::new(ArcSwap::new(Arc::new(
@@ -5066,7 +5066,7 @@ mod tests {
             sync_journal: None,
             sync_key: None,
             slave_mode: false,
-            base_dir: Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
+            base_dir: Arc::new({ let d = std::env::temp_dir().join(format!("runbound-test-{}", std::process::id())); let _ = std::fs::create_dir_all(&d); d }),
             audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp"), 0),
             xdp_active: Arc::new(AtomicU8::new(0)),
             resolver,
@@ -7200,7 +7200,7 @@ mod tests {
         std::fs::write(&tmp, conf_content).expect("write temp conf");
 
         init_api_key(Some(TEST_KEY.to_string()));
-        let _ = crate::runtime::BASE_DIR.set(std::path::PathBuf::from("/tmp/runbound-test"));
+        let _ = crate::runtime::BASE_DIR.set({ let d = std::env::temp_dir().join(format!("runbound-test-{}", std::process::id())); let _ = std::fs::create_dir_all(&d); d });
 
         let mut cfg = crate::config::parser::UnboundConfig::default();
         cfg.forward_zones.push(crate::config::parser::ForwardZone {
@@ -7243,7 +7243,7 @@ mod tests {
             sync_journal: None,
             sync_key: None,
             slave_mode: false,
-            base_dir: Arc::new(std::path::PathBuf::from("/tmp/runbound-test")),
+            base_dir: Arc::new({ let d = std::env::temp_dir().join(format!("runbound-test-{}", std::process::id())); let _ = std::fs::create_dir_all(&d); d }),
             audit: crate::audit::init(false, None, None, std::path::PathBuf::from("/tmp"), 0),
             xdp_active: Arc::new(AtomicU8::new(0)),
             resolver,
@@ -7681,7 +7681,7 @@ mod tests {
         assert_eq!(registry.all_users().len(), 2, "test registry must load 2 users");
 
         init_api_key(Some(TEST_KEY.to_string()));
-        let _ = crate::runtime::BASE_DIR.set(std::path::PathBuf::from("/tmp/runbound-test"));
+        let _ = crate::runtime::BASE_DIR.set({ let d = std::env::temp_dir().join(format!("runbound-test-{}", std::process::id())); let _ = std::fs::create_dir_all(&d); d });
 
         let cfg_arc = Arc::new(crate::config::parser::UnboundConfig::default());
         let base = std::path::PathBuf::from(uniq);
