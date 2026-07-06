@@ -6,11 +6,12 @@ Common operational issues and their resolutions.
 
 ## Memory pressure under low-memory systems
 
-**Behaviour:** There is no general query-answer cache in this architecture (outside the
-XDP fast-path snapshot). `ForwardPool` (`src/dns/forward.rs`) only pools upstream
-DoT/UDP connections and races them — it does not cache answers. The structure that
-`cache-min-entries` / `cache-size` / RAM-based auto-sizing actually govern is
-`stale_cache_wire`, the **serve-stale fallback store** (`src/dns/server.rs`): a
+**Behaviour:** The general query-answer cache **is** the fast-path snapshot (`xdp_cache`,
+`src/dns/cache_snapshot.rs`): it stores positive **and** RFC 2308 negative answers keyed by
+`(name, qtype)`, and is what `cache-size` / `cache-min-entries` / RAM-based auto-sizing cap.
+`ForwardPool` (`src/dns/forward.rs`) additionally only pools upstream DoT/UDP connections and
+races them — it does not cache answers. Separately, `stale_cache_wire`
+(`src/dns/server.rs`) is the **serve-stale fallback store**: a
 `DashMap` of the last-known-good answer per `(name, qtype)`, used only to answer queries
 when all upstreams are unreachable (RFC 8767). It is sized **once at startup** — a
 ceiling derived from available RAM (cgroup-aware: `memory.max` inside a container,

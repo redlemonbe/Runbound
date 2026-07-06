@@ -49,8 +49,11 @@ pub enum ResolveResult {
     /// see #210), so `neg_ttl` is computed but currently unread.
     NegativeAnswer {
         rcode: u16,
-        #[allow(dead_code)]
+        /// RFC 2308 §5 negative TTL: `min(SOA.minimum, SOA.ttl)`, or 0 = do-not-cache.
         neg_ttl: u32,
+        /// RFC 2308 §3: the zone SOA record(s) from the upstream authority section, so the
+        /// forward path serves and caches negatives with the SOA (like the recursion path).
+        soa: Vec<wire::Record>,
     },
     /// Transient error: timeout, connection failure, SERVFAIL, REFUSED
     Servfail,
@@ -606,6 +609,7 @@ fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
                 ResolveResult::NegativeAnswer {
                     rcode: rcode::NOERROR,
                     neg_ttl: soa_min_ttl(&msg).unwrap_or(0),
+                    soa: msg.authority.iter().filter(|r| matches!(r.rdata, wire::Rdata::Soa { .. })).cloned().collect(),
                 }
             } else {
                 ResolveResult::Answer { records: msg.answers }
@@ -614,6 +618,7 @@ fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
         rcode::NXDOMAIN => ResolveResult::NegativeAnswer {
             rcode: rcode::NXDOMAIN,
             neg_ttl: soa_min_ttl(&msg).unwrap_or(0),
+            soa: msg.authority.iter().filter(|r| matches!(r.rdata, wire::Rdata::Soa { .. })).cloned().collect(),
         },
         other => {
             debug!(rcode = other, "upstream returned error rcode");

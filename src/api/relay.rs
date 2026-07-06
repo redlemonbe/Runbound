@@ -330,11 +330,12 @@ pub fn push_to_slaves(
     let key = sync_key.to_string();
     let method_s = method.as_str().to_string();
 
+    let path = format!("/relay/{}", relay_path.trim_start_matches('/')); // loop-invariant
     for slave in slaves {
         let Some(relay_host) = slave.relay_host else {
             continue;
         };
-        let path = format!("/relay/{}", relay_path.trim_start_matches('/'));
+        let path = path.clone();
         let body = body.clone();
         let key = key.clone();
         let method_s = method_s.clone();

@@ -544,8 +544,9 @@ computes `used = 1 - MemAvailable/MemTotal` against two watermarks:
 | 70–80 % | Logged at `debug` only — nothing is resized (see below). |
 | ≥ 80 % | `ForwardPool` is rebuilt (refreshes upstream/DoT connections), cache stats counters are reset, and the rate limiter's DashMap of token buckets is cleared to free memory. |
 
-There is no general query-answer cache to "halve" in this architecture — `ForwardPool`
-only pools upstream connections, it does not cache answers. On non-Linux systems or
+The general query-answer cache (`xdp_cache` — positive **and** RFC 2308 negative answers,
+capped by `cache-size` / auto-sizing) is not "halved"; the guard resets counters and rebuilds
+`ForwardPool` (which only pools upstream connections, it does not cache answers). On non-Linux systems or
 containers without `/proc/meminfo`, the guard silently skips its check and DNS service
 continues normally.
 

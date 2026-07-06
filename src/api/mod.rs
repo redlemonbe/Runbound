@@ -4160,7 +4160,9 @@ fn render_prometheus_metrics(
 }
 
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
-    let snap = s.stats.snapshot();
+    // Reuse the once/sec cached snapshot (same <=1s staleness contract as /api/stats)
+    // instead of recomputing ~360 atomic loads + qtype sort + latency-ring scans per scrape.
+    let snap = s.stats_cache.load();
     // Canonical cache hits/misses = snapshot()'s SUMMED counters (slow path + XDP
     // fast-path worker hits, no double-count). Reusing the snapshot fields guarantees
     // hits_total/misses_total stay consistent with cache_hit_rate — both come from the

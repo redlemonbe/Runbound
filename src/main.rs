@@ -865,7 +865,15 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
         let _ = std::fs::create_dir_all(dir);
         let name = path.file_name()?;
-        Some(tracing_appender::rolling::never(dir, name))
+        // Verify we can actually write before committing to the file appender; otherwise
+        // fall back to stdout instead of silently losing every log line to a stderr error.
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(_) => Some(tracing_appender::rolling::never(dir, name)),
+            Err(e) => {
+                eprintln!("logfile {p} is not writable ({e}) — logging to stdout instead");
+                None
+            }
+        }
     });
     match (file_writer, json) {
         (Some(w), true) => tracing_subscriber::fmt().json().with_env_filter(log_filter).with_writer(w).init(),
@@ -878,6 +886,13 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         if let Err(e) = std::fs::write(pidfile, format!("{}\n", std::process::id())) {
             tracing::warn!(pidfile, err = %e, "could not write pidfile");
         }
+    }
+    // #knob guards: warn on transport configs that answer nothing / are silently ignored.
+    if !unbound_cfg.do_udp && !unbound_cfg.do_tcp {
+        tracing::warn!("both do-udp and do-tcp are disabled — no DNS transport will be served");
+    }
+    if unbound_cfg.xdp && !unbound_cfg.do_udp {
+        tracing::warn!("do-udp: no has no effect with xdp: yes — AF_XDP owns UDP:53");
     }
 
     runtime::BASE_DIR

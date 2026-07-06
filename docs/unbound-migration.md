@@ -66,9 +66,7 @@ Directives accepted without error but with no effect at runtime. Safe to leave i
 | Directive | Why it's a no-op in Runbound |
 |---|---|
 | `num-threads` | Runbound uses a Tokio async runtime with `SO_REUSEPORT` — threads are managed internally, not configurable via this directive |
-| `cache-size` | Cache size is adaptive (pressure-based halving) rather than a fixed allocation |
-| `msg-cache-size` | See `cache-size` |
-| `rrset-cache-size` | See `cache-size` |
+| `msg-cache-size` / `rrset-cache-size` | Runbound has **one** unified answer cache, not separate message/rrset caches — use `cache-size` (which **is** honoured: it caps the answer cache; RAM-based auto-sizing when unset) |
 | `so-rcvbuf` / `so-sndbuf` | Socket buffers managed internally |
 | `outgoing-range` | Outgoing port range not applicable to Runbound's upstream pool |
 | `num-queries-per-thread` | See `num-threads` |

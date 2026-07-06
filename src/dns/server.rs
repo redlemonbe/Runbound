@@ -978,16 +978,23 @@ impl RunboundHandler {
                 self.log_query_wire(client_ip, &qname_pres, qtype, action, start);
                 Some(resp)
             }
-            crate::dns::forward::ResolveResult::NegativeAnswer { rcode: rc, neg_ttl } => {
+            crate::dns::forward::ResolveResult::NegativeAnswer { rcode: rc, neg_ttl, soa } => {
                 let action = if rc == rcode::NXDOMAIN {
                     self.stats.inc_nxdomain();
                     LogAction::Nxdomain
                 } else {
-                    self.stats.inc_servfail();
-                    LogAction::Servfail
+                    // NOERROR + empty ANSWER = NODATA — a valid negative answer, NOT a
+                    // failure. Counting it as SERVFAIL wrongly inflated the servfail metric
+                    // (which feeds /health, and can withdraw a BGP route in anycast). A
+                    // AAAA on an IPv4-only host is a perfectly normal NODATA.
+                    LogAction::Forwarded
                 };
                 self.log_query_wire(client_ip, &qname_pres, qtype, action, start);
-                let resp = self.wire_error(&msg, rc);
+                // RFC 2308 §3: carry the zone SOA in the authority section — the forward
+                // path now matches the recursion path (previously wire_error sent none).
+                // do_bit=false: forward has no DNSSEC denial records, and this is also the
+                // cached DO=0 form served from the fast path.
+                let resp = self.wire_negative(&msg, rc, &soa, false);
                 // #166 / RFC 2308: cache the forwarded negative if the upstream gave a
                 // cacheable neg-TTL (from its authority SOA).
                 self.maybe_cache_negative(&q, &resp, neg_ttl);
