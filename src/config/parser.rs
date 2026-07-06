@@ -172,6 +172,12 @@ pub struct UnboundConfig {
     /// Resolution backend for cache-miss queries: `forward` (default) or `full-recursion`
     /// (sovereign iterative-from-root, opt-in). See [`ResolutionMode`].
     pub resolution_mode: ResolutionMode,
+    /// #231: QNAME minimisation (RFC 9156) for the full-recursion resolver — probe
+    /// intermediate authoritatives with the next label only (privacy). Default: true
+    /// (like Unbound; only takes effect under `resolution: full-recursion`). Relaxed
+    /// variant: falls back to the full name on any anomaly, so it never breaks a
+    /// resolution. Applied at startup (a restart is required to change it).
+    pub qname_minimisation: bool,
 
     // ── GDPR / privacy controls ────────────────────────────────────────────
     /// Max entries in the in-RAM query log ring buffer. Default: 1000. 0 = disabled.
@@ -518,6 +524,7 @@ impl UnboundConfig {
             log_retention: 1000,
             log_client_ip: false,
             resolution_mode: ResolutionMode::Forward,
+            qname_minimisation: true,
             xdp: true,
             xdp_hugepages: true,
             xdp_busy_poll: true,
@@ -1160,6 +1167,7 @@ fn parse_server_directive(
                 cfg.resolution_mode.as_str()
             ),
         },
+        "qname-minimisation" => cfg.qname_minimisation = val.trim_matches('"') != "no",
         "log-format" => cfg.log_format = val.trim_matches('"').trim().to_lowercase(),
         "dnssec-log-bogus" => cfg.dnssec_log_bogus = val.trim_matches('"') == "yes",
         "local-zone-dnssec" => cfg.local_zone_dnssec = val.trim_matches('"') == "yes",
@@ -1470,6 +1478,21 @@ mod tests {
     fn resolution_mode_unknown_keeps_default() {
         let cfg = parse_str("server:\n  resolution: bogus\n").unwrap();
         assert_eq!(cfg.resolution_mode, ResolutionMode::Forward);
+    }
+
+    #[test]
+    fn qname_minimisation_default_on_and_roundtrips() {
+        // #231: default on (only effective under full-recursion).
+        assert!(UnboundConfig::defaults().qname_minimisation);
+        assert!(parse_str("server:\n").unwrap().qname_minimisation);
+        // Explicit off parses and renders (a non-default value is emitted).
+        let cfg = parse_str("server:\n  qname-minimisation: no\n").unwrap();
+        assert!(!cfg.qname_minimisation);
+        let rendered = crate::config::writer::render_config(&cfg);
+        assert!(rendered.contains("qname-minimisation: no"), "rendered:\n{rendered}");
+        assert!(!parse_str(&rendered).unwrap().qname_minimisation);
+        // Explicit yes.
+        assert!(parse_str("server:\n  qname-minimisation: yes\n").unwrap().qname_minimisation);
     }
 
     #[test]

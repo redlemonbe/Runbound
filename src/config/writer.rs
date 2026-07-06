@@ -39,7 +39,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "api-key" | "api-port" | "api-socket"
                 | "cache-max-ttl" | "cache-min-ttl" | "cache-min-entries" | "cache-size"
                 | "private-address"
-                | "dnssec-validation" | "dnssec-log-bogus" | "local-zone-dnssec" | "resolution"
+                | "dnssec-validation" | "dnssec-log-bogus" | "local-zone-dnssec" | "resolution" | "qname-minimisation"
                 | "log-retention" | "log-client-ip"
                 | "audit-log" | "audit-log-path" | "audit-log-hmac-key" | "audit-checkpoint-every"
                 | "mode" | "sync-port" | "sync-master" | "sync-key" | "sync-interval"
@@ -157,6 +157,7 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if cfg.dnssec_log_bogus != d.dnssec_log_bogus { o.push_str(&format!("    dnssec-log-bogus: {}\n", b(cfg.dnssec_log_bogus))); }
     if cfg.local_zone_dnssec != d.local_zone_dnssec { o.push_str(&format!("    local-zone-dnssec: {}\n", b(cfg.local_zone_dnssec))); }
     if cfg.resolution_mode != d.resolution_mode { o.push_str(&format!("    resolution: {}\n", cfg.resolution_mode.as_str())); }
+    if cfg.qname_minimisation != d.qname_minimisation { o.push_str(&format!("    qname-minimisation: {}\n", b(cfg.qname_minimisation))); }
     if cfg.log_retention != d.log_retention { o.push_str(&format!("    log-retention: {}\n", cfg.log_retention)); }
     if cfg.log_client_ip != d.log_client_ip { o.push_str(&format!("    log-client-ip: {}\n", b(cfg.log_client_ip))); }
     if cfg.audit_log != d.audit_log { o.push_str(&format!("    audit-log: {}\n", b(cfg.audit_log))); }

@@ -900,9 +900,30 @@ When full-recursion is active:
 - **Anti-SSRF:** the recursor refuses to query loopback / RFC 1918 / CGNAT / link-local
   (incl. `169.254` cloud-metadata) / ULA addresses — on glue, CNAME chains and NS addresses.
 
-> **Not implemented:** `src/dns/recursor_wire.rs` sends the full QNAME in one query per
-> hop (no QNAME minimisation, RFC 7816) and does not randomise the case of the query
-> name (no 0x20 encoding). Transaction IDs are randomised per query. Serve-stale
+#### QNAME minimisation (RFC 9156, #231)
+
+By default the recursor **minimises** its outgoing queries: an intermediate authoritative
+server is asked only for the next label toward the target (as a QTYPE `A` probe), so the
+root and TLD servers never learn the full name — only that you looked up *something* under
+`com`, not `www.private-app.example.com`. The full name and type are sent solely to the
+zone's own authoritative server.
+
+```
+server:
+    qname-minimisation: yes   # default — probe one label at a time (privacy)
+    qname-minimisation: no    # send the full QNAME to every hop (legacy behaviour)
+```
+
+Only effective under `resolution: full-recursion` (there is nothing to minimise when
+forwarding). It is the **relaxed** variant: if a probe meets a non-conformant server
+(NXDOMAIN on an empty non-terminal, an unexpected answer, or silence), the resolver falls
+back to the full QNAME at that same delegation point, so minimisation only adds privacy and
+never breaks a name that would otherwise resolve. Deep names held flat with no intermediate
+delegations stop being probed label-by-label after 10 labels (anti-amplification). Applied
+at startup — changing it needs a restart (unlike the `resolution` mode, which is live).
+
+> **Not implemented:** `src/dns/recursor_wire.rs` does not randomise the case of the
+> query name (no 0x20 encoding); transaction IDs are randomised per query. Serve-stale
 > (RFC 8767) is a `forward`-mode / `ForwardPool` feature (`src/dns/server.rs`) and is not
 > wired into the recursor.
 

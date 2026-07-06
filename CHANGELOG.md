@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ## [Unreleased]
 
+### Added
+- QNAME minimisation (RFC 9156, #231) for the sovereign full-recursion resolver.
+  Intermediate authoritative servers (root, TLD) are now probed with only the next
+  label toward the target (as a QTYPE A query), so they never see the full query
+  name; the complete name and type are sent only to the zone's own authoritative
+  server. On by default under `resolution: full-recursion` (like Unbound), toggled
+  with `qname-minimisation: yes|no`. Relaxed variant: any anomaly on a probe
+  (NXDOMAIN on an empty non-terminal, an unexpected answer, or a mute server) falls
+  back to the full name at that delegation point, so it never breaks an
+  otherwise-resolvable name; deep flat names stop being probed label-by-label after
+  10 labels. The two previously-duplicated descent loops (`resolve_once` /
+  `resolve_message`) are unified into one engine. DNSSEC validation (incl. the
+  DS-at-parent anchoring, #230) and the infrastructure cache are unaffected —
+  verified live (Secure/Bogus/Insecure) and by packet capture showing the root
+  receiving only the TLD.
+
 ## [0.9.1]
 
 ### Added

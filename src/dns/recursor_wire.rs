@@ -103,6 +103,58 @@ const MAX_DEPTH: u8 = 24;
 /// Maximum CNAME indirections followed for one user query.
 const MAX_CNAME: u8 = 12;
 
+/// QNAME minimisation (RFC 9156, #231). When on, the iterative descent does not
+/// send the full QNAME to every intermediate authoritative server: it probes only
+/// the next label toward the target (QTYPE A) to discover the delegation, revealing
+/// the full name+type solely to the final authoritative server. This is the
+/// **relaxed** variant — any anomaly on a probe (NXDOMAIN, an unexpected answer, or
+/// a mute server) falls back to the full QNAME at that same cut, so minimisation can
+/// only add privacy, never break a resolution that would otherwise succeed. Default
+/// on: like Unbound, once full-recursion is enabled, minimisation is enabled unless
+/// explicitly disabled with `qname-minimisation: no`.
+static QMIN_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set QNAME minimisation on/off at runtime (from `qname-minimisation` in the
+/// config, applied at startup). #231.
+pub fn set_qname_minimisation(on: bool) {
+    QMIN_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn qmin_on() -> bool {
+    QMIN_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// QTYPE used for a minimised probe. RFC 9156 §2.3 recommends a type other than NS
+/// (a plain A) so a lame/misbehaving authoritative that mishandles a non-terminal NS
+/// query does not derail the descent; delegations are still discovered from the
+/// AUTHORITY NS RRset regardless of the probe QTYPE.
+const QMIN_PROBE_TYPE: u16 = consts::rtype::A;
+
+/// Cap on how many labels are added one-by-one under a single cut before the
+/// resolver gives up minimising and sends the full QNAME (RFC 9156 §2.3,
+/// anti-amplification for a deep name held flat with no intermediate delegations).
+const MAX_MINIMISE: usize = 10;
+
+/// The minimised query name at the current `zone` cut: `zone` extended by
+/// `1 + extra` labels toward `qname` (one label past the cut, plus any labels
+/// already added while probing empty non-terminals under the same cut). Returns
+/// `qname` itself once the target is reached or the `MAX_MINIMISE` cap is hit — the
+/// caller treats a returned name equal to `qname` as "send the real question".
+fn minimised(qname: &Name, zone: &Name, extra: usize) -> Name {
+    let want = zone.label_count() + 1 + extra;
+    let have = qname.label_count();
+    if extra >= MAX_MINIMISE || want >= have {
+        return qname.clone();
+    }
+    // Drop leftmost labels of qname until exactly `want` remain. `want < have`
+    // guarantees each `parent()` unwraps (we strip strictly fewer than `have`).
+    let mut n = qname.clone();
+    for _ in 0..(have - want) {
+        n = n.parent().expect("want < have keeps at least one label");
+    }
+    n
+}
+
 /// The outcome of an iterative resolution.
 #[derive(Debug)]
 pub enum Outcome {
@@ -258,115 +310,200 @@ enum StepOutcome {
     Failure,
 }
 
-/// One full descent from the root for a single (name, type), following
-/// referrals until an answer / negative / failure. Does not follow CNAMEs
-/// across the tree — that is the caller's loop.
-async fn resolve_once(qname: &Name, qtype: u16, budget: &mut u32) -> StepOutcome {
+/// One iterative descent for a single `(qname, qtype)`: walk referrals from the
+/// deepest cached enclosing cut (or the root) down to the authoritative server and
+/// return its terminal message (answer / CNAME / NXDOMAIN / NODATA). With QNAME
+/// minimisation on (#231), intermediate servers are probed with a minimised name
+/// (QTYPE A); the full `(qname, qtype)` question is asked only of the final
+/// authoritative server — or, in relaxed fallback, of a cut whose probe misbehaved.
+/// `budget` bounds the total upstream queries (shared with out-of-band NS-address
+/// resolution). `None` on a hard failure (all servers mute / budget spent).
+///
+/// This is the single descent engine shared by `resolve_once` (which interprets the
+/// terminal message into a `StepOutcome`) and `resolve_message` / the DNSSEC
+/// validator (which consume the message directly).
+async fn descend(qname: &Name, qtype: u16, budget: &mut u32) -> Option<wire::Message> {
     // #230: start at the deepest cached enclosing zone cut instead of always the
     // root. A stale/dead cached cut (its first query fails) is forgotten and we
-    // restart from the root, so the cache can only speed resolution up, never
-    // break it. Every answer is still DNSSEC-validated by the caller.
+    // restart from the root, so the cache can only speed resolution up, never break
+    // it. Every answer is still DNSSEC-validated by the caller.
     let (mut zone, mut ns_ips, mut from_cache) = match cached_start(qname, qtype) {
         Some((z, ips)) => (z, ips, true),
         None => (Name::root(), root_hints(), false),
     };
+    // #231: labels added one-by-one while probing empty non-terminals under the
+    // current cut; reset to 0 on every referral (the cut has moved down).
+    let mut extra = 0usize;
+    // #231: latched once a probe misbehaves — from here on ask the full QNAME
+    // (relaxed fallback). Stays false for the whole descent when minimisation is off.
+    let mut full = false;
 
     for _depth in 0..MAX_DEPTH {
-        let Some(msg) = query_ns_set(&ns_ips, qname, qtype, budget).await else {
-            if from_cache {
-                infra_cache::zone_cut_forget(&zone);
-                zone = Name::root();
-                ns_ips = root_hints();
-                from_cache = false;
-                continue;
+        // Decide what to actually put on the wire for this cut.
+        let probing = qmin_on() && !full && {
+            !minimised(qname, &zone, extra).eq_ignore_ascii_case(qname)
+        };
+        let (send_name, send_type) = if probing {
+            (minimised(qname, &zone, extra), QMIN_PROBE_TYPE)
+        } else {
+            (qname.clone(), qtype)
+        };
+
+        let msg = match query_ns_set(&ns_ips, &send_name, send_type, budget).await {
+            Some(m) => m,
+            None => {
+                // A mute probe must never fail an otherwise-resolvable name: retry
+                // the full QNAME at this same cut before giving up on the cut.
+                if probing {
+                    full = true;
+                    continue;
+                }
+                if from_cache {
+                    infra_cache::zone_cut_forget(&zone);
+                    zone = Name::root();
+                    ns_ips = root_hints();
+                    from_cache = false;
+                    continue;
+                }
+                return None;
             }
-            return StepOutcome::Failure;
         };
         from_cache = false;
         let rcode = msg.header.rcode_low();
 
-        // CNAME for our exact name (even when the type differs) → hand back to caller.
-        if let Some(cn) = msg.answers.iter().find(|r| {
-            r.rtype == consts::rtype::CNAME && r.name.eq_ignore_ascii_case(qname)
-        }) {
-            if let Rdata::Cname(next) = &cn.rdata {
-                return StepOutcome::Cname { chain: vec![cn.clone()], next: next.clone() };
+        // Terminal for the REAL question (only when we actually asked it): an answer
+        // for qname (qtype or CNAME) or NXDOMAIN ends the descent.
+        if !probing {
+            let has_answer = msg.answers.iter().any(|r| {
+                (r.rtype == qtype || r.rtype == consts::rtype::CNAME)
+                    && r.name.eq_ignore_ascii_case(qname)
+            });
+            if has_answer || rcode == consts::rcode::NXDOMAIN {
+                return Some(msg);
             }
         }
 
-        // Direct answer of the requested type for our name.
-        let direct: Vec<Record> = msg
-            .answers
-            .iter()
-            .filter(|r| r.rtype == qtype && r.name.eq_ignore_ascii_case(qname))
-            .cloned()
-            .collect();
-        if !direct.is_empty() {
-            return StepOutcome::Answer(direct);
-        }
-
-        if rcode == consts::rcode::NXDOMAIN {
-            return StepOutcome::Negative { rcode };
-        }
-
-        // Referral? Collect NS records in AUTHORITY for a zone strictly below the
-        // current one and at-or-above qname (otherwise it is a loop / lame).
+        // Referral strictly down the tree. Works for a minimised probe too: the
+        // delegation owner is a suffix of the probe, hence of qname.
         let referral_zone = msg
             .authority
             .iter()
             .filter(|r| r.rtype == consts::rtype::NS)
             .map(|r| &r.name)
-            .find(|n| qname.is_in_zone(n) && n.is_in_zone(&zone) && !n.eq_ignore_ascii_case(&zone))
+            .find(|nm| qname.is_in_zone(nm) && nm.is_in_zone(&zone) && !nm.eq_ignore_ascii_case(&zone))
             .cloned();
 
-        let Some(next_zone) = referral_zone else {
-            // No answer, no usable referral: NODATA (SOA present) or lame.
-            return StepOutcome::Negative { rcode: consts::rcode::NOERROR };
-        };
+        if let Some(next_zone) = referral_zone {
+            let ns_names: Vec<Name> = msg
+                .authority
+                .iter()
+                .filter(|r| r.rtype == consts::rtype::NS && r.name.eq_ignore_ascii_case(&next_zone))
+                .filter_map(|r| match &r.rdata {
+                    Rdata::Ns(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
 
-        let ns_names: Vec<Name> = msg
-            .authority
-            .iter()
-            .filter(|r| r.rtype == consts::rtype::NS && r.name.eq_ignore_ascii_case(&next_zone))
-            .filter_map(|r| match &r.rdata {
-                Rdata::Ns(n) => Some(n.clone()),
-                _ => None,
-            })
-            .collect();
+            // Glue from ADDITIONAL: A/AAAA for the referral's NS names.
+            let mut next_ips: Vec<IpAddr> = msg
+                .additional
+                .iter()
+                .filter(|r| ns_names.iter().any(|ns| ns.eq_ignore_ascii_case(&r.name)))
+                .filter_map(record_ip)
+                .filter(|ip| is_public_ip(*ip))
+                .collect();
 
-        // Glue from ADDITIONAL: A/AAAA for the referral's NS names.
-        let mut next_ips: Vec<IpAddr> = msg
-            .additional
-            .iter()
-            .filter(|r| ns_names.iter().any(|ns| ns.eq_ignore_ascii_case(&r.name)))
-            .filter_map(record_ip)
-            .filter(|ip| is_public_ip(*ip))
-            .collect();
-
-        // No usable glue → resolve one NS name's address out-of-band (bounded).
-        if next_ips.is_empty() {
-            for ns in &ns_names {
-                if *budget == 0 {
-                    return StepOutcome::Failure;
-                }
-                if let Some(ips) = resolve_ns_addr(ns, budget).await {
-                    next_ips = ips.into_iter().filter(|ip| is_public_ip(*ip)).collect();
-                    if !next_ips.is_empty() {
-                        break;
+            // No usable glue → resolve one NS name's address out-of-band (bounded).
+            if next_ips.is_empty() {
+                for ns in &ns_names {
+                    if *budget == 0 {
+                        return None;
+                    }
+                    if let Some(ips) = resolve_ns_addr(ns, budget).await {
+                        next_ips = ips.into_iter().filter(|ip| is_public_ip(*ip)).collect();
+                        if !next_ips.is_empty() {
+                            break;
+                        }
                     }
                 }
             }
+
+            if next_ips.is_empty() {
+                return None;
+            }
+            // #230: remember this cut so the next miss under it skips the root walk.
+            infra_cache::zone_cut_learn(&next_zone, &next_ips, cut_ttl(&msg, &next_zone, &ns_names));
+            ns_ips = next_ips;
+            zone = next_zone;
+            extra = 0; // cut moved down → restart minimisation from the new cut
+            continue;
         }
 
-        if next_ips.is_empty() {
-            return StepOutcome::Failure;
+        // No referral.
+        if probing {
+            // The minimised probe is not a delegation point. Decide how to advance.
+            let probe_answered = msg
+                .answers
+                .iter()
+                .any(|r| r.name.eq_ignore_ascii_case(&send_name));
+            if rcode == consts::rcode::NXDOMAIN || probe_answered {
+                // NXDOMAIN on a prefix (a conformant server implies NXDOMAIN below,
+                // RFC 8020, but a broken one may lie), or an unexpected answer on the
+                // probe (e.g. a CNAME at an intermediate name): re-ask the real
+                // question at this same cut and let it decide the truth.
+                full = true;
+                continue;
+            }
+            // NOERROR, no answer, no referral = empty non-terminal (the prefix exists
+            // in this zone but has no A here): lengthen by one label and probe again
+            // at the same cut. Bounded by MAX_MINIMISE via `minimised`.
+            extra += 1;
+            continue;
         }
-        // #230: remember this cut so the next miss under it skips the root walk.
-        infra_cache::zone_cut_learn(&next_zone, &next_ips, cut_ttl(&msg, &next_zone, &ns_names));
-        ns_ips = next_ips;
-        zone = next_zone;
+
+        // Full question asked, no terminal answer, no referral → NODATA (the message
+        // carries the zone SOA / NSEC*). Hand it back.
+        return Some(msg);
     }
-    StepOutcome::Failure
+    None
+}
+
+/// One full descent for a single (name, type), following referrals until an
+/// answer / negative / failure. Does not follow CNAMEs across the tree — that is
+/// the caller's loop. Interprets the terminal message from [`descend`].
+async fn resolve_once(qname: &Name, qtype: u16, budget: &mut u32) -> StepOutcome {
+    let Some(msg) = descend(qname, qtype, budget).await else {
+        return StepOutcome::Failure;
+    };
+    let rcode = msg.header.rcode_low();
+
+    // CNAME for our exact name (even when the type differs) → hand back to caller.
+    if let Some(cn) = msg
+        .answers
+        .iter()
+        .find(|r| r.rtype == consts::rtype::CNAME && r.name.eq_ignore_ascii_case(qname))
+    {
+        if let Rdata::Cname(next) = &cn.rdata {
+            return StepOutcome::Cname { chain: vec![cn.clone()], next: next.clone() };
+        }
+    }
+
+    // Direct answer of the requested type for our name.
+    let direct: Vec<Record> = msg
+        .answers
+        .iter()
+        .filter(|r| r.rtype == qtype && r.name.eq_ignore_ascii_case(qname))
+        .cloned()
+        .collect();
+    if !direct.is_empty() {
+        return StepOutcome::Answer(direct);
+    }
+
+    if rcode == consts::rcode::NXDOMAIN {
+        return StepOutcome::Negative { rcode };
+    }
+    // No answer, no CNAME, not NXDOMAIN → NODATA.
+    StepOutcome::Negative { rcode: consts::rcode::NOERROR }
 }
 
 /// Try each nameserver IP (in turn) until one answers; bounded by `budget`.
@@ -415,93 +552,14 @@ fn record_ip(r: &Record) -> Option<IpAddr> {
 }
 
 /// Resolve `(qname, qtype)` iteratively (DO set) and return the final
-/// authoritative message — answer or negative — for DNSSEC validation. Follows
-/// referrals like `resolve_once` but stops at the first terminal response (it
-/// does not chase CNAMEs: the validator queries explicit types).
+/// authoritative message — answer or negative — for DNSSEC validation. Stops at
+/// the first terminal response (it does not chase CNAMEs: the validator queries
+/// explicit types). Uses the shared [`descend`] engine, so QNAME minimisation
+/// (#231) applies here too; the terminal message always carries the real
+/// `(qname, qtype)` question, unchanged for the validator.
 pub async fn resolve_message(qname: &Name, qtype: u16) -> Option<wire::Message> {
     let mut budget = MAX_QUERIES;
-    // #230: start from the deepest cached cut, with a root fallback if it is stale.
-    let (mut zone, mut ns_ips, mut from_cache) = match cached_start(qname, qtype) {
-        Some((z, ips)) => (z, ips, true),
-        None => (Name::root(), root_hints(), false),
-    };
-
-    for _ in 0..MAX_DEPTH {
-        let msg = match query_ns_set(&ns_ips, qname, qtype, &mut budget).await {
-            Some(m) => m,
-            None => {
-                if from_cache {
-                    infra_cache::zone_cut_forget(&zone);
-                    zone = Name::root();
-                    ns_ips = root_hints();
-                    from_cache = false;
-                    continue;
-                }
-                return None;
-            }
-        };
-        from_cache = false;
-        let rcode = msg.header.rcode_low();
-
-        // Terminal: an answer for our name (qtype or CNAME), or NXDOMAIN.
-        let has_answer = msg.answers.iter().any(|r| {
-            (r.rtype == qtype || r.rtype == consts::rtype::CNAME) && r.name.eq_ignore_ascii_case(qname)
-        });
-        if has_answer || rcode == consts::rcode::NXDOMAIN {
-            return Some(msg);
-        }
-
-        // Referral down the tree?
-        let referral_zone = msg
-            .authority
-            .iter()
-            .filter(|r| r.rtype == consts::rtype::NS)
-            .map(|r| &r.name)
-            .find(|nm| qname.is_in_zone(nm) && nm.is_in_zone(&zone) && !nm.eq_ignore_ascii_case(&zone))
-            .cloned();
-        let Some(next_zone) = referral_zone else {
-            // No answer, no referral → NODATA (the message carries SOA/NSEC*).
-            return Some(msg);
-        };
-
-        let ns_names: Vec<Name> = msg
-            .authority
-            .iter()
-            .filter(|r| r.rtype == consts::rtype::NS && r.name.eq_ignore_ascii_case(&next_zone))
-            .filter_map(|r| match &r.rdata {
-                Rdata::Ns(n) => Some(n.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut next_ips: Vec<IpAddr> = msg
-            .additional
-            .iter()
-            .filter(|r| ns_names.iter().any(|ns| ns.eq_ignore_ascii_case(&r.name)))
-            .filter_map(record_ip)
-            .filter(|ip| is_public_ip(*ip))
-            .collect();
-        if next_ips.is_empty() {
-            for ns in &ns_names {
-                if budget == 0 {
-                    return None;
-                }
-                if let Some(ips) = resolve_ns_addr(ns, &mut budget).await {
-                    next_ips = ips.into_iter().filter(|ip| is_public_ip(*ip)).collect();
-                    if !next_ips.is_empty() {
-                        break;
-                    }
-                }
-            }
-        }
-        if next_ips.is_empty() {
-            return None;
-        }
-        // #230: remember this cut so the next miss under it skips the root walk.
-        infra_cache::zone_cut_learn(&next_zone, &next_ips, cut_ttl(&msg, &next_zone, &ns_names));
-        ns_ips = next_ips;
-        zone = next_zone;
-    }
-    None
+    descend(qname, qtype, &mut budget).await
 }
 
 /// A [`Fetcher`](crate::dns::dnssec_chain::Fetcher) backed by this resolver's own
@@ -668,6 +726,41 @@ mod tests {
         assert!(!is_public_ip("::1.2.3.4".parse().unwrap())); // IPv4-compatible (::/96)
     }
 
+    // #231: QNAME-minimisation label arithmetic (pure, no network).
+    #[test]
+    fn minimised_probes_one_label_below_the_cut() {
+        let q = Name::from_ascii("www.a.b.example.com.").unwrap();
+        let n = |s: &str| Name::from_ascii(s).unwrap();
+        let eq = |got: Name, want: &str| assert!(
+            got.eq_ignore_ascii_case(&n(want)),
+            "got {} want {want}",
+            got.to_ascii()
+        );
+        // From the root: the first probe is the TLD only — the root never sees more.
+        eq(minimised(&q, &Name::root(), 0), "com.");
+        let com = n("com.");
+        // One label past the `com` cut.
+        eq(minimised(&q, &com, 0), "example.com.");
+        // Lengthening under the same cut (empty non-terminals).
+        eq(minimised(&q, &com, 1), "b.example.com.");
+        eq(minimised(&q, &com, 2), "a.b.example.com.");
+        // Reaching the target hands back qname itself (caller then asks the real Q).
+        eq(minimised(&q, &com, 3), "www.a.b.example.com.");
+        // Past the cap → full qname (anti-amplification on flat deep names).
+        eq(minimised(&q, &com, MAX_MINIMISE), "www.a.b.example.com.");
+    }
+
+    #[test]
+    fn minimised_is_noop_when_the_cut_is_the_direct_parent() {
+        let n = |s: &str| Name::from_ascii(s).unwrap();
+        // A name one label under its cut is already the target: the "probe" equals
+        // qname, so the caller sends the real question (this is also the DS-at-parent
+        // shape, which must not be minimised).
+        assert!(minimised(&n("example.com."), &n("com."), 0).eq_ignore_ascii_case(&n("example.com.")));
+        // A single-label name from the root never minimises.
+        assert!(minimised(&n("com."), &Name::root(), 0).eq_ignore_ascii_case(&n("com.")));
+    }
+
     // Live test (needs outbound UDP/53 to the internet). Run with:
     //   cargo test -- --ignored recursor_wire
     #[tokio::test]
@@ -694,7 +787,12 @@ mod tests {
             }
         }
         // Negative: a name that does not exist must come back NXDOMAIN.
-        let bad = Name::from_ascii("nx-zzz-does-not-exist-9821.example.com.").unwrap();
+        // The zone must NOT use compact denial of existence ("black lies", Cloudflare):
+        // with DO=1 those servers answer NOERROR + an NSEC proving non-existence rather
+        // than NXDOMAIN, which the non-validating `resolve()` reads as NODATA (only the
+        // validating path interprets the NSEC). `iana.org` returns a classic NXDOMAIN,
+        // and being multi-label it also exercises QNAME minimisation on the negative path.
+        let bad = Name::from_ascii("nx-zzz-does-not-exist-9821.iana.org.").unwrap();
         match resolve(&bad, consts::rtype::A).await {
             Outcome::Negative { rcode } => {
                 eprintln!("LIVE NXDOMAIN rcode={rcode}");

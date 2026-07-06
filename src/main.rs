@@ -1199,6 +1199,8 @@ async fn build_and_launch(
     // hot-swap on toggle) share the same handles — same pattern as dnssec_enabled.
     let resolution_mode = dns::recursor::mode_atomic(cfg.resolution_mode);
     let recursor = dns::recursor::shared_recursor(cfg.resolution_mode, cfg.dnssec_validation);
+    // #231: apply QNAME minimisation (RFC 9156) to the iterative resolver at startup.
+    dns::recursor_wire::set_qname_minimisation(cfg.qname_minimisation);
 
     // ── Shared DNS resolver (hot-swappable via ArcSwap) ───────────────────
     let resolver = dns::server::create_shared_resolver(cfg)
