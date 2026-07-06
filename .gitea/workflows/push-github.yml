@@ -1,0 +1,54 @@
+name: Push → GitHub
+on:
+  workflow_dispatch:
+
+jobs:
+  push-github:
+    runs-on: [self-hosted, rb-builder]
+    steps:
+      - name: Sync du push mirror (refs git)
+        run: |
+          set -eu
+          API="http://127.0.0.1:3000/api/v1/repos/${{ github.repository }}"
+          AUTH="Authorization: token ${{ github.token }}"
+          T0=$(date -u +%s)
+          curl -sf -X POST -H "$AUTH" "$API/push_mirrors-sync"
+          echo "Sync demandee, attente du resultat du mirror…"
+          LAST_ERR=""
+          i=0
+          while [ $i -lt 36 ]; do
+            i=$((i+1)); sleep 5
+            M=$(curl -sf -H "$AUTH" "$API/push_mirrors")
+            LAST_ERR=$(printf "%s" "$M" | jq -r '.[0].last_error // ""')
+            LAST_UPD=$(printf "%s" "$M" | jq -r '.[0].last_update // ""')
+            UPD_S=$(date -u -d "$LAST_UPD" +%s 2>/dev/null || echo 0)
+            if [ "$UPD_S" -ge "$T0" ]; then
+              if [ -n "$LAST_ERR" ]; then
+                echo "::error::push mirror en erreur: $LAST_ERR"
+                printf "%s\n" "$M" | jq .
+                exit 1
+              fi
+              echo "Mirror synchronise ($LAST_UPD) :"
+              printf "%s" "$M" | jq '.[0] | {remote_name, last_update, sync_on_commit, interval}'
+              exit 0
+            fi
+          done
+          if [ -n "$LAST_ERR" ]; then
+            echo "::error::push mirror en erreur (statut non rafraichi): $LAST_ERR"
+          else
+            echo "::error::timeout: le mirror n a pas termine en 180 s"
+          fi
+          exit 1
+
+      - name: Replication des releases + assets
+        run: |
+          set -eu
+          R=$(curl -s -X POST -H "Authorization: token ${{ github.token }}" \
+                "http://127.0.0.1:8189/ghsync/${{ github.repository }}")
+          printf "%s\n" "$R" | jq .
+          printf "%s" "$R" | jq -e '(has("error") | not)
+            and ((.errors // []) | length == 0)
+            and ((.skipped_missing_tag // []) | length == 0)' >/dev/null || {
+            echo "::error::replication des releases en echec (details ci-dessus)"
+            exit 1
+          }
