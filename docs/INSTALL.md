@@ -80,7 +80,7 @@ To verify a release **manually** (e.g. before piping to a shell), see [BUILD.md]
 sha256sum -c SHA256SUMS --ignore-missing
 
 # signature (public key)
-minisign -Vm SHA256SUMS -P "RWT4uccC0fq9zgcaMtMsdH90azvmKpsNI1xlZrzlBuGH7xx1nDftTFJr"
+minisign -Vm SHA256SUMS -P "RWSBM9HzDiZpfCD82uTnkeP1Ui30LfWE96C8EtFyI4/WVyLAVxpLzYy/"
 ```
 
 ## File locations
