@@ -30,6 +30,23 @@ use crate::dns::forward::{self as forward_pool, ForwardPool};
 /// in 127.0.0.0/8 so the ACL treats it as loopback. Not an address a real client uses.
 const PREFETCH_PEER_IP: std::net::IpAddr =
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 53));
+
+/// Upper bound on a cached negative answer's TTL (#166 / RFC 2308). Caps how long a
+/// NXDOMAIN/NODATA lingers so a flood of random non-existent names cannot pin the
+/// cache full of negatives; the SOA-derived neg-TTL is still honoured below this.
+const NEG_CACHE_MAX_TTL: u32 = 900; // 15 min
+
+/// RFC 2308 §5 negative TTL from a response's authority SOA: `min(SOA.minimum, SOA.ttl)`.
+/// Returns 0 (do-not-cache) when no SOA is present in `authority`.
+fn neg_ttl_from_soa(authority: &[crate::dns::wire::Record]) -> u32 {
+    authority
+        .iter()
+        .find_map(|r| match &r.rdata {
+            crate::dns::wire::Rdata::Soa { minimum, .. } => Some((*minimum).min(r.ttl)),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -798,6 +815,14 @@ impl RunboundHandler {
                         if set_ad && resp.len() > 3 {
                             resp[3] |= 0x20; // authenticated denial (RFC 4035)
                         }
+                        // #166 / RFC 2308: cache the DO=0 NXDOMAIN so the fast path serves
+                        // it. Never cache a CD-served Bogus (would poison non-CD clients).
+                        if val.verdict != Verdict::Bogus {
+                            let neg_ttl = neg_ttl_from_soa(&val.authority);
+                            let cache_resp =
+                                self.wire_negative(&msg, rcode::NXDOMAIN, &val.authority, false);
+                            self.maybe_cache_negative(&q, &cache_resp, neg_ttl);
+                        }
                         return Some(resp);
                     }
                     let mut records = val.records;
@@ -807,6 +832,13 @@ impl RunboundHandler {
                             self.wire_negative(&msg, rcode::NOERROR, &val.authority, do_bit);
                         if set_ad && resp.len() > 3 {
                             resp[3] |= 0x20;
+                        }
+                        // #166 / RFC 2308: cache the DO=0 NODATA (Bogus never cached).
+                        if val.verdict != Verdict::Bogus {
+                            let neg_ttl = neg_ttl_from_soa(&val.authority);
+                            let cache_resp =
+                                self.wire_negative(&msg, rcode::NOERROR, &val.authority, false);
+                            self.maybe_cache_negative(&q, &cache_resp, neg_ttl);
                         }
                         self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Recursed, start);
                         return Some(resp);
@@ -934,7 +966,7 @@ impl RunboundHandler {
                 self.log_query_wire(client_ip, &qname_pres, qtype, action, start);
                 Some(resp)
             }
-            crate::dns::forward::ResolveResult::NegativeAnswer { rcode: rc, .. } => {
+            crate::dns::forward::ResolveResult::NegativeAnswer { rcode: rc, neg_ttl } => {
                 let action = if rc == rcode::NXDOMAIN {
                     self.stats.inc_nxdomain();
                     LogAction::Nxdomain
@@ -943,7 +975,11 @@ impl RunboundHandler {
                     LogAction::Servfail
                 };
                 self.log_query_wire(client_ip, &qname_pres, qtype, action, start);
-                Some(self.wire_error(&msg, rc))
+                let resp = self.wire_error(&msg, rc);
+                // #166 / RFC 2308: cache the forwarded negative if the upstream gave a
+                // cacheable neg-TTL (from its authority SOA).
+                self.maybe_cache_negative(&q, &resp, neg_ttl);
+                Some(resp)
             }
             crate::dns::forward::ResolveResult::Servfail => {
                 // #108 / RFC 8767: a transient upstream failure serves the last good
@@ -1268,6 +1304,41 @@ impl RunboundHandler {
         let entry = super::cache_snapshot::CacheEntry {
             wire_payload: Bytes::copy_from_slice(resp_wire),
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(min_ttl as u64),
+            wire_qname: bytes::Bytes::copy_from_slice(&qname_lc),
+        };
+        let cache_ref = Arc::clone(cache);
+        let max_ent = self.cache_max_entries;
+        tokio::spawn(async move {
+            super::cache_snapshot::cache_insert(&cache_ref, key, entry, max_ent);
+        });
+    }
+
+    /// #166 / RFC 2308: cache a negative answer (NXDOMAIN / NODATA) so the fast path
+    /// can serve it directly. `neg_ttl` is `min(SOA.minimum, SOA.ttl)`; 0 = do-not-cache.
+    /// Same key scheme and cache map as positive answers — the fast path serves the
+    /// cached negative datagram unchanged, so this adds zero hot-path cost. The cached
+    /// form is the DO=0 datagram (SOA in authority, no DNSSEC records); DO=1 clients
+    /// bypass the cache on the fast path and are served the full denial by the slow path.
+    fn maybe_cache_negative(
+        &self,
+        q: &crate::dns::wire::Question,
+        resp_wire: &[u8],
+        neg_ttl: u32,
+    ) {
+        let Some(cache) = &self.xdp_cache else { return };
+        if neg_ttl == 0 || resp_wire.is_empty() {
+            return; // no SOA / do-not-cache sentinel
+        }
+        let ttl = neg_ttl
+            .max(self.cache_min_ttl)
+            .min(self.cache_max_ttl)
+            .min(NEG_CACHE_MAX_TTL);
+        let qname_lc = crate::dns::wire_builder::normalize_query_qname(q.name.wire());
+        let raw_key = crate::dns::hasher::hash_wire_qname(&qname_lc);
+        let key: u64 = raw_key ^ ((q.qtype as u64) << 48);
+        let entry = super::cache_snapshot::CacheEntry {
+            wire_payload: Bytes::copy_from_slice(resp_wire),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl as u64),
             wire_qname: bytes::Bytes::copy_from_slice(&qname_lc),
         };
         let cache_ref = Arc::clone(cache);

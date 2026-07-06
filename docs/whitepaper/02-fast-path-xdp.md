@@ -195,9 +195,11 @@ have wire builders: `build_nxdomain` / `build_nodata` / `build_refused`
 directly into the TX frame. Of these, only `build_refused` is currently wired into the
 fast-path hot loop (`answer_dns_wire` in `worker.rs`); `build_nodata` is
 `#[allow(dead_code)]`, reserved for a future wildcard-aware fast path, and `build_nxdomain`
-is exercised only by unit tests. **No negative-answer cache exists on the fast path, or
-anywhere else in the codebase** (see #210) — `NXDOMAIN`/`NODATA` responses are built fresh
-each time, not cached as wire answers.
+is exercised only by unit tests. Recursor/forwarder **negative answers are now cached**
+(#166/#210, RFC 2308): `NXDOMAIN`/`NODATA` datagrams are stored in the same snapshot the
+fast path reads — keyed by (name, type) with a `min(SOA.minimum, SOA.ttl)` TTL (capped) —
+so a repeated negative is served from cache like any positive. `Bogus` (CD-served) answers
+are never cached. The in-kernel eBPF blacklist `NXDOMAIN` is still forged fresh per packet.
 
 ---
 

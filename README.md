@@ -278,7 +278,7 @@ not yet demonstrated (every run so far is link-bound at ≤24 % CPU).
 
 An eBPF XDP program attaches to the NIC at startup. UDP/53 packets for local zones and cache hits are answered in user space at driver level — near-zero syscalls on the hot path (a `sendto` wakeup only when the TX ring drains under sustained load). All other queries pass through to the normal resolver via `XDP_PASS`.
 
-Local-zone negative answers (`NODATA` / `NXDOMAIN`) are served on the fast path; a recursive negative cache (RFC 2308) is not yet implemented (#166). Huge pages and NIC queue counts are **configured automatically** at startup — see [docs/xdp.md](docs/xdp.md).
+Negative answers are cached: recursor/forwarder `NXDOMAIN` / `NODATA` are stored per (name, type) with an RFC 2308 SOA-derived TTL and served straight from the fast-path cache on a repeat (#166/#210); `Bogus` answers are never cached. Huge pages and NIC queue counts are **configured automatically** at startup — see [docs/xdp.md](docs/xdp.md).
 
 ```bash
 # Verify XDP is active
