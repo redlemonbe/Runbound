@@ -34,6 +34,11 @@ static HAS_POLICIES: AtomicBool = AtomicBool::new(false);
 /// A subnet policy as edited via the API and persisted to JSON.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct SubnetPolicy {
+    /// Policy name. Optional in a request body: `PUT /api/policies/:name` takes the
+    /// name from the path (the handler overrides this field), and a `POST` without a
+    /// name is rejected by `upsert_policy_resp` with a clear 400 "name is required"
+    /// instead of a cryptic 422 deserialization error when `name` is a hard field.
+    #[serde(default)]
     pub name: String,
     /// Source CIDR this policy applies to, e.g. `"192.168.10.0/24"`.
     pub subnet: String,

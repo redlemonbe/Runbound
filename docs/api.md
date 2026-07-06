@@ -53,6 +53,20 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/dns
 }
 ```
 
+#### `GET /api/dns/:id`
+
+Fetch a single local DNS entry by its UUID (the `id` field from `GET /api/dns`).
+Returns `404` if no entry has that id.
+
+```bash
+curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  http://localhost:8080/api/dns/550e8400-e29b-41d4-a716-446655440000
+```
+
+```json
+{"id": "550e8400-...", "name": "nas.home.", "type": "A", "value": "192.168.1.10", "ttl": 300}
+```
+
 #### `POST /api/dns`
 
 Add a local DNS entry.
@@ -1796,6 +1810,7 @@ to localhost only.
 | `GET` | `/api/clients/{ip}` | Detail for one client IP (counts, last seen). |
 | `GET` | `/api/clients/{ip}/logs` | Recent query log entries for one client IP. |
 | `GET` | `/api/audit/tail` | Tail of the HMAC-chained audit log (most recent entries). |
+| `GET` | `/api/alerts/rules` | Alias of `GET /api/alerts` — identical response (active rules, blocked clients, recent events). |
 | `POST` | `/api/upstreams/{id}/probe` | Trigger an immediate health probe of one upstream. |
 | `POST` | `/api/webhooks/test` | Send a synthetic test event to the configured webhook targets. |
 | `POST` | `/api/users/{id}/rotate-key` | Rotate (regenerate) the API key of a specific user. |
