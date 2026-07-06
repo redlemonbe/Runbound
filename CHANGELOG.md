@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [Unreleased]
+## [0.9.2]
 
 ### Added
 - QNAME minimisation (RFC 9156, #231) for the sovereign full-recursion resolver.
@@ -22,6 +22,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   DS-at-parent anchoring, #230) and the infrastructure cache are unaffected —
   verified live (Secure/Bogus/Insecure) and by packet capture showing the root
   receiving only the TLD.
+- The WebUI header now shows the running version, between the name and the status dot.
+
+### Fixed
+- WebUI idle auto-logout restored to **5 minutes** (it had drifted to 30).
+- Backup restore/import now **applies live (hot-reload)** instead of asking for a service
+  restart — Runbound never restarts. The restore re-reads the config, republishes local
+  zones (resyncing the XDP cache), refreshes alert rules, and re-applies the resolution
+  mode + QNAME-minimisation toggles; both restore paths share one `apply_config_hot_reload`
+  helper (`restore_handler` previously discarded the reloaded config). Verified live: a
+  restored zone reappears with no restart.
+- Persisted-cache load hardened against an `Instant`-overflow panic on a corrupt cache
+  file (checked add; PENT-1 from the offensive pentest — docs/security-audit/).
+
+### Changed
+- WebUI About page: removed the external Links section and the issue hyperlink; the
+  community-contributor credit is now plain text (no link).
 
 ## [0.9.1]
 

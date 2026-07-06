@@ -894,7 +894,7 @@ const HELP_ENDPOINTS: &[(&str, &str, &str)] = &[
     ("GET",    "/api/backup",            "List available backup snapshots"),
     ("POST",   "/api/backup/restore",    "Restore a snapshot by id (triggers hot-reload)"),
     ("GET",    "/api/backup/export",     "Full backup download (JSON): config + all state/secret files, base64-encoded"),
-    ("POST",   "/api/backup/import",     "Full restore from an exported backup — restart to apply (admin only)"),
+    ("POST",   "/api/backup/import",     "Full restore from an exported backup — applied live (admin only)"),
     ("DELETE", "/api/backup/:id",        "Delete a backup snapshot"),
 ];
 
@@ -1480,6 +1480,39 @@ pub(crate) fn resync_xdp_cache_inner(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Apply the on-disk config to the running server WITHOUT a restart: reload
+/// runbound.conf, rebuild + republish the local zones (resyncing the XDP cache),
+/// refresh alert rules, and re-apply the runtime resolution toggles (resolution
+/// mode + QNAME minimisation) a restore may have changed. Shared by POST
+/// /api/reload and the backup restore/import paths so a restore takes effect live
+/// ("no restart ever"). Returns `(local_zones, local_data, alert_rules)` counts.
+fn apply_config_hot_reload(s: &AppState) -> anyhow::Result<(usize, usize, usize)> {
+    let new_cfg = crate::config::load(&s.cfg_path)?;
+    let new_zones = crate::build_zone_set(&new_cfg);
+    resync_xdp_cache(s, &new_zones);
+    s.zones.store(std::sync::Arc::new(new_zones));
+    // #149: hot-reload alert rules without restart.
+    let alert_rules_count = new_cfg.alerts.len();
+    s.alert_tracker.update_rules(new_cfg.alerts.clone());
+    // Re-apply the runtime resolution toggles a restore may have changed.
+    use std::sync::atomic::Ordering;
+    let recursion_on =
+        new_cfg.resolution_mode == crate::config::parser::ResolutionMode::FullRecursion;
+    s.resolution_mode.store(u8::from(recursion_on), Ordering::Relaxed);
+    crate::dns::recursor_wire::set_qname_minimisation(new_cfg.qname_minimisation);
+    s.audit.send(AuditEvent::ConfigReload);
+    // Fire config-reloaded webhook (#11).
+    {
+        let tgts = s.webhook_targets.try_read();
+        if let Ok(tgts) = tgts {
+            let ev = crate::webhooks::WebhookEvent::now("config-reloaded");
+            s.webhook_dispatcher.fire(&tgts, ev);
+        }
+    }
+    info!(cfg_path = %s.cfg_path, alert_rules = alert_rules_count, "config hot-reload applied");
+    Ok((new_cfg.local_zones.len(), new_cfg.local_data.len(), alert_rules_count))
+}
+
 async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
     // FIX 3.2: independent 2 RPS cap — prevents authenticated DoS via rapid reloads.
     if !s.reload_limiter.check() {
@@ -1491,35 +1524,17 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
             })),
         );
     }
-    match crate::config::load(&s.cfg_path) {
-        Ok(new_cfg) => {
-            let new_zones = crate::build_zone_set(&new_cfg);
-            resync_xdp_cache(&s, &new_zones);
-            s.zones.store(std::sync::Arc::new(new_zones));
-            // #149: hot-reload alert rules without restart
-            let alert_rules_count = new_cfg.alerts.len();
-            s.alert_tracker.update_rules(new_cfg.alerts.clone());
-            info!(cfg_path = %s.cfg_path, alert_rules = alert_rules_count, "API hot-reload complete");
-            s.audit.send(AuditEvent::ConfigReload);
-            // Fire config-reloaded webhook (#11)
-            {
-                let tgts = s.webhook_targets.try_read();
-                if let Ok(tgts) = tgts {
-                    let ev = crate::webhooks::WebhookEvent::now("config-reloaded");
-                    s.webhook_dispatcher.fire(&tgts, ev);
-                }
-            }
-            (
-                StatusCode::OK,
-                JsonExtract(serde_json::json!({
-                    "status":       "ok",
-                    "cfg_path":     s.cfg_path,
-                    "local_zones":  new_cfg.local_zones.len(),
-                    "local_data":   new_cfg.local_data.len(),
-                    "alert_rules":  alert_rules_count,
-                })),
-            )
-        }
+    match apply_config_hot_reload(&s) {
+        Ok((local_zones, local_data, alert_rules)) => (
+            StatusCode::OK,
+            JsonExtract(serde_json::json!({
+                "status":      "ok",
+                "cfg_path":    s.cfg_path,
+                "local_zones": local_zones,
+                "local_data":  local_data,
+                "alert_rules": alert_rules,
+            })),
+        ),
         Err(e) => {
             // FIX 3.4: full error already in the WARN log; sanitize the HTTP body.
             warn!(err = %e, "API reload failed — keeping current zones");
@@ -8142,7 +8157,7 @@ async fn backup_export_handler(
 }
 
 /// POST /api/backup/import — restore a full backup (admin; slave read-only). Writes
-/// each whitelisted file atomically (tmp + rename). Restart the service to apply.
+/// each whitelisted file atomically (tmp + rename), then applies it live (no restart).
 async fn backup_import_handler(
     State(s): State<AppState>,
     caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
@@ -8191,9 +8206,16 @@ async fn backup_import_handler(
             restored += 1;
         }
     }
-    s.audit.send(AuditEvent::ConfigReload);
+    // Apply the restored config live — Runbound never restarts ("no restart ever").
+    let note = match apply_config_hot_reload(&s) {
+        Ok(_) => "applied live — no restart needed",
+        Err(e) => {
+            warn!(restored, err = %e, "restored files but hot-reload failed");
+            "restored, but live reload failed — check the config, then POST /api/reload"
+        }
+    };
     info!(restored, "full backup restored via API");
-    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","restored":restored,"note":"restart the service to apply the restored configuration"})))
+    (StatusCode::OK, JsonExtract(serde_json::json!({"status":"ok","restored":restored,"note":note})))
 }
 
 async fn backup_handler(
@@ -8326,10 +8348,11 @@ async fn restore_handler(
         }
     }
 
-    // Trigger hot-reload to pick up restored config
-    match crate::config::load(&s.cfg_path) {
-        Ok(_) => { tracing::info!(backup_id = %id, "backup restored, hot-reload triggered"); }
-        Err(e) => { tracing::warn!("restored config but reload failed: {e}"); }
+    // Apply the restored config live — Runbound never restarts ("no restart ever").
+    if let Err(e) = apply_config_hot_reload(&s) {
+        tracing::warn!(backup_id = %id, err = %e, "restored files but hot-reload failed");
+    } else {
+        tracing::info!(backup_id = %id, "backup restored and applied live");
     }
 
     (StatusCode::OK, JsonExtract(serde_json::json!({
