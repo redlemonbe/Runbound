@@ -34,6 +34,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   restored zone reappears with no restart.
 - Persisted-cache load hardened against an `Instant`-overflow panic on a corrupt cache
   file (checked add; PENT-1 from the offensive pentest — docs/security-audit/).
+- Compact denial of existence (RFC 9824 / Cloudflare "black lies", #232): under
+  `resolution: full-recursion` + `dnssec-validation: yes`, a non-existent name in a
+  Cloudflare-hosted zone is now presented to the client as **NXDOMAIN** instead of
+  NOERROR/NODATA. A validated NSEC that matches the qname and whose type bitmap carries
+  the NXNAME pseudo-type (128) translates NOERROR → NXDOMAIN (fail-closed: only on a
+  Secure verdict). Genuine NODATA and classic NXDOMAIN are unchanged. NSEC for now;
+  NSEC3 compact denial to follow.
 
 ### Changed
 - WebUI About page: removed the external Links section and the issue hyperlink; the

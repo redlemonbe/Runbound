@@ -75,6 +75,21 @@ pub fn nsec_proves_nodata(owner: &Name, bitmap: &[u8], qname: &Name, qtype: u16)
         && (qtype == consts::rtype::CNAME || !type_in_bitmap(bitmap, consts::rtype::CNAME))
 }
 
+/// The NXNAME pseudo-type (RFC 9824, "compact denial of existence"). When it appears
+/// in the type bitmap of an NSEC/NSEC3 whose owner MATCHES the qname, the name itself
+/// does not exist: a NOERROR reply carrying it is really an NXDOMAIN and must be
+/// presented to the client as one (e.g. Cloudflare "black lies").
+pub const NXNAME: u16 = 128;
+
+/// RFC 9824 (#232): does this NSEC RDATA's type bitmap carry the NXNAME pseudo-type?
+/// The caller MUST have (a) RRSIG-validated the NSEC and (b) checked its owner matches
+/// the qname before treating a NOERROR as NXDOMAIN — this is pure bitmap inspection.
+pub fn nsec_bitmap_has_nxname(rdata: &[u8]) -> bool {
+    parse_nsec(rdata)
+        .map(|(_, bitmap)| type_in_bitmap(bitmap, NXNAME))
+        .unwrap_or(false)
+}
+
 /// One validated NSEC record (owner + parsed RDATA), for the proof helpers.
 pub struct Nsec<'a> {
     pub owner: Name,
@@ -357,6 +372,28 @@ pub fn nsec_proves_nxdomain(nsecs: &[Nsec], qname: &Name, zone: &Name) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nxname_compact_denial_detected() {
+        use super::*;
+        // Type bitmap window 0, 17-byte block, only NXNAME (128) set -> byte 16 = 0x80.
+        let mut bm = vec![0u8, 17u8];
+        let mut block = vec![0u8; 17];
+        block[16] = 0x80;
+        bm.extend_from_slice(&block);
+        assert!(type_in_bitmap(&bm, NXNAME));
+        assert!(!type_in_bitmap(&bm, consts::rtype::A));
+        // As NSEC RDATA: a root next-name (0x00) followed by the bitmap.
+        let mut nsec = vec![0u8];
+        nsec.extend_from_slice(&bm);
+        assert!(nsec_bitmap_has_nxname(&nsec), "NXNAME bitmap must be detected");
+        // A genuine NODATA bitmap (A=1, RRSIG=46, NSEC=47; no NXNAME) must NOT match.
+        // window 0, len 6: byte0 bit1 (A)=0x40, byte5 bits6,7 (RRSIG,NSEC)=0x03.
+        let nodata_bm = vec![0u8, 6u8, 0x40, 0, 0, 0, 0, 0x03];
+        let mut nodata = vec![0u8];
+        nodata.extend_from_slice(&nodata_bm);
+        assert!(!nsec_bitmap_has_nxname(&nodata), "genuine NODATA is not a compact NXDOMAIN");
+    }
+
     use super::*;
 
     fn n(s: &str) -> Name {

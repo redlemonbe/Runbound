@@ -702,8 +702,35 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
         collect_covering_rrsigs(&msg.answers, &target, qtype, &mut rrsigs);
         // Serve only the VALIDATED authority from this terminal hop (RFC 2308 §3 SOA,
         // RRSIG-checked & in-bailiwick) — empty for a positive answer.
+        // #232 / RFC 9824: a compact denial of existence (e.g. Cloudflare "black lies")
+        // arrives as NOERROR + a validated NSEC that matches the name and carries the
+        // NXNAME pseudo-type. Present it to the client as the NXDOMAIN it really is —
+        // fail-closed: only when the denial validated Secure and the answer is empty.
+        let rcode = if verdict == Verdict::Secure
+            && rcode == consts::rcode::NOERROR
+            && records.is_empty()
+            && is_compact_nxdomain(&hop_authority, &target)
+        {
+            consts::rcode::NXDOMAIN
+        } else {
+            rcode
+        };
         return Some(Validated { records, answer_rrsigs: rrsigs, authority: hop_authority, rcode, verdict });
     }
+}
+
+/// RFC 9824 compact denial of existence (#232): is this validated denial authority
+/// really an NXDOMAIN? True when a validated NSEC in `authority` MATCHES `qname`
+/// (owner == qname) and its type bitmap carries the NXNAME pseudo-type (128). Callers
+/// invoke this only on a Secure verdict, so `authority` is the RRSIG-validated proof;
+/// this is pure inspection of that proof.
+fn is_compact_nxdomain(authority: &[Record], qname: &Name) -> bool {
+    authority.iter().any(|r| {
+        r.rtype == consts::rtype::NSEC
+            && r.name.eq_ignore_ascii_case(qname)
+            && matches!(&r.rdata, Rdata::Unknown { data, .. }
+                if crate::dns::dnssec_denial::nsec_bitmap_has_nxname(data))
+    })
 }
 
 /// Combine two hop verdicts into the verdict for the whole served chain: any
@@ -860,6 +887,33 @@ mod tests {
                 assert_eq!(got, Verdict::Secure, "{fqdn}: expected Secure");
             }
         }
+    }
+
+    // #232 / RFC 9824: a compact denial of existence (Cloudflare "black lies") must be
+    // presented to the client as NXDOMAIN, while a genuine NODATA stays NOERROR.
+    // Needs outbound UDP+TCP/53. Run with:
+    //   cargo test --release -- --ignored --nocapture live_compact_denial_nxdomain
+    #[tokio::test]
+    #[ignore]
+    async fn live_compact_denial_nxdomain() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        // example.com is Cloudflare-hosted -> compact denial for a non-existent name.
+        let bad = Name::from_ascii("nx-zzz-rb232-does-not-exist.example.com.").unwrap();
+        let v = resolve_validated(&bad, consts::rtype::A, now)
+            .await
+            .expect("resolver returned nothing");
+        eprintln!("compact-denial: rcode={} verdict={:?}", v.rcode, v.verdict);
+        assert_eq!(v.rcode, consts::rcode::NXDOMAIN, "compact denial must become NXDOMAIN");
+        // A genuine NODATA (name exists, type absent) must stay NOERROR: example.com
+        // exists but has no HINFO (13) RRset, and that NSEC carries no NXNAME.
+        let nd = Name::from_ascii("example.com.").unwrap();
+        let v2 = resolve_validated(&nd, consts::rtype::HINFO, now)
+            .await
+            .expect("resolver returned nothing");
+        eprintln!("genuine-nodata: rcode={} records={}", v2.rcode, v2.records.len());
+        assert_eq!(v2.rcode, consts::rcode::NOERROR, "genuine NODATA must stay NOERROR");
+        assert!(v2.records.is_empty(), "NODATA has no answer records");
     }
 
     // #230 regression: the infrastructure cache must make repeated misses under
