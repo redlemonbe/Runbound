@@ -381,6 +381,13 @@ pub async fn publish_loop(snapshot: SharedCacheSnapshot, mutable: MutableCacheMa
         }
         last_gen = cur_gen;
         let now = Instant::now();
+        // PERF (#165): on the periodic forced-eviction pass, drop expired entries from the
+        // MUTABLE map too — not just filter them out of the snapshot. This keeps the mutable
+        // below capacity so cache_insert almost never has to O(n)-scan for a victim under a
+        // cache-miss flood. Background task, never the hot path; sentinels are preserved.
+        if force_evict {
+            mutable.retain(|_, v| v.expires_at > now || is_sentinel(v));
+        }
         let new_snap: CacheSnapshot = mutable
             .iter()
             .filter(|kv| kv.value().expires_at > now)
