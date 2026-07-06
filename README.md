@@ -98,10 +98,13 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 
 ### Standards & interoperability
 
-Runbound is graded **A** by [DNS-OARC's *Check My DNS*](https://cmdns.dev.dns-oarc.net/) &mdash; an
-independent DNS conformance test run from a real client through the resolver: **100%** on
-**Transport**, **Basic DNS** and **DNS Features**, with well-randomised source ports and query
-IDs (off-path spoofing resistance).
+Runbound is graded **A** by [DNS-OARC's *Check My DNS*](https://cmdns.dev.dns-oarc.net/), an
+independent DNS conformance test &mdash; **100%** on **Transport**, **Basic DNS** and **DNS
+Features** (IPv6 and TCP transport, EDNS, and well-randomised source ports + query IDs for
+off-path spoofing resistance). The capture below is from a **production network where Runbound
+is the only resolver** &mdash; every client query goes through it, day in and day out &mdash; and
+the end-to-end report is a straight **A**, including client IPv6 and RPKI-valid transit to the
+authoritative servers it queries.
 
 <p align="center"><img src="docs/img/check-my-dns.png" alt="DNS-OARC Check My DNS report for Runbound: grade A, 100% on Transport, Basic DNS and DNS Features" width="820"><br><em>Check My DNS (DNS-OARC) &mdash; grade <strong>A</strong>, 100% across Transport / Basic DNS / DNS Features</em></p>
 
