@@ -10,7 +10,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ## [0.9.1]
 
 ### Added
-- **#228** — IPv6 bans are now enforced at the XDP fast path. A new `icmp_banned_v6`
+- IPv6 bans are now enforced at the XDP fast path. A new `icmp_banned_v6`
   BPF map (16-byte key) plus gated lookups on the main and VLAN-tagged IPv6
   datapaths drop banned IPv6 sources at kernel-bypass speed, not just in the
   userspace slow path. The IPv4 ban path is unchanged.
@@ -22,11 +22,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   escape the config file's directory.
 
 ### Fixed
-- **#229** — "Top Domains" stayed empty at low QPS: per-domain counters sat in
+- "Top Domains" stayed empty at low QPS: per-domain counters sat in
   thread-local buffers because the only flush trigger was count-based (every 512
   calls), which never fires at residential/LAN rates. Added a time-based flush
   (≤ 1 s) so the dashboard converges at any QPS; the multi-MQPS path is unchanged.
-- **#230** — The validating recursor had no infrastructure cache: every cache miss
+- The validating recursor had no infrastructure cache: every cache miss
   re-walked from the root, re-fetching zone-cut NS sets and the whole DNSSEC chain
   (root/TLD DNSKEY+DS) each time — ~70 % of miss traffic hit the root servers and
   each miss cost 325 ms–1.3 s. Added a TTL-honouring, bounded (LRU) zone-cut +
