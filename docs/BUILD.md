@@ -56,21 +56,21 @@ sha256sum -c SHA256SUMS
 
 ```bash
 # RUNBOUND_PUBKEY is published below / in the release notes
-minisign -Vm runbound-x86_64-linux-gnu -P "RWR8qoSBp5QDO/+vJox3/sHX1RIp4y1ifIVWb5nSKD//Po+exCOWPZ0B"
-minisign -Vm SHA256SUMS               -P "RWR8qoSBp5QDO/+vJox3/sHX1RIp4y1ifIVWb5nSKD//Po+exCOWPZ0B"
+minisign -Vm runbound-x86_64-linux-gnu -P "RWSBM9HzDiZpfCD82uTnkeP1Ui30LfWE96C8EtFyI4/WVyLAVxpLzYy/"
+minisign -Vm SHA256SUMS               -P "RWSBM9HzDiZpfCD82uTnkeP1Ui30LfWE96C8EtFyI4/WVyLAVxpLzYy/"
 ```
 
 The signing public key:
 
 ```
 untrusted comment: Runbound release signing key (minisign)
-RWR8qoSBp5QDO/+vJox3/sHX1RIp4y1ifIVWb5nSKD//Po+exCOWPZ0B
+RWSBM9HzDiZpfCD82uTnkeP1Ui30LfWE96C8EtFyI4/WVyLAVxpLzYy/
 ```
 
 ## Enabling signing (maintainer, one-time)
 
 ```bash
-minisign -G -W                   # generates (no passphrase: required for unattended CI signing) minisign.key (private) + minisign.pub (public)
+minisign -G                      # generates a passphrase-protected minisign.key (private) + minisign.pub (public)
 # 1. Add the *private* key file contents as repo secret MINISIGN_SECRET (Settings → Secrets → Actions)
 # 1b. If the key has a passphrase (recommended), also add it as repo secret MINISIGN_PASSWORD
 # 2. Paste the *public* key (minisign.pub) into the block above and commit
