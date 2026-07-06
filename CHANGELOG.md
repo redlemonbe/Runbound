@@ -64,6 +64,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   `wire_bridge` notes hickory is a dev-only oracle). `include:` documented in
   `docs/unbound-migration.md`.
 
+### Security
+
+- **M1** — the WebUI login always runs the argon2 verify, even when the username is
+  wrong, so response time no longer leaks whether a username is valid.
+- **M2** — the validating recursor reads UDP responses until one matches the query's
+  transaction id *and* question; a single spoofed or stray datagram from the queried
+  server no longer aborts resolution (still bounded by the query timeout).
+- **M3** — the systemd unit now sets `MemoryDenyWriteExecute=true` (W^X). Verified
+  compatible: AF_XDP UMEM is read/write only, eBPF loads via the `bpf()` syscall, and
+  the crypto is pure-Rust.
+- **M4** — the WebUI escapes the record id interpolated into the delete handlers.
+- **M5** — `tls-cert-bundle` is Unbound's *outbound* CA bundle, not the DoT/DoH server
+  certificate; it is now warned about and ignored instead of being loaded as the cert.
+- Documented in `docs/xdp.md` that the XDP blacklist fast-block matches the raw QNAME
+  case-sensitively — a case-varied (0x20) query falls through to the slow path, which
+  still blocks it (no bypass).
+
 ## [0.9.0]
 
 Consolidated baseline for the 0.9 line. Runbound is a drop-in Unbound-compatible DNS
