@@ -104,7 +104,7 @@ feature set.
 - RBAC API roles (read / dns / operator / admin).
 - Privacy by default — client-IP redaction, configurable retention (GDPR).
 - Tamper-evident audit log — HMAC-chained, actor-attributed, SIEM-ready JSON, searchable in the WebUI.
-- Signed releases — minisign signatures + CycloneDX SBOM shipped with every release. Signing public key `RWR8qoSBp5QDO/+vJox3/sHX1RIp4y1ifIVWb5nSKD//Po+exCOWPZ0B` (see `docs/BUILD.md`).
+- Signed releases — minisign signatures + CycloneDX SBOM shipped with every release. Signing public key `RWSBM9HzDiZpfCD82uTnkeP1Ui30LfWE96C8EtFyI4/WVyLAVxpLzYy/` (see `docs/BUILD.md`).
 
 ### Performance — XDP fast path
 - AF_XDP kernel-bypass, zero-syscall hot path (~9.85 M qps single-link, ~20.3 M qps dual-link on Intel X710).
