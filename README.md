@@ -53,7 +53,7 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 ### Resolution
 | Feature | Notes |
 |---|---|
-| Drop-in Unbound config | parses `unbound.conf`-style syntax |
+| Drop-in Unbound config | parses `unbound.conf`-style syntax, incl. `include:` / `include-toplevel:` (glob) |
 | Forwarding resolver | DoT-capable upstreams, query racing, per-upstream health probes |
 | Sovereign recursion | iterative from the root, opt-in (#202) — no third-party resolver sees your queries; DNSSEC-validated, anti-SSRF |
 | Split-horizon DNS | per-subnet answers |

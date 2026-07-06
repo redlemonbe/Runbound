@@ -14,6 +14,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   BPF map (16-byte key) plus gated lookups on the main and VLAN-tagged IPv6
   datapaths drop banned IPv6 sources at kernel-bypass speed, not just in the
   userspace slow path. The IPv4 ban path is unchanged.
+- Unbound `include:` / `include-toplevel:` directives are now honoured (with glob
+  support), so a split configuration — e.g. Debian's
+  `include: "/etc/unbound/unbound.conf.d/*.conf"` — loads correctly instead of being
+  silently dropped. Guard-railed: bounded nesting depth (8), file count (256) and
+  cumulative size (16 MiB), glob only in the final path component, and refusal to
+  escape the config file's directory.
 
 ### Fixed
 - **#229** — "Top Domains" stayed empty at low QPS: per-domain counters sat in
@@ -30,11 +36,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - `PUT /api/policies/:name` returned 422 when the request body omitted `name`; it
   now takes the name from the path as documented (and a `POST` without a name gives
   a clear 400 "name is required" instead of a 422).
+- The `fuzz`-feature library build was broken (`webhooks` referenced
+  `crate::feeds::{SsrfSafeDnsResolver, is_private_ip}`, but `feeds` is not exposed to
+  the cargo-fuzz lib). Extracted a standalone `src/ssrf.rs` — the single source of
+  truth for the SSRF address filter and connection-time DNS guard — that
+  `recursor_wire`, `feeds` and `webhooks` delegate to. Restores
+  `cargo build --features fuzz` and the weekly fuzz workflow.
+- `cargo audit` was not clean: bumped `anyhow` 1.0.102 → 1.0.103 (RUSTSEC-2026-0190),
+  documented the two remaining `unmaintained` advisories (`paste`, `rustls-pemfile`)
+  in `audit.toml`, and added a `cargo audit` CI job so the badge is verified on every
+  push.
+- Test harness: three `rbac_*` API tests were flaky-failing on some machines because
+  they shared a fixed `BASE_DIR` (`/tmp/runbound-test`) that could be owned by another
+  user, making `/api/dns` return 500. Each test process now uses its own writable temp
+  dir. Full suite: 464 passing / 0 failing.
 
 ### Docs
 - Documented `GET /api/dns/:id` and the `GET /api/alerts/rules` alias. `/api/help`
   now maps 1:1 to the router and every one of the 82 endpoints is covered by
   `docs/api.md`.
+- Pre-publication accuracy pass: build prerequisites (clang/libbpf-dev/mold/musl-tools)
+  in README + BUILD.md; fixed a dead audit-report link; version markers 0.9.0 → 0.9.1
+  in the API/quick-start/internals/sync examples; the audit log is described as
+  per-entry HMAC-SHA256 + periodic checkpoints (not a running chain); the sovereign
+  recursor is config-gated (`resolution: full-recursion`), not feature-gated; and
+  corrected stale source comments (`recursor_wire` build_query emits EDNS DO=1,
+  `wire_bridge` notes hickory is a dev-only oracle). `include:` documented in
+  `docs/unbound-migration.md`.
 
 ## [0.9.0]
 
