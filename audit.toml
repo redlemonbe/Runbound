@@ -1,6 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
-# cargo-audit configuration
-# All known CVEs resolved by the hickory-proto 0.26 / rustls 0.23 upgrades; no active ignores.
+# cargo-audit configuration.
+#
+# No open security *vulnerabilities*. The two entries below are `unmaintained`
+# informational advisories (not vulnerabilities); each is justified and reviewed.
 
 [advisories]
+ignore = [
+  # rustls-pemfile 2.x — unmaintained. Direct dep, used only to parse local PEM
+  # cert/key files at startup (trusted input). Migration to rustls-pki-types PEM
+  # parsing is tracked. No known vulnerability.
+  "RUSTSEC-2025-0134",
+  # paste 1.0.15 — unmaintained. Transitive via cryptoki (PKCS#11 / HSM), out of
+  # our control. No known vulnerability.
+  "RUSTSEC-2024-0436",
+]
