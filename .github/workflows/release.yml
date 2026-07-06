@@ -165,51 +165,39 @@ jobs:
           [ -s CHANGELOG_FRAGMENT.md ] || echo "Release ${GITHUB_REF_NAME}" \
             > CHANGELOG_FRAGMENT.md
 
-      # ── Publish release then upload assets ───────────────────────────────
-      # Two-step: create published release first, then upload.
-      # If the release already exists (e.g. created manually), edit it instead.
-      # --clobber on upload overwrites existing assets with the same name.
-      - name: Create or update release
+      # ── Publish the release on Gitea (never GitHub) ──────────────────────
+      # The runner checks out from Gitea; publish the signed artifacts back to a
+      # Gitea release via its REST API using the run's own token. GitHub is never
+      # touched. Re-run safe: an existing release is reused and same-named assets
+      # are deleted before re-upload (clobber).
+      - name: Publish Gitea release + assets
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GH_HOST: github.com
-          GH_REPO: redlemonbe/Runbound
+          TOKEN: ${{ github.token }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
-            gh release edit "${GITHUB_REF_NAME}" \
-              --title "${GITHUB_REF_NAME}" \
-              --notes-file CHANGELOG_FRAGMENT.md
+          set -uo pipefail
+          NOTES=$(python3 -c "import json;print(json.dumps(open('CHANGELOG_FRAGMENT.md').read()))")
+          code=$(curl -sk -o /tmp/rel.json -w "%{http_code}" -X POST "$API/releases" \
+            -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"${GITHUB_REF_NAME}\",\"name\":\"${GITHUB_REF_NAME}\",\"body\":${NOTES},\"draft\":false,\"prerelease\":false}")
+          if [ "$code" = "201" ]; then
+            RID=$(jq -r .id /tmp/rel.json)
           else
-            gh release create "${GITHUB_REF_NAME}" \
-              --title "${GITHUB_REF_NAME}" \
-              --notes-file CHANGELOG_FRAGMENT.md
+            RID=$(curl -sk "$API/releases/tags/${GITHUB_REF_NAME}" -H "Authorization: token $TOKEN" | jq -r .id)
           fi
-
-      - name: Upload assets
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GH_HOST: github.com
-          GH_REPO: redlemonbe/Runbound
-        run: |
-          gh release upload "${GITHUB_REF_NAME}" \
-            --clobber \
-            runbound-x86_64-linux-gnu \
-            runbound-x86_64-linux-musl \
-            runbound-aarch64-linux-gnu \
-            runbound-aarch64-linux-musl \
-            SHA256SUMS \
-            sbom.cdx.json
-
-      - name: Upload signatures (if any)
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          GH_HOST: github.com
-          GH_REPO: redlemonbe/Runbound
-        run: |
-          shopt -s nullglob
-          sigs=(*.minisig)
-          if [ ${#sigs[@]} -gt 0 ]; then
-            gh release upload "${GITHUB_REF_NAME}" --clobber "${sigs[@]}"
-          else
-            echo "no signatures to upload"
-          fi
+          echo "Gitea release id=$RID (create http=$code)"
+          [ -n "$RID" ] && [ "$RID" != "null" ] || { echo "no release id"; cat /tmp/rel.json; exit 1; }
+          existing=$(curl -sk "$API/releases/$RID/assets" -H "Authorization: token $TOKEN")
+          for f in runbound-x86_64-linux-gnu runbound-x86_64-linux-musl \
+                   runbound-aarch64-linux-gnu runbound-aarch64-linux-musl \
+                   SHA256SUMS sbom.cdx.json *.minisig; do
+            [ -e "$f" ] || continue
+            name=$(basename "$f")
+            aid=$(echo "$existing" | jq -r ".[] | select(.name==\"$name\") | .id" | head -1)
+            if [ -n "$aid" ] && [ "$aid" != "null" ]; then
+              curl -sk -X DELETE "$API/releases/$RID/assets/$aid" -H "Authorization: token $TOKEN" -o /dev/null
+            fi
+            curl -sk -X POST "$API/releases/$RID/assets?name=$name" \
+              -H "Authorization: token $TOKEN" -F "attachment=@$f" \
+              -o /dev/null -w "  $name -> %{http_code}\n"
+          done
