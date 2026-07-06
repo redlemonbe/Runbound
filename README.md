@@ -287,7 +287,9 @@ Quick links: [Quick Start](docs/quick-start.md) · [Configuration](docs/configur
 
 ## Contributing
 
-CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request — build, clippy and tests must all be green:
+CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request — build, clippy and tests must all be green.
+
+Build prerequisites (Debian/Ubuntu): `sudo apt install clang libbpf-dev mold musl-tools` (the CI installs the same). Full list: [docs/BUILD.md](docs/BUILD.md#prerequisites).
 
 ```bash
 cargo build --release                       # xdp is in the default feature set

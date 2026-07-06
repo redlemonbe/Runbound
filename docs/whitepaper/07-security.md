@@ -147,7 +147,7 @@ floods are handled by the rate limiter + `BADCOOKIE`.
 
 Every authenticated **mutating** request (config change, ban, rule edit, …) is recorded
 in the tamper-evident audit log (`audit-log: yes`) as an `admin_action` event carrying the
-**actor** (username), method, path and result status; the actor is inside the HMAC-chained
+**actor** (username), method, path and result status; the actor is inside the per-entry HMAC-SHA256
 fields. The WebUI **Logs** tab surfaces this audit stream alongside the query log, with a
 functional text search across both. Auth failures are recorded too.
 

@@ -881,7 +881,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 
 ```json
 {
-  "version": "0.9.0",
+  "version": "0.9.1",
   "uptime_secs": 3600,
   "xdp_active": true,
   "xdp_mode": "drv",
@@ -1158,7 +1158,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/sync
       "status": "connected",
       "last_seen_secs": 4,
       "zones_synced": 12,
-      "version": "0.9.0"
+      "version": "0.9.1"
     }
   ],
   "total": 1
@@ -1194,7 +1194,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/node
       "status":           "connected",
       "last_seen_secs":   5,
       "zones_synced":     42,
-      "version":          "0.9.0"
+      "version":          "0.9.1"
     }
   ],
   "total": 1
@@ -1809,7 +1809,7 @@ to localhost only.
 | `GET` | `/api/clients` | List observed client IPs with per-client query counters. |
 | `GET` | `/api/clients/{ip}` | Detail for one client IP (counts, last seen). |
 | `GET` | `/api/clients/{ip}/logs` | Recent query log entries for one client IP. |
-| `GET` | `/api/audit/tail` | Tail of the HMAC-chained audit log (most recent entries). |
+| `GET` | `/api/audit/tail` | Tail of the per-entry HMAC-SHA256 audit log (most recent entries). |
 | `GET` | `/api/alerts/rules` | Alias of `GET /api/alerts` — identical response (active rules, blocked clients, recent events). |
 | `POST` | `/api/upstreams/{id}/probe` | Trigger an immediate health probe of one upstream. |
 | `POST` | `/api/webhooks/test` | Send a synthetic test event to the configured webhook targets. |

@@ -208,7 +208,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/node
       "status":           "connected",
       "last_seen_secs":   5,
       "zones_synced":     42,
-      "version":          "0.9.0"
+      "version":          "0.9.1"
     }
   ],
   "total": 1

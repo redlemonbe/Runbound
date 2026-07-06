@@ -6,7 +6,7 @@ and to guide internal or third-party source-code audits.
 
 > **Audit reports** live under [`docs/security-audit/`](security-audit/): the
 > white-box report ([`SECURITY-AUDIT.md`](security-audit/SECURITY-AUDIT.md))
-> and the aggressive pentest ([`pentest-aggressive-2026-06-22.md`](security-audit/pentest-aggressive-2026-06-22.md)).
+> and the aggressive pentest (PENT-1, consolidated into [`SECURITY-AUDIT.md`](security-audit/SECURITY-AUDIT.md)).
 > Those files are point-in-time snapshots — do not rewrite them.
 
 ---

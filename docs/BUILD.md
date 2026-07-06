@@ -1,5 +1,19 @@
 # Building & verifying Runbound
 
+## Prerequisites
+
+Build dependencies (Debian/Ubuntu — the CI installs the same set):
+
+```bash
+sudo apt install clang libbpf-dev mold musl-tools
+```
+
+- **clang** + **libbpf-dev** — compile the embedded eBPF/XDP program (the default `xdp` feature).
+- **mold** — the repo's `.cargo/config.toml` links with `-fuse-ld=mold` on `x86_64-unknown-linux-gnu`; without it the build fails with `invalid linker name`.
+- **musl-tools** — only needed for the `*-musl` static targets.
+
+Plus a Rust toolchain via `rustup` (stable).
+
 ## Reproducible build
 
 Release binaries are built in CI from a pinned toolchain. To reproduce locally:

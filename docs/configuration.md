@@ -1427,7 +1427,7 @@ alert:
 Tune the thresholds to your traffic — a busy NAT gateway or downstream forwarder can
 legitimately exceed them. With `audit-log: yes`, every authenticated **mutating** API/WebUI
 request is recorded as an `admin_action` event carrying the **actor** (username), method,
-path and status (HMAC-chained), surfaced in the WebUI **Logs** tab with a functional search.
+path and status (per-entry HMAC-SHA256 + periodic checkpoints), surfaced in the WebUI **Logs** tab with a functional search.
 
 **Webhook payload (`action: notify`):**
 

@@ -1,6 +1,6 @@
 # Unbound Migration Guide
 
-Runbound is designed as a compatible DNS server for existing Unbound deployments. In most cases, pointing it at your existing `unbound.conf` is all you need. This page documents exactly what is and isn't supported.
+Runbound is designed as a compatible DNS server for existing Unbound deployments. In most cases, pointing it at your existing `unbound.conf` is all you need. `include:` and `include-toplevel:` are honoured (glob supported), so a split configuration — e.g. Debian's `include: "/etc/unbound/unbound.conf.d/*.conf"` — loads correctly (included files must stay within the config file's directory). This page documents exactly what is and isn't supported.
 
 ---
 
@@ -105,7 +105,7 @@ Directives accepted by Runbound but not understood by Unbound. Unbound will warn
 | `dnssec-log-bogus` | Log WARN on DNSSEC failures (default: no) |
 | `log-retention` | In-RAM query log ring buffer size (default: 1000; 0 = disabled) |
 | `log-client-ip` | Include client IPs in `/logs` (default: yes — set `no` for GDPR) |
-| `audit-log` | Enable HMAC-SHA256 chained audit log (default: no) |
+| `audit-log` | Enable HMAC-SHA256 per-entry audit log with periodic checkpoints (default: no) |
 | `audit-log-path` | Path for the audit log file |
 | `audit-log-hmac-key` | HMAC key (hex). Auto-generated if omitted |
 | `mode` | `master` (default) or `slave` — HA replication role |

@@ -3,11 +3,11 @@
 
 //! Bridge between our `wire::Record` and hickory's `Record`.
 //!
-//! The zone store is keyed on `wire::Record`, but some
-//! consumers stay on hickory for good reasons — the
-//! DNSSEC signer (`zone_signer`) deliberately keeps hickory's vetted crypto, and
-//! mutation inputs (DDNS, REST) still arrive as hickory records until their own
-//! parsers are migrated. This module converts between the two representations.
+//! The zone store is keyed on `wire::Record`. hickory is no longer a runtime
+//! dependency (it is a `[dev-dependencies]`-only differential oracle); this
+//! bridge converts between `wire::Record` and hickory's `Record` for the
+//! remaining hickory-typed code paths (tests/oracles and not-yet-migrated
+//! mutation inputs). The DNSSEC signer (`zone_signer`) is fully in-house.
 //!
 //! Both directions go through the wire: a record is serialized by one side and
 //! parsed by the other. That is exactly the path the differential oracle proves

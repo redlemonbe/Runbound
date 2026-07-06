@@ -119,8 +119,9 @@ pub enum Outcome {
 // webhook client, and reachable from the fuzz lib). Re-exported for the recursor.
 pub(crate) use crate::ssrf::is_public_ip;
 
-/// Build an iterative query: random id, RD=0, one question, no EDNS. Large
-/// answers set TC and we retry over TCP, so 512-byte UDP is fine here.
+/// Build an iterative query: random id, RD=0, one question, and an EDNS(0) OPT
+/// with DO=1 (advertises a 1232-byte UDP buffer and requests RRSIG/DS so the
+/// answer can be DNSSEC-validated). Oversized replies set TC and we retry over TCP.
 fn build_query(qname: &Name, qtype: u16) -> (u16, Vec<u8>) {
     let mut idb = [0u8; 2];
     let id = if getrandom::fill(&mut idb).is_ok() {

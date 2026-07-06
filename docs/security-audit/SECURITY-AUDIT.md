@@ -25,7 +25,7 @@ includes:
   kernels (`src/dns/simd.rs`, `src/dns/hasher.rs`), and the wire parsers/serialisers
   (`src/dns/wire/`, `src/dns/xdp/wire_builder.rs`).
 - **DNS serving:** local zones, split-horizon, forwarding/racing, the sovereign recursor
-  (feature-gated), AXFR/IXFR, DNS UPDATE (DDNS/TSIG, RFC 2136/8945), and the in-house
+  (config-gated via `resolution: full-recursion` — no Cargo feature), AXFR/IXFR, DNS UPDATE (DDNS/TSIG, RFC 2136/8945), and the in-house
   DNSSEC signer (`src/dns/zone_signer.rs`, `dnssec_sign.rs`).
 - **Transports:** UDP/TCP plus DoT/DoH/DoQ, with a public→loopback relay in front of the
   wire listeners.
