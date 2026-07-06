@@ -334,11 +334,21 @@ async fn descend(qname: &Name, qtype: u16, budget: &mut u32) -> Option<wire::Mes
     // #231: labels added one-by-one while probing empty non-terminals under the
     // current cut; reset to 0 on every referral (the cut has moved down).
     let mut extra = 0usize;
-    // #231: latched once a probe misbehaves — from here on ask the full QNAME
-    // (relaxed fallback). Stays false for the whole descent when minimisation is off.
+    // #231: latched once a probe misbehaves at THIS cut — ask the full QNAME here.
+    // Reset on every referral and on a root restart so the fallback stays cut-local
+    // (a misbehaving cut must not force the full name onto deeper cuts — audit F1).
     let mut full = false;
+    // Real delegation steps taken (root → TLD → …). Kept separate from the loop
+    // guard so per-cut minimisation probing (ENT lengthening, relaxed fallback) no
+    // longer eats into the delegation budget — a deep but legal name could otherwise
+    // exhaust MAX_DEPTH and SERVFAIL (audit F-1). Bounds the chain against loops/lame
+    // servers; real delegation depth is a handful of levels.
+    let mut delegations: u8 = 0;
 
-    for _depth in 0..MAX_DEPTH {
+    // The loop is hard-bounded by the query budget: every iteration spends ≥1 upstream
+    // query via query_ns_set (ns_ips is never empty), so it cannot run more than
+    // MAX_QUERIES times. MAX_QUERIES is the aligned absolute guard.
+    for _step in 0..MAX_QUERIES {
         // Decide what to actually put on the wire for this cut.
         let probing = qmin_on() && !full && {
             !minimised(qname, &zone, extra).eq_ignore_ascii_case(qname)
@@ -363,6 +373,11 @@ async fn descend(qname: &Name, qtype: u16, budget: &mut u32) -> Option<wire::Mes
                     zone = Name::root();
                     ns_ips = root_hints();
                     from_cache = false;
+                    // Restart minimisation cleanly from the root: a dead cached cut's
+                    // fallback/ENT state must not force the full name at the root/TLD
+                    // (privacy) nor skip labels via a stale `extra` (audit F1).
+                    full = false;
+                    extra = 0;
                     continue;
                 }
                 return None;
@@ -435,7 +450,15 @@ async fn descend(qname: &Name, qtype: u16, budget: &mut u32) -> Option<wire::Mes
             infra_cache::zone_cut_learn(&next_zone, &next_ips, cut_ttl(&msg, &next_zone, &ns_names));
             ns_ips = next_ips;
             zone = next_zone;
-            extra = 0; // cut moved down → restart minimisation from the new cut
+            // Cut moved down: restart minimisation from the new cut and drop the
+            // relaxed-fallback latch so a misbehaving parent cut does not force the
+            // full QNAME onto every deeper cut — the fallback stays cut-local (audit F1).
+            extra = 0;
+            full = false;
+            delegations += 1;
+            if delegations >= MAX_DEPTH {
+                return None; // too many delegation steps — loop / lame chain guard
+            }
             continue;
         }
 
