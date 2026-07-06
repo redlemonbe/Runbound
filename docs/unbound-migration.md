@@ -83,7 +83,6 @@ Directives accepted without error but with no effect at runtime. Safe to leave i
 | `cpu-affinity` | Deprecated and ignored — CPU placement is now automatic (#163). Unlike the other entries in this table, this one **does** log a deprecation warning |
 | `do-ip4` / `do-ip6` | The IPv4/IPv6 **listen** set is controlled by which `interface:` addresses you configure (`0.0.0.0` / `::` / a literal); these flags do not separately gate the resolver's outbound traffic |
 | `udp-busy-poll` | `SO_BUSY_POLL` is not applied to the kernel-UDP sockets (distinct from `xdp-busy-poll`, which **is** wired) |
-| `dnssec-log-bogus` | Bogus answers are counted (`GET /api/system` dnssec counters) and SERVFAIL'd, but there is no separate per-query Bogus log line |
 | `prefetch-threshold` | Accepted but unused: the prefetch refresher (#16) is TTL-driven (it refreshes entries near expiry), not hit-count-driven |
 | `module-config` | Unbound modules are not supported — Runbound is not module-extensible. Not a recognized directive, so it's captured into `raw_passthrough` and re-emitted unchanged on config regen — no warning is logged |
 | `python-script` | No Python scripting support. Same silent passthrough as `module-config` |

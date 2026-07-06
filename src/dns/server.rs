@@ -142,6 +142,8 @@ pub struct RunboundHandler {
     domain_stats: Arc<crate::domain_stats::DomainStats>,
     /// #94: enable /etc/resolv.conf fallback when all configured upstreams are down.
     resolv_fallback: bool,
+    /// #knob: log a WARN for every DNSSEC-bogus answer (dnssec-log-bogus).
+    dnssec_log_bogus: bool,
     /// #94: true while resolv.conf fallback is active.
     pub fallback_active: Arc<std::sync::atomic::AtomicBool>,
     /// #108: serve-stale cache (default wire serving path) — wire-native, keyed by
@@ -269,6 +271,7 @@ impl RunboundHandler {
             dashmap::DashMap<String, Arc<std::sync::atomic::AtomicU64>, ahash::RandomState>,
         >,
         resolv_fallback: bool,
+        dnssec_log_bogus: bool,
         fallback_active: Arc<std::sync::atomic::AtomicBool>,
         domain_stats: Arc<crate::domain_stats::DomainStats>,
         serve_stale: bool,
@@ -318,6 +321,7 @@ impl RunboundHandler {
             racing_wins,
             domain_stats,
             resolv_fallback,
+            dnssec_log_bogus,
             fallback_active,
             stale_cache_wire: if serve_stale {
                 Some(Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default())))
@@ -800,7 +804,12 @@ impl RunboundHandler {
                         Verdict::Secure => self.stats.inc_dnssec_secure(),
                         Verdict::Insecure => self.stats.inc_dnssec_insecure(),
                         // Reached only with CD=1 — counted as bogus, served unvalidated.
-                        Verdict::Bogus => self.stats.inc_dnssec_bogus(),
+                        Verdict::Bogus => {
+                            self.stats.inc_dnssec_bogus();
+                            if self.dnssec_log_bogus {
+                                warn!(name = %qname_pres, qtype, cd = true, "DNSSEC-bogus answer served under CD");
+                            }
+                        }
                     }
                     // AD only when the data is genuinely Secure and the client is
                     // DNSSEC-aware — never on a CD-served (unvalidated/Bogus) answer.
@@ -884,6 +893,9 @@ impl RunboundHandler {
                 Some(_bogus) => {
                     // Bogus and the client did NOT set CD → never served (RFC 4035) → SERVFAIL.
                     self.stats.inc_dnssec_bogus();
+                    if self.dnssec_log_bogus {
+                        warn!(name = %qname_pres, qtype, "DNSSEC-bogus answer refused (SERVFAIL)");
+                    }
                     self.stats.inc_servfail();
                     self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Servfail, start);
                     return Some(self.wire_error(&msg, rcode::SERVFAIL));
@@ -2774,6 +2786,7 @@ pub async fn run_dns_server(
         cfg.upstream_racing,
         racing_wins,
         cfg.resolv_fallback,
+        cfg.dnssec_log_bogus,
         fallback_active,
         domain_stats,
         cfg.serve_stale,
