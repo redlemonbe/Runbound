@@ -175,11 +175,11 @@ File: `src/dns/wire_builder.rs` — shared by both the AF_XDP fast path and the 
 fallback path (there is no separate `src/dns/xdp/wire_builder.rs`). The builder writes DNS
 wire responses directly for the common case (A/AAAA from local zones).
 
-- **Parse** (`parse_query`, `src/dns/wire_builder.rs:91`): validates a single-question
+- **Parse** (`parse_query`, `src/dns/wire_builder.rs:96`): validates a single-question
   query, finds the QNAME terminator with `simd::find_zero`, reads qtype/qclass, and parses
   any EDNS OPT RR. No heap allocation — the `qname_wire` is a slice into the original
   buffer (zero copy).
-- **EDNS / DNSSEC** (`EdnsInfo`, `src/dns/wire_builder.rs:55`): if the OPT RR has the
+- **EDNS / DNSSEC** (`EdnsInfo`, `src/dns/wire_builder.rs:57`): if the OPT RR has the
   DO bit set, the query wants DNSSEC → the wire builder returns `Fallback` so the slow-path
   handler (`serve_wire`, which does the DNSSEC signing/serving) handles it. The wire fast
   path never fakes DNSSEC.
@@ -207,7 +207,7 @@ When the XDP path cannot answer (a forwarded query, a cache miss), it falls back
 slow-path handler (`serve_wire`). But XDP workers have **no kernel arrival socket** to reply
 on. Replying from an ephemeral port causes clients to silently reject the answer (the source
 port doesn't match :53). A shared reply socket bound to `:53`, `XDP_FALLBACK_REPLY_SOCK`
-(`src/dns/kernel_loop.rs:55`), carries all XDP-mode fallback replies (#167). This constraint
+(`src/dns/kernel_loop.rs:56`), carries all XDP-mode fallback replies (#167). This constraint
 is specific to the zero-copy model and is documented here because it shapes the code.
 
 ---

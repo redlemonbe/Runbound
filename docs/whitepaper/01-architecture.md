@@ -134,4 +134,4 @@ fast-path lookups would silently miss, so the test is the guard against a silent
   attached, `ip link set <iface> xdp off` removes it.)
 - In XDP mode, recursion-miss fallbacks must be replied from a socket bound to `:53` — not
   an ephemeral port, which clients silently reject. This is the `XDP_FALLBACK_REPLY_SOCK`
-  mechanism (`src/dns/kernel_loop.rs:55`, issue #167).
+  mechanism (`src/dns/kernel_loop.rs:56`, issue #167).

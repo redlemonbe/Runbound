@@ -1,6 +1,6 @@
 # 07 — Security
 
-> **Status: current (0.9.0, last full sync pass: 2026-07-04)** — condensed, with code anchors; open items are listed
+> **Status: current (0.9.1, last full sync pass: 2026-07-06)** — condensed, with code anchors; open items are listed
 > at the end. Cross-references `SECURITY.md`, `THREAT_MODEL.md`,
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 
@@ -43,7 +43,7 @@
   (no early-exit timing side-channel). The unauthenticated surface is a single `/health`
   liveness route (no version or secrets).
 - **Constant-time TSIG key-name lookup.** The wire-native TSIG verifier compares the request
-  key name against the configured key with `subtle::ConstantTimeEq` (`src/dns/tsig.rs:242`),
+  key name against the configured key with `subtle::ConstantTimeEq` (`src/dns/tsig.rs:252`),
   so a signed UPDATE's key selection is not a timing oracle.
 - **Forward path validates the upstream response.** A plain-UDP upstream answer is accepted
   only when its transaction ID **and** its question (name case-insensitive + type + class)
@@ -105,7 +105,7 @@
   - **AXFR allow-list & split-horizon on the real client IP (PENT-1/PENT-2).** TCP/DoT/DoH
     are proxied through an internal loopback relay; the relay now carries the **real client
     IP via a PROXY v2 header** read **before** the TLS handshake for DoT/DoH
-    (`src/dns/server.rs:1992` builds it — `proxy_v2_header` —, `:2022` parses it —
+    (`src/dns/server.rs:2013` builds it — `proxy_v2_header` —, `:2043` parses it —
     `read_proxy_v2`). `axfr-allow` and split-horizon therefore evaluate the true source
     instead of `127.0.0.1` — closing a real ACL bypass.
   - **Least privilege default `CAP_NET_BIND_SERVICE`** (PENT-3, above).

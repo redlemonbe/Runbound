@@ -56,10 +56,10 @@ split-horizon — `add_split_horizon`/`delete_split_horizon` (`src/api/mod.rs`) 
 - **Sync** is a delta journal (`SyncJournal`, capacity 1000) over TOFU TLS, with SHA-256
   content hashing (`src/sync.rs`).
 - **Auto-registration**: the slave registers itself to the master on startup
-  (`POST /nodes/register`, HMAC-signed, `src/sync.rs:989`). The master validates the
+  (`POST /nodes/register`, HMAC-signed, `src/sync.rs:1017`). The master validates the
   advertised `relay_host` against SSRF: loopback, unspecified, link-local, IPv6 ULA and
   — unless `sync-allow-private-relay: yes` is set on the master — **RFC 1918 private
-  ranges are rejected with 400** (`src/sync.rs:1047`). LAN deployments (a slave at a
+  ranges are rejected with 400** (`src/sync.rs:1103`). LAN deployments (a slave at a
   private address, the common self-hosted case) therefore **require**
   `sync-allow-private-relay: yes` in the master config; without it registration fails
   with `INVALID_RELAY_HOST` and the slave logs only `Registration returned non-200

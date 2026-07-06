@@ -1,6 +1,6 @@
 # 04 — The slow path (wire-native `serve_wire`)
 
-> **Status: current (0.9.0, last full sync pass: 2026-07-04).** The slow path is served
+> **Status: current (0.9.1, last full sync pass: 2026-07-06).** The slow path is served
 > entirely by the in-house wire codec (`serve_wire`, `src/dns/server.rs`), and recursion +
 > DNSSEC validation are entirely in-house too (`src/dns/recursor_wire.rs`,
 > `src/dns/dnssec_*.rs`) and always compiled in — there is no `recursor` Cargo feature.
@@ -52,7 +52,7 @@ pipeline:
 - **32 MiB socket buffers**: each kloop socket requests `SO_RCVBUF = 32 MiB`
   (`RCVBUF_SIZE`, `src/dns/kernel_loop.rs:65`) so NAPI bursts are absorbed instead of
   dropped as `UdpRcvbufErrors`; startup auto-raises `net.core.rmem_max`/`wmem_max` to
-  match (best-effort, root — `src/dns/server.rs:2846`) and warns if the kernel clamps
+  match (best-effort, root — `src/dns/server.rs:2887`) and warns if the kernel clamps
   the buffer.
 - **The shared per-source gate.** Every datagram passes the *same* gate the XDP path uses,
   driven by the *same* objects: `rl_should_drop()` (the memoized per-source rate-limit) and
@@ -125,7 +125,7 @@ modes (#183). The `serve_wire` **fallback** still infers a hit from latency (a l
 ## 4.5 NIC auto-tune at startup (`xdp: no` only)
 
 When a slow-path interface is **explicitly named** in the config, startup reads the live
-topology and tunes the NIC for kernel-UDP throughput (`src/dns/server.rs:2663-2830`):
+topology and tunes the NIC for kernel-UDP throughput (`src/dns/server.rs:2827-2854`):
 
 - **RX queue count = the NIC's NUMA-node logical-CPU count**, capped at 32
   (`SLOWPATH_QUEUE_CAP`) and at the serving-core count. The kernel-UDP path is bounded by
@@ -176,7 +176,7 @@ These features are implemented in `serve_wire` so the default (wire) path carrie
   upstream SERVFAIL. This is the only stale-cache implementation.
 - **resolv.conf emergency fallback** (#94) — when all configured upstreams are down the
   forward path falls back to `/etc/resolv.conf` and recovers automatically
-  (`src/dns/server.rs:849`, recovery probe at `:2566`).
+  (`src/dns/server.rs:867`, recovery probe at `:2610`).
 - **Per-upstream racing-win metric** (#33, in `GET /api/system`) and **top-domains
   slow-path counting** (#5) are likewise restored on the wire path.
 

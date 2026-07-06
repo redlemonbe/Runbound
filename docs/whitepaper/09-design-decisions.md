@@ -1,6 +1,6 @@
 # 09 — Design decisions and rationale
 
-> **Status: current (0.9.0, last full sync pass: 2026-07-04)** — condensed decision table.
+> **Status: current (0.9.1, last full sync pass: 2026-07-06)** — condensed decision table.
 
 | Decision | Why | Trade-off |
 |----------|-----|-----------|

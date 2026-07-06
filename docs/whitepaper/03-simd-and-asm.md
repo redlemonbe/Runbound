@@ -158,7 +158,7 @@ step after a hash hit — it must be correct for every offset, which
 at 255 bytes. SSE2 path: `pcmpeqb` against a zero vector + `pmovmskb`, and the position is
 `mask.trailing_zeros()` within the first matching 16-byte block (`src/dns/simd.rs:349`).
 This is how `parse_query` finds the end of the name in one pass before lowercasing
-(`src/dns/wire_builder.rs:117`).
+(`src/dns/wire_builder.rs:120`).
 
 ---
 
