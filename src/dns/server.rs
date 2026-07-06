@@ -24,6 +24,12 @@ use dashmap::DashMap;
 use crate::dns::tsig::TsigAlg;
 
 use crate::dns::forward::{self as forward_pool, ForwardPool};
+
+/// Source IP used by the background prefetch refresher (FEAT #16). Recognised by
+/// `log_query_wire` so prefetch re-resolutions never pollute the query log; it falls
+/// in 127.0.0.0/8 so the ACL treats it as loopback. Not an address a real client uses.
+const PREFETCH_PEER_IP: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 53));
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -349,6 +355,10 @@ impl RunboundHandler {
     /// Latency stats are recorded inline by `serve_wire`; this only emits the
     /// structured log entry.
     fn log_query_wire(&self, client: IpAddr, name: &str, qtype: u16, action: LogAction, start: Instant) {
+        // FEAT #16: background prefetch re-resolutions must not appear in the query log.
+        if client == PREFETCH_PEER_IP {
+            return;
+        }
         let is_notable = matches!(
             action,
             LogAction::Nxdomain | LogAction::Servfail | LogAction::Refused | LogAction::Blocked
@@ -2674,6 +2684,9 @@ pub async fn run_dns_server(
     // #202: resolution_mode + recursor are created in build_and_launch (so the API can
     // hot-swap them) and threaded in as parameters — same pattern as dnssec_enabled.
 
+    // FEAT #16: clone the prefetch budget handle before it moves into the handler,
+    // for the background cache-scan refresher below.
+    let prefetch_tracker_scan = prefetch_tracker.as_ref().map(std::sync::Arc::clone);
     let handler = RunboundHandler::new(
         Arc::clone(&zones),
         Arc::clone(&resolver),
@@ -2737,6 +2750,68 @@ pub async fn run_dns_server(
     // Step 3b: wrap handler in Arc for sharing between the TLS supervisor and the fallback reader.
     let handler_arc = std::sync::Arc::new(handler);
     let handler_arc2 = std::sync::Arc::clone(&handler_arc);
+
+    // ── FEAT #16: background prefetch cache-scan refresher (opt-in) ───────────
+    // Off the hot path entirely: a background task scans the mutable cache and, for
+    // entries about to expire, re-resolves them through the normal serving path so a
+    // popular name's cached answer is refreshed before it lapses. The per-key budget
+    // (background-only, never touched by the fast path) bounds refreshes for names
+    // nobody asks for; a periodic global reset lets popular names be refreshed again.
+    if let (Some(pf), Some(cache)) = (prefetch_tracker_scan.as_ref(), xdp_cache_for_kloop.as_ref()) {
+        let pf = std::sync::Arc::clone(pf);
+        let cache = std::sync::Arc::clone(cache);
+        let h = std::sync::Arc::clone(&handler_arc);
+        tokio::spawn(async move {
+            const SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+            const REFRESH_LEAD: std::time::Duration = std::time::Duration::from_secs(12);
+            const RESET_EVERY_TICKS: u64 = 60; // ~5 min
+            const MAX_PER_SCAN: usize = 256;
+            let mut scan = tokio::time::interval(SCAN_EVERY);
+            scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticks: u64 = 0;
+            loop {
+                scan.tick().await;
+                ticks += 1;
+                if ticks % RESET_EVERY_TICKS == 0 {
+                    pf.reset_all();
+                }
+                let now = std::time::Instant::now();
+                // Collect near-expiry entries first (bounded), then re-resolve without
+                // holding any DashMap shard guard across the awaits.
+                let mut todo: Vec<(u64, Vec<u8>)> = Vec::new();
+                for e in cache.iter() {
+                    let ce = e.value();
+                    if ce.wire_payload.is_empty() {
+                        continue;
+                    }
+                    let remaining = ce.expires_at.saturating_duration_since(now);
+                    if remaining > std::time::Duration::ZERO && remaining < REFRESH_LEAD {
+                        let key = *e.key();
+                        if pf.budget(key) > 0 {
+                            todo.push((key, ce.wire_payload.to_vec()));
+                            if todo.len() >= MAX_PER_SCAN {
+                                break;
+                            }
+                        }
+                    }
+                }
+                for (key, payload) in todo {
+                    let Ok(msg) = crate::dns::wire::Message::parse(&payload) else {
+                        continue;
+                    };
+                    let Some(q) = msg.first_question() else { continue };
+                    let query = crate::dns::wire::message::encode_query(&q.name, q.qtype);
+                    pf.spend(key);
+                    let hh = std::sync::Arc::clone(&h);
+                    tokio::spawn(async move {
+                        let peer = std::net::SocketAddr::new(PREFETCH_PEER_IP, 0);
+                        let _ = hh.handle_request_wire(&query, peer).await;
+                    });
+                }
+            }
+        });
+        info!("prefetch cache-scan refresher started (opt-in, prefetch: yes)");
+    }
 
     // handler_arc2 is used by the fallback reader; TLS supervisor uses handler_arc.
     // No hickory Server needed — all listeners use handle_request_wire().

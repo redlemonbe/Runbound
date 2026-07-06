@@ -1,66 +1,58 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 RedLemonBe — https://github.com/redlemonbe/Runbound
-// DNS prefetch tracker — counts forwarded queries per domain per window.
-// When a domain exceeds the threshold the background task re-resolves it
-// proactively before the cached answer expires (opt-in, prefetch: yes).
 //
-// Uses DashMap<String, AtomicU32> instead of Mutex<HashMap> so that DNS
-// worker threads can increment counters without contending on a global lock.
+// DNS prefetch (FEAT #16) — background cache-scan refresher state.
+//
+// Keeps popular cache entries warm by re-resolving them shortly before they expire.
+// This is entirely OFF the hot path: the executor (in `server::build_and_launch`)
+// runs on a background task, and the per-key refresh budget below is never read or
+// written by the serving fast path — so prefetch adds zero cost to serving.
+//
+// The budget bounds wasted upstream traffic: an entry may be prefetch-refreshed at
+// most `PREFETCH_BUDGET` times before it is left to expire, unless a global reset
+// (fired periodically by the executor) restores budgets so still-popular names can
+// be refreshed again. Opt-in via `prefetch: yes`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 
+/// Max prefetch refreshes for one cache key before it is left to expire (until the
+/// next periodic global reset). Bounds the traffic spent on a name nobody asks for.
+pub const PREFETCH_BUDGET: u8 = 8;
+
+/// Per-cache-key refresh budget. Background-only state.
 pub struct PrefetchTracker {
-    inner: DashMap<String, AtomicU32, ahash::RandomState>,
+    budget: DashMap<u64, u8, ahash::RandomState>,
 }
 
 impl PrefetchTracker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: DashMap::with_hasher(ahash::RandomState::default()),
+            budget: DashMap::with_hasher(ahash::RandomState::default()),
         })
     }
 
-    /// Increment the request counter for `domain` — lock-free on the fast path.
-    /// Incomplete feature: only the recursor increments, and no executor drains the
-    /// tracker (`take_hot` is test-only), so this is unused on the default path.
-    #[allow(dead_code)]
-    pub fn increment(&self, domain: &str) {
-        if let Some(v) = self.inner.get(domain) {
-            v.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.inner
-                .entry(domain.to_owned())
-                .or_insert_with(|| AtomicU32::new(0))
-                .fetch_add(1, Ordering::Relaxed);
-        }
+    /// Refresh budget remaining for `key` (full budget if never seen).
+    pub fn budget(&self, key: u64) -> u8 {
+        self.budget.get(&key).map(|v| *v).unwrap_or(PREFETCH_BUDGET)
     }
 
-    /// Return all domains with count >= threshold and reset all counters to zero.
-    pub fn take_hot(&self, threshold: u32) -> Vec<String> {
-        let hot: Vec<String> = self
-            .inner
-            .iter()
-            .filter(|e| e.value().load(Ordering::Relaxed) >= threshold)
-            .map(|e| e.key().clone())
-            .collect();
-        self.inner.clear();
-        hot
+    /// Spend one refresh for `key` (saturating at 0).
+    pub fn spend(&self, key: u64) {
+        let left = self.budget(key).saturating_sub(1);
+        self.budget.insert(key, left);
     }
 
-    #[cfg(test)]
-    pub fn count_for(&self, domain: &str) -> u32 {
-        self.inner
-            .get(domain)
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(0)
+    /// Clear all budgets — a periodic global reset so still-popular names can be
+    /// refreshed again after their budget was spent.
+    pub fn reset_all(&self) {
+        self.budget.clear();
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.budget.len()
     }
 }
 
@@ -69,35 +61,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn increment_and_count() {
+    fn budget_spend_and_reset() {
         let t = PrefetchTracker::new();
-        t.increment("example.com");
-        t.increment("example.com");
-        t.increment("other.net");
-        assert_eq!(t.count_for("example.com"), 2);
-        assert_eq!(t.count_for("other.net"), 1);
-    }
-
-    #[test]
-    fn take_hot_filters_by_threshold() {
-        let t = PrefetchTracker::new();
-        for _ in 0..5 {
-            t.increment("hot.com");
+        // Unseen key starts at full budget.
+        assert_eq!(t.budget(42), PREFETCH_BUDGET);
+        t.spend(42);
+        assert_eq!(t.budget(42), PREFETCH_BUDGET - 1);
+        // Spending past zero saturates.
+        for _ in 0..PREFETCH_BUDGET {
+            t.spend(42);
         }
-        t.increment("cold.com");
-        let hot = t.take_hot(5);
-        assert_eq!(hot, vec!["hot.com"]);
-        // counters reset
-        assert_eq!(t.count_for("hot.com"), 0);
-        assert_eq!(t.count_for("cold.com"), 0);
-    }
-
-    #[test]
-    fn take_hot_resets_all_counters() {
-        let t = PrefetchTracker::new();
-        t.increment("a.com");
-        t.increment("b.com");
-        let _ = t.take_hot(1);
+        assert_eq!(t.budget(42), 0);
+        // Global reset restores full budget.
+        t.reset_all();
+        assert_eq!(t.budget(42), PREFETCH_BUDGET);
         assert_eq!(t.len(), 0);
     }
 }

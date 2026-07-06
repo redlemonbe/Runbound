@@ -1456,41 +1456,14 @@ async fn build_and_launch(
 
     let xdp_mode = Arc::new(AtomicU8::new(0)); // 0=disabled, 1=drv, 2=skb
 
-    // ── DNS prefetch tracker (FEAT #16, opt-in via prefetch: yes) ─────────
+    // ── DNS prefetch (FEAT #16, opt-in via prefetch: yes) ─────────────────
+    // The background cache-scan refresher lives in `server::build_and_launch` (it
+    // needs the handler + XDP cache). Here we only allocate the per-key refresh
+    // budget map; `None` disables prefetch. `prefetch-threshold` is retained for
+    // config compatibility but unused by the cache-scan design.
+    let _ = cfg.prefetch_threshold;
     let prefetch_tracker: Option<Arc<dns::prefetch::PrefetchTracker>> = if cfg.prefetch {
-        let tracker = dns::prefetch::PrefetchTracker::new();
-        let t = Arc::clone(&tracker);
-        let res = Arc::clone(&resolver);
-        let threshold = cfg.prefetch_threshold;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let hot = t.take_hot(threshold);
-                if hot.is_empty() {
-                    continue;
-                }
-                tracing::debug!(
-                    count = hot.len(),
-                    "prefetch: queuing {} domain(s)",
-                    hot.len()
-                );
-                // Prefetch: send dummy A query to warm up DoT connections
-                for name in hot {
-                    let r = Arc::clone(&res);
-                    tokio::spawn(async move {
-                        // Synthesise the prefetch A query with our own wire encoder (no hickory).
-                        if let Ok(n) = dns::wire::Name::from_ascii(&name) {
-                            let wire =
-                                dns::wire::message::encode_query(&n, dns::wire::consts::rtype::A);
-                            let _ = r.load().forward(&wire).await;
-                        }
-                    });
-                }
-            }
-        });
-        Some(tracker)
+        Some(dns::prefetch::PrefetchTracker::new())
     } else {
         None
     };
