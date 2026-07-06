@@ -2144,7 +2144,7 @@ async fn spawn_tls_service(
     drop(handler); // consumed; DoT now uses handler_dot_sup clone
     for iface in interfaces {
         // DNS-over-TLS (853 TCP) — public listener relays to a loopback wire listener.
-        let dot_addr = format!("{}:{}", iface, dot_port);
+        let dot_addr = crate::dns::kernel_loop::iface_socket_str(iface, dot_port);
         match TcpListener::bind(&dot_addr).await {
             Ok(public_dot) => match TcpListener::bind("127.0.0.1:0").await {
                 Ok(relay_dot) => {
@@ -2214,7 +2214,7 @@ async fn spawn_tls_service(
         }
 
         // DNS-over-HTTPS (443 TCP)
-        let doh_addr = format!("{}:{}", iface, doh_port);
+        let doh_addr = crate::dns::kernel_loop::iface_socket_str(iface, doh_port);
         match TcpListener::bind(&doh_addr).await {
             Ok(public_doh) => match TcpListener::bind("127.0.0.1:0").await {
                 Ok(relay_doh) => {
@@ -2253,7 +2253,7 @@ async fn spawn_tls_service(
         // client address directly (conn.remote_address()). The ACL, per-IP connection
         // cap and abuse engine are applied on the QUIC connection, parity with
         // run_tcp_with_limit (the per-query ACL + abuse verdict still run in serve_wire).
-        let doq_addr = format!("{}:{}", iface, doq_port);
+        let doq_addr = crate::dns::kernel_loop::iface_socket_str(iface, doq_port);
         match doq_addr.parse::<SocketAddr>() {
             Ok(sa) => {
                 let h_doq = std::sync::Arc::clone(&handler_dot_sup);
@@ -3021,8 +3021,8 @@ pub async fn run_dns_server(
                 let n = fast_cores.len().min(SECONDARY_IFACE_CORES).max(1);
                 &fast_cores[fast_cores.len() - n..]
             };
-            let kernel_loop_bind = format!("{iface}:{}", cfg.port);
-            let handle = crate::dns::kernel_loop::start_kernel_fast_loop(
+            let kernel_loop_bind = crate::dns::kernel_loop::iface_socket_str(iface, cfg.port);
+            let handle = match crate::dns::kernel_loop::start_kernel_fast_loop(
                 &kernel_loop_bind,
                 bind_cores,
                 Arc::clone(&zones_for_kloop),
@@ -3033,7 +3033,17 @@ pub async fn run_dns_server(
                 kloop_cache_snapshot.clone(),
                 Some(Arc::clone(&stats_for_kloop)),
                 Some(Arc::clone(&domain_stats_for_kloop)),
-            )?;
+            ) {
+                Ok(h) => h,
+                // #233: a secondary interface (e.g. a fixed IPv6 whose prefix went away)
+                // must not take down the primary DNS — warn and keep serving the rest.
+                Err(e) if idx > 0 => {
+                    warn!(addr = %kernel_loop_bind, err = %e,
+                        "secondary interface kernel-loop bind failed — skipping (primary DNS unaffected)");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             info!(
                 threads = bind_cores.len(),
                 addr = %kernel_loop_bind,
@@ -3089,9 +3099,9 @@ pub async fn run_dns_server(
     let tcp_tracker = TcpConnTracker::new();
     const TCP_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
-    for iface in &interfaces {
-        let udp_addr = format!("{}:{}", iface, port);
-        let tcp_addr = format!("{}:{}", iface, port);
+    for (idx, iface) in interfaces.iter().enumerate() {
+        let udp_addr = crate::dns::kernel_loop::iface_socket_str(iface, port);
+        let tcp_addr = crate::dns::kernel_loop::iface_socket_str(iface, port);
 
         // UDP sockets are now owned by the kernel fast loop (Step 3b).
         // No UDP sockets are bound here — the wire handler serves only TCP + fallback channel.
@@ -3100,9 +3110,16 @@ pub async fn run_dns_server(
         // FIX 6.2: public-facing TCP listener feeds our per-IP accept gate.
         // The wire handler gets a loopback relay listener so its accept
         // loop never sees connections from over-limit source IPs.
-        let public_tcp = TcpListener::bind(&tcp_addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("TCP bind {tcp_addr}: {e}"))?;
+        let public_tcp = match TcpListener::bind(&tcp_addr).await {
+            Ok(l) => l,
+            // #233: keep the primary DNS up if a secondary (IPv6) interface can't bind.
+            Err(e) if idx > 0 => {
+                warn!(addr = %tcp_addr, err = %e,
+                    "secondary interface TCP bind failed — skipping (primary DNS unaffected)");
+                continue;
+            }
+            Err(e) => return Err(anyhow::anyhow!("TCP bind {tcp_addr}: {e}")),
+        };
         // Relay listener: loopback, ephemeral port — the own wire relay loop owns this listener.
         let relay_tcp = TcpListener::bind("127.0.0.1:0")
             .await

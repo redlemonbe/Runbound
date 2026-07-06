@@ -65,10 +65,30 @@ pub struct KernelLoopHandle {
 const RCVBUF_SIZE: usize = 32 * 1024 * 1024; // 32 MiB (#slowpath: absorb RX bursts; needs net.core.rmem_max raised — auto-set in server.rs)
 const DNS_BUF_SIZE: usize = 4096;
 
+/// Join an interface/host and a port into a bindable socket-address string,
+/// bracketing a bare IPv6 literal so it parses as `[::]:53` instead of the invalid
+/// `:::53` (#233). IPv4 and already-bracketed inputs pass through unchanged.
+pub(crate) fn iface_socket_str(iface: &str, port: u16) -> String {
+    if iface.contains(':') && !iface.starts_with('[') {
+        format!("[{iface}]:{port}")
+    } else {
+        format!("{iface}:{port}")
+    }
+}
+
 /// Bind a blocking SO_REUSEPORT UDP socket with explicit buffer sizes.
 fn bind_kernel_udp(addr: &str) -> anyhow::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    // #233: pick the socket domain from the address so an IPv6 interface binds too.
+    let sockaddr: std::net::SocketAddr = addr.parse()?;
+    let domain = if sockaddr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if sockaddr.is_ipv6() {
+        // IPv6-only: a `[::]:53` socket must not also capture IPv4 (dual-stack) — that
+        // would collide with a sibling 0.0.0.0:53 and hide real IPv4 sources behind
+        // ::ffff: mapped addresses from the ACL / rate-limiter.
+        sock.set_only_v6(true)?;
+    }
     sock.set_reuse_port(true)?;
     sock.set_reuse_address(true)?; // #167b: coexist 0.0.0.0:53 (reply) + 127.0.0.1:53 (lo)
     sock.set_recv_buffer_size(RCVBUF_SIZE)?;
@@ -85,8 +105,7 @@ fn bind_kernel_udp(addr: &str) -> anyhow::Result<UdpSocket> {
         );
     }
 
-    let addr: std::net::SocketAddr = addr.parse()?;
-    sock.bind(&addr.into())?;
+    sock.bind(&sockaddr.into())?;
 
     // #slowpath-spread: spread incoming datagrams EVENLY across the SO_REUSEPORT group,
     // INDEPENDENT of flow count. The kernel's default 4-tuple hash confines a few-flow load
@@ -509,6 +528,24 @@ mod sockaddr_parse_tests {
     fn ipv4_round_trips() {
         let ss = v4(Ipv4Addr::new(1, 2, 3, 4), 53);
         assert_eq!(sockaddr_to_std(&ss), Some("1.2.3.4:53".parse().unwrap()));
+    }
+
+    #[test]
+    fn iface_socket_str_brackets_ipv6() {
+        use super::iface_socket_str;
+        // IPv4 and hostnames pass through unchanged.
+        assert_eq!(iface_socket_str("0.0.0.0", 53), "0.0.0.0:53");
+        assert_eq!(iface_socket_str("192.168.8.12", 53), "192.168.8.12:53");
+        // Bare IPv6 literals get bracketed so they parse as SocketAddr.
+        assert_eq!(iface_socket_str("::", 53), "[::]:53");
+        assert_eq!(iface_socket_str("::1", 5353), "[::1]:5353");
+        assert_eq!(iface_socket_str("2a01:cc00:d280:a02::53", 53), "[2a01:cc00:d280:a02::53]:53");
+        // Already-bracketed input is left alone.
+        assert_eq!(iface_socket_str("[::1]", 53), "[::1]:53");
+        // All produced strings must parse as a SocketAddr.
+        for i in ["0.0.0.0", "::", "::1", "2a01:cc00:d280:a02::53"] {
+            assert!(iface_socket_str(i, 53).parse::<std::net::SocketAddr>().is_ok(), "{i}");
+        }
     }
 
     #[test]

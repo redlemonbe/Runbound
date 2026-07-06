@@ -41,6 +41,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   the NXNAME pseudo-type (128) translates NOERROR → NXDOMAIN (fail-closed: only on a
   Secure verdict). Genuine NODATA and classic NXDOMAIN are unchanged. NSEC for now;
   NSEC3 compact denial to follow.
+- IPv6 on the slow path (#233): with `xdp: no`, an IPv6 `interface:` failed to bind
+  (`:::53` is invalid and the kernel-loop socket was hard-coded to IPv4), which took
+  down ALL of DNS. Bind addresses are now bracketed (`[::]:53`), the socket domain
+  follows the address (IPv6-only, so `[::]:53` coexists with an IPv4 wildcard bind and
+  the ACL/rate-limiter sees the real source), and a secondary interface that cannot bind
+  (e.g. a fixed IPv6 whose prefix went away) is skipped with a warning instead of
+  failing the whole service — the primary DNS stays up.
 
 ### Changed
 - WebUI About page: removed the external Links section and the issue hyperlink; the
