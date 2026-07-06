@@ -114,45 +114,10 @@ pub enum Outcome {
     Failure,
 }
 
-/// Reject nameserver addresses that must never be queried (anti-SSRF). Mirrors
-/// the spirit of hickory's RECOMMENDED_SERVER_FILTERS: no loopback, private,
-/// link-local, CGNAT, documentation, benchmarking, multicast or unspecified.
-pub(crate) fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(a) => {
-            let o = a.octets();
-            !(a.is_loopback()
-                || a.is_private()
-                || a.is_link_local()
-                || a.is_broadcast()
-                || a.is_documentation()
-                || a.is_unspecified()
-                || a.is_multicast()
-                || o[0] == 0                       // 0.0.0.0/8
-                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
-                || (o[0] == 198 && (o[1] & 0xfe) == 18)    // 198.18.0.0/15 benchmark
-                || o[0] >= 240) // 240.0.0.0/4 reserved
-        }
-        IpAddr::V6(a) => {
-            // An IPv4-mapped address (::ffff:a.b.c.d) is routed by the kernel to the
-            // embedded IPv4 on a dual-stack host — re-run the (thorough) v4 checks so
-            // ::ffff:10.0.0.1 / ::ffff:127.0.0.1 can't bypass the SSRF guard.
-            if let Some(v4) = a.to_ipv4_mapped() {
-                return is_public_ip(IpAddr::V4(v4));
-            }
-            let s = a.segments();
-            !(a.is_loopback()
-                || a.is_unspecified()
-                || a.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00                 // fc00::/7 ULA
-                || (s[0] & 0xffc0) == 0xfe80                 // fe80::/10 link-local
-                || (s[0] == 0x64 && s[1] == 0xff9b)          // 64:ff9b::/96 NAT64 → v4
-                || (s[0] == 0x2001 && s[1] == 0x0db8)        // 2001:db8::/32 documentation
-                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)) // ::/96 (incl. IPv4-compatible)
-        }
-    }
-}
+// The anti-SSRF address filter (`is_public_ip`) is the single source of truth in
+// the standalone `crate::ssrf` module (shared with the feed fetcher and the
+// webhook client, and reachable from the fuzz lib). Re-exported for the recursor.
+pub(crate) use crate::ssrf::is_public_ip;
 
 /// Build an iterative query: random id, RD=0, one question, no EDNS. Large
 /// answers set TC and we retry over TCP, so 512-byte UDP is fine here.

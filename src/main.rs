@@ -50,6 +50,7 @@ mod icmp;
 mod integrity;
 mod logbuffer;
 mod runtime;
+mod ssrf;
 mod stats;
 mod store;
 mod subnet_policy;

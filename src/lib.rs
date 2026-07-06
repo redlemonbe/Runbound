@@ -29,6 +29,10 @@ pub mod hsm;
 // the parser compile in the library crate without dragging in the binary.
 #[cfg(feature = "fuzz")]
 pub mod webhooks;
+// webhooks delegates its SSRF filter to the standalone `ssrf` module (std/tokio/
+// reqwest only), so it must be exposed alongside webhooks in the fuzz lib.
+#[cfg(feature = "fuzz")]
+pub mod ssrf;
 #[cfg(feature = "fuzz")]
 pub mod multiuser;
 #[cfg(feature = "fuzz")]

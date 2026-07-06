@@ -17,6 +17,9 @@ use uuid::Uuid;
 use crate::dns::BlacklistAction;
 use crate::error::AppError;
 use crate::integrity::{store_key, verify_mac, write_mac};
+// SSRF address filter + connection-time DNS guard live in the shared `crate::ssrf`
+// module (single source of truth). Re-exported for this module's fetch path.
+pub(crate) use crate::ssrf::{is_private_ip, SsrfSafeDnsResolver};
 
 // ============================================================
 // Constants
@@ -390,10 +393,6 @@ async fn validate_feed_url(url: &str) -> Result<(), AppError> {
 // SSRF guards in this codebase cannot drift apart — one source of truth covering
 // RFC1918, CGNAT, loopback, link-local, broadcast, documentation, benchmarking,
 // reserved (240/4), multicast, unspecified, IPv4-mapped (re-checked), NAT64 and ULA.
-pub(crate) fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    !crate::dns::recursor_wire::is_public_ip(*ip)
-}
-
 /// Validate feed ID: must be a valid UUID v4 (prevents path traversal in cache filenames).
 fn validate_feed_id(id: &str) -> bool {
     // UUID v4: 8-4-4-4-12 hex chars with dashes, 4th group starts with 4
@@ -672,36 +671,8 @@ pub async fn update_feed(feed: &mut Feed, client: &reqwest::Client) -> Result<us
 
 // ── MED-03: SSRF-safe DNS resolver ───────────────────────────────────────────
 //
-// Defense-in-depth below validate_feed_url(): filters private IPs at the TCP
-// connection layer so that even a DNS rebinding attack that slips past the
-// async lookup in validate_feed_url() cannot reach internal services.
-// Every hostname-to-address resolution made by reqwest passes through here.
-
-pub(crate) struct SsrfSafeDnsResolver;
-
-impl reqwest::dns::Resolve for SsrfSafeDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            type DynErr = Box<dyn std::error::Error + Send + Sync>;
-
-            let addrs = tokio::net::lookup_host(format!("{host}:0"))
-                .await
-                .map_err(|e| Box::new(e) as DynErr)?;
-
-            let safe: Vec<std::net::SocketAddr> =
-                addrs.filter(|a| !is_private_ip(&a.ip())).collect();
-
-            if safe.is_empty() {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("all IPs for '{host}' are private/internal — SSRF blocked"),
-                )) as DynErr);
-            }
-            Ok(Box::new(safe.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
+// `SsrfSafeDnsResolver` (connection-time private-IP filter, defense-in-depth
+// against DNS rebinding) is defined once in `crate::ssrf` and re-exported above.
 
 /// Build a reqwest client with layered SSRF protection:
 ///   1. Custom DNS resolver (MED-03): private IPs filtered at connection time.

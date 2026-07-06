@@ -170,7 +170,7 @@ impl WebhookDispatcher {
                 .user_agent("Runbound-Webhook/1.0")
                 // SEC-2026-07-B: filter private/internal IPs at resolution time (rebinding-safe)
                 // and never follow redirects into internal targets.
-                .dns_resolver(Arc::new(crate::feeds::SsrfSafeDnsResolver))
+                .dns_resolver(Arc::new(crate::ssrf::SsrfSafeDnsResolver))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default();
@@ -310,7 +310,7 @@ fn is_safe_url(url: &str) -> bool {
     // link-local AND IPv6 ULA/link-local/mapped) — SEC-2026-07-B. Rebinding via a
     // hostname is caught at resolution time by SsrfSafeDnsResolver on the client below.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if crate::feeds::is_private_ip(&ip) { return false; }
+        if crate::ssrf::is_private_ip(&ip) { return false; }
     }
     let host_lc = host.to_ascii_lowercase();
     // Match the internal-name guards of the feeds redirect policy (defense in depth
