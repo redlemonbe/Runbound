@@ -590,10 +590,169 @@ impl UnboundConfig {
     }
 }
 
+// ── Unbound `include:` / `include-toplevel:` expansion ───────────────────────
+// Included files are spliced in at the include position before parsing, so a
+// standard Unbound layout (e.g. `include: "/etc/runbound/conf.d/*.conf"`) is
+// honoured rather than silently dropped. Guard-railed against runaway/hostile
+// configs: bounded nesting depth, file count and cumulative size; glob only in
+// the final path component; and every resolved file must stay inside the
+// top-level config file's directory (no `..` or symlink escape).
+
+const MAX_INCLUDE_DEPTH: usize = 8;
+const MAX_INCLUDE_FILES: usize = 256;
+const MAX_INCLUDE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB, cumulative
+
+struct IncludeState {
+    files: usize,
+    bytes: u64,
+    /// Canonical directory of the top-level config file; includes may not escape it.
+    top: std::path::PathBuf,
+}
+
+/// Minimal glob match for one path component: `*` matches any run (incl. empty),
+/// `?` matches exactly one character. No `[classes]`, no `**`. Case-sensitive.
+fn glob_match(pat: &str, name: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            mark = ni;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Expand a possibly-glob include path to the sorted list of matching files.
+/// Glob metacharacters are honoured only in the final path component.
+fn glob_expand(pattern: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let s = pattern.to_string_lossy();
+    if !s.contains('*') && !s.contains('?') {
+        return Ok(vec![pattern.to_path_buf()]);
+    }
+    let parent = pattern.parent().unwrap_or_else(|| std::path::Path::new("."));
+    if parent.to_string_lossy().contains('*') || parent.to_string_lossy().contains('?') {
+        anyhow::bail!("include: glob is only supported in the final path component: {s}");
+    }
+    let fname = pattern
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| anyhow::anyhow!("include: invalid glob pattern: {s}"))?;
+    let mut out = Vec::new();
+    let rd = std::fs::read_dir(parent)
+        .with_context(|| format!("include: cannot read directory {}", parent.display()))?;
+    for entry in rd.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            // Skip dotfiles, matching shell glob semantics.
+            if !name.starts_with('.') && glob_match(fname, name) && entry.path().is_file() {
+                out.push(entry.path());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Recursively expand `include:` / `include-toplevel:` directives, returning the
+/// combined config text with all includes spliced in at their positions.
+fn expand_includes(
+    content: &str,
+    base_dir: &std::path::Path,
+    depth: usize,
+    st: &mut IncludeState,
+) -> Result<String> {
+    if depth > MAX_INCLUDE_DEPTH {
+        anyhow::bail!("include: nesting deeper than {MAX_INCLUDE_DEPTH} — possible include cycle");
+    }
+    let mut out = String::with_capacity(content.len());
+    for raw in content.lines() {
+        let line = strip_inline_comment(raw).trim();
+        let inc = line
+            .split_once(':')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .filter(|(k, _)| *k == "include" || *k == "include-toplevel");
+        let Some((_k, v)) = inc else {
+            out.push_str(raw);
+            out.push('\n');
+            continue;
+        };
+        let pattern = v.trim().trim_matches('"');
+        if pattern.is_empty() {
+            anyhow::bail!("include: empty path");
+        }
+        let glob_path = if std::path::Path::new(pattern).is_absolute() {
+            std::path::PathBuf::from(pattern)
+        } else {
+            base_dir.join(pattern)
+        };
+        let files = glob_expand(&glob_path)?;
+        if files.is_empty() {
+            warn!("include: '{pattern}' matched no files");
+        }
+        for f in files {
+            st.files += 1;
+            if st.files > MAX_INCLUDE_FILES {
+                anyhow::bail!("include: more than {MAX_INCLUDE_FILES} files — refused");
+            }
+            let canon = f
+                .canonicalize()
+                .with_context(|| format!("include: cannot open {}", f.display()))?;
+            if !canon.starts_with(&st.top) {
+                anyhow::bail!(
+                    "include: {} is outside the config directory {} — refused",
+                    canon.display(),
+                    st.top.display()
+                );
+            }
+            let meta = std::fs::metadata(&canon)?;
+            st.bytes = st.bytes.saturating_add(meta.len());
+            if st.bytes > MAX_INCLUDE_BYTES {
+                anyhow::bail!("include: cumulative size exceeds {MAX_INCLUDE_BYTES} bytes — refused");
+            }
+            let text = std::fs::read_to_string(&canon)
+                .with_context(|| format!("include: cannot read {}", canon.display()))?;
+            let inc_base = canon.parent().unwrap_or(base_dir);
+            out.push_str(&expand_includes(&text, inc_base, depth + 1, st)?);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn parse_file(path: &str) -> Result<UnboundConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Cannot read unbound config: {}", path))?;
-    parse_str(&content)
+    // Expand `include:` / `include-toplevel:` relative to the config file's own
+    // directory, refusing any file that escapes it (see expand_includes).
+    let base = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let top = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let mut st = IncludeState {
+        files: 0,
+        bytes: 0,
+        top,
+    };
+    let expanded = expand_includes(&content, base, 0, &mut st)?;
+    parse_str(&expanded)
 }
 
 pub fn parse_str(content: &str) -> Result<UnboundConfig> {
@@ -640,6 +799,17 @@ pub fn parse_str(content: &str) -> Result<UnboundConfig> {
         // Do NOT strip quotes globally — directives like local-zone have complex quoted values.
         // Each handler strips its own quotes where needed.
         let val = val.trim();
+
+        // include: / include-toplevel: are resolved by parse_file() before parsing.
+        // A direct parse_str() caller (e.g. fuzzing) has no file context to resolve
+        // them, so skip explicitly rather than silently capturing in raw_passthrough.
+        if key == "include" || key == "include-toplevel" {
+            warn!(
+                "Line {}: include: is only applied when loading a config file — ignored here",
+                lineno + 1
+            );
+            continue;
+        }
 
         // VAL-2: `axfr:` and `io-uring:` are sub-blocks of `server:` in this flat
         // section model (they only own `enable`/`allow`). Without nesting, a `server:`
@@ -1510,4 +1680,105 @@ mod tests {
         assert!(!cfg.xdp, "xdp: no must disable fast path");
     }
 
+}
+
+#[cfg(test)]
+mod include_tests {
+    use super::*;
+
+    fn unique_tmp() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "rb-inc-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn glob_match_basic() {
+        assert!(glob_match("*.conf", "a.conf"));
+        assert!(glob_match("*.conf", "long-name.conf"));
+        assert!(!glob_match("*.conf", "a.txt"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("db-*.conf", "db-1.conf"));
+        assert!(!glob_match("db-*.conf", "x-1.conf"));
+        assert!(glob_match("*.conf", ".conf")); // '*' matches empty run
+    }
+
+    #[test]
+    fn expand_includes_splices_and_globs_sorted() {
+        let d = unique_tmp();
+        std::fs::create_dir_all(d.join("conf.d")).unwrap();
+        std::fs::write(d.join("conf.d/10-a.conf"), "line-A\n").unwrap();
+        std::fs::write(d.join("conf.d/20-b.conf"), "line-B\n").unwrap();
+        let content = "top-line\ninclude: \"conf.d/*.conf\"\ntail-line\n";
+        let top = d.canonicalize().unwrap();
+        let mut st = IncludeState { files: 0, bytes: 0, top };
+        let out = expand_includes(content, &d, 0, &mut st).unwrap();
+        assert!(out.contains("top-line") && out.contains("tail-line"));
+        assert!(out.contains("line-A") && out.contains("line-B"));
+        // glob results are applied in sorted order (10- before 20-)
+        assert!(out.find("line-A").unwrap() < out.find("line-B").unwrap());
+        assert_eq!(st.files, 2);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn include_refuses_escaping_config_dir() {
+        let d = unique_tmp();
+        let top = d.canonicalize().unwrap();
+        // absolute path outside the config directory must be refused
+        let content = "include: \"/etc/hostname\"\n";
+        let mut st = IncludeState { files: 0, bytes: 0, top };
+        let err = expand_includes(content, &d, 0, &mut st).unwrap_err().to_string();
+        assert!(
+            err.contains("outside the config directory") || err.contains("cannot open"),
+            "expected escape refusal, got: {err}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn include_cycle_is_bounded() {
+        let d = unique_tmp();
+        let top = d.canonicalize().unwrap();
+        std::fs::write(d.join("a.conf"), "include: \"b.conf\"\n").unwrap();
+        std::fs::write(d.join("b.conf"), "include: \"a.conf\"\n").unwrap();
+        let mut st = IncludeState { files: 0, bytes: 0, top };
+        let err = expand_includes("include: \"a.conf\"\n", &d, 0, &mut st)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nesting") || err.contains("cycle") || err.contains("files"),
+            "expected cycle/depth guard, got: {err}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn include_missing_file_errors() {
+        let d = unique_tmp();
+        let top = d.canonicalize().unwrap();
+        let mut st = IncludeState { files: 0, bytes: 0, top };
+        let err = expand_includes("include: \"nope.conf\"\n", &d, 0, &mut st).unwrap_err();
+        assert!(err.to_string().contains("include:"), "got: {err}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn parse_file_applies_included_directive() {
+        let d = unique_tmp();
+        std::fs::write(d.join("extra.conf"), "server:\n  rate-limit: 4242\n").unwrap();
+        let main = d.join("runbound.conf");
+        std::fs::write(&main, "server:\n  interface: 127.0.0.1\n  include: \"extra.conf\"\n").unwrap();
+        let cfg = parse_file(main.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.rate_limit, Some(4242), "directive from the included file must be applied");
+        std::fs::remove_dir_all(&d).ok();
+    }
 }
