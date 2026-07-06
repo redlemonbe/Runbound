@@ -66,7 +66,7 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 | Authoritative DNSSEC signing | online & zero-touch — per-zone KSK+ZSK (ECDSAP256), NSEC3 authenticated denial of existence, DS surfaced via API (#201) |
 | Encrypted DNS server | DoT (853) / DoH (443/RFC 8484 GET+POST) / DoQ (853) — self-signed leaf signed by a downloadable local CA (import once), or import your own; live, no restart |
 | Automatic TLS | built-in ACME / Let’s Encrypt |
-| DDoS abuse engine | per-client rate-limit + **tarpit** + bans, escalation gated to **verified sources** (connection-based transports TCP/DoT/DoH/DoQ, or UDP carrying a valid DNS cookie — anti-spoof); bans dropped at the XDP/kernel layer (IPv4; IPv6 bans enforced in the slow path — #228); enforced on both datapaths |
+| DDoS abuse engine | per-client rate-limit + **tarpit** + bans, escalation gated to **verified sources** (connection-based transports TCP/DoT/DoH/DoQ, or UDP carrying a valid DNS cookie — anti-spoof); bans dropped at the XDP/kernel layer (IPv4 **and** IPv6 — #228); enforced on both datapaths |
 | RBAC | read / dns / operator / admin API roles |
 | Privacy by default | client-IP redaction, configurable retention (GDPR) |
 | Tamper-evident audit log | per-entry HMAC-SHA256, SIEM-ready JSON; **actor-attributed** (every admin/user action), searchable in the WebUI |
