@@ -68,3 +68,30 @@ hot path, so the hot path only does a `fetch_add` on the miss/fallback branch.
 
 `save_xdp_cache`/`load_xdp_cache` serialise the DashMap to disk with `rkyv` (zero-copy
 binary), prefixed with a 4-byte magic `b"RBv1"` for format detection.
+
+## 5.7 Recursor infrastructure cache (#230)
+
+Everything above is the **answer** (packet) cache. Under `resolution: full-recursion`
+the iterative resolver additionally keeps an **infrastructure** cache
+(`src/dns/infra_cache.rs`, added in #230) so a cache *miss* no longer re-walks from the
+root every time. Before #230 each miss re-fetched every zone-cut NS set and the whole
+DNSSEC chain — ~70 % of miss traffic hit the root servers and each miss cost 325 ms–1.3 s.
+
+- **Zone-cut cache** — `zone → resolved NS addresses`, learned from referrals and consulted
+  by `resolve_once`/`resolve_message` (`src/dns/recursor_wire.rs`, via `zone_cut_start` /
+  `zone_cut_learn`). A descent starts at the deepest cached enclosing cut instead of the
+  root; a stale/dead cached cut is forgotten (`zone_cut_forget`) and the descent falls back
+  to a fresh root walk — the cache can only speed resolution up, never break it. A **DS**
+  query is anchored at the *parent* zone (`cached_start`), never at the zone's own cut,
+  otherwise it would ask the child for its own DS and fail the chain to Bogus.
+- **Validated-DNSKEY cache** — `zone → DNSSEC-validated DNSKEY rdatas`
+  (`src/dns/dnssec_chain.rs::trusted_keys_for`), reusing cuts it already validated (the root
+  DNSKEY effectively once per ~48 h, not per miss).
+
+Both are TTL-honouring (`min(record TTL, cap)`; DNSKEY entries additionally bounded by their
+RRSIG signature-expiry so a rolled/revoked key is not reused past its signature validity),
+bounded, and evicted sampled-LRU. **Fail-closed is preserved**: a DNSKEY is cached only
+after a Secure result, an expired entry is ignored (forcing re-validation), and every served
+answer is still DNSSEC-validated regardless of which cached cut was used. Measured on the
+production master: three NXDOMAIN misses under the same parent collapse from ~240 ms (cold)
+to ~55 ms (warm).

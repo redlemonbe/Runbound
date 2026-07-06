@@ -100,7 +100,9 @@ Sovereign full-recursion is a **runtime config toggle**, not a Cargo feature —
 `resolution: full-recursion` under `server:` in `unbound.conf` to switch the cache-miss
 backend from forward to the in-house iterative resolver (`src/dns/recursor_wire.rs`); the
 default is `resolution: forward`. Both code paths ship in every build; there is no
-`recursor` build flag.
+`recursor` build flag. Under full-recursion the resolver also keeps a TTL-bounded
+**infrastructure cache** — zone cuts + validated DNSKEY chains (§5.7, #230) — so repeated
+misses do not re-walk from the root.
 
 ## 4.3 Upstream health monitoring
 

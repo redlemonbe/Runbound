@@ -138,8 +138,10 @@ floods are handled by the rate limiter + `BADCOOKIE`.
 - **Block** is enforced at the **kernel**: the userspace detector pushes the IP to a BPF
   map and the XDP program `XDP_DROP`s its DNS before userspace — gated by a `bans_active`
   flag so an idle server pays only a single array lookup per packet (bench-verified: no
-  fast-path regression). On connection transports the ban is enforced at the relay (the
-  handler sees only the loopback relay address); IPv6 / non-XDP falls back to userspace.
+  fast-path regression). **Both IPv4 and IPv6 are dropped at the XDP layer** (`icmp_banned`
+  and `icmp_banned_v6` respectively — #228 closed the earlier IPv4-only gap). On connection
+  transports the ban is enforced at the relay (the handler sees only the loopback relay
+  address); in `xdp: no` mode the drop is enforced by the kernel-UDP loop instead.
 - Rules are editable **live** (WebUI Protection tab or `PUT /api/alerts/rules`), persisted
   to config and hot-applied without a restart.
 

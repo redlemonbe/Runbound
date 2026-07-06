@@ -11,11 +11,11 @@ Files: `ebpf/dns_xdp.c`, `src/dns/xdp/{loader,socket,umem,worker}.rs`, `src/dns/
 
 ## 2.1 The eBPF decision tree
 
-`dns_xdp` (`ebpf/dns_xdp.c:299`) runs on every frame the NIC delivers to the XDP hook,
+`dns_xdp` (`ebpf/dns_xdp.c:311`) runs on every frame the NIC delivers to the XDP hook,
 before the kernel network stack. Its logic, in order:
 
 1. **Parse Ethernet.** If the frame carries one 802.1Q VLAN tag (`ETH_P_8021Q`), skip
-   exactly one tag to reach the inner ethertype (#188, `ebpf/dns_xdp.c:312` — on a tagged
+   exactly one tag to reach the inner ethertype (#188, `ebpf/dns_xdp.c:324` — on a tagged
    fabric with `rx-vlan-offload` off the tag stays inside the frame). If the result is
    not IPv4/IPv6, `XDP_PASS` (hand to kernel). Untagged traffic pays one extra ethertype
    compare per frame and is otherwise byte-for-byte unchanged.
@@ -23,22 +23,24 @@ before the kernel network stack. Its logic, in order:
    echo in place with `XDP_TX` (see §3.7). Otherwise `XDP_PASS`.
 3. **Must be UDP, dest port 53.** Anything else (TCP for DoT/DoH/AXFR, other ports)
    `XDP_PASS` — so the kernel stack still serves TCP/TLS DNS normally.
-4. **DDoS abuse-engine kernel ban (IPv4).** Gated on a `bans_active` array-map flag (one
-   lookup when idle, no measurable fast-path cost): if set, look the source IP up in the
-   `icmp_banned` LRU hash and `XDP_DROP` on a hit. Bans are populated by the userspace
+4. **DDoS abuse-engine kernel ban (IPv4 + IPv6).** Gated on a `bans_active` array-map flag
+   (one lookup when idle, no measurable fast-path cost): if set, look the source address up
+   in the `icmp_banned` LRU hash (IPv4) or the `icmp_banned_v6` LRU hash (IPv6, keyed on the
+   16-byte `struct in6_addr` — added in #228 so an IPv6 flood is shed at XDP speed too, not
+   only in the slow path) and `XDP_DROP` on a hit. Bans are populated by the userspace
    abuse engine — escalation to `tarpit`/`block` only happens for **verified** sources
    (TCP/DoT/DoH/DoQ or UDP carrying a valid DNS cookie), so a spoofed UDP source can never
-   get a victim banned. (`ebpf/dns_xdp.c:503`)
+   get a victim banned. (`ebpf/dns_xdp.c:526` IPv4, `:553` IPv6)
 5. **Blacklist (IPv4).** Extract the QNAME key, look it up in the `dns_blacklist` hash
    map; on a hit, forge NXDOMAIN in place and `XDP_TX` (~µs round-trip, never wakes user
-   space). (`ebpf/dns_xdp.c:525`)
+   space). (`ebpf/dns_xdp.c:571`)
 6. **Optional domain-affinity routing.** If `domain_routing_cfg.enabled`, hash the QNAME
    (FNV-1a, §3.6) and `bpf_redirect_map` to a specific CPU via `CPUMAP`, so repeated
-   queries for one name always hit the same core's warm cache. (`ebpf/dns_xdp.c:544`)
+   queries for one name always hit the same core's warm cache. (`ebpf/dns_xdp.c:590`)
 7. **Default.** `bpf_redirect_map(&XSKS, rx_queue_index, XDP_PASS)` — hand the frame to
    the AF_XDP socket bound to this NIC queue. If no socket is registered for the queue
    (e.g. during startup), the `XDP_PASS` fallback sends it to the normal kernel socket.
-   (`ebpf/dns_xdp.c:586`)
+   (`ebpf/dns_xdp.c:632`)
 
 The key design property: **everything the fast path does not explicitly claim is passed
 to the kernel.** TCP, DoT/DoH/DoQ, non-DNS traffic, IPv6 blacklist hits, IP-with-options
@@ -47,7 +49,7 @@ packets — all fall through untouched. The fast path is purely additive.
 ### Why a runtime flag for routing, not a constant
 
 Domain routing is gated by a `BPF_MAP_TYPE_ARRAY` entry, not a `volatile const`
-(`ebpf/dns_xdp.c:199`). A `.rodata` constant is frozen at eBPF load time. The Array map
+(`ebpf/dns_xdp.c:211`). A `.rodata` constant is frozen at eBPF load time. The Array map
 lets user space flip routing **after** the AF_XDP zero-copy bind has succeeded — because
 whether zero-copy actually engaged is only known post-bind, and the routing choice depends
 on it. This preserves the zero-copy fast path (issue #155).
