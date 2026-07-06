@@ -173,6 +173,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_HOST: github.com
+          GH_REPO: redlemonbe/Runbound
         run: |
           if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
             gh release edit "${GITHUB_REF_NAME}" \
@@ -188,6 +189,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_HOST: github.com
+          GH_REPO: redlemonbe/Runbound
         run: |
           gh release upload "${GITHUB_REF_NAME}" \
             --clobber \
@@ -202,6 +204,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GH_HOST: github.com
+          GH_REPO: redlemonbe/Runbound
         run: |
           shopt -s nullglob
           sigs=(*.minisig)
