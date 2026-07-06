@@ -96,6 +96,15 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 
 *¹ Runbound ships both REST API-driven replication and standard AXFR (RFC 5936) / IXFR (RFC 1995) zone transfers. IXFR is answered as a full AXFR (no incremental transfer). AXFR requires explicit ACL configuration — see [docs/configuration.md](docs/configuration.md).
 
+### Standards & interoperability
+
+Runbound is graded **A** by [DNS-OARC's *Check My DNS*](https://cmdns.dev.dns-oarc.net/) &mdash; an
+independent DNS conformance test run from a real client through the resolver: **100%** on
+**Transport**, **Basic DNS** and **DNS Features**, with well-randomised source ports and query
+IDs (off-path spoofing resistance).
+
+<p align="center"><img src="docs/img/check-my-dns.png" alt="DNS-OARC Check My DNS report for Runbound: grade A, 100% on Transport, Basic DNS and DNS Features" width="820"><br><em>Check My DNS (DNS-OARC) &mdash; grade <strong>A</strong>, 100% across Transport / Basic DNS / DNS Features</em></p>
+
 ---
 
 ## Install
