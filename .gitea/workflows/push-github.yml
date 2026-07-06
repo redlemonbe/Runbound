@@ -9,18 +9,18 @@ jobs:
       - name: Sync du push mirror (refs git)
         run: |
           set -eu
-          API="http://127.0.0.1:3000/api/v1/repos/${{ github.repository }}"
+          API="http://127.0.0.1:8189/ghsync/${{ github.repository }}"
           AUTH="Authorization: token ${{ github.token }}"
           T0=$(date -u +%s)
-          curl -sf -X POST -H "$AUTH" "$API/push_mirrors-sync"
+          curl -sf -X POST -H "$AUTH" "$API/mirror-sync" >/dev/null
           echo "Sync demandee, attente du resultat du mirror…"
           LAST_ERR=""
           i=0
           while [ $i -lt 36 ]; do
             i=$((i+1)); sleep 5
-            M=$(curl -sf -H "$AUTH" "$API/push_mirrors")
-            LAST_ERR=$(printf "%s" "$M" | jq -r '.[0].last_error // ""')
-            LAST_UPD=$(printf "%s" "$M" | jq -r '.[0].last_update // ""')
+            M=$(curl -sf -H "$AUTH" "$API/mirror")
+            LAST_ERR=$(printf "%s" "$M" | jq -r '.mirrors[0].last_error // ""')
+            LAST_UPD=$(printf "%s" "$M" | jq -r '.mirrors[0].last_update // ""')
             UPD_S=$(date -u -d "$LAST_UPD" +%s 2>/dev/null || echo 0)
             if [ "$UPD_S" -ge "$T0" ]; then
               if [ -n "$LAST_ERR" ]; then
@@ -29,7 +29,7 @@ jobs:
                 exit 1
               fi
               echo "Mirror synchronise ($LAST_UPD) :"
-              printf "%s" "$M" | jq '.[0] | {remote_name, last_update, sync_on_commit, interval}'
+              printf "%s" "$M" | jq '.mirrors[0]'
               exit 0
             fi
           done
