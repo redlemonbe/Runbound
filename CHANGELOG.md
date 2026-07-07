@@ -8,6 +8,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ## [0.9.2]
 
 ### Added
+- **Live-editable DNS rate limit** — `rate-limit` / `rate-limit-burst` are changeable at runtime
+  via `PATCH /api/config` and the WebUI Protection tab ("DNS Rate Limit" card): applied live to the
+  XDP fast path + kernel slow path (no restart) and persisted to `runbound.conf`. `rate-limit-burst`
+  is now honoured at `server:` level (it was silently ignored — the DNS burst was hard-coded to
+  `rps*2`) and survives config regeneration; `GET /api/config` reports both live. Per-node (a local
+  capacity policy, not replicated to slaves).
 - QNAME minimisation (RFC 9156, #231) for the sovereign full-recursion resolver.
   Intermediate authoritative servers (root, TLD) are now probed with only the next
   label toward the target (as a QTYPE A query), so they never see the full query
@@ -24,7 +30,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   receiving only the TLD.
 - The WebUI header now shows the running version, between the name and the status dot.
 
+### Security
+- **Double-pass adversarial audit** (`docs/security-audit/AUDIT-2026-07-07`): `GET /api/audit/tail`
+  is gated to admins (was readable by any authenticated key in multi-user); backup import writes
+  secret files `0600`; the forward negative cache checks the authority SOA is in-bailiwick for the
+  qname; `parse_nsec` slices the NSEC type bitmap at the bytes consumed, not the presentation length.
+- **Auto-ban hardening on every path.** Loopback/unspecified can no longer be banned (a
+  `PUT /blacklist/127.0.0.1` self-DoS that also persisted); relayed and manual bans are now permanent
+  on **both** ban systems (XDP/kernel fast path *and* the slow-path/DoT/DoH/DoQ enforcer), fixing a
+  silent 24h lapse on slaves; bot-defense bans also reach `icmp_stats` so they enforce on the
+  kernel-UDP path under `xdp: no`; IPv6 bans propagate to the fast-path map; the in-memory ban and
+  login-rate maps are capped.
+
 ### Fixed
+- Alert rules with different windows now each count in their own sliding window; a single shared
+  counter previously let a short-window rule reset the count a long-window rule needed, silently
+  disabling it.
+- `create_user` wrote a **duplicate** entry to `users.json`.
+- `/api/metrics`: the `runbound_cache_hit_rate` HELP said "0.0 to 1.0" but the value is a percentage.
+- Startup **fails fast** with an actionable message when the config base directory is not writable
+  (was an obscure tokio "cannot drop a runtime" panic); the API/UI runtimes are leaked at creation to
+  remove that async-drop panic class.
+- **API documentation** (`docs/api.md`) resynced with the handlers across 21 endpoints — response
+  schemas (`dns/lookup`, `cache/stats`, upstream probe), real OpenMetrics family names, the
+  `PATCH /api/config` "is persisted" note, and 11 missing `/api/system` fields.
 - WebUI idle auto-logout restored to **5 minutes** (it had drifted to 30).
 - Backup restore/import now **applies live (hot-reload)** instead of asking for a service
   restart — Runbound never restarts. The restore re-reads the config, republishes local
@@ -50,6 +79,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   failing the whole service — the primary DNS stays up.
 
 ### Changed
+- A manual ban via `PUT /api/alerts/blocked/:ip` is now **permanent** on both ban systems (matching
+  the documented "permanent, no expiry"). Ban/blacklist endpoints return `{blocked:false,reason}` /
+  `{blacklisted:false,reason}` for a protected (loopback/unspecified) target instead of a false
+  success.
 - WebUI About page: removed the external Links section and the issue hyperlink; the
   community-contributor credit is now plain text (no link).
 
