@@ -1410,6 +1410,7 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
         "access_control":    cfg.access_control,
         "private_addresses": cfg.private_addresses,
         "rate_limit":        cfg.rate_limit,
+        "rate_limit_burst":  cfg.rate_limit_burst,
         "cache_max_ttl":     cfg.cache_max_ttl,
         "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
         "resolution_mode":   if s.resolution_mode.load(Ordering::Relaxed) == 1 { "full-recursion" } else { "forward" },

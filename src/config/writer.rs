@@ -34,7 +34,7 @@ pub fn is_managed_directive(section: &str, key: &str) -> bool {
                 | "tls-service-pem" | "tls-cert-bundle" | "tls-service-key"
                 | "tls-port" | "https-port" | "quic-port"
                 | "tls-cert-hostname" | "server-hostname" | "dot-client-auth-ca"
-                | "rate-limit" | "rate-limit-prefix-v4" | "rate-limit-prefix-v6"
+                | "rate-limit" | "rate-limit-burst" | "rate-limit-prefix-v4" | "rate-limit-prefix-v6"
                 | "abuse-tarpit-delay-ms" | "abuse-tarpit-max-conns"
                 | "api-key" | "api-port" | "api-socket"
                 | "cache-max-ttl" | "cache-min-ttl" | "cache-min-entries" | "cache-size"
@@ -141,6 +141,7 @@ pub fn render_config(cfg: &UnboundConfig) -> String {
     if let Some(v) = &cfg.tls.dot_client_auth_ca { o.push_str(&format!("    dot-client-auth-ca: \"{}\"\n", escape_str(v))); }
     // rate limit
     if let Some(v) = cfg.rate_limit { o.push_str(&format!("    rate-limit: {v}\n")); }
+    if let Some(v) = cfg.rate_limit_burst { o.push_str(&format!("    rate-limit-burst: {v}\n")); }
     if cfg.rate_limit_prefix_v4 != d.rate_limit_prefix_v4 { o.push_str(&format!("    rate-limit-prefix-v4: {}\n", cfg.rate_limit_prefix_v4)); }
     if cfg.rate_limit_prefix_v6 != d.rate_limit_prefix_v6 { o.push_str(&format!("    rate-limit-prefix-v6: {}\n", cfg.rate_limit_prefix_v6)); }
     if cfg.abuse_tarpit_delay_ms != d.abuse_tarpit_delay_ms { o.push_str(&format!("    abuse-tarpit-delay-ms: {}\n", cfg.abuse_tarpit_delay_ms)); }
