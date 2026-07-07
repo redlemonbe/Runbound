@@ -299,6 +299,7 @@ pub struct AppState {
     pub zones_mutex: Arc<Mutex<()>>,
     pub tls_cfg: Arc<TlsConfig>,
     pub rate_limiter: ApiRateLimiter,
+    pub dns_rate_limiter: Arc<crate::dns::ratelimit::RateLimiter>,
     pub reload_limiter: Arc<ReloadLimiter>,
     pub stats: Arc<Stats>,
     /// Pre-computed snapshot refreshed every second by `qps_update_loop`.
@@ -1409,8 +1410,8 @@ async fn config_handler(State(s): State<AppState>) -> impl IntoResponse {
         "api_feeds":         api_feeds,
         "access_control":    cfg.access_control,
         "private_addresses": cfg.private_addresses,
-        "rate_limit":        cfg.rate_limit,
-        "rate_limit_burst":  cfg.rate_limit_burst,
+        "rate_limit":        s.dns_rate_limiter.rps(),
+        "rate_limit_burst":  s.dns_rate_limiter.burst(),
         "cache_max_ttl":     cfg.cache_max_ttl,
         "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
         "resolution_mode":   if s.resolution_mode.load(Ordering::Relaxed) == 1 { "full-recursion" } else { "forward" },
@@ -1557,6 +1558,10 @@ async fn reload_handler(State(s): State<AppState>) -> impl IntoResponse {
 #[derive(Deserialize)]
 struct PatchConfigBody {
     dnssec_validation: Option<bool>,
+    /// DNS rate limiter steady-state rps (0 disables). Applied live.
+    rate_limit: Option<u64>,
+    /// DNS rate limiter burst ceiling. Applied live.
+    rate_limit_burst: Option<u64>,
 }
 
 async fn patch_config_handler(
@@ -1585,9 +1590,20 @@ async fn patch_config_handler(
             }
         }
     }
+    if body.rate_limit.is_some() || body.rate_limit_burst.is_some() {
+        // Live-edit the DNS rate limiter (shared with the XDP fast path via AtomicU64).
+        // A field left out keeps its current value; both are clamped like the parser.
+        let rps = body.rate_limit.map(|v| v.min(1_000_000)).unwrap_or_else(|| s.dns_rate_limiter.rps());
+        let burst = body.rate_limit_burst.map(|v| v.min(2_000_000)).unwrap_or_else(|| s.dns_rate_limiter.burst());
+        s.dns_rate_limiter.set_limits(rps, Some(burst));
+        info!(rps, burst, "DNS rate limit updated live via API");
+        persist_config(&s);
+    }
     JsonExtract(serde_json::json!({
         "ok": true,
         "dnssec_validation": s.dnssec_enabled.load(Ordering::Relaxed),
+        "rate_limit": s.dns_rate_limiter.rps(),
+        "rate_limit_burst": s.dns_rate_limiter.burst(),
     }))
 }
 
@@ -3000,6 +3016,8 @@ fn persist_config(s: &AppState) {
     };
     c.forward_zones = upstreams::rebuild_forward_zones(&s.upstreams);
     c.split_horizon = s.split_horizon.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    c.rate_limit = Some(s.dns_rate_limiter.rps());
+    c.rate_limit_burst = Some(s.dns_rate_limiter.burst());
     match crate::config::writer::write_config_atomic(&c, std::path::Path::new(&s.cfg_path)) {
         Ok(()) => info!(path = %s.cfg_path, "config persisted to runbound.conf"),
         Err(e) => warn!(%e, path = %s.cfg_path, "failed to persist config to runbound.conf"),
@@ -5087,6 +5105,7 @@ mod tests {
             zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
             tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
             rate_limiter: ApiRateLimiter::new_public(),
+            dns_rate_limiter: crate::dns::ratelimit::RateLimiter::new(0, None, 24, 56),
             reload_limiter: Arc::new(ReloadLimiter::new()),
             stats,
             stats_cache,
@@ -7264,6 +7283,7 @@ mod tests {
             zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
             tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
             rate_limiter: ApiRateLimiter::new_public(),
+            dns_rate_limiter: crate::dns::ratelimit::RateLimiter::new(0, None, 24, 56),
             reload_limiter: Arc::new(ReloadLimiter::new()),
             stats,
             stats_cache,
@@ -7738,6 +7758,7 @@ mod tests {
                 zones_mutex: Arc::new(tokio::sync::Mutex::new(())),
                 tls_cfg: Arc::new(crate::config::parser::TlsConfig::default()),
                 rate_limiter: ApiRateLimiter::new_public(),
+            dns_rate_limiter: crate::dns::ratelimit::RateLimiter::new(0, None, 24, 56),
                 reload_limiter: Arc::new(ReloadLimiter::new()),
                 stats,
                 stats_cache,

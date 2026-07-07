@@ -62,8 +62,8 @@ pub struct RateLimiter {
     buckets: DashMap<IpAddr, IpBucket, ahash::RandomState>,
     start: Instant,        // base for nanosecond GC clock
     next_gc_ns: AtomicU64, // nanos since `start` at which to next run retain()
-    rps: u64,
-    burst: u64,
+    rps: AtomicU64,
+    burst: AtomicU64,
     prefix_v4: u8,
     prefix_v6: u8,
 }
@@ -74,8 +74,8 @@ impl RateLimiter {
             buckets: DashMap::with_hasher(ahash::RandomState::default()),
             start: Instant::now(),
             next_gc_ns: AtomicU64::new(10_000_000_000), // first GC at 10 s
-            rps,
-            burst: burst.unwrap_or_else(|| rps.saturating_mul(2)),
+            rps: AtomicU64::new(rps),
+            burst: AtomicU64::new(burst.unwrap_or_else(|| rps.saturating_mul(2))),
             prefix_v4,
             prefix_v6,
         })
@@ -83,11 +83,24 @@ impl RateLimiter {
 
     /// Cheap disabled-check (rps==0) so hot paths can skip the gate entirely.
     #[inline]
-    pub fn enabled(&self) -> bool { self.rps != 0 }
+    pub fn enabled(&self) -> bool { self.rps.load(Ordering::Relaxed) != 0 }
+
+    /// Steady-state rps (live-editable via set_limits).
+    pub fn rps(&self) -> u64 { self.rps.load(Ordering::Relaxed) }
+    /// Burst ceiling (live-editable via set_limits).
+    pub fn burst(&self) -> u64 { self.burst.load(Ordering::Relaxed) }
+    /// Live-update the limits (API/WebUI). rps==0 disables the limiter. burst=None -> rps*2.
+    /// Relaxed stores: the hot path reads these with a single relaxed load per packet, so a
+    /// concurrent update is picked up on the next packet with no ordering requirement.
+    pub fn set_limits(&self, rps: u64, burst: Option<u64>) {
+        self.rps.store(rps, Ordering::Relaxed);
+        self.burst.store(burst.unwrap_or_else(|| rps.saturating_mul(2)), Ordering::Relaxed);
+    }
 
     #[inline]
     pub fn check(&self, ip: IpAddr) -> bool {
-        if self.rps == 0 {
+        let rps = self.rps.load(Ordering::Relaxed);
+        if rps == 0 {
             return true;
         }
         // Never rate-limit loopback (local health checks / dig @127.0.0.1) — mirrors the
@@ -96,6 +109,7 @@ impl RateLimiter {
             return true;
         }
 
+        let burst = self.burst.load(Ordering::Relaxed);
         let ip = normalize_ip(ip, self.prefix_v4, self.prefix_v6);
         let now = Instant::now();
 
@@ -132,20 +146,20 @@ impl RateLimiter {
         }
 
         let mut bucket = self.buckets.entry(ip).or_insert_with(|| IpBucket {
-            tokens: self.burst,
+            tokens: burst,
             last_refill: now,
         });
 
         let elapsed_ms = now.duration_since(bucket.last_refill).as_millis() as u64;
         if elapsed_ms >= RATE_LIMIT_WINDOW_MS {
-            bucket.tokens = self.burst;
+            bucket.tokens = burst;
             bucket.last_refill = now;
         } else {
             // u128 math + saturating add: a huge configured rps must never overflow.
             let new_tokens =
-                ((self.rps as u128 * elapsed_ms as u128) / RATE_LIMIT_WINDOW_MS as u128) as u64;
+                ((rps as u128 * elapsed_ms as u128) / RATE_LIMIT_WINDOW_MS as u128) as u64;
             if new_tokens > 0 {
-                bucket.tokens = bucket.tokens.saturating_add(new_tokens).min(self.burst);
+                bucket.tokens = bucket.tokens.saturating_add(new_tokens).min(burst);
                 bucket.last_refill = now;
             }
         }

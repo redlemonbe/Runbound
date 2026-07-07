@@ -642,6 +642,26 @@
       </div>
     </div>
 
+    <!-- DNS rate limiter (server-level rate-limit / rate-limit-burst) -->
+    <div class="card mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs text-gray-600 uppercase tracking-wide">DNS Rate Limit — per source IP</span>
+      </div>
+      <div class="icmp-config-row">
+        <div class="icmp-config-field">
+          <span class="field-label">Rate (qps)</span>
+          <input type="number" id="prot-dns-rate" min="0" max="1000000" class="input w-28"/>
+        </div>
+        <div class="icmp-config-field">
+          <span class="field-label">Burst</span>
+          <input type="number" id="prot-dns-burst" min="0" max="2000000" class="input w-28"/>
+        </div>
+        <button onclick="saveDnsRateLimit()" class="btn-secondary text-xs">Apply live</button>
+        <span id="prot-dns-msg" class="text-xs self-center"></span>
+      </div>
+      <p class="text-xs text-gray-600 mt-2">0 qps disables. Applied live (XDP fast path + kernel slow path) and persisted to runbound.conf. This node only.</p>
+    </div>
+
     <!-- Stats par nœud -->
     <div id="prot-nodes-grid" class="mb-4"></div>
 
@@ -1780,6 +1800,24 @@ async function saveRules(){
 async function loadRules(){
   try{ const a=await api('GET','/alerts'); _rules=(a.rules||[]).map(r=>({name:r.name,metric:r.metric||'client-qps',window_s:r.window_s,threshold:r.threshold,action:r.action,block_duration_s:r.block_duration_s})); renderRules(); }catch(_){}
 }
+async function saveDnsRateLimit() {
+  const msg = document.getElementById('prot-dns-msg');
+  const rate  = parseInt(document.getElementById('prot-dns-rate').value, 10);
+  const burst = parseInt(document.getElementById('prot-dns-burst').value, 10);
+  const body = {};
+  if (Number.isFinite(rate))  body.rate_limit = rate;
+  if (Number.isFinite(burst)) body.rate_limit_burst = burst;
+  if (Object.keys(body).length === 0) { msg.textContent = 'nothing to apply'; msg.className = 'text-xs self-center text-gray-500'; return; }
+  try {
+    const r = await api('PATCH', '/config', body);
+    msg.textContent = 'Applied: ' + r.rate_limit + ' qps / burst ' + r.rate_limit_burst;
+    msg.className = 'text-xs self-center text-green-400';
+  } catch(e) {
+    msg.textContent = 'Error: ' + e.message;
+    msg.className = 'text-xs self-center text-red-400';
+  }
+}
+
 async function loadProtection() {
   // Load master config (global)
   try {
@@ -1795,6 +1833,11 @@ async function loadProtection() {
     toggle._icmpEnabled = en;
     document.getElementById('prot-icmp-rate').value   = c.rate_limit    ?? 10;
     document.getElementById('prot-icmp-burst').value  = c.burst         ?? 5;
+    try {
+      const dcfg = await api('GET', '/config');
+      document.getElementById('prot-dns-rate').value  = dcfg.rate_limit ?? 200;
+      document.getElementById('prot-dns-burst').value = dcfg.rate_limit_burst ?? '';
+    } catch(_) {}
     document.getElementById('prot-icmp-banthr').value = c.ban_threshold ?? 100;
   } catch(_) {}
 

@@ -1630,6 +1630,15 @@ async fn build_and_launch(
     // receiver returned to async_main() for use in the ICMP/XDP poll task.
     let (blacklist_reload_tx, blacklist_reload_rx) = tokio::sync::mpsc::channel::<Vec<String>>(8);
 
+    // Shared DNS rate limiter (XDP fast path + kernel slow path). Created here so AppState
+    // holds it for live edits (PATCH /api/config) and the SAME Arc is returned for the data
+    // path — one limiter, edited in one place, read everywhere.
+    let rate_limiter = RateLimiter::new(
+        cfg.rate_limit.unwrap_or(200),
+        cfg.rate_limit_burst,
+        cfg.rate_limit_prefix_v4,
+        cfg.rate_limit_prefix_v6,
+    );
     let state = AppState {
         split_horizon: std::sync::Arc::new(std::sync::Mutex::new(cfg.split_horizon.clone())),
         node_health: crate::api::NodeHealth {
@@ -1641,6 +1650,7 @@ async fn build_and_launch(
         zones: Arc::clone(&zones),
         tls_cfg: Arc::clone(&tls_cfg),
         rate_limiter: api::ApiRateLimiter::new_public(),
+        dns_rate_limiter: Arc::clone(&rate_limiter),
         reload_limiter: Arc::new(api::ReloadLimiter::new()),
         zones_mutex: Arc::clone(&zones_mutex),
         stats: Arc::clone(&global_stats),
@@ -2103,13 +2113,6 @@ async fn build_and_launch(
         });
     }
 
-    // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
-    let rate_limiter = RateLimiter::new(
-        cfg.rate_limit.unwrap_or(200),
-        cfg.rate_limit_burst,
-        cfg.rate_limit_prefix_v4,
-        cfg.rate_limit_prefix_v6,
-    );
     let acl = Arc::new(Acl::from_config(&cfg.access_control));
 
     Ok((
