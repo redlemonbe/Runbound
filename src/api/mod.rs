@@ -366,8 +366,9 @@ pub struct AppState {
     /// for fast-path NXDOMAIN blocking. None when XDP is disabled.
     pub blacklist_reload_tx: Option<tokio::sync::mpsc::Sender<Vec<String>>>,
     /// #10: editable split-horizon entries. CRUD via /api/split-horizon persists to
-    /// runbound.conf; applied to the resolver on the next service restart (the live
-    /// resolver's split-horizon table is built at boot and not hot-swapped).
+    /// runbound.conf and is applied LIVE (#187): apply_split_horizon_live rebuilds the
+    /// per-view fast-path snapshots and hot-swaps SPLIT_HORIZON_LIVE for the slow path —
+    /// no restart required.
     pub split_horizon: Arc<std::sync::Mutex<Vec<crate::config::parser::SplitHorizonEntry>>>,
     pub node_health: NodeHealth,
 }
@@ -834,7 +835,7 @@ const HELP_ENDPOINTS: &[(&str, &str, &str)] = &[
     ("POST",   "/api/blacklist",        "Add a domain to the blacklist (refuse/nxdomain)"),
     ("DELETE", "/api/blacklist/:id",    "Remove a blacklist entry"),
     ("GET",    "/api/split-horizon",       "List split-horizon entries (per-client-subnet answer sets, #10)"),
-    ("POST",   "/api/split-horizon",       "Add or replace (by name) a split-horizon entry — applies on next restart"),
+    ("POST",   "/api/split-horizon",       "Add or replace (by name) a split-horizon entry — applied live (no restart)"),
     ("DELETE", "/api/split-horizon/:name", "Remove a split-horizon entry by name"),
     ("GET",    "/api/policies",         "List per-subnet/VLAN filtering policies, additive to the global blacklist (#8)"),
     ("POST",   "/api/policies",         "Add or replace (by name) a subnet policy — applied live, no restart (#8)"),
@@ -8060,7 +8061,14 @@ async fn put_blocked_ip(
     match ip_str.parse::<std::net::IpAddr>() {
         Ok(ip) => {
             state.alert_tracker.block_manual(ip, "manual".to_string());
-            state.icmp_stats.ban(ip, crate::icmp::BanSource::Manual);
+            // #protection-bans: a manual ban is permanent ("no expiry", per the API help
+            // and matching alert_tracker's expires:None). Previously this used
+            // icmp_stats.ban() (permanent:false, auto-expiring), so after the TTL the IP
+            // unblocked on the icmp/XDP fast path while alert_tracker (slow path, DoT/DoH/
+            // DoQ) still held it — and /api/protection/banned reported permanent:false
+            // while /api/alerts reported permanent:true for the very same ban. Use
+            // ban_permanent() so both systems agree and the ban does not silently lapse.
+            state.icmp_stats.ban_permanent(ip);
             match ip {
                 std::net::IpAddr::V4(ipv4) => {
                     let _ = state.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
