@@ -95,7 +95,11 @@ fn cut_ttl(msg: &wire::Message, zone: &Name, ns_names: &[Name]) -> u32 {
     }
 }
 
-const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+const QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Hedge delay: if the current authoritative server hasn't answered within this,
+/// fire the next one in parallel (the fastest reply wins). Bounds the worst case to
+/// roughly the best server's RTT instead of QUERY_TIMEOUT per mute server (#slow-path).
+const HEDGE_DELAY: Duration = Duration::from_millis(300);
 /// Total upstream queries allowed for one user query (anti-DoS budget).
 const MAX_QUERIES: u32 = 80;
 /// Maximum delegation depth (root → TLD → … ) before giving up.
@@ -529,24 +533,63 @@ async fn resolve_once(qname: &Name, qtype: u16, budget: &mut u32) -> StepOutcome
     StepOutcome::Negative { rcode: consts::rcode::NOERROR }
 }
 
-/// Try each nameserver IP (in turn) until one answers; bounded by `budget`.
+/// query_server + RTT measurement, for hedged selection feedback.
+async fn query_server_timed(
+    addr: SocketAddr,
+    qname: &Name,
+    qtype: u16,
+) -> (SocketAddr, Option<wire::Message>, u32) {
+    let start = tokio::time::Instant::now();
+    let resp = query_server(addr, qname, qtype).await;
+    let rtt_ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    (addr, resp, rtt_ms)
+}
+
+/// Query a nameserver set with RTT-based ordering + hedging, bounded by `budget`.
+/// Servers are tried fastest-known-first; if one is slow (HEDGE_DELAY), the next is
+/// fired in parallel and the first valid reply wins. This turns a mute/slow first NS
+/// from a QUERY_TIMEOUT stall into ~best-RTT + one hedge delay (#slow-path).
 async fn query_ns_set(
     ns_ips: &[IpAddr],
     qname: &Name,
     qtype: u16,
     budget: &mut u32,
 ) -> Option<wire::Message> {
-    for ip in ns_ips {
-        if *budget == 0 {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    // #3 RTT order: fastest known servers first, never-seen ones after.
+    let mut ips: Vec<IpAddr> = ns_ips.to_vec();
+    ips.sort_by_key(|ip| infra_cache::rtt_of(ip).unwrap_or(u32::MAX));
+
+    let mut inflight = FuturesUnordered::new();
+    let mut next = 0usize;
+
+    loop {
+        // Launch the next server if the list and the query budget allow.
+        if next < ips.len() && *budget > 0 {
+            *budget -= 1;
+            let addr = SocketAddr::new(ips[next], 53);
+            next += 1;
+            inflight.push(query_server_timed(addr, qname, qtype));
+        }
+        if inflight.is_empty() {
             return None;
         }
-        *budget -= 1;
-        let addr = SocketAddr::new(*ip, 53);
-        if let Some(msg) = query_server(addr, qname, qtype).await {
-            return Some(msg);
+        let more = next < ips.len() && *budget > 0;
+        tokio::select! {
+            biased;
+            Some((addr, resp, rtt_ms)) = inflight.next() => {
+                if let Some(msg) = resp {
+                    infra_cache::record_rtt(addr.ip(), rtt_ms);
+                    return Some(msg);
+                }
+                // this server failed/timed out — loop to launch the next / await the rest
+            }
+            _ = tokio::time::sleep(HEDGE_DELAY), if more => {
+                // hedge timer fired: the loop launches the next server in parallel
+            }
         }
     }
-    None
 }
 
 /// Resolve a nameserver's A records via a fresh descent (no-glue case).

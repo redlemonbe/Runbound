@@ -30,6 +30,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dns::wire::Name;
 
+// ── Per-authoritative-server RTT (server selection, #slow-path) ───────────────
+// Smoothed (EWMA) round-trip time in ms per server IP, so the iterative recursor
+// queries the fastest known server first and hedges the rest. A one-off spike does
+// not pin a server as slow. Map is bounded (cleared when full — rare, NS IPs are few).
+static RTT: LazyLock<Mutex<HashMap<IpAddr, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const RTT_MAX_ENTRIES: usize = 8192;
+
+/// Record a measured RTT sample (ms) for `ip` (EWMA: 3/4 old + 1/4 new).
+pub fn record_rtt(ip: IpAddr, sample_ms: u32) {
+    let mut m = RTT.lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() >= RTT_MAX_ENTRIES && !m.contains_key(&ip) {
+        m.clear();
+    }
+    m.entry(ip)
+        .and_modify(|r| *r = (r.saturating_mul(3).saturating_add(sample_ms)) / 4)
+        .or_insert(sample_ms);
+}
+
+/// Smoothed RTT (ms) for `ip`, if this server has ever answered.
+pub fn rtt_of(ip: &IpAddr) -> Option<u32> {
+    RTT.lock().unwrap_or_else(|e| e.into_inner()).get(ip).copied()
+}
+
 /// Cap on cached zone-cut entries (NS address sets).
 const MAX_CUTS: usize = 16_384;
 /// Cap on cached validated-DNSKEY entries (one per zone in the chains we serve).
