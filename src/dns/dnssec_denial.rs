@@ -44,12 +44,17 @@ pub fn type_in_bitmap(mut bm: &[u8], rtype: u16) -> bool {
 /// Split NSEC RDATA into its next owner name and the type bitmap (RFC 4034 §4.1).
 /// The next name is uncompressed.
 pub fn parse_nsec(rdata: &[u8]) -> Option<(Name, &[u8])> {
-    let next = Name::parse(&mut Decoder::new(rdata)).ok()?;
-    let nlen = next.len();
-    if nlen > rdata.len() {
+    // Slice the type bitmap at the decoder's consumed length, not the presentation
+    // length. RFC 4034 §4.1.1 forbids compression in the NSEC next-name, but a peer
+    // that violates that (or otherwise encodes the name shorter on the wire than
+    // `Name::len()`) would mis-offset the bitmap; `dec.pos()` is the exact bytes read.
+    let mut dec = Decoder::new(rdata);
+    let next = Name::parse(&mut dec).ok()?;
+    let consumed = dec.pos();
+    if consumed > rdata.len() {
         return None;
     }
-    Some((next, &rdata[nlen..]))
+    Some((next, &rdata[consumed..]))
 }
 
 /// Does the NSEC interval `(owner, next]`'s open range `owner < name < next`

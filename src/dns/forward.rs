@@ -609,7 +609,7 @@ fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
                 ResolveResult::NegativeAnswer {
                     rcode: rcode::NOERROR,
                     neg_ttl: soa_min_ttl(&msg).unwrap_or(0),
-                    soa: msg.authority.iter().filter(|r| matches!(r.rdata, wire::Rdata::Soa { .. })).cloned().collect(),
+                    soa: zone_soas(&msg),
                 }
             } else {
                 ResolveResult::Answer { records: msg.answers }
@@ -618,7 +618,7 @@ fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
         rcode::NXDOMAIN => ResolveResult::NegativeAnswer {
             rcode: rcode::NXDOMAIN,
             neg_ttl: soa_min_ttl(&msg).unwrap_or(0),
-            soa: msg.authority.iter().filter(|r| matches!(r.rdata, wire::Rdata::Soa { .. })).cloned().collect(),
+            soa: zone_soas(&msg),
         },
         other => {
             debug!(rcode = other, "upstream returned error rcode");
@@ -634,13 +634,35 @@ fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
 /// invented TTL — the consumer treats `None`/0 as "do not negative-cache". The
 /// configured-window clamp is the consumer's job, not done here.
 fn soa_min_ttl(msg: &wire::Message) -> Option<u32> {
-    msg.authority.iter().find_map(|r| {
-        if let wire::Rdata::Soa { minimum, .. } = &r.rdata {
-            Some((*minimum).min(r.ttl))
-        } else {
-            None
-        }
+    let qname = response_qname(msg)?;
+    msg.authority.iter().find_map(|r| match &r.rdata {
+        wire::Rdata::Soa { minimum, .. } if qname.is_in_zone(&r.name) => Some((*minimum).min(r.ttl)),
+        _ => None,
     })
+}
+
+/// The query name from the response's own question section. `response_matches`
+/// (SEC-O1) has already bound this question to the query we sent, so it is a
+/// trustworthy anchor for the bailiwick check below.
+fn response_qname(msg: &wire::Message) -> Option<&wire::Name> {
+    msg.questions.first().map(|q| &q.name)
+}
+
+/// Authority-section SOA records that actually enclose the qname (RFC 2308 §3: a
+/// negative answer's SOA must come from a zone authoritative for the name). A
+/// laterally out-of-bailiwick SOA — e.g. an `other.tld` SOA stuffed into a reply
+/// for `www.victim.tld` — is dropped so it cannot drive the negative-cache TTL.
+/// Mirrors the recursor's in-bailiwick guarantee (minus the DNSSEC proof: forward
+/// mode trusts the configured upstream, but not an unrelated zone's SOA).
+fn zone_soas(msg: &wire::Message) -> Vec<wire::Record> {
+    let Some(qname) = response_qname(msg) else {
+        return Vec::new();
+    };
+    msg.authority
+        .iter()
+        .filter(|r| matches!(r.rdata, wire::Rdata::Soa { .. }) && qname.is_in_zone(&r.name))
+        .cloned()
+        .collect()
 }
 
 /// Build a keepalive SOA query for "." in DNS wire format.
@@ -728,5 +750,37 @@ mod sec_o1_tests {
     #[test]
     fn rejects_truncated() {
         assert!(!response_matches(&[0x12, 0x34], 0x1234, None));
+    }
+
+    #[test]
+    fn negative_soa_out_of_bailiwick_is_dropped() {
+        let soa = |owner: &str, minimum: u32, ttl: u32| wire::Record {
+            name: wire::Name::from_ascii(owner).unwrap(),
+            rtype: rtype::SOA,
+            rclass: 1, // IN
+            ttl,
+            rdata: wire::Rdata::Soa {
+                mname: wire::Name::from_ascii("ns.example.com.").unwrap(),
+                rname: wire::Name::from_ascii("hostmaster.example.com.").unwrap(),
+                serial: 1, refresh: 3600, retry: 600, expire: 86400, minimum,
+            },
+        };
+        let msg = |auth: Vec<wire::Record>| wire::Message {
+            header: wire::Header { id: 1, flags: 0, qdcount: 1, ancount: 0, nscount: 0, arcount: 0 },
+            questions: vec![wire::Question::new(wire::Name::from_ascii("www.victim.tld.").unwrap(), rtype::A)],
+            answers: vec![],
+            authority: auth,
+            additional: vec![],
+        };
+        // In-bailiwick SOA (the enclosing zone) is kept and drives the neg-TTL
+        // (min(SOA.minimum, record.ttl) = min(300, 900)).
+        let good = msg(vec![soa("victim.tld.", 300, 900)]);
+        assert_eq!(zone_soas(&good).len(), 1);
+        assert_eq!(soa_min_ttl(&good), Some(300));
+        // A laterally out-of-bailiwick SOA (unrelated zone) is dropped: an on-path /
+        // malicious upstream cannot pin a forged negative-cache TTL on www.victim.tld.
+        let forged = msg(vec![soa("attacker.example.org.", 900, 900)]);
+        assert!(zone_soas(&forged).is_empty());
+        assert_eq!(soa_min_ttl(&forged), None);
     }
 }

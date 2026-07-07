@@ -89,7 +89,8 @@ impl UserAccount {
         })
     }
 
-    /// Generate a new random 32-char hex API key (128 bits, OS CSPRNG).
+    /// Generate a new random 32-char hex API key (UUIDv4: 122 bits of entropy,
+    /// OS CSPRNG via getrandom) — well beyond brute-force.
     pub fn generate_key() -> String {
         use std::fmt::Write as _;
         let raw = uuid::Uuid::new_v4();

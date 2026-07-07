@@ -3891,8 +3891,20 @@ struct AuditTailQuery {
 
 async fn audit_tail_handler(
     State(s): State<AppState>,
+    caller_ext: Option<axum::Extension<crate::multiuser::RequestUser>>,
     Query(q): Query<AuditTailQuery>,
 ) -> impl IntoResponse {
+    // The audit log is a security control (privileged-action record, auth failures,
+    // per-actor usernames), not operational telemetry. Gate it to admins like
+    // /backup/export (SEC-N1) instead of leaving it on the blanket "Read = any GET"
+    // surface, where a scoped key could enumerate cross-user/admin activity.
+    let caller = caller_ext.map(|e| e.0).unwrap_or_else(crate::multiuser::RequestUser::admin_context);
+    if !caller.admin {
+        return (
+            StatusCode::FORBIDDEN,
+            JsonExtract(serde_json::json!({"error": "FORBIDDEN"})),
+        );
+    }
     let n = q.n.unwrap_or(100).min(1000);
     // Use the configured audit-log-path if set, else base_dir/audit.log — must match
     // audit::init resolution, otherwise /audit/tail cannot find the log (QA Cycle I).
@@ -8183,6 +8195,7 @@ async fn backup_import_handler(
     };
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut restored = 0u32;
+    let mut secrets_restored = false;
     for (name, val) in files {
         // Security: only whitelisted names, never a path component.
         let allowed = name == "runbound.conf" || BACKUP_STATE_FILES.contains(&name.as_str());
@@ -8199,17 +8212,32 @@ async fn backup_import_handler(
         // first; if creation still fails (race / planted symlink), skip this file.
         let _ = std::fs::remove_file(&tmp);
         use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Some restored files are secrets (api.key, webui-auth.conf, sync-key.pem,
+        // webui-ca-key.pem). Create them 0600 like every other secret-write path
+        // (tls_write_key_0600 / sync::write_key_0600) instead of inheriting the
+        // umask default (0644, world-readable). Harmless for the data files too.
         let wrote = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&tmp)
             .and_then(|mut f| f.write_all(&data));
         if wrote.is_ok() && std::fs::rename(&tmp, &dest).is_ok() {
             restored += 1;
+            // apply_config_hot_reload does NOT re-read these — they bind at startup.
+            if matches!(name.as_str(), "api.key" | "webui-auth.conf" | "sync-key.pem" | "webui-ca-key.pem") {
+                secrets_restored = true;
+            }
         }
     }
     // Apply the restored config live — Runbound never restarts ("no restart ever").
     let note = match apply_config_hot_reload(&s) {
+        // A restored API key / relay key / WebUI creds bind at startup; the hot
+        // reload re-reads zones/alerts/resolution only. Don't claim "no restart
+        // needed" when the operator just restored secret material that is still inert.
+        Ok(_) if secrets_restored =>
+            "config and data applied live; a restored API key / private keys take effect only after a restart",
         Ok(_) => "applied live — no restart needed",
         Err(e) => {
             warn!(restored, err = %e, "restored files but hot-reload failed");
