@@ -1,6 +1,6 @@
 # 04 — The slow path (wire-native `serve_wire`)
 
-> **Status: current (0.9.1, last full sync pass: 2026-07-06).** The slow path is served
+> **Status: current (0.9.2, last full sync pass: 2026-07-07).** The slow path is served
 > entirely by the in-house wire codec (`serve_wire`, `src/dns/server.rs`), and recursion +
 > DNSSEC validation are entirely in-house too (`src/dns/recursor_wire.rs`,
 > `src/dns/dnssec_*.rs`) and always compiled in — there is no `recursor` Cargo feature.

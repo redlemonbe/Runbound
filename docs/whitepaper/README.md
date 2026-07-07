@@ -10,8 +10,9 @@ Runbound does but *how* and *why* — down to the hand-written assembly on the h
 and the eBPF verifier constraints that shaped the in-kernel code.
 
 > **Status & honesty.** This document describes the code as it exists in the repository
-> at **0.9.1** (last full sync pass: 2026-07-06 — #228 IPv6 XDP ban, #229 low-QPS
-> Top-Domains flush, #230 recursor infrastructure cache). Where a claim is not backed by a
+> at **0.9.2** (last full sync pass: 2026-07-07 — QNAME minimisation #231, compact denial
+> #232, IPv6 slow-path binding #233, a live-editable per-source DNS rate limit, auto-ban
+> hardening across both datapaths, and a full `docs/api.md` resync). Where a claim is not backed by a
 > measurement or by the code, it is marked **"I cannot confirm this."** No marketing
 > language is used: the words *production-ready, blazing, world-first, military-grade,
 > rock-solid, unbreakable, guaranteed* are banned, in line with the project's

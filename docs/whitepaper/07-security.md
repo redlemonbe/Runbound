@@ -1,6 +1,6 @@
 # 07 — Security
 
-> **Status: current (0.9.1, last full sync pass: 2026-07-06)** — condensed, with code anchors; open items are listed
+> **Status: current (0.9.2, last full sync pass: 2026-07-07)** — condensed, with code anchors; open items are listed
 > at the end. Cross-references `SECURITY.md`, `THREAT_MODEL.md`,
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 
@@ -142,7 +142,9 @@ floods are handled by the rate limiter + `BADCOOKIE`.
   and `icmp_banned_v6` respectively — #228 closed the earlier IPv4-only gap). On connection
   transports the ban is enforced at the relay (the handler sees only the loopback relay
   address); in `xdp: no` mode the drop is enforced by the kernel-UDP loop instead.
-- Rules are editable **live** (WebUI Protection tab or `PUT /api/alerts/rules`), persisted
+- Rules **and the per-source rate limit** (`rate-limit` / `rate-limit-burst`) are editable
+  **live** — WebUI Protection tab, `PUT /api/alerts/rules` / `PATCH /api/config` — applied to
+  both datapaths without a restart, persisted
   to config and hot-applied without a restart.
 
 ## Audit trail — who did what

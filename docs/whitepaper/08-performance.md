@@ -1,5 +1,11 @@
 # 08 — Performance
 
+> **0.9.2 hot-path note.** The per-source DNS rate limiter now reads its rps/burst as
+> `AtomicU64` in the hot path (`check()` / `rl_should_drop`, `worker.rs`) so the limits can be
+> edited live. On x86 a relaxed atomic load is a plain `mov`, so this is expected to be
+> perf-neutral, but the hot path was touched and has **not yet been re-benched on baremetal** —
+> the 0.9.0 figures below predate this change.
+
 > **Status: current (0.9.0), measured 2026-07-03** under the documented methodology
 > (dnsmark 1.0 + dnsperf 2.14.0, 100k-name real corpus). Recursion + DNSSEC validation
 > run in-house; the fast path's hot loop is the SIMD/ASM cache wire responder. Governed by
