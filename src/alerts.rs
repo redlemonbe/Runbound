@@ -228,9 +228,12 @@ impl AlertTracker {
 
         // Per-rule counting: each rule accumulates in its OWN window (previously one shared
         // count/window let the smallest-window rule reset what the larger-window rules
-        // needed, silently disabling them — #alerts).
-        let mut bucket = self.client_counts.entry(ip).or_default();
+        // needed, silently disabling them — #alerts). The threshold check is inline in the
+        // same lock — no per-request HashMap of counts nor clone of the whole rule Vec; a
+        // rule is cloned only when it actually fires (rare).
+        let mut to_fire: Vec<AlertRule> = Vec::new();
         {
+            let mut bucket = self.client_counts.entry(ip).or_default();
             let rules = self.rules.read().unwrap();
             for rule in rules.iter() {
                 if rule.metric != "client-qps" {
@@ -245,21 +248,14 @@ impl AlertTracker {
                     w.window_start = now;
                 }
                 w.count += 1;
+                // Fire once when THIS rule's own counter crosses its threshold.
+                if w.count == rule.threshold + 1 {
+                    to_fire.push(rule.clone());
+                }
             }
         }
-        let rule_counts: std::collections::HashMap<String, u64> =
-            bucket.per_rule.iter().map(|(k, v)| (k.clone(), v.count)).collect();
-        drop(bucket);
-
-        let rules_snapshot: Vec<_> = self.rules.read().unwrap().clone();
-        for rule in &rules_snapshot {
-            if rule.metric != "client-qps" {
-                continue;
-            }
-            // Fire once when THIS rule's own counter crosses its threshold.
-            if rule_counts.get(&rule.name) == Some(&(rule.threshold + 1)) {
-                self.trigger(ip, rule, rule.threshold + 1, now);
-            }
+        for rule in &to_fire {
+            self.trigger(ip, rule, rule.threshold + 1, now);
         }
 
         if self.is_blocked(ip) {

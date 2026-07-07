@@ -2497,7 +2497,7 @@ async fn get_feeds_handler(State(_s): State<AppState>) -> impl IntoResponse {
         .iter()
         .map(|f| {
             let blocked_count: serde_json::Value = if f.enabled {
-                serde_json::json!(feeds::load_feed_domains(&f.id).len())
+                serde_json::json!(feeds::load_feed_domain_count(&f.id))
             } else {
                 serde_json::Value::Null
             };

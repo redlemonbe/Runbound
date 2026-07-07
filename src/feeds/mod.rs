@@ -245,6 +245,27 @@ pub fn load_feed_domains(feed_id: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(&content).unwrap_or_default()
 }
 
+/// Count a feed's cached domains WITHOUT allocating a `String` per domain — the
+/// `GET /api/feeds` list only needs the count. `Vec<IgnoredAny>` parses (and validates)
+/// the JSON structure but each element is a zero-sized ignore, so a 1M-domain cache costs
+/// no per-domain heap. HMAC still verified.
+pub fn load_feed_domain_count(feed_id: &str) -> usize {
+    let path = cache_path(feed_id);
+    if !path.exists() {
+        return 0;
+    }
+    let content = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    if verify_mac(&path, content.as_bytes(), store_key().as_deref()).is_err() {
+        return 0;
+    }
+    serde_json::from_str::<Vec<serde::de::IgnoredAny>>(&content)
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
 fn save_feed_domains(feed_id: &str, domains: &[String]) -> Result<(), AppError> {
     fs::create_dir_all(feed_cache_dir())
         .map_err(|e| AppError::Internal(format!("Failed to create feed cache dir: {}", e)))?;

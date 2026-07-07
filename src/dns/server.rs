@@ -401,7 +401,9 @@ impl RunboundHandler {
         if let Some(ref sc) = self.stale_cache_wire {
             if !records.is_empty() {
                 if sc.len() >= self.cache_max_entries {
-                    if let Some(old) = sc.iter().next().map(|e| e.key().clone()) {
+                    // Evict the genuine oldest entry (the stored Instant), not an
+                    // arbitrary hash-order one — the comment promised "oldest".
+                    if let Some(old) = sc.iter().min_by_key(|e| e.value().1).map(|e| e.key().clone()) {
                         sc.remove(&old);
                     }
                 }
