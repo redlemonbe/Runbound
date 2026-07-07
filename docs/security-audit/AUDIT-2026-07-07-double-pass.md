@@ -104,14 +104,18 @@ direction). Fixed to slice at `dec.pos()` (exact bytes read).
 - **Forward mode does not DNSSEC-validate.** By design — forward mode trusts the configured
   upstream (`resolution: forward`). Users needing on-path integrity use `resolution: full-recursion`
   (in-house validation, fail-closed). SEC-2026-07-L hardens the SOA hygiene within that trust model.
+- **SEC-2026-07-N — WebUI 8 h absolute session vs the 5-minute idle auto-logout — Accepted.**
+  The idle auto-logout is real and works: `index.html` `resetIdleTimer()` (5 min, sliding — reset on
+  click/keydown/mousemove/touchstart) fires `POST /logout`, which the server honours by removing the
+  token from `state.sessions` (a genuine server-side invalidation, not a redirect). The residual — a
+  stolen cookie is valid up to the 8 h `SESSION_TTL` only if the victim's tab is closed (idle JS not
+  running) — is accepted: the `HttpOnly`/`SameSite` cookie plus the working idle logout cover the
+  realistic cases. Maintainer decision 2026-07-07.
 
-## Open (not remediated — pending maintainer decision)
+## Open (not remediated)
 
-- **SEC-2026-07-N — LOW — WebUI session is 8 h absolute; the advertised "5-minute idle auto-logout"
-  is client-side JS only.** `SESSION_TTL = 8h` (`src/webui/mod.rs`) is never refreshed and not
-  idle-bounded server-side; a stolen `rb_session` cookie is honoured for the full 8 h regardless of
-  the `index.html` idle timer. Closing it means a server-side sliding idle expiry, which changes
-  session semantics — left Open for a maintainer decision rather than silently changing behaviour.
+None in this cycle. SEC-2026-07-N was reviewed and Accepted (see below) by the
+maintainer on 2026-07-07.
 
 ## Disputed (candidate refuted at source)
 
