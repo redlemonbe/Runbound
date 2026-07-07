@@ -1690,12 +1690,18 @@ async fn build_and_launch(
     // tasks/second, which starves axum task slots and freezes the API entirely.
     // A separate runtime gives the HTTP server its own scheduler queue.
     // Box::leak is intentional: the runtime must stay alive for the whole process.
-    let api_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("runbound-api")
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("API runtime: {e}"))?;
+    // Leak the runtime at creation: it lives for the whole process anyway, and leaking
+    // it up-front (rather than after the setup below) guarantees no later `?`/unwind can
+    // drop a Runtime from within this async context — which panics with
+    // "Cannot drop a runtime in a context where blocking is not allowed".
+    let api_rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("runbound-api")
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow::anyhow!("API runtime: {e}"))?,
+    ));
     // #174: optional Unix-domain socket (mode 0600), in addition to localhost TCP.
     // axum 0.7 serve() is TCP-only, so the socket is served via a small hyper-util loop.
     if let Some(sock_path) = cfg.api_socket.clone() {
@@ -1746,7 +1752,6 @@ async fn build_and_launch(
             tokio::net::TcpListener::from_std(std_listener).expect("TcpListener::from_std failed");
         axum::serve(listener, app).await.ok()
     });
-    Box::leak(Box::new(api_rt));
 
     // ── Embedded web UI server (#4/#91) ───────────────────────────────────────
     if cfg.ui_enabled {
@@ -1758,12 +1763,17 @@ async fn build_and_launch(
             Ok(ui_std_listener) => {
                 ui_std_listener.set_nonblocking(true).ok();
                 let api_port = cfg.api_port.unwrap_or(8080);
-                let ui_rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .thread_name("runbound-ui")
-                    .enable_all()
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("Web UI runtime: {e}"))?;
+                // Leak at creation — same rationale as api_rt above: the WebUI TLS/cert
+                // setup below can `?` (e.g. base_dir not writable), and dropping this
+                // Runtime during that unwind would panic in the async context.
+                let ui_rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .thread_name("runbound-ui")
+                        .enable_all()
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("Web UI runtime: {e}"))?,
+                ));
                 if cfg.ui_tls && cfg.ui_tls_acme {
                     // ── ACME DNS-01 path ──────────────────────────────────────
                     if cfg.ui_acme_domain.is_empty() || cfg.ui_acme_email.is_empty() {
@@ -1876,7 +1886,6 @@ async fn build_and_launch(
                             });
                         }
                     });
-                    Box::leak(Box::new(ui_rt));
                     info!(addr=%ui_addr, domain=%cfg.ui_acme_domain, "Web UI listening (HTTPS/ACME)");
                 } else if cfg.ui_tls {
                     // ── Local CA path ─────────────────────────────────────────
@@ -2031,7 +2040,6 @@ async fn build_and_launch(
                             });
                         }
                     });
-                    Box::leak(Box::new(ui_rt));
                     info!(addr=%ui_addr, "Web UI listening (HTTPS)");
                 } else {
                     // Plain HTTP
@@ -2057,7 +2065,6 @@ async fn build_and_launch(
                             .expect("ui TcpListener::from_std failed");
                         axum::serve(listener, ui_app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.ok()
                     });
-                    Box::leak(Box::new(ui_rt));
                     info!(addr=%ui_addr, "Web UI listening (HTTP)");
                 }
             }
