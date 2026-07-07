@@ -2,7 +2,7 @@
 
 ## Status
 
-Runbound is **experimental** and has **not** undergone an external human security
+Runbound has **not** undergone an external human security
 audit. See [THREAT_MODEL.md](THREAT_MODEL.md) for the threat model and planned hardening.
 
 ## Supported versions

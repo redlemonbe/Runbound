@@ -2,8 +2,9 @@
 
 **Maintained by:** RedLemonBe — https://github.com/redlemonbe/Runbound
 
-> **Status caveat.** Runbound is **experimental — under active development, not yet
-> externally audited; not recommended for production handling sensitive traffic.**
+> **Status caveat.** Runbound has **not** undergone an external human security audit
+> (see #170). The findings below come from AI-internal, AI-adversarial and automated
+> cycles only — read them as such.
 
 This document is the single authoritative security-audit reference for Runbound 0.9.
 It consolidates every audit cycle run to date — the baseline whole-program audit plus
@@ -17,7 +18,7 @@ Disputed depending on the evidence and the maintainer's remediation decision.
 
 ## Overview
 
-Runbound 0.9 is an experimental authoritative + forwarding/recursing DNS server written
+Runbound 0.9 is an authoritative + forwarding/recursing DNS server written
 in Rust. It combines an eBPF/XDP + AF_XDP fast path (zero-syscall packet handling), a
 kernel-UDP slow path, and an in-house wire-native serving layer. The audited surface
 includes:

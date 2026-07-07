@@ -204,4 +204,4 @@ feature set.
 - Hot backup / restore via the API.
 - White-label UI branding — name, logo, accent colour, favicon via `branding.conf`.
 
-> ⚠️ **Experimental** — under active development, not yet externally audited; not recommended for production deployments handling sensitive traffic.
+> Not yet audited by an external third party — see #170.

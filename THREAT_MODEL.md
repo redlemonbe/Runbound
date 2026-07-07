@@ -1,6 +1,6 @@
 # Runbound — Threat Model
 
-> Status: **experimental**, AI-first development, no external human audit yet.
+> Status: AI-first development, no external human audit yet.
 > This document states what Runbound does and does not defend against **today**.
 > See [SECURITY.md](SECURITY.md) for crypto and reporting.
 
