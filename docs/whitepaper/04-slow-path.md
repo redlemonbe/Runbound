@@ -104,6 +104,28 @@ default is `resolution: forward`. Both code paths ship in every build; there is 
 **infrastructure cache** — zone cuts + validated DNSKEY chains (§5.7, #230) — so repeated
 misses do not re-walk from the root.
 
+### 4.2.1 Hedged, RTT-ordered nameserver selection
+
+Each iterative step must pick which of a delegation's nameservers to query. The recursor
+does **not** try them sequentially with a long per-server timeout; it queries the set with
+RTT-based ordering and hedging (`query_ns_set`, `src/dns/recursor_wire.rs:552`):
+
+- **RTT ordering.** The nameserver IPs are sorted fastest-known-first
+  (`ips.sort_by_key(|ip| infra_cache::rtt_of(ip)…)`, `recursor_wire.rs:562`); a
+  never-measured server sorts last (`u32::MAX`). Per-server RTT is a smoothed EWMA
+  (3/4 old + 1/4 new sample) kept in the infrastructure cache
+  (`infra_cache::record_rtt`/`rtt_of`, `src/dns/infra_cache.rs:41`/`:52`), updated on
+  every successful exchange (`recursor_wire.rs:583`).
+- **Hedging.** The fastest server is launched first; if it has not answered within
+  `HEDGE_DELAY = 300 ms` (`recursor_wire.rs:102`) the next server is fired **in parallel**
+  and the first valid reply wins (`tokio::select!` over a `FuturesUnordered`,
+  `recursor_wire.rs:576-591`). This turns a mute or slow first server from a full
+  `QUERY_TIMEOUT` stall into roughly best-RTT + one hedge delay.
+- **Tighter timeout.** The per-exchange hard cap is `QUERY_TIMEOUT = 1500 ms`
+  (`recursor_wire.rs:98`) — down from 3 s — bounded further by the caller's overall query
+  budget. Each launched exchange decrements that budget, so a delegation with many
+  nameservers cannot fan out without limit.
+
 ## 4.3 Upstream health monitoring
 
 `src/upstreams.rs` probes upstreams every 30 s (2 s timeout):

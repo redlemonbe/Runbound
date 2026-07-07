@@ -600,6 +600,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/conf
   "access_control": ["192.168.1.0/24 allow"],
   "private_addresses": ["10.0.0.0/8"],
   "rate_limit": 200,
+  "rate_limit_burst": 400,
   "cache_max_ttl": 86400,
   "dnssec_validation": false,
   "resolution_mode": "forward",
@@ -623,31 +624,50 @@ in `runbound.conf`. Entries added via REST API (`POST /dns`, `POST /blacklist`, 
 appear in `api_dns_entries`, `api_blacklist`, and `api_feeds`. Use `GET /dns` and `GET /blacklist`
 for the full live lists.
 
+**Note on `rate_limit` / `rate_limit_burst`:** these are the *live* DNS rate-limiter
+values (steady-state rps and burst ceiling), read from the running limiter — not the
+static config-file value. They are live-editable via `PATCH /api/config` (see below).
+`rate_limit: 0` means the DNS rate limiter is disabled.
+
 ---
 
 
 ### `PATCH /api/config`
 
-Toggle runtime settings without restarting. Currently supports DNSSEC validation
-(when full-recursion is active the sovereign recursor is rebuilt so the new policy takes effect).
-The change is applied immediately and propagated to all registered slaves.
+Toggle runtime settings without restarting. Supports DNSSEC validation and the DNS
+rate limiter. Each field is optional; omitted fields keep their current value. When
+DNSSEC validation is toggled and full-recursion is active, the sovereign recursor is
+rebuilt so the new policy takes effect. Changes are applied immediately and propagated
+to all registered slaves.
 
 ```bash
+# Toggle DNSSEC validation
 curl -X PATCH http://localhost:8080/api/config \
   -H "Authorization: Bearer $RUNBOUND_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"dnssec_validation": true}'
+
+# Live-edit the DNS rate limiter (steady-state rps + burst ceiling)
+curl -X PATCH http://localhost:8080/api/config \
+  -H "Authorization: Bearer $RUNBOUND_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"rate_limit": 500, "rate_limit_burst": 1000}'
 ```
 
+The response always reports the current value of every runtime-editable field, whether
+or not it was in the request body:
+
 ```json
-{"ok": true, "dnssec_validation": true}
+{"ok": true, "dnssec_validation": true, "rate_limit": 500, "rate_limit_burst": 1000}
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `dnssec_validation` | bool | Enable or disable DNSSEC validation at runtime |
+| `rate_limit` | u64 | DNS rate limiter steady-state rps applied live to the limiter shared with the XDP fast path. `0` disables it. Clamped to a max of 1,000,000. |
+| `rate_limit_burst` | u64 | DNS rate limiter burst ceiling, applied live. Clamped to a max of 2,000,000. |
 
-**Note:** The change **is** persisted — the handler rewrites `runbound.conf` (via the atomic config writer) so it survives a restart. The one exception is **slave mode**, where config is driven by the master and the persist step returns early (no local rewrite). The change is also propagated to all registered slaves over the relay.
+**Note:** The change **is** persisted — the handler rewrites `runbound.conf` (via the atomic config writer) so it survives a restart. The one exception is **slave mode**, where config is driven by the master and the persist step returns early (no local rewrite). DNSSEC toggles are also propagated to all registered slaves over the relay. (Live rate-limit edits are persisted locally but are not currently pushed to slaves over the relay.)
 
 ---
 
@@ -1656,6 +1676,16 @@ curl -X PUT http://localhost:8080/api/alerts/blocked/203.0.113.42 \
 
 The IP is blocked immediately at the DNS layer (REFUSED response) and, if XDP is active, at the XDP layer (packet drop).
 
+**Protected addresses.** A loopback (`127.0.0.0/8`, `::1`) or unspecified (`0.0.0.0`, `::`)
+address is never banned. The request still returns `200 OK`, but with `blocked: false`
+and a `reason`:
+
+```json
+{"blocked": false, "ip": "127.0.0.1", "reason": "protected address (loopback/unspecified) is never banned"}
+```
+
+A syntactically invalid IP in the path returns `400 Bad Request` with `{"error": "invalid IP"}`.
+
 ---
 
 ### `DELETE /api/alerts/blocked/:ip`
@@ -1712,6 +1742,14 @@ curl -X POST http://localhost:8080/api/protection/banned/203.0.113.42/blacklist 
 
 ```json
 {"blacklisted": true, "ip": "203.0.113.42"}
+```
+
+Like `PUT /api/alerts/blocked/:ip`, a loopback/unspecified address is never banned and
+returns `200 OK` with `blacklisted: false` and a `reason`; an invalid IP returns
+`400 Bad Request` with `{"error": "invalid IP"}`.
+
+```json
+{"blacklisted": false, "ip": "127.0.0.1", "reason": "protected address (loopback/unspecified) is never banned"}
 ```
 
 > **Enforcement.** Banned IPs and the per-source `rate-limit` are enforced on

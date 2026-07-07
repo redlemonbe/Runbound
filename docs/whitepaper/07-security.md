@@ -21,8 +21,16 @@
   rate limiting (default 200 qps) and the ban set are enforced through a *shared* gate
   (`rl_should_drop()` + `icmp_stats.is_banned()`) called from **both** the AF_XDP fast path
   and the kernel slow loop, driven by the same objects — like the blacklist, one place
-  governs both routes. Both are enforced in `xdp: no` as well as in XDP. A separate
-  per-source ICMP rate limit + flood detector bans source IPs at
+  governs both routes. Both are enforced in `xdp: no` as well as in XDP. The limits are
+  **live-editable**: `rps`/`burst` are read as `AtomicU64` on the hot path
+  (`RateLimiter::check`/`set_limits`, `src/dns/ratelimit.rs:65`/`:95`), so a `PATCH
+  /api/config` edit applies to both datapaths with no restart; a live `burst: 0` is clamped
+  to ≥1 when `rps>0` so an edit cannot self-DoS the node. **Loopback is never
+  rate-limited or banned** on either mechanism (`ip.is_loopback()` shortcut in
+  `RateLimiter::check`, `src/dns/ratelimit.rs:112`; the ban insert refuses
+  loopback/unspecified, `src/icmp.rs:115`) — local health checks and `dig @127.0.0.1`
+  cannot be dropped, and a spoofed loopback cannot persist a self-ban across reboots. A
+  separate per-source ICMP rate limit + flood detector bans source IPs at
   the XDP layer via `ebpf/dns_xdp.c`. Permanent ("blacklisted") bans are persisted to a
   `0600` file and reloaded at startup (capped on both write and read).
 - **DNSSEC `AD`.** On the default (forward) path, `wire_answer` never sets `AD`
@@ -139,7 +147,11 @@ floods are handled by the rate limiter + `BADCOOKIE`.
   map and the XDP program `XDP_DROP`s its DNS before userspace — gated by a `bans_active`
   flag so an idle server pays only a single array lookup per packet (bench-verified: no
   fast-path regression). **Both IPv4 and IPv6 are dropped at the XDP layer** (`icmp_banned`
-  and `icmp_banned_v6` respectively — #228 closed the earlier IPv4-only gap). On connection
+  and `icmp_banned_v6` respectively — #228 closed the earlier IPv4-only gap). The same
+  rule-triggered block is **mirrored into the shared `icmp_stats` ban set**
+  (`BanSource::Bot`, `src/alerts.rs:316`) — the object the shared gate consults
+  (`icmp_stats.is_banned()`) — so the kernel-UDP loop (`xdp: no`) enforces it on cache hits
+  too, matching the manual/relay ban paths. On connection
   transports the ban is enforced at the relay (the handler sees only the loopback relay
   address); in `xdp: no` mode the drop is enforced by the kernel-UDP loop instead.
 - Rules **and the per-source rate limit** (`rate-limit` / `rate-limit-burst`) are editable

@@ -15,6 +15,26 @@ preferred over config; optionally stored in a PKCS#11 HSM). Optionally also list
 **Unix-domain socket** (`api-socket`, mode 0600, #174), served via a hyper-util accept loop
 because axum 0.7 `serve()` is TCP-only (chapter 02 of the API; see also the socket commit).
 
+### 6.1.1 Stats counters — the whole query mix, not just local zones (#veracity)
+
+The `/api/system` counters and the latency histogram behind them cover **every** answer path,
+not only local-zone answers:
+
+- **Forward/recursion feeds the latency histogram.** A completed forwarded/recursed lookup
+  now records its round-trip into the same fixed-bucket histogram as local answers
+  (`record_forward` → `record_latency_us`, `src/stats.rs:342`), driving p50/p95/p99. Before
+  this, only local-zone answers recorded latency, so a pure forwarding/recursing server
+  reported p50/p95/p99 = 0.
+- **NODATA / NXDOMAIN count their round-trip.** Negative answers record a `record_forward`
+  (miss + latency) like the positive `Answer` arm (`src/dns/server.rs:1006`); NODATA
+  (NOERROR + empty answer) is counted as `forwarded` rather than mis-attributed to
+  `servfail` (`src/dns/server.rs:997`), so the sub-counters reconcile with `total_queries`.
+- **Cache flush resets the XDP hit counters.** A resolver cache flush zeroes not only
+  `cache_hits`/`cache_misses`/`cache_entries` but also the per-worker XDP packet counters
+  (`XDP_WORKER_PKTS`), which carry all cache hits under `xdp: no`
+  (`Stats::reset_cache`, `src/stats.rs:362`). Without this, a flush left the hit-rate stuck
+  at 100 % (hits > 0, misses 0) with no traffic afterwards.
+
 ## 6.2 Config-writer — full regeneration, atomic
 
 `src/config/writer.rs` regenerates the entire `runbound.conf` from the in-memory model:

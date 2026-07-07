@@ -58,13 +58,25 @@ normalised to `192.168.1.1` before matching — your IPv4 ACL rules apply correc
 ### Rate limiting
 
 ```
-rate-limit: 1000
+rate-limit:       1000    # steady-state queries/s per source bucket
+rate-limit-burst: 2000    # burst ceiling (default: rate-limit * 2)
 ```
 
 Maximum queries per second accepted from a single source IP. Excess queries receive
 a REFUSED response. Uses a token-bucket algorithm.
 
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `rate-limit` | integer | `0` (off) | Steady-state queries/s per source bucket. `0` disables the DNS rate limiter. Capped at 1,000,000. |
+| `rate-limit-burst` | integer | `rate-limit × 2` | Burst ceiling above the steady rate. Capped at 2,000,000. |
+
 Setting `rate-limit: 0` disables rate limiting.
+
+**Live-editable via API/WebUI.** Both `rate-limit` and `rate-limit-burst` can be changed
+at runtime without a restart via `PATCH /api/config` (`{"rate_limit": N, "rate_limit_burst": M}`)
+or the WebUI. The same limiter instance is shared with the XDP fast path, so a live edit
+takes effect on both datapaths. The current live values are reported by `GET /api/config`
+(`rate_limit`, `rate_limit_burst`). See [api.md](api.md).
 
 ### Local zones
 
@@ -190,6 +202,40 @@ NOERROR queries (forwarded, cached, local) skip `sanitize_dns_name()`, mutex, an
 Add `RUST_LOG=runbound=debug` to `/etc/runbound/environment` for temporary debug sessions without editing the config file.
 
 Set `logfile: ""` or omit it to log to stdout (recommended with systemd).
+
+```
+log-format: json    # default: text
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `log-format` | `text` \| `json` | `text` | Emit structured JSON log records instead of the human-readable text format. Any value other than `json` (case-insensitive) is treated as text. |
+
+### CHAOS identity / version (`version.bind.`, `hostname.bind.`)
+
+Runbound answers `CHAOS`-class `version.bind.` / `version.server.` and `id.server.` /
+`hostname.bind.` queries wire-native, and is **secure-by-default**: both are refused
+(REFUSED) unless explicitly opened. This avoids leaking the software version or a host
+identity to fingerprinting scans.
+
+```
+server:
+    hide-version:  no              # default: yes (refuse version.bind.)
+    version:       "dns"           # optional custom string when hide-version: no
+    hide-identity: no              # default: yes (refuse id.server.)
+    identity:      "ns1.example."  # optional custom string when hide-identity: no
+```
+
+| Directive | Type | Default | Description |
+|---|---|---|---|
+| `hide-version` | bool (`yes`/`no`) | `yes` (refuse) | When `no`, answer `version.bind.`/`version.server.` with `version` if set, else the build version (`CARGO_PKG_VERSION`). |
+| `version` | string | build version | Custom string reported for `version.bind.`/`version.server.` when `hide-version: no`. Defaults to the build version if unset. |
+| `hide-identity` | bool (`yes`/`no`) | `yes` (refuse) | When `no`, answer `id.server.`/`hostname.bind.` with `identity` if set, else the system hostname. |
+| `identity` | string | system hostname | Custom string reported for `id.server.`/`hostname.bind.` when `hide-identity: no`. Defaults to the system hostname if unset. |
+
+The answer is a single wire-native `CHAOS`-class `TXT` record (split into 255-octet
+character-strings if the string is longer). `authors.bind.` is not implemented and falls
+through to REFUSED.
 
 ### API key and port
 
@@ -900,6 +946,17 @@ When full-recursion is active:
   are stripped for non-DO clients (RFC 4035 §3.2.1).
 - **Anti-SSRF:** the recursor refuses to query loopback / RFC 1918 / CGNAT / link-local
   (incl. `169.254` cloud-metadata) / ULA addresses — on glue, CNAME chains and NS addresses.
+- **Compact denial of existence (RFC 9824, #232):** a validated `NOERROR` + NSEC denial
+  that matches the queried name and carries the NXNAME pseudo-type (Cloudflare "black
+  lies") is presented to the client as the `NXDOMAIN` it really is. Fail-closed — the
+  rewrite happens only when the denial validated **Secure** and the answer set is empty.
+- **RTT-based nameserver selection with hedging (#slow-path):** for each delegation the
+  recursor sorts the authoritative servers fastest-known-first using a per-server smoothed
+  RTT (EWMA, ¾ old + ¼ new sample, ≤ 8192 servers tracked), then queries the fastest. If it
+  does not answer within the 300 ms hedge delay, the next server is fired in parallel and
+  the first valid reply wins — bounding a mute/slow server's cost to roughly the best RTT
+  plus one hedge delay instead of the full 1500 ms query timeout. This is automatic; there
+  is no directive to tune it.
 
 #### QNAME minimisation (RFC 9156, #231)
 
