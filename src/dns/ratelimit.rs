@@ -90,6 +90,11 @@ impl RateLimiter {
         if self.rps == 0 {
             return true;
         }
+        // Never rate-limit loopback (local health checks / dig @127.0.0.1) — mirrors the
+        // ban systems' loopback exemption. Remote clients always arrive via the real IP.
+        if ip.is_loopback() {
+            return true;
+        }
 
         let ip = normalize_ip(ip, self.prefix_v4, self.prefix_v6);
         let now = Instant::now();

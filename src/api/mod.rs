@@ -8031,6 +8031,9 @@ async fn blacklist_ip_handler(
     axum::extract::Path(ip_str): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     match ip_str.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() || ip.is_unspecified() => {
+            (StatusCode::OK, JsonExtract(serde_json::json!({"blacklisted": false, "ip": ip_str, "reason": "protected address (loopback/unspecified) is never banned"}))).into_response()
+        }
         Ok(ip) => {
             state.icmp_stats.ban_permanent(ip);
             state.alert_tracker.block_manual(ip, "manual-blacklist".to_string());
@@ -8059,6 +8062,9 @@ async fn put_blocked_ip(
     axum::extract::Path(ip_str): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     match ip_str.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() || ip.is_unspecified() => {
+            (StatusCode::OK, JsonExtract(serde_json::json!({"blocked": false, "ip": ip_str, "reason": "protected address (loopback/unspecified) is never banned"}))).into_response()
+        }
         Ok(ip) => {
             state.alert_tracker.block_manual(ip, "manual".to_string());
             // #protection-bans: a manual ban is permanent ("no expiry", per the API help

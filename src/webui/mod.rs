@@ -59,6 +59,7 @@ pub struct WebUiState {
     // ── Bot defense ──────────────────────────────────────────────────────────
     pub alert_tracker: Arc<AlertTracker>,
     pub ban_cmd_tx: tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>,
+    pub icmp_stats: Arc<crate::icmp::IcmpStats>,
     pub sync_journal: Option<Arc<SyncJournal>>,
     pub bot_ban_duration_secs: u64,
     pub bot_honeypot_enabled: bool,
@@ -87,7 +88,7 @@ pub fn router(
     base_dir: PathBuf,
     ca_cert_pem: String,
     alert_tracker: Arc<AlertTracker>,
-    ban_cmd_tx: tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>,
+    icmp_stats: Arc<crate::icmp::IcmpStats>,
     sync_journal: Option<Arc<SyncJournal>>,
     bot_ban_duration_secs: u64,
     bot_honeypot_enabled: bool,
@@ -102,6 +103,7 @@ pub fn router(
 ) -> Router {
     let auth_path = base_dir.join(CRED_FILE);
     let creds = load_or_default_creds(&auth_path);
+    let ban_cmd_tx = icmp_stats.ban_cmd_tx.clone();
     let state = Arc::new(WebUiState {
         api_port,
         api_key,
@@ -117,6 +119,7 @@ pub fn router(
         ca_cert_pem: Arc::new(ca_cert_pem),
         alert_tracker,
         ban_cmd_tx,
+        icmp_stats,
         sync_journal,
         bot_ban_duration_secs,
         bot_honeypot_enabled,
@@ -786,8 +789,12 @@ async fn ban_bot(state: &WebUiState, ip: std::net::IpAddr, rule: &str) {
         return; // already banned
     }
     state.alert_tracker.block_bot(ip, rule, state.bot_ban_duration_secs);
-    if let std::net::IpAddr::V4(ipv4) = ip {
-        let _ = state.ban_cmd_tx.send(IcmpBanCmd::Ban(ipv4));
+    // Also record locally in icmp_stats so the kernel-UDP fast path (xdp:no) enforces the
+    // bot ban on THIS node — previously only alert_tracker (slow path) + the XDP map were set.
+    state.icmp_stats.ban(ip, crate::icmp::BanSource::Bot);
+    match ip {
+        std::net::IpAddr::V4(ipv4) => { let _ = state.ban_cmd_tx.send(IcmpBanCmd::Ban(ipv4)); }
+        std::net::IpAddr::V6(ipv6) => { let _ = state.ban_cmd_tx.send(IcmpBanCmd::BanV6(ipv6)); }
     }
     if let Some(journal) = &state.sync_journal {
         journal.push(SyncOp::AddGlobalBan {
@@ -1047,7 +1054,7 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
             String::new(),
             tracker,
-            icmp.ban_cmd_tx.clone(),
+            Arc::clone(&icmp),
             None,
             86400,
             false,

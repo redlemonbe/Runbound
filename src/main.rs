@@ -511,7 +511,10 @@ async fn async_main(
                 let h = match xdp_handles_all.first_mut() {
                     Some(h) => h,
                     None => {
-                        // No XDP handles at all — sleep and retry (no-op).
+                        // No XDP handles (xdp:no): the BPF ban map doesn't exist, but drain
+                        // the channel so queued ban/unban commands don't accumulate unbounded
+                        // (icmp_stats.banned is the source of truth on the kernel-UDP path).
+                        while ban_cmd_rx.try_recv().is_ok() {}
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
@@ -1820,7 +1823,7 @@ async fn build_and_launch(
                     let ui_app = webui::router(
                         api_port, api_key.clone(), base_dir.clone(), String::new(),
                         Arc::clone(&alert_tracker),
-                        icmp_stats.ban_cmd_tx.clone(),
+                        Arc::clone(&icmp_stats),
                         sync_journal.as_ref().map(Arc::clone),
                         cfg.bot_ban_duration_secs,
                         cfg.bot_honeypot_enabled,
@@ -1894,7 +1897,7 @@ async fn build_and_launch(
                     let ui_app = webui::router(
                         api_port, api_key.clone(), base_dir.clone(), ca_cert_pem.clone(),
                         Arc::clone(&alert_tracker),
-                        icmp_stats.ban_cmd_tx.clone(),
+                        Arc::clone(&icmp_stats),
                         sync_journal.as_ref().map(Arc::clone),
                         cfg.bot_ban_duration_secs,
                         cfg.bot_honeypot_enabled,
@@ -2046,7 +2049,7 @@ async fn build_and_launch(
                     let ui_app = webui::router(
                         api_port, api_key.clone(), base_dir.clone(), String::new(),
                         Arc::clone(&alert_tracker),
-                        icmp_stats.ban_cmd_tx.clone(),
+                        Arc::clone(&icmp_stats),
                         sync_journal.as_ref().map(Arc::clone),
                         cfg.bot_ban_duration_secs,
                         cfg.bot_honeypot_enabled,

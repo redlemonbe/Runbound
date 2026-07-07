@@ -45,6 +45,8 @@ pub enum BanSource {
     IcmpFlood,
     Manual,
     Relay,
+    /// Bot-defense ban (honeypot / scanner / bad-request burst).
+    Bot,
 }
 
 #[derive(Clone, Debug)]
