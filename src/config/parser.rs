@@ -133,6 +133,8 @@ pub struct UnboundConfig {
     /// DNS rate limit in queries/second per source IP.
     /// Overrides the compiled default (200). Set to 5000+ for shared resolvers.
     pub rate_limit: Option<u64>,
+    /// #knob: rate-limit-burst — max burst above the steady rps (default: rps*2).
+    pub rate_limit_burst: Option<u64>,
     /// IPv4 prefix length for rate-limit subnet bucketing. Default: 24 (/24).
     pub rate_limit_prefix_v4: u8,
     /// IPv6 prefix length for rate-limit subnet bucketing. Default: 48 (/48).
@@ -1130,6 +1132,7 @@ fn parse_server_directive(
         }
         // Runbound-specific extensions (not in stock Unbound)
         "rate-limit" => cfg.rate_limit = val.parse::<u64>().ok().map(|v| v.min(1_000_000)), // cap at 1M rps — u64::MAX silently disables
+        "rate-limit-burst" => cfg.rate_limit_burst = val.parse::<u64>().ok().map(|v| v.min(2_000_000)),
         "rate-limit-prefix-v4" => {
             cfg.rate_limit_prefix_v4 = val.parse::<u8>().unwrap_or(24).min(32)
         }

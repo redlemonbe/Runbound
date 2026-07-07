@@ -69,13 +69,13 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    pub fn new(rps: u64, prefix_v4: u8, prefix_v6: u8) -> Arc<Self> {
+    pub fn new(rps: u64, burst: Option<u64>, prefix_v4: u8, prefix_v6: u8) -> Arc<Self> {
         Arc::new(Self {
             buckets: DashMap::with_hasher(ahash::RandomState::default()),
             start: Instant::now(),
             next_gc_ns: AtomicU64::new(10_000_000_000), // first GC at 10 s
             rps,
-            burst: rps.saturating_mul(2),
+            burst: burst.unwrap_or_else(|| rps.saturating_mul(2)),
             prefix_v4,
             prefix_v6,
         })

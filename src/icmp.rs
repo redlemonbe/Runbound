@@ -8,6 +8,17 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
+/// Loopback / unspecified addresses must never be banned: a manual or relayed blacklist
+/// of 127.0.0.1 / :: would drop the node's own loopback DNS (and persist across reboots).
+/// Mirrors AlertTracker::is_ban_exempt so both ban systems agree.
+fn is_ban_exempt(ip: IpAddr) -> bool {
+    ip.is_loopback() || ip.is_unspecified()
+}
+
+/// Hard cap on the in-memory ban map (parity with AlertTracker's 50k and the BPF LRU's
+/// 65536) so a multi-IP flood/spoof cannot grow it without bound.
+const MAX_BANNED: usize = 100_000;
+
 /// In-memory config mirroring the BPF `icmp_cfg_entry` map entry.
 #[derive(Clone, Debug)]
 pub struct IcmpConfig {
@@ -99,17 +110,40 @@ impl IcmpStats {
         })
     }
 
-    pub fn ban(&self, ip: IpAddr, src: BanSource) {
-        self.banned.insert(ip, BanEntry { ts: Instant::now(), src, permanent: false });
+    /// Central ban insert — enforces the loopback exemption and the size cap for every
+    /// ban path (manual, flood, relay, bot). Persists only permanent bans.
+    fn ban_with(&self, ip: IpAddr, src: BanSource, permanent: bool) {
+        if is_ban_exempt(ip) {
+            tracing::warn!(%ip, "ban skipped: protected IP (loopback/unspecified)");
+            return;
+        }
+        // Cap only NEW entries; re-banning an already-present IP (update) is always allowed.
+        if !self.banned.contains_key(&ip) && self.banned.len() >= MAX_BANNED {
+            tracing::warn!(%ip, cap = MAX_BANNED, "ban dropped: ban map is full");
+            return;
+        }
+        self.banned.insert(ip, BanEntry { ts: Instant::now(), src, permanent });
         self.banned_present.store(true, std::sync::atomic::Ordering::Relaxed);
+        if permanent {
+            self.persist_blacklist();
+        }
+    }
+
+    pub fn ban(&self, ip: IpAddr, src: BanSource) {
+        self.ban_with(ip, src, false);
     }
 
     /// Permanent ban ("blacklist") — survives expiry cleanup. Used by the API
     /// blacklist action; still propagated to slaves like any other ban.
     pub fn ban_permanent(&self, ip: IpAddr) {
-        self.banned.insert(ip, BanEntry { ts: Instant::now(), src: BanSource::Manual, permanent: true });
-        self.banned_present.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.persist_blacklist();
+        self.ban_with(ip, BanSource::Manual, true);
+    }
+
+    /// Permanent ban keeping the originating source — used by the relay path so a
+    /// propagated ban shows its real source yet does NOT silently lapse on the fast path
+    /// (previously the relay used ban() => permanent:false, diverging from alert_tracker).
+    pub fn ban_permanent_src(&self, ip: IpAddr, src: BanSource) {
+        self.ban_with(ip, src, true);
     }
 
     /// Per-packet data-path check (XDP enforces via the BPF `icmp_banned` map;
@@ -189,6 +223,7 @@ impl IcmpStats {
         // tampered/oversized file), mirroring persist_blacklist.
         for ip_s in ips.into_iter().take(100_000) {
             if let Ok(ip) = ip_s.parse::<IpAddr>() {
+                if is_ban_exempt(ip) { continue; }
                 self.banned.insert(ip, BanEntry { ts: Instant::now(), src: BanSource::Manual, permanent: true });
                 match ip {
                     IpAddr::V4(v4) => {

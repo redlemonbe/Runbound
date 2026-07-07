@@ -2103,6 +2103,7 @@ async fn build_and_launch(
     // ── Shared rate limiter and ACL (XDP fast-path + normal DNS path) ─────
     let rate_limiter = RateLimiter::new(
         cfg.rate_limit.unwrap_or(200),
+        cfg.rate_limit_burst,
         cfg.rate_limit_prefix_v4,
         cfg.rate_limit_prefix_v6,
     );

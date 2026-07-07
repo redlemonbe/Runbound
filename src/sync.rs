@@ -1594,16 +1594,23 @@ impl SlaveClient {
                 if let Ok(parsed_ip) = ip.parse::<std::net::IpAddr>() {
                     let dur = expires_secs.unwrap_or(86400);
                     self.alert_tracker.block_bot(parsed_ip, &rule, dur);
-                    if let std::net::IpAddr::V4(ipv4) = parsed_ip {
-                        let _ = self.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+                    // Also record in icmp_stats so the kernel-UDP fast path (xdp:no) enforces
+                    // the bot ban — previously only the BPF map (xdp:yes) and alert_tracker
+                    // (slow path) were set, leaving UDP:53 open on xdp:no nodes.
+                    self.icmp_stats.ban(parsed_ip, crate::icmp::BanSource::Relay);
+                    match parsed_ip {
+                        std::net::IpAddr::V4(ipv4) => { let _ = self.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4)); }
+                        std::net::IpAddr::V6(ipv6) => { let _ = self.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::BanV6(ipv6)); }
                     }
                 }
             }
             SyncOp::DeleteGlobalBan { ip } => {
                 if let Ok(parsed_ip) = ip.parse::<std::net::IpAddr>() {
                     self.alert_tracker.unblock(parsed_ip);
-                    if let std::net::IpAddr::V4(ipv4) = parsed_ip {
-                        let _ = self.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+                    self.icmp_stats.unban(parsed_ip);
+                    match parsed_ip {
+                        std::net::IpAddr::V4(ipv4) => { let _ = self.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4)); }
+                        std::net::IpAddr::V6(ipv6) => { let _ = self.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::UnbanV6(ipv6)); }
                     }
                 }
             }
@@ -2015,9 +2022,12 @@ async fn handle_relay_request(
                 Err(_) => Ok(json_resp(400, serde_json::json!({ "error": "invalid IP" }))),
                 Ok(ip) => {
                     relay.alert_tracker.block_manual(ip, "icmp-flood-relay".to_string());
-                    relay.icmp_stats.ban(ip, crate::icmp::BanSource::Relay);
-                    if let std::net::IpAddr::V4(ipv4) = ip {
-                        let _ = relay.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4));
+                    // permanent + real source: matches alert_tracker (expires:None) and no
+                    // longer lapses on the fast path after 24h (was ban(Relay), permanent:false).
+                    relay.icmp_stats.ban_permanent_src(ip, crate::icmp::BanSource::Relay);
+                    match ip {
+                        std::net::IpAddr::V4(ipv4) => { let _ = relay.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Ban(ipv4)); }
+                        std::net::IpAddr::V6(ipv6) => { let _ = relay.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::BanV6(ipv6)); }
                     }
                     Ok(json_ok(serde_json::json!({ "ok": true, "ip": ip_str })))
                 }
@@ -2030,8 +2040,9 @@ async fn handle_relay_request(
                 Ok(ip) => {
                     relay.alert_tracker.unblock(ip);
                     relay.icmp_stats.unban(ip);
-                    if let std::net::IpAddr::V4(ipv4) = ip {
-                        let _ = relay.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4));
+                    match ip {
+                        std::net::IpAddr::V4(ipv4) => { let _ = relay.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::Unban(ipv4)); }
+                        std::net::IpAddr::V6(ipv6) => { let _ = relay.icmp_stats.ban_cmd_tx.send(crate::icmp::IcmpBanCmd::UnbanV6(ipv6)); }
                     }
                     Ok(json_ok(serde_json::json!({ "ok": true, "ip": ip_str })))
                 }

@@ -520,6 +520,12 @@ async fn handle_login(
     // concurrent-request bypass. On success, entry is removed (reset). On failure, count stays.
     {
         let now = Instant::now();
+        // Bound the per-IP login table: if it is full and this is a new source, drop
+        // entries older than the 60s window first (cleanup task only runs every 300s).
+        const LOGIN_RL_MAX: usize = 100_000;
+        if state.login_rl.len() >= LOGIN_RL_MAX && !state.login_rl.contains_key(&client_ip_addr) {
+            state.login_rl.retain(|_, (_, since)| since.elapsed().as_secs() < 60);
+        }
         let mut entry = state.login_rl.entry(client_ip_addr).or_insert((0u32, now));
         let (count, since) = &mut *entry;
         if since.elapsed().as_secs() >= 60 { *count = 0; *since = now; }

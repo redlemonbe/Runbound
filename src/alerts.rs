@@ -28,9 +28,16 @@ pub struct AlertEvent {
     pub action: String,
 }
 
-struct ClientBucket {
+/// Per-rule sliding window: each alert rule counts in its OWN window so a short-window
+/// rule can no longer reset the counter a long-window rule is accumulating (#alerts).
+struct RuleWindow {
     count: u64,
     window_start: Instant,
+}
+
+#[derive(Default)]
+struct ClientBucket {
+    per_rule: std::collections::HashMap<String, RuleWindow>,
 }
 
 struct BlockEntry {
@@ -215,31 +222,33 @@ impl AlertTracker {
         if self.client_counts.len() >= MAX_CLIENT_BUCKETS {
             let max_window = self.rules.read().unwrap().iter().map(|r| r.window_s).max().unwrap_or(60);
             self.client_counts.retain(|_, b| {
-                now.duration_since(b.window_start).as_secs() < max_window * 2
+                b.per_rule.values().any(|w| now.duration_since(w.window_start).as_secs() < max_window * 2)
             });
         }
 
-        let mut bucket = self.client_counts.entry(ip).or_insert_with(|| ClientBucket {
-            count: 0,
-            window_start: now,
-        });
-
-        // Check per-rule, smallest window first.
+        // Per-rule counting: each rule accumulates in its OWN window (previously one shared
+        // count/window let the smallest-window rule reset what the larger-window rules
+        // needed, silently disabling them — #alerts).
+        let mut bucket = self.client_counts.entry(ip).or_default();
         {
             let rules = self.rules.read().unwrap();
             for rule in rules.iter() {
                 if rule.metric != "client-qps" {
                     continue;
                 }
-                let elapsed = now.duration_since(bucket.window_start).as_secs();
-                if elapsed >= rule.window_s {
-                    bucket.count = 0;
-                    bucket.window_start = now;
+                let w = bucket.per_rule.entry(rule.name.clone()).or_insert(RuleWindow {
+                    count: 0,
+                    window_start: now,
+                });
+                if now.duration_since(w.window_start).as_secs() >= rule.window_s {
+                    w.count = 0;
+                    w.window_start = now;
                 }
+                w.count += 1;
             }
         }
-        bucket.count += 1;
-        let count = bucket.count;
+        let rule_counts: std::collections::HashMap<String, u64> =
+            bucket.per_rule.iter().map(|(k, v)| (k.clone(), v.count)).collect();
         drop(bucket);
 
         let rules_snapshot: Vec<_> = self.rules.read().unwrap().clone();
@@ -247,9 +256,9 @@ impl AlertTracker {
             if rule.metric != "client-qps" {
                 continue;
             }
-            if count == rule.threshold + 1 {
-                // Crossed threshold — fire once per window
-                self.trigger(ip, rule, count, now);
+            // Fire once when THIS rule's own counter crosses its threshold.
+            if rule_counts.get(&rule.name) == Some(&(rule.threshold + 1)) {
+                self.trigger(ip, rule, rule.threshold + 1, now);
             }
         }
 
