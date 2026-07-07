@@ -819,6 +819,9 @@ impl RunboundHandler {
                     let set_ad = val.verdict == Verdict::Secure && do_bit;
                     if val.rcode == rcode::NXDOMAIN {
                         self.stats.inc_nxdomain();
+                        // A recursion NXDOMAIN is a real cache miss — count the round-trip
+                        // (miss + latency), previously untouched (#veracity).
+                        self.stats.record_forward(start.elapsed().as_micros() as u64);
                         self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Nxdomain, start);
                         // RFC 2308 §3: carry the zone SOA (+ DNSSEC denial for DO).
                         let mut resp =
@@ -851,6 +854,11 @@ impl RunboundHandler {
                                 self.wire_negative(&msg, rcode::NOERROR, &val.authority, false);
                             self.maybe_cache_negative(&q, &cache_resp, neg_ttl);
                         }
+                        // A recursion NODATA is a real cache miss and a valid answer —
+                        // categorise it (forwarded) + record the round-trip so the
+                        // sub-counters reconcile with total and latency is measured (#veracity).
+                        self.stats.inc_forwarded();
+                        self.stats.record_forward(start.elapsed().as_micros() as u64);
                         self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Recursed, start);
                         return Some(resp);
                     }
@@ -981,16 +989,21 @@ impl RunboundHandler {
                 Some(resp)
             }
             crate::dns::forward::ResolveResult::NegativeAnswer { rcode: rc, neg_ttl, soa } => {
+                let neg_us = start.elapsed().as_micros() as u64;
                 let action = if rc == rcode::NXDOMAIN {
                     self.stats.inc_nxdomain();
                     LogAction::Nxdomain
                 } else {
                     // NOERROR + empty ANSWER = NODATA — a valid negative answer, NOT a
-                    // failure. Counting it as SERVFAIL wrongly inflated the servfail metric
-                    // (which feeds /health, and can withdraw a BGP route in anycast). A
-                    // AAAA on an IPv4-only host is a perfectly normal NODATA.
+                    // failure. Counting it as SERVFAIL wrongly inflated the servfail metric.
+                    // Count it as forwarded so the sub-counters reconcile with total_queries
+                    // (it incremented nothing before — #veracity).
+                    self.stats.inc_forwarded();
                     LogAction::Forwarded
                 };
+                // Record the upstream round-trip (miss + latency) like the Answer arm —
+                // negatives previously never touched cache_misses or the latency histogram.
+                self.stats.record_forward(neg_us);
                 self.log_query_wire(client_ip, &qname_pres, qtype, action, start);
                 // RFC 2308 §3: carry the zone SOA in the authority section — the forward
                 // path now matches the recursion path (previously wire_error sent none).

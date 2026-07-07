@@ -336,6 +336,10 @@ impl Stats {
     /// elapsed_us ≥ 2 ms → cache miss (round-trip to upstream resolver).
     #[inline]
     pub fn record_forward(&self, elapsed_us: u64) {
+        // Feed the latency histogram too: forward/recursion answers are the bulk of a
+        // resolver's traffic; previously only local-zone answers recorded latency, so
+        // p50/p95/p99 stayed at 0 for a forwarding/recursing server (#veracity).
+        self.record_latency_us(elapsed_us);
         if elapsed_us < CACHE_HIT_THRESHOLD_US {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -359,6 +363,12 @@ impl Stats {
         self.cache_hits.store(0, Ordering::Relaxed);
         self.cache_misses.store(0, Ordering::Relaxed);
         self.cache_entries.store(0, Ordering::Relaxed);
+        // Also zero the per-worker XDP hit counters — they carry ALL cache hits under
+        // xdp:no, so a flush that left them untouched kept hit_rate stuck (hits > 0,
+        // misses 0 => 100%) with no traffic afterward (#veracity).
+        for c in crate::dns::cache_snapshot::XDP_WORKER_PKTS.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Compute a percentile (0–100) from the current latency histogram.
