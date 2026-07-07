@@ -845,6 +845,29 @@ fn init_runtime(args: &[String]) -> Result<(UnboundConfig, std::path::PathBuf, S
         _ => {}
     }
 
+    // Fail fast — and with an actionable message — if the base directory is not
+    // writable. Runbound persists its runtime state there (api.key, node-id,
+    // sync-master.fingerprint, relay-cert.pem, xdp_cache.rkyv…). A read-only base_dir
+    // otherwise surfaces much later as a cascade of I/O errors during slave-sync /
+    // relay init and, because the API/UI runtimes are already live in the async
+    // context by then, a confusing tokio "cannot drop a runtime in a context where
+    // blocking is not allowed" panic instead of a clear cause.
+    {
+        let probe = base_dir.join(".runbound-write-test");
+        match std::fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "Config base directory '{}' is not writable ({}). Runbound stores its runtime state there — fix its ownership/permissions so the runbound user can write it, or, under a systemd sandbox, add it to ReadWritePaths=.",
+                    base_dir.display(),
+                    e
+                );
+            }
+        }
+    }
+
     // Load config before tracing so verbosity: takes effect.
     // Unknown-directive warnings from the parser are silently dropped here;
     // they will reappear on reload if the operator adds an unknown key.
