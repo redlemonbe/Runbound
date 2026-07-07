@@ -1329,6 +1329,8 @@ async fn build_and_launch(
     // icmp state hoisted here so NodeRelay (slave relay) can reference it
     let icmp_stats = IcmpStats::new();
     icmp_stats.load_blacklist();
+    // #ddos: let alert-rule `block` escalations also hit the kernel-UDP fast-path ban set.
+    alert_tracker.set_icmp_stats(Arc::clone(&icmp_stats));
 
     // #8: load per-subnet filtering policies from disk into the live (slow-path) set.
     subnet_policy::init();

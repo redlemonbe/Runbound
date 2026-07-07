@@ -40,14 +40,18 @@ pub enum Role {
 impl Role {
     /// Whether this role allows write (POST/PUT/DELETE/PATCH) on the given path prefix.
     pub fn may_write(self, path: &str) -> bool {
+        // Segment-aware prefix match: "/api/dns" must grant "/api/dns" and "/api/dns/..."
+        // but NOT "/api/dnssec*" — a bare starts_with would leak a future write endpoint
+        // under /api/dnssec to the Dns role.
+        let under = |base: &str| path == base || path.strip_prefix(base).is_some_and(|r| r.starts_with('/'));
         match self {
             Role::Read => false,
-            Role::Dns => path.starts_with("/api/dns") || path.starts_with("/api/zones"),
+            Role::Dns => under("/api/dns") || under("/api/zones"),
             Role::Operator => {
-                path.starts_with("/api/dns")
-                    || path.starts_with("/api/zones")
-                    || path.starts_with("/api/blacklist")
-                    || path.starts_with("/api/feeds")
+                under("/api/dns")
+                    || under("/api/zones")
+                    || under("/api/blacklist")
+                    || under("/api/feeds")
             }
             Role::Admin => true,
         }

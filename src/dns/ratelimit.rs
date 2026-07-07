@@ -94,7 +94,11 @@ impl RateLimiter {
     /// concurrent update is picked up on the next packet with no ordering requirement.
     pub fn set_limits(&self, rps: u64, burst: Option<u64>) {
         self.rps.store(rps, Ordering::Relaxed);
-        self.burst.store(burst.unwrap_or_else(|| rps.saturating_mul(2)), Ordering::Relaxed);
+        let burst = burst.unwrap_or_else(|| rps.saturating_mul(2));
+        // burst=0 with rps>0 refuses every non-loopback packet (tokens never refill above 0)
+        // — clamp to >=1 so a live PATCH /api/config edit can't self-DoS the node.
+        let burst = if rps > 0 { burst.max(1) } else { burst };
+        self.burst.store(burst, Ordering::Relaxed);
     }
 
     #[inline]

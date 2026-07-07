@@ -64,6 +64,9 @@ pub struct AlertTracker {
     base_dir: Option<Arc<PathBuf>>,
     /// #ddos: XDP ban channel — wired only when XDP is attached (set_ban_tx).
     ban_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>>,
+    /// #ddos: icmp_stats mirror so rule-triggered bans also enter the kernel-UDP
+    /// fast-path ban set (consulted on cache hits when xdp:no). Wired unconditionally.
+    icmp_stats: std::sync::OnceLock<Arc<crate::icmp::IcmpStats>>,
 }
 
 impl AlertTracker {
@@ -80,6 +83,7 @@ impl AlertTracker {
             notify_tx: tx,
             base_dir: base_dir_arc,
             ban_tx: std::sync::OnceLock::new(),
+            icmp_stats: std::sync::OnceLock::new(),
         });
         tracker.load_blocks();
         tracker
@@ -304,6 +308,13 @@ impl AlertTracker {
                     self.blocked.insert(ip, BlockEntry { expires, rule: rule.name.clone() });
                     self.persist_blocks();
                     self.xdp_push(ip, true);
+                    // Mirror into icmp_stats so the kernel-UDP fast path (xdp:no) enforces
+                    // this rule-triggered ban on cache hits — it only checks
+                    // icmp_stats.is_banned(), not alert_tracker. Matches the manual/bot/relay
+                    // paths; no-op if not wired.
+                    if let Some(icmp) = self.icmp_stats.get() {
+                        icmp.ban(ip, crate::icmp::BanSource::Bot);
+                    }
                 }
             }
             "tarpit" => {
@@ -412,6 +423,12 @@ impl AlertTracker {
     /// Wire the XDP ban channel — call ONCE, only when XDP is attached (otherwise
     /// nothing drains the channel and sends accumulate). Re-syncs already-loaded
     /// blocks (e.g. restored from disk) into the BPF map.
+    /// Wire the icmp_stats ban set so an alert-rule `block` also lands on the kernel-UDP
+    /// fast path (xdp:no). Called unconditionally at startup, unlike set_ban_tx.
+    pub fn set_icmp_stats(&self, icmp: Arc<crate::icmp::IcmpStats>) {
+        let _ = self.icmp_stats.set(icmp);
+    }
+
     pub fn set_ban_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<IcmpBanCmd>) {
         if self.ban_tx.set(tx).is_err() {
             return;
