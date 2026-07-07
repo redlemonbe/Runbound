@@ -238,8 +238,11 @@ impl UserRegistry {
         let arc = Arc::new(u);
         self.by_id.insert(arc.id.clone(), Arc::clone(&arc));
         self.by_key.insert(arc.api_key.clone(), Arc::clone(&arc));
-        let mut store = self.current_store();
-        store.users.push((*arc).clone());
+        // by_id already holds the new user (inserted just above), and current_store()
+        // rebuilds the on-disk list from by_id — so it already contains it. A second
+        // push here duplicated the entry in users.json (masked in RAM by the by_id map,
+        // but corrupt on disk until the next rotate/delete rewrote the store).
+        let store = self.current_store();
         self.save_store(&store)?;
         Ok(arc)
     }

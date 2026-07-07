@@ -4037,7 +4037,7 @@ fn render_prometheus_metrics(
     ));
     out.push_str(&fmt_gauge(
         "runbound_cache_hit_rate",
-        "Cache hit rate (0.0 to 1.0)",
+        "Cache hit rate as a percentage (0 to 100)",
         snap.cache_hit_rate,
     ));
     out.push_str(&fmt_gauge(
