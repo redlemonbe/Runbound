@@ -64,8 +64,14 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 ```
 
 ```json
-{"id": "550e8400-...", "name": "nas.home.", "type": "A", "value": "192.168.1.10", "ttl": 300}
+{"entry": {"id": "550e8400-...", "name": "nas.home.", "type": "A", "value": "192.168.1.10", "ttl": 300}}
 ```
+
+The entry is wrapped in an `"entry"` object. Its fields mirror one element of the
+`entries` array from `GET /api/dns`: `id`, `name`, `type`, `ttl`, plus whatever
+record-specific fields apply (`value` for A/AAAA/CNAME/TXT/PTR/NS, `priority` for
+MX/SRV, `weight`/`port` for SRV, `flags`/`tag` for CAA, etc.). Optional fields are
+omitted when unset.
 
 #### `POST /api/dns`
 
@@ -120,27 +126,40 @@ curl -X POST http://localhost:8080/api/dns/lookup \
 
 ```json
 {
-  "rcode":      "NOERROR",
-  "action":     "forwarded",
-  "from_cache": false,
+  "name":       "google.com",
+  "type":       "A",
+  "answers": [
+    {"ttl": 300, "data": "142.250.179.46"}
+  ],
+  "status":     "NOERROR",
   "elapsed_ms": 14,
-  "records": [
-    {"value": "142.250.179.46", "ttl": 300}
-  ]
+  "from_cache": false
 }
 ```
 
-Blocked domain example:
+Blocked domain example (matches a local blacklist / block-page zone):
 
 ```json
 {
-  "rcode":      "NXDOMAIN",
-  "action":     "blocked",
-  "from_cache": true,
+  "name":       "ads.example.com",
+  "type":       "A",
+  "answers":    [],
+  "status":     "BLOCKED",
   "elapsed_ms": 0,
-  "records":    []
+  "from_cache": false
 }
 ```
+
+**Response fields:**
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `name` | string | Echoes the requested name (as sent, trailing dot preserved). |
+| `type` | string | Echoes the requested record type. |
+| `answers` | array | Zero or more `{ "ttl": u32, "data": "<presentation-form rdata>" }`. Empty for a blocked, NXDOMAIN, NODATA, REFUSED or SERVFAIL result. |
+| `status` | string | `"NOERROR"`, `"BLOCKED"` (matched a local block rule), `"NXDOMAIN"`, `"NODATA"`, `"REFUSED"`, or `"SERVFAIL"`. |
+| `elapsed_ms` | u64 | Resolution time in milliseconds (`0` when answered locally). |
+| `from_cache` | bool | `true` when served from a local static zone, or when the upstream answer came back fast enough (< cache-hit threshold) to be counted as a cache hit. |
 
 **Fields:**
 
@@ -321,9 +340,11 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stat
 ```json
 {
   "total":           125432,
+  "total_queries":   125432,
   "blocked":         8921,
   "forwarded":       112000,
   "nxdomain":        4500,
+  "stale_served":    12,
   "refused":         8921,
   "servfail":        11,
   "local_hits":      3200,
@@ -335,15 +356,35 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stat
   "latency_p50_ms":  0.3,
   "latency_p95_ms":  4.2,
   "latency_p99_ms":  22.5,
+  "latency_min_ms":  0.1,
+  "latency_avg_ms":  1.4,
+  "latency_max_ms":  55.0,
   "cache_hit_rate":  68.4,
+  "cache_hits":      76500,
+  "cache_misses":    35500,
+  "xdp_cache_hits":  0,
   "cache_entries":   2941,
   "dnssec": {
     "secure":   1042,
     "bogus":    3,
     "insecure": 897
-  }
+  },
+  "latency_windows": {
+    "1m":  {"min_ms": 0.1, "avg_ms": 1.2, "max_ms": 42.0, "count": 2081},
+    "5m":  {"min_ms": 0.1, "avg_ms": 1.4, "max_ms": 55.0, "count": 10402}
+  },
+  "qtype_stats": [
+    {"type": "A",    "count": 90211},
+    {"type": "AAAA", "count": 30122}
+  ],
+  "xdp_ifaces": [],
+  "xdp_queues": []
 }
 ```
+
+> `xdp_ifaces` and `xdp_queues` are added by the `GET /api/stats` handler only —
+> they are **not** part of the raw stats snapshot and are absent from the
+> `GET /api/stats/stream` payload (see below).
 
 **Counter semantics:**
 
@@ -358,8 +399,16 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stat
 | `qps_1m` / `qps_5m` | Average queries/second over the last 1 and 5 minutes |
 | `qps_peak` | All-time highest queries in any single second |
 | `latency_p50/95/99_ms` | Latency percentiles from a fixed 10-bucket histogram (zero-alloc) |
-| `cache_hit_rate` | Percentage of forwarded lookups served from the in-process DNS cache (< 2 ms) |
+| `cache_hit_rate` | Percentage of lookups served from the in-process DNS cache (`cache_hits / (cache_hits + cache_misses) × 100`) |
+| `cache_hits` / `cache_misses` | Canonical cache hit/miss counters (slow path + XDP fast-path workers, summed) |
+| `xdp_cache_hits` | Cache hits served specifically by the XDP fast path (subset of `cache_hits`) |
 | `cache_entries` | Approximate distinct domains cached |
+| `total_queries` | Alias of `total` (same value; kept for dashboard compatibility) |
+| `stale_served` | Answers served from an expired cache entry (serve-stale, RFC 8767) |
+| `latency_min_ms` / `latency_avg_ms` / `latency_max_ms` | Min / mean / max response latency (ms) since start |
+| `latency_windows` | Per-window `{min_ms, avg_ms, max_ms, count}` latency map (e.g. `1m`, `5m`) |
+| `qtype_stats` | Array of `{type, count}` — per-record-type query counters |
+| `xdp_ifaces` / `xdp_queues` | Per-interface / per-queue AF_XDP state; `[]` when XDP is inactive. Present only on `GET /api/stats`, not on the stream. |
 | `dnssec.secure` | Queries validated with a full RRSIG chain (requires `dnssec-validation: yes`) |
 | `dnssec.bogus` | Queries where DNSSEC validation failed — potential tampering or misconfiguration |
 | `dnssec.insecure` | Queries for zones with no DNSSEC signatures (unsigned delegations) |
@@ -385,7 +434,12 @@ data: {"total":125432,"blocked":8921,...,"qps_1m":34.7,"latency_p50_ms":0.3}
 data: {"total":125465,"blocked":8921,...,"qps_1m":34.9,"latency_p50_ms":0.3}
 ```
 
-The stream is a standard SSE event stream (`Content-Type: text/event-stream`). Each `data:` line is the same JSON object as `GET /stats`. The connection stays open until the client closes it.
+The stream is a standard SSE event stream (`Content-Type: text/event-stream`). The connection stays open until the client closes it.
+
+> **Not identical to `GET /api/stats`.** Each `data:` line is the raw stats snapshot
+> (`snapshot_to_json`): it carries `total`, `blocked`, `qps_*`, `latency_*`, `cache_*`,
+> `dnssec`, `latency_windows`, `qtype_stats`, etc., but **omits** the `xdp_ifaces` and
+> `xdp_queues` keys, which the non-streaming `GET /api/stats` handler appends on top.
 
 > The `-N` flag disables curl's output buffering — required to see events in real time.
 
@@ -593,7 +647,7 @@ curl -X PATCH http://localhost:8080/api/config \
 |---|---|---|
 | `dnssec_validation` | bool | Enable or disable DNSSEC validation at runtime |
 
-**Note:** This change is not persisted to `runbound.conf`. To make it permanent, edit `dnssec-validation: yes/no` in the config file and restart.
+**Note:** The change **is** persisted — the handler rewrites `runbound.conf` (via the atomic config writer) so it survives a restart. The one exception is **slave mode**, where config is driven by the master and the persist step returns early (no local rewrite). The change is also propagated to all registered slaves over the relay.
 
 ---
 
@@ -659,24 +713,72 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/metr
 # HELP runbound_queries_total Total DNS queries received
 # TYPE runbound_queries_total counter
 runbound_queries_total 125432
-# HELP runbound_blocked_total Queries answered with REFUSED (blacklist/feeds)
-# TYPE runbound_blocked_total counter
-runbound_blocked_total 8921
-# HELP runbound_qps Queries per second
-# TYPE runbound_qps gauge
-runbound_qps{window="1m"} 34.7
-runbound_qps{window="5m"} 31.2
-runbound_qps{window="peak"} 410
-# HELP runbound_latency_ms DNS query latency percentiles in milliseconds
-# TYPE runbound_latency_ms gauge
-runbound_latency_ms{quantile="0.5"} 0.3
-runbound_latency_ms{quantile="0.95"} 4.2
-runbound_latency_ms{quantile="0.99"} 22.5
-# HELP runbound_dnssec_total DNSSEC validation results
-# TYPE runbound_dnssec_total counter
-runbound_dnssec_total{status="secure"} 1000
-runbound_dnssec_total{status="bogus"} 5
-runbound_dnssec_total{status="insecure"} 100
+# HELP runbound_queries_blocked_total Queries blocked by blocklist
+# TYPE runbound_queries_blocked_total counter
+runbound_queries_blocked_total 8921
+# HELP runbound_queries_forwarded_total Queries forwarded to upstreams
+# TYPE runbound_queries_forwarded_total counter
+runbound_queries_forwarded_total 112000
+# HELP runbound_queries_nxdomain_total Queries answered NXDOMAIN
+# TYPE runbound_queries_nxdomain_total counter
+runbound_queries_nxdomain_total 4500
+# HELP runbound_queries_servfail_total Queries answered SERVFAIL
+# TYPE runbound_queries_servfail_total counter
+runbound_queries_servfail_total 11
+# HELP runbound_queries_local_hits_total Queries answered from local zones
+# TYPE runbound_queries_local_hits_total counter
+runbound_queries_local_hits_total 3200
+# HELP runbound_qps_1m Queries per second (1 minute average)
+# TYPE runbound_qps_1m gauge
+runbound_qps_1m 34.7
+# HELP runbound_qps_peak Peak queries per second observed
+# TYPE runbound_qps_peak gauge
+runbound_qps_peak 410
+# HELP runbound_latency_p50_ms DNS response latency p50 in milliseconds
+# TYPE runbound_latency_p50_ms gauge
+runbound_latency_p50_ms 0.3
+# HELP runbound_latency_p95_ms DNS response latency p95 in milliseconds
+# TYPE runbound_latency_p95_ms gauge
+runbound_latency_p95_ms 4.2
+# HELP runbound_latency_p99_ms DNS response latency p99 in milliseconds
+# TYPE runbound_latency_p99_ms gauge
+runbound_latency_p99_ms 22.5
+# HELP runbound_cache_hit_rate Cache hit rate as a percentage (0 to 100)
+# TYPE runbound_cache_hit_rate gauge
+runbound_cache_hit_rate 68.4
+# HELP runbound_cache_entries Current number of entries in DNS cache
+# TYPE runbound_cache_entries gauge
+runbound_cache_entries 2941
+# HELP runbound_cache_hits_total Total cache hits
+# TYPE runbound_cache_hits_total counter
+runbound_cache_hits_total 76500
+# HELP runbound_cache_misses_total Total cache misses
+# TYPE runbound_cache_misses_total counter
+runbound_cache_misses_total 35500
+# HELP runbound_cache_evictions_total Total cache evictions
+# TYPE runbound_cache_evictions_total counter
+runbound_cache_evictions_total 18
+# HELP runbound_uptime_seconds Service uptime in seconds
+# TYPE runbound_uptime_seconds gauge
+runbound_uptime_seconds 3600
+# HELP runbound_xdp_active Whether XDP fast path is active (1=yes, 0=no)
+# TYPE runbound_xdp_active gauge
+runbound_xdp_active 1
+# HELP runbound_xdp_cache_hits_total DNS responses served from the fast-path cache
+# TYPE runbound_xdp_cache_hits_total counter
+runbound_xdp_cache_hits_total 0
+# HELP runbound_xdp_cache_misses_total XDP fast-path cache lookups that missed
+# TYPE runbound_xdp_cache_misses_total counter
+runbound_xdp_cache_misses_total 0
+# HELP runbound_xdp_kernel_snapshot_hits_total DNS responses answered directly by the in-kernel eBPF cache snapshot
+# TYPE runbound_xdp_kernel_snapshot_hits_total counter
+runbound_xdp_kernel_snapshot_hits_total 0
+# HELP runbound_xdp_kernel_snapshot_misses_total Lookups the in-kernel eBPF cache snapshot could not answer
+# TYPE runbound_xdp_kernel_snapshot_misses_total counter
+runbound_xdp_kernel_snapshot_misses_total 0
+# HELP runbound_xdp_cache_entries Current live entries in XDP wire-format cache
+# TYPE runbound_xdp_cache_entries gauge
+runbound_xdp_cache_entries 0
 # HELP runbound_nic_rx_ring NIC RX ring depth currently applied (descriptors)
 # TYPE runbound_nic_rx_ring gauge
 runbound_nic_rx_ring 4096
@@ -686,9 +788,28 @@ runbound_nic_rx_ring_max 4096
 # HELP runbound_nic_rx_dropped_total Hardware RX drops at NIC level (pre-XDP)
 # TYPE runbound_nic_rx_dropped_total counter
 runbound_nic_rx_dropped_total 0
+# HELP runbound_queries_by_type_total DNS queries by record type
+# TYPE runbound_queries_by_type_total counter
+runbound_queries_by_type_total{type="A"} 90211
+runbound_queries_by_type_total{type="AAAA"} 30122
+# HELP runbound_upstream_healthy Whether upstream is healthy (1=yes, 0=no)
+# TYPE runbound_upstream_healthy gauge
+runbound_upstream_healthy{id="550e8400-...",addr="1.1.1.1",port="853",protocol="dot"} 1
+# HELP runbound_upstream_latency_ms Last measured upstream latency in milliseconds
+# TYPE runbound_upstream_latency_ms gauge
+runbound_upstream_latency_ms{id="550e8400-...",addr="1.1.1.1",port="853",protocol="dot"} 14
+# HELP runbound_icmp_handled_total ICMP echo requests handled by XDP
+# TYPE runbound_icmp_handled_total counter
+runbound_icmp_handled_total 0
+# HELP runbound_icmp_replied_total ICMP echo replies sent by XDP
+# TYPE runbound_icmp_replied_total counter
+runbound_icmp_replied_total 0
 # HELP runbound_icmp_dropped_total Packets dropped from banned source IPs at XDP
 # TYPE runbound_icmp_dropped_total counter
 runbound_icmp_dropped_total 0
+# HELP runbound_icmp_rate_limited_total Packets rate-limited at the XDP ICMP gate
+# TYPE runbound_icmp_rate_limited_total counter
+runbound_icmp_rate_limited_total 0
 # HELP runbound_banned_ips Source IPs currently banned in the XDP map
 # TYPE runbound_banned_ips gauge
 runbound_banned_ips 0
@@ -701,10 +822,13 @@ runbound_alert_tarpitted_ips 1
 # HELP runbound_tcp_connections_active Active TCP/DoT/DoH relay connections (listener saturation)
 # TYPE runbound_tcp_connections_active gauge
 runbound_tcp_connections_active 12
-...
 ```
 
-**Metric families (#208):** query totals + per-type (`queries_by_type_total`) + rcode (nxdomain/servfail/blocked/forwarded/local_hits) + QPS + latency percentiles; cache (hit-rate, hits/misses/evictions, entries) incl. XDP wire cache; NIC (rx-ring, rx-dropped); XDP fast-path; **DDoS/abuse** (`icmp_*`, `banned_ips`, `alert_blocked_ips`, `alert_tarpitted_ips`); **listener saturation** (`tcp_connections_active`); per-upstream health + latency; node identity for anycast.
+> There is no `runbound_dnssec_total` metric — DNSSEC secure/bogus/insecure counts are
+> exposed via `GET /api/stats` (`dnssec` object) and the WebUI, not the OpenMetrics
+> endpoint. `runbound_node_info{node="..."}` is emitted first when a node id is configured.
+
+**Metric families:** node identity (`runbound_node_info`); query totals (`runbound_queries_total`) + per-type (`runbound_queries_by_type_total`) + rcode (`runbound_queries_blocked_total`, `runbound_queries_forwarded_total`, `runbound_queries_nxdomain_total`, `runbound_queries_servfail_total`, `runbound_queries_local_hits_total`); QPS (`runbound_qps_1m`, `runbound_qps_peak` — distinct metrics, no `window`/`quantile` labels); latency (`runbound_latency_p50_ms`, `runbound_latency_p95_ms`, `runbound_latency_p99_ms`); cache (`runbound_cache_hit_rate`, `runbound_cache_hits_total`, `runbound_cache_misses_total`, `runbound_cache_evictions_total`, `runbound_cache_entries`); XDP cache (`runbound_xdp_cache_hits_total`, `runbound_xdp_cache_misses_total`, `runbound_xdp_kernel_snapshot_hits_total`, `runbound_xdp_kernel_snapshot_misses_total`, `runbound_xdp_cache_entries`, `runbound_xdp_active`); NIC (`runbound_nic_rx_ring`, `runbound_nic_rx_ring_max`, `runbound_nic_rx_dropped_total`); uptime (`runbound_uptime_seconds`); **DDoS/abuse** (`runbound_icmp_handled_total`, `runbound_icmp_replied_total`, `runbound_icmp_dropped_total`, `runbound_icmp_rate_limited_total`, `runbound_banned_ips`, `runbound_alert_blocked_ips`, `runbound_alert_tarpitted_ips`); **listener saturation** (`runbound_tcp_connections_active`); per-upstream health + latency (`runbound_upstream_healthy`, `runbound_upstream_latency_ms`). There is **no** `runbound_dnssec_total` metric.
 
 **Prometheus scrape config:**
 
@@ -780,9 +904,13 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/tls
   "dot": {"enabled": true, "port": 853, "rfc": "RFC 7858"},
   "doh": {"enabled": true, "port": 443, "rfc": "RFC 8484"},
   "doq": {"enabled": true, "port": 853, "rfc": "RFC 9250"},
-  "cert": "/etc/runbound/cert.pem"
+  "cert": "/etc/runbound/cert.pem",
+  "hostname": "dns.example.com"
 }
 ```
+
+`cert` is `"not configured"` and `hostname` defaults to `"runbound.local"` when no
+certificate is set.
 
 ---
 
@@ -798,7 +926,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/tls/
 {
   "active": true, "configured": true, "restart_required": false,
   "dot_port": 853, "doh_port": 443, "doq_port": 853, "hostname": "dns.example.com",
-  "cert": { "subject_cn": "dns.example.com", "self_signed": true, "not_after": 1788000000,
+  "cert_path": "/etc/runbound/cert.pem",
+  "cert": { "subject_cn": "dns.example.com", "issuer_cn": "dns.example.com", "self_signed": true,
+            "not_before": 1756464000, "not_after": 1788000000,
             "days_remaining": 365, "expired": false, "fingerprint_sha256": "AB:CD:...", "sans": ["dns.example.com"] }
 }
 ```
@@ -824,7 +954,7 @@ MIIBozCCAUmg... (Runbound Local CA)
 
 ### `POST /api/tls/self-signed`
 
-Generate a self-signed certificate + key for `hostname` and enable DoT/DoH/DoQ. The key is written `0600` (atomic) in `base_dir`; the config is updated. **Admin only.** Requires a restart to bind the listeners (`restart_required: true`).
+Generate a self-signed certificate + key for `hostname` and enable DoT/DoH/DoQ. The key is written `0600` (atomic) in `base_dir`; the config is updated. **Admin only.** The DoT/DoH/DoQ listeners are (re)bound live via the TLS-apply channel, so `restart_required` is `false`. The response is `{"ok": true, "mode": "self-signed", "restart_required": false, "cert": { ... }}` (the `cert` object is the same shape as `GET /api/tls/cert`).
 
 ```bash
 curl -X POST http://localhost:8080/api/tls/self-signed \
@@ -841,7 +971,7 @@ curl -X POST http://localhost:8080/api/tls/self-signed \
 
 ### `POST /api/tls/import`
 
-Import an existing certificate + key (e.g. Lets Encrypt). The pair is validated against rustls (the key must match the leaf certificate) before being written; a mismatch returns `400`. Key written `0600`. **Admin only.** `restart_required: true`.
+Import an existing certificate + key (e.g. Lets Encrypt). The pair is validated against rustls (the key must match the leaf certificate) before being written; a mismatch returns `400`. Key written `0600`. **Admin only.** Listeners are re-bound live, so `restart_required` is `false`. Response: `{"ok": true, "mode": "import", "restart_required": false, "cert": { ... }}`.
 
 ```bash
 curl -X POST http://localhost:8080/api/tls/import \
@@ -853,7 +983,7 @@ curl -X POST http://localhost:8080/api/tls/import \
 
 ### `DELETE /api/tls`
 
-Disable encrypted DNS (clears `tls-service-pem` / `tls-service-key`). **Admin only.** `restart_required: true`.
+Disable encrypted DNS (clears `tls-service-pem` / `tls-service-key`). **Admin only.** Listeners are unbound live, so `restart_required` is `false`. Response: `{"ok": true, "restart_required": false}`.
 
 ---
 
@@ -894,6 +1024,17 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
   "prefetch_enabled": true,
   "upstreams_healthy": 3,
   "upstreams_total": 3,
+  "dot_reconnects_total": 2,
+  "last_reconnect_at": "2026-05-22T15:00:00Z",
+  "dnssec_validation": true,
+  "xdp_cache_entries": 12000,
+  "xdp_cache_hits": 0,
+  "xdp_cache_misses": 0,
+  "xdp_cache_hit_rate": 0.0,
+  "xdp_kernel_snapshot_hits": 0,
+  "xdp_kernel_snapshot_misses": 0,
+  "xdp_domain_routing": false,
+  "xdp_worker_distribution": [0, 0, 0, 0],
   "nic_rx_ring": 4096,
   "nic_rx_ring_max": 4096,
   "xsk_rx_dropped": 0,
@@ -912,6 +1053,15 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/syst
 | `prefetch_enabled` | bool | `true` when `prefetch: yes` is set in `runbound.conf` |
 | `upstreams_healthy` | u32 | Count of upstreams with `healthy == true` at last health check |
 | `upstreams_total` | u32 | Total registered upstreams (config + API) |
+| `dot_reconnects_total` | u64 | Number of DoT reconnect cycles (`POST /api/upstreams/reconnect` + auto-recovery) since start |
+| `last_reconnect_at` | string or `null` | Timestamp of the last DoT reconnect, or `null` if none yet |
+| `dnssec_validation` | bool | Current runtime DNSSEC-validation state (matches the `PATCH /api/config` toggle) |
+| `xdp_cache_entries` | u64 | Live entries in the XDP wire-format cache snapshot |
+| `xdp_cache_hits` / `xdp_cache_misses` | u64 | XDP fast-path (per-worker) cache hits / misses — what the XDP datapath served from cache |
+| `xdp_cache_hit_rate` | f64 | `xdp_cache_hits / (xdp_cache_hits + xdp_cache_misses) × 100`, one decimal (`0.0` when no XDP traffic) |
+| `xdp_kernel_snapshot_hits` / `xdp_kernel_snapshot_misses` | u64 | In-kernel eBPF snapshot hits / misses (`0` when the snapshot path is not serving, e.g. copy mode on a VM) |
+| `xdp_domain_routing` | bool | `true` when `xdp-domain-routing` is enabled in `runbound.conf` |
+| `xdp_worker_distribution` | `[u64]` | Per-XDP-worker packet counters (one entry per worker) |
 | `nic_rx_ring` | u32 | Current RX ring depth applied to the NIC (descriptors). `0` when XDP is disabled or the driver does not support ethtool ring queries. |
 | `nic_rx_ring_max` | u32 | Maximum RX ring depth supported by the driver. Equal to `nic_rx_ring` when auto-sizing succeeded. |
 | `xsk_rx_dropped` | u64 | AF_XDP socket RX drops (kernel `XDP_STATISTICS` getsockopt), summed across XDP sockets. Valid under zero-copy, unlike the old ethtool/sysfs `rx_dropped` counters which are blind to `XDP_REDIRECT`→XSK traffic. |
@@ -959,19 +1109,21 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/cach
 
 ```json
 {
-  "cache_hits":      58432,
-  "cache_misses":    3201,
-  "cache_evictions": 18,
-  "hit_rate_pct":    94.8
+  "entries":      2941,
+  "hits":         58432,
+  "misses":       3201,
+  "evictions":    18,
+  "hit_rate_pct": 94.8
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `cache_hits` | u64 | Responses served from the in-process cache |
-| `cache_misses` | u64 | Cache misses forwarded to an upstream |
-| `cache_evictions` | u64 | Entries evicted to enforce the cache size limit |
-| `hit_rate_pct` | f64 or `null` | `cache_hits / (cache_hits + cache_misses) × 100`, rounded to 1 decimal. `null` when both are zero. |
+| `entries` | u64 | Current number of entries in the DNS cache |
+| `hits` | u64 | Responses served from cache — slow-path counter plus the summed XDP fast-path worker hits (same canonical sum as `GET /api/stats`) |
+| `misses` | u64 | Cache misses forwarded to an upstream |
+| `evictions` | u64 | Entries evicted to enforce the cache size limit |
+| `hit_rate_pct` | f64 or `null` | `hits / (hits + misses) × 100`, rounded to 1 decimal. `null` when `hits + misses == 0`. |
 
 All counters reset to zero on `POST /api/cache/flush`.
 
@@ -1005,7 +1157,9 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
       "last_error": null,
       "zone": ".",
       "latency_history": [11, 12, 14, 11, 13],
-      "source": "runtime",
+      "dnssec_supported": true,
+      "dnssec_stripping": false,
+      "source": "api",
       "temporary": false
     }
   ],
@@ -1016,11 +1170,12 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/upst
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `source` | `"runtime"`, `"config"`, or `"resolv.conf"` | `"config"` for upstreams loaded from `forward-zone` in `runbound.conf`; `"runtime"` for upstreams added via API; `"resolv.conf"` for temporary emergency fallback upstreams injected from `/etc/resolv.conf`. |
+| `source` | `"api"`, `"config"`, or `"resolv.conf"` | `"config"` for upstreams loaded from `forward-zone` in `runbound.conf`; `"api"` for upstreams added via the REST API (the default when not set); `"resolv.conf"` for temporary emergency fallback upstreams injected from `/etc/resolv.conf`. |
 | `temporary` | bool | `true` for upstreams injected as emergency fallback from `/etc/resolv.conf`. These upstreams are never persisted to `upstreams.json` and are automatically removed when a primary upstream recovers. Always `false` for normal upstreams. |
 | `tls_hostname` | `string` or absent | DoT only. TLS SNI hostname used for certificate validation. Absent when not set (auto-detected from well-known IPs). |
 | `last_error` | `string` or `null` | Short description of the last probe failure (`"connection timeout"`, `"tls handshake failed"`, etc.). `null` when the last probe succeeded. |
-| `dnssec_supported` | `bool` or absent | `true` if the upstream sets the AD bit in probe responses. Absent when unhealthy or not yet probed. DoT upstreams always omit this field. |
+| `dnssec_supported` | `bool` or absent | `true` if the upstream sets the AD bit in probe responses. Present for any healthy upstream that has been probed (UDP **and** DoT); omitted only when the upstream is unhealthy or not yet probed. |
+| `dnssec_stripping` | bool | `true` when the upstream previously advertised DNSSEC (AD bit) but has since stopped — an active-stripping signal (#34). Always serialised; `false` in the normal case. |
 | `latency_history` | `[u64]` | Last ≤ 5 successful probe round-trip times (ms). Empty array until the first successful probe. Failed probes do not append. |
 
 #### `POST /api/upstreams`
@@ -1100,24 +1255,51 @@ curl -X POST -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 
 ```json
 {
-  "id": "550e8400-...",
-  "healthy": true,
-  "latency_ms": 14,
-  "dnssec_supported": true,
-  "probed_at": "2026-05-22T15:00:00Z"
+  "status": "ok",
+  "upstream": {
+    "id": "550e8400-...",
+    "name": "Cloudflare DoT",
+    "addr": "1.1.1.1",
+    "port": 853,
+    "protocol": "dot",
+    "tls_hostname": "one.one.one.one",
+    "source": "api",
+    "healthy": true,
+    "latency_ms": 14,
+    "last_check": "2026-05-22T15:00:00Z",
+    "dnssec_supported": true,
+    "dnssec_stripping": false,
+    "latency_history": [11, 12, 14, 11, 13],
+    "zone": ".",
+    "temporary": false
+  }
 }
 ```
 
-On failure:
+The response wraps the **full, freshly-probed `UpstreamStatus`** object (same shape as one
+element of `GET /api/upstreams`) under `"upstream"`. There is no `probed_at` field — the
+probe time is reflected in `last_check`.
+
+On a failed probe the upstream is returned with `"healthy": false`, `"latency_ms": null`,
+`dnssec_supported` and `latency_history` omitted/unchanged, and a `"last_error"` string:
 
 ```json
 {
-  "id": "550e8400-...",
-  "healthy": false,
-  "latency_ms": null,
-  "dnssec_supported": null,
-  "last_error": "connection timeout",
-  "probed_at": "2026-05-22T15:00:00Z"
+  "status": "ok",
+  "upstream": {
+    "id": "550e8400-...",
+    "addr": "1.1.1.1",
+    "port": 853,
+    "protocol": "dot",
+    "source": "api",
+    "healthy": false,
+    "latency_ms": null,
+    "last_error": "connection timeout",
+    "last_check": "2026-05-22T15:00:00Z",
+    "dnssec_stripping": false,
+    "zone": ".",
+    "temporary": false
+  }
 }
 ```
 
@@ -1134,8 +1316,15 @@ curl -X POST -H "Authorization: Bearer $RUNBOUND_API_KEY" \
 ```
 
 ```json
-{"reconnected": 4, "failed": 0}
+{"reconnected": 4, "failed": 0, "warm_up": true, "duration_ms": 182}
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reconnected` | u32 | DoT upstreams that answered a probe after the rebuild |
+| `failed` | u32 | DoT upstreams that failed to probe after the rebuild |
+| `warm_up` | bool | Whether the resolver rebuild warmed (pre-opened) the new DoT connections before the swap |
+| `duration_ms` | u64 | Total time the reconnect took, in milliseconds |
 
 The shared resolver is atomically rebuilt with fresh connections. All in-flight queries
 complete against the old resolver before it is dropped.
@@ -1589,19 +1778,24 @@ List all users. Admin only.
 curl -H "Authorization: Bearer $MASTER_KEY" http://localhost:8080/api/users
 ```
 
-Response:
+Response — a `{"users": [...]}` envelope. API keys are **not** included (they are only
+ever returned once, on creation / rotation):
 ```json
-[
-  {
-    "id": "a1b2c3d4-...",
-    "username": "alice",
-    "api_key": "...",
-    "zone_prefixes": ["home.", "internal."],
-    "enabled": true,
-    "admin": false
-  }
-]
+{
+  "users": [
+    {
+      "id": "a1b2c3d4-...",
+      "username": "alice",
+      "admin": false,
+      "enabled": true,
+      "zone_prefixes": ["home.", "internal."],
+      "role": "read"
+    }
+  ]
+}
 ```
+
+`role` is one of `"read"` (default), `"dns"`, `"operator"`, or `"admin"`.
 
 #### `POST /api/users`
 
@@ -1611,10 +1805,14 @@ Create a user. Returns the new API key — **copy it immediately, it is not show
 curl -X POST -H "Authorization: Bearer $MASTER_KEY" \
   -H "Content-Type: application/json" \
   http://localhost:8080/api/users \
-  -d '{"username":"alice","zone_prefixes":["home.","internal."],"admin":false}'
+  -d '{"username":"alice","zone_prefixes":["home.","internal."],"admin":false,"role":"dns"}'
 ```
 
-Response: `201 Created`
+**Request fields:** `username` (required), `zone_prefixes` (optional, default `[]`),
+`admin` (optional bool, default `false`), `role` (optional, default `"read"` — one of
+`"read"`, `"dns"`, `"operator"`, `"admin"`).
+
+Response: `201 Created`. The `api_key` is returned **once** here and never again:
 ```json
 {
   "id": "a1b2c3d4-...",
@@ -1622,7 +1820,8 @@ Response: `201 Created`
   "api_key": "3a7f9e2c...",
   "zone_prefixes": ["home.", "internal."],
   "enabled": true,
-  "admin": false
+  "admin": false,
+  "role": "dns"
 }
 ```
 
@@ -1645,7 +1844,13 @@ curl -H "Authorization: Bearer $USER_KEY" http://localhost:8080/api/users/me
 
 #### `POST /api/users/:id/rotate-key`
 
-Generate a new API key. Allowed for admins or the user themselves. The old key is immediately invalidated.
+Generate a new API key. The old key is immediately invalidated.
+
+The handler itself authorises an **admin** or the **user themselves** (`caller.id == :id`).
+However, this is a write (`POST`), so the RBAC write-middleware runs first: a per-user key
+whose `role` does not permit writes to this path is rejected with `403` **before** the
+handler runs. The default `"read"` role (and `"dns"` / `"operator"`, whose write scope does
+not cover `/api/users/...`) cannot self-rotate — only an `admin` (or `admin: true`) key can.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $MASTER_KEY" \
@@ -1662,8 +1867,9 @@ Response:
 ### Split-horizon
 
 Editable split-horizon entries (per-client-network answer sets, #10). CRUD persists to
-`runbound.conf`; changes apply on the **next service restart** (the resolver's split-horizon
-table is built at boot). Slave nodes are read-only (`503`).
+`runbound.conf` **and** is applied **live** — the handler recompiles the editable entries
+into the running resolver and evicts affected names from the XDP cache, so no restart is
+needed. Slave nodes are read-only (`503`).
 
 Entry shape:
 
@@ -1681,7 +1887,7 @@ curl -s http://127.0.0.1:8080/api/split-horizon -H "Authorization: Bearer $KEY"
 
 #### `POST /api/split-horizon`
 
-Add (or replace by name) an entry.
+Add (or replace by name) an entry. Applied live (no restart).
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/api/split-horizon -H "Authorization: Bearer $KEY" \
@@ -1689,12 +1895,20 @@ curl -s -X POST http://127.0.0.1:8080/api/split-horizon -H "Authorization: Beare
   -d '{"name":"internal","subnets":["10.0.0.0/8"],"local_data":["intra.example. A 10.0.0.5"]}'
 ```
 
+```json
+{"status": "ok", "name": "internal", "note": "applied live (no restart)"}
+```
+
 #### `DELETE /api/split-horizon/:name`
 
-Remove an entry by name.
+Remove an entry by name. Applied live (no restart).
 
 ```bash
 curl -s -X DELETE http://127.0.0.1:8080/api/split-horizon/internal -H "Authorization: Bearer $KEY"
+```
+
+```json
+{"status": "ok", "removed": 1, "note": "applied live (no restart)"}
 ```
 
 ---
@@ -1797,6 +2011,40 @@ TOO_MANY_DOMAINS`.
 
 ---
 
+### `GET /api/audit/tail`
+
+Return the most recent entries of the per-entry HMAC-SHA256, tamper-evident audit log.
+**Admin only** — a non-admin per-user key gets `403`. Query parameter `n` selects how many
+trailing entries to return (default `100`, capped at `1000`).
+
+```bash
+curl -s "http://localhost:8080/api/audit/tail?n=50" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "lines": [
+    {
+      "seq": 41,
+      "ts": 1747926000,
+      "event": "admin_action",
+      "fields": {"method": "POST", "path": "/api/dns", "status": 200, "actor": "alice"},
+      "mac": "9f2c...e1"
+    }
+  ],
+  "count": 1,
+  "enabled": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `lines` | array | Parsed audit records (oldest → newest within the tail). Each: `seq` (u64 monotonic), `ts` (u64 Unix epoch seconds), `event` (string event name), `fields` (object; event-specific, always carries `actor`), `mac` (hex HMAC-SHA256 over `seq‖ts‖event‖fields`). |
+| `count` | integer | Number of entries in `lines`. |
+| `enabled` | bool | `false` (with `lines: []`, `count: 0`) when no audit log exists on disk — i.e. audit logging is not enabled. `true` otherwise. |
+
+---
+
 ## Additional endpoints
 
 These endpoints are served by the API. All require
@@ -1809,7 +2057,7 @@ to localhost only.
 | `GET` | `/api/clients` | List observed client IPs with per-client query counters. |
 | `GET` | `/api/clients/{ip}` | Detail for one client IP (counts, last seen). |
 | `GET` | `/api/clients/{ip}/logs` | Recent query log entries for one client IP. |
-| `GET` | `/api/audit/tail` | Tail of the per-entry HMAC-SHA256 audit log (most recent entries). |
+| `GET` | `/api/audit/tail` | Tail of the per-entry HMAC-SHA256 audit log (most recent entries). **Admin only** (`403` for a non-admin key in multi-user mode). Query param `n` (default 100, max 1000). Response: `{"lines": [{"seq", "ts", "event", "fields", "mac"}], "count", "enabled"}` — see below. |
 | `GET` | `/api/alerts/rules` | Alias of `GET /api/alerts` — identical response (active rules, blocked clients, recent events). |
 | `POST` | `/api/upstreams/{id}/probe` | Trigger an immediate health probe of one upstream. |
 | `POST` | `/api/webhooks/test` | Send a synthetic test event to the configured webhook targets. |
@@ -1831,8 +2079,11 @@ TOKEN="your-api-key"
 curl -s -X POST http://localhost:8080/api/upstreams/<id>/probe \
   -H "Authorization: Bearer $TOKEN"
 
-# Create a backup, then list backups
-curl -s -X POST http://localhost:8080/api/backup -H "Authorization: Bearer $TOKEN"
+# Create a backup, then list backups.
+# POST /api/backup parses a JSON body (an optional {"label": "..."}), so it MUST send
+# Content-Type: application/json and a body — otherwise Axum rejects it with 415.
+curl -s -X POST http://localhost:8080/api/backup -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{}'
 curl -s        http://localhost:8080/api/backup -H "Authorization: Bearer $TOKEN"
 
 # Tail the audit log
