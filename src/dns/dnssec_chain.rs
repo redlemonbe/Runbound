@@ -116,6 +116,25 @@ fn delegation_path(zone: &Name) -> Vec<Name> {
     up
 }
 
+/// A pool of pre-fetched DNSSEC messages, keyed by `(owner name, qtype)`.
+/// `Name` hashes/compares case-insensitively, so lookups are canonical.
+type FetchMap = std::collections::HashMap<(Name, u16), Option<wire::Message>>;
+
+/// Take a pre-fetched `(name, qtype)` message out of `map` if present, else fetch
+/// it directly. Provenance-only: a pre-fetched hit and a direct fetch return the
+/// SAME datum — this never alters what gets validated, only where it came from.
+async fn take_or_fetch<F: Fetcher>(
+    map: &mut FetchMap,
+    name: &Name,
+    qtype: u16,
+    fetcher: &F,
+) -> Option<wire::Message> {
+    match map.remove(&(name.clone(), qtype)) {
+        Some(v) => v,
+        None => fetcher.fetch(name, qtype).await,
+    }
+}
+
 /// Validate the chain of trust down to `zone` and return its trusted DNSKEY
 /// rdatas (Secure), or a non-Secure verdict.
 pub async fn trusted_keys_for<F: Fetcher>(
@@ -131,13 +150,44 @@ pub async fn trusted_keys_for<F: Fetcher>(
         return (Verdict::Secure, keys);
     }
 
+    // Pre-fetch the whole chain's DS/DNSKEY messages in PARALLEL (latency #A + #C).
+    // These are INDEPENDENT network reads — each server answers its own datum — so
+    // fetching them concurrently only anticipates data. It changes NOTHING about the
+    // validation below, which still consumes each level strictly in order, under the
+    // parent's keys, fail-closed on Bogus. A level already cached (#230) is not
+    // pre-fetched (it is adopted below without any fetch); the conditional NS probe
+    // and any other unanticipated fetch fall back to a direct `fetcher.fetch` via
+    // `take_or_fetch`. Pre-fetching a level that a higher level later proves Insecure
+    // just wastes a few network reads — never a validation shortcut.
+    let path = delegation_path(zone);
+    let mut fetch_keys: Vec<(Name, u16)> = Vec::new();
+    if infra_cache::dnskey_get(&Name::root()).is_none() {
+        fetch_keys.push((Name::root(), consts::rtype::DNSKEY));
+    }
+    for child in &path {
+        if infra_cache::dnskey_get(child).is_none() {
+            fetch_keys.push((child.clone(), consts::rtype::DS));
+            fetch_keys.push((child.clone(), consts::rtype::DNSKEY));
+        }
+    }
+    let mut prefetched: FetchMap =
+        futures_util::future::join_all(fetch_keys.into_iter().map(move |(name, qtype)| async move {
+            let msg = fetcher.fetch(&name, qtype).await;
+            ((name, qtype), msg)
+        }))
+        .await
+        .into_iter()
+        .collect();
+
     // 1. Root DNSKEY: reuse the cached validated set if fresh, else fetch it,
     //    validate against the hardcoded anchor, and cache it (~once / 48 h).
     let mut current = Name::root();
     let mut keys: Vec<Vec<u8>> = if let Some(rk) = infra_cache::dnskey_get(&Name::root()) {
         rk
     } else {
-        let Some(root_msg) = fetcher.fetch(&Name::root(), consts::rtype::DNSKEY).await else {
+        let Some(root_msg) =
+            take_or_fetch(&mut prefetched, &Name::root(), consts::rtype::DNSKEY, fetcher).await
+        else {
             return (Verdict::Bogus, vec![]);
         };
         let (rk, rs) = split(&root_msg.answers, consts::rtype::DNSKEY);
@@ -159,7 +209,7 @@ pub async fn trusted_keys_for<F: Fetcher>(
     };
 
     // 2. Descend each zone cut, validating DS (in the parent) then the child DNSKEY.
-    for child in delegation_path(zone) {
+    for child in path {
         if child.eq_ignore_ascii_case(&current) {
             continue;
         }
@@ -172,7 +222,8 @@ pub async fn trusted_keys_for<F: Fetcher>(
         }
         let key_refs: Vec<&[u8]> = keys.iter().map(|v| v.as_slice()).collect();
 
-        let Some(ds_msg) = fetcher.fetch(&child, consts::rtype::DS).await else {
+        let Some(ds_msg) = take_or_fetch(&mut prefetched, &child, consts::rtype::DS, fetcher).await
+        else {
             return (Verdict::Bogus, vec![]);
         };
         let (ds_rd, ds_sig) = split(&ds_msg.answers, consts::rtype::DS);
@@ -197,8 +248,7 @@ pub async fn trusted_keys_for<F: Fetcher>(
             // empty DS as an insecure-delegation candidate when `child` clears that
             // bar; otherwise it's not a real cut, so skip it and keep validating
             // deeper against the SAME (already-trusted) parent keys.
-            let is_real_cut = fetcher
-                .fetch(&child, consts::rtype::NS)
+            let is_real_cut = take_or_fetch(&mut prefetched, &child, consts::rtype::NS, fetcher)
                 .await
                 .is_some_and(|ns_msg| {
                     ns_msg
@@ -236,7 +286,9 @@ pub async fn trusted_keys_for<F: Fetcher>(
 
         // Child DNSKEY validated against the now-trusted DS.
         let ds_list: Vec<verify::Ds> = ds_rd.iter().filter_map(|r| verify::parse_ds(r)).collect();
-        let Some(km) = fetcher.fetch(&child, consts::rtype::DNSKEY).await else {
+        let Some(km) =
+            take_or_fetch(&mut prefetched, &child, consts::rtype::DNSKEY, fetcher).await
+        else {
             return (Verdict::Bogus, vec![]);
         };
         let (ck, cs) = split(&km.answers, consts::rtype::DNSKEY);

@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.4]
+
+### Changed
+- **Recursor slow-path latency** (cache-miss). Three network-scheduling optimisations;
+  DNSSEC validation semantics are unchanged (same order, same fail-closed).
+  - DNSSEC chain fetched in parallel: `trusted_keys_for` pre-fetches every level's
+    DS/DNSKEY messages concurrently, then validates them strictly in order (each level
+    under the parent's keys). A cold ~5-RTT serial chain collapses toward ~1-2 RTT.
+    Cached levels (#230) are not re-fetched; the conditional NS probe falls back to a
+    direct fetch.
+  - Leaf answer + DNSKEY overlap (same servers, known from the referral).
+  - Cold hedge: with no RTT history, `query_ns_set` fans out to 2 nameservers at once
+    instead of waiting a hedge delay on a lone slow pick; hedge delay 300ms -> 150ms.
+
 ## [0.9.3]
 
 ### Fixed

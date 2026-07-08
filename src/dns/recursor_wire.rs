@@ -99,7 +99,7 @@ const QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Hedge delay: if the current authoritative server hasn't answered within this,
 /// fire the next one in parallel (the fastest reply wins). Bounds the worst case to
 /// roughly the best server's RTT instead of QUERY_TIMEOUT per mute server (#slow-path).
-const HEDGE_DELAY: Duration = Duration::from_millis(300);
+const HEDGE_DELAY: Duration = Duration::from_millis(150);
 /// Total upstream queries allowed for one user query (anti-DoS budget).
 const MAX_QUERIES: u32 = 80;
 /// Maximum delegation depth (root → TLD → … ) before giving up.
@@ -561,6 +561,9 @@ async fn query_ns_set(
     let mut ips: Vec<IpAddr> = ns_ips.to_vec();
     ips.sort_by_key(|ip| infra_cache::rtt_of(ip).unwrap_or(u32::MAX));
 
+    // Cold-cache detection (#B): true when NO server in the set has a known RTT.
+    let cold = !ips.is_empty() && ips.iter().all(|ip| infra_cache::rtt_of(ip).is_none());
+
     let mut inflight = FuturesUnordered::new();
     let mut next = 0usize;
 
@@ -571,6 +574,16 @@ async fn query_ns_set(
             let addr = SocketAddr::new(ips[next], 53);
             next += 1;
             inflight.push(query_server_timed(addr, qname, qtype));
+            // Cold cache (#B): on the very first launch, when NO server has a known
+            // RTT, fire a SECOND server at once (fastest reply wins) — a lone slow
+            // pick would otherwise stall a full HEDGE_DELAY before the hedge fires.
+            // Deeper servers keep the normal one-at-a-time hedge; budget is honoured.
+            if cold && next == 1 && next < ips.len() && *budget > 0 {
+                *budget -= 1;
+                let addr = SocketAddr::new(ips[next], 53);
+                next += 1;
+                inflight.push(query_server_timed(addr, qname, qtype));
+            }
         }
         if inflight.is_empty() {
             return None;
