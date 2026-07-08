@@ -473,7 +473,14 @@ impl Stats {
             cache_hits,
             cache_misses,
             xdp_cache_hits: xh,
-            cache_entries: self.cache_entries.load(Ordering::Relaxed),
+            // #obs (v0.9.3): report the REAL number of cached entries (the resolver
+            // cache map len), not the miss counter. `self.cache_entries` was incremented
+            // once per miss (capped at UPSTREAM_CACHE_SIZE), so it equalled cache_misses
+            // and made the dashboard read "N entries" when N was really "N misses".
+            cache_entries: crate::dns::cache_snapshot::XDP_CACHE_FOR_API
+                .get()
+                .map(|c| c.len() as u64)
+                .unwrap_or_else(|| self.cache_entries.load(Ordering::Relaxed)),
             local_hits: self.local_hits.load(Ordering::Relaxed),
             dnssec_secure: self.dnssec_secure.load(Ordering::Relaxed),
             dnssec_bogus: self.dnssec_bogus.load(Ordering::Relaxed),

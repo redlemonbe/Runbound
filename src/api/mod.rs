@@ -3685,7 +3685,12 @@ async fn cache_stats_handler(State(s): State<AppState>) -> impl IntoResponse {
     let hits = s.stats.cache_hits.load(Ordering::Relaxed) + xh;
     let misses = s.stats.cache_misses.load(Ordering::Relaxed);
     let evictions = s.cache_evictions.load(Ordering::Relaxed);
-    let entries = s.stats.cache_entries.load(Ordering::Relaxed);
+    // #obs (v0.9.3): real cached-entry count (resolver cache map len), not the
+    // per-miss counter — see stats.rs snapshot().
+    let entries = crate::dns::cache_snapshot::XDP_CACHE_FOR_API
+        .get()
+        .map(|c| c.len() as u64)
+        .unwrap_or_else(|| s.stats.cache_entries.load(Ordering::Relaxed));
     let total = hits + misses;
     let hit_rate_pct = if total == 0 {
         serde_json::Value::Null
