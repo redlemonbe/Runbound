@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.3]
+
+### Fixed
+- **CPU over-subscription on VMs / containers (self-inflicted latency).** `cpu::physical_cores()`
+  read host-wide `/sys` CPU topology, which is NOT namespaced: a Proxmox VM with vCPU hotplug
+  slots (or an LXC cpuset) advertises far more `cpuN` entries than the process may run on. On a
+  2-vCPU VM Runbound therefore spawned **64 tokio workers + 63 kernel-loop threads**, saturating
+  the box (load ~14, ~193% CPU at idle) and adding a **~200 ms scheduling stall to every
+  slow-path UDP answer** (blocks, CHAOS, and each cache-miss recursion) — cache hits on the fast
+  path stayed at ~1 ms, so the effective cache-hit rate and average latency looked "dirty".
+  `physical_cores()` now intersects the sysfs topology with the CPU-affinity mask
+  (`sched_getaffinity`, the same source as `nproc`), so worker/thread counts match the real
+  budget. Physical-only selection is preserved (cores are only dropped, never an SMT sibling
+  added — the ASM/XDP hot path stays HT-free). No-op on bare-metal.
+
 ## [0.9.2]
 
 ### Added

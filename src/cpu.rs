@@ -45,6 +45,22 @@ pub fn physical_cores() -> Vec<usize> {
             Err(_) => break,
         }
     }
+    // #vm-sizing (v0.9.3): /sys CPU topology is host-wide and NOT namespaced — a
+    // Proxmox VM with vCPU hotplug slots, an LXC cpuset, or offline CPUs advertises far
+    // more `cpuN` entries than this process may actually run on. Intersect with the
+    // affinity mask (sched_getaffinity, the same source as nproc) so thread/worker
+    // sizing matches the REAL budget: a 2-vCPU VM must not spawn 64 tokio workers + 63
+    // kloop threads (load 14, self-inflicted scheduling stall). Physical-only preserved:
+    // we only DROP cores absent from the mask, NEVER add an SMT sibling, so the ASM/XDP
+    // hot path stays HT-free. No-op on bare-metal (mask = every core).
+    #[cfg(target_os = "linux")]
+    if let Some(allowed) = affinity_mask() {
+        let filtered: Vec<usize> =
+            physical.iter().copied().filter(|c| allowed.contains(c)).collect();
+        if !filtered.is_empty() {
+            return filtered;
+        }
+    }
     if physical.is_empty() {
         let n = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -52,6 +68,28 @@ pub fn physical_cores() -> Vec<usize> {
         (0..n).collect()
     } else {
         physical
+    }
+}
+
+/// The set of logical CPUs this process may run on (`sched_getaffinity`). `None` on
+/// error / non-Linux. Used to clamp [`physical_cores`] to the real CPU budget in a
+/// VM/container whose sysfs advertises host-wide topology (see #vm-sizing).
+#[cfg(target_os = "linux")]
+fn affinity_mask() -> Option<std::collections::HashSet<usize>> {
+    // SAFETY: zeroed cpu_set_t, sched_getaffinity on self (pid 0), then CPU_ISSET reads
+    // within CPU_SETSIZE. All standard libc, no aliasing.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return None;
+        }
+        let mut cpus = std::collections::HashSet::new();
+        for c in 0..libc::CPU_SETSIZE as usize {
+            if libc::CPU_ISSET(c, &set) {
+                cpus.insert(c);
+            }
+        }
+        Some(cpus)
     }
 }
 
