@@ -5,83 +5,61 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
-## [0.9.6]
+## [0.9.3] - 2026-07-09
 
-### Changed
-- **Forward mode now caches DO=1 (DNSSEC) answers locally** so repeat validated
-  queries no longer re-forward to the upstream (signed answers bounded by RRSIG expiration, unsigned Insecure answers by record TTL). In forward mode a DO=1 client
-  query was re-sent to the upstream on every repeat (the XDP/UDP fast path only
-  caches the AD-less DO=0 datagram); it is now held in a dedicated cache keyed by
-  `(qname, qtype)`, storing the answer together with the covering RRSIGs the
-  upstream returned. Fail-closed: TTLs decay with elapsed time, the entry lifetime
-  is bounded by both the smallest record TTL and the nearest RRSIG expiration
-  (serial arithmetic, RFC 4034 §3.1.5, 24 h cap), a served TTL is clamped to the
-  remaining lifetime, an already-expired or RRSIG-less answer is never cached, and
-  the AD bit is relayed under the same authenticated-channel gate as the live path
-  (RFC 6840 §5.7). The DO=0 fast path is unchanged. `POST /api/cache/flush` clears
-  it alongside the resolver, validated and XDP caches.
-
----
-
-## [0.9.5]
-
-### Changed
-- **Forward mode relays the upstream AD (Authenticated Data) bit — safely.** A forwarder
-  does not validate DNSSEC itself, so the upstream AD is only propagated to the client when
-  BOTH hold: (a) the answer arrived over an authenticated DoT channel (`forward-tls-upstream`),
-  and (b) the client asked for validation (AD or DO bit set). Cleartext UDP/TCP upstreams
-  never propagate AD — a plaintext AD bit is spoofable (anti-spoofing, RFC 6840 §5.7).
-  The wire cache still stores the AD-less base form; AD is stamped only on the served copy.
-
----
-
-## [0.9.4]
+Consolidated release of all post-0.9.2 work: VM/container CPU sizing, DNSSEC-validated
+answer caching, parallel DNSSEC-chain recursion, forward-mode AD relay and DO=1 caching,
+and observability.
 
 ### Added
-- **DNSSEC verdict counters in OpenMetrics.** `GET /api/metrics` now exports
+- **DNSSEC verdict counters in OpenMetrics.** `GET /api/metrics` exports
   `runbound_dnssec_secure_total`, `runbound_dnssec_bogus_total` and
   `runbound_dnssec_insecure_total` (previously only in `GET /api/stats` and the WebUI).
-- **Finer latency histogram above 1 s.** The fixed histogram gains 1.5 s / 2 s / 3 s
-  bucket bounds (15 buckets total), sharpening p95/p99 for slow cache-miss recursions.
+- **Finer latency histogram above 1 s.** The fixed histogram gains 1.5 s / 2 s / 3 s bucket
+  bounds (15 buckets total), sharpening p95/p99 for slow cache-miss recursions.
 
 ### Changed
-- **DNSSEC-validated answers are cached (DO=1).** The shared wire cache previously stored
-  only the RRSIG-free (DO=0) form, so DO=1 queries — the bulk of real traffic — re-recursed
-  on every hit. A validating cache now holds the full validated answer keyed by
-  `(qname, qtype)`; `Bogus` is never cached, and entry lifetime is bounded by both the
-  smallest record/authority TTL and the nearest RRSIG expiration (fail-closed).
-- **Recursor slow-path latency** (cache-miss). Three network-scheduling optimisations;
-  DNSSEC validation semantics are unchanged (same order, same fail-closed).
-  - DNSSEC chain fetched in parallel: `trusted_keys_for` pre-fetches every level's
-    DS/DNSKEY messages concurrently, then validates them strictly in order (each level
-    under the parent's keys). A cold ~5-RTT serial chain collapses toward ~1-2 RTT.
-    Cached levels (#230) are not re-fetched; the conditional NS probe falls back to a
-    direct fetch.
+- **DNSSEC-validated answers are cached (DO=1, full-recursion).** The shared wire cache
+  previously stored only the RRSIG-free (DO=0) form, so DO=1 queries — the bulk of real
+  traffic — re-recursed on every hit. A validating cache now holds the full validated answer
+  keyed by `(qname, qtype)`; `Bogus` is never cached, and entry lifetime is bounded by both
+  the smallest record/authority TTL and the nearest RRSIG expiration (fail-closed). Measured
+  on the production master: validated hit rate ~7 % -> 35 %+, mean latency ~532 ms -> ~170 ms.
+- **Recursor slow-path latency** (cache-miss). Three network-scheduling optimisations; DNSSEC
+  validation semantics unchanged (same order, same fail-closed).
+  - DNSSEC chain fetched in parallel: `trusted_keys_for` pre-fetches every level's DS/DNSKEY
+    concurrently, then validates strictly in order. A cold ~5-RTT serial chain collapses toward
+    ~1-2 RTT. Measured: -39 % median cold cache-miss latency.
   - Leaf answer + DNSKEY overlap (same servers, known from the referral).
-  - Cold hedge: with no RTT history, `query_ns_set` fans out to 2 nameservers at once
-    instead of waiting a hedge delay on a lone slow pick; hedge delay 300ms -> 150ms.
-
-## [0.9.3]
+  - Cold hedge: with no RTT history, `query_ns_set` fans out to 2 nameservers at once instead
+    of waiting on a lone slow pick; hedge delay 300 ms -> 150 ms.
+- **Forward mode relays the upstream AD (Authenticated Data) bit — safely.** A forwarder does
+  not validate DNSSEC itself, so the upstream AD is propagated to the client only when BOTH
+  hold: (a) the answer arrived over an authenticated DoT channel (`forward-tls-upstream`), and
+  (b) the client asked for validation (AD or DO set). Cleartext UDP/TCP upstreams never
+  propagate AD (anti-spoofing, RFC 6840 §5.7). The cache still stores the AD-less base form;
+  AD is stamped only on the served copy.
+- **Forward mode caches DO=1 (DNSSEC) answers locally** so repeat validated queries no longer
+  re-forward to the upstream. Signed answers are cached with their RRSIGs and bounded by RRSIG
+  expiration; unsigned (Insecure) answers are bounded by record TTL alone. Fail-closed: TTLs
+  decay and are clamped to the entry lifetime, an already-expired RRSIG is never cached, the
+  DO=0 fast path is unchanged, and AD is relayed under the same authenticated-channel gate.
+  Measured on the production master (forward mode): hit rate ~13 % -> ~33 %.
 
 ### Fixed
-- **`GET /api/config` now reports `cache_min_ttl`.** The TTL floor was applied at
-  cache-insert time but omitted from the config dump; it is now serialised alongside
-  `cache_max_ttl`.
-- **`cache_entries` reports the real cached-entry count.** `GET /api/stats` and
-  `GET /api/cache/stats` exposed a per-miss counter (capped at the cache size) that
-  equalled `cache_misses`; they now report the live resolver-cache map length
-  (`XDP_CACHE_FOR_API.len()`), falling back to the counter only when the map is not wired.
 - **CPU over-subscription on VMs / containers (self-inflicted latency).** `cpu::physical_cores()`
   read host-wide `/sys` CPU topology, which is NOT namespaced: a Proxmox VM with vCPU hotplug
   slots (or an LXC cpuset) advertises far more `cpuN` entries than the process may run on. On a
-  2-vCPU VM Runbound therefore spawned **64 tokio workers + 63 kernel-loop threads**, saturating
-  the box (load ~14, ~193% CPU at idle) and adding a **~200 ms scheduling stall to every
-  slow-path UDP answer** (blocks, CHAOS, and each cache-miss recursion) — cache hits on the fast
-  path stayed at ~1 ms, so the effective cache-hit rate and average latency looked "dirty".
-  `physical_cores()` now intersects the sysfs topology with the CPU-affinity mask
-  (`sched_getaffinity`, the same source as `nproc`), so worker/thread counts match the real
-  budget. Physical-only selection is preserved (cores are only dropped, never an SMT sibling
-  added — the ASM/XDP hot path stays HT-free). No-op on bare-metal.
+  2-vCPU VM Runbound spawned **64 tokio workers + 63 kernel-loop threads**, saturating the box
+  (load ~14, ~193 % CPU at idle) and adding a **~200 ms scheduling stall to every slow-path UDP
+  answer**. `physical_cores()` now intersects the sysfs topology with the CPU-affinity mask
+  (`sched_getaffinity`), so worker/thread counts match the real budget. Physical-only selection
+  is preserved (cores only dropped, never an SMT sibling added). No-op on bare-metal.
+- **`cache_entries` reports the real cached-entry count.** `GET /api/stats` and
+  `GET /api/cache/stats` exposed a per-miss counter that equalled `cache_misses`; they now
+  report the live resolver-cache map length (`XDP_CACHE_FOR_API.len()`).
+- **`GET /api/config` now reports `cache_min_ttl`** alongside `cache_max_ttl` (the TTL floor was
+  applied at cache-insert time but omitted from the config dump).
 
 ## [0.9.2]
 
