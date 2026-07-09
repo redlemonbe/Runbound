@@ -1,13 +1,14 @@
 # 10 — Appendices
 
-> **Status: current (0.9.2, last full sync pass: 2026-07-07)** — intentionally pointer-style: references
+> **Status: current (0.9.4, last full sync pass: 2026-07-09)** — intentionally pointer-style: references
 > `docs/configuration.md` and `docs/api.md` rather than duplicating them.
 
 ## A. Configuration reference
 See `docs/configuration.md`. Notable directives: `xdp`, `api-port`, `api-key`,
 `api-socket` (#174), `ui-bind` (default `127.0.0.1` — set `0.0.0.0` to expose
 the WebUI on the network), `log-format` (#175, json/text), `upstream-racing`, `serve-stale`,
-DoT upstreams, split-horizon, firewall.
+`cache-min-ttl` (TTL floor, surfaced in `GET /api/config`), DoT upstreams, split-horizon,
+firewall.
 
 > **Build note.** Sovereign full recursion (`src/dns/recursor_wire.rs`) and DNSSEC
 > validation (`src/dns/dnssec_*.rs`) are entirely in-house and always compiled in —

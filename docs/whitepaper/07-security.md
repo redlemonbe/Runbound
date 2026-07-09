@@ -1,6 +1,6 @@
 # 07 — Security
 
-> **Status: current (0.9.2, last full sync pass: 2026-07-07)** — condensed, with code anchors; open items are listed
+> **Status: current (0.9.4, last full sync pass: 2026-07-09)** — condensed, with code anchors; open items are listed
 > at the end. Cross-references `SECURITY.md`, `THREAT_MODEL.md`,
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 

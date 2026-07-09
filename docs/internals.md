@@ -516,7 +516,12 @@ feature gating it. Full-recursion is a **runtime config toggle**
 (`resolution: full-recursion` vs the default `forward`), not a compile-time feature: no
 special build or rebuild is needed. When enabled, cache misses are resolved
 **iteratively from the root** (RFC 9156 QNAME minimisation, anti-SSRF guards on
-glue/NS/CNAME addresses, and DNSSEC validation when `dnssec-validation: yes`). The mode is toggled live via `PUT /api/resolution` (master
+glue/NS/CNAME addresses, and DNSSEC validation when `dnssec-validation: yes`). Under
+`dnssec-validation: yes`, validated answers are also held in a dedicated validating cache
+(`VALIDATED_CACHE`, keyed by `(qname, qtype)`) so DO=1 clients are served from cache
+instead of re-recursing on every hit (0.9.4); entry lifetime is bounded by both the
+smallest record/authority TTL and the nearest RRSIG expiration, and `Bogus` results are
+never cached. The mode is toggled live via `PUT /api/resolution` (master
 propagates to slaves over the relay); `src/dns/recursor_wire.rs::rebuild_shared`
 hot-swaps the `ArcSwap<Option<…>>` handle.
 

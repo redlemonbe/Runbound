@@ -1,6 +1,6 @@
 # 04 — The slow path (wire-native `serve_wire`)
 
-> **Status: current (0.9.2, last full sync pass: 2026-07-07).** The slow path is served
+> **Status: current (0.9.4, last full sync pass: 2026-07-09).** The slow path is served
 > entirely by the in-house wire codec (`serve_wire`, `src/dns/server.rs`), and recursion +
 > DNSSEC validation are entirely in-house too (`src/dns/recursor_wire.rs`,
 > `src/dns/dnssec_*.rs`) and always compiled in — there is no `recursor` Cargo feature.
@@ -101,30 +101,66 @@ Sovereign full-recursion is a **runtime config toggle**, not a Cargo feature —
 backend from forward to the in-house iterative resolver (`src/dns/recursor_wire.rs`); the
 default is `resolution: forward`. Both code paths ship in every build; there is no
 `recursor` build flag. Under full-recursion the resolver also keeps a TTL-bounded
-**infrastructure cache** — zone cuts + validated DNSKEY chains (§5.7, #230) — so repeated
-misses do not re-walk from the root.
+**infrastructure cache** — zone cuts + validated DNSKEY chains (§5.7, #230) — and, when
+`dnssec-validation: yes`, a cache of DNSSEC-validated answers (§5.8) — so repeated misses do
+not re-walk from the root.
+
+> **Forward vs full-recursion — a latency/sovereignty trade-off.** Forwarding to a public
+> resolver over DoT is intrinsically *lower-latency* than sovereign full-recursion: the
+> upstream answers from a large, globally warm cache and Runbound skips the cold iterative
+> walk root → TLD → authoritative zone. Full-recursion trades that latency for sovereignty
+> and privacy — no third party sees the query stream and the answer is validated end-to-end
+> in-house. The caches in §4.2.1, §5.7 and §5.8 exist to narrow the cold-walk gap on
+> repeated misses; they do not remove the very first, cold miss.
 
 ### 4.2.1 Hedged, RTT-ordered nameserver selection
 
 Each iterative step must pick which of a delegation's nameservers to query. The recursor
 does **not** try them sequentially with a long per-server timeout; it queries the set with
-RTT-based ordering and hedging (`query_ns_set`, `src/dns/recursor_wire.rs:552`):
+RTT-based ordering and hedging (`query_ns_set`, `src/dns/recursor_wire.rs:554`):
 
 - **RTT ordering.** The nameserver IPs are sorted fastest-known-first
-  (`ips.sort_by_key(|ip| infra_cache::rtt_of(ip)…)`, `recursor_wire.rs:562`); a
+  (`ips.sort_by_key(|ip| infra_cache::rtt_of(ip)…)`, `recursor_wire.rs:564`); a
   never-measured server sorts last (`u32::MAX`). Per-server RTT is a smoothed EWMA
   (3/4 old + 1/4 new sample) kept in the infrastructure cache
   (`infra_cache::record_rtt`/`rtt_of`, `src/dns/infra_cache.rs:41`/`:52`), updated on
-  every successful exchange (`recursor_wire.rs:583`).
+  every successful exchange (`recursor_wire.rs:598`).
 - **Hedging.** The fastest server is launched first; if it has not answered within
-  `HEDGE_DELAY = 300 ms` (`recursor_wire.rs:102`) the next server is fired **in parallel**
-  and the first valid reply wins (`tokio::select!` over a `FuturesUnordered`,
-  `recursor_wire.rs:576-591`). This turns a mute or slow first server from a full
-  `QUERY_TIMEOUT` stall into roughly best-RTT + one hedge delay.
+  `HEDGE_DELAY = 150 ms` (`recursor_wire.rs:104`, halved from 300 ms in 0.9.4) the next
+  server is fired **in parallel** and the first valid reply wins (`tokio::select!` over a
+  `FuturesUnordered`, `query_ns_set`, `recursor_wire.rs:554`). This turns a mute or slow
+  first server from a full `QUERY_TIMEOUT` stall into roughly best-RTT + one hedge delay.
+- **Cold-cache hedge (0.9.4).** When **no** server in the set has a known RTT — a cold
+  cache, where RTT ordering has nothing to sort on — `query_ns_set` fires the **first two**
+  servers at once on the opening launch (the `cold` branch, `recursor_wire.rs:567`), fastest
+  reply wins, rather than paying a full `HEDGE_DELAY` before the hedge fires for a lone slow
+  pick. Deeper servers keep the normal one-at-a-time hedge and the caller's query budget is
+  still decremented per launch.
 - **Tighter timeout.** The per-exchange hard cap is `QUERY_TIMEOUT = 1500 ms`
-  (`recursor_wire.rs:98`) — down from 3 s — bounded further by the caller's overall query
+  (`recursor_wire.rs:100`) — down from 3 s — bounded further by the caller's overall query
   budget. Each launched exchange decrements that budget, so a delegation with many
   nameservers cannot fan out without limit.
+
+### 4.2.2 Parallel DNSSEC-chain prefetch (0.9.4)
+
+Validating an answer needs the DS + DNSKEY of every zone cut from the root down to the
+target (`trusted_keys_for`, `src/dns/dnssec_chain.rs:140`). On a cold infrastructure cache
+these were fetched **serially** — each level's DNSKEY before the next level's DS — roughly
+five sequential round-trips for a typical name.
+
+`trusted_keys_for` now **pre-fetches the whole chain's DS/DNSKEY messages in parallel**
+(`futures_util::future::join_all`, `src/dns/dnssec_chain.rs:173`) and then validates them
+**strictly in order**, each level under its parent's already-validated keys, fail-closed on
+`Bogus` — the validation itself is unchanged. These are independent network reads (each
+server answers its own datum), so concurrency only anticipates data; it alters neither what
+is validated nor the order in which it is validated. A level already in the infrastructure
+cache (§5.7, #230) is not pre-fetched, and any unanticipated fetch (e.g. the conditional NS
+probe that tells a real insecure delegation from a synthetic label) falls back to a direct
+fetch via `take_or_fetch`. Pre-fetching a level that a higher level later proves Insecure
+just wastes a few reads — never a validation shortcut.
+
+Combined with the cold-cache hedge above, the cold DNSSEC chain collapses from ~5 serial
+RTTs toward ~1–2. Measured on the production master: cold cache-miss latency −39 % median.
 
 ## 4.3 Upstream health monitoring
 

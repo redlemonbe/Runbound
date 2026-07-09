@@ -10,9 +10,12 @@ Runbound does but *how* and *why* — down to the hand-written assembly on the h
 and the eBPF verifier constraints that shaped the in-kernel code.
 
 > **Status & honesty.** This document describes the code as it exists in the repository
-> at **0.9.2** (last full sync pass: 2026-07-07 — QNAME minimisation #231, compact denial
-> #232, IPv6 slow-path binding #233, a live-editable per-source DNS rate limit, auto-ban
-> hardening across both datapaths, and a full `docs/api.md` resync). Where a claim is not backed by a
+> at **0.9.4** (last full sync pass: 2026-07-09 — a DNSSEC-validated answer cache so DO=1
+> queries stop re-recursing (0.9.4); parallelised DNSSEC-chain fetches + cold-cache hedging
+> on the recursor slow path (0.9.4); CPU-affinity-aware worker sizing on VMs/containers
+> (0.9.3); and observability fixes — DNSSEC OpenMetrics counters, finer latency buckets, a
+> real cached-entry count, and a `cache-min-ttl` directive surfaced in `/api/config`
+> (0.9.3/0.9.4)). Where a claim is not backed by a
 > measurement or by the code, it is marked **"I cannot confirm this."** No marketing
 > language is used: the words *production-ready, blazing, world-first, military-grade,
 > rock-solid, unbreakable, guaranteed* are banned, in line with the project's
@@ -31,7 +34,7 @@ Each chapter is a standalone Markdown file. Line references point at real source
 | 02 | [The XDP fast path](02-fast-path-xdp.md) | eBPF program, AF_XDP zero-copy, XSKMAP/CPUMAP routing, 802.1Q tagged fabrics, per-view split-horizon snapshots, the zero-alloc wire response builder (positive + negative answers) |
 | 03 | [SIMD & hand-written assembly](03-simd-and-asm.md) | CRC32c domain hashing, AVX2/SSE2 label lowercasing & comparison, the eBPF FNV-vs-CRC verifier story |
 | 04 | [The slow path](04-slow-path.md) | the `xdp:no` kernel fast loop (SO_REUSEPORT per core, by-CPU cBPF + RPS, batched recvmmsg/sendmmsg, shared rate-limit/ban gate, shared wire responder); startup NIC auto-tune (NUMA-local queues/IRQs, RPS, coalescing); the wire-native `serve_wire` handler (forward, DoT/DoH, AXFR/IXFR, TSIG, DDNS, DNSSEC signing, serve-stale); the in-house sovereign full-recursion resolver, always compiled in but off by runtime default (a config toggle, not a Cargo feature) |
-| 05 | [Caching](05-cache.md) | Cache sizing under cgroup v2, stale serving, negative cache |
+| 05 | [Caching](05-cache.md) | Cache sizing under cgroup v2, stale serving, negative cache, recursor infrastructure cache, DNSSEC-validated answer cache |
 | 06 | [Control plane](06-control-plane.md) | REST API (axum), config-writer (atomic full-regen), web UI, HMAC relay, SSE, split-horizon, Unix socket |
 | 07 | [Security](07-security.md) | rate-limit + bans on both datapaths (one shared gate), DNSSEC AD, constant-time auth, least-privilege systemd, HMAC relay, reproducible build + signatures, SBOM, audit discipline |
 | 08 | [Performance](08-performance.md) | Benchmark methodology, measured ceilings, lessons learned |

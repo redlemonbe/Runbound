@@ -34,6 +34,16 @@ not only local-zone answers:
   (`XDP_WORKER_PKTS`), which carry all cache hits under `xdp: no`
   (`Stats::reset_cache`, `src/stats.rs:362`). Without this, a flush left the hit-rate stuck
   at 100 % (hits > 0, misses 0) with no traffic afterwards.
+- **DNSSEC verdict families in OpenMetrics (0.9.4).** `GET /api/metrics` exposes
+  `runbound_dnssec_secure_total`, `runbound_dnssec_bogus_total` and
+  `runbound_dnssec_insecure_total` (`src/api/mod.rs:4036-4048`), fed by the per-verdict
+  counters the validating resolver increments. The latency histogram also gained two finer
+  buckets above 1 s — upper bounds `1_500_000` and `2_000_000` µs (`HIST_BOUNDS_US`,
+  `src/stats.rs:46`; 13 → 15 buckets) — so a slow cold-recursion tail is visible instead of
+  collapsing into one "> 1 s" bucket.
+- **`cache_min_ttl` reported by `GET /api/config` (0.9.3).** The `cache-min-ttl` TTL floor
+  was applied internally but not surfaced; `/api/config` now returns it
+  (`src/api/mod.rs:1416`) next to `cache_max_ttl`.
 
 ## 6.2 Config-writer — full regeneration, atomic
 

@@ -398,11 +398,11 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/stat
 | `blocked_percent` | `blocked / total × 100` — REFUSED blocking rate (f64, one decimal place) |
 | `qps_1m` / `qps_5m` | Average queries/second over the last 1 and 5 minutes |
 | `qps_peak` | All-time highest queries in any single second |
-| `latency_p50/95/99_ms` | Latency percentiles from a fixed 10-bucket histogram (zero-alloc) |
+| `latency_p50/95/99_ms` | Latency percentiles from a fixed 15-bucket histogram (zero-alloc); bucket bounds run to 3 s with finer resolution above 1 s (1.5 s / 2 s / 3 s, since 0.9.4) |
 | `cache_hit_rate` | Percentage of lookups served from the in-process DNS cache (`cache_hits / (cache_hits + cache_misses) × 100`) |
 | `cache_hits` / `cache_misses` | Canonical cache hit/miss counters (slow path + XDP fast-path workers, summed) |
 | `xdp_cache_hits` | Cache hits served specifically by the XDP fast path (subset of `cache_hits`) |
-| `cache_entries` | Approximate distinct domains cached |
+| `cache_entries` | Live entry count of the resolver cache map — the real map length (`XDP_CACHE_FOR_API.len()`), not the per-miss counter (fixed in 0.9.3) |
 | `total_queries` | Alias of `total` (same value; kept for dashboard compatibility) |
 | `stale_served` | Answers served from an expired cache entry (serve-stale, RFC 8767) |
 | `latency_min_ms` / `latency_avg_ms` / `latency_max_ms` | Min / mean / max response latency (ms) since start |
@@ -602,6 +602,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/conf
   "rate_limit": 200,
   "rate_limit_burst": 400,
   "cache_max_ttl": 86400,
+  "cache_min_ttl": 0,
   "dnssec_validation": false,
   "resolution_mode": "forward",
   "log_retention": 1000,
@@ -745,6 +746,15 @@ runbound_queries_nxdomain_total 4500
 # HELP runbound_queries_servfail_total Queries answered SERVFAIL
 # TYPE runbound_queries_servfail_total counter
 runbound_queries_servfail_total 11
+# HELP runbound_dnssec_secure_total Answers DNSSEC-validated as Secure
+# TYPE runbound_dnssec_secure_total counter
+runbound_dnssec_secure_total 1042
+# HELP runbound_dnssec_bogus_total Answers DNSSEC-validated as Bogus (served as SERVFAIL)
+# TYPE runbound_dnssec_bogus_total counter
+runbound_dnssec_bogus_total 3
+# HELP runbound_dnssec_insecure_total Answers in unsigned (Insecure) zones
+# TYPE runbound_dnssec_insecure_total counter
+runbound_dnssec_insecure_total 897
 # HELP runbound_queries_local_hits_total Queries answered from local zones
 # TYPE runbound_queries_local_hits_total counter
 runbound_queries_local_hits_total 3200
@@ -844,11 +854,13 @@ runbound_alert_tarpitted_ips 1
 runbound_tcp_connections_active 12
 ```
 
-> There is no `runbound_dnssec_total` metric — DNSSEC secure/bogus/insecure counts are
-> exposed via `GET /api/stats` (`dnssec` object) and the WebUI, not the OpenMetrics
-> endpoint. `runbound_node_info{node="..."}` is emitted first when a node id is configured.
+> DNSSEC secure/bogus/insecure counts are exposed as three counters
+> (`runbound_dnssec_secure_total`, `runbound_dnssec_bogus_total`, `runbound_dnssec_insecure_total`,
+> since 0.9.4), alongside the `dnssec` object of `GET /api/stats` and the WebUI. There is no
+> aggregate `runbound_dnssec_total` metric. `runbound_node_info{node="..."}` is emitted first
+> when a node id is configured.
 
-**Metric families:** node identity (`runbound_node_info`); query totals (`runbound_queries_total`) + per-type (`runbound_queries_by_type_total`) + rcode (`runbound_queries_blocked_total`, `runbound_queries_forwarded_total`, `runbound_queries_nxdomain_total`, `runbound_queries_servfail_total`, `runbound_queries_local_hits_total`); QPS (`runbound_qps_1m`, `runbound_qps_peak` — distinct metrics, no `window`/`quantile` labels); latency (`runbound_latency_p50_ms`, `runbound_latency_p95_ms`, `runbound_latency_p99_ms`); cache (`runbound_cache_hit_rate`, `runbound_cache_hits_total`, `runbound_cache_misses_total`, `runbound_cache_evictions_total`, `runbound_cache_entries`); XDP cache (`runbound_xdp_cache_hits_total`, `runbound_xdp_cache_misses_total`, `runbound_xdp_kernel_snapshot_hits_total`, `runbound_xdp_kernel_snapshot_misses_total`, `runbound_xdp_cache_entries`, `runbound_xdp_active`); NIC (`runbound_nic_rx_ring`, `runbound_nic_rx_ring_max`, `runbound_nic_rx_dropped_total`); uptime (`runbound_uptime_seconds`); **DDoS/abuse** (`runbound_icmp_handled_total`, `runbound_icmp_replied_total`, `runbound_icmp_dropped_total`, `runbound_icmp_rate_limited_total`, `runbound_banned_ips`, `runbound_alert_blocked_ips`, `runbound_alert_tarpitted_ips`); **listener saturation** (`runbound_tcp_connections_active`); per-upstream health + latency (`runbound_upstream_healthy`, `runbound_upstream_latency_ms`). There is **no** `runbound_dnssec_total` metric.
+**Metric families:** node identity (`runbound_node_info`); query totals (`runbound_queries_total`) + per-type (`runbound_queries_by_type_total`) + rcode (`runbound_queries_blocked_total`, `runbound_queries_forwarded_total`, `runbound_queries_nxdomain_total`, `runbound_queries_servfail_total`, `runbound_queries_local_hits_total`); **DNSSEC** (`runbound_dnssec_secure_total`, `runbound_dnssec_bogus_total`, `runbound_dnssec_insecure_total` — since 0.9.4); QPS (`runbound_qps_1m`, `runbound_qps_peak` — distinct metrics, no `window`/`quantile` labels); latency (`runbound_latency_p50_ms`, `runbound_latency_p95_ms`, `runbound_latency_p99_ms`); cache (`runbound_cache_hit_rate`, `runbound_cache_hits_total`, `runbound_cache_misses_total`, `runbound_cache_evictions_total`, `runbound_cache_entries`); XDP cache (`runbound_xdp_cache_hits_total`, `runbound_xdp_cache_misses_total`, `runbound_xdp_kernel_snapshot_hits_total`, `runbound_xdp_kernel_snapshot_misses_total`, `runbound_xdp_cache_entries`, `runbound_xdp_active`); NIC (`runbound_nic_rx_ring`, `runbound_nic_rx_ring_max`, `runbound_nic_rx_dropped_total`); uptime (`runbound_uptime_seconds`); **DDoS/abuse** (`runbound_icmp_handled_total`, `runbound_icmp_replied_total`, `runbound_icmp_dropped_total`, `runbound_icmp_rate_limited_total`, `runbound_banned_ips`, `runbound_alert_blocked_ips`, `runbound_alert_tarpitted_ips`); **listener saturation** (`runbound_tcp_connections_active`); per-upstream health + latency (`runbound_upstream_healthy`, `runbound_upstream_latency_ms`). There is **no** `runbound_dnssec_total` metric.
 
 **Prometheus scrape config:**
 
@@ -1139,7 +1151,7 @@ curl -H "Authorization: Bearer $RUNBOUND_API_KEY" http://localhost:8080/api/cach
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `entries` | u64 | Current number of entries in the DNS cache |
+| `entries` | u64 | Live entry count of the resolver cache map (real map length since 0.9.3, not the per-miss counter) |
 | `hits` | u64 | Responses served from cache — slow-path counter plus the summed XDP fast-path worker hits (same canonical sum as `GET /api/stats`) |
 | `misses` | u64 | Cache misses forwarded to an upstream |
 | `evictions` | u64 | Entries evicted to enforce the cache size limit |

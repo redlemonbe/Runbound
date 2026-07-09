@@ -815,11 +815,16 @@ WARN cpu-affinity is deprecated and ignored — CPU placement is now automatic (
 There is no config field behind this directive anymore; it is accepted purely so
 existing config files still parse without error.
 
-### Cache TTL cap
+### Cache TTL floor / cap
 
 ```
+cache-min-ttl: 60     # never cache an answer for less than 60 s (default: 0 = off)
 cache-max-ttl: 3600   # cap all TTLs at 1 hour (default: 86400)
 ```
+
+`cache-min-ttl` raises very short TTLs to a floor before an answer is cached. The two
+bounds are applied together as `ttl.max(cache-min-ttl).min(cache-max-ttl)`, so the floor
+is clamped by the cap when both are set; `cache-min-ttl: 0` (the default) disables it.
 
 Upstream resolvers sometimes return TTLs of 24–48 hours. Capping the TTL limits
 how long a stale or poisoned record lingers in clients' caches.

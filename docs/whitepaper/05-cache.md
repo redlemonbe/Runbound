@@ -64,6 +64,11 @@ miss counter `XDP_WORKER_MISS[64]` (`:143`) mirrors the existing per-worker
 `XDP_WORKER_PKTS[64]` (`:133`, served = hits); the hit *rate* is computed in Rust off the
 hot path, so the hot path only does a `fetch_add` on the miss/fallback branch.
 
+The `cache_entries` field of `/api/system` reports the **real number of live entries** — the
+snapshot map's `len()` (`XDP_CACHE_FOR_API`, `src/stats.rs:481`) — not the running
+`cache_entries` counter, which is now only a fallback used when the snapshot map is not yet
+built (0.9.3 fix: the counter had been a miss tally, so the reported entry count was wrong).
+
 ## 5.6 Persistence (#29)
 
 `save_xdp_cache`/`load_xdp_cache` serialise the DashMap to disk with `rkyv` (zero-copy
@@ -95,3 +100,41 @@ after a Secure result, an expired entry is ignored (forcing re-validation), and 
 answer is still DNSSEC-validated regardless of which cached cut was used. Measured on the
 production master: three NXDOMAIN misses under the same parent collapse from ~240 ms (cold)
 to ~55 ms (warm).
+
+## 5.8 DNSSEC-validated answer cache (#dnssec-cache)
+
+§5.7 caches the *infrastructure* (zone cuts + validated DNSKEY chains) so a miss no longer
+re-walks from the root. This section caches the *answer itself* for the validating resolver.
+
+Under `resolution: full-recursion` with `dnssec-validation: yes`, the validating entry point
+is `resolve_validated` (`src/dns/recursor_wire.rs:853`). Before this cache, only the
+RRSIG-free wire form served to DO=0 clients was cached; every **DO=1** query (the EDNS
+"DNSSEC OK" bit, which the overwhelming majority of real traffic sets) fell through and
+re-recursed — a measured validated hit rate of **~7 %** (`src/dns/recursor_wire.rs:681`).
+
+`resolve_validated` now memoises the full validated result — answer records, the covering
+RRSIGs, the validated authority (RFC 2308 SOA + NSEC/NSEC3 denial proof) and the DNSSEC
+verdict — in `VALIDATED_CACHE`, a `DashMap<(Name, u16), …>` keyed by `(qname, qtype)`
+(`src/dns/recursor_wire.rs:742`). A DO=1 client is then served the cached, signed answer
+without re-recursing; `Name` compares case-insensitively, so mixed-case queries share one
+entry.
+
+The cache is **fail-closed** (`cache_validated`, `src/dns/recursor_wire.rs:784`):
+
+- A `Bogus` verdict is **never** inserted, hence never served.
+- Entry lifetime is bounded by `min(smallest record/authority TTL, seconds to the nearest
+  RRSIG expiration, 24 h cap)`. The RRSIG bound uses wrap-safe serial arithmetic
+  (`nearest_rrsig_secs`, RFC 4034 §3.1.5), so a hit can never outlive a signature's validity
+  (`VALIDATED_CACHE_TTL_CAP = 86_400`).
+- TTLs **decay**: a hit returns `TTL_original − elapsed` (`clone_decremented`); if any RRset
+  TTL has reached 0, or the monotonic deadline has passed, the entry is treated as a miss and
+  dropped.
+- Size is bounded at `VALIDATED_CACHE_MAX = 100_000`; once full, only **new** keys are
+  refused (existing keys keep expiring / being refreshed in place — no LRU).
+- `POST /api/cache/flush` clears it alongside the resolver + XDP caches
+  (`flush_validated_cache`, `src/dns/recursor_wire.rs:828`).
+
+Because the entry is a fully validated `Validated` (records + RRSIGs + validated authority +
+verdict), it is served straight to DO=1 clients — the exact case that previously always
+re-recursed. Measured on the production master as the cache warms: the validated hit rate
+rises from ~7 % to **35 %+** and mean query latency falls from **~532 ms to ~170 ms**.
