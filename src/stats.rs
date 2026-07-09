@@ -42,10 +42,11 @@ pub fn new_snapshot_cache(stats: &Stats) -> SharedSnapshot {
 //   [4]  ≤ 5 ms     [5]  ≤ 10 ms    [6]  ≤ 50 ms   [7]  ≤ 100 ms
 //   [8]  ≤ 250 ms   [9]  ≤ 500 ms  [10]  ≤ 1 s     [11]  ≤ 3 s
 //   [12] > 3 s     (overflow — reported as lower bound, not a fake midpoint)
-pub const HIST_BOUNDS_US: [u64; 12] = [
-    100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 3_000_000,
+pub const HIST_BOUNDS_US: [u64; 14] = [
+    100, 500, 1_000, 2_000, 5_000, 10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 1_500_000,
+    2_000_000, 3_000_000,
 ];
-pub const HIST_BUCKETS: usize = 13;
+pub const HIST_BUCKETS: usize = 15;
 
 // ── QPS ring buffer ────────────────────────────────────────────────────────
 // 300 slots × 1 second each = 5-minute sliding window.

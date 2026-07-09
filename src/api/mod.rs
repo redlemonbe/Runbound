@@ -4032,6 +4032,21 @@ fn render_prometheus_metrics(
         snap.servfail,
     ));
     out.push_str(&fmt_counter(
+        "runbound_dnssec_secure_total",
+        "Answers DNSSEC-validated as Secure",
+        snap.dnssec_secure,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_dnssec_bogus_total",
+        "Answers DNSSEC-validated as Bogus (served as SERVFAIL)",
+        snap.dnssec_bogus,
+    ));
+    out.push_str(&fmt_counter(
+        "runbound_dnssec_insecure_total",
+        "Answers in unsigned (Insecure) zones",
+        snap.dnssec_insecure,
+    ));
+    out.push_str(&fmt_counter(
         "runbound_queries_local_hits_total",
         "Queries answered from local zones",
         snap.local_hits,
@@ -6223,6 +6238,9 @@ mod tests {
             "runbound_queries_forwarded_total",
             "runbound_queries_nxdomain_total",
             "runbound_queries_servfail_total",
+            "runbound_dnssec_secure_total",
+            "runbound_dnssec_bogus_total",
+            "runbound_dnssec_insecure_total",
             "runbound_queries_local_hits_total",
             "runbound_qps_1m",
             "runbound_qps_peak",
