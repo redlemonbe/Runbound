@@ -897,6 +897,10 @@ mod forward_do_cache_tests {
     use super::*;
     use crate::dns::wire::consts::rtype;
 
+    // The tests below share the process-global FORWARD_DO_CACHE and flush it; run them
+    // serially so one test's flush never races another's insert (poison-tolerant).
+    static FORWARD_CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Build an RRSIG record whose signature-expiration field (RFC 4034 §3.1,
     /// octets 8..12 of the rdata) is `expiration` epoch-seconds. The other rdata
     /// fields are irrelevant to the cache's lifetime bound, so they stay zero.
@@ -925,6 +929,7 @@ mod forward_do_cache_tests {
 
     #[test]
     fn ttl_bounded_by_rrsig_expiration() {
+        let _g = FORWARD_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         flush_forward_do_cache();
         let now: u32 = 1_000_000;
         let name = wire::Name::from_ascii("secure.example.").unwrap();
@@ -945,6 +950,7 @@ mod forward_do_cache_tests {
 
     #[test]
     fn expired_rrsig_not_cached() {
+        let _g = FORWARD_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         flush_forward_do_cache();
         let now: u32 = 1_000_000;
         let name = wire::Name::from_ascii("expired.example.").unwrap();
@@ -961,6 +967,7 @@ mod forward_do_cache_tests {
 
     #[test]
     fn unsigned_answer_cached_bounded_by_ttl() {
+        let _g = FORWARD_CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         flush_forward_do_cache();
         let now: u32 = 1_000_000;
         let name = wire::Name::from_ascii("nosig.example.").unwrap();
