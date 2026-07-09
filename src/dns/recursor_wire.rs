@@ -24,8 +24,10 @@
 #![allow(dead_code)]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -671,6 +673,162 @@ pub struct Validated {
     pub verdict: crate::dns::dnssec_chain::Verdict,
 }
 
+// ---------------------------------------------------------------------------
+// DNSSEC-validated answer cache (#dnssec-cache).
+//
+// Before this cache, every DO=1 query (the overwhelming majority of real
+// traffic) re-recursed because the shared wire cache only stored the RRSIG-free
+// form served to DO=0 clients — measured hit rate ~7%. This memoises the full
+// `Validated` (records + RRSIGs + validated authority + verdict) keyed by
+// (qname, qtype) and serves it straight back to DO=1 clients.
+//
+// Security invariants (fail-closed, non-negotiable):
+//   * A `Bogus` verdict is NEVER inserted, hence never served.
+//   * An entry's lifetime is bounded by BOTH the smallest record/authority TTL
+//     AND the nearest RRSIG expiration (answer + authority, serial arithmetic):
+//     a hit can never be served past a signature's expiration (RFC 4034 §3.1.5).
+//   * TTLs decay: a hit returns TTL_original - elapsed; if any RRset TTL reaches
+//     0 the entry is treated as expired (miss) and dropped.
+// ---------------------------------------------------------------------------
+
+/// Hard ceiling on how long any validated answer may be cached, regardless of
+/// record TTL or RRSIG window (defence against absurd upstream TTLs): 24 h.
+const VALIDATED_CACHE_TTL_CAP: u32 = 86_400;
+/// Naive size bound: once the cache holds this many entries we stop inserting
+/// NEW keys (existing entries keep expiring / being refreshed in place). No LRU —
+/// the cheapest bound that never serves stale data; churn drains it as TTLs and
+/// RRSIG windows elapse.
+const VALIDATED_CACHE_MAX: usize = 100_000;
+
+/// A DNSSEC-validated answer held in memory. Records keep their ORIGINAL TTLs;
+/// the elapsed time since `inserted_at` is subtracted on every read.
+struct CachedValidated {
+    records: Vec<Record>,
+    answer_rrsigs: Vec<Record>,
+    authority: Vec<Record>,
+    rcode: u16,
+    verdict: crate::dns::dnssec_chain::Verdict,
+    inserted_at: Instant,
+    expires_at: Instant,
+}
+
+impl CachedValidated {
+    /// Rebuild a `Validated` with every record's TTL reduced by `elapsed`
+    /// seconds. Returns `None` if any TTL would reach 0 (the RRset expired since
+    /// insertion -> the hit is a miss). Never mutates the cached entry.
+    fn clone_decremented(&self, elapsed: u32) -> Option<Validated> {
+        fn dec(src: &[Record], elapsed: u32) -> Option<Vec<Record>> {
+            let mut out = Vec::with_capacity(src.len());
+            for r in src {
+                let ttl = r.ttl.checked_sub(elapsed).filter(|&t| t > 0)?;
+                let mut c = r.clone();
+                c.ttl = ttl;
+                out.push(c);
+            }
+            Some(out)
+        }
+        Some(Validated {
+            records: dec(&self.records, elapsed)?,
+            answer_rrsigs: dec(&self.answer_rrsigs, elapsed)?,
+            authority: dec(&self.authority, elapsed)?,
+            rcode: self.rcode,
+            verdict: self.verdict,
+        })
+    }
+}
+
+/// Global cache of DNSSEC-validated answers, keyed by (qname, qtype). `Name`
+/// hashes/compares case-insensitively, so mixed-case queries share one entry.
+static VALIDATED_CACHE: LazyLock<DashMap<(Name, u16), CachedValidated>> =
+    LazyLock::new(DashMap::new);
+
+/// Seconds until the nearest RRSIG expiration among `answer_rrsigs` and any RRSIG
+/// carried in `authority`, using serial-number arithmetic against `now` (RFC 4034
+/// §3.1.5 — the same wrap-safe comparison as `dnssec_verify::within_validity`).
+/// The expiration is octets 8..12 of the RRSIG rdata (RFC 4034 §3.1). Returns:
+///   * `None` — no RRSIG to bound the entry;
+///   * `Some(0)` — at least one RRSIG is already expired (fail-closed: do not cache);
+///   * `Some(min_left)` — smallest seconds-until-expiration across all RRSIGs.
+fn nearest_rrsig_secs(answer_rrsigs: &[Record], authority: &[Record], now: u32) -> Option<u32> {
+    let mut min_left: Option<u32> = None;
+    for r in answer_rrsigs.iter().chain(authority.iter()) {
+        if r.rtype != consts::rtype::RRSIG {
+            continue;
+        }
+        let Rdata::Unknown { data, .. } = &r.rdata else {
+            continue;
+        };
+        let secs = if data.len() >= 12 {
+            let exp = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+            // Serial-space distance now -> expiration; >= 2^31 means `now` is at or
+            // past expiration (RFC 4034 §3.1.5) -> already expired.
+            let left = exp.wrapping_sub(now);
+            if left >= 0x8000_0000 {
+                0
+            } else {
+                left
+            }
+        } else {
+            0 // unparseable RRSIG -> fail-closed (treat as expired)
+        };
+        min_left = Some(min_left.map_or(secs, |m| m.min(secs)));
+    }
+    min_left
+}
+
+/// Insert `v` into `VALIDATED_CACHE` under `key`, unless it is `Bogus` (never
+/// cached — RFC 4035 fail-closed) or its bounded lifetime is 0. The cache TTL is
+/// `min(smallest record/authority TTL, seconds to the nearest RRSIG expiration,
+/// 24 h cap)`. `now` is epoch-seconds (for the RRSIG serial comparison); the
+/// entry's monotonic deadline uses `Instant`.
+fn cache_validated(key: &(Name, u16), now: u32, v: &Validated) {
+    use crate::dns::dnssec_chain::Verdict;
+    if v.verdict == Verdict::Bogus {
+        return;
+    }
+    let mut ttl_cache = u32::MAX;
+    for r in v.records.iter().chain(v.authority.iter()) {
+        ttl_cache = ttl_cache.min(r.ttl);
+    }
+    if let Some(s) = nearest_rrsig_secs(&v.answer_rrsigs, &v.authority, now) {
+        ttl_cache = ttl_cache.min(s);
+    }
+    // Degenerate empty answer with no TTL source: fall back to the hard cap so we
+    // never cache unbounded.
+    if ttl_cache == u32::MAX {
+        ttl_cache = VALIDATED_CACHE_TTL_CAP;
+    }
+    ttl_cache = ttl_cache.min(VALIDATED_CACHE_TTL_CAP);
+    if ttl_cache == 0 {
+        return;
+    }
+    // Naive size bound: reject NEW keys once full; refreshing an existing key is
+    // always allowed so a stale entry can be replaced.
+    if VALIDATED_CACHE.len() >= VALIDATED_CACHE_MAX && !VALIDATED_CACHE.contains_key(key) {
+        return;
+    }
+    let now_i = Instant::now();
+    VALIDATED_CACHE.insert(
+        key.clone(),
+        CachedValidated {
+            records: v.records.clone(),
+            answer_rrsigs: v.answer_rrsigs.clone(),
+            authority: v.authority.clone(),
+            rcode: v.rcode,
+            verdict: v.verdict,
+            inserted_at: now_i,
+            expires_at: now_i + Duration::from_secs(u64::from(ttl_cache)),
+        },
+    );
+}
+
+/// Drop every entry in the DNSSEC-validated answer cache. Called by the API
+/// `POST /api/cache/flush` handler alongside the resolver + XDP cache clears so a
+/// flush truly forgets all resolved names (#dnssec-cache).
+pub fn flush_validated_cache() {
+    VALIDATED_CACHE.clear();
+}
+
 /// Push, into `out`, the RRSIG records from `answers` whose owner is `owner` and
 /// whose type-covered field is `covered`. RFC 4034 §3.1: the covered type is the
 /// first two RDATA octets; RRSIG rdata is carried opaquely as `Rdata::Unknown`
@@ -694,6 +852,26 @@ fn collect_covering_rrsigs(answers: &[Record], owner: &Name, covered: u16, out: 
 /// authoritative reply for `qname`. `None` only on a hard resolution failure.
 pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Validated> {
     use crate::dns::dnssec_chain::Verdict;
+    // Cache lookup (#dnssec-cache): serve a still-valid, non-Bogus validated answer
+    // without re-recursing. TTLs are decremented by the elapsed time; if any RRset
+    // TTL has reached 0, or the monotonic deadline has passed, the entry is dropped
+    // and we fall through to a fresh recursion.
+    let key = (qname.clone(), qtype);
+    if let Some(hit) = VALIDATED_CACHE.get(&key) {
+        let now_i = Instant::now();
+        let served = if hit.expires_at > now_i {
+            let elapsed =
+                now_i.duration_since(hit.inserted_at).as_secs().min(u64::from(u32::MAX)) as u32;
+            hit.clone_decremented(elapsed)
+        } else {
+            None
+        };
+        drop(hit); // release the DashMap shard lock before any remove()
+        if let Some(v) = served {
+            return Some(v);
+        }
+        VALIDATED_CACHE.remove(&key);
+    }
     let mut target = qname.clone();
     let mut cname_left = MAX_CNAME;
     let mut records: Vec<Record> = Vec::new();
@@ -771,7 +949,10 @@ pub async fn resolve_validated(qname: &Name, qtype: u16, now: u32) -> Option<Val
         } else {
             rcode
         };
-        return Some(Validated { records, answer_rrsigs: rrsigs, authority: hop_authority, rcode, verdict });
+        let validated =
+            Validated { records, answer_rrsigs: rrsigs, authority: hop_authority, rcode, verdict };
+        cache_validated(&key, now, &validated);
+        return Some(validated);
     }
 }
 
@@ -807,6 +988,100 @@ fn worst_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #dnssec-cache unit tests (pure, no network) ---
+    fn a_rec(name: &Name, ttl: u32) -> Record {
+        Record {
+            name: name.clone(),
+            rtype: consts::rtype::A,
+            rclass: consts::class::IN,
+            ttl,
+            rdata: Rdata::A(Ipv4Addr::new(192, 0, 2, 1)),
+        }
+    }
+
+    // Minimal RRSIG record: only octets 8..12 (expiration) are read by the cache
+    // bounding logic (RFC 4034 §3.1); the rest is padded.
+    fn rrsig_rec(name: &Name, expiration: u32) -> Record {
+        let mut data = vec![0u8; 20];
+        data[0..2].copy_from_slice(&consts::rtype::A.to_be_bytes()); // type_covered
+        data[8..12].copy_from_slice(&expiration.to_be_bytes()); // expiration
+        Record {
+            name: name.clone(),
+            rtype: consts::rtype::RRSIG,
+            rclass: consts::class::IN,
+            ttl: 3600,
+            rdata: Rdata::Unknown { rtype: consts::rtype::RRSIG, data },
+        }
+    }
+
+    #[test]
+    fn bogus_answer_is_never_cached() {
+        use crate::dns::dnssec_chain::Verdict;
+        let q = Name::from_ascii("bogus-cache-test.example.").unwrap();
+        let key = (q.clone(), consts::rtype::A);
+        let now = 1_000_000u32;
+        let v = Validated {
+            records: vec![a_rec(&q, 300)],
+            answer_rrsigs: vec![rrsig_rec(&q, now + 3600)],
+            authority: Vec::new(),
+            rcode: consts::rcode::NOERROR,
+            verdict: Verdict::Bogus,
+        };
+        cache_validated(&key, now, &v);
+        assert!(
+            !VALIDATED_CACHE.contains_key(&key),
+            "a Bogus verdict must never be inserted"
+        );
+    }
+
+    #[test]
+    fn expired_rrsig_is_not_cached() {
+        use crate::dns::dnssec_chain::Verdict;
+        let q = Name::from_ascii("expired-rrsig-cache-test.example.").unwrap();
+        let key = (q.clone(), consts::rtype::A);
+        let now = 2_000_000u32;
+        // RRSIG already expired (expiration < now): the bounded TTL collapses to 0.
+        let v = Validated {
+            records: vec![a_rec(&q, 3600)],
+            answer_rrsigs: vec![rrsig_rec(&q, now - 10)],
+            authority: Vec::new(),
+            rcode: consts::rcode::NOERROR,
+            verdict: Verdict::Secure,
+        };
+        cache_validated(&key, now, &v);
+        assert!(
+            !VALIDATED_CACHE.contains_key(&key),
+            "an answer with an expired RRSIG must not be cached"
+        );
+    }
+
+    #[test]
+    fn secure_answer_is_cached_and_bounded_by_rrsig() {
+        use crate::dns::dnssec_chain::Verdict;
+        let q = Name::from_ascii("fresh-secure-cache-test.example.").unwrap();
+        let key = (q.clone(), consts::rtype::A);
+        let now = 3_000_000u32;
+        let v = Validated {
+            records: vec![a_rec(&q, 100_000)],       // record TTL far in the future
+            answer_rrsigs: vec![rrsig_rec(&q, now + 50)], // RRSIG expires in 50 s
+            authority: Vec::new(),
+            rcode: consts::rcode::NOERROR,
+            verdict: Verdict::Secure,
+        };
+        cache_validated(&key, now, &v);
+        let hit = VALIDATED_CACHE
+            .get(&key)
+            .expect("a fresh Secure answer must be cached");
+        // The deadline must be bounded by the RRSIG (50 s), not the 100000 s TTL.
+        let ttl_left = hit.expires_at.saturating_duration_since(hit.inserted_at).as_secs();
+        assert!(
+            (49..=50).contains(&ttl_left),
+            "cache TTL must be bounded by the RRSIG expiration, got {ttl_left}"
+        );
+        drop(hit);
+        VALIDATED_CACHE.remove(&key);
+    }
 
     #[test]
     fn public_ip_filter_rejects_private_and_special() {

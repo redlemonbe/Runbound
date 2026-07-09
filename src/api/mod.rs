@@ -3333,6 +3333,7 @@ async fn cache_flush_handler(State(s): State<AppState>) -> impl IntoResponse {
     match crate::dns::server::rebuild_and_swap(&s.resolver, &addrs, s.dnssec_enabled.load(Ordering::Relaxed)).await {
         Ok(_warmed) => {
             s.stats.reset_cache();
+            crate::dns::recursor_wire::flush_validated_cache();
             s.cache_evictions.store(0, Ordering::Relaxed);
             // rebuild_and_swap only rebuilds the async resolver's own cache (the
             // slow serve_wire path). On an XDP-active host almost every cache hit
