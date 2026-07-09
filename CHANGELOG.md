@@ -5,6 +5,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.6]
+
+### Changed
+- **Forward mode now caches DO=1 (DNSSEC) answers locally** so repeat validated
+  queries no longer re-forward to the upstream (signed answers bounded by RRSIG expiration, unsigned Insecure answers by record TTL). In forward mode a DO=1 client
+  query was re-sent to the upstream on every repeat (the XDP/UDP fast path only
+  caches the AD-less DO=0 datagram); it is now held in a dedicated cache keyed by
+  `(qname, qtype)`, storing the answer together with the covering RRSIGs the
+  upstream returned. Fail-closed: TTLs decay with elapsed time, the entry lifetime
+  is bounded by both the smallest record TTL and the nearest RRSIG expiration
+  (serial arithmetic, RFC 4034 §3.1.5, 24 h cap), a served TTL is clamped to the
+  remaining lifetime, an already-expired or RRSIG-less answer is never cached, and
+  the AD bit is relayed under the same authenticated-channel gate as the live path
+  (RFC 6840 §5.7). The DO=0 fast path is unchanged. `POST /api/cache/flush` clears
+  it alongside the resolver, validated and XDP caches.
+
+---
+
 ## [0.9.5]
 
 ### Changed

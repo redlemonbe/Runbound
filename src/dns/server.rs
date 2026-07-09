@@ -919,6 +919,30 @@ impl RunboundHandler {
             }
         }
 
+        // ── Forward DO=1 answer cache lookup (#dnssec-forward-cache) ────────
+        // A DO=1 (DNSSEC-aware) client would otherwise re-forward to the upstream on
+        // every repeat: the fast path only caches the AD-less DO=0 datagram. Serve
+        // the locally cached validated answer (records incl. RRSIGs) when present.
+        let fwd_do = msg.edns().ok().flatten().map(|e| e.dnssec_ok()).unwrap_or(false);
+        if fwd_do {
+            if let Some((records, authenticated)) =
+                crate::dns::forward::forward_do_cache_get(&q.name, qtype)
+            {
+                let mut resp = self.wire_answer(&msg, &records, rcode::NOERROR);
+                // RFC 6840 §5.7: relay AD only when the answer was authenticated AND
+                // the client asked for validation (AD or DO) — the same gate as the
+                // live forward path below.
+                let client_wants_ad = msg.header.ad() || fwd_do;
+                if authenticated && client_wants_ad && resp.len() > 3 {
+                    resp[3] |= 0x20; // AD bit lives in flags octet 3
+                }
+                let us = start.elapsed().as_micros() as u64;
+                self.stats.inc_forwarded();
+                self.stats.record_forward(us); // sub-CACHE_HIT_THRESHOLD_US => counts as a cache hit
+                self.log_query_wire(client_ip, &qname_pres, qtype, LogAction::Cached, start);
+                return Some(resp);
+            }
+        }
         // ── Forward upstream (own wire forward pool) ────────────────────────
         let (fwd, winner) = self.pool.load().forward(query).await;
         // #33: record the racing win for the upstream that answered first.
@@ -979,6 +1003,25 @@ impl RunboundHandler {
                 self.maybe_cache_wire(&q, &resp, &records);
                 // #108: remember this answer so a later transient SERVFAIL can serve it stale.
                 self.store_stale_wire(&qname_lc, qtype, &records);
+                // #dnssec-forward-cache: a DO=1 client would otherwise re-forward this
+                // validated answer on every repeat. Cache it locally so repeat DO=1
+                // queries are served without hitting the upstream. `records` already
+                // carries the upstream RRSIGs (the client's DO=1 query was forwarded
+                // verbatim); the cache stores them as-is and bounds the entry by their
+                // expiration. DO=0 answers are never cached here (fast path unchanged).
+                if fwd_do {
+                    let now_epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as u32)
+                        .unwrap_or(0);
+                    crate::dns::forward::forward_do_cache_put(
+                        &q.name,
+                        qtype,
+                        &records,
+                        authenticated,
+                        now_epoch,
+                    );
+                }
                 // RFC 6840 §5.7: a forwarder may relay the upstream AD only when the answer
                 // arrived over an authenticated channel (DoT) AND the client asked for
                 // validation (AD or DO). Applied AFTER caching so only the served copy

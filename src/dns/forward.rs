@@ -8,8 +8,9 @@
 //! - Keepalive probes for DoT connections
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicU16, Ordering};
+use dashmap::DashMap;
 use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
@@ -699,6 +700,281 @@ fn split_addr_port(s: &str, default_port: u16) -> (&str, u16) {
         (&s[..at], port)
     } else {
         (s, default_port)
+    }
+}
+
+// ─────────────────── Forward DO=1 answer cache (#dnssec-forward-cache) ────────
+//
+// In forward mode a DO=1 (DNSSEC-aware) client query is re-forwarded to the
+// upstream on every repeat: the XDP/UDP fast-path cache only holds the AD-less
+// DO=0 datagram, so a validating client keeps paying the upstream round-trip.
+// This cache holds the forwarded answer *including* the covering RRSIGs the
+// upstream returned (the client's DO=1 query is forwarded verbatim, so the
+// upstream answer section carries them), keyed by (qname, qtype); repeat DO=1
+// queries are then served locally. The DO=0 fast path is entirely untouched.
+//
+// Security invariants (fail-closed — mirrors recursor_wire::VALIDATED_CACHE):
+//   * Only DO=1 answers are ever inserted or served (they carry the RRSIGs the
+//     client needs to validate; a DO=0 answer has none and never reaches here).
+//   * An entry's lifetime is bounded by BOTH the smallest record TTL AND the
+//     nearest RRSIG expiration (serial arithmetic, RFC 4034 §3.1.5), capped at
+//     24 h. A served record's TTL is additionally clamped to the remaining entry
+//     lifetime, so a hit can never advertise a TTL past a signature's expiration.
+//   * TTLs decay: a hit returns TTL_original - elapsed (then clamped); if any
+//     record TTL would reach 0 the entry is a miss and is dropped.
+//   * An answer carrying NO RRSIG is refused (nothing bounds it by signature
+//     expiry — fail-closed): we only validate-cache signed answers.
+
+/// Hard ceiling on how long any forward DO=1 answer may be cached (defence
+/// against absurd upstream TTLs): 24 h. Matches VALIDATED_CACHE_TTL_CAP.
+const FORWARD_DO_CACHE_TTL_CAP: u32 = 86_400;
+/// Naive size bound: once full we stop inserting NEW keys (existing entries keep
+/// expiring / being refreshed in place). No LRU — the cheapest bound that never
+/// serves stale data; churn drains it as TTLs / RRSIG windows elapse.
+const FORWARD_DO_CACHE_MAX: usize = 100_000;
+
+/// A forward-mode DO=1 answer held in memory. `records` keep their ORIGINAL TTLs
+/// (INCLUDING the covering RRSIGs); the elapsed time since `inserted_at` is
+/// subtracted, and the result clamped to the remaining lifetime, on every read.
+struct CachedForward {
+    records: Vec<wire::Record>,
+    /// Upstream set AD AND the answer arrived over an authenticated (DoT) channel;
+    /// stored verbatim so the caller can re-apply the same AD relay gate as the
+    /// live forward path (RFC 6840 §5.7). False for any cleartext upstream.
+    authenticated: bool,
+    inserted_at: Instant,
+    expires_at: Instant,
+}
+
+/// Global cache of forward-mode DO=1 answers, keyed by (qname, qtype). `Name`
+/// hashes/compares case-insensitively, so mixed-case queries share one entry.
+static FORWARD_DO_CACHE: LazyLock<DashMap<(wire::Name, u16), CachedForward>> =
+    LazyLock::new(DashMap::new);
+
+/// Seconds until the nearest RRSIG expiration among `records`, using serial-number
+/// arithmetic against `now` (RFC 4034 §3.1.5 — wrap-safe, the same comparison as
+/// `recursor_wire::nearest_rrsig_secs`). The expiration is octets 8..12 of the
+/// RRSIG rdata (RFC 4034 §3.1), carried opaquely as `Rdata::Unknown` (RFC 3597).
+/// Returns:
+///   * `None` — no RRSIG present to bound the entry (caller must not cache);
+///   * `Some(0)` — at least one RRSIG is already expired (fail-closed: do not cache);
+///   * `Some(min_left)` — smallest seconds-until-expiration across all RRSIGs.
+fn forward_nearest_rrsig_secs(records: &[wire::Record], now: u32) -> Option<u32> {
+    let mut min_left: Option<u32> = None;
+    for r in records {
+        if r.rtype != wire::consts::rtype::RRSIG {
+            continue;
+        }
+        let wire::Rdata::Unknown { data, .. } = &r.rdata else {
+            continue;
+        };
+        let secs = if data.len() >= 12 {
+            let exp = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+            // Serial-space distance now -> expiration; >= 2^31 means `now` is at or
+            // past expiration (RFC 4034 §3.1.5) -> already expired.
+            let left = exp.wrapping_sub(now);
+            if left >= 0x8000_0000 { 0 } else { left }
+        } else {
+            0 // unparseable RRSIG -> fail-closed (treat as expired)
+        };
+        min_left = Some(min_left.map_or(secs, |m| m.min(secs)));
+    }
+    min_left
+}
+
+/// Look up a cached forward DO=1 answer. On a live hit returns the records with
+/// every TTL decremented by the elapsed time AND clamped to the entry's remaining
+/// lifetime (so no served TTL ever outlives the nearest RRSIG expiry), plus the
+/// stored `authenticated` flag. Returns `None` (and drops the entry) if it is
+/// expired, or if any record TTL would reach 0 (the RRset expired since insertion
+/// -> the hit is a miss). Never mutates a live entry.
+pub fn forward_do_cache_get(qname: &wire::Name, qtype: u16) -> Option<(Vec<wire::Record>, bool)> {
+    let key = (qname.clone(), qtype);
+    let hit = FORWARD_DO_CACHE.get(&key)?;
+    let now_i = Instant::now();
+    let served = if hit.expires_at > now_i {
+        let elapsed =
+            now_i.duration_since(hit.inserted_at).as_secs().min(u64::from(u32::MAX)) as u32;
+        // Remaining entry lifetime (bounded at put-time by the nearest RRSIG
+        // expiry): every served record TTL is clamped to this so a hit never
+        // advertises a TTL past a signature's expiration.
+        let remaining =
+            hit.expires_at.saturating_duration_since(now_i).as_secs().min(u64::from(u32::MAX)) as u32;
+        let mut out = Vec::with_capacity(hit.records.len());
+        let mut ok = true;
+        for r in &hit.records {
+            // Decay by elapsed (miss if it reaches 0), then clamp to `remaining`.
+            match r.ttl.checked_sub(elapsed).filter(|&t| t > 0) {
+                Some(ttl) => {
+                    let served_ttl = ttl.min(remaining);
+                    if served_ttl == 0 {
+                        ok = false;
+                        break;
+                    }
+                    let mut c = r.clone();
+                    c.ttl = served_ttl;
+                    out.push(c);
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok { Some((out, hit.authenticated)) } else { None }
+    } else {
+        None
+    };
+    drop(hit); // release the DashMap shard lock before any remove()
+    if served.is_none() {
+        FORWARD_DO_CACHE.remove(&key);
+    }
+    served
+}
+
+/// Insert a forward-mode DO=1 answer under `(qname, qtype)`. Cache TTL is
+/// `min(smallest record TTL, seconds to the nearest RRSIG expiration, 24 h cap)`.
+/// `now` is epoch-seconds (for the RRSIG serial comparison); the entry's monotonic
+/// deadline uses `Instant`. Refuses to cache when: `records` carries no RRSIG (a
+/// DO=1 answer we can't bound by a signature — fail-closed), any RRSIG is already
+/// expired, the bounded TTL is 0, or the cache is full and this is a NEW key.
+pub fn forward_do_cache_put(
+    qname: &wire::Name,
+    qtype: u16,
+    records: &[wire::Record],
+    authenticated: bool,
+    now: u32,
+) {
+    // Signed answers are bounded by their nearest RRSIG expiration; an unsigned
+    // (Insecure) DO=1 answer carries no RRSIG and is bounded by its record TTL alone
+    // — safe, since there is no signature that could outlive the entry. Only an
+    // ALREADY-EXPIRED signature is fail-closed (never cached).
+    let rrsig_left = match forward_nearest_rrsig_secs(records, now) {
+        Some(0) => return, // a covering signature is already expired -> fail-closed
+        Some(s) => s,      // signed: bound by the nearest RRSIG expiration
+        None => u32::MAX,  // unsigned (Insecure): record-TTL bound only
+    };
+    let mut ttl_cache = u32::MAX;
+    for r in records {
+        ttl_cache = ttl_cache.min(r.ttl);
+    }
+    ttl_cache = ttl_cache.min(rrsig_left);
+    // Degenerate: no record supplied a TTL -> fall back to the cap (never unbounded).
+    if ttl_cache == u32::MAX {
+        ttl_cache = FORWARD_DO_CACHE_TTL_CAP;
+    }
+    ttl_cache = ttl_cache.min(FORWARD_DO_CACHE_TTL_CAP);
+    if ttl_cache == 0 {
+        return; // already-expired signature or zero TTL -> fail-closed
+    }
+    let key = (qname.clone(), qtype);
+    // Naive size bound: reject NEW keys once full; refreshing an existing key is
+    // always allowed so a stale entry can be replaced.
+    if FORWARD_DO_CACHE.len() >= FORWARD_DO_CACHE_MAX && !FORWARD_DO_CACHE.contains_key(&key) {
+        return;
+    }
+    let now_i = Instant::now();
+    FORWARD_DO_CACHE.insert(
+        key,
+        CachedForward {
+            records: records.to_vec(),
+            authenticated,
+            inserted_at: now_i,
+            expires_at: now_i + Duration::from_secs(u64::from(ttl_cache)),
+        },
+    );
+}
+
+/// Drop every entry in the forward DO=1 answer cache. Called by the API
+/// `POST /api/cache/flush` handler alongside the resolver + validated + XDP cache
+/// clears so a flush truly forgets all forwarded validated names.
+pub fn flush_forward_do_cache() {
+    FORWARD_DO_CACHE.clear();
+}
+
+#[cfg(test)]
+mod forward_do_cache_tests {
+    use super::*;
+    use crate::dns::wire::consts::rtype;
+
+    /// Build an RRSIG record whose signature-expiration field (RFC 4034 §3.1,
+    /// octets 8..12 of the rdata) is `expiration` epoch-seconds. The other rdata
+    /// fields are irrelevant to the cache's lifetime bound, so they stay zero.
+    fn rrsig(name: &str, ttl: u32, expiration: u32) -> wire::Record {
+        let mut data = vec![0u8; 18];
+        data[0] = 0x00;
+        data[1] = 0x01; // type-covered = A (not read by the bound; only octets 8..12 matter)
+        data[8..12].copy_from_slice(&expiration.to_be_bytes());
+        wire::Record {
+            name: wire::Name::from_ascii(name).unwrap(),
+            rtype: rtype::RRSIG,
+            rclass: 1,
+            ttl,
+            rdata: wire::Rdata::Unknown { rtype: rtype::RRSIG, data },
+        }
+    }
+    fn a_record(name: &str, ttl: u32) -> wire::Record {
+        wire::Record {
+            name: wire::Name::from_ascii(name).unwrap(),
+            rtype: rtype::A,
+            rclass: 1,
+            ttl,
+            rdata: wire::Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+        }
+    }
+
+    #[test]
+    fn ttl_bounded_by_rrsig_expiration() {
+        flush_forward_do_cache();
+        let now: u32 = 1_000_000;
+        let name = wire::Name::from_ascii("secure.example.").unwrap();
+        // A record TTL 100000s but the RRSIG expires in 50s -> the entry, and every
+        // served record TTL, must be bounded to ~50s (never the raw 100000s).
+        let records =
+            vec![a_record("secure.example.", 100_000), rrsig("secure.example.", 100_000, now + 50)];
+        forward_do_cache_put(&name, rtype::A, &records, true, now);
+        let (got, authed) = forward_do_cache_get(&name, rtype::A).expect("DO=1 answer must cache");
+        assert!(authed, "authenticated flag must round-trip");
+        let a_ttl = got.iter().find(|r| r.rtype == rtype::A).unwrap().ttl;
+        assert!(
+            (45..=50).contains(&a_ttl),
+            "served A TTL must be bounded to the ~50s RRSIG window, got {a_ttl}"
+        );
+        flush_forward_do_cache();
+    }
+
+    #[test]
+    fn expired_rrsig_not_cached() {
+        flush_forward_do_cache();
+        let now: u32 = 1_000_000;
+        let name = wire::Name::from_ascii("expired.example.").unwrap();
+        // RRSIG already expired (10s in the past) -> fail-closed, never cached.
+        let records =
+            vec![a_record("expired.example.", 3600), rrsig("expired.example.", 3600, now - 10)];
+        forward_do_cache_put(&name, rtype::A, &records, true, now);
+        assert!(
+            forward_do_cache_get(&name, rtype::A).is_none(),
+            "an already-expired RRSIG must not be cached"
+        );
+        flush_forward_do_cache();
+    }
+
+    #[test]
+    fn unsigned_answer_cached_bounded_by_ttl() {
+        flush_forward_do_cache();
+        let now: u32 = 1_000_000;
+        let name = wire::Name::from_ascii("nosig.example.").unwrap();
+        // An unsigned (Insecure) DO=1 answer carries no RRSIG: cache it bounded by its
+        // record TTL alone (there is no signature that could outlive the entry).
+        // `authenticated` is false for an unsigned answer.
+        let records = vec![a_record("nosig.example.", 300)];
+        forward_do_cache_put(&name, rtype::A, &records, false, now);
+        let (got, authed) = forward_do_cache_get(&name, rtype::A)
+            .expect("an unsigned DO=1 answer must be TTL-cached");
+        assert!(!authed, "an unsigned answer is never authenticated");
+        let a_ttl = got.iter().find(|r| r.rtype == rtype::A).map(|r| r.ttl).unwrap();
+        assert!(a_ttl > 0 && a_ttl <= 300, "served A TTL must be within the record TTL, got {a_ttl}");
+        flush_forward_do_cache();
     }
 }
 
