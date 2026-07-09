@@ -2210,7 +2210,7 @@ async fn dns_lookup_handler(
     let from_cache = elapsed_ms * 1000 < crate::stats::CACHE_HIT_THRESHOLD_US;
     use crate::dns::forward::ResolveResult;
     match fwd_result {
-        ResolveResult::Answer { records } => {
+        ResolveResult::Answer { records, .. } => {
             let answers: Vec<serde_json::Value> = records
                 .iter()
                 .map(|r| serde_json::json!({ "ttl": r.ttl, "data": r.rdata.to_presentation() }))

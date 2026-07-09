@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.5]
+
+### Changed
+- **Forward mode relays the upstream AD (Authenticated Data) bit — safely.** A forwarder
+  does not validate DNSSEC itself, so the upstream AD is only propagated to the client when
+  BOTH hold: (a) the answer arrived over an authenticated DoT channel (`forward-tls-upstream`),
+  and (b) the client asked for validation (AD or DO bit set). Cleartext UDP/TCP upstreams
+  never propagate AD — a plaintext AD bit is spoofable (anti-spoofing, RFC 6840 §5.7).
+  The wire cache still stores the AD-less base form; AD is stamped only on the served copy.
+
+---
+
 ## [0.9.4]
 
 ### Added

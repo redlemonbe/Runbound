@@ -41,7 +41,13 @@ const POOL_IDLE_TTL: Duration = Duration::from_secs(90);
 #[derive(Debug)]
 pub enum ResolveResult {
     /// NOERROR with one or more answer records
-    Answer { records: Vec<wire::Record> },
+    Answer {
+        records: Vec<wire::Record>,
+        /// upstream set AD AND arrived over an authenticated (DoT) channel; a
+        /// forwarder may then relay AD to a client that asked for it (RFC 6840 §5.7).
+        /// False on any cleartext (UDP/TCP) upstream — plaintext AD is spoofable.
+        authenticated: bool,
+    },
     /// Authoritative negative: NXDOMAIN or NOERROR+empty ANSWER (NODATA).
     /// `neg_ttl` is RFC 2308 §5 min(SOA MINIMUM, SOA record TTL), or 0 if no SOA
     /// was present (do-not-cache sentinel). No negative-answer cache exists yet
@@ -186,7 +192,7 @@ impl DotUpstream {
             match Self::send_recv(&mut c, wire).await {
                 Ok(resp) => {
                     self.return_conn(c).await;
-                    return parse_response(&resp);
+                    return parse_response(&resp, true);
                 }
                 Err(e) => {
                     debug!(addr=%self.addr, err=%e, "DoT pooled conn broken, reconnecting");
@@ -199,7 +205,7 @@ impl DotUpstream {
             Ok(mut c) => match Self::send_recv(&mut c, wire).await {
                 Ok(resp) => {
                     self.return_conn(c).await;
-                    parse_response(&resp)
+                    parse_response(&resp, true)
                 }
                 Err(e) => {
                     debug!(addr=%self.addr, err=%e, "DoT fresh conn query failed");
@@ -274,14 +280,14 @@ impl UdpUpstream {
                                 // Re-apply SEC-O1: the TCP answer must match the
                                 // query ID + question before it is trusted.
                                 if response_matches(&full, qid, qquestion.as_ref()) {
-                                    return parse_response(&full);
+                                    return parse_response(&full, false);
                                 }
                             }
                             // TCP failed / mismatched → fall through to the
                             // truncated UDP parse (a TC-flagged partial beats a
                             // dropped query).
                         }
-                        return parse_response(&buf[..n]);
+                        return parse_response(&buf[..n], false);
                     }
                     debug!(addr=%self.addr, "UDP forward: response did not match query (id/question) — ignored");
                     // loop and wait for the genuine reply (bounded by the outer timeout)
@@ -591,7 +597,7 @@ pub(crate) fn dot_tls_name(ip: &IpAddr, override_: Option<&str>) -> Arc<str> {
 // ─────────────────────── Wire helpers ────────────────────────────────────────
 
 /// Parse a DNS wire response into a `ResolveResult`.
-fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
+fn parse_response(wire_bytes: &[u8], authed_channel: bool) -> ResolveResult {
     use crate::dns::wire::consts::rcode;
     let msg = match wire::Message::parse(wire_bytes) {
         Ok(m) => m,
@@ -612,7 +618,10 @@ fn parse_response(wire_bytes: &[u8]) -> ResolveResult {
                     soa: zone_soas(&msg),
                 }
             } else {
-                ResolveResult::Answer { records: msg.answers }
+                ResolveResult::Answer {
+                    authenticated: msg.header.ad() && authed_channel,
+                    records: msg.answers,
+                }
             }
         }
         rcode::NXDOMAIN => ResolveResult::NegativeAnswer {
@@ -750,6 +759,50 @@ mod sec_o1_tests {
     #[test]
     fn rejects_truncated() {
         assert!(!response_matches(&[0x12, 0x34], 0x1234, None));
+    }
+
+    /// NOERROR response carrying a single A record, with the AD flag controllable.
+    fn answer_response(ad: bool) -> Vec<u8> {
+        let mut h = Header { id: 0x1234, flags: 0, qdcount: 0, ancount: 0, nscount: 0, arcount: 0 };
+        h.set_opcode(opcode::QUERY);
+        h.set_qr(true);
+        h.set_ad(ad);
+        Message {
+            header: h,
+            questions: vec![Question::new(Name::from_ascii("example.com.").unwrap(), rtype::A)],
+            answers: vec![wire::Record {
+                name: Name::from_ascii("example.com.").unwrap(),
+                rtype: rtype::A,
+                rclass: 1, // IN
+                ttl: 300,
+                rdata: wire::Rdata::A(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            }],
+            authority: vec![],
+            additional: vec![],
+        }
+        .encode()
+    }
+
+    #[test]
+    fn ad_propagates_only_over_authenticated_channel() {
+        // Upstream set AD=1 but the answer came over cleartext UDP/TCP: AD is spoofable
+        // there, so a forwarder must never propagate it.
+        let wire_ad = answer_response(true);
+        match parse_response(&wire_ad, false) {
+            ResolveResult::Answer { authenticated, .. } => assert!(!authenticated),
+            other => panic!("expected Answer, got {other:?}"),
+        }
+        // Same AD=1 answer over an authenticated (DoT) channel: propagation allowed.
+        match parse_response(&wire_ad, true) {
+            ResolveResult::Answer { authenticated, .. } => assert!(authenticated),
+            other => panic!("expected Answer, got {other:?}"),
+        }
+        // Upstream AD=0 on an authenticated channel: never fabricate AD out of nothing.
+        let wire_noad = answer_response(false);
+        match parse_response(&wire_noad, true) {
+            ResolveResult::Answer { authenticated, .. } => assert!(!authenticated),
+            other => panic!("expected Answer, got {other:?}"),
+        }
     }
 
     #[test]

@@ -951,7 +951,7 @@ impl RunboundHandler {
             });
         }
         match fwd {
-            crate::dns::forward::ResolveResult::Answer { mut records } => {
+            crate::dns::forward::ResolveResult::Answer { mut records, authenticated } => {
                 // private-address block (#rebinding)
                 if !self.private_addrs.is_empty() {
                     for r in &records {
@@ -973,10 +973,21 @@ impl RunboundHandler {
                 for r in records.iter_mut() {
                     r.ttl = r.ttl.max(self.cache_min_ttl).min(self.cache_max_ttl);
                 }
-                let resp = self.wire_answer(&msg, &records, rcode::NOERROR);
+                let mut resp = self.wire_answer(&msg, &records, rcode::NOERROR);
+                // Cache/stale MUST store the AD-less base form: the fast path serves this
+                // copy to DO=0 clients, which must never receive a spurious AD bit.
                 self.maybe_cache_wire(&q, &resp, &records);
                 // #108: remember this answer so a later transient SERVFAIL can serve it stale.
                 self.store_stale_wire(&qname_lc, qtype, &records);
+                // RFC 6840 §5.7: a forwarder may relay the upstream AD only when the answer
+                // arrived over an authenticated channel (DoT) AND the client asked for
+                // validation (AD or DO). Applied AFTER caching so only the served copy
+                // carries AD; cleartext upstreams have `authenticated == false`.
+                let client_wants_ad = msg.header.ad()
+                    || msg.edns().ok().flatten().map(|e| e.dnssec_ok()).unwrap_or(false);
+                if authenticated && client_wants_ad && resp.len() > 3 {
+                    resp[3] |= 0x20; // AD bit lives in flags octet 3
+                }
                 let fwd_us = start.elapsed().as_micros() as u64;
                 self.stats.inc_forwarded();
                 self.stats.record_forward(fwd_us);
