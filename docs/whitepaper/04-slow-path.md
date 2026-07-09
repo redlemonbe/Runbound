@@ -252,3 +252,13 @@ path saturates a physical core's execution units, so a thread scheduled on the S
 steals throughput instead of adding it. HT only helps code that leaves execution units
 idle; the wire builder leaves none. Residual SMT-core activity under load is kernel
 housekeeping (ksoftirqd), not Runbound.
+
+The physical-core set is further intersected with the process CPU-affinity mask
+(`sched_getaffinity`, the same source as `nproc`), so a VM or container whose sysfs
+advertises host-wide topology — a Proxmox guest exposing vCPU-hotplug slots, an LXC
+cpuset — sizes its worker and thread counts to the cores it may actually run on, not the
+host's. Without the clamp a 2-vCPU guest read the host's ~64 sysfs CPUs and spawned dozens
+of tokio workers plus kernel-loop threads it could never schedule, self-inflicting a load
+spike and a per-answer scheduling stall; the clamp keeps the count truthful
+(`src/cpu.rs::physical_cores`). Physical-only selection is preserved — the affinity mask
+can only drop cores, never add an SMT sibling.
