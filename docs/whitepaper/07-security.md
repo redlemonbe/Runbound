@@ -33,10 +33,14 @@
   separate per-source ICMP rate limit + flood detector bans source IPs at
   the XDP layer via `ebpf/dns_xdp.c`. Permanent ("blacklisted") bans are persisted to a
   `0600` file and reloaded at startup (capped on both write and read).
-- **DNSSEC `AD`.** On the default (forward) path, `wire_answer` never sets `AD`
-  (`src/dns/server.rs`, flags built from scratch with no `set_ad` call) — Runbound does not
-  itself validate DNSSEC or track `Secure`/`Insecure` for forwarded answers; `dnssec-validation`
-  only affects the sovereign resolver below. The wire serving path never sets `AD` on its own
+- **DNSSEC `AD`.** On the forward path Runbound does not itself validate DNSSEC. Since v0.9.5 it **relays**
+  the upstream's `AD` to a client that asked for validation (its query set `AD` or `DO`), but
+  **only** when the answer arrived over an authenticated **DoT** channel (`forward-tls-upstream`)
+  and the upstream itself set `AD` (`authenticated = msg.header.ad() && authed_channel`,
+  `src/dns/forward.rs`); a plaintext UDP/TCP answer carries a spoofable `AD` and is never
+  propagated (`authenticated = false`). The bit is applied to the served copy only, **after**
+  the cache has stored the AD-less base form, so DO=0 fast-path clients never receive a spurious
+  `AD` (`src/dns/server.rs`). `dnssec-validation` only affects the sovereign resolver below. The wire serving path never sets `AD` on its own
   authoritative answers either (`wire_serve` clears it, `src/dns/wire_serve.rs:66`). With `resolution:
   full-recursion` (a runtime config toggle, not a Cargo feature), the sovereign in-house
   resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) attaches a per-record `Proof`
