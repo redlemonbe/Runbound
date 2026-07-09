@@ -138,3 +138,24 @@ Because the entry is a fully validated `Validated` (records + RRSIGs + validated
 verdict), it is served straight to DO=1 clients — the exact case that previously always
 re-recursed. Measured on the production master as the cache warms: the validated hit rate
 rises from ~7 % to **35 %+** and mean query latency falls from **~532 ms to ~170 ms**.
+
+## 5.9 Forward DO=1 answer cache (#dnssec-forward-cache)
+
+§5.8 caches validated answers on the **full-recursion** path. The **forward** path had the
+same pathology: a DO=1 client re-forwarded to the upstream on every repeat, because the fast
+path only stores the RRSIG-free DO=0 datagram. `FORWARD_DO_CACHE` (`src/dns/forward.rs`, a
+`DashMap<(Name, u16), CachedForward>`) closes it: on a forward `NOERROR` answer to a DO=1
+query the records — which already carry the upstream's RRSIGs, since the client's DO=1 query
+is forwarded verbatim — are cached and served back to later DO=1 clients without touching the
+upstream.
+
+Entry lifetime is bounded by the smallest record TTL, and additionally by the nearest RRSIG
+expiration when the answer is **signed** (`forward_nearest_rrsig_secs`, the same serial-space
+comparison as §5.8); an **unsigned (Insecure)** answer carries no RRSIG and is bounded by its
+record TTL alone — safe, since there is no signature that could outlive the entry. An
+already-expired RRSIG is **fail-closed** (never cached); TTLs decay and are clamped to the
+entry's remaining lifetime; the size is capped at `FORWARD_DO_CACHE_MAX = 100_000`; and
+`POST /api/cache/flush` clears it. The DO=0 fast path is unchanged, a rebinding-blocked
+(private-address) answer is refused before it can be cached, and the `AD` bit is relayed only
+under the §7 authenticated-DoT gate. Measured: a repeat DO=1 query drops from a ~22 ms
+upstream re-forward to a ~4 ms local hit.
