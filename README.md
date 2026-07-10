@@ -99,8 +99,9 @@ A drop-in Unbound-compatible DNS server with an XDP kernel-bypass fast path, a l
 
 Runbound is graded **A** by [DNS-OARC's *Check My DNS*](https://cmdns.dev.dns-oarc.net/), an
 independent DNS conformance test &mdash; **100%** on **Transport**, **Basic DNS** and **DNS
-Features** (IPv6 and TCP transport, EDNS, and well-randomised source ports + query IDs for
-off-path spoofing resistance). The capture below is from a **production network where Runbound
+Features** (IPv6 and TCP transport, EDNS, and well-randomised query IDs (Runbound, via
+`getrandom`) + source ports (OS ephemeral selection, RFC 6056) for off-path spoofing
+resistance). The capture below is from a **production network where Runbound
 is the only resolver** &mdash; every client query goes through it, day in and day out &mdash; and
 the end-to-end report is a straight **A**, including client IPv6 and RPKI-valid transit to the
 authoritative servers it queries.
@@ -246,7 +247,7 @@ Threadripper PRO 5995WX receiver, dual Xeon E5-2690 v2 generator, direct 10 GbE 
 X710/i40e + X520/ixgbe), 100k-name real corpus. Every throughput figure is cross-checked
 against the receiver NIC `tx_packets` (agreement 0.1–1.0 %).
 
-| Runbound 0.9 | Served (receiver NIC) | Host CPU (128 c) | Limited by |
+| Runbound 0.9.0 (measured 2026-07-03) | Served (receiver NIC) | Host CPU (128 c) | Limited by |
 |---|---|---|---|
 | `xdp: yes` — **dual-link** (X710 + X520) | **~19.4 M qps** (flood) / 20.3 M (ramp) | ~24.4 % | 99 % of the aggregate 20 G link — **link-bound** (CPU not saturated) |
 | `xdp: yes` — single link (X710) | ~9.85 M qps | ~10.1 % | 10 G link (103 B responses → line-bound) |

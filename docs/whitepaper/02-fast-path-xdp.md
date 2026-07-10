@@ -130,7 +130,7 @@ configurable (powers of two in [64, 65536], default 4096; `XdpRingSizes`,
 
 File: `src/dns/xdp/worker.rs`. One worker owns one `XskSocket` (one NIC queue) and runs on
 a dedicated OS thread, so the hot path never contends with the Tokio executor
-(`src/dns/xdp/worker.rs:6`). The loop:
+(`src/dns/xdp/worker.rs:8`). The loop:
 
 ```
 poll() → consume_rx() → parse eth/ip/udp/dns → LocalZoneSet lookup →
@@ -138,7 +138,7 @@ build response → enqueue_tx() → kick if needed → return frames to fill rin
 ```
 
 The per-query answer is `answer_dns_wire`, which returns a three-way result rather than an
-ambiguous `Option<usize>` (`src/dns/xdp/worker.rs:WireResult`):
+ambiguous `Option<usize>` (`WireResult`, `src/dns/xdp/worker.rs:36`):
 
 - `Answered(len)` — response written into the TX frame, send it.
 - `Fallback` — wire builder doesn't handle this case → hand to the slow-path handler over a
@@ -163,9 +163,12 @@ through to the slow path. When no split-horizon is configured the per-packet cos
 
 ### VLAN tag on TX
 
-The in-place reply preserves the 802.1Q tag that arrived in the frame. For NICs that
-strip the RX tag in hardware and refuse to disable it (e.g. bnxt), `RUNBOUND_XDP_VLAN=<vid>`
-re-inserts one tag on the reply (`src/dns/xdp/worker.rs:97`).
+The reply is built **zero-copy into a distinct TX frame of the UMEM** — not a rewrite of
+the received RX frame in place. The UMEM splits its frames into a lower RX pool and an upper
+TX pool, and the worker allocates the response frame from the TX free pool
+(`src/dns/xdp/umem.rs:505-508`). The reply preserves the 802.1Q tag that arrived in the RX
+frame; for NICs that strip the RX tag in hardware and refuse to disable it (e.g. bnxt),
+`RUNBOUND_XDP_VLAN=<vid>` re-inserts one tag on the reply (`src/dns/xdp/worker.rs:97`).
 
 ---
 
@@ -191,7 +194,7 @@ wire responses directly for the common case (A/AAAA from local zones).
 
 Positive answers are wire-built for A (1) and AAAA (28). Negative and error responses also
 have wire builders: `build_nxdomain` / `build_nodata` / `build_refused`
-(`src/dns/wire_builder.rs:388-520`) write RFC-minimal responses (no SOA in authority)
+(`src/dns/wire_builder.rs:512-545`) write RFC-minimal responses (no SOA in authority)
 directly into the TX frame. Of these, only `build_refused` is currently wired into the
 fast-path hot loop (`answer_dns_wire` in `worker.rs`); `build_nodata` is
 `#[allow(dead_code)]`, reserved for a future wildcard-aware fast path, and `build_nxdomain`

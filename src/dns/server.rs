@@ -3103,18 +3103,19 @@ pub async fn run_dns_server(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let rps_targets: Vec<String> = if named.is_empty() {
+            let slowpath_tune_targets: Vec<String> = if named.is_empty() {
                 crate::cpu::physical_up_nics()
             } else {
                 named.clone()
             };
             // Moderate NIC queue count for the kernel-UDP slow path (vs the XDP max):
             // ~16 queues feed the RX ring fast enough at line rate while leaving the bulk
-            // of cores free for the RPS-distributed serving threads. RPS to all physical
-            // serving cores is the dominant lever (measured 0.5M -> 6.4M qps). Queue +
-            // IRQ retune only on an explicitly named NIC (a combined-count change resets
-            // the link — never do that to the management NIC); RPS is harmless on idle
-            // NICs, so it is applied to every detected target.
+            // of cores free for the serving threads. Serving is spread across all cores by
+            // the random reuseport cBPF (kernel_loop.rs), NOT by RPS — RPS collapses on
+            // i40e (see the #slowpath-spread note below). Queue + IRQ retune only on an
+            // explicitly named NIC (a combined-count change resets the link — never do
+            // that to the management NIC); the retune is harmless on idle NICs, so it is
+            // applied to every detected target.
             // Raise the kernel socket-buffer ceiling so the kloop's SO_RCVBUF request
             // (RCVBUF_SIZE, 32 MiB) is not clamped — otherwise NAPI overruns the socket
             // under burst (UdpRcvbufErrors) even with spare CPU. Best-effort sysctl write
@@ -3131,7 +3132,7 @@ pub async fn run_dns_server(
             // Safety cap so a pathologically large NUMA node (NPS1: a node = the
             // whole socket) does not create an excessive number of NAPI/IRQ cores.
             const SLOWPATH_QUEUE_CAP: u32 = 32;
-            for nic in &rps_targets {
+            for nic in &slowpath_tune_targets {
                 let mut queues = 0u32;
                 let mut irq_n = 0usize;
                 if named.contains(nic) {
@@ -3328,7 +3329,8 @@ pub async fn run_dns_server(
         });
 
     // Step 3b: hickory no longer has UDP sockets — fast loop covers all cores.
-    // TSIG/AXFR/UPDATE are served wire-native; only the (feature-gated) recursor uses the fallback.
+    // TSIG/AXFR/UPDATE are served wire-native; only the in-house recursor uses the fallback
+    // (always compiled, OFF by default via `resolution-mode` — no Cargo feature gates it).
     // TCP is kept intact (low volume, handled by run_tcp_with_limit).
     let port = cfg.port;
 

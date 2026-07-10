@@ -10,12 +10,12 @@ Runbound does but *how* and *why* — down to the hand-written assembly on the h
 and the eBPF verifier constraints that shaped the in-kernel code.
 
 > **Status & honesty.** This document describes the code as it exists in the repository
-> at **0.9.4** (last full sync pass: 2026-07-09 — a DNSSEC-validated answer cache so DO=1
-> queries stop re-recursing (0.9.4); parallelised DNSSEC-chain fetches + cold-cache hedging
-> on the recursor slow path (0.9.4); CPU-affinity-aware worker sizing on VMs/containers
+> at **0.9.3** (last full sync pass: 2026-07-09 — a DNSSEC-validated answer cache so DO=1
+> queries stop re-recursing (0.9.3); parallelised DNSSEC-chain fetches + cold-cache hedging
+> on the recursor slow path (0.9.3); CPU-affinity-aware worker sizing on VMs/containers
 > (0.9.3); and observability fixes — DNSSEC OpenMetrics counters, finer latency buckets, a
 > real cached-entry count, and a `cache-min-ttl` directive surfaced in `/api/config`
-> (0.9.3/0.9.4)). Where a claim is not backed by a
+> (0.9.3)). Where a claim is not backed by a
 > measurement or by the code, it is marked **"I cannot confirm this."** No marketing
 > language is used: the words *production-ready, blazing, world-first, military-grade,
 > rock-solid, unbreakable, guaranteed* are banned, in line with the project's

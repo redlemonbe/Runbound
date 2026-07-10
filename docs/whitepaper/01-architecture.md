@@ -41,7 +41,7 @@ issue #167b) running *alongside* the XDP workers, because XDP only owns the phys
 and local resolution still needs a kernel path. So for loopback traffic specifically, Tier
 1 and Tier 2 run concurrently. Both share the **same** zero-allocation wire answer routine.
 Tier 3 is always present: it is the in-house wire handler
-`serve_wire` (`src/dns/server.rs:431`, codec in `src/dns/wire/`). Every path (forward,
+`serve_wire` (`src/dns/server.rs:464`, codec in `src/dns/wire/`). Every path (forward,
 full-recursion, local, AXFR, DDNS, TSIG, …) is served by `serve_wire`. The sovereign
 full-recursion resolver (`src/dns/recursor_wire.rs`) and DNSSEC validation
 (`src/dns/dnssec_*.rs`) are entirely in-house and always compiled in (no Cargo feature
@@ -72,7 +72,7 @@ in-house wire handler throughout.
 
 Both fast tiers call the same function, `answer_dns_wire` (exposed as
 `answer_dns_wire_pub` in `src/dns/xdp/worker.rs`, called from the kernel loop at
-`src/dns/kernel_loop.rs:356`). It:
+`src/dns/kernel_loop.rs:375` (`answer_dns_wire_pub`)). It:
 
 1. parses the query with `parse_query` (no allocation, SIMD `find_zero`),
 2. looks the name up in a `WireRecordIndex` keyed by CRC32c `hash_wire_qname`,
@@ -84,17 +84,17 @@ If the query is anything the wire path does not handle (EDNS DO=1 / DNSSEC, CNAM
 TSIG, AXFR, TCP, or a cache/zone miss requiring recursion), the routine returns
 `Fallback` and the query is handed up a tier. The contract that the two normalisation
 paths (load-time name parsing and hot-path raw wire) produce **byte-identical** keys is
-enforced by the `wire_qname_roundtrip` test (`src/dns/hasher.rs:411`); if it ever broke,
+enforced by the `wire_qname_roundtrip` test (`src/dns/hasher.rs:412`); if it ever broke,
 fast-path lookups would silently miss, so the test is the guard against a silent no-op.
 
 ## 1.4 Process and runtime model
 
 - **DNS data plane.** Tier 1 uses dedicated OS worker threads pinned to physical,
   NUMA-local cores, one per AF_XDP queue. Tier 2 uses one blocking OS thread per
-  NUMA-local core, each owning a `SO_REUSEPORT` UDP socket (`src/dns/kernel_loop.rs:133-134`).
+  NUMA-local core, each owning a `SO_REUSEPORT` UDP socket (`start_kernel_fast_loop`, `src/dns/kernel_loop.rs:152-153`).
   The per-worker RX/TX scratch buffers are `Vec<[u8; DNS_BUF_SIZE]>` (heap), allocated
   **once** before the hot loop and reused every batch — so there is **zero allocation per
-  packet** on the hot path (`src/dns/kernel_loop.rs:237` and `:242`; `DNS_BUF_SIZE = 4096`).
+  packet** on the hot path (`rx_bufs`/`tx_bufs`, `src/dns/kernel_loop.rs:256` and `:261`; `DNS_BUF_SIZE = 4096`).
   `SO_RCVBUF`/`SO_SNDBUF` are set to 32 MiB and the code warns if the kernel clamps them
   (`net.core.rmem_max` too low).
 - **Control plane.** The REST API runs on a **separate, dedicated 2-thread Tokio runtime**

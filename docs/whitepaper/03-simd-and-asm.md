@@ -27,7 +27,7 @@ on detected CPU features (`crate::cpu::simd_level()` and `hasher::init()`).
 The design rule throughout: **the optimised kernel must be provably equal to a simple
 reference.** This is enforced by tests, not by inspection — e.g. `asm_matches_intrinsic`
 compares the raw-`asm!` CRC against the intrinsic CRC for every input length 0..=80
-(`src/dns/hasher.rs:330`).
+(`src/dns/hasher.rs:331` (`asm_matches_intrinsic`)).
 
 ---
 
@@ -211,7 +211,7 @@ preserved or incrementally patched rather than recomputed.
 
 | Kernel | Where | Technique | Reference impl tested against |
 |--------|-------|-----------|-------------------------------|
-| Domain hash (user) | `hasher.rs:70` | CRC32c raw `asm!`, 8/4/1-byte stages | intrinsic `crc32c_sse42` (`:330`) |
+| Domain hash (user) | `hasher.rs:70` | CRC32c raw `asm!`, 8/4/1-byte stages | intrinsic `crc32c_sse42` (`:331`) |
 | Domain hash (kernel) | `dns_xdp.c:237` | FNV-1a, `#pragma unroll 64` | verifier-bounded by construction |
 | Lowercase | `simd.rs:22` | AVX2/SSE2, XOR-0x80 signed-compare trick | scalar, all lengths 0..=80 |
 | Byte equality | `simd.rs:193` | AVX2/SSE2 `pcmpeqb`+`pmovmskb`, early exit | scalar, mismatch at each pos |

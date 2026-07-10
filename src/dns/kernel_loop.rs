@@ -19,8 +19,8 @@
 // cases the fast path cannot (EDNS DO=1 signed zones, CNAME, MX, TSIG, AXFR,
 // forwarding) — it never sees the local-zone hot path.
 //
-// SO_RCVBUF/SO_SNDBUF set to 8 MiB per socket (fixes udp_RcvbufErrors=93k/s
-// measured on the Xeon v2 rig with the previous default-buffer path).
+// SO_RCVBUF/SO_SNDBUF set to 32 MiB per socket (RCVBUF_SIZE; fixes
+// udp_RcvbufErrors=93k/s measured on the Xeon v2 rig with the default-buffer path).
 //
 // Non-XDP-specific: no AF_XDP, no UMEM, no BPF — pure kernel UDP sockets.
 

@@ -433,9 +433,10 @@ const FLAGS_REFUSED: u16 = 0x8585;
 /// Build an NXDOMAIN response directly into `out`.
 ///
 /// Wire: Header(12, RCODE=3, ancount=0) + echo Question.
-/// No SOA in authority (RFC-minimal; no negative-answer cache exists on the fast
-/// path, or anywhere else in the codebase — see #210). dig reports `status:
-/// NXDOMAIN` correctly regardless.
+/// No SOA in authority (RFC-minimal fast-path builder). Negative answers ARE
+/// cached, on the slow path (`server.rs` `maybe_cache_negative`, RFC 2308; see
+/// #166/#210); this zero-alloc builder only emits the wire form. dig reports
+/// `status: NXDOMAIN` correctly regardless.
 ///
 /// Returns `Some(len)` on success, `None` if `out` is too small.
 /// Build an A/AAAA answer from pre-serialised `WireRdata` entries (from `WireRecordIndex`).
@@ -503,6 +504,10 @@ pub fn build_answer_a_aaaa_wire(
     Some(p)
 }
 
+// Dead on the current fast path: negative answers are served from the slow-path
+// negative cache (`server.rs` `maybe_cache_negative`), not synthesised here. Kept
+// (with wire-correctness tests) as the zero-alloc builder for a future fast-path
+// negative responder. Only `build_refused` below is wired into the hot path.
 #[allow(dead_code)]
 pub fn build_nxdomain(wq: &WireQuery<'_>, out: &mut [u8], edns: Option<&EdnsInfo>) -> Option<usize> {
     let flags = (FLAGS_AA_NXDOMAIN & 0xFEFF) | (u16::from(wq.rd) << 8); // RD echoed from query

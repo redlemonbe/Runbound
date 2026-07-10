@@ -22,24 +22,24 @@ not only local-zone answers:
 
 - **Forward/recursion feeds the latency histogram.** A completed forwarded/recursed lookup
   now records its round-trip into the same fixed-bucket histogram as local answers
-  (`record_forward` → `record_latency_us`, `src/stats.rs:342`), driving p50/p95/p99. Before
+  (`record_forward` → `record_latency_us`, `src/stats.rs:343`), driving p50/p95/p99. Before
   this, only local-zone answers recorded latency, so a pure forwarding/recursing server
   reported p50/p95/p99 = 0.
 - **NODATA / NXDOMAIN count their round-trip.** Negative answers record a `record_forward`
-  (miss + latency) like the positive `Answer` arm (`src/dns/server.rs:1006`); NODATA
+  (miss + latency) like the positive `Answer` arm (`src/dns/server.rs:1060`); NODATA
   (NOERROR + empty answer) is counted as `forwarded` rather than mis-attributed to
-  `servfail` (`src/dns/server.rs:997`), so the sub-counters reconcile with `total_queries`.
+  `servfail` (`src/dns/server.rs:1055`), so the sub-counters reconcile with `total_queries`.
 - **Cache flush resets the XDP hit counters.** A resolver cache flush zeroes not only
   `cache_hits`/`cache_misses`/`cache_entries` but also the per-worker XDP packet counters
   (`XDP_WORKER_PKTS`), which carry all cache hits under `xdp: no`
-  (`Stats::reset_cache`, `src/stats.rs:362`). Without this, a flush left the hit-rate stuck
+  (`Stats::reset_cache`, `src/stats.rs:363`). Without this, a flush left the hit-rate stuck
   at 100 % (hits > 0, misses 0) with no traffic afterwards.
-- **DNSSEC verdict families in OpenMetrics (0.9.4).** `GET /api/metrics` exposes
+- **DNSSEC verdict families in OpenMetrics (0.9.3).** `GET /api/metrics` exposes
   `runbound_dnssec_secure_total`, `runbound_dnssec_bogus_total` and
-  `runbound_dnssec_insecure_total` (`src/api/mod.rs:4036-4048`), fed by the per-verdict
+  `runbound_dnssec_insecure_total` (`src/api/mod.rs:4036-4050`), fed by the per-verdict
   counters the validating resolver increments. The latency histogram also gained two finer
   buckets above 1 s — upper bounds `1_500_000` and `2_000_000` µs (`HIST_BOUNDS_US`,
-  `src/stats.rs:46`; 13 → 15 buckets) — so a slow cold-recursion tail is visible instead of
+  `src/stats.rs:45`; 13 → 15 buckets) — so a slow cold-recursion tail is visible instead of
   collapsing into one "> 1 s" bucket.
 - **`cache_min_ttl` reported by `GET /api/config` (0.9.3).** The `cache-min-ttl` TTL floor
   was applied internally but not surfaced; `/api/config` now returns it
@@ -89,7 +89,7 @@ split-horizon — `add_split_horizon`/`delete_split_horizon` (`src/api/mod.rs`) 
   (`POST /nodes/register`, HMAC-signed, `src/sync.rs:1017`). The master validates the
   advertised `relay_host` against SSRF: loopback, unspecified, link-local, IPv6 ULA and
   — unless `sync-allow-private-relay: yes` is set on the master — **RFC 1918 private
-  ranges are rejected with 400** (`src/sync.rs:1103`). LAN deployments (a slave at a
+  ranges are rejected with 400** (`src/sync.rs:1144`). LAN deployments (a slave at a
   private address, the common self-hosted case) therefore **require**
   `sync-allow-private-relay: yes` in the master config; without it registration fails
   with `INVALID_RELAY_HOST` and the slave logs only `Registration returned non-200
@@ -115,5 +115,5 @@ split-horizon — `add_split_horizon`/`delete_split_horizon` (`src/api/mod.rs`) 
   live with no restart. Merged into the WebUI **Subnets** tab alongside split-horizon.
 - **Embedded web UI**: static HTML gzipped at build (`include_bytes!` of
   `OUT_DIR/index.html.gz`), served by the binary — no nginx. The admin panel **binds
-  `127.0.0.1` by default** (`ui-bind` default `127.0.0.1`, `src/config/parser.rs:551`);
+  `127.0.0.1` by default** (`ui-bind` default `127.0.0.1`, `src/config/parser.rs:560`);
   exposing it on the network requires an explicit `ui-bind: 0.0.0.0`.

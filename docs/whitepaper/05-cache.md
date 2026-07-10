@@ -17,7 +17,7 @@ blacklist add/delete, feed add/update/delete) and mutates the same `MutableCache
   `src/dns/cache_snapshot.rs:109`).
 - **Reader**: an `ArcSwap<HashMap>` holds an immutable **snapshot**. XDP workers call
   `load_full()` once per received batch and look up from the frozen copy with zero locking.
-- A background **publish loop** (`publish_loop`, `src/dns/cache_snapshot.rs:364`) clones the
+- A background **publish loop** (`publish_loop`, `src/dns/cache_snapshot.rs:369`) clones the
   mutable map every **10 ms**, evicts expired entries, and atomically swaps the snapshot in.
 
 ### Skipping the clone when nothing changed (PERF-1 / #135)
@@ -25,7 +25,7 @@ blacklist add/delete, feed add/update/delete) and mutates the same `MutableCache
 Cloning the whole map every 10 ms is wasteful when no inserts happened. A monotonic
 `CACHE_WRITE_GEN` counter (`src/dns/cache_snapshot.rs:120`) is bumped on every insert; the
 publish loop compares it to its last-seen value and **skips the O(n) clone** when unchanged
-(`src/dns/cache_snapshot.rs:374`). A forced eviction pass still runs every 256 ticks
+(`src/dns/cache_snapshot.rs:379`). A forced eviction pass still runs every 256 ticks
 (~2.5 s) to drop TTL-expired entries even when nothing new was inserted.
 
 ## 5.2 Keys: CRC32c → u64 + IdentityHasher

@@ -1,6 +1,6 @@
 # 07 — Security
 
-> **Status: current (0.9.4, last full sync pass: 2026-07-09)** — condensed, with code anchors; open items are listed
+> **Status: current (0.9.3, last full sync pass: 2026-07-09)** — condensed, with code anchors; open items are listed
 > at the end. Cross-references `SECURITY.md`, `THREAT_MODEL.md`,
 > `docs/security-audit/SECURITY-AUDIT.md`, `docs/BUILD.md`.
 
@@ -10,30 +10,32 @@
   (`src/dns/doq.rs`, wired in `src/dns/server.rs`). `quinn` is a direct dependency
   with minimal features (ring crypto, no platform-verifier).
 - **Relay authentication.** HMAC-SHA256 over method + path + timestamp **+ body**
-  (SEC-I14), anti-replay ±30 s (`replay_check_and_record`, `src/sync.rs:118`),
+  (SEC-I14), anti-replay ±30 s (`replay_check_and_record`, `src/sync.rs:117`),
   constant-time compare (`hmac_verify_with_ts`, `src/sync.rs:145`); TOFU cert pinning.
   Only the body-covering signature is accepted (SEC-J5). Registration rejects
   loopback/link-local/ULA and (by default) RFC 1918 relay hosts —
   `sync-allow-private-relay` opts LAN deployments in (§6.3).
 - **API.** Localhost-only bind; bearer token (env var preferred over config); optional
   PKCS#11 HSM storage for the API key and relay HMAC key; optional Unix socket (0600).
-- **Rate limit + bans on *both* datapaths (one mechanism).** Per-source-IP token-bucket
-  rate limiting (default 200 qps) and the ban set are enforced through a *shared* gate
-  (`rl_should_drop()` + `icmp_stats.is_banned()`) called from **both** the AF_XDP fast path
-  and the kernel slow loop, driven by the same objects — like the blacklist, one place
-  governs both routes. Both are enforced in `xdp: no` as well as in XDP. The limits are
+- **Rate limit + bans on *both* datapaths.** Per-source-IP token-bucket rate limiting
+  (default 200 qps) runs through **one shared function** (`rl_should_drop()`) called from
+  **both** the AF_XDP fast path and the kernel slow loop. Bans are **a shared ban set,
+  enforced on each datapath** — the fast path drops banned sources with `XDP_DROP` in eBPF
+  (`icmp_banned`/`icmp_banned_v6`) while the kernel slow loop checks the same set via
+  `icmp_stats.is_banned()`. Both paths are driven by the same objects, so — like the
+  blacklist — both routes see the same state. Both are enforced in `xdp: no` as well as in XDP. The limits are
   **live-editable**: `rps`/`burst` are read as `AtomicU64` on the hot path
-  (`RateLimiter::check`/`set_limits`, `src/dns/ratelimit.rs:65`/`:95`), so a `PATCH
+  (`RateLimiter::check`/`set_limits`, `src/dns/ratelimit.rs:105`/`:95`), so a `PATCH
   /api/config` edit applies to both datapaths with no restart; a live `burst: 0` is clamped
   to ≥1 when `rps>0` so an edit cannot self-DoS the node. **Loopback is never
   rate-limited or banned** on either mechanism (`ip.is_loopback()` shortcut in
   `RateLimiter::check`, `src/dns/ratelimit.rs:112`; the ban insert refuses
-  loopback/unspecified, `src/icmp.rs:115`) — local health checks and `dig @127.0.0.1`
+  loopback/unspecified, `src/icmp.rs:118`) — local health checks and `dig @127.0.0.1`
   cannot be dropped, and a spoofed loopback cannot persist a self-ban across reboots. A
   separate per-source ICMP rate limit + flood detector bans source IPs at
   the XDP layer via `ebpf/dns_xdp.c`. Permanent ("blacklisted") bans are persisted to a
   `0600` file and reloaded at startup (capped on both write and read).
-- **DNSSEC `AD`.** On the forward path Runbound does not itself validate DNSSEC. Since v0.9.5 it **relays**
+- **DNSSEC `AD`.** On the forward path Runbound does not itself validate DNSSEC. Since v0.9.3 it **relays**
   the upstream's `AD` to a client that asked for validation (its query set `AD` or `DO`), but
   **only** when the answer arrived over an authenticated **DoT** channel (`forward-tls-upstream`)
   and the upstream itself set `AD` (`authenticated = msg.header.ad() && authed_channel`,
@@ -46,7 +48,7 @@
   resolver (`src/dns/recursor_wire.rs`, `src/dns/dnssec_*.rs`) attaches a per-record `Proof`
   and sets `AD` only when the answer is cryptographically `Secure` **and** the query's
   own `DO` bit is set (`set_ad = val.verdict == Verdict::Secure && do_bit`,
-  `src/dns/server.rs:781`) — `Bogus` is SERVFAIL'd (unless the client set `CD`), and
+  `src/dns/server.rs:819`) — `Bogus` is SERVFAIL'd (unless the client set `CD`), and
   insecure/unsigned or DO-less answers leave `AD` clear. Outbound DNSSEC **signing** of
   local zones is wire-native — an in-house ECDSA P-256 signer on `ring` (RFC
   6605/4034/5155/9276), validated byte-identical
@@ -59,11 +61,11 @@
   so a signed UPDATE's key selection is not a timing oracle.
 - **Forward path validates the upstream response.** A plain-UDP upstream answer is accepted
   only when its transaction ID **and** its question (name case-insensitive + type + class)
-  match the query (SEC-O1, `src/dns/forward.rs:326`) — a cache-poisoning defence the
+  match the query (SEC-O1, `response_matches`, `src/dns/forward.rs:335`) — a cache-poisoning defence the
   forwarder enforces.
 - **Firewall integration.** `src/firewall/` manages backend rules automatically.
 - **Availability under flood.** A hard inflight cap (`MAX_INFLIGHT_REQUESTS = 4096`,
-  non-blocking semaphore → instant `REFUSED`, `src/dns/server.rs:49`) bounds memory even at
+  non-blocking semaphore → instant `REFUSED`, `src/dns/server.rs:72`) bounds memory even at
   line rate — a spawn-per-request handler with no backpressure would OOM under a flood.
   Per-source-IP token-bucket rate limiting
   (default 200 qps) sits in front.
@@ -73,8 +75,10 @@
   rests on the HMAC key + fingerprint, not a CA. A reviewer must confirm the TOFU
   enforcement point.
 - **Supply-chain integrity (#171, #172).**
-  - **Reproducible build** — `docs/BUILD.md`: pinned toolchain + `Cargo.lock`; `SHA256SUMS`
-    published per release.
+  - **Verifiable build (SBOM + checksums + signatures)** — `docs/BUILD.md`: toolchain +
+    `Cargo.lock`; `SHA256SUMS` published per release. (Byte-for-byte reproducibility is not
+    claimed — there is no rebuild-and-diff, no `SOURCE_DATE_EPOCH`, and the `stable`
+    toolchain is not pinned to an exact version.)
   - **Signatures** — minisign signing in CI (key in `MINISIGN_SECRET`, optional
     passphrase in `MINISIGN_PASSWORD`); public key in `docs/BUILD.md`.
   - **SBOM** — CycloneDX generated by `cargo-cyclonedx` in CI, attached to each release.
@@ -117,12 +121,12 @@
   - **AXFR allow-list & split-horizon on the real client IP (PENT-1/PENT-2).** TCP/DoT/DoH
     are proxied through an internal loopback relay; the relay now carries the **real client
     IP via a PROXY v2 header** read **before** the TLS handshake for DoT/DoH
-    (`src/dns/server.rs:2013` builds it — `proxy_v2_header` —, `:2043` parses it —
+    (`src/dns/server.rs:2178` builds it — `proxy_v2_header` —, `:2208` parses it —
     `read_proxy_v2`). `axfr-allow` and split-horizon therefore evaluate the true source
     instead of `127.0.0.1` — closing a real ACL bypass.
   - **Least privilege default `CAP_NET_BIND_SERVICE`** (PENT-3, above).
   - **WebUI binds `127.0.0.1` by default** (PENT, `ui-bind` default,
-    `src/config/parser.rs:551`).
+    `src/config/parser.rs:560`).
   - Config-parser correctness: a `server:` directive written after an `axfr:`/`io-uring:`
     sub-block is parsed; a `tsig-key` name with a trailing dot is normalized to match the
     verifier so signed UPDATEs are not rejected with `UnknownKey`.

@@ -51,9 +51,8 @@ pub enum ResolveResult {
     },
     /// Authoritative negative: NXDOMAIN or NOERROR+empty ANSWER (NODATA).
     /// `neg_ttl` is RFC 2308 §5 min(SOA MINIMUM, SOA record TTL), or 0 if no SOA
-    /// was present (do-not-cache sentinel). No negative-answer cache exists yet
-    /// anywhere in the codebase (neither this slow path nor the XDP fast path —
-    /// see #210), so `neg_ttl` is computed but currently unread.
+    /// was present (do-not-cache sentinel). It is consumed by the slow-path
+    /// negative cache (`server.rs` `maybe_cache_negative`; see #166/#210).
     NegativeAnswer {
         rcode: u16,
         /// RFC 2308 §5 negative TTL: `min(SOA.minimum, SOA.ttl)`, or 0 = do-not-cache.

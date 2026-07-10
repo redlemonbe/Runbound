@@ -1,6 +1,6 @@
 # 10 — Appendices
 
-> **Status: current (0.9.4, last full sync pass: 2026-07-09)** — intentionally pointer-style: references
+> **Status: current (0.9.3, last full sync pass: 2026-07-09)** — intentionally pointer-style: references
 > `docs/configuration.md` and `docs/api.md` rather than duplicating them.
 
 ## A. Configuration reference

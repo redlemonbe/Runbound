@@ -41,9 +41,9 @@ This chapter holds **only measured numbers produced under the documented methodo
 ## Methodology (summary — see docs/benchmark/README.md)
 - Generator: dnsmark. Warmup + ramp to saturation, then a sustained **hold** = the stable
   figure (not the ramp peak). Corpus: Tranco top-10 000, random order.
-- **Truth is the NIC hardware counters** (`ethtool -S`: `rx_packets`, `rx_missed_errors`),
-  not the generator's self-reported round-trip — in zero-copy mode the software counters do
-  not reflect the datapath.
+- **Truth is the NIC hardware counter** (`ethtool -S`: receiver `tx_packets`, the ASIC
+  served-reply counter), not the generator's self-reported round-trip — in zero-copy mode the
+  software counters do not reflect the datapath.
 - Governor pinned `performance`; Ethernet flow control off; RSS spread; verify `:53`
   ownership before each run; compare back-to-back only (one variable at a time).
 

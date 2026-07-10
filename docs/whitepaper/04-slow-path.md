@@ -1,6 +1,6 @@
 # 04 — The slow path (wire-native `serve_wire`)
 
-> **Status: current (0.9.4, last full sync pass: 2026-07-09).** The slow path is served
+> **Status: current (0.9.3, last full sync pass: 2026-07-09).** The slow path is served
 > entirely by the in-house wire codec (`serve_wire`, `src/dns/server.rs`), and recursion +
 > DNSSEC validation are entirely in-house too (`src/dns/recursor_wire.rs`,
 > `src/dns/dnssec_*.rs`) and always compiled in — there is no `recursor` Cargo feature.
@@ -40,19 +40,19 @@ pipeline:
   16.8M softnet drops/s). On a few-flow benchmark generator this is what lets every serving
   core stay busy; on real traffic (thousands of source ports) the default hash already would.
 - **Batched receive with `recvmmsg`** (`MSG_WAITFORONE`): one syscall drains up to 64
-  datagrams (`BATCH = 64`, `src/dns/kernel_loop.rs:236`)
+  datagrams (`BATCH = 64`, `src/dns/kernel_loop.rs:255`)
   instead of one syscall per datagram. Per-packet `recv_from` cannot keep the
   socket buffer empty under burst — the overflow shows up as `UdpRcvbufErrors`, not a NIC
   drop. `MSG_WAITFORONE` returns as soon as ≥1 datagram is ready, so a lone query (e.g.
   `dig`) is still answered immediately — no batching latency for single queries.
 - **Batched transmit with `sendmmsg`**: answered responses from one `recvmmsg`
   batch are collected and flushed with a **single** `sendmmsg`
-  (`src/dns/kernel_loop.rs:444`) — one syscall per batch on the TX side too, with the
+  (`src/dns/kernel_loop.rs:463`) — one syscall per batch on the TX side too, with the
   iovec/header arrays allocated once, not per batch.
 - **32 MiB socket buffers**: each kloop socket requests `SO_RCVBUF = 32 MiB`
   (`RCVBUF_SIZE`, `src/dns/kernel_loop.rs:65`) so NAPI bursts are absorbed instead of
   dropped as `UdpRcvbufErrors`; startup auto-raises `net.core.rmem_max`/`wmem_max` to
-  match (best-effort, root — `src/dns/server.rs:2887`) and warns if the kernel clamps
+  match (best-effort, root — `src/dns/server.rs:3124`) and warns if the kernel clamps
   the buffer.
 - **The shared per-source gate.** Every datagram passes the *same* gate the XDP path uses,
   driven by the *same* objects: `rl_should_drop()` (the memoized per-source rate-limit) and
@@ -63,7 +63,7 @@ pipeline:
 - **Then the shared SIMD/ASM responder** — `answer_dns_wire` (local-data / wire) and
   `answer_from_cache` (cache snapshot, §05). Only `WireResult::Fallback` (cache miss,
   CNAME/MX/DNSSEC DO=1, ANY) is handed to the slow-path handler `serve_wire`
-  (`src/dns/server.rs:431`) via a bounded channel.
+  (`src/dns/server.rs:464`) via a bounded channel.
 
 The net effect: in `xdp: no` the cache-hit path is the same hand-written wire builder as
 XDP, on a kernel UDP socket; the wire-native `serve_wire` handler only sees the genuine
@@ -73,7 +73,7 @@ misses.
 
 A spawn-per-request handler with no backpressure exhausts RAM under a flood. The
 wire-native handler bounds concurrency with a semaphore of
-`MAX_INFLIGHT_REQUESTS = 4096` (`src/dns/server.rs:49`). A **non-blocking** `try_acquire`
+`MAX_INFLIGHT_REQUESTS = 4096` (`src/dns/server.rs:72`). A **non-blocking** `try_acquire`
 returns `REFUSED` instantly without allocating, so the bound holds even at line rate. This
 is a deliberate availability trade-off: shed load rather than OOM.
 
@@ -84,7 +84,7 @@ Forwarding is wire-native — the in-house forward pool (`src/dns/forward.rs`):
 - **Upstream racing** (`upstream-racing: yes`): the forward pool queries all upstreams in
   parallel and the first **definitive** result (positive or authoritative negative) ends
   the race; a `Servfail` is not definitive (`Forward::is_definitive`,
-  `src/dns/forward.rs:61`; racing logic in `ForwardPool::forward`, `src/dns/forward.rs:387`).
+  `src/dns/forward.rs:70`; racing logic in `ForwardPool::forward`, `src/dns/forward.rs:396`).
 - **txid + question validation** (SEC-O1): a plain-UDP upstream response is accepted only
   when its transaction ID and its question (name case-insensitive + type + class) match the
   query (`response_matches`, `src/dns/forward.rs`) — a cache-poisoning defence the
@@ -92,7 +92,10 @@ Forwarding is wire-native — the in-house forward pool (`src/dns/forward.rs`):
 - **Hard lookup timeout** (#83): forward lookups are wrapped in a hard timeout so a stuck
   upstream cannot pin a task/Tokio worker indefinitely (a measured-and-fixed deadlock root
   cause).
-- **TLS** via `rustls` 0.23 (TLS 1.2 + 1.3) for DoT/DoH/DoQ.
+- **TLS** via `rustls` 0.23 (TLS 1.2 + 1.3) for DoT upstreams. The forward pool's only
+  upstream transports are plain UDP and DoT (`UpstreamKind`, `src/dns/forward.rs:87`); DoH
+  and DoQ are server-side listeners only (Runbound accepts them as inbound query transports,
+  §06), never used as an outbound transport toward upstreams.
 - **TSIG** is wire-native on `ring` HMAC (RFC 8945), `src/dns/tsig.rs`; the key-name
   lookup is constant-time (§07).
 
@@ -126,11 +129,11 @@ RTT-based ordering and hedging (`query_ns_set`, `src/dns/recursor_wire.rs:554`):
   (`infra_cache::record_rtt`/`rtt_of`, `src/dns/infra_cache.rs:41`/`:52`), updated on
   every successful exchange (`recursor_wire.rs:598`).
 - **Hedging.** The fastest server is launched first; if it has not answered within
-  `HEDGE_DELAY = 150 ms` (`recursor_wire.rs:104`, halved from 300 ms in 0.9.4) the next
+  `HEDGE_DELAY = 150 ms` (`recursor_wire.rs:104`, halved from 300 ms in 0.9.3) the next
   server is fired **in parallel** and the first valid reply wins (`tokio::select!` over a
   `FuturesUnordered`, `query_ns_set`, `recursor_wire.rs:554`). This turns a mute or slow
   first server from a full `QUERY_TIMEOUT` stall into roughly best-RTT + one hedge delay.
-- **Cold-cache hedge (0.9.4).** When **no** server in the set has a known RTT — a cold
+- **Cold-cache hedge (0.9.3).** When **no** server in the set has a known RTT — a cold
   cache, where RTT ordering has nothing to sort on — `query_ns_set` fires the **first two**
   servers at once on the opening launch (the `cold` branch, `recursor_wire.rs:567`), fastest
   reply wins, rather than paying a full `HEDGE_DELAY` before the hedge fires for a lone slow
@@ -141,7 +144,7 @@ RTT-based ordering and hedging (`query_ns_set`, `src/dns/recursor_wire.rs:554`):
   budget. Each launched exchange decrements that budget, so a delegation with many
   nameservers cannot fan out without limit.
 
-### 4.2.2 Parallel DNSSEC-chain prefetch (0.9.4)
+### 4.2.2 Parallel DNSSEC-chain prefetch (0.9.3)
 
 Validating an answer needs the DS + DNSKEY of every zone cut from the root down to the
 target (`trusted_keys_for`, `src/dns/dnssec_chain.rs:140`). On a cold infrastructure cache
@@ -149,7 +152,7 @@ these were fetched **serially** — each level's DNSKEY before the next level's 
 five sequential round-trips for a typical name.
 
 `trusted_keys_for` now **pre-fetches the whole chain's DS/DNSKEY messages in parallel**
-(`futures_util::future::join_all`, `src/dns/dnssec_chain.rs:173`) and then validates them
+(`futures_util::future::join_all`, `src/dns/dnssec_chain.rs:174`) and then validates them
 **strictly in order**, each level under its parent's already-validated keys, fail-closed on
 `Bogus` — the validation itself is unchanged. These are independent network reads (each
 server answers its own datum), so concurrency only anticipates data; it alters neither what
@@ -183,7 +186,7 @@ modes (#183). The `serve_wire` **fallback** still infers a hit from latency (a l
 ## 4.5 NIC auto-tune at startup (`xdp: no` only)
 
 When a slow-path interface is **explicitly named** in the config, startup reads the live
-topology and tunes the NIC for kernel-UDP throughput (`src/dns/server.rs:2827-2854`):
+topology and tunes the NIC for kernel-UDP throughput (`#slowpath-autotune` block, `src/dns/server.rs:3077-3219`):
 
 - **RX queue count = the NIC's NUMA-node logical-CPU count**, capped at 32
   (`SLOWPATH_QUEUE_CAP`) and at the serving-core count. The kernel-UDP path is bounded by
@@ -228,13 +231,13 @@ work.
 These features are implemented in `serve_wire` so the default (wire) path carries them:
 
 - **Query logging** — wire-native, feeds the WebUI Logs panel and `GET /api/logs`
-  (`log_query_wire`, `src/dns/server.rs:351`).
+  (`log_query_wire`, `src/dns/server.rs:378`).
 - **serve-stale** (#108, RFC 8767) — a wire-native stale cache (`stale_cache_wire`,
-  `src/dns/server.rs:126`) keyed by `(name, type)`, serving an expired answer on a transient
+  `src/dns/server.rs:152`) keyed by `(name, type)`, serving an expired answer on a transient
   upstream SERVFAIL. This is the only stale-cache implementation.
 - **resolv.conf emergency fallback** (#94) — when all configured upstreams are down the
   forward path falls back to `/etc/resolv.conf` and recovers automatically
-  (`src/dns/server.rs:867`, recovery probe at `:2610`).
+  (`src/dns/server.rs:955`, recovery probe at `:2775`).
 - **Per-upstream racing-win metric** (#33, in `GET /api/system`) and **top-domains
   slow-path counting** (#5) are likewise restored on the wire path.
 
