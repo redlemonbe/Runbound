@@ -86,6 +86,51 @@ pub(crate) fn tarpit_delay() -> Duration {
 
 const RATE_LIMIT_QPS_DEFAULT: u64 = 200;
 
+/// The serve-stale fallback store (RFC 8767) — keyed by (lowercased presentation
+/// name, qtype), holding the last-known-good answer and its genuine insertion
+/// `Instant`. Unlike `cache_snapshot::MutableCacheMap`, entries here already carry
+/// a real insertion timestamp (no TTL-proxy needed for oldest-first eviction).
+type StaleCacheMap =
+    Arc<DashMap<(String, u16), (Vec<crate::dns::wire::Record>, Instant), ahash::RandomState>>;
+
+/// Evict live entries oldest-first (genuine insertion `Instant`) until at most
+/// `target_len` remain. Used exclusively by the background memory-pressure
+/// watchdog (`memory_guard_loop`) — never the hot query path, so its cost never
+/// touches DNS latency. Same O(n) collect + `select_nth_unstable_by_key`
+/// (average O(n), no full sort) + O(k) removal shape as
+/// `cache_snapshot::evict_oldest`; no sentinel concept here (every entry in this
+/// store is a disposable fallback copy, unlike `local-data` in `xdp_cache`).
+fn evict_oldest_stale(store: &StaleCacheMap, target_len: usize) -> usize {
+    let current = store.len();
+    if current <= target_len {
+        return 0;
+    }
+    let want_removed = current - target_len;
+
+    let mut candidates: Vec<((String, u16), Instant)> = store
+        .iter()
+        .map(|kv| (kv.key().clone(), kv.value().1))
+        .collect();
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let n = want_removed.min(candidates.len());
+    if n < candidates.len() {
+        // Partition so the n oldest (smallest Instant) entries land in [..n] —
+        // avoids paying for a full sort of entries we're going to keep.
+        candidates.select_nth_unstable_by_key(n - 1, |&(_, inserted_at)| inserted_at);
+    }
+
+    let mut evicted = 0usize;
+    for (key, _) in candidates.into_iter().take(n) {
+        if store.remove(&key).is_some() {
+            evicted += 1;
+        }
+    }
+    evicted
+}
 
 // ============================================================
 // Handler
@@ -149,7 +194,9 @@ pub struct RunboundHandler {
     /// #108: serve-stale cache (default wire serving path) — wire-native, keyed by
     /// (lowercased presentation name, qtype). Fed on a successful forward, served on
     /// a transient upstream SERVFAIL (RFC 8767). `None` when serve-stale is off.
-    stale_cache_wire: Option<Arc<dashmap::DashMap<(String, u16), (Vec<crate::dns::wire::Record>, std::time::Instant), ahash::RandomState>>>,
+    /// Created by the caller (`run_dns_server`) and passed in — same pattern as
+    /// `xdp_cache` — so `memory_guard_loop` can hold its own clone.
+    stale_cache_wire: Option<StaleCacheMap>,
     /// #108: TTL to advertise for stale answers (seconds).
     stale_answer_ttl: u32,
     /// #108: max age of a stale entry (seconds).
@@ -274,7 +321,7 @@ impl RunboundHandler {
         dnssec_log_bogus: bool,
         fallback_active: Arc<std::sync::atomic::AtomicBool>,
         domain_stats: Arc<crate::domain_stats::DomainStats>,
-        serve_stale: bool,
+        stale_cache_wire: Option<StaleCacheMap>,
         stale_answer_ttl: u32,
         stale_max_age: u64,
         allow_update: bool,
@@ -323,11 +370,7 @@ impl RunboundHandler {
             resolv_fallback,
             dnssec_log_bogus,
             fallback_active,
-            stale_cache_wire: if serve_stale {
-                Some(Arc::new(dashmap::DashMap::with_hasher(ahash::RandomState::default())))
-            } else {
-                None
-            },
+            stale_cache_wire,
             stale_answer_ttl,
             stale_max_age,
             allow_update,
@@ -1787,31 +1830,35 @@ fn read_meminfo() -> Option<(u64, u64)> {
 }
 
 /// Background task: monitors system memory and shrinks the DNS resolver
-/// cache — plus clears transient connection/rate-limiter state — under
-/// pressure.
+/// cache and the serve-stale fallback store — plus clears transient
+/// connection/rate-limiter state — under pressure.
 ///
 /// Two watermarks, checked every `MEM_CHECK_SECS` against
 /// `used = 1 - MemAvailable/MemTotal` (cgroup v2-aware, see `read_meminfo`):
 ///   <  70 %  — stable: no action.
-///   70–80 %  — moderate: halve the resolver cache (`xdp_cache`), floored at
-///              `cfg.cache_min_entries` (default 2048).
+///   70–80 %  — moderate: halve `xdp_cache` and `stale_cache_wire`, each
+///              floored at `cfg.cache_min_entries` (default 2048).
 ///   ≥  80 %  — high: recompute the cache ceiling from CURRENT available RAM
 ///              (`cache_entries_for_available_kb` — the same formula the
-///              startup auto-sizer uses) and shrink to it if the live cache
-///              is larger; also rebuilds the forward pool (clears stale DoT
+///              startup auto-sizer uses) and shrink both stores to it if
+///              larger; also rebuilds the forward pool (clears stale DoT
 ///              connection churn) and flushes the rate limiter's token
 ///              buckets.
 ///
-/// Eviction is oldest-first by `expires_at` — see
+/// `xdp_cache` is evicted oldest-first by `expires_at` (see
 /// `cache_snapshot::evict_oldest` for why that's the right "oldest" proxy
-/// here and why `local-data` (sentinel) entries are never touched. Both
-/// bands are monotonic (never grow the cache) and floor-bounded, so a
-/// sustained high-pressure host converges to `cache_min_entries` within a
-/// few ticks rather than oscillating or evicting forever.
+/// there, and why `local-data` sentinel entries are never touched).
+/// `stale_cache_wire` already carries a genuine insertion `Instant` per
+/// entry, so `evict_oldest_stale` uses that directly — no proxy needed, and
+/// every entry there is a disposable fallback copy (no sentinel concept).
+/// Both stores, in both bands, are monotonic (never grow back) and
+/// floor-bounded, so a sustained high-pressure host converges to
+/// `cache_min_entries` within a few ticks rather than oscillating or
+/// evicting forever.
 ///
-/// This task is the only place the cache shrinks outside of normal TTL
-/// expiry (`publish_loop`'s periodic sweep). It never runs on the hot query
-/// path — DNS latency is unaffected by how much work an eviction pass does.
+/// This task is the only place either store shrinks outside of normal TTL
+/// expiry / insert-time backpressure. It never runs on the hot query path —
+/// DNS latency is unaffected by how much work an eviction pass does.
 pub async fn memory_guard_loop(
     rate_limiter: Arc<RateLimiter>,
     pool: Arc<ArcSwap<ForwardPool>>,
@@ -1820,6 +1867,7 @@ pub async fn memory_guard_loop(
     upstreams: crate::upstreams::SharedUpstreams,
     _dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
     xdp_cache: Option<super::cache_snapshot::MutableCacheMap>,
+    stale_cache: Option<StaleCacheMap>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(MEM_CHECK_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1842,12 +1890,14 @@ pub async fn memory_guard_loop(
             let _ = rebuild_and_swap(&pool, &addrs, false).await;
             stats.reset_cache();
             let freed = rate_limiter.clear();
+            let target = cache_entries_for_available_kb(avail_kb).max(cfg.cache_min_entries);
 
             let (cache_evicted, cache_len) = match xdp_cache.as_ref() {
-                Some(cache) => {
-                    let target = cache_entries_for_available_kb(avail_kb).max(cfg.cache_min_entries);
-                    (super::cache_snapshot::evict_oldest(cache, target), cache.len())
-                }
+                Some(cache) => (super::cache_snapshot::evict_oldest(cache, target), cache.len()),
+                None => (0, 0),
+            };
+            let (stale_evicted, stale_len) = match stale_cache.as_ref() {
+                Some(store) => (evict_oldest_stale(store, target), store.len()),
                 None => (0, 0),
             };
 
@@ -1856,28 +1906,40 @@ pub async fn memory_guard_loop(
                 freed_buckets = freed,
                 cache_evicted,
                 cache_len,
+                stale_evicted,
+                stale_len,
                 "memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM"
             );
         } else if used_ratio >= MEM_MOD_WATERMARK {
-            match xdp_cache.as_ref() {
+            let (cache_evicted, cache_len) = match xdp_cache.as_ref() {
                 Some(cache) => {
                     let target = cache_shrink_target(cache.len(), cfg.cache_min_entries);
-                    let cache_evicted = super::cache_snapshot::evict_oldest(cache, target);
-                    if cache_evicted > 0 {
-                        warn!(
-                            used_pct = format!("{:.1}%", used_ratio * 100.0),
-                            cache_evicted,
-                            cache_len = cache.len(),
-                            "memory pressure moderate: cache halved"
-                        );
-                    } else {
-                        debug!(
-                            used_pct = format!("{:.1}%", used_ratio * 100.0),
-                            "memory moderate pressure — cache already at floor"
-                        );
-                    }
+                    (super::cache_snapshot::evict_oldest(cache, target), cache.len())
                 }
-                None => debug!(used_pct = format!("{:.1}%", used_ratio * 100.0), "memory moderate pressure"),
+                None => (0, 0),
+            };
+            let (stale_evicted, stale_len) = match stale_cache.as_ref() {
+                Some(store) => {
+                    let target = cache_shrink_target(store.len(), cfg.cache_min_entries);
+                    (evict_oldest_stale(store, target), store.len())
+                }
+                None => (0, 0),
+            };
+
+            if cache_evicted > 0 || stale_evicted > 0 {
+                warn!(
+                    used_pct = format!("{:.1}%", used_ratio * 100.0),
+                    cache_evicted,
+                    cache_len,
+                    stale_evicted,
+                    stale_len,
+                    "memory pressure moderate: cache halved"
+                );
+            } else {
+                debug!(
+                    used_pct = format!("{:.1}%", used_ratio * 100.0),
+                    "memory moderate pressure — caches already at floor"
+                );
             }
         }
         // Low/stable band: no action.
@@ -1908,6 +1970,56 @@ mod memory_guard_tests {
         // A large host scales up and respects the ceiling.
         let huge = cache_entries_for_available_kb(1024 * 1024 * 1024); // 1 TiB available
         assert_eq!(huge, 64 * 1024 * 1024);
+    }
+
+    fn stale_store() -> StaleCacheMap {
+        Arc::new(DashMap::with_hasher(ahash::RandomState::default()))
+    }
+
+    fn stale_entry(age_secs_ago: u64) -> (Vec<crate::dns::wire::Record>, Instant) {
+        // Older entries get an Instant further in the past — evict_oldest_stale
+        // must remove the smallest (oldest) Instant first.
+        (Vec::new(), Instant::now() - Duration::from_secs(age_secs_ago))
+    }
+
+    #[test]
+    fn stale_no_op_when_already_under_target() {
+        let s = stale_store();
+        s.insert(("a.example.".into(), 1), stale_entry(10));
+        s.insert(("b.example.".into(), 1), stale_entry(20));
+        assert_eq!(evict_oldest_stale(&s, 10), 0);
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn stale_evicts_oldest_first() {
+        let s = stale_store();
+        // Key N is N*10 seconds old — key 10 (100s old) is the oldest.
+        for i in 1u64..=10 {
+            s.insert((format!("d{i}.example."), 1), stale_entry(i * 10));
+        }
+        let evicted = evict_oldest_stale(&s, 4);
+        assert_eq!(evicted, 6);
+        assert_eq!(s.len(), 4);
+        // Survivors must be the 4 youngest entries: d1..=d4 (10..=40s old).
+        let mut remaining: Vec<String> = s.iter().map(|kv| kv.key().0.clone()).collect();
+        remaining.sort_unstable();
+        assert_eq!(remaining, vec!["d1.example.", "d2.example.", "d3.example.", "d4.example."]);
+    }
+
+    #[test]
+    fn stale_evicts_down_to_zero_when_target_is_zero() {
+        let s = stale_store();
+        s.insert(("a.example.".into(), 1), stale_entry(5));
+        s.insert(("b.example.".into(), 28), stale_entry(1));
+        assert_eq!(evict_oldest_stale(&s, 0), 2);
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn stale_returns_zero_on_empty_store() {
+        let s = stale_store();
+        assert_eq!(evict_oldest_stale(&s, 0), 0);
     }
 }
 // ============================================================
@@ -2783,6 +2895,14 @@ pub async fn run_dns_server(
         "resolver cache cap (#165: RAM-scaled or explicit cache-size)"
     );
 
+    // #108: serve-stale fallback store — created here (not inside RunboundHandler::new)
+    // so memory_guard_loop can hold its own clone, same pattern as xdp_cache.
+    let stale_cache_wire: Option<StaleCacheMap> = if cfg.serve_stale {
+        Some(Arc::new(DashMap::with_hasher(ahash::RandomState::default())))
+    } else {
+        None
+    };
+
     // Spawn memory pressure guard — monitors /proc/meminfo every 30 s,
     // shrinks the DNS cache under pressure, and flushes the rate limiter.
     {
@@ -2793,8 +2913,9 @@ pub async fn run_dns_server(
         let ups_mg = Arc::clone(&upstreams);
         let dnssec_mg = Arc::clone(&dnssec_enabled);
         let cache_mg = xdp_cache.as_ref().map(Arc::clone);
+        let stale_mg = stale_cache_wire.as_ref().map(Arc::clone);
         tokio::spawn(async move {
-            memory_guard_loop(rl, res, cfg_arc, stats_mg, ups_mg, dnssec_mg, cache_mg).await
+            memory_guard_loop(rl, res, cfg_arc, stats_mg, ups_mg, dnssec_mg, cache_mg, stale_mg).await
         });
     }
 
@@ -2936,7 +3057,7 @@ pub async fn run_dns_server(
         cfg.dnssec_log_bogus,
         fallback_active,
         domain_stats,
-        cfg.serve_stale,
+        stale_cache_wire,
         cfg.stale_answer_ttl,
         cfg.stale_max_age,
         cfg.allow_update,
