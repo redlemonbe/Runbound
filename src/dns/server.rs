@@ -1709,13 +1709,25 @@ fn cgroup_memory_current_bytes() -> Option<u64> {
         .ok()
 }
 
-/// Compute an appropriate resolver cache size from current available RAM.
+/// Resolver cache sizing formula, shared by the startup auto-sizer
+/// (`cache_size_from_meminfo`) and the live watchdog recalculation in
+/// `memory_guard_loop` — one formula, one place to tune it.
 ///
-/// 1 hickory cache entry ≈ 512 bytes.
-/// Allocates up to 10 % of available memory, clamped to [512, 65536].
+/// ~1/4 of available memory ÷ ~512 B/entry (name + RRset + metadata),
+/// clamped to [8192, 64 Mi] entries (~32 GiB ceiling). This is a CEILING,
+/// not an upfront allocation — entries fill it as queries arrive.
+fn cache_entries_for_available_kb(avail_kb: u64) -> usize {
+    if avail_kb == 0 {
+        return 8192;
+    }
+    const CACHE_ENTRY_BYTES: u64 = 512;
+    let entries = avail_kb * 1024 / 4 / CACHE_ENTRY_BYTES;
+    (entries as usize).clamp(8192, 64 * 1024 * 1024)
+}
+
+/// Compute an appropriate resolver cache size from current available RAM.
 /// Inside a cgroup v2 container /proc/meminfo reflects host RAM; we use the
 /// cgroup limit instead to avoid overcommitting the container's memory budget.
-/// Falls back to 8192 when neither source is available.
 fn cache_size_from_meminfo() -> usize {
     let avail_kb: u64 = if let Some(max_bytes) = cgroup_memory_max_bytes() {
         let current_bytes = cgroup_memory_current_bytes().unwrap_or(0);
@@ -1731,17 +1743,15 @@ fn cache_size_from_meminfo() -> usize {
             })
             .unwrap_or(0)
     };
-    if avail_kb == 0 {
-        return 8192;
-    }
-    // #cache: size the resolver cache to a generous slice of AVAILABLE memory (cgroup-aware),
-    // so it scales with the host's RAM instead of a fixed tiny cap. This is a CEILING, not an
-    // upfront allocation — entries fill it as queries arrive; the memory-pressure watermarks
-    // (MEM_*_WATERMARK) shrink it dynamically if usage climbs, so growing it stays OOM-safe.
-    // Was clamped at 65536 entries (~32 MiB) — absurdly small on a multi-GiB host.
-    const CACHE_ENTRY_BYTES: u64 = 512; // rough avg cache entry (name + RRset + metadata)
-    let entries = avail_kb * 1024 / 4 / CACHE_ENTRY_BYTES; // ~1/4 of available memory
-    (entries as usize).clamp(8192, 64 * 1024 * 1024) // 8K floor … 64M entries (~32 GiB) ceiling
+    cache_entries_for_available_kb(avail_kb)
+}
+
+/// Moderate-pressure eviction target: halve the live cache, floored at
+/// `cfg.cache_min_entries`. Pure function — extracted so the halving/floor
+/// arithmetic is unit-testable without mocking `/proc/meminfo`.
+#[inline]
+fn cache_shrink_target(current_len: usize, min_entries: usize) -> usize {
+    (current_len / 2).max(min_entries)
 }
 
 /// Read system memory and return (available_kb, total_kb).
@@ -1776,35 +1786,41 @@ fn read_meminfo() -> Option<(u64, u64)> {
     Some((available, total))
 }
 
-/// Background task: monitors system memory and adjusts the DNS resolver cache size.
+/// Background task: monitors system memory and shrinks the DNS resolver
+/// cache — plus clears transient connection/rate-limiter state — under
+/// pressure.
 ///
-/// Four operating modes based on memory pressure (used = 1 - MemAvailable/MemTotal):
-///   < 60 %  — scale up: restore cache toward optimal size (with cooldown).
-///   60–70 % — stable: no action.
-///   70–80 % — moderate pressure: halve cache size, floor at cache_min_entries.
-///   ≥ 80 %  — high pressure: recalc cache from current RAM + flush rate limiter.
+/// Two watermarks, checked every `MEM_CHECK_SECS` against
+/// `used = 1 - MemAvailable/MemTotal` (cgroup v2-aware, see `read_meminfo`):
+///   <  70 %  — stable: no action.
+///   70–80 %  — moderate: halve the resolver cache (`xdp_cache`), floored at
+///              `cfg.cache_min_entries` (default 2048).
+///   ≥  80 %  — high: recompute the cache ceiling from CURRENT available RAM
+///              (`cache_entries_for_available_kb` — the same formula the
+///              startup auto-sizer uses) and shrink to it if the live cache
+///              is larger; also rebuilds the forward pool (clears stale DoT
+///              connection churn) and flushes the rate limiter's token
+///              buckets.
 ///
-/// Three guards prevent infinite cache destruction on memory-constrained systems:
-///   1. Floor: never halve below cfg.cache_min_entries (default 2048).
-///   2. Cooldown: at most one halving per CACHE_HALVE_COOLDOWN (5 min).
-///   3. No-effect detection: if halving does not reduce used_pct by ≥ 5 %,
-///      halvings are disabled for this process lifetime with a clear WARN.
+/// Eviction is oldest-first by `expires_at` — see
+/// `cache_snapshot::evict_oldest` for why that's the right "oldest" proxy
+/// here and why `local-data` (sentinel) entries are never touched. Both
+/// bands are monotonic (never grow the cache) and floor-bounded, so a
+/// sustained high-pressure host converges to `cache_min_entries` within a
+/// few ticks rather than oscillating or evicting forever.
 ///
-/// Cache changes take effect by rebuilding the forward pool and atomically
-/// swapping it via ArcSwap. In-flight queries keep their Arc until completion.
-/// Background task: monitors system memory and adjusts rate limiter under pressure.
-/// The DNS cache now lives in ForwardPool (no hickory resolver cache to resize);
-/// we keep the memory watermark logic to flush the rate limiter under high pressure.
+/// This task is the only place the cache shrinks outside of normal TTL
+/// expiry (`publish_loop`'s periodic sweep). It never runs on the hot query
+/// path — DNS latency is unaffected by how much work an eviction pass does.
 pub async fn memory_guard_loop(
     rate_limiter: Arc<RateLimiter>,
     pool: Arc<ArcSwap<ForwardPool>>,
     cfg: Arc<UnboundConfig>,
     stats: Arc<Stats>,
-    initial_cache_size: usize,
     upstreams: crate::upstreams::SharedUpstreams,
     _dnssec_enabled: Arc<std::sync::atomic::AtomicBool>,
+    xdp_cache: Option<super::cache_snapshot::MutableCacheMap>,
 ) {
-    let _ = initial_cache_size; // ForwardPool has no resolver cache to resize
     let mut interval = tokio::time::interval(Duration::from_secs(MEM_CHECK_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1826,18 +1842,72 @@ pub async fn memory_guard_loop(
             let _ = rebuild_and_swap(&pool, &addrs, false).await;
             stats.reset_cache();
             let freed = rate_limiter.clear();
+
+            let (cache_evicted, cache_len) = match xdp_cache.as_ref() {
+                Some(cache) => {
+                    let target = cache_entries_for_available_kb(avail_kb).max(cfg.cache_min_entries);
+                    (super::cache_snapshot::evict_oldest(cache, target), cache.len())
+                }
+                None => (0, 0),
+            };
+
             warn!(
                 used_pct = format!("{:.1}%", used_ratio * 100.0),
                 freed_buckets = freed,
-                "memory pressure high: pool rebuilt, rate limiter cleared"
+                cache_evicted,
+                cache_len,
+                "memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM"
             );
         } else if used_ratio >= MEM_MOD_WATERMARK {
-            // Moderate pressure: nothing to halve in ForwardPool, just log.
-            let min = cfg.cache_min_entries;
-            let _ = min;
-            debug!(used_pct = format!("{:.1}%", used_ratio * 100.0), "memory moderate pressure");
+            match xdp_cache.as_ref() {
+                Some(cache) => {
+                    let target = cache_shrink_target(cache.len(), cfg.cache_min_entries);
+                    let cache_evicted = super::cache_snapshot::evict_oldest(cache, target);
+                    if cache_evicted > 0 {
+                        warn!(
+                            used_pct = format!("{:.1}%", used_ratio * 100.0),
+                            cache_evicted,
+                            cache_len = cache.len(),
+                            "memory pressure moderate: cache halved"
+                        );
+                    } else {
+                        debug!(
+                            used_pct = format!("{:.1}%", used_ratio * 100.0),
+                            "memory moderate pressure — cache already at floor"
+                        );
+                    }
+                }
+                None => debug!(used_pct = format!("{:.1}%", used_ratio * 100.0), "memory moderate pressure"),
+            }
         }
         // Low/stable band: no action.
+    }
+}
+
+#[cfg(test)]
+mod memory_guard_tests {
+    use super::*;
+
+    #[test]
+    fn shrink_target_halves_above_floor() {
+        assert_eq!(cache_shrink_target(100_000, 2048), 50_000);
+    }
+
+    #[test]
+    fn shrink_target_respects_floor() {
+        assert_eq!(cache_shrink_target(3_000, 2048), 2_048);
+        assert_eq!(cache_shrink_target(1_000, 2048), 2_048);
+    }
+
+    #[test]
+    fn cache_entries_formula_matches_prior_default_behavior() {
+        // 0 available (no /proc/meminfo, no cgroup limit) → conservative fallback.
+        assert_eq!(cache_entries_for_available_kb(0), 8192);
+        // A tiny host still gets the floor, never less.
+        assert_eq!(cache_entries_for_available_kb(1024), 8192);
+        // A large host scales up and respects the ceiling.
+        let huge = cache_entries_for_available_kb(1024 * 1024 * 1024); // 1 TiB available
+        assert_eq!(huge, 64 * 1024 * 1024);
     }
 }
 // ============================================================
@@ -2713,8 +2783,8 @@ pub async fn run_dns_server(
         "resolver cache cap (#165: RAM-scaled or explicit cache-size)"
     );
 
-    // Spawn memory pressure guard — monitors /proc/meminfo every 30 s and
-    // adjusts the DNS cache size and flushes the rate limiter under pressure.
+    // Spawn memory pressure guard — monitors /proc/meminfo every 30 s,
+    // shrinks the DNS cache under pressure, and flushes the rate limiter.
     {
         let rl = Arc::clone(&rate_limiter);
         let res = Arc::clone(&resolver);
@@ -2722,8 +2792,9 @@ pub async fn run_dns_server(
         let stats_mg = Arc::clone(&stats);
         let ups_mg = Arc::clone(&upstreams);
         let dnssec_mg = Arc::clone(&dnssec_enabled);
+        let cache_mg = xdp_cache.as_ref().map(Arc::clone);
         tokio::spawn(async move {
-            memory_guard_loop(rl, res, cfg_arc, stats_mg, initial_cache_size, ups_mg, dnssec_mg).await
+            memory_guard_loop(rl, res, cfg_arc, stats_mg, ups_mg, dnssec_mg, cache_mg).await
         });
     }
 
