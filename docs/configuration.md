@@ -603,8 +603,8 @@ normally.
 **Log output examples:**
 
 ```
-WARN memory pressure moderate: cache halved  used_pct=74.2%  cache_evicted=21000  cache_len=21000
-WARN memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM  used_pct=82.1%  freed_buckets=4096  cache_evicted=18234  cache_len=42000
+WARN memory pressure moderate: cache halved  used_pct=74.2%  cache_evicted=21000  cache_len=21000  stale_evicted=8500  stale_len=8500
+WARN memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM  used_pct=82.1%  freed_buckets=4096  cache_evicted=18234  cache_len=42000  stale_evicted=9120  stale_len=41000
 ```
 
 ```
@@ -614,11 +614,12 @@ server:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `cache-min-entries` | integer | `2048` | Floor for the memory-pressure watchdog's cache eviction — `xdp_cache` is never shrunk below this many entries, however sustained the pressure. |
+| `cache-min-entries` | integer | `2048` | Floor for the memory-pressure watchdog's eviction of **both** `xdp_cache` and the serve-stale fallback store (`stale_cache_wire`) — neither is ever shrunk below this many entries, however sustained the pressure. |
 
 See [docs/troubleshooting.md](troubleshooting.md#memory-pressure-under-low-memory-systems)
-for the serve-stale fallback store (`stale_cache_wire`, sized once at startup, not
-touched by this watchdog) and further low-memory remediation steps.
+for the serve-stale fallback store (`stale_cache_wire`) — sized once at startup like
+`xdp_cache`, and shrunk by the same watchdog under pressure — and further low-memory
+remediation steps.
 
 ### XDP kernel-bypass fast path
 

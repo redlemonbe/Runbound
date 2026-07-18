@@ -144,20 +144,23 @@ bands based on `used = 1 − MemAvailable / MemTotal`:
 | Band | Action |
 |---|---|
 | **< 70 %** | Stable — no action |
-| **70 – 80 %** | Moderate pressure: the resolver cache (`xdp_cache`) is halved, floored at `cache-min-entries` (default 2048) |
-| **≥ 80 %** | High pressure: `xdp_cache` is shrunk to a ceiling recomputed from *current* available RAM (same formula as the startup auto-sizer), floored at `cache-min-entries`; the forward pool is also rebuilt (clears stale DoT connection churn) and the rate limiter's buckets are flushed |
+| **70 – 80 %** | Moderate pressure: the resolver cache (`xdp_cache`) **and** the serve-stale fallback store (`stale_cache_wire`) are each halved, floored at `cache-min-entries` (default 2048) |
+| **≥ 80 %** | High pressure: both stores are shrunk to a ceiling recomputed from *current* available RAM (same formula as the startup auto-sizer), floored at `cache-min-entries`; the forward pool is also rebuilt (clears stale DoT connection churn) and the rate limiter's buckets are flushed |
 
 The resolver cache (`xdp_cache`, `src/dns/cache_snapshot.rs`) — the fast-path answer
-cache read by XDP workers via a lock-free `ArcSwap` snapshot — is what actually
-shrinks here. `ForwardPool` only pools upstream DoT/UDP connections; it caches no
-answers, but is rebuilt at the high watermark anyway to clear stale connections.
-Eviction is oldest-first by remaining TTL (soonest-to-expire first —
-`cache_snapshot::evict_oldest`); `local-data` entries never expire and are never
-evicted. Both bands only ever shrink the cache and never go below
-`cache-min-entries`, so sustained pressure converges to the floor within a few
-ticks rather than oscillating. The eviction pass runs entirely on this background
-task — never the hot query path — so DNS latency is unaffected regardless of cache
-size.
+cache read by XDP workers via a lock-free `ArcSwap` snapshot — evicts oldest-first by
+remaining TTL (soonest-to-expire first — `cache_snapshot::evict_oldest`); `local-data`
+entries never expire and are never evicted. `stale_cache_wire` (`src/dns/server.rs`) —
+the RFC 8767 last-known-good answer store, served only when all upstreams are
+unreachable — evicts oldest-first by its own genuine insertion timestamp
+(`evict_oldest_stale`); every entry there is a disposable fallback copy, so there is
+no sentinel concept to protect. `ForwardPool` only pools upstream DoT/UDP connections;
+it caches no answers, but is rebuilt at the high watermark anyway to clear stale
+connections. Both stores, in both bands, only ever shrink and never go below
+`cache-min-entries`, so sustained pressure converges both to the floor within a few
+ticks rather than oscillating. The eviction passes run entirely on this background
+task — never the hot query path — so DNS latency is unaffected regardless of either
+store's size.
 
 **Auto-sized cache at startup:** cache capacity is computed from available memory
 at launch (~25 % of available RAM ÷ 512 B per entry — cgroup-aware), clamped to
@@ -170,8 +173,8 @@ On non-Linux systems or containers without `/proc/meminfo`, the guard silently
 skips its check.
 
 ```
-WARN memory pressure moderate: cache halved  used_pct=74.2%  cache_evicted=21000  cache_len=21000
-WARN memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM  used_pct=82.3%  freed_buckets=8241  cache_evicted=18234  cache_len=42000
+WARN memory pressure moderate: cache halved  used_pct=74.2%  cache_evicted=21000  cache_len=21000  stale_evicted=8500  stale_len=8500
+WARN memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM  used_pct=82.3%  freed_buckets=8241  cache_evicted=18234  cache_len=42000  stale_evicted=9120  stale_len=41000
 ```
 
 **The memory guard is always active — no configuration required.**
@@ -502,7 +505,7 @@ Fixed findings, by ID. Full per-cycle detail lives in the
 | BUG-RATELIMIT | Medium | `rate-limit: 0` refused every query instead of disabling rate limiting |
 | FEAT-AFFINITY | — | CPU affinity for tokio workers and DNS socket workers — physical cores, HT excluded |
 | FEAT-CACHE-AUTO | — | Cache auto-sized from available memory at startup (~25 %, clamped [8 192, 67 108 864]) |
-| FEAT-MEMGUARD | — | Memory guard 2-band system (70–80 % cache halved / ≥ 80 % cache recalced from current RAM + pool rebuild + limiter flush), floored at `cache-min-entries`, oldest-first eviction |
+| FEAT-MEMGUARD | — | Memory guard 2-band system (70–80 % halved / ≥ 80 % recalced from current RAM + pool rebuild + limiter flush), floored at `cache-min-entries`, oldest-first eviction, covering both `xdp_cache` and the serve-stale fallback store (`stale_cache_wire`) |
 | FEAT-WORKERS | — | DNS socket workers use physical core count (consistent with tokio affinity) |
 | FEAT-XDP | — | AF/XDP kernel-bypass fast path — local-zone queries answered in user space at NIC driver level |
 | FIX-XDP-VERIFIER | — | eBPF program uses constant IHL=20 — eliminates BPF verifier rejection on variable pointer arithmetic |

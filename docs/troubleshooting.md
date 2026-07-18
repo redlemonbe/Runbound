@@ -16,30 +16,38 @@ races them — it does not cache answers. Separately, `stale_cache_wire`
 when all upstreams are unreachable (RFC 8767). It is sized **once at startup** — a
 ceiling derived from available RAM (cgroup-aware: `memory.max` inside a container,
 `/proc/meminfo` `MemAvailable` otherwise), clamped to [8192, 64M] entries. It fills as
-queries arrive and evicts its own genuine-oldest entry on overflow at insert time —
-it is **not** touched by the memory-pressure watchdog below (that's `xdp_cache`'s job).
+queries arrive and evicts its own genuine-oldest entry on overflow at insert time; it
+is **also** actively shrunk by the memory-pressure watchdog below, same as `xdp_cache`.
 
-The 30 s memory-pressure monitor (`memory_guard_loop`) actively shrinks `xdp_cache`
-under pressure, oldest-entries-first (soonest-to-expire, via
-`cache_snapshot::evict_oldest`) — `local-data` entries are never evicted. Two
-watermarks (`MEM_MOD_WATERMARK` / `MEM_HIGH_WATERMARK`):
+The 30 s memory-pressure monitor (`memory_guard_loop`) actively shrinks both `xdp_cache`
+and `stale_cache_wire` under pressure. `xdp_cache` evicts oldest-first by remaining TTL
+(soonest-to-expire, via `cache_snapshot::evict_oldest` — `local-data` entries are never
+evicted); `stale_cache_wire` evicts oldest-first by its own genuine insertion timestamp
+(via `evict_oldest_stale` — no such thing as a `local-data` entry there, every entry is
+a disposable fallback copy). Two watermarks (`MEM_MOD_WATERMARK` / `MEM_HIGH_WATERMARK`):
 
 | Used memory | Action |
 |---|---|
 | < 70 % | No action (stable). |
-| 70–80 % | `xdp_cache` is halved, floored at `cache-min-entries` (default 2048). |
-| ≥ 80 % | `xdp_cache` is shrunk to a ceiling recomputed from **current** available RAM (same formula as the startup auto-sizer), floored at `cache-min-entries`; `ForwardPool` is also rebuilt (refreshes upstream/DoT connections) and the rate limiter's bucket table is cleared: |
+| 70–80 % | Both stores are halved, each floored at `cache-min-entries` (default 2048). |
+| ≥ 80 % | Both stores are shrunk to a ceiling recomputed from **current** available RAM (same formula as the startup auto-sizer), floored at `cache-min-entries`; `ForwardPool` is also rebuilt (refreshes upstream/DoT connections) and the rate limiter's bucket table is cleared: |
 
 ```
-WARN memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM  used_pct=82.1%  freed_buckets=4096  cache_evicted=18234  cache_len=42000
-WARN memory pressure moderate: cache halved  used_pct=74.2%  cache_evicted=21000  cache_len=21000
+WARN memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM  used_pct=82.1%  freed_buckets=4096  cache_evicted=18234  cache_len=42000  stale_evicted=9120  stale_len=41000
+WARN memory pressure moderate: cache halved  used_pct=74.2%  cache_evicted=21000  cache_len=21000  stale_evicted=8500  stale_len=8500
 ```
 
-Both actions only ever shrink the cache (never grow it back), and never evict below
-`cache-min-entries` — a sustained high-pressure host converges to the floor within a
+Both stores, in both bands, only ever shrink (never grow back), and never evict below
+`cache-min-entries` — a sustained high-pressure host converges both to the floor within a
 few 30 s ticks rather than oscillating or evicting forever. If pressure stays ≥ 80 %
-even after `xdp_cache` has reached the floor, the eviction has done what it can; the
-next steps below apply.
+even after both have reached the floor, the eviction has done what it can; the next
+steps below apply.
+
+**Verified against real memory pressure** (2026-07-18, temporary test LXC, 512 MB RAM,
+`xdp_cache` side only — `stale_cache_wire` uses the identical trigger/target logic added
+in the same change, re-verified by unit test rather than a second live run): moderate band
+converged 1989 → 993 → 496 → 248 → 200 (floor) over 4 ticks; high band held steady at the
+floor across 4 further ticks with no crash and DNS resolution unaffected throughout.
 
 **If you are still low on memory:**
 - Raise `cache-min-entries` down or leave it at the default (2048) — a lower floor lets
