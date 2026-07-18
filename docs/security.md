@@ -137,35 +137,37 @@ new requests receive REFUSED immediately without allocating any additional memor
 
 ### 2. Memory pressure guard
 
-A background task reads `/proc/meminfo` every **30 seconds** and operates in four
+A background task reads `/proc/meminfo` (cgroup v2 `memory.max`/`memory.current`
+instead, when running in a container) every **30 seconds** and operates in two
 bands based on `used = 1 − MemAvailable / MemTotal`:
 
 | Band | Action |
 |---|---|
-| **< 60 %** | Scale up: restore cache toward optimal size (5-minute cooldown between upscales) |
-| **60 – 70 %** | Stable — no action |
-| **70 – 80 %** | Moderate pressure: halve cache size (floor 512 entries) |
-| **≥ 80 %** | High pressure: recalculate cache from current RAM + flush rate-limiter buckets |
+| **< 70 %** | Stable — no action |
+| **70 – 80 %** | Moderate pressure: logged at `debug` level only — no cache resize (the `ForwardPool` architecture has no resolver cache to shrink; `cache-min-entries` is read but currently unused here) |
+| **≥ 80 %** | High pressure: rebuilds the forward pool (helps clear stale DoT connection churn), resets cache stats, and flushes all rate-limiter buckets |
 
-The DNS cache lives in the wire-native `ForwardPool`; cache changes take effect by
-atomically swapping the pool via **ArcSwap**. In-flight queries keep their `Arc`
-reference until completion — no query is dropped mid-flight. Under high pressure the
-guard also flushes the rate-limiter buckets.
+The DNS cache lives in the wire-native `ForwardPool`; the pool is swapped
+atomically via **ArcSwap** when rebuilt. In-flight queries keep their `Arc`
+reference until completion — no query is dropped mid-flight.
 
-**Auto-sized cache at startup:** cache capacity is computed from `MemAvailable`
-at launch (10 % of available RAM ÷ 512 B per entry), clamped to **[512, 65 536]**
-entries. Falls back to 8 192 when `/proc/meminfo` is unavailable.
+**Auto-sized cache at startup:** cache capacity is computed from available memory
+at launch (~25 % of available RAM ÷ 512 B per entry — cgroup-aware), clamped to
+**[8 192, 67 108 864]** entries (8K floor … ~64M/~32 GiB ceiling). Falls back to
+8 192 when neither `/proc/meminfo` nor a cgroup limit is available. This is a
+ceiling the cache fills toward as queries arrive, not an upfront allocation.
 
 On non-Linux systems or containers without `/proc/meminfo`, the guard silently
 skips its check.
 
 ```
-WARN memory pressure — cache halved  used_pct=74.2%  cache_from=8192  cache_to=4096
-WARN memory pressure high — cache flushed, resized, rate limiter cleared
-     used_pct=82.3%  cache_from=4096  cache_to=2048  freed_buckets=8241
+WARN memory pressure high: pool rebuilt, rate limiter cleared  used_pct=82.3%  freed_buckets=8241
 ```
 
-**The memory guard is always active — no configuration required.**
+**The memory guard is always active — no configuration required.** *(Note: the
+`memory_guard_loop` function's own internal doc comment in `src/dns/server.rs`
+still describes an older four-band scale-up/halving design that predates the
+`ForwardPool` rewrite — that in-source comment is stale, not this section.)*
 
 ---
 
@@ -332,11 +334,9 @@ Core topology is read from
 (containers, non-Linux), the affinity step is silently skipped and the process
 continues with OS-scheduled threads.
 
-CPU affinity can be disabled in `unbound.conf`:
-
-```
-cpu-affinity: no   # default: yes
-```
+**`cpu-affinity` is deprecated and ignored** (#163) — CPU placement is now automatic
+and cannot be disabled from `unbound.conf`. Setting the directive logs a `WARN` and
+has no other effect; the toggle shown in older docs no longer does anything.
 
 ---
 
@@ -363,9 +363,10 @@ are silently skipped instead of producing undefined behaviour.
 **Systemd requirements:** `LimitMEMLOCK=infinity` is required in the service file
 for AF/XDP UMEM allocation. The provided `runbound.service` sets this automatically.
 The XDP fast path additionally needs `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF` and
-`CAP_PERFMON` — these are **not** granted by default (see *Systemd hardening* below).
-Enabling `xdp: yes` requires switching the service to the commented-out wider
-capability set in `runbound.service` / `install.sh`.
+`CAP_PERFMON` — these **are granted by default**, since XDP is also the default build
+feature and resolution path (see *Systemd hardening* below). A minimal
+`CAP_NET_BIND_SERVICE`-only set is available as a commented-out opt-in for deployments
+that run with `xdp: no` and want to shrink the capability set.
 
 **Fallback:** If XDP initialisation fails (missing capabilities, unsupported NIC,
 kernel < 5.10), Runbound logs a descriptive `WARN` with an actionable hint and
@@ -410,15 +411,17 @@ The provided unit file applies:
 - `ProtectSystem=strict`
 - `ProtectHome=yes`
 - `ProtectKernelTunables=yes`
-- `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` and `AmbientCapabilities=CAP_NET_BIND_SERVICE`
-  (port 53 only — no root)
+- `CapabilityBoundingSet` / `AmbientCapabilities` = `CAP_NET_BIND_SERVICE CAP_NET_RAW
+  CAP_NET_ADMIN CAP_BPF CAP_PERFMON` by default — the wider set, not just port 53
 
-**Least-privilege default (PENT-3):** the shipped `runbound.service` and
-`install.sh` grant **only `CAP_NET_BIND_SERVICE`** by default. The XDP fast path
-(`xdp: yes`) and the firewall-manage feature need `CAP_NET_RAW`, `CAP_NET_ADMIN`,
-`CAP_BPF` and `CAP_PERFMON` — these are an **explicit, commented opt-in** (uncomment
-the wider `AmbientCapabilities` / `CapabilityBoundingSet` lines). The default
-`xdp: no` path holds none of them, shrinking the blast radius of any compromise.
+**Capability set (PENT-3, corrected):** the shipped `runbound.service` and `install.sh`
+grant the **wider set by default** (`CAP_NET_BIND_SERVICE`, `CAP_NET_RAW`, `CAP_NET_ADMIN`,
+`CAP_BPF`, `CAP_PERFMON`), because `xdp: yes` is the default build feature and resolution
+path (`Cargo.toml` `default = ["xdp"]`). This does not enlarge the *lasting* blast radius:
+`CAP_BPF`/`CAP_PERFMON` are only checked by the kernel at `BPF_MAP_CREATE`/`BPF_PROG_LOAD`
+time, both at startup. A minimal `CAP_NET_BIND_SERVICE`-only set is available as a
+**commented-out opt-in** (uncomment the narrower `AmbientCapabilities` /
+`CapabilityBoundingSet` lines) for deployments running with `xdp: no`.
 
 See [systemd.md](systemd.md) for the full unit file and [hardening.md](hardening.md)
 for the per-parameter breakdown.
@@ -491,8 +494,8 @@ Fixed findings, by ID. Full per-cycle detail lives in the
 | PERF-03 | — | `BIND_V4`/`BIND_V6` are `const SocketAddr`, removing `.parse().unwrap()` in hot probe path |
 | BUG-RATELIMIT | Medium | `rate-limit: 0` refused every query instead of disabling rate limiting |
 | FEAT-AFFINITY | — | CPU affinity for tokio workers and DNS socket workers — physical cores, HT excluded |
-| FEAT-CACHE-AUTO | — | Cache auto-sized from `MemAvailable` at startup (10 %, clamped [512, 65 536]) |
-| FEAT-MEMGUARD | — | Memory guard 4-band system (< 60 / 60–70 / 70–80 / ≥ 80 %) |
+| FEAT-CACHE-AUTO | — | Cache auto-sized from available memory at startup (~25 %, clamped [8 192, 67 108 864]) |
+| FEAT-MEMGUARD | — | Memory guard 2-band system (70–80 % debug-log only / ≥ 80 % pool rebuild + limiter flush) |
 | FEAT-WORKERS | — | DNS socket workers use physical core count (consistent with tokio affinity) |
 | FEAT-XDP | — | AF/XDP kernel-bypass fast path — local-zone queries answered in user space at NIC driver level |
 | FIX-XDP-VERIFIER | — | eBPF program uses constant IHL=20 — eliminates BPF verifier rejection on variable pointer arithmetic |
