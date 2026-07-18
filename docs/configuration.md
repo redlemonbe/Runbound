@@ -67,10 +67,10 @@ a REFUSED response. Uses a token-bucket algorithm.
 
 | Directive | Type | Default | Description |
 |---|---|---|---|
-| `rate-limit` | integer | `0` (off) | Steady-state queries/s per source bucket. `0` disables the DNS rate limiter. Capped at 1,000,000. |
+| `rate-limit` | integer | `200` | Steady-state queries/s per source bucket. `0` disables the DNS rate limiter. Capped at 1,000,000. |
 | `rate-limit-burst` | integer | `rate-limit × 2` | Burst ceiling above the steady rate. Capped at 2,000,000. |
 
-Setting `rate-limit: 0` disables rate limiting.
+A rate limiter is active by default (200 qps/source). Set `rate-limit: 0` to disable it.
 
 **Live-editable via API/WebUI.** Both `rate-limit` and `rate-limit-burst` can be changed
 at runtime without a restart via `PATCH /api/config` (`{"rate_limit": N, "rate_limit_burst": M}`)
@@ -123,7 +123,7 @@ honoured per query.
 Publish the **DS** at the parent — fetch it from [`GET /api/dnssec/ds`](api.md):
 
 ```bash
-curl -s localhost:8081/api/dnssec/ds -H "Authorization: Bearer $KEY"
+curl -s localhost:8080/api/dnssec/ds -H "Authorization: Bearer $KEY"
 # { "enabled": true, "ds": [ { "zone": "home.", "ds": "12345 13 2 <sha256-digest>" } ] }
 ```
 
@@ -338,11 +338,10 @@ localhost-only. See [web-ui.md](web-ui.md) for setup details.
 > section is silently ignored.
 
 ```
-icmp {
+icmp:
     enable:           no     # default: no — set yes to activate XDP ICMP responder
     rate-limit:       10     # echo requests/s per source IP before dropping (default: 10)
     rate-limit-burst: 5      # initial burst tokens for new source IPs (default: 5)
-}
 ```
 
 | Directive | Type | Default | Description |
@@ -750,10 +749,10 @@ counter (`runbound_nic_rx_dropped_total`) is only available via `GET /api/metric
 
 ```
 server:
-    xdp-irq-affinity: auto    # default: off
+    xdp-irq-affinity: yes    # default: off. Only "yes" activates — any other value (incl. "auto") leaves it disabled.
 ```
 
-When set to `auto`, Runbound pins each NIC queue's IRQ to the same physical core as its XDP worker at startup. Reads `/proc/interrupts`, writes `/proc/irq/<N>/smp_affinity_list`. Requires `CAP_NET_ADMIN`. Silent no-op in containers or when `/proc/irq/` is not writable.
+When set to `yes`, Runbound pins each NIC queue's IRQ to the same physical core as its XDP worker at startup. Reads `/proc/interrupts`, writes `/proc/irq/<N>/smp_affinity_list`. Requires `CAP_NET_ADMIN`. Silent no-op in containers or when `/proc/irq/` is not writable.
 
 Gain: −1–5 µs latency variance, +1–3% throughput on high-frequency workloads.
 
@@ -795,8 +794,9 @@ Set the Linux CPU frequency governor for cores running XDP worker threads.
 `performance` disables P-state transitions during the XDP polling loop, eliminating
 the 10–50 µs wakeup latency spike seen when cores return from C-states.
 
-Accepted values: `performance`, `powersave`, `ondemand`. Requires root and
-`cpufreq` kernel support. Has no effect on systems without governor control.
+Accepted values: `performance` (or legacy `yes`) to activate. Any other value —
+including `powersave` or `ondemand` — leaves the feature disabled (no governor is set).
+Requires root and `cpufreq` kernel support. Has no effect on systems without governor control.
 ### CPU affinity
 
 ```
@@ -911,9 +911,10 @@ server:
 | `api-port` | TCP | if API is enabled |
 | `sync-port` | TCP | master only |
 
-Rules are tagged with `firewall-tag` (default `runbound`). Only rules with
-that tag are ever removed. Runbound never flushes chains or modifies unrelated
-rules.
+Rules are tagged with `firewall-tag` — there is no built-in default (an unset
+`firewall-tag` resolves to an empty string), so always set it explicitly, as in the
+example above. Only rules with that tag are ever removed. Runbound never flushes
+chains or modifies unrelated rules.
 
 > **Safety:** `firewall-manage: no` (default) means Runbound never touches
 > firewall rules unless explicitly enabled. If the process is killed with
@@ -1087,7 +1088,7 @@ anycast:
 | `local-as` | u32 | This node's BGP AS number. **Required.** |
 | `peer` | string | BGP peer (router/route-reflector) IP. **Required.** |
 | `peer-as` | u32 | Peer BGP AS number. **Required.** |
-| `local-address` | string | This node's IP for the BGP session. **Required.** |
+| `local-address` | string | This node's IP for the BGP session. Optional — defaults to the peer-facing IP. |
 | `router-id` | string | BGP router-id. Defaults to `local-address`. |
 | `exabgp-path` | string | Path to the `exabgp` binary. Defaults to `exabgp` on `$PATH`. |
 
@@ -1162,25 +1163,22 @@ forward-zone:
     forward-tls-upstream: yes
 
 # Optional — io_uring for TCP/DoT/DoH slow path (Linux 5.10+)
-# io-uring {
+# io-uring:
 #     enable: yes
-# }
 
 # Optional — AXFR zone transfers for secondary nameservers
-# axfr {
+# axfr:
 #     enable: yes
 #     allow:  192.168.1.20     # IP of your secondary DNS
-# }
 
 # Optional — alert thresholds (DDoS detection + auto-block)
-# alert {
+# alert:
 #     name:             ddos-block
 #     metric:           client-qps
 #     window-s:         10
 #     threshold:        500
 #     action:           block
 #     block-duration-s: 300
-# }
 ```
 
 ---
@@ -1295,9 +1293,8 @@ submission-queue interface. Reduces system-call overhead on the slow path
 between user space and kernel.
 
 ```
-io-uring {
+io-uring:
     enable: yes
-}
 ```
 
 | Directive | Type | Default | Description |
@@ -1305,7 +1302,7 @@ io-uring {
 | `enable` | bool (`yes`/`no`) | `no` | Enable io_uring for async DNS and API I/O. |
 
 > **Parser note:** `io-uring:` is a sub-block of `server:` and owns only the
-> `enable` key. A `server:` directive written **after** an `io-uring { … }` block (still
+> `enable` key. A `server:` directive written **after** an `io-uring:` block (still
 > inside `server:`) is correctly parsed as a `server:` directive.
 
 **Startup detection:** Runbound reads `/proc/sys/kernel/io_uring_disabled` at
@@ -1349,11 +1346,10 @@ secondaries, or monitoring tools that speak AXFR.
 > transferable via AXFR.
 
 ```
-axfr {
+axfr:
     enable: yes
     allow:  192.168.0.0/16
     allow:  10.0.0.0/8
-}
 ```
 
 | Directive | Type | Default | Description |
@@ -1362,7 +1358,7 @@ axfr {
 | `allow` | CIDR | — | IP range allowed to request AXFR. Repeat for multiple ranges. Required when `enable: yes`. |
 
 > **Parser note:** `axfr:` is a sub-block of `server:` and owns only the `enable`
-> and `allow` keys. A `server:` directive written **after** an `axfr { … }` block (still
+> and `allow` keys. A `server:` directive written **after** an `axfr:` block (still
 > inside `server:`) is correctly parsed as a `server:` directive.
 >
 > **Real client IP:** the `allow:` ACL evaluates the **true** source address.
@@ -1555,24 +1551,22 @@ server:
     rate-limit: 200
 
 # Layer 2 — alert: block after sustained flood
-alert {
+alert:
     name:             sustained-flood
     metric:           client-qps
     window-s:         5
     threshold:        800
     action:           block
     block-duration-s: 600
-}
 
 # Layer 3 — notify NOC on very high-volume attack
-alert {
+alert:
     name:      noc-escalation
     metric:    client-qps
     window-s:  5
     threshold: 5000
     action:    notify
     notify-url: https://pagerduty.example.com/webhook
-}
 ```
 
 
@@ -1684,7 +1678,7 @@ They exist to bound memory usage and protect against authenticated DoS.
 | **API max payload** | 64 KB | Maximum size of any single REST API request body. Requests with a `Content-Length` header exceeding this value receive a `413 Payload Too Large` response before the body is read. |
 | **API rate limit** | 30 req/s | Token-bucket rate limiter per source IP on the REST API. Burst capacity: 60 requests. Returns `429 Too Many Requests` when exceeded. |
 | **Sync ring buffer** | 1,000 events | The master keeps the last 1,000 delta events in memory. A slave that falls more than 1,000 events behind receives `410 Gone` and triggers a full re-sync. |
-| **Memory purge threshold** | 80 % → 50 % | When system memory usage reaches 80 %, Runbound purges the DNS resolver cache. Purge stops when usage falls below 50 % (target). |
+| **Memory pressure watermarks** | 70 % / 80 % | At ≥80% used memory, Runbound rebuilds the forward pool, resets cache stats, and flushes the rate limiter (one-shot, not a purge-to-50% loop). At 70–80% it only logs at `debug` level — no action taken. See [security.md](security.md#anti-oom-memory-protection). |
 | **Max DNS entries (API)** | 10,000 | Maximum number of DNS records that can be added via `POST /dns`. Feed-loaded blocklist entries are not counted here. |
 | **Max blacklist entries (API)** | 100,000 | Maximum number of manual blacklist entries via `POST /blacklist`. |
 | **Max feed subscriptions** | 100 | Maximum number of concurrent feed subscriptions via `POST /feeds`. |
@@ -1725,7 +1719,7 @@ unless a section header is shown.
 | Directive | Default | Description |
 |-----------|---------|-------------|
 | `block-page` | `no` | Serve an HTTP block page for blocked domains instead of plain NXDOMAIN. |
-| `block-page-port` | `8083` | TCP port for the block page server. |
+| `block-page-port` | `8083`* | TCP port for the block page server. *Only applied when the directive is present but malformed; if `block-page-port` is omitted entirely, it resolves to `0`. Always set it explicitly when enabling `block-page: yes`. |
 | `block-page-title` | (brand) | Title shown on the block page. |
 | `block-page-org` | (brand) | Organisation name shown on the block page. |
 | `block-page-redirect-ip` | (unset) | IP returned for blocked names so clients reach the block page. |
@@ -1748,7 +1742,7 @@ unless a section header is shown.
 |-----------|---------|-------------|
 | `xdp-busy-poll` | `yes` | Drain the RX ring before sleeping + NAPI busy-poll hints (lower idle latency). |
 | `xdp-cache-snapshot-size` | `10000` | Max entries in the XDP cache snapshot. |
-| `xdp-fill-ring-size` / `xdp-comp-ring-size` / `xdp-rx-ring-size` / `xdp-tx-ring-size` | `auto` | Per-ring AF_XDP sizes; `auto` derives them from the NIC hardware ring. |
+| `xdp-fill-ring-size` / `xdp-comp-ring-size` / `xdp-rx-ring-size` / `xdp-tx-ring-size` | `4096` | Per-ring AF_XDP software ring sizes. Must be a power of 2 between 64 and 65536 — `auto` is **not** a valid value here and fails startup (unlike the NIC hardware `xdp-ring-size`, which does accept `auto`). |
 
 ### WebUI TLS / ACME / branding
 
@@ -1760,7 +1754,7 @@ unless a section header is shown.
 | `ui-acme-dns` | (unset) | ACME DNS-01 provider (e.g. `cloudflare`) for the WebUI cert. |
 | `ui-acme-cf-token` | (unset) | Cloudflare API token for ACME DNS-01. |
 | `ui-acme-hook` | (unset) | External hook command for ACME DNS-01. |
-| `ui-brand-name` | `RUNBOUND` | White-label brand name shown in the WebUI header. |
+| `ui-brand-name` | `Runbound` | White-label brand name shown in the WebUI header. |
 | `ui-brand-logo-url` | (unset) | Logo URL for white-label branding. |
 | `ui-accent-color` | `#22d3ee` | Accent colour (hex) for the WebUI theme. |
 | `ui-favicon-url` | (unset) | Favicon URL for white-label branding. |
