@@ -16,36 +16,41 @@ races them — it does not cache answers. Separately, `stale_cache_wire`
 when all upstreams are unreachable (RFC 8767). It is sized **once at startup** — a
 ceiling derived from available RAM (cgroup-aware: `memory.max` inside a container,
 `/proc/meminfo` `MemAvailable` otherwise), clamped to [8192, 64M] entries. It fills as
-queries arrive; it is never forcibly shrunk at runtime.
+queries arrive and evicts its own genuine-oldest entry on overflow at insert time —
+it is **not** touched by the memory-pressure watchdog below (that's `xdp_cache`'s job).
 
-**This entire section only matters if serve-stale is enabled** (`serve-stale: yes`,
-which is the default — check your `runbound.conf` if unsure). `stale_cache_wire` is
-only allocated when serve-stale is on; with `serve-stale: no`, none of the
-sizing/watermark logic below touches anything real — every query goes straight
-upstream, uncached, on every request. The `cache-min-entries` config directive still
-parses and round-trips for backward compatibility with existing config files, but has
-no runtime effect (there is nothing to floor).
-
-The 30 s memory-pressure monitor (`memory_guard_loop`) still runs, with 70 % / 80 %
-watermarks (`MEM_MOD_WATERMARK` / `MEM_HIGH_WATERMARK`), but its actions changed:
+The 30 s memory-pressure monitor (`memory_guard_loop`) actively shrinks `xdp_cache`
+under pressure, oldest-entries-first (soonest-to-expire, via
+`cache_snapshot::evict_oldest`) — `local-data` entries are never evicted. Two
+watermarks (`MEM_MOD_WATERMARK` / `MEM_HIGH_WATERMARK`):
 
 | Used memory | Action |
 |---|---|
 | < 70 % | No action (stable). |
-| 70–80 % | Logged at `debug` only — no cache resize. |
-| ≥ 80 % | `ForwardPool` is rebuilt with the same target size (refreshes upstream/DoT connections), cache stats counters are reset, and the rate limiter's bucket table is cleared to free memory: |
+| 70–80 % | `xdp_cache` is halved, floored at `cache-min-entries` (default 2048). |
+| ≥ 80 % | `xdp_cache` is shrunk to a ceiling recomputed from **current** available RAM (same formula as the startup auto-sizer), floored at `cache-min-entries`; `ForwardPool` is also rebuilt (refreshes upstream/DoT connections) and the rate limiter's bucket table is cleared: |
 
 ```
-WARN memory pressure high: pool rebuilt, rate limiter cleared  used_pct=82.1%  freed_buckets=4096
+WARN memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM  used_pct=82.1%  freed_buckets=4096  cache_evicted=18234  cache_len=42000
+WARN memory pressure moderate: cache halved  used_pct=74.2%  cache_evicted=21000  cache_len=21000
 ```
+
+Both actions only ever shrink the cache (never grow it back), and never evict below
+`cache-min-entries` — a sustained high-pressure host converges to the floor within a
+few 30 s ticks rather than oscillating or evicting forever. If pressure stays ≥ 80 %
+even after `xdp_cache` has reached the floor, the eviction has done what it can; the
+next steps below apply.
 
 **If you are still low on memory:**
+- Raise `cache-min-entries` down or leave it at the default (2048) — a lower floor lets
+  the watchdog claw back more RAM under sustained pressure, at the cost of a colder
+  cache (more upstream re-queries).
 - Add a `MemoryMax=` directive to the systemd service file (e.g. `MemoryMax=512M` under
   `[Service]` in `runbound.service`) — the shipped unit does not set one by default, so
   the cgroup is otherwise unbounded and Runbound sizes its startup ceiling from all
   available host RAM.
-- Set an explicit `cache-size:` in `runbound.conf` to cap the serve-stale store
-  regardless of available RAM (only relevant if `serve-stale: yes`).
+- Set an explicit `cache-size:` in `runbound.conf` to cap `xdp_cache` regardless of
+  available RAM.
 - Reduce the workload of other processes sharing the host.
 - Add swap space as a last resort.
 

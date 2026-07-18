@@ -580,41 +580,45 @@ This bound is hard even at line rate.
 # Watermarks: 70 % (moderate) and 80 % (high)
 ```
 
-A background task (`memory_guard_loop`) reads `/proc/meminfo` every 30 seconds and
-computes `used = 1 - MemAvailable/MemTotal` against two watermarks:
+A background task (`memory_guard_loop`) reads `/proc/meminfo` every 30 seconds
+(cgroup v2-aware — uses `memory.max`/`memory.current` instead, when running in a
+container) and computes `used = 1 - MemAvailable/MemTotal` against two watermarks:
 
 | Used memory | Action |
 |---|---|
 | < 70 % | No action (stable). |
-| 70–80 % | Logged at `debug` only — nothing is resized (see below). |
-| ≥ 80 % | `ForwardPool` is rebuilt (refreshes upstream/DoT connections), cache stats counters are reset, and the rate limiter's DashMap of token buckets is cleared to free memory. |
+| 70–80 % | The resolver cache (`xdp_cache`) is halved, floored at `cache-min-entries`. |
+| ≥ 80 % | `xdp_cache` is shrunk to a ceiling recomputed from **current** available RAM (the same formula the startup auto-sizer uses), floored at `cache-min-entries`; `ForwardPool` is also rebuilt (refreshes upstream/DoT connections) and the rate limiter's DashMap of token buckets is cleared. |
 
-The general query-answer cache (`xdp_cache` — positive **and** RFC 2308 negative answers,
-capped by `cache-size` / auto-sizing) is not "halved"; the guard resets counters and rebuilds
-`ForwardPool` (which only pools upstream connections, it does not cache answers). On non-Linux systems or
-containers without `/proc/meminfo`, the guard silently skips its check and DNS service
-continues normally.
+Eviction is oldest-first by remaining TTL (soonest-to-expire entries go first —
+`cache_snapshot::evict_oldest`); `local-zone`/`local-data` entries never expire and
+are never evicted. Both actions only ever shrink the cache and never evict below
+`cache-min-entries`, so a sustained high-pressure host converges to the floor within
+a few 30 s ticks instead of oscillating or evicting forever. This all runs on a
+background task, never the hot query path — DNS latency is unaffected regardless of
+cache size or how much work an eviction pass does. On non-Linux systems or containers
+without `/proc/meminfo`, the guard silently skips its check and DNS service continues
+normally.
 
-**Log output example (≥ 80 % watermark):**
+**Log output examples:**
 
 ```
-WARN memory pressure high: pool rebuilt, rate limiter cleared  used_pct=82.1%  freed_buckets=4096
+WARN memory pressure moderate: cache halved  used_pct=74.2%  cache_evicted=21000  cache_len=21000
+WARN memory pressure high: pool rebuilt, rate limiter cleared, cache trimmed to current RAM  used_pct=82.1%  freed_buckets=4096  cache_evicted=18234  cache_len=42000
 ```
-
-**`cache-min-entries`** — accepted for backward compatibility only:
 
 ```
 server:
-    cache-min-entries: 2048   # default: 2048
+    cache-min-entries: 2048   # default: 2048 — floor below which the watchdog never evicts
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `cache-min-entries` | integer | `2048` | Parses and round-trips in the config file, but has **no runtime effect** — there is no cache-halving mechanism for it to floor. The value is read into config and otherwise discarded. |
+| `cache-min-entries` | integer | `2048` | Floor for the memory-pressure watchdog's cache eviction — `xdp_cache` is never shrunk below this many entries, however sustained the pressure. |
 
-See [docs/troubleshooting.md](troubleshooting.md#memory-pressure-under-low-memory-systems-cache-no-longer-shrinks-to-zero)
-for how cache sizing actually works today (the serve-stale fallback store,
-`stale_cache_wire`, sized once at startup from available RAM).
+See [docs/troubleshooting.md](troubleshooting.md#memory-pressure-under-low-memory-systems)
+for the serve-stale fallback store (`stale_cache_wire`, sized once at startup, not
+touched by this watchdog) and further low-memory remediation steps.
 
 ### XDP kernel-bypass fast path
 
@@ -1678,7 +1682,7 @@ They exist to bound memory usage and protect against authenticated DoS.
 | **API max payload** | 64 KB | Maximum size of any single REST API request body. Requests with a `Content-Length` header exceeding this value receive a `413 Payload Too Large` response before the body is read. |
 | **API rate limit** | 30 req/s | Token-bucket rate limiter per source IP on the REST API. Burst capacity: 60 requests. Returns `429 Too Many Requests` when exceeded. |
 | **Sync ring buffer** | 1,000 events | The master keeps the last 1,000 delta events in memory. A slave that falls more than 1,000 events behind receives `410 Gone` and triggers a full re-sync. |
-| **Memory pressure watermarks** | 70 % / 80 % | At ≥80% used memory, Runbound rebuilds the forward pool, resets cache stats, and flushes the rate limiter (one-shot, not a purge-to-50% loop). At 70–80% it only logs at `debug` level — no action taken. See [security.md](security.md#anti-oom-memory-protection). |
+| **Memory pressure watermarks** | 70 % / 80 % | At 70–80% used memory, Runbound halves the resolver cache (floored at `cache-min-entries`). At ≥80%, it shrinks the cache to a ceiling recomputed from current available RAM, rebuilds the forward pool, and flushes the rate limiter. See [security.md](security.md#anti-oom-memory-protection). |
 | **Max DNS entries (API)** | 10,000 | Maximum number of DNS records that can be added via `POST /dns`. Feed-loaded blocklist entries are not counted here. |
 | **Max blacklist entries (API)** | 100,000 | Maximum number of manual blacklist entries via `POST /blacklist`. |
 | **Max feed subscriptions** | 100 | Maximum number of concurrent feed subscriptions via `POST /feeds`. |
