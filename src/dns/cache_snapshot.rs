@@ -204,6 +204,61 @@ pub fn cache_insert_local(
     mutable.insert(key, entry);
     CACHE_WRITE_GEN.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Evict live, non-sentinel entries oldest-first until at most `target_len`
+/// remain. "Oldest" = soonest-to-expire (`expires_at`) — `CacheEntry` carries
+/// no separate insertion timestamp, and reusing the TTL field costs nothing
+/// extra per entry while still favouring the least-useful-going-forward
+/// entries for removal, which is what a resolver cache actually wants evicted
+/// under pressure (a fresh 300s-TTL answer survives over one with 2s left).
+///
+/// Used exclusively by the background memory-pressure watchdog
+/// (`memory_guard_loop`) — never called from the hot query path, so its cost
+/// never touches DNS latency regardless of cache size.
+///
+/// Cost: one O(n) pass to collect non-sentinel `(key, expires_at)` pairs, one
+/// O(n) average-case partial selection (`select_nth_unstable_by_key` — no
+/// full O(n log n) sort) to find the eviction cutoff, then O(k) removals.
+///
+/// Returns the number of entries actually removed. Bumps `CACHE_WRITE_GEN` on
+/// any removal so the next `publish_loop` tick (≤10 ms) republishes the
+/// shrunk snapshot to the XDP read side.
+pub fn evict_oldest(mutable: &MutableCacheMap, target_len: usize) -> usize {
+    let current = mutable.len();
+    if current <= target_len {
+        return 0;
+    }
+    let want_removed = current - target_len;
+
+    let mut candidates: Vec<(u64, Instant)> = mutable
+        .iter()
+        .filter(|kv| !is_sentinel(kv.value()))
+        .map(|kv| (*kv.key(), kv.value().expires_at))
+        .collect();
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let n = want_removed.min(candidates.len());
+    if n < candidates.len() {
+        // Partition so the n soonest-to-expire entries land in [..n] —
+        // avoids paying for a full sort of entries we're going to keep.
+        candidates.select_nth_unstable_by_key(n - 1, |&(_, expires_at)| expires_at);
+    }
+
+    let mut evicted = 0usize;
+    for (key, _) in candidates.into_iter().take(n) {
+        if mutable.remove(&key).is_some() {
+            evicted += 1;
+        }
+    }
+    if evicted > 0 {
+        CACHE_WRITE_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+    evicted
+}
+
 /// Construct a new empty MutableCacheMap with the correct IdentityHasherBuilder.
 pub fn new_mutable_cache() -> MutableCacheMap {
     Arc::new(DashMap::with_hasher(IdentityHasherBuilder))
@@ -395,5 +450,83 @@ pub async fn publish_loop(snapshot: SharedCacheSnapshot, mutable: MutableCacheMa
             .collect();
         XDP_CACHE_SNAPSHOT_ENTRIES.store(new_snap.len() as u64, Ordering::Relaxed);
         snapshot.store(Arc::new(new_snap));
+    }
+}
+
+#[cfg(test)]
+mod evict_oldest_tests {
+    use super::*;
+
+    fn entry(ttl_secs: u64) -> CacheEntry {
+        CacheEntry {
+            wire_payload: Bytes::new(),
+            expires_at: Instant::now() + Duration::from_secs(ttl_secs),
+            wire_qname: Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn no_op_when_already_under_target() {
+        let m = new_mutable_cache();
+        m.insert(1, entry(60));
+        m.insert(2, entry(120));
+        assert_eq!(evict_oldest(&m, 10), 0);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn evicts_soonest_to_expire_first() {
+        let m = new_mutable_cache();
+        // Key N has an N*10s TTL — key 1 is the "oldest" (least remaining life).
+        for i in 1u64..=10 {
+            m.insert(i, entry(i * 10));
+        }
+        let evicted = evict_oldest(&m, 4);
+        assert_eq!(evicted, 6);
+        assert_eq!(m.len(), 4);
+        // Survivors must be the 4 entries with the longest remaining TTL: keys 7..=10.
+        let mut remaining: Vec<u64> = m.iter().map(|kv| *kv.key()).collect();
+        remaining.sort_unstable();
+        assert_eq!(remaining, vec![7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn never_evicts_sentinel_entries() {
+        let m = new_mutable_cache();
+        m.insert(1, entry(5)); // short TTL — would normally go first
+        let sentinel = CacheEntry {
+            wire_payload: Bytes::new(),
+            expires_at: sentinel_expires(),
+            wire_qname: Bytes::new(),
+        };
+        m.insert(2, sentinel);
+        // Ask to shrink to 0 — only the non-sentinel entry may be removed.
+        let evicted = evict_oldest(&m, 0);
+        assert_eq!(evicted, 1);
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key(&2));
+    }
+
+    #[test]
+    fn returns_zero_on_all_sentinel_cache() {
+        let m = new_mutable_cache();
+        m.insert(1, CacheEntry {
+            wire_payload: Bytes::new(),
+            expires_at: sentinel_expires(),
+            wire_qname: Bytes::new(),
+        });
+        assert_eq!(evict_oldest(&m, 0), 0);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn bumps_write_gen_only_on_actual_eviction() {
+        let m = new_mutable_cache();
+        m.insert(1, entry(60));
+        let before = CACHE_WRITE_GEN.load(Ordering::Relaxed);
+        assert_eq!(evict_oldest(&m, 10), 0); // no-op: already under target
+        assert_eq!(CACHE_WRITE_GEN.load(Ordering::Relaxed), before);
+        assert_eq!(evict_oldest(&m, 0), 1); // real eviction
+        assert_eq!(CACHE_WRITE_GEN.load(Ordering::Relaxed), before + 1);
     }
 }
