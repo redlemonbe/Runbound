@@ -1,3 +1,4 @@
+
 # Installing Runbound
 
 This guide covers the `install.sh` script — what it does, how to verify what it installs,
@@ -55,9 +56,11 @@ Piped form: append `-s -- <option>`, e.g.
 7. **API key** — generates a random key into `/etc/runbound/env` as `RUNBOUND_API_KEY`
    (via `openssl`, falling back to `/dev/urandom`), **only if the file does not exist**.
 8. **Service** — installs a hardened `runbound.service` (`NoNewPrivileges`,
-   `ProtectSystem=strict`, capability set limited to `CAP_NET_BIND_SERVICE` by default —
-   the wider `NET_RAW`/`NET_ADMIN`/`BPF`/`PERFMON` set needed by the XDP fast path and the
-   firewall-manage feature is a commented opt-in in the unit), then `enable` + `start`, and
+   `ProtectSystem=strict`, capability set `CAP_NET_BIND_SERVICE`/`NET_RAW`/`NET_ADMIN`/
+   `BPF`/`PERFMON` granted **by default** — XDP is the default build feature and
+   resolution path, so the wider set is needed out of the box; a minimal
+   `CAP_NET_BIND_SERVICE`-only set is available as a commented opt-in for `xdp: no`
+   deployments that want to shrink the capability set), then `enable` + `start`, and
    verifies it is active.
 
 Re-running the installer upgrades the binary and service to the latest release while keeping
