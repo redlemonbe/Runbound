@@ -5,6 +5,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 
 ---
 
+## [0.9.4] - 2026-07-18
+
+### Fixed
+- **Memory-pressure watchdog no longer a no-op.** `memory_guard_loop`'s 70–80 %/≥80 %
+  watermark bands stopped actually shrinking any cache during the ForwardPool rewrite —
+  the background task kept polling `/proc/meminfo` and flushing the rate limiter, but the
+  cache-eviction arithmetic was silently dropped while the function's own doc comment kept
+  describing a halving design that no longer existed. Restored the behavior the comment
+  always promised, for both caches the watchdog is responsible for:
+  - `xdp_cache` (the fast-path answer cache): 70–80 % halves it, ≥80 % shrinks it to a
+    ceiling recomputed from *current* available RAM (same formula as the startup
+    auto-sizer). Eviction is oldest-first by remaining TTL
+    (`cache_snapshot::evict_oldest`) — `local-data` entries are never touched.
+  - `stale_cache_wire` (the RFC 8767 serve-stale fallback store): same two bands, same
+    targets. It already carried a genuine per-entry insertion timestamp, so eviction is
+    oldest-first by real age (`evict_oldest_stale`) rather than a TTL proxy.
+  - Both stores, in both bands, are monotonic (never grow back) and floored at
+    `cache-min-entries` (default 2048), which is no longer a documented-but-inert
+    configuration value.
+  - Neither eviction pass touches the hot query path — both run entirely inside the
+    pre-existing background watchdog task, so DNS latency is unaffected regardless of
+    cache size or how much work a pass does.
+  - Verified against real memory pressure on a temporary test instance (not simulated):
+    the moderate band converged a live cache from 1989 → 993 → 496 → 248 → 200 (floor)
+    over 4 ticks; the high band held steady at the floor across 4 further ticks with no
+    crash and DNS resolution unaffected throughout.
+
+### Changed
+- `cache-min-entries` now has the runtime effect its documentation always described
+  (eviction floor), instead of being parsed and discarded.
+
 ## [0.9.3] - 2026-07-09
 
 Consolidated release of all post-0.9.2 work: VM/container CPU sizing, DNSSEC-validated
